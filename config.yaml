@@ -1,0 +1,6 @@
+deployment:
+  etcd:
+    host:
+      - "http://127.0.0.1:2379"
+    prefix: /aisix
+    timeout: 30

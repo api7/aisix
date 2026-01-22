@@ -33,6 +33,7 @@ dependencies = [
  "fastrace-reqwest",
  "fastrace-tracing",
  "futures",
+ "http 1.4.0",
  "http-body-util",
  "hyper 1.8.1",
  "hyper-util",

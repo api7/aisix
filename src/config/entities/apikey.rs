@@ -6,6 +6,7 @@ use super::EntityStore;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKey {
+    pub key: String,
     pub allowed_models: Vec<String>,
 }
 
@@ -27,6 +28,16 @@ impl ApiKeysStore {
 
     pub fn get(&self, username: &str) -> Option<ApiKey> {
         self.store.get(username)
+    }
+
+    pub fn get_by_key(&self, api_key: &str) -> Option<(String, ApiKey)> {
+        //TODO pre-computed map
+        for (username, apikey) in self.store.list().into_iter() {
+            if apikey.key == api_key {
+                return Some((username, apikey));
+            }
+        }
+        None
     }
 
     #[fastrace::trace]

@@ -9,6 +9,7 @@ use fastrace::prelude::{SpanContext, SpanId, TraceId};
 use serde_json::json;
 
 pub mod chat;
+mod middlewares;
 pub mod validate_model;
 
 #[derive(Clone)]
@@ -52,7 +53,11 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat::chat_completions))
-        .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middlewares::auth::auth,
+        ))
+        .with_state(state.clone())
 }
 
 #[fastrace::trace]

@@ -23,6 +23,8 @@ where
 
     #[fastrace::trace]
     async fn from_request(req: Request, state: &AppState) -> Result<Self, Self::Rejection> {
+        let extensions = req.extensions().clone();
+
         let Json(data) = Json::<T>::from_request(req, state).await.map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
@@ -70,6 +72,24 @@ where
                 ));
             }
         };
+
+        let api_key = extensions
+            .get::<crate::config::entities::apikey::ApiKey>()
+            .cloned()
+            .unwrap();
+
+        if !api_key.allowed_models.contains(&model.name) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": {
+                        "message": format!("Access to model '{}' is forbidden", model.name),
+                        "type": "invalid_request_error",
+                        "code": "model_access_forbidden"
+                    }
+                })),
+            ));
+        }
 
         Ok(Self(data, model))
     }
