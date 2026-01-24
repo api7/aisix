@@ -1,9 +1,9 @@
 use log::info;
 
-use crate::{config::entities::ResourceRegistry, handler::AppState};
+use crate::{config::entities::ResourceRegistry, handlers::AppState};
 
 mod config;
-mod handler;
+mod handlers;
 mod providers;
 
 #[tokio::main]
@@ -16,7 +16,7 @@ async fn main() {
     let config_provider = config::create_provider(config.clone()).await;
     let resources = ResourceRegistry::init(config_provider).await;
 
-    serve(handler::AppState::new(config.clone(), resources.clone())).await;
+    serve(handlers::AppState::new(config.clone(), resources.clone())).await;
 }
 
 async fn serve(state: AppState) {
@@ -24,5 +24,5 @@ async fn serve(state: AppState) {
 
     info!("Server listening on http://0.0.0.0:3000");
 
-    let _ = tokio::join!(axum::serve(listener, handler::create_router(state),),);
+    let _ = tokio::join!(axum::serve(listener, handlers::create_router(state),),);
 }

@@ -5,7 +5,7 @@ use axum::{
 };
 use log::debug;
 
-use crate::{config::entities::apikey::ApiKey, handler::AppState};
+use crate::{config::entities::apikey::ApiKey, handlers::AppState};
 
 #[derive(Debug)]
 pub enum AuthError {

@@ -9,8 +9,8 @@ use fastrace::prelude::{SpanContext, SpanId, TraceId};
 use serde_json::json;
 
 pub mod chat;
+mod extractors;
 mod middlewares;
-pub mod validate_model;
 
 #[derive(Clone)]
 pub struct AppState {
