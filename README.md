@@ -14,7 +14,7 @@ RUST_LOG=info cargo run
 
 ### Config file (config.yaml)
 
-```
+```yaml
 deployment:
   etcd:
     host:
@@ -26,11 +26,13 @@ deployment:
 ### ETCD
 
 ```bash
-etcdctl put /aisix/apikeys/user1 '{"key":"user1","allowed_models": ["@my-ds/chat", "mock"]}'
+etcdctl put /aisix/apikeys/user1 '{"key":"user1","allowed_models": ["@my-ds/chat","@my-gemini/gemini-2.5-flash","mock"]}'
 
 etcdctl put /aisix/apikeys/user2 '{"key":"user2","allowed_models": []}'
 
-etcdctl put /aisix/models/deepseek-chat '{"name":"@my-ds/chat","model":"deepseek/deepseek-chat","provider_config":{"api_key":"sk-<your_key>"}}'
+etcdctl put /aisix/models/deepseek-chat '{"name":"@my-ds/chat","model":"deepseek/deepseek-chat","provider_config":{"api_key":"<your_key>"}}'
 
 etcdctl put /aisix/models/mock '{"name":"mock","model":"mock/mock","provider_config":{}}'
+
+etcdctl put /aisix/models/gemini-2_5-flash '{"name":"@my-gemini/gemini-2.5-flash","model":"gemini/gemini-2.5-flash","provider_config":{"api_key":"<your_key>"}}'
 ```
