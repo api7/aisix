@@ -4,19 +4,41 @@ use std::{error::Error, sync::LazyLock};
 
 use crate::{
     config::entities::models::ProviderConfig,
-    handlers::chat::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
+    handlers::chat_completions::{
+        ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
+    },
 };
 
-pub mod deepseek;
-pub mod mock;
+mod deepseek;
+mod gemini;
+mod mock;
+mod openai_compatible;
+
+// Re-export identifiers
+pub mod identifiers {
+    use super::{deepseek, gemini, mock};
+
+    pub const DEEPSEEK: &str = deepseek::IDENTIFIER;
+    pub const GEMINI: &str = gemini::IDENTIFIER;
+    pub const MOCK: &str = mock::IDENTIFIER;
+}
+
+// Re-export provider config types
+pub mod configs {
+    pub use super::{deepseek::DeepSeekProviderConfig, gemini::GeminiProviderConfig};
+}
 
 static REQWEST_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| reqwest::Client::new());
 
 pub fn create_provider(config: &ProviderConfig) -> Box<dyn Provider> {
     match config {
-        ProviderConfig::DeepSeek(deepseek_config) => Box::new(deepseek::DeepSeekProvider::new(
+        ProviderConfig::DeepSeek(config) => Box::new(deepseek::DeepSeekProvider::new(
             REQWEST_CLIENT.clone(),
-            deepseek_config.api_key.clone(),
+            config.api_key.clone(),
+        )),
+        ProviderConfig::Gemini(config) => Box::new(gemini::GeminiProvider::new(
+            REQWEST_CLIENT.clone(),
+            config.api_key.clone(),
         )),
         ProviderConfig::Mock => Box::new(mock::MockProvider::default()),
     }

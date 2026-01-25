@@ -14,25 +14,25 @@ use crate::{
 
 use super::openai_compatible::{chat_completion, chat_completion_stream};
 
-pub const IDENTIFIER: &str = "deepseek";
-const DEFAULT_API_BASE: &str = "https://api.deepseek.com/v1";
+pub const IDENTIFIER: &str = "gemini";
+const DEFAULT_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeepSeekProviderConfig {
+pub struct GeminiProviderConfig {
     pub api_key: String,
     pub api_base: Option<String>,
 }
 
-pub struct DeepSeekProvider {
-    config: DeepSeekProviderConfig,
+pub struct GeminiProvider {
+    config: GeminiProviderConfig,
     client: Client,
 }
 
-impl DeepSeekProvider {
+impl GeminiProvider {
     #[fastrace::trace]
     pub fn new(client: Client, api_key: String) -> Self {
         Self {
-            config: DeepSeekProviderConfig {
+            config: GeminiProviderConfig {
                 api_key: api_key.clone(),
                 api_base: Some(DEFAULT_API_BASE.to_string()),
             },
@@ -48,7 +48,7 @@ impl DeepSeekProvider {
 }
 
 #[async_trait]
-impl Provider for DeepSeekProvider {
+impl Provider for GeminiProvider {
     #[fastrace::trace(properties = { "request": "{request:?}" })]
     async fn chat_completion(
         &self,

@@ -3,9 +3,13 @@ use std::error::Error;
 use async_trait::async_trait;
 
 use crate::{
-    handlers::chat::{ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse},
+    handlers::chat_completions::{
+        ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
+    },
     providers::Provider,
 };
+
+pub const IDENTIFIER: &str = "mock";
 
 #[derive(Default)]
 pub struct MockProvider {}
@@ -24,7 +28,7 @@ impl Provider for MockProvider {
             model: request.model.clone(),
             choices: vec![ChatCompletionChoice {
                 index: 0,
-                message: crate::handlers::chat::ChatMessage {
+                message: crate::handlers::chat_completions::ChatMessage {
                     name: None,
                     role: "assistant".to_string(),
                     content: format!(
@@ -37,7 +41,7 @@ impl Provider for MockProvider {
                 },
                 finish_reason: Some("stop".to_string()),
             }],
-            usage: crate::handlers::chat::ChatCompletionUsage {
+            usage: crate::handlers::chat_completions::ChatCompletionUsage {
                 prompt_tokens: 5,
                 completion_tokens: 33,
                 total_tokens: 38,

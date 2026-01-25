@@ -1,5 +1,5 @@
 use super::{ConfigProvider, EntityStore};
-use crate::providers::deepseek::DeepSeekProviderConfig;
+use crate::providers::{configs, identifiers};
 use serde::{Deserialize, Serialize, de::Error};
 use std::{
     collections::HashMap,
@@ -8,7 +8,8 @@ use std::{
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProviderConfig {
-    DeepSeek(DeepSeekProviderConfig),
+    DeepSeek(configs::DeepSeekProviderConfig),
+    Gemini(configs::GeminiProviderConfig),
     Mock,
 }
 
@@ -18,11 +19,17 @@ impl ProviderConfig {
         json_value: &serde_json::Value,
     ) -> Result<Self, serde_json::Error> {
         match provider {
-            "deepseek" => {
-                let config = serde_json::from_value::<DeepSeekProviderConfig>(json_value.clone())?;
+            identifiers::DEEPSEEK => {
+                let config =
+                    serde_json::from_value::<configs::DeepSeekProviderConfig>(json_value.clone())?;
                 Ok(ProviderConfig::DeepSeek(config))
             }
-            "mock" => Ok(ProviderConfig::Mock),
+            identifiers::GEMINI => {
+                let config =
+                    serde_json::from_value::<configs::GeminiProviderConfig>(json_value.clone())?;
+                Ok(ProviderConfig::Gemini(config))
+            }
+            identifiers::MOCK => Ok(ProviderConfig::Mock),
             _ => Err(serde_json::Error::custom(format!(
                 "Unknown provider type: {}",
                 provider
