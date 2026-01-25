@@ -1,3 +1,5 @@
+use std::convert::Infallible;
+
 use axum::{
     Json,
     extract::State,
@@ -138,6 +140,7 @@ pub async fn chat_completions(
                 ProviderConfig::DeepSeek(deepseek_config) => {
                     Box::new(DeepSeekProvider::new(deepseek_config.api_key.clone()))
                 }
+                ProviderConfig::Mock => Box::new(crate::providers::mock::MockProvider::default()),
             },
             None => panic!("TODO: Provider config not set for model {}", model.name),
         }
@@ -196,18 +199,29 @@ async fn handle_stream_request(
     original_model: String,
 ) -> Response {
     use futures::stream::StreamExt;
-    use std::convert::Infallible;
     match provider.chat_completion_stream(request).await {
         Ok(stream) => {
             let sse_stream = stream
-                .map(move |mut chunk| {
-                    chunk.model = original_model.clone();
-                    let data = serde_json::to_string(&chunk);
-                    match data {
-                        Ok(json) => Ok::<Event, Infallible>(Event::default().data(json)),
-                        Err(err) => {
-                            error!("Failed to serialize chunk: {}", err);
-                            Ok(Event::default().data("{}"))
+                .filter_map(move |chunk_result| {
+                    let original_model = original_model.clone();
+                    async move {
+                        match chunk_result {
+                            Ok(mut chunk) => {
+                                chunk.model = original_model;
+                                match serde_json::to_string(&chunk) {
+                                    Ok(json) => {
+                                        Some(Ok::<Event, Infallible>(Event::default().data(json)))
+                                    }
+                                    Err(err) => {
+                                        error!("Failed to serialize chunk: {}", err);
+                                        None
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                error!("Stream error: {}", err);
+                                None
+                            }
                         }
                     }
                 })

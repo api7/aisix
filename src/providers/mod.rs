@@ -1,19 +1,28 @@
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 use std::error::Error;
 
-use crate::handler::chat::{ChatCompletionRequest, ChatCompletionResponse};
+use crate::handlers::chat::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse};
 
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn chat_completion(
         &self,
         request: ChatCompletionRequest,
-    ) -> Result<ChatCompletionResponse, Box<dyn Error + Send + Sync>>;
+    ) -> Result<ChatCompletionResponse, Box<dyn Error + Send + Sync>> {
+        Err("Not implemented".into())
+    }
 
     async fn chat_completion_stream(
         &self,
         request: ChatCompletionRequest,
-    ) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>>;
+    ) -> Result<
+        BoxStream<'static, Result<ChatCompletionChunk, Box<dyn Error + Send + Sync>>>,
+        Box<dyn Error + Send + Sync>,
+    > {
+        Err("Not implemented".into())
+    }
 }
 
 pub mod deepseek;
+pub mod mock;

@@ -9,6 +9,7 @@ use std::{
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProviderConfig {
     DeepSeek(DeepSeekProviderConfig),
+    Mock,
 }
 
 impl ProviderConfig {
@@ -21,6 +22,7 @@ impl ProviderConfig {
                 let config = serde_json::from_value::<DeepSeekProviderConfig>(json_value.clone())?;
                 Ok(ProviderConfig::DeepSeek(config))
             }
+            "mock" => Ok(ProviderConfig::Mock),
             _ => Err(serde_json::Error::custom(format!(
                 "Unknown provider type: {}",
                 provider

@@ -26,9 +26,11 @@ deployment:
 ### ETCD
 
 ```bash
-etcdctl put /aisix/apikeys/user1 '{"key":"user1","allowed_models": ["@my-ds/chat"]}'
+etcdctl put /aisix/apikeys/user1 '{"key":"user1","allowed_models": ["@my-ds/chat", "mock"]}'
 
 etcdctl put /aisix/apikeys/user2 '{"key":"user2","allowed_models": []}'
 
 etcdctl put /aisix/models/deepseek-chat '{"name":"@my-ds/chat","model":"deepseek/deepseek-chat","provider_config":{"api_key":"sk-<your_key>"}}'
+
+etcdctl put /aisix/models/mock '{"name":"mock","model":"mock/mock","provider_config":{}}'
 ```

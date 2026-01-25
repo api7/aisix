@@ -1,10 +1,12 @@
 use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
+use futures::{Stream, StreamExt, stream::BoxStream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 
 use super::Provider;
-use crate::handler::chat::{ChatCompletionRequest, ChatCompletionResponse};
+use crate::handlers::chat::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeepSeekProviderConfig {
@@ -67,11 +69,13 @@ impl Provider for DeepSeekProvider {
         Ok(completion)
     }
 
-    #[fastrace::trace]
     async fn chat_completion_stream(
         &self,
         request: ChatCompletionRequest,
-    ) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+    ) -> Result<
+        BoxStream<'static, Result<ChatCompletionChunk, Box<dyn Error + Send + Sync>>>,
+        Box<dyn Error + Send + Sync>,
+    > {
         let url = format!(
             "{}/chat/completions",
             self.config.api_base.as_ref().unwrap()
@@ -92,6 +96,69 @@ impl Provider for DeepSeekProvider {
             return Err(format!("DeepSeek API error {}: {}", status, error_text).into());
         }
 
-        Ok(response)
+        Ok(Box::pin(parse_sse_stream(response.bytes_stream())))
     }
+}
+
+fn parse_sse_stream(
+    stream: impl Stream<Item = Result<Bytes, reqwest::Error>>,
+) -> impl Stream<Item = Result<ChatCompletionChunk, Box<dyn Error + Send + Sync>>> {
+    stream
+        .chain(futures::stream::once(async {
+            Ok(Bytes::from_static(b"\n"))
+        }))
+        .scan(BytesMut::new(), |buffer, result| {
+            match result {
+                Ok(chunk) => {
+                    buffer.extend_from_slice(&chunk);
+
+                    let mut lines = Vec::new();
+
+                    // If there are incomplete lines, then this chunk will not terminate with a line break.
+                    // We accumulate these remaining bytes and append them during the next extraction.
+                    if let Some(last_newline) = buffer.iter().rposition(|&b| b == b'\n') {
+                        let complete_data = buffer.split_to(last_newline + 1);
+
+                        let text = String::from_utf8_lossy(&complete_data);
+                        for line in text.lines() {
+                            lines.push(Ok(line.to_string()));
+                        }
+                    }
+
+                    futures::future::ready(Some(futures::stream::iter(lines)))
+                }
+                Err(e) => {
+                    let err: Box<dyn Error + Send + Sync> = Box::new(e);
+                    futures::future::ready(Some(futures::stream::iter(vec![Err(err)])))
+                }
+            }
+        })
+        .flatten()
+        .filter_map(|line_result| async move {
+            match line_result {
+                Ok(line) => {
+                    // Only process lines starting with "data: "
+                    if let Some(json_str) = line.strip_prefix("data: ") {
+                        // Skip [DONE] events
+                        // Stream termination signifies completion; we need not explicitly propagate them.
+                        if json_str == "[DONE]" {
+                            return None;
+                        }
+
+                        match serde_json::from_str::<ChatCompletionChunk>(json_str) {
+                            Ok(chunk) => Some(Ok(chunk)),
+                            Err(e) => {
+                                // Propagate parse errors instead of skipping
+                                let err: Box<dyn Error + Send + Sync> =
+                                    format!("Failed to parse SSE chunk: {}", e).into();
+                                Some(Err(err))
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => Some(Err(e)),
+            }
+        })
 }
