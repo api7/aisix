@@ -12,26 +12,35 @@ use crate::{
 mod deepseek;
 mod gemini;
 mod mock;
+mod openai;
 mod openai_compatible;
 
 // Re-export identifiers
 pub mod identifiers {
-    use super::{deepseek, gemini, mock};
+    use super::{deepseek, gemini, mock, openai};
 
     pub const DEEPSEEK: &str = deepseek::IDENTIFIER;
     pub const GEMINI: &str = gemini::IDENTIFIER;
     pub const MOCK: &str = mock::IDENTIFIER;
+    pub const OPENAI: &str = openai::IDENTIFIER;
 }
 
 // Re-export provider config types
 pub mod configs {
-    pub use super::{deepseek::DeepSeekProviderConfig, gemini::GeminiProviderConfig};
+    pub use super::{
+        deepseek::DeepSeekProviderConfig, gemini::GeminiProviderConfig,
+        openai::OpenAIProviderConfig,
+    };
 }
 
 static REQWEST_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| reqwest::Client::new());
 
 pub fn create_provider(config: &ProviderConfig) -> Box<dyn Provider> {
     match config {
+        ProviderConfig::OpenAI(config) => Box::new(openai::OpenAIProvider::new(
+            REQWEST_CLIENT.clone(),
+            config.api_key.clone(),
+        )),
         ProviderConfig::DeepSeek(config) => Box::new(deepseek::DeepSeekProvider::new(
             REQWEST_CLIENT.clone(),
             config.api_key.clone(),

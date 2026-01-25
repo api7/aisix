@@ -10,6 +10,7 @@ use std::{
 pub enum ProviderConfig {
     DeepSeek(configs::DeepSeekProviderConfig),
     Gemini(configs::GeminiProviderConfig),
+    OpenAI(configs::OpenAIProviderConfig),
     Mock,
 }
 
@@ -30,6 +31,11 @@ impl ProviderConfig {
                 Ok(ProviderConfig::Gemini(config))
             }
             identifiers::MOCK => Ok(ProviderConfig::Mock),
+            identifiers::OPENAI => {
+                let config =
+                    serde_json::from_value::<configs::OpenAIProviderConfig>(json_value.clone())?;
+                Ok(ProviderConfig::OpenAI(config))
+            }
             _ => Err(serde_json::Error::custom(format!(
                 "Unknown provider type: {}",
                 provider
