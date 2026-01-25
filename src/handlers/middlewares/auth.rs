@@ -35,7 +35,6 @@ pub async fn auth(
         }
         None => return Err(AuthError::InvalidApiKey),
     };
-    debug!("Authenticating request with API key: {}", api_key);
 
     let api_key = match state.resources().apikeys.get_by_key(api_key) {
         Some(api_key) => api_key,
