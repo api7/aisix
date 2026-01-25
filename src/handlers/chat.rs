@@ -14,9 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use crate::{
-    config::entities::models::ProviderConfig,
     handlers::extractors::{ValidatedModel, validate_model::HasModelField},
-    providers::{Provider, deepseek::DeepSeekProvider},
+    providers::{Provider, create_provider},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,16 +131,12 @@ pub async fn chat_completions(
     State(_state): State<AppState>,
     ValidatedModel(mut request, model): ValidatedModel<ChatCompletionRequest>,
 ) -> Response {
-    let provider: Box<dyn Provider> = {
+    let provider = {
         let _new_provider_span =
             fastrace::prelude::LocalSpan::enter_with_local_parent("create_provider_instance");
-        match &model.provider_config.get() {
-            Some(config) => match config {
-                ProviderConfig::DeepSeek(deepseek_config) => {
-                    Box::new(DeepSeekProvider::new(deepseek_config.api_key.clone()))
-                }
-                ProviderConfig::Mock => Box::new(crate::providers::mock::MockProvider::default()),
-            },
+
+        match model.provider_config.get() {
+            Some(config) => create_provider(config),
             None => panic!("TODO: Provider config not set for model {}", model.name),
         }
     };

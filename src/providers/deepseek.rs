@@ -21,13 +21,13 @@ pub struct DeepSeekProvider {
 
 impl DeepSeekProvider {
     #[fastrace::trace]
-    pub fn new(api_key: String) -> Self {
+    pub fn new(client: Client, api_key: String) -> Self {
         Self {
             config: DeepSeekProviderConfig {
                 api_key: api_key.clone(),
                 api_base: Some("https://api.deepseek.com/v1".to_string()),
             },
-            client: Client::new(),
+            client,
         }
     }
 
