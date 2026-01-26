@@ -32,7 +32,7 @@ impl Provider for MockProvider {
                     name: None,
                     role: "assistant".to_string(),
                     content: format!(
-                        "Hello！👋 Current time: {:?}",
+                        "Hello! 👋 Current time: {:?}",
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()

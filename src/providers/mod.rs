@@ -4,8 +4,9 @@ use std::{error::Error, sync::LazyLock};
 
 use crate::{
     config::entities::models::ProviderConfig,
-    handlers::chat_completions::{
-        ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
+    handlers::{
+        chat_completions::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
+        embeddings::{EmbeddingRequest, EmbeddingResponse},
     },
 };
 
@@ -69,6 +70,13 @@ pub trait Provider: Send + Sync {
         BoxStream<'static, Result<ChatCompletionChunk, Box<dyn Error + Send + Sync>>>,
         Box<dyn Error + Send + Sync>,
     > {
+        Err("Not implemented".into())
+    }
+
+    async fn embedding(
+        &self,
+        _request: EmbeddingRequest,
+    ) -> Result<EmbeddingResponse, Box<dyn Error + Send + Sync>> {
         Err("Not implemented".into())
     }
 }

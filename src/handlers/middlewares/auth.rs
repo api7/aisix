@@ -3,7 +3,6 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use log::debug;
 
 use crate::{config::entities::apikey::ApiKey, handlers::AppState};
 

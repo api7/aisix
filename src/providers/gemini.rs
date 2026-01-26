@@ -9,7 +9,7 @@ use crate::{
     handlers::chat_completions::{
         ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
     },
-    providers::Provider,
+    providers::{Provider, openai_compatible::embedding},
 };
 
 use super::openai_compatible::{chat_completion, chat_completion_stream};
@@ -47,6 +47,7 @@ impl GeminiProvider {
     }
 }
 
+// TODO custom input/output struct definition and transformer
 #[async_trait]
 impl Provider for GeminiProvider {
     #[fastrace::trace(properties = { "request": "{request:?}" })]
@@ -73,5 +74,16 @@ impl Provider for GeminiProvider {
             self.config.api_base.as_deref().unwrap_or(DEFAULT_API_BASE)
         );
         chat_completion_stream(self.client.clone(), &url, &self.config.api_key, request).await
+    }
+
+    async fn embedding(
+        &self,
+        request: crate::handlers::embeddings::EmbeddingRequest,
+    ) -> Result<crate::handlers::embeddings::EmbeddingResponse, Box<dyn Error + Send + Sync>> {
+        let url = format!(
+            "{}/embeddings",
+            self.config.api_base.as_deref().unwrap_or(DEFAULT_API_BASE)
+        );
+        embedding(self.client.clone(), &url, &self.config.api_key, request).await
     }
 }

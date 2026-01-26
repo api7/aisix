@@ -6,6 +6,7 @@ use axum::{
 };
 
 pub mod chat_completions;
+pub mod embeddings;
 mod extractors;
 mod middlewares;
 mod models;
@@ -38,9 +39,10 @@ pub fn create_router(state: AppState) -> Router {
             "/v1/chat/completions",
             post(chat_completions::chat_completions),
         )
+        .route("/v1/embeddings", post(embeddings::embeddings))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            middlewares::auth::auth,
+            middlewares::auth,
         ))
         .with_state(state.clone())
 }

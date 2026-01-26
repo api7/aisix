@@ -3,8 +3,9 @@ use std::error::Error;
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, stream::BoxStream};
 
-use crate::handlers::chat_completions::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
+use crate::handlers::{
+    chat_completions::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
+    embeddings::{EmbeddingRequest, EmbeddingResponse},
 };
 
 pub async fn chat_completion(
@@ -55,6 +56,30 @@ pub async fn chat_completion_stream(
     }
 
     Ok(Box::pin(parse_sse_stream(response.bytes_stream())))
+}
+
+pub async fn embedding(
+    client: reqwest::Client,
+    url: &str,
+    api_key: &str,
+    request: EmbeddingRequest,
+) -> Result<EmbeddingResponse, Box<dyn Error + Send + Sync>> {
+    let response = client
+        .post(url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response.text().await.unwrap_or_default();
+        return Err(format!("API error {}: {}", status, error_text).into());
+    }
+
+    let embedding = response.json::<EmbeddingResponse>().await?;
+    Ok(embedding)
 }
 
 fn parse_sse_stream(
