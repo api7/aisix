@@ -13,6 +13,7 @@ mod models;
 
 #[derive(Clone)]
 pub struct AppState {
+    #[allow(dead_code)]
     config: Arc<crate::config::Config>,
     resources: Arc<crate::config::entities::ResourceRegistry>,
 }
@@ -44,5 +45,7 @@ pub fn create_router(state: AppState) -> Router {
             state.clone(),
             middlewares::auth,
         ))
+        .layer(axum::middleware::from_fn(middlewares::log))
+        .layer(middlewares::TraceLayer)
         .with_state(state.clone())
 }
