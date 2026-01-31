@@ -1,13 +1,15 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use super::{
     ConfigEvent, ConfigEventReceiver, ConfigItemKey, ConfigItemRevision, ConfigItemValue,
     ConfigProvider,
 };
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use log::{error, info, warn};
+use dashmap::{DashMap, Entry};
+use log::{info, warn};
 use serde::Deserialize;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -22,121 +24,26 @@ pub struct Config {
 pub struct EtcdConfigProvider {
     client: etcd_client::Client,
     prefix: String,
-    txs: Arc<Mutex<HashMap<String, mpsc::Sender<ConfigEvent>>>>,
+    txs: Arc<DashMap<String, mpsc::Sender<ConfigEvent>>>,
 }
 
 impl EtcdConfigProvider {
-    pub async fn new(config: Config) -> Self {
-        let client = Self::connect_client(&config).await;
+    pub async fn new(config: Config) -> Result<Self> {
+        let client = Self::connect_client(&config).await?;
 
-        let txs = Arc::new(Mutex::new(
-            HashMap::<String, mpsc::Sender<ConfigEvent>>::new(),
-        ));
+        let txs = Arc::new(DashMap::<String, mpsc::Sender<ConfigEvent>>::new());
 
         let prefix = config.prefix.clone();
-        Self::spawn_watch_loop(client.clone(), prefix.clone(), txs.clone());
+        Self::spawn_watch_loop(client.clone(), prefix.clone(), txs.clone()).await?;
 
-        Self {
+        Ok(Self {
             client,
             prefix: config.prefix.clone(),
             txs,
-        }
+        })
     }
 
-    fn spawn_watch_loop(
-        mut client: etcd_client::Client,
-        prefix: String,
-        txs: Arc<Mutex<HashMap<String, mpsc::Sender<ConfigEvent>>>>,
-    ) {
-        tokio::spawn(async move {
-            let mut backoff_secs = 1u64;
-            loop {
-                let watch_opts = etcd_client::WatchOptions::new().with_prefix();
-                match client.watch(prefix.as_str(), Some(watch_opts)).await {
-                    Ok((_watcher, mut stream)) => {
-                        info!("Started etcd prefix watch: {}", prefix);
-                        backoff_secs = 1;
-
-                        while let Ok(msg) = stream.message().await {
-                            let resp = match msg {
-                                Some(resp) => resp,
-                                None => {
-                                    warn!("Watch stream ended, preparing to retry");
-                                    break;
-                                }
-                            };
-
-                            if resp.canceled() {
-                                warn!("Watch was canceled, preparing to retry");
-                                break;
-                            }
-
-                            for event in resp.events() {
-                                if let Some(kv) = event.kv() {
-                                    let key = match kv.key_str() {
-                                        Ok(k) => k.to_string(),
-                                        Err(err) => {
-                                            warn!("Failed to parse watch key: {}", err);
-                                            continue;
-                                        }
-                                    };
-
-                                    let targets: Vec<mpsc::Sender<ConfigEvent>> = {
-                                        let guard = txs.lock().await;
-                                        guard
-                                            .iter()
-                                            .filter(|(k, _)| key.starts_with(k.as_str()))
-                                            .map(|(_, tx)| tx.clone())
-                                            .collect()
-                                    };
-
-                                    if targets.is_empty() {
-                                        continue;
-                                    }
-
-                                    /* let payload = ConfigEvent {
-                                        key: key.clone(),
-                                        value: if kv.value().is_empty() {
-                                            None
-                                        } else {
-                                            Some(kv.value().to_vec())
-                                        },
-                                        event_type: event.event_type().clone(),
-                                        mod_revision: kv.mod_revision(),
-                                    }; */
-                                    let payload = match event.event_type() {
-                                        etcd_client::EventType::Put => ConfigEvent::Put((
-                                            key,
-                                            kv.value().to_vec(),
-                                            kv.mod_revision(),
-                                        )),
-                                        etcd_client::EventType::Delete => {
-                                            ConfigEvent::Delete((key, kv.mod_revision()))
-                                        }
-                                    };
-
-                                    for tx in targets {
-                                        if let Err(err) = tx.send(payload.clone()).await {
-                                            warn!("Failed to dispatch watch event: {}", err);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        error!("Failed to start etcd watch: {}", err);
-                    }
-                }
-
-                warn!("Watch error, retrying in {}s", backoff_secs);
-                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(30);
-            }
-        });
-    }
-
-    async fn connect_client(config: &Config) -> etcd_client::Client {
+    async fn connect_client(config: &Config) -> Result<etcd_client::Client> {
         let mut opts = etcd_client::ConnectOptions::default()
             .with_timeout(Duration::from_secs(config.timeout as u64));
 
@@ -154,7 +61,81 @@ impl EtcdConfigProvider {
             Some(opts),
         )
         .await
-        .expect("Failed to connect to etcd")
+        .map_err(|e| anyhow::anyhow!("Failed to connect to etcd: {}", e))
+    }
+
+    //TODO auto re-connect on failure
+    async fn spawn_watch_loop(
+        mut client: etcd_client::Client,
+        prefix: String,
+        txs: Arc<DashMap<String, mpsc::Sender<ConfigEvent>>>,
+    ) -> Result<()> {
+        let (_watcher, mut stream) = client
+            .watch(
+                prefix.as_str(),
+                Some(etcd_client::WatchOptions::new().with_prefix()),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to start etcd watch: {}", e))?;
+
+        info!("Started etcd prefix watch: {}", prefix);
+
+        tokio::spawn(async move {
+            while let Ok(msg) = stream.message().await {
+                let resp = match msg {
+                    Some(resp) => resp,
+                    None => {
+                        warn!("Watch stream ended, preparing to retry");
+                        break;
+                    }
+                };
+
+                if resp.canceled() {
+                    warn!("Watch was canceled, preparing to retry");
+                    break;
+                }
+
+                for event in resp.events() {
+                    if let Some(kv) = event.kv() {
+                        let key = match kv.key_str() {
+                            Ok(k) => k.to_string(),
+                            Err(err) => {
+                                warn!("Failed to parse watch key: {}", err);
+                                continue;
+                            }
+                        };
+
+                        let targets: Vec<mpsc::Sender<ConfigEvent>> = {
+                            txs.iter()
+                                .filter(|entry| key.starts_with(entry.key().as_str()))
+                                .map(|entry| entry.value().clone())
+                                .collect()
+                        };
+
+                        if targets.is_empty() {
+                            continue;
+                        }
+
+                        let payload = match event.event_type() {
+                            etcd_client::EventType::Put => {
+                                ConfigEvent::Put((key, kv.value().to_vec(), kv.mod_revision()))
+                            }
+                            etcd_client::EventType::Delete => {
+                                ConfigEvent::Delete((key, kv.mod_revision()))
+                            }
+                        };
+
+                        for tx in targets {
+                            if let Err(err) = tx.send(payload.clone()).await {
+                                warn!("Failed to dispatch watch event: {}", err);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(())
     }
 }
 
@@ -205,19 +186,16 @@ impl ConfigProvider for EtcdConfigProvider {
         todo!()
     }
 
-    async fn watch(&self, prefix: Option<&str>) -> Option<ConfigEventReceiver> {
+    async fn watch(&self, prefix: Option<&str>) -> Result<ConfigEventReceiver> {
         let full_prefix = format!("{}{}", self.prefix, prefix.unwrap_or(""));
 
-        {
-            let guard = self.txs.lock().await;
-            if guard.contains_key(&full_prefix) {
-                return None;
+        match self.txs.entry(full_prefix) {
+            Entry::Occupied(_) => Err(anyhow!("Prefix has been watched")),
+            Entry::Vacant(v) => {
+                let (tx, rx) = mpsc::channel(32);
+                v.insert(tx);
+                Ok(rx)
             }
         }
-
-        let (tx, rx) = mpsc::channel(32);
-        self.txs.lock().await.insert(full_prefix, tx);
-
-        Some(rx)
     }
 }

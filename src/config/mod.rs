@@ -25,8 +25,10 @@ pub fn load() -> Result<Config, config::ConfigError> {
         .try_deserialize::<Config>()
 }
 
-pub async fn create_provider(config: Config) -> Arc<dyn ConfigProvider + Send + Sync> {
-    Arc::new(etcd::EtcdConfigProvider::new(config.deployment.etcd.clone()).await)
+pub async fn create_provider(config: Config) -> Result<Arc<dyn ConfigProvider + Send + Sync>> {
+    Ok(Arc::new(
+        etcd::EtcdConfigProvider::new(config.deployment.etcd.clone()).await?,
+    ))
 }
 
 type ConfigItemKey = String;
@@ -52,5 +54,5 @@ pub trait ConfigProvider {
 
     async fn put(&self);
 
-    async fn watch(&self, prefix: Option<&str>) -> Option<ConfigEventReceiver>;
+    async fn watch(&self, prefix: Option<&str>) -> Result<ConfigEventReceiver>;
 }

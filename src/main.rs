@@ -13,7 +13,9 @@ async fn main() {
     let config = config::load().expect("Failed to load configuration");
     info!("Loaded config: {:?}", config);
 
-    let config_provider = config::create_provider(config.clone()).await;
+    let config_provider = config::create_provider(config.clone())
+        .await
+        .expect("Failed to create config provider");
     let resources = ResourceRegistry::init(config_provider).await;
 
     // Initialize global rate limiter

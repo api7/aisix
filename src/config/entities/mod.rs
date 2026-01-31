@@ -181,7 +181,7 @@ impl<T: DeserializeOwned + Clone + Send + Sync + 'static> EntityStore<T> {
 
         // Subscribe to incremental updates
         match provider.watch(Some(prefix)).await {
-            Some(mut rx) => {
+            Ok(mut rx) => {
                 let store_clone = store.clone();
                 let entity_name = entity_name.to_string();
                 let prefix = prefix.to_string();
@@ -198,7 +198,7 @@ impl<T: DeserializeOwned + Clone + Send + Sync + 'static> EntityStore<T> {
                     .await;
                 });
             }
-            None => {
+            Err(_) => {
                 warn!(
                     "Duplicate registration of {} prefix watch ignored: {}",
                     entity_name, prefix
