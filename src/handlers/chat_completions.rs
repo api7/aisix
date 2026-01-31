@@ -2,7 +2,7 @@ use std::convert::Infallible;
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Extension, State},
     http::StatusCode,
     response::{
         IntoResponse, Response,
@@ -13,6 +13,10 @@ use log::error;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
+use crate::{
+    config::entities::{ApiKey, Model},
+    handlers::extractors::RateLimitGuards,
+};
 use crate::{
     handlers::extractors::{ValidatedModel, validate_model::HasModelField},
     providers::{Provider, create_provider},
@@ -124,22 +128,24 @@ pub struct ChatCompletionChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChatCompletionChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ChatCompletionUsage>,
 }
 
 #[fastrace::trace]
 pub async fn chat_completions(
     State(_state): State<AppState>,
+    Extension(api_key): Extension<ApiKey>,
     ValidatedModel(mut request, model): ValidatedModel<ChatCompletionRequest>,
 ) -> Response {
-    let provider = {
-        let _new_provider_span =
-            fastrace::prelude::LocalSpan::enter_with_local_parent("create_provider_instance");
-
-        match model.provider_config.get() {
-            Some(config) => create_provider(config),
-            None => panic!("TODO: Provider config not set for model {}", model.name),
-        }
+    // Check rate limits
+    let _guards = match crate::handlers::extractors::RateLimitGuards::check(&api_key, &model).await
+    {
+        Ok(guards) => guards,
+        Err(err) => return err.into_response(),
     };
+
+    let provider = create_provider(&model.provider_config);
 
     // Save original model value for response
     let original_model = request.model.clone();
@@ -152,11 +158,9 @@ pub async fn chat_completions(
     let is_stream = request.stream.unwrap_or(false);
 
     if is_stream {
-        // Streaming response
-        handle_stream_request(provider, request, original_model).await
+        handle_stream_request(provider, request, original_model, api_key, model).await
     } else {
-        // Non-streaming response
-        handle_regular_request(provider, request, original_model).await
+        handle_regular_request(provider, request, original_model, api_key, model).await
     }
 }
 
@@ -165,10 +169,57 @@ async fn handle_regular_request(
     provider: Box<dyn Provider>,
     request: ChatCompletionRequest,
     original_model: String,
+    api_key: ApiKey,
+    model: Model,
 ) -> Response {
     match provider.chat_completion(request).await {
         Ok(mut response) => {
+            let tokens = response.usage.total_tokens as u64;
             response.model = original_model;
+
+            // Record token usage
+            let limiter = crate::policies::rate_limit::get_rate_limiter();
+
+            // Check model token limits
+            if let Some(ref rate_limit) = model.rate_limit {
+                if let Err(err) = limiter
+                    .record_usage("model", &model.name, rate_limit, tokens)
+                    .await
+                {
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(serde_json::json!({
+                            "error": {
+                                "message": err.to_string(),
+                                "type": "rate_limit_error",
+                                "code": "rate_limit_exceeded"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+
+            // Check apikey token limits
+            if let Some(ref rate_limit) = api_key.rate_limit {
+                if let Err(err) = limiter
+                    .record_usage("apikey", &api_key.key, rate_limit, tokens)
+                    .await
+                {
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(serde_json::json!({
+                            "error": {
+                                "message": err.to_string(),
+                                "type": "rate_limit_error",
+                                "code": "rate_limit_exceeded"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+
             Json::<ChatCompletionResponse>(response).into_response()
         }
         Err(err) => {
@@ -192,17 +243,56 @@ async fn handle_stream_request(
     provider: Box<dyn Provider>,
     request: ChatCompletionRequest,
     original_model: String,
+    api_key: ApiKey,
+    model: crate::config::entities::models::Model,
 ) -> Response {
     use futures::stream::StreamExt;
     match provider.chat_completion_stream(request).await {
         Ok(stream) => {
+            let limiter = crate::policies::rate_limit::get_rate_limiter();
+            let model_rate_limit = model.rate_limit.clone();
+            let apikey_rate_limit = api_key.rate_limit.clone();
+            let model_name = model.name.clone();
+            let api_key_key = api_key.key.clone();
+
             let sse_stream = stream
                 .filter_map(move |chunk_result| {
                     let original_model = original_model.clone();
+                    let limiter = limiter.clone();
+                    let model_rate_limit = model_rate_limit.clone();
+                    let apikey_rate_limit = apikey_rate_limit.clone();
+                    let model_name = model_name.clone();
+                    let api_key_key = api_key_key.clone();
+
                     async move {
                         match chunk_result {
                             Ok(mut chunk) => {
                                 chunk.model = original_model;
+
+                                // Check if this chunk has usage (typically the last real chunk)
+                                if let Some(usage) = &chunk.usage {
+                                    let tokens = usage.total_tokens as u64;
+
+                                    // Record usage for model
+                                    if let Some(ref rate_limit) = model_rate_limit {
+                                        let _ = limiter
+                                            .record_usage("model", &model_name, rate_limit, tokens)
+                                            .await;
+                                    }
+
+                                    // Record usage for apikey
+                                    if let Some(ref rate_limit) = apikey_rate_limit {
+                                        let _ = limiter
+                                            .record_usage(
+                                                "apikey",
+                                                &api_key_key,
+                                                rate_limit,
+                                                tokens,
+                                            )
+                                            .await;
+                                    }
+                                }
+
                                 match serde_json::to_string(&chunk) {
                                     Ok(json) => {
                                         Some(Ok::<Event, Infallible>(Event::default().data(json)))

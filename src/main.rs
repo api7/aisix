@@ -4,6 +4,7 @@ use crate::{config::entities::ResourceRegistry, handlers::AppState};
 
 mod config;
 mod handlers;
+mod policies;
 mod providers;
 
 #[tokio::main]
@@ -15,6 +16,9 @@ async fn main() {
 
     let config_provider = config::create_provider(config.clone()).await;
     let resources = ResourceRegistry::init(config_provider).await;
+
+    // Initialize global rate limiter
+    policies::rate_limit::init_rate_limiter();
 
     serve(handlers::AppState::new(config.clone(), resources.clone())).await;
 

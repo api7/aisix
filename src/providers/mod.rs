@@ -36,6 +36,7 @@ pub mod configs {
 
 static REQWEST_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| reqwest::Client::new());
 
+#[fastrace::trace(short_name = true)]
 pub fn create_provider(config: &ProviderConfig) -> Box<dyn Provider> {
     match config {
         ProviderConfig::OpenAI(config) => Box::new(openai::OpenAIProvider::new(

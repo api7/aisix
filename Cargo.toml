@@ -56,3 +56,4 @@ clap = { version = "4.5.54", features = ["derive"] }
 http = "1.4.0"
 opentelemetry-semantic-conventions = "0.31.0"
 pin-project = "1.1.10"
+dashmap = "6.1.0"

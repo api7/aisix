@@ -1,4 +1,4 @@
-use crate::config::ConfigProvider;
+use crate::config::{ConfigProvider, entities::types::RateLimit};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 
@@ -8,6 +8,7 @@ use super::EntityStore;
 pub struct ApiKey {
     pub key: String,
     pub allowed_models: Vec<String>,
+    pub rate_limit: Option<RateLimit>,
 }
 
 #[derive(Clone)]

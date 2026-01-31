@@ -9,6 +9,10 @@ use crate::config::{ConfigEvent, ConfigProvider};
 
 pub mod apikey;
 pub mod models;
+pub mod types;
+
+pub use apikey::ApiKey;
+pub use models::Model;
 
 #[derive(Clone)]
 pub struct ResourceRegistry {

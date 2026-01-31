@@ -1,10 +1,11 @@
 use axum::{
     Json,
-    extract::State,
+    extract::{Extension, State},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 
+use crate::config::entities::apikey::ApiKey;
 use crate::{
     handlers::{AppState, extractors::ValidatedModel, extractors::validate_model::HasModelField},
     providers::create_provider,
@@ -58,17 +59,17 @@ pub struct EmbeddingResponse {
 
 pub async fn embeddings(
     State(_state): State<AppState>,
+    Extension(api_key): Extension<ApiKey>,
     ValidatedModel(mut request, model): ValidatedModel<EmbeddingRequest>,
 ) -> Response {
-    let provider = {
-        let _new_provider_span =
-            fastrace::prelude::LocalSpan::enter_with_local_parent("create_provider_instance");
-
-        match model.provider_config.get() {
-            Some(config) => create_provider(config),
-            None => panic!("TODO: Provider config not set for model {}", model.name),
-        }
+    // Check rate limits
+    let _guards = match crate::handlers::extractors::RateLimitGuards::check(&api_key, &model).await
+    {
+        Ok(guards) => guards,
+        Err(err) => return err.into_response(),
     };
+
+    let provider = create_provider(&model.provider_config);
 
     // Save original model value for response
     let original_model = request.model.clone();
@@ -80,6 +81,53 @@ pub async fn embeddings(
     match provider.embedding(request).await {
         Ok(mut response) => {
             response.model = original_model;
+
+            // Record token usage if available and check limits
+            if let Some(ref usage) = response.usage {
+                let tokens = usage.total_tokens as u64;
+                let limiter = crate::policies::rate_limit::get_rate_limiter();
+
+                // Check model token limits
+                if let Some(ref rate_limit) = model.rate_limit {
+                    if let Err(err) = limiter
+                        .record_usage("model", &model.name, rate_limit, tokens)
+                        .await
+                    {
+                        return (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "message": err.to_string(),
+                                    "type": "rate_limit_error",
+                                    "code": "rate_limit_exceeded"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
+
+                // Check apikey token limits
+                if let Some(ref rate_limit) = api_key.rate_limit {
+                    if let Err(err) = limiter
+                        .record_usage("apikey", &api_key.key, rate_limit, tokens)
+                        .await
+                    {
+                        return (
+                            axum::http::StatusCode::TOO_MANY_REQUESTS,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "message": err.to_string(),
+                                    "type": "rate_limit_error",
+                                    "code": "rate_limit_exceeded"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+
             Json::<EmbeddingResponse>(response).into_response()
         }
         Err(err) => (

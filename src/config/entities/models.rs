@@ -1,10 +1,10 @@
 use super::{ConfigProvider, EntityStore};
-use crate::providers::{configs, identifiers};
-use serde::{Deserialize, Serialize, de::Error};
-use std::{
-    collections::HashMap,
-    sync::{Arc, OnceLock},
+use crate::{
+    config::entities::types::RateLimit,
+    providers::{configs, identifiers},
 };
+use serde::{Deserialize, Serialize, de::Error};
+use std::{collections::HashMap, sync::Arc};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProviderConfig {
@@ -50,11 +50,13 @@ pub struct Model {
     pub model: String,
 
     #[serde(skip)]
-    provider: OnceLock<String>,
+    provider: String,
     #[serde(skip)]
-    provider_model: OnceLock<String>,
+    provider_model: String,
     #[serde(skip)]
-    pub provider_config: OnceLock<ProviderConfig>,
+    pub provider_config: ProviderConfig,
+
+    pub rate_limit: Option<RateLimit>,
 }
 
 impl<'de> Deserialize<'de> for Model {
@@ -67,6 +69,7 @@ impl<'de> Deserialize<'de> for Model {
             name: String,
             model: String,
             provider_config: serde_json::Value,
+            rate_limit: Option<RateLimit>,
         }
 
         let raw = ModelRaw::deserialize(deserializer)?;
@@ -95,16 +98,17 @@ impl<'de> Deserialize<'de> for Model {
             name: raw.name,
             model: raw.model,
 
-            provider: OnceLock::from(provider),
-            provider_model: OnceLock::from(provider_model),
-            provider_config: OnceLock::from(provider_config),
+            provider: provider,
+            provider_model: provider_model,
+            provider_config: provider_config,
+            rate_limit: raw.rate_limit,
         })
     }
 }
 
 impl Model {
     pub fn get_provider(&self) -> &str {
-        self.provider.get().unwrap()
+        &self.provider
     }
 }
 
