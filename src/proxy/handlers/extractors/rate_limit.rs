@@ -8,7 +8,7 @@ use serde_json::json;
 
 use crate::{
     config::entities::{apikey::ApiKey, models::Model},
-    policies::rate_limit::{self, ConcurrencyGuard},
+    proxy::policies::rate_limit::{self, ConcurrencyGuard},
 };
 
 pub enum RateLimitError {

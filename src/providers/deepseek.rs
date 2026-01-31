@@ -5,12 +5,8 @@ use futures::stream::BoxStream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    handlers::chat_completions::{
-        ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
-    },
-    providers::Provider,
-};
+use crate::providers::Provider;
+use crate::proxy::types::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse};
 
 use super::openai_compatible::{chat_completion, chat_completion_stream};
 

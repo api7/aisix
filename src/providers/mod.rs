@@ -4,9 +4,9 @@ use std::{error::Error, sync::LazyLock};
 
 use crate::{
     config::entities::models::ProviderConfig,
-    handlers::{
-        chat_completions::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
-        embeddings::{EmbeddingRequest, EmbeddingResponse},
+    proxy::types::{
+        ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingRequest,
+        EmbeddingResponse,
     },
 };
 

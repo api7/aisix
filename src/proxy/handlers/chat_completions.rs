@@ -13,14 +13,13 @@ use log::error;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
+use crate::proxy::policies;
 use crate::{
     config::entities::{ApiKey, Model},
-    handlers::extractors::RateLimitGuards,
-};
-use crate::{
-    handlers::extractors::{ValidatedModel, validate_model::HasModelField},
     providers::{Provider, create_provider},
 };
+
+use super::extractors::{RateLimitGuards, ValidatedModel, validate_model::HasModelField};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -139,8 +138,7 @@ pub async fn chat_completions(
     ValidatedModel(mut request, model): ValidatedModel<ChatCompletionRequest>,
 ) -> Response {
     // Check rate limits
-    let _guards = match crate::handlers::extractors::RateLimitGuards::check(&api_key, &model).await
-    {
+    let _guards = match RateLimitGuards::check(&api_key, &model).await {
         Ok(guards) => guards,
         Err(err) => return err.into_response(),
     };
@@ -178,7 +176,7 @@ async fn handle_regular_request(
             response.model = original_model;
 
             // Record token usage
-            let limiter = crate::policies::rate_limit::get_rate_limiter();
+            let limiter = policies::rate_limit::get_rate_limiter();
 
             // Check model token limits
             if let Some(ref rate_limit) = model.rate_limit {
@@ -249,7 +247,7 @@ async fn handle_stream_request(
     use futures::stream::StreamExt;
     match provider.chat_completion_stream(request).await {
         Ok(stream) => {
-            let limiter = crate::policies::rate_limit::get_rate_limiter();
+            let limiter = policies::rate_limit::get_rate_limiter();
             let model_rate_limit = model.rate_limit.clone();
             let apikey_rate_limit = api_key.rate_limit.clone();
             let model_name = model.name.clone();

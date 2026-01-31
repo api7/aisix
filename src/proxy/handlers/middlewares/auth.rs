@@ -4,7 +4,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::{config::entities::apikey::ApiKey, handlers::AppState};
+use crate::config::entities::apikey::ApiKey;
+
+use super::super::AppState;
 
 #[derive(Debug)]
 pub enum AuthError {

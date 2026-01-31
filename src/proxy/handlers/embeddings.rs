@@ -5,10 +5,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::config::entities::apikey::ApiKey;
-use crate::{
-    handlers::{AppState, extractors::ValidatedModel, extractors::validate_model::HasModelField},
-    providers::create_provider,
+use crate::{config::entities::apikey::ApiKey, providers::create_provider, proxy::policies};
+
+use super::{
+    AppState, extractors::RateLimitGuards, extractors::ValidatedModel,
+    extractors::validate_model::HasModelField,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,8 +64,7 @@ pub async fn embeddings(
     ValidatedModel(mut request, model): ValidatedModel<EmbeddingRequest>,
 ) -> Response {
     // Check rate limits
-    let _guards = match crate::handlers::extractors::RateLimitGuards::check(&api_key, &model).await
-    {
+    let _guards = match RateLimitGuards::check(&api_key, &model).await {
         Ok(guards) => guards,
         Err(err) => return err.into_response(),
     };
@@ -85,7 +85,7 @@ pub async fn embeddings(
             // Record token usage if available and check limits
             if let Some(ref usage) = response.usage {
                 let tokens = usage.total_tokens as u64;
-                let limiter = crate::policies::rate_limit::get_rate_limiter();
+                let limiter = policies::rate_limit::get_rate_limiter();
 
                 // Check model token limits
                 if let Some(ref rate_limit) = model.rate_limit {

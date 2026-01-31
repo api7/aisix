@@ -6,7 +6,9 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::{config::entities::models::Model, handlers::AppState};
+use crate::config::entities::models::Model;
+
+use super::super::AppState;
 
 pub trait HasModelField {
     fn model(&self) -> Option<String>;

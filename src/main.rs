@@ -1,11 +1,10 @@
 use log::info;
 
-use crate::{config::entities::ResourceRegistry, handlers::AppState};
+use crate::config::entities::ResourceRegistry;
 
 mod config;
-mod handlers;
-mod policies;
 mod providers;
+mod proxy;
 
 #[tokio::main]
 async fn main() {
@@ -18,9 +17,9 @@ async fn main() {
     let resources = ResourceRegistry::init(config_provider).await;
 
     // Initialize global rate limiter
-    policies::rate_limit::init_rate_limiter();
+    proxy::policies::rate_limit::init_rate_limiter();
 
-    serve(handlers::AppState::new(config.clone(), resources.clone())).await;
+    serve(proxy::AppState::new(config.clone(), resources.clone())).await;
 
     if cfg!(feature = "trace") {
         fastrace::flush();
@@ -77,7 +76,7 @@ fn init_observability() {
         .apply();
 }
 
-async fn serve(state: AppState) {
+async fn serve(state: proxy::AppState) {
     use std::net::SocketAddr;
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -86,6 +85,6 @@ async fn serve(state: AppState) {
 
     let _ = tokio::join!(axum::serve(
         listener,
-        handlers::create_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        proxy::create_router(state).into_make_service_with_connect_info::<SocketAddr>(),
     ),);
 }

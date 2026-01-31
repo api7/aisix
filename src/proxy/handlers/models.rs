@@ -3,7 +3,7 @@ use std::time::SystemTime;
 use axum::{Json, extract::State};
 use serde::Serialize;
 
-use crate::handlers::AppState;
+use super::AppState;
 
 // Model structure representing a single model
 #[derive(Serialize)]

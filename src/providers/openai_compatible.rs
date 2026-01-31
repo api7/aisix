@@ -3,9 +3,9 @@ use std::error::Error;
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, stream::BoxStream};
 
-use crate::handlers::{
-    chat_completions::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
-    embeddings::{EmbeddingRequest, EmbeddingResponse},
+use crate::proxy::types::{
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingRequest,
+    EmbeddingResponse,
 };
 
 pub async fn chat_completion(

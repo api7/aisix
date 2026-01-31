@@ -5,11 +5,10 @@ use futures::stream::BoxStream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    handlers::chat_completions::{
-        ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
-    },
-    providers::{Provider, openai_compatible::embedding},
+use crate::providers::{Provider, openai_compatible::embedding};
+use crate::proxy::types::{
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingRequest,
+    EmbeddingResponse,
 };
 
 use super::openai_compatible::{chat_completion, chat_completion_stream};
@@ -78,8 +77,8 @@ impl Provider for GeminiProvider {
 
     async fn embedding(
         &self,
-        request: crate::handlers::embeddings::EmbeddingRequest,
-    ) -> Result<crate::handlers::embeddings::EmbeddingResponse, Box<dyn Error + Send + Sync>> {
+        request: EmbeddingRequest,
+    ) -> Result<EmbeddingResponse, Box<dyn Error + Send + Sync>> {
         let url = format!(
             "{}/embeddings",
             self.config.api_base.as_deref().unwrap_or(DEFAULT_API_BASE)

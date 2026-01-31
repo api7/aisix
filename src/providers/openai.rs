@@ -5,14 +5,9 @@ use futures::stream::BoxStream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    handlers::chat_completions::{
-        ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
-    },
-    providers::Provider,
-};
-
 use super::openai_compatible::{chat_completion, chat_completion_stream};
+use crate::providers::Provider;
+use crate::proxy::types::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse};
 
 pub const IDENTIFIER: &str = "openai";
 const DEFAULT_API_BASE: &str = "https://api.openai.com/v1";

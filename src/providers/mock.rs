@@ -2,11 +2,10 @@ use std::error::Error;
 
 use async_trait::async_trait;
 
-use crate::{
-    handlers::chat_completions::{
-        ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
-    },
-    providers::Provider,
+use crate::providers::Provider;
+use crate::proxy::types::{
+    ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionUsage,
+    ChatMessage,
 };
 
 pub const IDENTIFIER: &str = "mock";
@@ -28,7 +27,7 @@ impl Provider for MockProvider {
             model: request.model.clone(),
             choices: vec![ChatCompletionChoice {
                 index: 0,
-                message: crate::handlers::chat_completions::ChatMessage {
+                message: ChatMessage {
                     name: None,
                     role: "assistant".to_string(),
                     content: format!(
@@ -41,7 +40,7 @@ impl Provider for MockProvider {
                 },
                 finish_reason: Some("stop".to_string()),
             }],
-            usage: crate::handlers::chat_completions::ChatCompletionUsage {
+            usage: ChatCompletionUsage {
                 prompt_tokens: 5,
                 completion_tokens: 33,
                 total_tokens: 38,
