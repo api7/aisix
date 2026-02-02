@@ -2,7 +2,7 @@ use crate::config::{ConfigProvider, entities::types::RateLimit};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 
-use super::EntityStore;
+use super::{EntityStore, ResourceEntry};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKey {
@@ -23,15 +23,15 @@ impl ApiKeysStore {
         }
     }
 
-    pub fn list(&self) -> HashMap<String, ApiKey> {
+    pub fn list(&self) -> HashMap<String, ResourceEntry<ApiKey>> {
         self.store.list()
     }
 
-    pub fn get(&self, username: &str) -> Option<ApiKey> {
+    pub fn get(&self, username: &str) -> Option<ResourceEntry<ApiKey>> {
         self.store.get(username)
     }
 
-    pub fn get_by_key(&self, api_key: &str) -> Option<(String, ApiKey)> {
+    pub fn get_by_key(&self, api_key: &str) -> Option<(String, ResourceEntry<ApiKey>)> {
         //TODO pre-computed map
         for (username, apikey) in self.store.list().into_iter() {
             if apikey.key == api_key {

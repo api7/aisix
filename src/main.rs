@@ -16,7 +16,7 @@ async fn main() {
     let config_provider = config::create_provider(config.clone())
         .await
         .expect("Failed to create config provider");
-    let resources = ResourceRegistry::init(config_provider).await;
+    let resources = ResourceRegistry::new(config_provider).await;
 
     // Initialize global rate limiter
     proxy::policies::rate_limit::init_rate_limiter();

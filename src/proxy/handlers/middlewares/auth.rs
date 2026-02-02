@@ -4,9 +4,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::config::entities::apikey::ApiKey;
-
-use super::super::AppState;
+use crate::{
+    config::entities::{ApiKey, ResourceEntry},
+    proxy::AppState,
+};
 
 #[derive(Debug)]
 pub enum AuthError {
@@ -42,7 +43,9 @@ pub async fn auth(
         None => return Err(AuthError::InvalidApiKey),
     };
 
-    request.extensions_mut().insert::<ApiKey>(api_key.1);
+    request
+        .extensions_mut()
+        .insert::<ResourceEntry<ApiKey>>(api_key.1);
 
     Ok(next.run(request).await)
 }

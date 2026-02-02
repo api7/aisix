@@ -5,10 +5,14 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{config::entities::apikey::ApiKey, providers::create_provider, proxy::policies};
+use crate::{
+    config::entities,
+    providers::create_provider,
+    proxy::{AppState, policies},
+};
 
 use super::{
-    AppState, extractors::RateLimitGuards, extractors::ValidatedModel,
+    extractors::RateLimitGuards, extractors::ValidatedModel,
     extractors::validate_model::HasModelField,
 };
 
@@ -60,7 +64,7 @@ pub struct EmbeddingResponse {
 
 pub async fn embeddings(
     State(_state): State<AppState>,
-    Extension(api_key): Extension<ApiKey>,
+    Extension(api_key): Extension<entities::ResourceEntry<entities::ApiKey>>,
     ValidatedModel(mut request, model): ValidatedModel<EmbeddingRequest>,
 ) -> Response {
     // Check rate limits

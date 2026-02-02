@@ -6,7 +6,7 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::config::entities::models::Model;
+use crate::config::entities;
 
 use super::super::AppState;
 
@@ -91,7 +91,7 @@ impl IntoResponse for ValidatedModelError {
 }
 
 #[derive(Debug, Clone)]
-pub struct ValidatedModel<T>(pub T, pub Model);
+pub struct ValidatedModel<T>(pub T, pub entities::ResourceEntry<entities::Model>);
 
 impl<T> FromRequest<AppState> for ValidatedModel<T>
 where
@@ -123,7 +123,7 @@ where
         };
 
         let api_key = extensions
-            .get::<crate::config::entities::apikey::ApiKey>()
+            .get::<entities::ResourceEntry<entities::ApiKey>>()
             .cloned();
         if let None = api_key {
             return Err(ValidatedModelError::Unauthorized);

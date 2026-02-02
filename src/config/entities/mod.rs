@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use arc_swap::ArcSwap;
 use log::{info, warn};
@@ -7,7 +7,7 @@ use tokio::sync::mpsc::Receiver;
 
 use crate::config::{ConfigEvent, ConfigProvider};
 
-pub mod apikey;
+mod apikey;
 pub mod models;
 pub mod types;
 
@@ -21,7 +21,7 @@ pub struct ResourceRegistry {
 }
 
 impl ResourceRegistry {
-    pub async fn init(provider: Arc<dyn ConfigProvider + Send + Sync>) -> Self {
+    pub async fn new(provider: Arc<dyn ConfigProvider + Send + Sync>) -> Self {
         let models = models::ModelsStore::new(provider.clone()).await;
         let apikeys = apikey::ApiKeysStore::new(provider).await;
 
@@ -29,16 +29,30 @@ impl ResourceRegistry {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ResourceEntry<T> {
+    value: T,
+    revision: i64,
+}
+
+impl<T> ResourceEntry<T> {
+    pub fn revision(&self) -> i64 {
+        self.revision
+    }
+}
+
+impl<T> Deref for ResourceEntry<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
 #[derive(Clone)]
 pub struct ResourceStore<T> {
     data: Arc<ArcSwap<HashMap<String, ResourceEntry<T>>>>,
     latest_mod_revision: Arc<ArcSwap<i64>>,
-}
-
-#[derive(Clone)]
-struct ResourceEntry<T> {
-    value: T,
-    mod_revision: i64,
 }
 
 impl<T: Clone> ResourceStore<T> {
@@ -49,22 +63,16 @@ impl<T: Clone> ResourceStore<T> {
         }
     }
 
-    pub fn upsert(&self, key: String, value: T, mod_revision: i64) {
+    pub fn upsert(&self, key: String, value: T, revision: i64) {
         // Use load-modify-store pattern
         let current: arc_swap::Guard<Arc<HashMap<String, ResourceEntry<T>>>> = self.data.load();
         let mut new_map = (**current).clone();
-        new_map.insert(
-            key,
-            ResourceEntry {
-                value,
-                mod_revision,
-            },
-        );
+        new_map.insert(key, ResourceEntry { value, revision });
         self.data.store(Arc::new(new_map));
 
         // Update latest mod_revision
-        if mod_revision > self.latest_mod_revision() {
-            self.latest_mod_revision.store(Arc::new(mod_revision));
+        if revision > self.latest_mod_revision() {
+            self.latest_mod_revision.store(Arc::new(revision));
         }
     }
 
@@ -82,16 +90,16 @@ impl<T: Clone> ResourceStore<T> {
         deleted
     }
 
-    pub fn get(&self, key: &str) -> Option<T> {
-        let current = self.data.load();
-        current.get(key).map(|entry| entry.value.clone())
+    pub fn get(&self, key: &str) -> Option<ResourceEntry<T>> {
+        let current: arc_swap::Guard<Arc<HashMap<String, ResourceEntry<T>>>> = self.data.load();
+        current.get(key).map(|entry| entry.clone())
     }
 
-    pub fn snapshot(&self) -> HashMap<String, T> {
+    pub fn snapshot(&self) -> HashMap<String, ResourceEntry<T>> {
         let current = self.data.load();
         current
             .iter()
-            .map(|(k, entry)| (k.clone(), entry.value.clone()))
+            .map(|(k, entry)| (k.clone(), entry.clone()))
             .collect()
     }
 
@@ -210,12 +218,12 @@ impl<T: DeserializeOwned + Clone + Send + Sync + 'static> EntityStore<T> {
     }
 
     /// Get the value of the specified key
-    pub fn get(&self, key: &str) -> Option<T> {
+    pub fn get(&self, key: &str) -> Option<ResourceEntry<T>> {
         self.store.get(key)
     }
 
     /// Get snapshot of all entities
-    pub fn list(&self) -> HashMap<String, T> {
+    pub fn list(&self) -> HashMap<String, ResourceEntry<T>> {
         self.store.snapshot()
     }
 

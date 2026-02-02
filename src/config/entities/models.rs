@@ -1,6 +1,6 @@
 use super::{ConfigProvider, EntityStore};
 use crate::{
-    config::entities::types::RateLimit,
+    config::entities::{ResourceEntry, types::RateLimit},
     providers::{configs, identifiers},
 };
 use serde::{Deserialize, Serialize, de::Error};
@@ -106,12 +106,6 @@ impl<'de> Deserialize<'de> for Model {
     }
 }
 
-impl Model {
-    pub fn get_provider(&self) -> &str {
-        &self.provider
-    }
-}
-
 #[derive(Clone)]
 pub struct ModelsStore {
     store: EntityStore<Model>,
@@ -124,15 +118,15 @@ impl ModelsStore {
         }
     }
 
-    pub fn list(&self) -> HashMap<String, Model> {
+    pub fn list(&self) -> HashMap<String, ResourceEntry<Model>> {
         self.store.list()
     }
 
-    pub fn get(&self, key: &str) -> Option<Model> {
+    pub fn get(&self, key: &str) -> Option<ResourceEntry<Model>> {
         self.store.get(key)
     }
 
-    pub fn get_by_name(&self, name: &str) -> Option<Model> {
+    pub fn get_by_name(&self, name: &str) -> Option<ResourceEntry<Model>> {
         for model in self.store.list().values() {
             if model.name == name {
                 return Some(model.clone());

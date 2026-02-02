@@ -12,11 +12,10 @@ use axum::{
 use log::error;
 use serde::{Deserialize, Serialize};
 
-use super::AppState;
-use crate::proxy::policies;
 use crate::{
-    config::entities::{ApiKey, Model},
+    config::entities,
     providers::{Provider, create_provider},
+    proxy::{AppState, policies},
 };
 
 use super::extractors::{RateLimitGuards, ValidatedModel, validate_model::HasModelField};
@@ -134,7 +133,7 @@ pub struct ChatCompletionChunk {
 #[fastrace::trace]
 pub async fn chat_completions(
     State(_state): State<AppState>,
-    Extension(api_key): Extension<ApiKey>,
+    Extension(api_key): Extension<entities::ResourceEntry<entities::ApiKey>>,
     ValidatedModel(mut request, model): ValidatedModel<ChatCompletionRequest>,
 ) -> Response {
     // Check rate limits
@@ -167,8 +166,8 @@ async fn handle_regular_request(
     provider: Box<dyn Provider>,
     request: ChatCompletionRequest,
     original_model: String,
-    api_key: ApiKey,
-    model: Model,
+    api_key: entities::ResourceEntry<entities::ApiKey>,
+    model: entities::ResourceEntry<entities::Model>,
 ) -> Response {
     match provider.chat_completion(request).await {
         Ok(mut response) => {
@@ -241,8 +240,8 @@ async fn handle_stream_request(
     provider: Box<dyn Provider>,
     request: ChatCompletionRequest,
     original_model: String,
-    api_key: ApiKey,
-    model: crate::config::entities::models::Model,
+    api_key: entities::ResourceEntry<entities::ApiKey>,
+    model: entities::ResourceEntry<entities::Model>,
 ) -> Response {
     use futures::stream::StreamExt;
     match provider.chat_completion_stream(request).await {
