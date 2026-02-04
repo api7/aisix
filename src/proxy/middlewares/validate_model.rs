@@ -1,43 +1,37 @@
 use axum::{
     Json,
-    extract::{FromRequest, Request},
+    extract::{Request, State},
     http::StatusCode,
-    response::IntoResponse,
+    middleware::Next,
+    response::{IntoResponse, Response},
 };
 use serde_json::json;
 
-use crate::config::entities;
+use crate::{config::entities, proxy::AppState};
 
-use super::super::AppState;
-
+/// Trait for request types that have a model field
 pub trait HasModelField {
     fn model(&self) -> Option<String>;
 }
 
 pub enum ValidatedModelError {
-    BadRequest,
+    MissingRequest,
     MissingModelField,
     ModelNotFound(String),
     AccessForbidden(String),
     Unauthorized,
 }
 
-impl From<axum::extract::rejection::JsonRejection> for ValidatedModelError {
-    fn from(_: axum::extract::rejection::JsonRejection) -> Self {
-        ValidatedModelError::BadRequest
-    }
-}
-
 impl IntoResponse for ValidatedModelError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            ValidatedModelError::BadRequest => (
-                StatusCode::BAD_REQUEST,
+            ValidatedModelError::MissingRequest => (
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
                     "error": {
-                        "message": "Bad request",
-                        "type": "invalid_request_error",
-                        "code": "bad_request"
+                        "message": "Request not found in extensions",
+                        "type": "internal_error",
+                        "code": "missing_request"
                     }
                 })),
             )
@@ -90,50 +84,58 @@ impl IntoResponse for ValidatedModelError {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ValidatedModel<T>(pub T, pub entities::ResourceEntry<entities::Model>);
-
-impl<T> FromRequest<AppState> for ValidatedModel<T>
+/// Middleware to validate model and store in Extensions
+///
+/// Requires:
+/// - Request body already parsed and stored in Extensions (use parse_body middleware first)
+/// - API key in Extensions (from auth middleware)
+///
+/// Usage:
+/// ```rust
+/// .layer(from_fn_with_state(state, validate_model::<ChatCompletionRequest>))
+/// ```
+pub async fn validate_model<T>(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, ValidatedModelError>
 where
-    T: serde::de::DeserializeOwned + HasModelField,
+    T: HasModelField + Clone + Send + Sync + 'static,
 {
-    type Rejection = ValidatedModelError;
+    // Get parsed body from Extensions
+    let body = req
+        .extensions()
+        .get::<T>()
+        .cloned()
+        .ok_or_else(|| ValidatedModelError::MissingRequest)?;
 
-    async fn from_request(req: Request, state: &AppState) -> Result<Self, Self::Rejection> {
-        let extensions = req.extensions().clone();
+    // Get model name from body
+    let model_name = body
+        .model()
+        .ok_or_else(|| ValidatedModelError::MissingModelField)?;
 
-        let Json(data) = Json::<T>::from_request(req, state)
-            .await
-            .map_err(ValidatedModelError::from)?;
+    // Look up model in resources
+    let res = state.resources();
+    let model = res
+        .models
+        .get_by_name(&model_name)
+        .ok_or_else(|| ValidatedModelError::ModelNotFound(model_name.clone()))?;
 
-        let model = match data.model() {
-            Some(m) => m,
-            None => {
-                return Err(ValidatedModelError::MissingModelField);
-            }
-        };
+    // Get API key from Extensions (should be set by auth middleware)
+    let api_key = req
+        .extensions()
+        .get::<entities::ResourceEntry<entities::ApiKey>>()
+        .cloned()
+        .ok_or_else(|| ValidatedModelError::Unauthorized)?;
 
-        let res = state.resources();
-
-        let model = match res.models.get_by_name(&model) {
-            Some(m) => m,
-            None => {
-                return Err(ValidatedModelError::ModelNotFound(model));
-            }
-        };
-
-        let api_key = extensions
-            .get::<entities::ResourceEntry<entities::ApiKey>>()
-            .cloned();
-        if let None = api_key {
-            return Err(ValidatedModelError::Unauthorized);
-        }
-
-        let api_key = api_key.unwrap();
-        if !api_key.allowed_models.contains(&model.name) {
-            return Err(ValidatedModelError::AccessForbidden(model.name.clone()));
-        }
-
-        Ok(Self(data, model))
+    // Check if API key has access to this model
+    if !api_key.allowed_models.contains(&model.name) {
+        return Err(ValidatedModelError::AccessForbidden(model.name.clone()));
     }
+
+    // Store validated model in Extensions
+    req.extensions_mut().insert(model);
+
+    // Continue
+    Ok(next.run(req).await)
 }

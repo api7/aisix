@@ -2,7 +2,7 @@ use std::convert::Infallible;
 
 use axum::{
     Json,
-    extract::{Extension, State},
+    extract::Extension,
     http::StatusCode,
     response::{
         IntoResponse, Response,
@@ -15,10 +15,11 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::entities,
     providers::{Provider, create_provider},
-    proxy::{AppState, policies},
+    proxy::{
+        middlewares::HasModelField,
+        policies::rate_limit::{self, RateLimitError, RateLimitState},
+    },
 };
-
-use super::extractors::{RateLimitGuards, ValidatedModel, validate_model::HasModelField};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -132,16 +133,11 @@ pub struct ChatCompletionChunk {
 
 #[fastrace::trace]
 pub async fn chat_completions(
-    State(_state): State<AppState>,
+    Extension(mut request): Extension<ChatCompletionRequest>,
     Extension(api_key): Extension<entities::ResourceEntry<entities::ApiKey>>,
-    ValidatedModel(mut request, model): ValidatedModel<ChatCompletionRequest>,
+    Extension(model): Extension<entities::ResourceEntry<entities::Model>>,
+    Extension(rate_limit_state): Extension<RateLimitState>,
 ) -> Response {
-    // Check rate limits
-    let _guards = match RateLimitGuards::check(&api_key, &model).await {
-        Ok(guards) => guards,
-        Err(err) => return err.into_response(),
-    };
-
     let provider = create_provider(&model.provider_config);
 
     // Save original model value for response
@@ -157,7 +153,15 @@ pub async fn chat_completions(
     if is_stream {
         handle_stream_request(provider, request, original_model, api_key, model).await
     } else {
-        handle_regular_request(provider, request, original_model, api_key, model).await
+        handle_regular_request(
+            provider,
+            request,
+            original_model,
+            api_key,
+            model,
+            rate_limit_state,
+        )
+        .await
     }
 }
 
@@ -168,56 +172,33 @@ async fn handle_regular_request(
     original_model: String,
     api_key: entities::ResourceEntry<entities::ApiKey>,
     model: entities::ResourceEntry<entities::Model>,
+    mut rate_limit_state: RateLimitState,
 ) -> Response {
     match provider.chat_completion(request).await {
         Ok(mut response) => {
             let tokens = response.usage.total_tokens as u64;
             response.model = original_model;
 
-            // Record token usage
-            let limiter = policies::rate_limit::get_rate_limiter();
-
-            // Check model token limits
-            if let Some(ref rate_limit) = model.rate_limit {
-                if let Err(err) = limiter
-                    .record_usage("model", &model.name, rate_limit, tokens)
-                    .await
-                {
-                    return (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        Json(serde_json::json!({
-                            "error": {
-                                "message": err.to_string(),
-                                "type": "rate_limit_error",
-                                "code": "rate_limit_exceeded"
-                            }
-                        })),
-                    )
-                        .into_response();
+            // Record token usage with post_check for api_key
+            match rate_limit::post_check(&api_key, tokens).await {
+                Ok(results) => {
+                    rate_limit_state.store_post_check(results);
+                }
+                Err((metric, err)) => {
+                    if let RateLimitError::Internal(msg) = &err {
+                        log::error!(
+                            "Post-check internal error for api_key: metric={:?}, error={}",
+                            metric,
+                            msg
+                        );
+                    }
                 }
             }
 
-            // Check apikey token limits
-            if let Some(ref rate_limit) = api_key.rate_limit {
-                if let Err(err) = limiter
-                    .record_usage("apikey", &api_key.key, rate_limit, tokens)
-                    .await
-                {
-                    return (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        Json(serde_json::json!({
-                            "error": {
-                                "message": err.to_string(),
-                                "type": "rate_limit_error",
-                                "code": "rate_limit_exceeded"
-                            }
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-
-            Json::<ChatCompletionResponse>(response).into_response()
+            // Use finalize_response to handle model post_check and add headers
+            rate_limit_state
+                .finalize_response(Json(response), tokens, &model)
+                .await
         }
         Err(err) => {
             error!("Provider request failed: {}", err);
@@ -246,20 +227,14 @@ async fn handle_stream_request(
     use futures::stream::StreamExt;
     match provider.chat_completion_stream(request).await {
         Ok(stream) => {
-            let limiter = policies::rate_limit::get_rate_limiter();
-            let model_rate_limit = model.rate_limit.clone();
-            let apikey_rate_limit = api_key.rate_limit.clone();
-            let model_name = model.name.clone();
-            let api_key_key = api_key.key.clone();
+            let api_key_clone = api_key.clone();
+            let model_clone = model.clone();
 
             let sse_stream = stream
                 .filter_map(move |chunk_result| {
                     let original_model = original_model.clone();
-                    let limiter = limiter.clone();
-                    let model_rate_limit = model_rate_limit.clone();
-                    let apikey_rate_limit = apikey_rate_limit.clone();
-                    let model_name = model_name.clone();
-                    let api_key_key = api_key_key.clone();
+                    let api_key = api_key_clone.clone();
+                    let model = model_clone.clone();
 
                     async move {
                         match chunk_result {
@@ -270,23 +245,24 @@ async fn handle_stream_request(
                                 if let Some(usage) = &chunk.usage {
                                     let tokens = usage.total_tokens as u64;
 
-                                    // Record usage for model
-                                    if let Some(ref rate_limit) = model_rate_limit {
-                                        let _ = limiter
-                                            .record_usage("model", &model_name, rate_limit, tokens)
-                                            .await;
+                                    // Record token usage with post_check
+                                    if let Err((metric, err)) = rate_limit::post_check(&api_key, tokens).await {
+                                        if let RateLimitError::Internal(msg) = &err {
+                                            log::error!(
+                                                "Post-check internal error for api_key in stream: metric={:?}, error={}",
+                                                metric,
+                                                msg
+                                            );
+                                        }
                                     }
-
-                                    // Record usage for apikey
-                                    if let Some(ref rate_limit) = apikey_rate_limit {
-                                        let _ = limiter
-                                            .record_usage(
-                                                "apikey",
-                                                &api_key_key,
-                                                rate_limit,
-                                                tokens,
-                                            )
-                                            .await;
+                                    if let Err((metric, err)) = rate_limit::post_check(&model, tokens).await {
+                                        if let RateLimitError::Internal(msg) = &err {
+                                            log::error!(
+                                                "Post-check internal error for model in stream: metric={:?}, error={}",
+                                                metric,
+                                                msg
+                                            );
+                                        }
                                     }
                                 }
 

@@ -1,19 +1,18 @@
 use axum::{
     Json,
-    extract::{Extension, State},
+    extract::Extension,
     response::{IntoResponse, Response},
 };
+use log::error;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     config::entities,
     providers::create_provider,
-    proxy::{AppState, policies},
-};
-
-use super::{
-    extractors::RateLimitGuards, extractors::ValidatedModel,
-    extractors::validate_model::HasModelField,
+    proxy::{
+        middlewares::HasModelField,
+        policies::rate_limit::{self, RateLimitError, RateLimitState},
+    },
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,16 +62,11 @@ pub struct EmbeddingResponse {
 }
 
 pub async fn embeddings(
-    State(_state): State<AppState>,
+    Extension(mut request): Extension<EmbeddingRequest>,
     Extension(api_key): Extension<entities::ResourceEntry<entities::ApiKey>>,
-    ValidatedModel(mut request, model): ValidatedModel<EmbeddingRequest>,
+    Extension(model): Extension<entities::ResourceEntry<entities::Model>>,
+    Extension(mut rate_limit_state): Extension<RateLimitState>,
 ) -> Response {
-    // Check rate limits
-    let _guards = match RateLimitGuards::check(&api_key, &model).await {
-        Ok(guards) => guards,
-        Err(err) => return err.into_response(),
-    };
-
     let provider = create_provider(&model.provider_config);
 
     // Save original model value for response
@@ -86,58 +80,44 @@ pub async fn embeddings(
         Ok(mut response) => {
             response.model = original_model;
 
-            // Record token usage if available and check limits
+            // Record token usage if available
             if let Some(ref usage) = response.usage {
                 let tokens = usage.total_tokens as u64;
-                let limiter = policies::rate_limit::get_rate_limiter();
 
-                // Check model token limits
-                if let Some(ref rate_limit) = model.rate_limit {
-                    if let Err(err) = limiter
-                        .record_usage("model", &model.name, rate_limit, tokens)
-                        .await
-                    {
-                        return (
-                            axum::http::StatusCode::TOO_MANY_REQUESTS,
-                            Json(serde_json::json!({
-                                "error": {
-                                    "message": err.to_string(),
-                                    "type": "rate_limit_error",
-                                    "code": "rate_limit_exceeded"
-                                }
-                            })),
-                        )
-                            .into_response();
+                // Record token usage with post_check for api_key
+                match rate_limit::post_check(&api_key, tokens).await {
+                    Ok(results) => {
+                        rate_limit_state.store_post_check(results);
+                    }
+                    Err((metric, err)) => {
+                        if let RateLimitError::Internal(msg) = &err {
+                            log::error!(
+                                "Post-check internal error for api_key: metric={:?}, error={}",
+                                metric,
+                                msg
+                            );
+                        }
                     }
                 }
 
-                // Check apikey token limits
-                if let Some(ref rate_limit) = api_key.rate_limit {
-                    if let Err(err) = limiter
-                        .record_usage("apikey", &api_key.key, rate_limit, tokens)
-                        .await
-                    {
-                        return (
-                            axum::http::StatusCode::TOO_MANY_REQUESTS,
-                            Json(serde_json::json!({
-                                "error": {
-                                    "message": err.to_string(),
-                                    "type": "rate_limit_error",
-                                    "code": "rate_limit_exceeded"
-                                }
-                            })),
-                        )
-                            .into_response();
-                    }
-                }
+                // Use finalize_response to handle model post_check and add headers
+                rate_limit_state
+                    .finalize_response(Json(response), tokens, &model)
+                    .await
+            } else {
+                // No usage info, just return response with pre-check headers
+                let mut resp = Json::<EmbeddingResponse>(response).into_response();
+                rate_limit_state.add_headers(resp.headers_mut());
+                resp
             }
-
-            Json::<EmbeddingResponse>(response).into_response()
         }
-        Err(err) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Error generating embeddings: {}", err),
-        )
-            .into_response(),
+        Err(err) => {
+            error!("Error generating embeddings: {}", err);
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Error generating embeddings: {}", err),
+            )
+                .into_response()
+        }
     }
 }

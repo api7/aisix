@@ -1,4 +1,7 @@
-use crate::config::{ConfigProvider, entities::types::RateLimit};
+use crate::config::{
+    ConfigProvider,
+    entities::types::{HasRateLimit, RateLimit, RateLimitMetric},
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 
@@ -8,7 +11,18 @@ use super::{EntityStore, ResourceEntry};
 pub struct ApiKey {
     pub key: String,
     pub allowed_models: Vec<String>,
+
     pub rate_limit: Option<RateLimit>,
+}
+
+impl HasRateLimit for ResourceEntry<ApiKey> {
+    fn rate_limit(&self) -> Option<RateLimit> {
+        self.rate_limit.clone()
+    }
+
+    fn rate_limit_key(&self, metric: RateLimitMetric) -> String {
+        format!("apikey:{}:{}", self.key, metric.to_string())
+    }
 }
 
 #[derive(Clone)]

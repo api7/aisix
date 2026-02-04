@@ -1,6 +1,9 @@
 use super::{ConfigProvider, EntityStore};
 use crate::{
-    config::entities::{ResourceEntry, types::RateLimit},
+    config::entities::{
+        ResourceEntry,
+        types::{HasRateLimit, RateLimit, RateLimitMetric},
+    },
     providers::{configs, identifiers},
 };
 use serde::{Deserialize, Serialize, de::Error};
@@ -103,6 +106,16 @@ impl<'de> Deserialize<'de> for Model {
             provider_config: provider_config,
             rate_limit: raw.rate_limit,
         })
+    }
+}
+
+impl HasRateLimit for ResourceEntry<Model> {
+    fn rate_limit(&self) -> Option<RateLimit> {
+        self.rate_limit.clone()
+    }
+
+    fn rate_limit_key(&self, metric: RateLimitMetric) -> String {
+        format!("model:{}:{}", self.name, metric.to_string())
     }
 }
 

@@ -8,7 +8,7 @@ trace = []
 
 [dependencies]
 log = { version = "0.4.29", features = ["kv", "kv_serde"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 hyper = { version = "1.8", features = ["server", "http1", "http2"] }
 openssl = { version = "0.10" }
@@ -27,6 +27,7 @@ axum = { version = "0.8.8", features = [
   "json",
   "matched-path",
   "tokio",
+  "macros",
 ], default-features = false }
 serde = "1.0.228"
 serde_json = "1.0"
@@ -57,3 +58,12 @@ http = "1.4.0"
 opentelemetry-semantic-conventions = "0.31.0"
 pin-project = "1.1.10"
 dashmap = "6.1.0"
+thiserror = "1.0"
+skp-ratelimit = { git = "https://github.com/bzp2010/skp-ratelimit.git", branch = "bzp/feat-custom-cost", default-features = false, features = [
+  "memory",
+] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+assert_matches = "1.5"
+pretty_assertions = "1.4"

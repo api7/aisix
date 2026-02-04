@@ -1,5 +1,6 @@
 mod handlers;
-pub mod policies;
+mod middlewares;
+mod policies;
 
 pub use handlers::{AppState, create_router};
 

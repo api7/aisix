@@ -5,10 +5,10 @@ use axum::{
     routing::{get, post},
 };
 
+use crate::proxy::middlewares;
+
 pub mod chat_completions;
 pub mod embeddings;
-mod extractors;
-mod middlewares;
 mod models;
 
 #[derive(Clone)]
@@ -38,9 +38,28 @@ pub fn create_router(state: AppState) -> Router {
         .merge(Router::new().route("/v1/models", get(models::list_models)))
         .route(
             "/v1/chat/completions",
-            post(chat_completions::chat_completions),
+            post(chat_completions::chat_completions)
+                .layer(axum::middleware::from_fn(middlewares::rate_limit_check))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    middlewares::validate_model::<chat_completions::ChatCompletionRequest>,
+                ))
+                .layer(axum::middleware::from_fn(
+                    middlewares::parse_body::<chat_completions::ChatCompletionRequest>,
+                )),
         )
-        .route("/v1/embeddings", post(embeddings::embeddings))
+        .route(
+            "/v1/embeddings",
+            post(embeddings::embeddings)
+                .layer(axum::middleware::from_fn(middlewares::rate_limit_check))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    middlewares::validate_model::<embeddings::EmbeddingRequest>,
+                ))
+                .layer(axum::middleware::from_fn(
+                    middlewares::parse_body::<embeddings::EmbeddingRequest>,
+                )),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middlewares::auth,

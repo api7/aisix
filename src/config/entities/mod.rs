@@ -31,6 +31,7 @@ impl ResourceRegistry {
 
 #[derive(Clone, Debug)]
 pub struct ResourceEntry<T> {
+    pub id: String,
     value: T,
     revision: i64,
 }
@@ -67,7 +68,14 @@ impl<T: Clone> ResourceStore<T> {
         // Use load-modify-store pattern
         let current: arc_swap::Guard<Arc<HashMap<String, ResourceEntry<T>>>> = self.data.load();
         let mut new_map = (**current).clone();
-        new_map.insert(key, ResourceEntry { value, revision });
+        new_map.insert(
+            key.clone(),
+            ResourceEntry {
+                id: key,
+                value,
+                revision,
+            },
+        );
         self.data.store(Arc::new(new_map));
 
         // Update latest mod_revision

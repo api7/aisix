@@ -18,9 +18,6 @@ async fn main() {
         .expect("Failed to create config provider");
     let resources = ResourceRegistry::new(config_provider).await;
 
-    // Initialize global rate limiter
-    proxy::policies::rate_limit::init_rate_limiter();
-
     serve(proxy::AppState::new(config.clone(), resources.clone())).await;
 
     if cfg!(feature = "trace") {
