@@ -13,11 +13,10 @@ use log::error;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::entities,
     providers::{Provider, create_provider},
     proxy::{
+        hooks::{Context, HOOK_MANAGER, ResponseData, TokenUsage},
         middlewares::HasModelField,
-        policies::rate_limit::{self, RateLimitError, RateLimitState},
     },
 };
 
@@ -134,14 +133,10 @@ pub struct ChatCompletionChunk {
 #[fastrace::trace]
 pub async fn chat_completions(
     Extension(mut request): Extension<ChatCompletionRequest>,
-    Extension(api_key): Extension<entities::ResourceEntry<entities::ApiKey>>,
-    Extension(model): Extension<entities::ResourceEntry<entities::Model>>,
-    Extension(rate_limit_state): Extension<RateLimitState>,
+    Extension(hook_ctx): Extension<Context>,
 ) -> Response {
+    let model = hook_ctx.model.clone();
     let provider = create_provider(&model.provider_config);
-
-    // Save original model value for response
-    let original_model = request.model.clone();
 
     // Replace request model name with real model name
     //TODO safe unwrap
@@ -151,17 +146,9 @@ pub async fn chat_completions(
     let is_stream = request.stream.unwrap_or(false);
 
     if is_stream {
-        handle_stream_request(provider, request, original_model, api_key, model).await
+        handle_stream_request(provider, request, hook_ctx).await
     } else {
-        handle_regular_request(
-            provider,
-            request,
-            original_model,
-            api_key,
-            model,
-            rate_limit_state,
-        )
-        .await
+        handle_regular_request(provider, request, hook_ctx).await
     }
 }
 
@@ -169,36 +156,32 @@ pub async fn chat_completions(
 async fn handle_regular_request(
     provider: Box<dyn Provider>,
     request: ChatCompletionRequest,
-    original_model: String,
-    api_key: entities::ResourceEntry<entities::ApiKey>,
-    model: entities::ResourceEntry<entities::Model>,
-    mut rate_limit_state: RateLimitState,
+    hook_ctx: Context,
 ) -> Response {
+    let mut hook_ctx = hook_ctx;
     match provider.chat_completion(request).await {
         Ok(mut response) => {
-            let tokens = response.usage.total_tokens as u64;
-            response.model = original_model;
+            response.model = hook_ctx.original_model.clone();
 
-            // Record token usage with post_check for api_key
-            match rate_limit::post_check(&api_key, tokens).await {
-                Ok(results) => {
-                    rate_limit_state.store_post_check(results);
-                }
-                Err((metric, err)) => {
-                    if let RateLimitError::Internal(msg) = &err {
-                        log::error!(
-                            "Post-check internal error for api_key: metric={:?}, error={}",
-                            metric,
-                            msg
-                        );
-                    }
-                }
+            // Execute post_call_success hooks
+            let response_data = ResponseData::ChatCompletion(response.clone());
+            if let Err(err) = HOOK_MANAGER
+                .execute_post_call_success(&mut hook_ctx, &response_data)
+                .await
+            {
+                error!("Hook post_call_success error: {}", err);
             }
 
-            // Use finalize_response to handle model post_check and add headers
-            rate_limit_state
-                .finalize_response(Json(response), tokens, &model)
+            // Build response and add headers
+            let mut resp = Json(response).into_response();
+            if let Err(err) = HOOK_MANAGER
+                .execute_post_call_headers(&hook_ctx, resp.headers_mut())
                 .await
+            {
+                error!("Hook post_call_headers error: {}", err);
+            }
+
+            resp
         }
         Err(err) => {
             error!("Provider request failed: {}", err);
@@ -220,73 +203,86 @@ async fn handle_regular_request(
 async fn handle_stream_request(
     provider: Box<dyn Provider>,
     request: ChatCompletionRequest,
-    original_model: String,
-    api_key: entities::ResourceEntry<entities::ApiKey>,
-    model: entities::ResourceEntry<entities::Model>,
+    hook_ctx: Context,
 ) -> Response {
     use futures::stream::StreamExt;
     match provider.chat_completion_stream(request).await {
         Ok(stream) => {
-            let api_key_clone = api_key.clone();
-            let model_clone = model.clone();
+            let original_model = hook_ctx.original_model.clone();
+            let hook_ctx_clone = hook_ctx.clone();
 
-            let sse_stream = stream
-                .filter_map(move |chunk_result| {
-                    let original_model = original_model.clone();
-                    let api_key = api_key_clone.clone();
-                    let model = model_clone.clone();
+            let (tx, rx) = tokio::sync::mpsc::channel(100);
 
-                    async move {
-                        match chunk_result {
-                            Ok(mut chunk) => {
-                                chunk.model = original_model;
+            // Spawn task to process stream and execute hooks after completion
+            tokio::spawn(async move {
+                let mut last_usage: Option<TokenUsage> = None;
+                let mut hook_ctx = hook_ctx_clone;
 
-                                // Check if this chunk has usage (typically the last real chunk)
-                                if let Some(usage) = &chunk.usage {
-                                    let tokens = usage.total_tokens as u64;
+                futures::pin_mut!(stream);
+                while let Some(chunk_result) = stream.next().await {
+                    match chunk_result {
+                        Ok(mut chunk) => {
+                            chunk.model = original_model.clone();
 
-                                    // Record token usage with post_check
-                                    if let Err((metric, err)) = rate_limit::post_check(&api_key, tokens).await {
-                                        if let RateLimitError::Internal(msg) = &err {
-                                            log::error!(
-                                                "Post-check internal error for api_key in stream: metric={:?}, error={}",
-                                                metric,
-                                                msg
-                                            );
-                                        }
-                                    }
-                                    if let Err((metric, err)) = rate_limit::post_check(&model, tokens).await {
-                                        if let RateLimitError::Internal(msg) = &err {
-                                            log::error!(
-                                                "Post-check internal error for model in stream: metric={:?}, error={}",
-                                                metric,
-                                                msg
-                                            );
-                                        }
-                                    }
-                                }
-
-                                match serde_json::to_string(&chunk) {
-                                    Ok(json) => {
-                                        Some(Ok::<Event, Infallible>(Event::default().data(json)))
-                                    }
-                                    Err(err) => {
-                                        error!("Failed to serialize chunk: {}", err);
-                                        None
-                                    }
-                                }
+                            // Check if this chunk has usage (typically the last real chunk)
+                            if let Some(usage) = &chunk.usage {
+                                last_usage = Some(TokenUsage {
+                                    prompt_tokens: Some(usage.prompt_tokens as u64),
+                                    completion_tokens: Some(usage.completion_tokens as u64),
+                                    total_tokens: usage.total_tokens as u64,
+                                });
                             }
-                            Err(err) => {
-                                error!("Stream error: {}", err);
-                                None
+
+                            // Send chunk to client
+                            if tx.send(chunk).await.is_err() {
+                                break;
                             }
                         }
+                        Err(err) => {
+                            error!("Stream error: {}", err);
+                            break;
+                        }
                     }
+                }
+
+                // Stream ended, execute post_call_streaming hook
+                if let Some(usage) = last_usage {
+                    if let Err(err) = HOOK_MANAGER
+                        .execute_post_call_streaming(&mut hook_ctx, &usage)
+                        .await
+                    {
+                        error!("Hook post_call_streaming error: {}", err);
+                    }
+                }
+            });
+
+            // Create SSE stream from receiver
+            let sse_stream = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| {
+                    let event = match serde_json::to_string(&chunk) {
+                        Ok(json) => Ok::<Event, Infallible>(Event::default().data(json)),
+                        Err(err) => {
+                            error!("Failed to serialize chunk: {}", err);
+                            Ok(Event::default().data(""))
+                        }
+                    };
+                    (event, rx)
                 })
-                .chain(futures::stream::iter(vec![Ok::<Event, Infallible>(
-                    Event::default().data("[DONE]"),
-                )]));
-            Sse::new(sse_stream).into_response()
+            })
+            .chain(futures::stream::iter(vec![Ok::<Event, Infallible>(
+                Event::default().data("[DONE]"),
+            )]));
+
+            // Build response and add headers (with pre-check values)
+            let mut resp = Sse::new(sse_stream).into_response();
+            if let Err(err) = HOOK_MANAGER
+                .execute_post_call_headers(&hook_ctx, resp.headers_mut())
+                .await
+            {
+                error!("Hook post_call_headers error: {}", err);
+            }
+
+            resp
         }
         Err(err) => {
             error!("Provider stream request failed: {}", err);

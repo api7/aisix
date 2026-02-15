@@ -39,7 +39,7 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/v1/chat/completions",
             post(chat_completions::chat_completions)
-                .layer(axum::middleware::from_fn(middlewares::rate_limit_check))
+                .layer(axum::middleware::from_fn(middlewares::hook_pre_call))
                 .layer(axum::middleware::from_fn_with_state(
                     state.clone(),
                     middlewares::validate_model::<chat_completions::ChatCompletionRequest>,
@@ -51,7 +51,7 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/v1/embeddings",
             post(embeddings::embeddings)
-                .layer(axum::middleware::from_fn(middlewares::rate_limit_check))
+                .layer(axum::middleware::from_fn(middlewares::hook_pre_call))
                 .layer(axum::middleware::from_fn_with_state(
                     state.clone(),
                     middlewares::validate_model::<embeddings::EmbeddingRequest>,

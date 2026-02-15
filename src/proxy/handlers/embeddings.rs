@@ -7,11 +7,10 @@ use log::error;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::entities,
     providers::create_provider,
     proxy::{
+        hooks::{Context, ResponseData, HOOK_MANAGER},
         middlewares::HasModelField,
-        policies::rate_limit::{self, RateLimitError, RateLimitState},
     },
 };
 
@@ -63,14 +62,11 @@ pub struct EmbeddingResponse {
 
 pub async fn embeddings(
     Extension(mut request): Extension<EmbeddingRequest>,
-    Extension(api_key): Extension<entities::ResourceEntry<entities::ApiKey>>,
-    Extension(model): Extension<entities::ResourceEntry<entities::Model>>,
-    Extension(mut rate_limit_state): Extension<RateLimitState>,
+    Extension(hook_ctx): Extension<Context>,
 ) -> Response {
+    let mut hook_ctx = hook_ctx;
+    let model = hook_ctx.model.clone();
     let provider = create_provider(&model.provider_config);
-
-    // Save original model value for response
-    let original_model = request.model.clone();
 
     // Replace request model name with real model name
     //TODO safe unwrap
@@ -78,38 +74,21 @@ pub async fn embeddings(
 
     match provider.embedding(request).await {
         Ok(mut response) => {
-            response.model = original_model;
+            response.model = hook_ctx.original_model.clone();
 
-            // Record token usage if available
-            if let Some(ref usage) = response.usage {
-                let tokens = usage.total_tokens as u64;
-
-                // Record token usage with post_check for api_key
-                match rate_limit::post_check(&api_key, tokens).await {
-                    Ok(results) => {
-                        rate_limit_state.store_post_check(results);
-                    }
-                    Err((metric, err)) => {
-                        if let RateLimitError::Internal(msg) = &err {
-                            log::error!(
-                                "Post-check internal error for api_key: metric={:?}, error={}",
-                                metric,
-                                msg
-                            );
-                        }
-                    }
-                }
-
-                // Use finalize_response to handle model post_check and add headers
-                rate_limit_state
-                    .finalize_response(Json(response), tokens, &model)
-                    .await
-            } else {
-                // No usage info, just return response with pre-check headers
-                let mut resp = Json::<EmbeddingResponse>(response).into_response();
-                rate_limit_state.add_headers(resp.headers_mut());
-                resp
+            // Execute post_call_success hooks
+            let response_data = ResponseData::Embedding(response.clone());
+            if let Err(err) = HOOK_MANAGER.execute_post_call_success(&mut hook_ctx, &response_data).await {
+                error!("Hook post_call_success error: {}", err);
             }
+
+            // Build response and add headers
+            let mut resp = Json(response).into_response();
+            if let Err(err) = HOOK_MANAGER.execute_post_call_headers(&hook_ctx, resp.headers_mut()).await {
+                error!("Hook post_call_headers error: {}", err);
+            }
+
+            resp
         }
         Err(err) => {
             error!("Error generating embeddings: {}", err);

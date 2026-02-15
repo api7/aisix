@@ -1,4 +1,5 @@
 mod handlers;
+mod hooks;
 mod middlewares;
 mod policies;
 
