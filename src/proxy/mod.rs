@@ -1,9 +1,14 @@
+use std::sync::Arc;
+
+use axum::{
+    Router,
+    routing::{get, post},
+};
+
 mod handlers;
 mod hooks;
 mod middlewares;
 mod policies;
-
-pub use handlers::{AppState, create_router};
 
 // types
 pub mod types {
@@ -14,4 +19,61 @@ pub mod types {
         },
         embeddings::{EmbeddingRequest, EmbeddingResponse},
     };
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    #[allow(dead_code)]
+    config: Arc<crate::config::Config>,
+    resources: Arc<crate::config::entities::ResourceRegistry>,
+}
+
+impl AppState {
+    pub fn new(
+        config: crate::config::Config,
+        resources: crate::config::entities::ResourceRegistry,
+    ) -> Self {
+        let config = Arc::new(config);
+        let resources = Arc::new(resources);
+        Self { config, resources }
+    }
+
+    pub fn resources(&self) -> Arc<crate::config::entities::ResourceRegistry> {
+        self.resources.clone()
+    }
+}
+
+pub fn create_router(state: AppState) -> Router {
+    Router::new()
+        .merge(Router::new().route("/v1/models", get(handlers::models::list_models)))
+        .route(
+            "/v1/chat/completions",
+            post(handlers::chat_completions::chat_completions)
+                .layer(axum::middleware::from_fn(middlewares::hook_pre_call))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    middlewares::validate_model::<handlers::chat_completions::ChatCompletionRequest>,
+                ))
+                .layer(axum::middleware::from_fn(
+                    middlewares::parse_body::<handlers::chat_completions::ChatCompletionRequest>,
+                )),
+        )
+        .route(
+            "/v1/embeddings",
+            post(handlers::embeddings::embeddings)
+                .layer(axum::middleware::from_fn(middlewares::hook_pre_call))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    middlewares::validate_model::<handlers::embeddings::EmbeddingRequest>,
+                ))
+                .layer(axum::middleware::from_fn(
+                    middlewares::parse_body::<handlers::embeddings::EmbeddingRequest>,
+                )),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middlewares::auth,
+        ))
+        .layer(axum::middleware::from_fn(middlewares::trace))
+        .with_state(state.clone())
 }
