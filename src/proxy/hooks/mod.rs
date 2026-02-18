@@ -1,44 +1,19 @@
+mod auth;
 mod rate_limit;
+mod validate_model;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use axum::{http::HeaderMap, response::Response};
+use axum::{extract::Request, http::HeaderMap, response::Response};
 use std::sync::{Arc, LazyLock};
 
-use crate::{
-    config::entities::{ApiKey, Model, ResourceEntry},
-    proxy::{
-        handlers::{
-            chat_completions::{ChatCompletionChunk, ChatCompletionResponse, ChatCompletionUsage},
-            embeddings::{EmbeddingResponse, EmbeddingUsage},
-        },
-        policies::rate_limit::RateLimitState,
-    },
+use crate::proxy::handlers::{
+    chat_completions::{ChatCompletionChunk, ChatCompletionResponse, ChatCompletionUsage},
+    embeddings::{EmbeddingResponse, EmbeddingUsage},
 };
 
 /// Hook context containing request metadata and state
-#[derive(Clone)]
-pub struct Context {
-    pub api_key: ResourceEntry<ApiKey>,
-    pub model: ResourceEntry<Model>,
-    pub original_model: String,
-    pub rate_limit_state: RateLimitState,
-}
-
-impl Context {
-    pub fn new(
-        api_key: ResourceEntry<ApiKey>,
-        model: ResourceEntry<Model>,
-        original_model: String,
-    ) -> Self {
-        Self {
-            api_key,
-            model,
-            original_model,
-            rate_limit_state: RateLimitState::new(),
-        }
-    }
-}
+pub type Context = http::Extensions;
 
 /// Hook action result
 pub enum HookAction {
@@ -114,7 +89,7 @@ pub trait ProxyHook: Send + Sync {
 
     /// Pre-call hook: executed before provider call
     /// Can modify request or return early response
-    async fn pre_call(&self, _ctx: &mut Context) -> Result<HookAction> {
+    async fn pre_call(&self, _ctx: &mut Context, _req: &mut Request) -> Result<HookAction> {
         Ok(HookAction::Continue)
     }
 
@@ -163,7 +138,7 @@ pub trait ProxyHook: Send + Sync {
 
 /// Hook manager for registering and executing hooks
 pub struct HookManager {
-    hooks: Vec<Arc<dyn ProxyHook>>,
+    pub hooks: Vec<Arc<dyn ProxyHook>>,
 }
 
 impl HookManager {
@@ -176,9 +151,13 @@ impl HookManager {
     }
 
     /// Execute all pre_call hooks in order
-    pub async fn execute_pre_call(&self, ctx: &mut Context) -> Result<HookAction> {
+    pub async fn execute_pre_call(
+        &self,
+        ctx: &mut Context,
+        req: &mut Request,
+    ) -> Result<HookAction> {
         for hook in &self.hooks {
-            match hook.pre_call(ctx).await? {
+            match hook.pre_call(ctx, req).await? {
                 HookAction::Continue => continue,
                 HookAction::EarlyReturn(resp) => return Ok(HookAction::EarlyReturn(resp)),
             }
@@ -256,6 +235,8 @@ pub static HOOK_MANAGER: LazyLock<HookManager> = LazyLock::new(|| {
     let mut manager = HookManager::new();
 
     // Register built-in hooks
+    manager.register(Arc::new(auth::AuthHook::new()));
+    manager.register(Arc::new(validate_model::ValidateModelHook::new()));
     manager.register(Arc::new(rate_limit::RateLimitHook::new()));
 
     manager

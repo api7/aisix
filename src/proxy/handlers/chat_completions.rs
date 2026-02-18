@@ -2,7 +2,7 @@ use std::convert::Infallible;
 
 use axum::{
     Json,
-    extract::Extension,
+    extract::{Extension, Request, State},
     http::StatusCode,
     response::{
         IntoResponse, Response,
@@ -13,10 +13,12 @@ use log::error;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    config::entities::{Model, ResourceEntry},
     providers::{Provider, create_provider},
     proxy::{
-        hooks::{Context, HOOK_MANAGER, ResponseData, TokenUsage},
-        middlewares::HasModelField,
+        AppState,
+        hooks::{Context, HOOK_MANAGER, HookAction, ResponseData, TokenUsage},
+        middlewares::RequestModel,
     },
 };
 
@@ -73,12 +75,6 @@ pub struct ChatCompletionRequest {
     //TODO web_search_options
 }
 
-impl HasModelField for ChatCompletionRequest {
-    fn model(&self) -> Option<String> {
-        Some(self.model.clone())
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionChoice {
     pub index: u32,
@@ -132,23 +128,58 @@ pub struct ChatCompletionChunk {
 
 #[fastrace::trace]
 pub async fn chat_completions(
-    Extension(mut request): Extension<ChatCompletionRequest>,
-    Extension(hook_ctx): Extension<Context>,
+    State(state): State<AppState>,
+    Extension(mut request_data): Extension<ChatCompletionRequest>,
+    mut request: Request,
 ) -> Response {
-    let model = hook_ctx.model.clone();
+    // PRE CALL HOOKS START
+    let mut hook_ctx = Context::new();
+
+    hook_ctx.insert(state);
+    hook_ctx.insert(RequestModel(request_data.model));
+
+    let action = HOOK_MANAGER
+        .execute_pre_call(&mut hook_ctx, &mut request)
+        .await;
+
+    match action {
+        Ok(HookAction::EarlyReturn(response)) => {
+            return response;
+        }
+        Err(err) => {
+            error!("Hook pre_call error: {}", err);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Internal server error: {}", err),
+                        "type": "server_error",
+                        "code": "hook_pre_call_error"
+                    }
+                })),
+            )
+                .into_response();
+        }
+        _ => {}
+    }
+
+    // PRE CALL HOOKS END
+
+    let model = hook_ctx.get::<ResourceEntry<Model>>().cloned().unwrap(); //TODO: safe unwrap
+
     let provider = create_provider(&model.provider_config);
 
     // Replace request model name with real model name
     //TODO safe unwrap
-    request.model = model.model.split("/").nth(1).unwrap().to_string();
+    request_data.model = model.model.split("/").nth(1).unwrap().to_string();
 
     // Check if it's a streaming request
-    let is_stream = request.stream.unwrap_or(false);
+    let is_stream = request_data.stream.unwrap_or(false);
 
     if is_stream {
-        handle_stream_request(provider, request, hook_ctx).await
+        handle_stream_request(provider, request_data, hook_ctx).await
     } else {
-        handle_regular_request(provider, request, hook_ctx).await
+        handle_regular_request(provider, request_data, hook_ctx).await
     }
 }
 
@@ -161,7 +192,7 @@ async fn handle_regular_request(
     let mut hook_ctx = hook_ctx;
     match provider.chat_completion(request).await {
         Ok(mut response) => {
-            response.model = hook_ctx.original_model.clone();
+            response.model = hook_ctx.get::<RequestModel>().cloned().unwrap().0; //TODO: safe unwrap
 
             // Execute post_call_success hooks
             let response_data = ResponseData::ChatCompletion(response.clone());
@@ -208,7 +239,7 @@ async fn handle_stream_request(
     use futures::stream::StreamExt;
     match provider.chat_completion_stream(request).await {
         Ok(stream) => {
-            let original_model = hook_ctx.original_model.clone();
+            let original_model = hook_ctx.get::<RequestModel>().cloned().unwrap().0;
             let hook_ctx_clone = hook_ctx.clone();
 
             let (tx, rx) = tokio::sync::mpsc::channel(100);

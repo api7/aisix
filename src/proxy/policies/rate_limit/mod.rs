@@ -17,9 +17,6 @@ pub use utils::RateLimitState;
 pub use utils::post_check;
 pub use utils::pre_check;
 
-// Re-export types needed by middleware
-pub use crate::config::entities::types::RateLimitMetric as Metric;
-
 /// Rate limiter error types
 #[derive(Debug, Clone, Error)]
 pub enum RateLimitError {

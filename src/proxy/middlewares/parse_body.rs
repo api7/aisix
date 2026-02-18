@@ -15,6 +15,15 @@ pub struct RawRequestBody {
     pub bytes: Bytes,
 }
 
+impl From<Bytes> for RawRequestBody {
+    fn from(bytes: Bytes) -> Self {
+        Self { bytes }
+    }
+}
+
+#[derive(Clone)]
+pub struct RequestModel(pub String);
+
 /// Middleware to parse request body and store in Extensions
 ///
 /// Usage:
@@ -46,13 +55,11 @@ where
         }
     };
 
-    parts.extensions.insert(RawRequestBody {
-        bytes: bytes.clone(),
-    });
+    parts.extensions.insert(RawRequestBody::from(bytes.clone()));
 
     // Deserialize
     let body: T = match serde_json::from_slice(&bytes) {
-        Ok(body) => body,
+        Ok(val) => val,
         Err(err) => {
             return Err((
                 StatusCode::BAD_REQUEST,

@@ -1,16 +1,19 @@
 use axum::{
     Json,
-    extract::Extension,
+    extract::{Extension, Request, State},
     response::{IntoResponse, Response},
 };
+use http::StatusCode;
 use log::error;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    config::entities::{Model, ResourceEntry},
     providers::create_provider,
     proxy::{
-        hooks::{Context, ResponseData, HOOK_MANAGER},
-        middlewares::HasModelField,
+        AppState,
+        hooks::{Context, HOOK_MANAGER, HookAction, ResponseData},
+        middlewares::RequestModel,
     },
 };
 
@@ -31,12 +34,6 @@ pub struct EmbeddingRequest {
     pub encoding_format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-}
-
-impl HasModelField for EmbeddingRequest {
-    fn model(&self) -> Option<String> {
-        Some(self.model.clone())
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,30 +58,70 @@ pub struct EmbeddingResponse {
 }
 
 pub async fn embeddings(
-    Extension(mut request): Extension<EmbeddingRequest>,
-    Extension(hook_ctx): Extension<Context>,
+    State(state): State<AppState>,
+    Extension(mut request_data): Extension<EmbeddingRequest>,
+    mut request: Request,
 ) -> Response {
-    let mut hook_ctx = hook_ctx;
-    let model = hook_ctx.model.clone();
+    // PRE CALL HOOKS START
+    let mut hook_ctx = Context::new();
+
+    hook_ctx.insert(state);
+    hook_ctx.insert(RequestModel(request_data.model));
+
+    let action = HOOK_MANAGER
+        .execute_pre_call(&mut hook_ctx, &mut request)
+        .await;
+
+    match action {
+        Ok(HookAction::EarlyReturn(response)) => {
+            return response;
+        }
+        Err(err) => {
+            error!("Hook pre_call error: {}", err);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Internal server error: {}", err),
+                        "type": "server_error",
+                        "code": "hook_pre_call_error"
+                    }
+                })),
+            )
+                .into_response();
+        }
+        _ => {}
+    }
+
+    // PRE CALL HOOKS END
+
+    //TODO: safe unwrap
+    let model = hook_ctx.get::<ResourceEntry<Model>>().cloned().unwrap();
+
     let provider = create_provider(&model.provider_config);
 
     // Replace request model name with real model name
-    //TODO safe unwrap
-    request.model = model.model.split("/").nth(1).unwrap().to_string();
+    request_data.model = model.model.split("/").nth(1).unwrap().to_string();
 
-    match provider.embedding(request).await {
+    match provider.embedding(request_data).await {
         Ok(mut response) => {
-            response.model = hook_ctx.original_model.clone();
+            response.model = hook_ctx.get::<RequestModel>().cloned().unwrap().0; //TODO: safe unwrap
 
             // Execute post_call_success hooks
             let response_data = ResponseData::Embedding(response.clone());
-            if let Err(err) = HOOK_MANAGER.execute_post_call_success(&mut hook_ctx, &response_data).await {
+            if let Err(err) = HOOK_MANAGER
+                .execute_post_call_success(&mut hook_ctx, &response_data)
+                .await
+            {
                 error!("Hook post_call_success error: {}", err);
             }
 
             // Build response and add headers
             let mut resp = Json(response).into_response();
-            if let Err(err) = HOOK_MANAGER.execute_post_call_headers(&hook_ctx, resp.headers_mut()).await {
+            if let Err(err) = HOOK_MANAGER
+                .execute_post_call_headers(&hook_ctx, resp.headers_mut())
+                .await
+            {
                 error!("Hook post_call_headers error: {}", err);
             }
 
@@ -93,8 +130,14 @@ pub async fn embeddings(
         Err(err) => {
             error!("Error generating embeddings: {}", err);
             (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Error generating embeddings: {}", err),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Error generating embeddings: {}", err),
+                        "type": "server_error",
+                        "code": "embedding_error"
+                    }
+                })),
             )
                 .into_response()
         }

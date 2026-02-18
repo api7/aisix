@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
+    middleware::from_fn,
     routing::{get, post},
 };
 
@@ -48,32 +49,16 @@ pub fn create_router(state: AppState) -> Router {
         .merge(Router::new().route("/v1/models", get(handlers::models::list_models)))
         .route(
             "/v1/chat/completions",
-            post(handlers::chat_completions::chat_completions)
-                .layer(axum::middleware::from_fn(middlewares::hook_pre_call))
-                .layer(axum::middleware::from_fn_with_state(
-                    state.clone(),
-                    middlewares::validate_model::<handlers::chat_completions::ChatCompletionRequest>,
-                ))
-                .layer(axum::middleware::from_fn(
-                    middlewares::parse_body::<handlers::chat_completions::ChatCompletionRequest>,
-                )),
+            post(handlers::chat_completions::chat_completions).layer(from_fn(
+                middlewares::parse_body::<handlers::chat_completions::ChatCompletionRequest>,
+            )),
         )
         .route(
             "/v1/embeddings",
-            post(handlers::embeddings::embeddings)
-                .layer(axum::middleware::from_fn(middlewares::hook_pre_call))
-                .layer(axum::middleware::from_fn_with_state(
-                    state.clone(),
-                    middlewares::validate_model::<handlers::embeddings::EmbeddingRequest>,
-                ))
-                .layer(axum::middleware::from_fn(
-                    middlewares::parse_body::<handlers::embeddings::EmbeddingRequest>,
-                )),
+            post(handlers::embeddings::embeddings).layer(from_fn(
+                middlewares::parse_body::<handlers::embeddings::EmbeddingRequest>,
+            )),
         )
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            middlewares::auth,
-        ))
-        .layer(axum::middleware::from_fn(middlewares::trace))
-        .with_state(state.clone())
+        .layer(from_fn(middlewares::trace))
+        .with_state(state)
 }
