@@ -1,11 +1,13 @@
 mod auth;
+mod metric;
 mod rate_limit;
 mod validate_model;
+
+use std::sync::{Arc, LazyLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use axum::{extract::Request, http::HeaderMap, response::Response};
-use std::sync::{Arc, LazyLock};
 
 use crate::proxy::handlers::{
     chat_completions::{ChatCompletionChunk, ChatCompletionResponse, ChatCompletionUsage},
@@ -238,6 +240,7 @@ pub static HOOK_MANAGER: LazyLock<HookManager> = LazyLock::new(|| {
     manager.register(Arc::new(auth::AuthHook::new()));
     manager.register(Arc::new(validate_model::ValidateModelHook::new()));
     manager.register(Arc::new(rate_limit::RateLimitHook::new()));
+    manager.register(Arc::new(metric::MetricHook::new()));
 
     manager
 });

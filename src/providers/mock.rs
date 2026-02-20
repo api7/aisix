@@ -1,11 +1,13 @@
-use std::error::Error;
+use std::{error::Error, time::Duration};
 
 use async_trait::async_trait;
 
-use crate::providers::Provider;
-use crate::proxy::types::{
-    ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionUsage,
-    ChatMessage,
+use crate::{
+    providers::Provider,
+    proxy::types::{
+        ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionUsage,
+        ChatMessage,
+    },
 };
 
 pub const IDENTIFIER: &str = "mock";
@@ -20,6 +22,9 @@ impl Provider for MockProvider {
         &self,
         request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, Box<dyn Error + Send + Sync>> {
+        let secs: u64 = rand::random_range(1..=5);
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+
         Ok(ChatCompletionResponse {
             id: "1332793c-46e5-4a4b-bbfd-479a3153b99d".to_string(),
             object: "chat.completion".to_string(),

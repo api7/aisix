@@ -62,6 +62,8 @@ thiserror = "1.0"
 skp-ratelimit = { git = "https://github.com/bzp2010/skp-ratelimit.git", branch = "bzp/feat-custom-cost", default-features = false, features = [
   "memory",
 ] }
+rand = "0.10.0"
+http-body = "1.0.1"
 
 [dev-dependencies]
 tokio-test = "0.4"

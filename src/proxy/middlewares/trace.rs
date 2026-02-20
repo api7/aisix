@@ -1,17 +1,22 @@
 //! Trace middleware
-//! Derived from [fastrace-axum](https://github.com/fast/fastrace-axum)
-//! However, it enables the generation of root spans on its own,
-//! rather than skipping tracing when a trace context is absent.
+//! 1. Generate root spans for tracing
+//! 2. Generate access logs
+//! 3. Record request count and latency metrics
 
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Instant;
 
-use axum::extract::ConnectInfo;
-use axum::extract::MatchedPath;
-use axum::extract::Request;
-use axum::middleware::Next;
-use axum::response::Response;
-use fastrace::local::LocalSpan;
+use axum::{
+    Error,
+    body::{Body, Bytes},
+    extract::{ConnectInfo, MatchedPath, Request},
+    middleware::Next,
+    response::Response,
+};
 use fastrace::prelude::*;
+use http_body::Frame;
 use log::info;
 use opentelemetry_semantic_conventions::trace::{
     HTTP_REQUEST_METHOD, HTTP_RESPONSE_STATUS_CODE, HTTP_ROUTE, URL_PATH,
@@ -19,7 +24,65 @@ use opentelemetry_semantic_conventions::trace::{
 
 pub const TRACEPARENT_HEADER: &str = "traceparent";
 
-pub async fn trace(req: Request, next: Next) -> Response {
+pub struct TimedBody {
+    start_time: Instant,
+    inner: Body,
+    metric_attrs: [opentelemetry::KeyValue; 3],
+    latency_recorded: bool,
+}
+
+impl http_body::Body for TimedBody {
+    type Data = Bytes;
+    type Error = Error;
+
+    #[inline]
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let poll = Pin::new(&mut self.inner).poll_frame(cx);
+
+        if let Poll::Ready(None) = &poll {
+            // At this moment, all frames have been consumed by hyper, but it remains uncertain whether
+            // the data has been written to the kernel TCP buffer or sent to the client.
+            self.record_latency();
+        }
+
+        poll
+    }
+
+    #[inline]
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+
+    #[inline]
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+}
+
+impl Drop for TimedBody {
+    fn drop(&mut self) {
+        //TODO: consider record or not record latency in drop, since in some cases the body might not be fully consumed, the latency might be inaccurate.
+        self.record_latency();
+    }
+}
+
+impl TimedBody {
+    fn record_latency(&mut self) {
+        if self.latency_recorded {
+            return;
+        }
+        let latency = self.start_time.elapsed().as_millis() as u64;
+        crate::utils::metrics::METRIC_REQUEST_LATENCY.record(latency, &self.metric_attrs);
+        self.latency_recorded = true;
+    }
+}
+
+pub async fn trace(mut req: Request, next: Next) -> Response<TimedBody> {
+    let start_time = Instant::now();
+
     let headers = req.headers();
     let conn_info = req.extensions().get::<ConnectInfo<SocketAddr>>().cloned();
     let method = req.method().clone();
@@ -33,7 +96,11 @@ pub async fn trace(req: Request, next: Next) -> Response {
         .to_string();
     let path = req.uri().path().to_string();
 
-    let span = generate_span(&req);
+    let (span, span_ctx) = generate_span(&req);
+
+    // Inject span context to facilitate generate new root spans throughout the project.
+    // A typical use case is span recording for SSE streams.
+    req.extensions_mut().insert(span_ctx);
 
     span.add_properties(|| {
         [
@@ -59,6 +126,30 @@ pub async fn trace(req: Request, next: Next) -> Response {
     .in_span(span)
     .await;
 
+    let (parts, body) = response.into_parts();
+    let status = parts.status.clone();
+
+    let metric_attrs = [
+        opentelemetry::KeyValue::new("method", method.to_string()),
+        opentelemetry::KeyValue::new(
+            "endpoint",
+            matched_path
+                .clone()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or("-".to_string()),
+        ),
+        opentelemetry::KeyValue::new("status_code", status.as_u16() as i64),
+    ];
+
+    let response = Response::from_parts(
+        parts,
+        TimedBody {
+            start_time,
+            inner: body,
+            metric_attrs: metric_attrs.clone(),
+        },
+    );
+
     info!(
         target: "access_log",
         "{} - \"{} {} {:?}\" {} \"{}\"",
@@ -73,10 +164,12 @@ pub async fn trace(req: Request, next: Next) -> Response {
         user_agent
     );
 
+    crate::utils::metrics::METRIC_REQUEST_COUNT.add(1, &metric_attrs);
+
     response
 }
 
-fn generate_span(req: &Request) -> Span {
+fn generate_span(req: &Request) -> (Span, SpanContext) {
     let name = if let Some(target) = req.extensions().get::<MatchedPath>() {
         format!("{} {}", req.method(), target.as_str())
     } else {
@@ -89,5 +182,5 @@ fn generate_span(req: &Request) -> Span {
         .and_then(|traceparent| SpanContext::decode_w3c_traceparent(traceparent.to_str().ok()?))
         .unwrap_or_else(|| SpanContext::random());
 
-    Span::root(name, parent)
+    (Span::root(name, parent), parent.clone())
 }

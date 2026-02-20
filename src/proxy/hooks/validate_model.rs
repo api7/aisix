@@ -88,7 +88,7 @@ impl ProxyHook for ValidateModelHook {
             .cloned()
             .expect("AppState should be in context");
 
-        let model = match state.resources().models.get(&model_name) {
+        let model = match state.resources().models.get_by_name(&model_name) {
             Some(model) => model,
             None => {
                 return Ok(HookAction::EarlyReturn(

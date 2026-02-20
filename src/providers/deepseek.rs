@@ -45,7 +45,7 @@ impl DeepSeekProvider {
 
 #[async_trait]
 impl Provider for DeepSeekProvider {
-    #[fastrace::trace(properties = { "request": "{request:?}" })]
+    #[fastrace::trace]
     async fn chat_completion(
         &self,
         request: ChatCompletionRequest,

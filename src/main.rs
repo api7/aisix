@@ -1,10 +1,11 @@
-use log::info;
-
-use crate::config::entities::ResourceRegistry;
-
 mod config;
 mod providers;
 mod proxy;
+mod utils;
+
+use log::info;
+
+use crate::config::entities::ResourceRegistry;
 
 #[tokio::main]
 async fn main() {
@@ -35,9 +36,25 @@ fn init_observability() {
     };
     use opentelemetry::{InstrumentationScope, KeyValue};
     use opentelemetry_otlp::{SpanExporter, WithExportConfig};
-    use opentelemetry_sdk::Resource;
+    use opentelemetry_sdk::{
+        Resource,
+        metrics::{PeriodicReader, SdkMeterProvider, Temporality},
+    };
     use std::{borrow::Cow, time::Duration};
 
+    // log
+    logforth::starter_log::builder()
+        .dispatch(|d| {
+            d.filter(EnvFilterBuilder::from_default_env().build())
+                .append(Stdout::default().with_layout(TextLayout::default()))
+        })
+        .dispatch(|d| {
+            d.filter(EnvFilterBuilder::from_default_env().build())
+                .append(FastraceEvent::default())
+        })
+        .apply();
+
+    // trace
     if cfg!(feature = "trace") {
         let reporter = OpenTelemetryReporter::new(
             SpanExporter::builder()
@@ -63,16 +80,24 @@ fn init_observability() {
         );
     }
 
-    logforth::starter_log::builder()
-        .dispatch(|d| {
-            d.filter(EnvFilterBuilder::from_default_env().build())
-                .append(Stdout::default().with_layout(TextLayout::default()))
-        })
-        .dispatch(|d| {
-            d.filter(EnvFilterBuilder::from_default_env().build())
-                .append(FastraceEvent::default())
-        })
-        .apply();
+    // metric
+    let exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_http()
+        .with_temporality(Temporality::default())
+        .with_endpoint("http://127.0.0.1:9090/api/v1/otlp/v1/metrics")
+        .build()
+        .unwrap();
+
+    let reader = PeriodicReader::builder(exporter)
+        .with_interval(std::time::Duration::from_secs(10))
+        .build();
+
+    let provider = SdkMeterProvider::builder().with_reader(reader).build();
+
+    // TODO: provider.shutdown()
+    opentelemetry::global::set_meter_provider(provider.clone());
+
+    let _ = opentelemetry::global::meter("ai-gateway");
 }
 
 async fn serve(state: proxy::AppState) {

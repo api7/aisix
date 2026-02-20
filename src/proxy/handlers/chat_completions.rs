@@ -1,4 +1,4 @@
-use std::convert::Infallible;
+use std::{convert::Infallible, time::Instant};
 
 use axum::{
     Json,
@@ -6,9 +6,10 @@ use axum::{
     http::StatusCode,
     response::{
         IntoResponse, Response,
-        sse::{Event, Sse},
+        sse::{Event as SseEvent, Sse},
     },
 };
+use fastrace::prelude::{Event as TraceEvent, *};
 use log::error;
 use serde::{Deserialize, Serialize};
 
@@ -130,6 +131,7 @@ pub struct ChatCompletionChunk {
 pub async fn chat_completions(
     State(state): State<AppState>,
     Extension(mut request_data): Extension<ChatCompletionRequest>,
+    Extension(span_ctx): Extension<SpanContext>,
     mut request: Request,
 ) -> Response {
     // PRE CALL HOOKS START
@@ -176,11 +178,22 @@ pub async fn chat_completions(
     // Check if it's a streaming request
     let is_stream = request_data.stream.unwrap_or(false);
 
-    if is_stream {
-        handle_stream_request(provider, request_data, hook_ctx).await
+    let start_time = Instant::now();
+    let response = if is_stream {
+        handle_stream_request(provider, request_data, hook_ctx, start_time, span_ctx).await
     } else {
-        handle_regular_request(provider, request_data, hook_ctx).await
-    }
+        let response = handle_regular_request(provider, request_data, hook_ctx).await;
+
+        let duration = start_time.elapsed().as_millis() as u64;
+        crate::utils::metrics::METRIC_LLM_LATENCY.record(
+            duration,
+            &[opentelemetry::KeyValue::new("model", model.model.clone())],
+        );
+
+        response
+    };
+
+    response
 }
 
 #[fastrace::trace]
@@ -191,9 +204,7 @@ async fn handle_regular_request(
 ) -> Response {
     let mut hook_ctx = hook_ctx;
     match provider.chat_completion(request).await {
-        Ok(mut response) => {
-            response.model = hook_ctx.get::<RequestModel>().cloned().unwrap().0; //TODO: safe unwrap
-
+        Ok(response) => {
             // Execute post_call_success hooks
             let response_data = ResponseData::ChatCompletion(response.clone());
             if let Err(err) = HOOK_MANAGER
@@ -231,89 +242,92 @@ async fn handle_regular_request(
     }
 }
 
+#[fastrace::trace]
 async fn handle_stream_request(
     provider: Box<dyn Provider>,
     request: ChatCompletionRequest,
     hook_ctx: Context,
+    start_time: Instant,
+    span_ctx: SpanContext,
 ) -> Response {
     use futures::stream::StreamExt;
+
+    let model = hook_ctx
+        .get::<ResourceEntry<Model>>()
+        .unwrap() //TODO: safe unwrap
+        .model
+        .clone();
     match provider.chat_completion_stream(request).await {
         Ok(stream) => {
-            let original_model = hook_ctx.get::<RequestModel>().cloned().unwrap().0;
-            let hook_ctx_clone = hook_ctx.clone();
+            let stream_span = Span::root("sse_connection", span_ctx);
 
-            let (tx, rx) = tokio::sync::mpsc::channel(100);
+            let sse_stream = futures::stream::unfold(
+                (stream, stream_span, 0, model, hook_ctx, start_time, false),
+                |(mut stream, span, idx, model, mut hook_ctx, start_time, done)| async move {
+                    if done {
+                        drop(span);
+                        return None;
+                    }
+                    match stream.next().await {
+                        Some(Ok(chunk)) => {
+                            // Record first-token latency once
+                            if idx == 0 {
+                                let latency = start_time.elapsed().as_millis() as u64;
+                                crate::utils::metrics::METRIC_LLM_FIRST_TOKEN_LATENCY.record(
+                                    latency,
+                                    &[opentelemetry::KeyValue::new("model", model.clone())],
+                                );
+                                span.add_event(TraceEvent::new("first token arrived"));
+                            }
 
-            // Spawn task to process stream and execute hooks after completion
-            tokio::spawn(async move {
-                let mut last_usage: Option<TokenUsage> = None;
-                let mut hook_ctx = hook_ctx_clone;
-
-                futures::pin_mut!(stream);
-                while let Some(chunk_result) = stream.next().await {
-                    match chunk_result {
-                        Ok(mut chunk) => {
-                            chunk.model = original_model.clone();
-
-                            // Check if this chunk has usage (typically the last real chunk)
+                            // Record token usage for last chunk
                             if let Some(usage) = &chunk.usage {
-                                last_usage = Some(TokenUsage {
-                                    prompt_tokens: Some(usage.prompt_tokens as u64),
-                                    completion_tokens: Some(usage.completion_tokens as u64),
-                                    total_tokens: usage.total_tokens as u64,
-                                });
+                                if let Err(err) = HOOK_MANAGER
+                                    .execute_post_call_streaming(
+                                        &mut hook_ctx,
+                                        &TokenUsage::from_chat_completion(usage),
+                                    )
+                                    .await
+                                {
+                                    error!("Hook post_call_streaming error: {}", err);
+                                }
                             }
 
-                            // Send chunk to client
-                            if tx.send(chunk).await.is_err() {
-                                break;
-                            }
+                            let event = match serde_json::to_string(&chunk) {
+                                Ok(json) => {
+                                    Ok::<SseEvent, Infallible>(SseEvent::default().data(json))
+                                }
+                                Err(err) => {
+                                    error!("Failed to serialize chunk: {}", err);
+                                    Ok(SseEvent::default().data(""))
+                                }
+                            };
+                            Some((
+                                event,
+                                (stream, span, idx + 1, model, hook_ctx, start_time, false),
+                            ))
                         }
-                        Err(err) => {
+                        Some(Err(err)) => {
                             error!("Stream error: {}", err);
-                            break;
+                            // Drop span here too so it captures the correct end time
+                            drop(span);
+                            None
+                        }
+                        None => {
+                            let duration = start_time.elapsed().as_millis() as u64;
+                            crate::utils::metrics::METRIC_LLM_LATENCY.record(
+                                duration,
+                                &[opentelemetry::KeyValue::new("model", model.clone())],
+                            );
+                            Some((
+                                Ok(SseEvent::default().data("[DONE]")),
+                                (stream, span, idx + 1, model, hook_ctx, start_time, true),
+                            ))
                         }
                     }
-                }
-
-                // Stream ended, execute post_call_streaming hook
-                if let Some(usage) = last_usage {
-                    if let Err(err) = HOOK_MANAGER
-                        .execute_post_call_streaming(&mut hook_ctx, &usage)
-                        .await
-                    {
-                        error!("Hook post_call_streaming error: {}", err);
-                    }
-                }
-            });
-
-            // Create SSE stream from receiver
-            let sse_stream = futures::stream::unfold(rx, |mut rx| async move {
-                rx.recv().await.map(|chunk| {
-                    let event = match serde_json::to_string(&chunk) {
-                        Ok(json) => Ok::<Event, Infallible>(Event::default().data(json)),
-                        Err(err) => {
-                            error!("Failed to serialize chunk: {}", err);
-                            Ok(Event::default().data(""))
-                        }
-                    };
-                    (event, rx)
-                })
-            })
-            .chain(futures::stream::iter(vec![Ok::<Event, Infallible>(
-                Event::default().data("[DONE]"),
-            )]));
-
-            // Build response and add headers (with pre-check values)
-            let mut resp = Sse::new(sse_stream).into_response();
-            if let Err(err) = HOOK_MANAGER
-                .execute_post_call_headers(&hook_ctx, resp.headers_mut())
-                .await
-            {
-                error!("Hook post_call_headers error: {}", err);
-            }
-
-            resp
+                },
+            );
+            Sse::new(sse_stream).into_response()
         }
         Err(err) => {
             error!("Provider stream request failed: {}", err);
