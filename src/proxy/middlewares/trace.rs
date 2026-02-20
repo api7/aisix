@@ -147,6 +147,7 @@ pub async fn trace(mut req: Request, next: Next) -> Response<TimedBody> {
             start_time,
             inner: body,
             metric_attrs: metric_attrs.clone(),
+            latency_recorded: false,
         },
     );
 
