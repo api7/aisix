@@ -1,3 +1,5 @@
+use axum::{Json, response::IntoResponse};
+use http::StatusCode;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,4 +104,38 @@ pub struct ChatCompletionChunk {
     pub choices: Vec<ChatCompletionChunkChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<ChatCompletionUsage>,
+}
+
+pub enum ChatCompletionError {
+    ProviderError(String),
+    InternalError(String), //TODO more specific error definitions
+}
+
+impl IntoResponse for ChatCompletionError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            ChatCompletionError::ProviderError(err) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Provider error: {}", err),
+                        "type": "server_error",
+                        "code": "provider_error"
+                    }
+                })),
+            )
+                .into_response(),
+            ChatCompletionError::InternalError(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Internal error: {}", err),
+                        "type": "server_error",
+                        "code": "internal_error"
+                    }
+                })),
+            )
+                .into_response(),
+        }
+    }
 }

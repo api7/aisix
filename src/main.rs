@@ -19,6 +19,8 @@ async fn main() {
         .expect("Failed to create config provider");
     let resources = ResourceRegistry::new(config_provider).await;
 
+    providers::init_client();
+
     serve(proxy::AppState::new(config.clone(), resources.clone())).await;
 
     if cfg!(feature = "trace") {

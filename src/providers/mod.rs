@@ -1,6 +1,14 @@
+mod deepseek;
+mod gemini;
+mod mock;
+mod openai;
+mod openai_compatible;
+mod types;
+
+use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use std::{error::Error, sync::LazyLock};
+use std::sync::LazyLock;
 
 use crate::{
     config::entities::models::ProviderConfig,
@@ -9,12 +17,7 @@ use crate::{
         EmbeddingResponse,
     },
 };
-
-mod deepseek;
-mod gemini;
-mod mock;
-mod openai;
-mod openai_compatible;
+use types::ProviderError;
 
 // Re-export identifiers
 pub mod identifiers {
@@ -35,6 +38,10 @@ pub mod configs {
 }
 
 static REQWEST_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| reqwest::Client::new());
+
+pub fn init_client() {
+    let _ = REQWEST_CLIENT.clone();
+}
 
 #[fastrace::trace(short_name = true)]
 pub fn create_provider(config: &ProviderConfig) -> Box<dyn Provider> {
@@ -60,24 +67,21 @@ pub trait Provider: Send + Sync {
     async fn chat_completion(
         &self,
         _request: ChatCompletionRequest,
-    ) -> Result<ChatCompletionResponse, Box<dyn Error + Send + Sync>> {
-        Err("Not implemented".into())
+    ) -> Result<ChatCompletionResponse, ProviderError> {
+        Err(ProviderError::NotYetImplemented)
     }
 
     async fn chat_completion_stream(
         &self,
         _request: ChatCompletionRequest,
-    ) -> Result<
-        BoxStream<'static, Result<ChatCompletionChunk, Box<dyn Error + Send + Sync>>>,
-        Box<dyn Error + Send + Sync>,
-    > {
-        Err("Not implemented".into())
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
+        Err(ProviderError::NotYetImplemented)
     }
 
     async fn embedding(
         &self,
         _request: EmbeddingRequest,
-    ) -> Result<EmbeddingResponse, Box<dyn Error + Send + Sync>> {
-        Err("Not implemented".into())
+    ) -> Result<EmbeddingResponse, ProviderError> {
+        Err(ProviderError::NotYetImplemented)
     }
 }

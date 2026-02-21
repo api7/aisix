@@ -1,11 +1,12 @@
-use std::error::Error;
-
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, stream::BoxStream};
 
-use crate::proxy::types::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingRequest,
-    EmbeddingResponse,
+use crate::{
+    providers::ProviderError,
+    proxy::types::{
+        ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingRequest,
+        EmbeddingResponse,
+    },
 };
 
 pub async fn chat_completion(
@@ -13,7 +14,7 @@ pub async fn chat_completion(
     url: &str,
     api_key: &str,
     request: ChatCompletionRequest,
-) -> Result<ChatCompletionResponse, Box<dyn Error + Send + Sync>> {
+) -> Result<ChatCompletionResponse, ProviderError> {
     let response = client
         .post(url)
         .header("Authorization", format!("Bearer {}", api_key))
@@ -25,7 +26,7 @@ pub async fn chat_completion(
     if !response.status().is_success() {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
-        return Err(format!("API error {}: {}", status, error_text).into());
+        return Err(ProviderError::ServiceError(status, error_text));
     }
 
     let completion = response.json::<ChatCompletionResponse>().await?;
@@ -37,10 +38,7 @@ pub async fn chat_completion_stream(
     url: &str,
     api_key: &str,
     request: ChatCompletionRequest,
-) -> Result<
-    BoxStream<'static, Result<ChatCompletionChunk, Box<dyn Error + Send + Sync>>>,
-    Box<dyn Error + Send + Sync>,
-> {
+) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
     let response = client
         .post(url)
         .header("Authorization", format!("Bearer {}", api_key))
@@ -52,7 +50,7 @@ pub async fn chat_completion_stream(
     if !response.status().is_success() {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
-        return Err(format!("API error {}: {}", status, error_text).into());
+        return Err(ProviderError::ServiceError(status, error_text));
     }
 
     Ok(Box::pin(parse_sse_stream(response.bytes_stream())))
@@ -63,7 +61,7 @@ pub async fn embedding(
     url: &str,
     api_key: &str,
     request: EmbeddingRequest,
-) -> Result<EmbeddingResponse, Box<dyn Error + Send + Sync>> {
+) -> Result<EmbeddingResponse, ProviderError> {
     let response = client
         .post(url)
         .header("Authorization", format!("Bearer {}", api_key))
@@ -75,7 +73,7 @@ pub async fn embedding(
     if !response.status().is_success() {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
-        return Err(format!("API error {}: {}", status, error_text).into());
+        return Err(ProviderError::ServiceError(status, error_text));
     }
 
     let embedding = response.json::<EmbeddingResponse>().await?;
@@ -84,7 +82,7 @@ pub async fn embedding(
 
 fn parse_sse_stream(
     stream: impl Stream<Item = Result<Bytes, reqwest::Error>>,
-) -> impl Stream<Item = Result<ChatCompletionChunk, Box<dyn Error + Send + Sync>>> {
+) -> impl Stream<Item = Result<ChatCompletionChunk, ProviderError>> {
     use futures::stream::StreamExt;
 
     stream
@@ -111,32 +109,26 @@ fn parse_sse_stream(
 
                     futures::future::ready(Some(futures::stream::iter(lines)))
                 }
-                Err(e) => {
-                    let err: Box<dyn Error + Send + Sync> = Box::new(e);
-                    futures::future::ready(Some(futures::stream::iter(vec![Err(err)])))
-                }
+                Err(err) => futures::future::ready(Some(futures::stream::iter(vec![Err(
+                    ProviderError::RequestError(err),
+                )]))),
             }
         })
         .flatten()
-        .filter_map(|line_result| async move {
-            match line_result {
+        .filter_map(|line| async move {
+            match line {
                 Ok(line) => {
                     // Only process lines starting with "data: "
                     if let Some(json_str) = line.strip_prefix("data: ") {
                         // Skip [DONE] events
-                        // Stream termination signifies completion; we need not explicitly propagate them.
+                        // Stream termination signifies completion; we do not need to explicitly propagate them.
                         if json_str == "[DONE]" {
                             return None;
                         }
 
                         match serde_json::from_str::<ChatCompletionChunk>(json_str) {
                             Ok(chunk) => Some(Ok(chunk)),
-                            Err(e) => {
-                                // Propagate parse errors instead of skipping
-                                let err: Box<dyn Error + Send + Sync> =
-                                    format!("Failed to parse SSE chunk: {}", e).into();
-                                Some(Err(err))
-                            }
+                            Err(err) => Some(Err(ProviderError::CodecError(err))),
                         }
                     } else {
                         None

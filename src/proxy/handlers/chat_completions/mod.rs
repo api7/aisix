@@ -5,7 +5,6 @@ use std::{convert::Infallible, time::Instant};
 use axum::{
     Json,
     extract::{Extension, Request, State},
-    http::StatusCode,
     response::{
         IntoResponse, Response,
         sse::{Event as SseEvent, Sse},
@@ -49,17 +48,7 @@ pub async fn chat_completions(
         }
         Err(err) => {
             error!("Hook pre_call error: {}", err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!("Internal server error: {}", err),
-                        "type": "server_error",
-                        "code": "hook_pre_call_error"
-                    }
-                })),
-            )
-                .into_response();
+            return (ChatCompletionError::InternalError(err.to_string())).into_response();
         }
         _ => {}
     }
@@ -126,17 +115,7 @@ async fn handle_regular_request(
         }
         Err(err) => {
             error!("Provider request failed: {}", err);
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!("Provider request failed: {}", err),
-                        "type": "server_error",
-                        "code": "provider_error"
-                    }
-                })),
-            )
-                .into_response()
+            ChatCompletionError::ProviderError(err.to_string()).into_response()
         }
     }
 }
@@ -230,17 +209,7 @@ async fn handle_stream_request(
         }
         Err(err) => {
             error!("Provider stream request failed: {}", err);
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!("Provider stream request failed: {}", err),
-                        "type": "server_error",
-                        "code": "provider_stream_error"
-                    }
-                })),
-            )
-                .into_response()
+            (ChatCompletionError::ProviderError(err.to_string())).into_response()
         }
     }
 }

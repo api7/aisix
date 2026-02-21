@@ -5,7 +5,6 @@ use axum::{
     extract::{Extension, Request, State},
     response::{IntoResponse, Response},
 };
-use http::StatusCode;
 use log::error;
 
 use crate::{
@@ -41,17 +40,7 @@ pub async fn embeddings(
         }
         Err(err) => {
             error!("Hook pre_call error: {}", err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!("Internal server error: {}", err),
-                        "type": "server_error",
-                        "code": "hook_pre_call_error"
-                    }
-                })),
-            )
-                .into_response();
+            return (EmbeddingError::InternalError(err.to_string())).into_response();
         }
         _ => {}
     }
@@ -92,17 +81,7 @@ pub async fn embeddings(
         }
         Err(err) => {
             error!("Error generating embeddings: {}", err);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!("Error generating embeddings: {}", err),
-                        "type": "server_error",
-                        "code": "embedding_error"
-                    }
-                })),
-            )
-                .into_response()
+            (EmbeddingError::ProviderError(err.to_string())).into_response()
         }
     }
 }

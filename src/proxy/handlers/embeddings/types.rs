@@ -1,3 +1,5 @@
+use axum::{Json, response::IntoResponse};
+use http::StatusCode;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,4 +40,38 @@ pub struct EmbeddingResponse {
     pub data: Vec<EmbeddingData>,
     pub model: String,
     pub usage: Option<EmbeddingUsage>,
+}
+
+pub enum EmbeddingError {
+    ProviderError(String),
+    InternalError(String), //TODO more specific error definitions
+}
+
+impl IntoResponse for EmbeddingError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            EmbeddingError::ProviderError(err) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Provider error: {}", err),
+                        "type": "server_error",
+                        "code": "provider_error"
+                    }
+                })),
+            )
+                .into_response(),
+            EmbeddingError::InternalError(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Internal error: {}", err),
+                        "type": "server_error",
+                        "code": "internal_error"
+                    }
+                })),
+            )
+                .into_response(),
+        }
+    }
 }

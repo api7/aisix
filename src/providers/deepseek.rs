@@ -1,14 +1,16 @@
-use std::error::Error;
-
+use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::providers::Provider;
-use crate::proxy::types::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse};
-
-use super::openai_compatible::{chat_completion, chat_completion_stream};
+use crate::{
+    providers::{
+        Provider, ProviderError,
+        openai_compatible::{chat_completion, chat_completion_stream},
+    },
+    proxy::types::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
+};
 
 pub const IDENTIFIER: &str = "deepseek";
 const DEFAULT_API_BASE: &str = "https://api.deepseek.com/v1";
@@ -49,7 +51,7 @@ impl Provider for DeepSeekProvider {
     async fn chat_completion(
         &self,
         request: ChatCompletionRequest,
-    ) -> Result<ChatCompletionResponse, Box<dyn Error + Send + Sync>> {
+    ) -> Result<ChatCompletionResponse, ProviderError> {
         let url = format!(
             "{}/chat/completions",
             self.config.api_base.as_deref().unwrap_or(DEFAULT_API_BASE)
@@ -60,10 +62,7 @@ impl Provider for DeepSeekProvider {
     async fn chat_completion_stream(
         &self,
         request: ChatCompletionRequest,
-    ) -> Result<
-        BoxStream<'static, Result<ChatCompletionChunk, Box<dyn Error + Send + Sync>>>,
-        Box<dyn Error + Send + Sync>,
-    > {
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
         let url = format!(
             "{}/chat/completions",
             self.config.api_base.as_deref().unwrap_or(DEFAULT_API_BASE)

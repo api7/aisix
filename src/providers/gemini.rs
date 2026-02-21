@@ -1,17 +1,18 @@
-use std::error::Error;
-
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::providers::{Provider, openai_compatible::embedding};
-use crate::proxy::types::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingRequest,
-    EmbeddingResponse,
+use crate::{
+    providers::{
+        Provider, ProviderError,
+        openai_compatible::{chat_completion, chat_completion_stream, embedding},
+    },
+    proxy::types::{
+        ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingRequest,
+        EmbeddingResponse,
+    },
 };
-
-use super::openai_compatible::{chat_completion, chat_completion_stream};
 
 pub const IDENTIFIER: &str = "gemini";
 const DEFAULT_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
@@ -53,7 +54,7 @@ impl Provider for GeminiProvider {
     async fn chat_completion(
         &self,
         request: ChatCompletionRequest,
-    ) -> Result<ChatCompletionResponse, Box<dyn Error + Send + Sync>> {
+    ) -> Result<ChatCompletionResponse, ProviderError> {
         let url = format!(
             "{}/chat/completions",
             self.config.api_base.as_deref().unwrap_or(DEFAULT_API_BASE)
@@ -64,10 +65,7 @@ impl Provider for GeminiProvider {
     async fn chat_completion_stream(
         &self,
         request: ChatCompletionRequest,
-    ) -> Result<
-        BoxStream<'static, Result<ChatCompletionChunk, Box<dyn Error + Send + Sync>>>,
-        Box<dyn Error + Send + Sync>,
-    > {
+    ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
         let url = format!(
             "{}/chat/completions",
             self.config.api_base.as_deref().unwrap_or(DEFAULT_API_BASE)
@@ -78,7 +76,7 @@ impl Provider for GeminiProvider {
     async fn embedding(
         &self,
         request: EmbeddingRequest,
-    ) -> Result<EmbeddingResponse, Box<dyn Error + Send + Sync>> {
+    ) -> Result<EmbeddingResponse, ProviderError> {
         let url = format!(
             "{}/embeddings",
             self.config.api_base.as_deref().unwrap_or(DEFAULT_API_BASE)

@@ -1,9 +1,10 @@
-use std::{error::Error, time::Duration};
+use std::time::Duration;
 
+use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::{
-    providers::Provider,
+    providers::{Provider, types::ProviderError},
     proxy::types::{
         ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionUsage,
         ChatMessage,
@@ -21,7 +22,7 @@ impl Provider for MockProvider {
     async fn chat_completion(
         &self,
         request: ChatCompletionRequest,
-    ) -> Result<ChatCompletionResponse, Box<dyn Error + Send + Sync>> {
+    ) -> Result<ChatCompletionResponse, ProviderError> {
         let secs: u64 = rand::random_range(1..=5);
         tokio::time::sleep(Duration::from_secs(secs)).await;
 
