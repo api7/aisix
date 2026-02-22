@@ -71,7 +71,7 @@ pub async fn embeddings(
             // Build response and add headers
             let mut resp = Json(response).into_response();
             if let Err(err) = HOOK_MANAGER
-                .execute_post_call_headers(&hook_ctx, resp.headers_mut())
+                .execute_post_call_headers(&mut hook_ctx, resp.headers_mut())
                 .await
             {
                 error!("Hook post_call_headers error: {}", err);

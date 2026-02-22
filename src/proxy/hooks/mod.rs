@@ -133,7 +133,7 @@ pub trait ProxyHook: Send + Sync {
     }
 
     /// Post-call headers hook: add custom headers to response
-    async fn post_call_headers(&self, _ctx: &Context, _headers: &mut HeaderMap) -> Result<()> {
+    async fn post_call_headers(&self, _ctx: &mut Context, _headers: &mut HeaderMap) -> Result<()> {
         Ok(())
     }
 }
@@ -221,7 +221,7 @@ impl HookManager {
     /// Execute all post_call_headers hooks in order
     pub async fn execute_post_call_headers(
         &self,
-        ctx: &Context,
+        ctx: &mut Context,
         headers: &mut HeaderMap,
     ) -> Result<()> {
         for hook in &self.hooks {

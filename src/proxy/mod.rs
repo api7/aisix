@@ -9,7 +9,6 @@ use axum::{
 mod handlers;
 mod hooks;
 mod middlewares;
-mod policies;
 
 // types
 pub mod types {

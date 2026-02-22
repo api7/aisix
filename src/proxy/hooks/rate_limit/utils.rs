@@ -1,12 +1,11 @@
-use std::{time::Instant, vec};
+use std::time::Instant;
 
 use axum::{Json, response::IntoResponse};
 use http::{HeaderMap, HeaderValue, StatusCode};
+use log::error;
 
-use crate::{
-    config::entities::types::{HasRateLimit, RateLimitMetric},
-    proxy::policies::rate_limit::{RateLimitError, RateLimitInfo, RateLimitRule, get_rate_limiter},
-};
+use super::{RateLimitError, RateLimitInfo, RateLimitRule, get_rate_limiter};
+use crate::config::entities::types::{HasRateLimit, RateLimitMetric};
 
 /// Helper to convert duration to human-readable format (e.g., "1s", "6m0s")
 fn format_duration(duration: std::time::Duration) -> String {
@@ -22,6 +21,10 @@ fn format_duration(duration: std::time::Duration) -> String {
             format!("{}m{}s", mins, remaining_secs)
         }
     }
+}
+
+fn insert_header(headers: &mut HeaderMap, name: &'static str, value: String) {
+    headers.insert(name, HeaderValue::from_str(&value).unwrap());
 }
 
 /// Storage for rate limit information from pre_check and post_check
@@ -41,10 +44,7 @@ impl RateLimitState {
 
     /// Choose the stricter rate limit info between existing and new
     /// Prioritizes lower remaining count, then earlier reset time
-    fn choose_stricter(
-        existing: Option<RateLimitInfo>,
-        new: RateLimitInfo,
-    ) -> RateLimitInfo {
+    fn choose_stricter(existing: Option<RateLimitInfo>, new: RateLimitInfo) -> RateLimitInfo {
         match existing {
             None => new,
             Some(existing) => {
@@ -71,7 +71,8 @@ impl RateLimitState {
         for (metric, info) in results {
             match metric {
                 RateLimitMetric::RPM | RateLimitMetric::RPD => {
-                    self.request_info = Some(Self::choose_stricter(self.request_info.clone(), info));
+                    self.request_info =
+                        Some(Self::choose_stricter(self.request_info.clone(), info));
                 }
                 RateLimitMetric::TPM | RateLimitMetric::TPD => {
                     self.token_info = Some(Self::choose_stricter(self.token_info.clone(), info));
@@ -93,150 +94,98 @@ impl RateLimitState {
         }
     }
 
-    /// Finalize non-streaming response with post_check and rate limit headers
-    ///
-    /// # Example
-    /// ```
-    /// rate_limit_state.finalize_response(Json(response), tokens, &model).await
-    /// ```
-    pub async fn finalize_response<T>(
-        mut self,
-        response: axum::Json<T>,
-        tokens: u64,
-        entity: &impl HasRateLimit,
-    ) -> axum::response::Response
-    where
-        T: serde::Serialize,
-    {
-        // Execute post_check
-        match post_check(entity, tokens).await {
-            Ok(results) => self.store_post_check(results),
-            Err((metric, err)) => {
-                if let RateLimitError::Internal(msg) = &err {
-                    log::error!("Post-check internal error: metric={:?}, error={}", metric, msg);
-                }
-            }
-        }
-
-        // Build response with headers
-        let mut resp = response.into_response();
-        self.add_headers(resp.headers_mut());
-
-        resp
-    }
-
     /// Add rate limit headers to response
     pub fn add_headers(&self, headers: &mut HeaderMap) {
         let now = Instant::now();
 
         if let Some(ref req_info) = self.request_info {
-            headers.insert(
+            insert_header(
+                headers,
                 "x-ratelimit-limit-requests",
-                HeaderValue::from_str(&req_info.limit.to_string()).unwrap(),
+                req_info.limit.to_string(),
             );
-            headers.insert(
+            insert_header(
+                headers,
                 "x-ratelimit-remaining-requests",
-                HeaderValue::from_str(&req_info.remaining.to_string()).unwrap(),
+                req_info.remaining.to_string(),
             );
-            let reset_duration = req_info.reset_at.saturating_duration_since(now);
-            headers.insert(
+            insert_header(
+                headers,
                 "x-ratelimit-reset-requests",
-                HeaderValue::from_str(&format_duration(reset_duration)).unwrap(),
+                format_duration(req_info.reset_at.saturating_duration_since(now)),
             );
         }
 
         if let Some(ref token_info) = self.token_info {
-            headers.insert(
+            insert_header(
+                headers,
                 "x-ratelimit-limit-tokens",
-                HeaderValue::from_str(&token_info.limit.to_string()).unwrap(),
+                token_info.limit.to_string(),
             );
-            headers.insert(
+            insert_header(
+                headers,
                 "x-ratelimit-remaining-tokens",
-                HeaderValue::from_str(&token_info.remaining.to_string()).unwrap(),
+                token_info.remaining.to_string(),
             );
-            let reset_duration = token_info.reset_at.saturating_duration_since(now);
-            headers.insert(
+            insert_header(
+                headers,
                 "x-ratelimit-reset-tokens",
-                HeaderValue::from_str(&format_duration(reset_duration)).unwrap(),
+                format_duration(token_info.reset_at.saturating_duration_since(now)),
             );
         }
     }
 }
 
-/// Request pre-check for a given entity.
-/// - Token metrics will not commit tokens. As we always obtain usage data from upstream responses.
-/// - Request metrics are committed.
-pub async fn pre_check<T: HasRateLimit>(
-    entity: &T,
-) -> Result<Vec<(RateLimitMetric, RateLimitInfo)>, (RateLimitMetric, RateLimitError)> {
-    if let Some(rate_limit) = entity.rate_limit() {
-        let limiter = get_rate_limiter();
-        let rules: Vec<(RateLimitMetric, RateLimitRule)> = rate_limit.into();
-
-        let mut results = Vec::new();
-        for (metric, rule) in rules {
-            let key = entity.rate_limit_key(metric.clone());
-            match rule
-                .incoming(limiter.clone(), &key, 1, {
-                    match metric {
-                        RateLimitMetric::TPM | RateLimitMetric::TPD => false,
-                        RateLimitMetric::RPM | RateLimitMetric::RPD => true,
-                    }
-                })
-                .await
-            {
-                Ok(info) => {
-                    results.push((metric, info));
-                }
-                Err(e) => {
-                    return Err((metric, e));
-                }
-            }
-        }
-        return Ok(results);
-    }
-    Ok(vec![])
+#[derive(Copy, Clone)]
+pub enum CheckPhase {
+    Pre,
+    Post(u64),
 }
 
-/// Post-check for a given entity with cost.
-/// - Token metrics will commit tokens.
-/// - Request metrics are no-ops as they were already committed in pre-check.
-pub async fn post_check<T: HasRateLimit>(
-    entity: &T,
-    cost: u64,
-) -> Result<Vec<(RateLimitMetric, RateLimitInfo)>, (RateLimitMetric, RateLimitError)> {
-    if let Some(rate_limit) = entity.rate_limit() {
-        let limiter = get_rate_limiter();
-        let rules: Vec<(RateLimitMetric, RateLimitRule)> = rate_limit.into();
-
-        let mut results = Vec::new();
-        for (metric, rule) in rules {
-            if matches!(metric, RateLimitMetric::RPM | RateLimitMetric::RPD) {
-                // Skip request metrics in post-check
-                continue;
-            }
-
-            let key = entity.rate_limit_key(metric.clone());
-            match rule
-                .incoming(limiter.clone(), &key, cost, {
-                    match metric {
-                        RateLimitMetric::TPM | RateLimitMetric::TPD => true,
-                        RateLimitMetric::RPM | RateLimitMetric::RPD => false,
-                    }
-                })
-                .await
-            {
-                Ok(info) => {
-                    results.push((metric, info));
-                }
-                Err(e) => {
-                    return Err((metric, e));
-                }
-            }
-        }
-        return Ok(results);
+impl CheckPhase {
+    fn should_skip(self, metric: &RateLimitMetric) -> bool {
+        matches!(self, Self::Post(_))
+            && matches!(metric, RateLimitMetric::RPM | RateLimitMetric::RPD)
     }
-    Ok(vec![])
+    fn commit(self, metric: &RateLimitMetric) -> bool {
+        match self {
+            Self::Pre => matches!(metric, RateLimitMetric::RPM | RateLimitMetric::RPD),
+            Self::Post(_) => matches!(metric, RateLimitMetric::TPM | RateLimitMetric::TPD),
+        }
+    }
+    fn cost(self) -> u64 {
+        match self {
+            Self::Pre => 1,
+            Self::Post(cost) => cost,
+        }
+    }
+}
+
+pub async fn run_check<T: HasRateLimit>(
+    entity: &T,
+    phase: CheckPhase,
+) -> Result<Vec<(RateLimitMetric, RateLimitInfo)>, (RateLimitMetric, RateLimitError)> {
+    let Some(rate_limit) = entity.rate_limit() else {
+        return Ok(Vec::new());
+    };
+    let limiter = get_rate_limiter();
+    let rules: Vec<(RateLimitMetric, RateLimitRule)> = rate_limit.into();
+    let mut results = Vec::new();
+    for (metric, rule) in rules {
+        if phase.should_skip(&metric) {
+            continue;
+        }
+        let key = entity.rate_limit_key(metric.clone());
+
+        match limiter
+            .incoming(&key, rule, phase.cost(), phase.commit(&metric))
+            .await
+        {
+            Ok(info) => results.push((metric, info)),
+            Err(e) => return Err((metric, e)),
+        }
+    }
+    Ok(results)
 }
 
 pub struct RateLimitResponse(String, RateLimitMetric, RateLimitError);
@@ -285,10 +234,7 @@ impl IntoResponse for RateLimitResponse {
                 response
             }
             RateLimitError::Internal(msg) => {
-                // Log detailed error on server side
-                log::error!("Rate limit internal error: {}", msg);
-
-                // Return generic error to client (don't expose internal details)
+                error!("Rate limit internal error: {}", msg);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
