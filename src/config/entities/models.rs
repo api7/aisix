@@ -8,13 +8,15 @@ use crate::{
 };
 use serde::{Deserialize, Serialize, de::Error};
 use std::{collections::HashMap, sync::Arc};
+use utoipa::ToSchema;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(untagged)]
 pub enum ProviderConfig {
     DeepSeek(configs::DeepSeekProviderConfig),
     Gemini(configs::GeminiProviderConfig),
     OpenAI(configs::OpenAIProviderConfig),
-    Mock,
+    Mock(configs::MockProviderConfig),
 }
 
 impl ProviderConfig {
@@ -33,7 +35,7 @@ impl ProviderConfig {
                     serde_json::from_value::<configs::GeminiProviderConfig>(json_value.clone())?;
                 Ok(ProviderConfig::Gemini(config))
             }
-            identifiers::MOCK => Ok(ProviderConfig::Mock),
+            identifiers::MOCK => Ok(ProviderConfig::Mock(configs::MockProviderConfig {})),
             identifiers::OPENAI => {
                 let config =
                     serde_json::from_value::<configs::OpenAIProviderConfig>(json_value.clone())?;
@@ -47,18 +49,27 @@ impl ProviderConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ProviderModel {
+    #[serde(skip)]
+    pub provider: String,
+    #[serde(skip)]
+    pub name: String,
+
+    #[schema(pattern = "^(deepseek|gemini|openai|mock)/.+$")]
+    #[serde(rename = "model")]
+    pub original_model: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Model {
     pub name: String,
-    pub model: String,
 
-    #[serde(skip)]
-    provider: String,
-    #[serde(skip)]
-    provider_model: String,
-    #[serde(skip)]
+    #[serde(flatten)]
+    pub model: ProviderModel,
     pub provider_config: ProviderConfig,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
 }
 
@@ -99,10 +110,11 @@ impl<'de> Deserialize<'de> for Model {
 
         Ok(Model {
             name: raw.name,
-            model: raw.model,
-
-            provider: provider,
-            provider_model: provider_model,
+            model: ProviderModel {
+                provider: provider,
+                name: provider_model,
+                original_model: raw.model,
+            },
             provider_config: provider_config,
             rate_limit: raw.rate_limit,
         })

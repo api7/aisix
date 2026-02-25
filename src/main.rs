@@ -1,9 +1,11 @@
+mod admin;
 mod config;
 mod providers;
 mod proxy;
 mod utils;
 
 use log::info;
+use tokio::select;
 
 use crate::config::entities::ResourceRegistry;
 
@@ -17,11 +19,17 @@ async fn main() {
     let config_provider = config::create_provider(config.clone())
         .await
         .expect("Failed to create config provider");
-    let resources = ResourceRegistry::new(config_provider).await;
+    let resources = ResourceRegistry::new(config_provider.clone()).await;
 
     providers::init_client();
 
-    serve(proxy::AppState::new(config.clone(), resources.clone())).await;
+    select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received Ctrl+C, shutting down");
+        }
+        _ = serve_proxy(proxy::AppState::new(config.clone(), resources.clone())) => {}
+        _ = serve_admin(admin::AppState::new(config.clone(), config_provider)) => {}
+    }
 
     if cfg!(feature = "trace") {
         fastrace::flush();
@@ -102,7 +110,7 @@ fn init_observability() {
     let _ = opentelemetry::global::meter("ai-gateway");
 }
 
-async fn serve(state: proxy::AppState) {
+async fn serve_proxy(state: proxy::AppState) {
     use std::net::SocketAddr;
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -112,5 +120,20 @@ async fn serve(state: proxy::AppState) {
     let _ = tokio::join!(axum::serve(
         listener,
         proxy::create_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    ),);
+}
+
+async fn serve_admin(state: admin::AppState) {
+    use std::net::SocketAddr;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3001")
+        .await
+        .unwrap();
+
+    info!("Admin API listening on http://127.0.0.1:3001");
+
+    let _ = tokio::join!(axum::serve(
+        listener,
+        admin::create_router(state).into_make_service_with_connect_info::<SocketAddr>(),
     ),);
 }

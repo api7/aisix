@@ -5,7 +5,7 @@ use log::{info, warn};
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc::Receiver;
 
-use crate::config::{ConfigEvent, ConfigProvider};
+use crate::config::{ConfigEvent, ConfigProvider, GetAllEntry};
 
 mod apikey;
 pub mod models;
@@ -141,9 +141,15 @@ impl<T: DeserializeOwned + Clone + Send + Sync + 'static> EntityStore<T> {
 
         // Full load of existing data at startup
         info!("{} Starting full load, prefix={}", entity_name, prefix);
-        match provider.get_all(Some(prefix)).await {
+        match provider.get_all_raw(Some(prefix)).await {
             Ok(kvs) => {
-                for (key, value, mod_revision) in kvs {
+                for GetAllEntry {
+                    key,
+                    value,
+                    create_revision: _,
+                    mod_revision,
+                } in kvs
+                {
                     // Extract relative path
                     let base_prefix = if let Some(idx) = key.find(prefix) {
                         &key[..idx + prefix.len()]

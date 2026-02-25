@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     providers::{Provider, types::ProviderError},
@@ -13,8 +14,13 @@ use crate::{
 
 pub const IDENTIFIER: &str = "mock";
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MockProviderConfig {}
+
 #[derive(Default)]
-pub struct MockProvider {}
+pub struct MockProvider {
+    _config: MockProviderConfig,
+}
 
 #[async_trait]
 impl Provider for MockProvider {

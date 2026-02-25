@@ -1,6 +1,7 @@
 use std::fmt::Display;
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RateLimitMetric {
@@ -22,7 +23,7 @@ impl Display for RateLimitMetric {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RateLimit {
     #[serde(rename = "tpm")]
     pub token_per_minute: Option<u64>,

@@ -32,7 +32,7 @@ pub mod identifiers {
 // Re-export provider config types
 pub mod configs {
     pub use super::{
-        deepseek::DeepSeekProviderConfig, gemini::GeminiProviderConfig,
+        deepseek::DeepSeekProviderConfig, gemini::GeminiProviderConfig, mock::MockProviderConfig,
         openai::OpenAIProviderConfig,
     };
 }
@@ -58,7 +58,7 @@ pub fn create_provider(config: &ProviderConfig) -> Box<dyn Provider> {
             REQWEST_CLIENT.clone(),
             config.api_key.clone(),
         )),
-        ProviderConfig::Mock => Box::new(mock::MockProvider::default()),
+        ProviderConfig::Mock(_config) => Box::new(mock::MockProvider::default()),
     }
 }
 

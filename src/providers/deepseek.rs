@@ -15,9 +15,11 @@ use crate::{
 pub const IDENTIFIER: &str = "deepseek";
 const DEFAULT_API_BASE: &str = "https://api.deepseek.com/v1";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DeepSeekProviderConfig {
     pub api_key: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub api_base: Option<String>,
 }
 

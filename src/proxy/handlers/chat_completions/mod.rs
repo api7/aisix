@@ -61,7 +61,7 @@ pub async fn chat_completions(
 
     // Replace request model name with real model name
     //TODO safe unwrap
-    request_data.model = model.model.split("/").nth(1).unwrap().to_string();
+    request_data.model = model.model.name.clone();
 
     // Check if it's a streaming request
     let is_stream = request_data.stream.unwrap_or(false);
@@ -75,7 +75,10 @@ pub async fn chat_completions(
         let duration = start_time.elapsed().as_millis() as u64;
         crate::utils::metrics::METRIC_LLM_LATENCY.record(
             duration,
-            &[opentelemetry::KeyValue::new("model", model.model.clone())],
+            &[opentelemetry::KeyValue::new(
+                "model",
+                model.model.name.clone(),
+            )],
         );
 
         response
@@ -153,7 +156,7 @@ async fn handle_stream_request(
                                 let latency = start_time.elapsed().as_millis() as u64;
                                 crate::utils::metrics::METRIC_LLM_FIRST_TOKEN_LATENCY.record(
                                     latency,
-                                    &[opentelemetry::KeyValue::new("model", model.clone())],
+                                    &[opentelemetry::KeyValue::new("model", model.name.clone())],
                                 );
                                 span.add_event(TraceEvent::new("first token arrived"));
                             }
@@ -195,7 +198,7 @@ async fn handle_stream_request(
                             let duration = start_time.elapsed().as_millis() as u64;
                             crate::utils::metrics::METRIC_LLM_LATENCY.record(
                                 duration,
-                                &[opentelemetry::KeyValue::new("model", model.clone())],
+                                &[opentelemetry::KeyValue::new("model", model.name.clone())],
                             );
                             Some((
                                 Ok(SseEvent::default().data("[DONE]")),

@@ -53,7 +53,7 @@ pub async fn embeddings(
     let provider = create_provider(&model.provider_config);
 
     // Replace request model name with real model name
-    request_data.model = model.model.split("/").nth(1).unwrap().to_string();
+    request_data.model = model.model.name.clone();
 
     match provider.embedding(request_data).await {
         Ok(mut response) => {

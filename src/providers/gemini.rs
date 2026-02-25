@@ -17,9 +17,11 @@ use crate::{
 pub const IDENTIFIER: &str = "gemini";
 const DEFAULT_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GeminiProviderConfig {
     pub api_key: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub api_base: Option<String>,
 }
 

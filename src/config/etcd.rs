@@ -1,15 +1,16 @@
 use std::{sync::Arc, time::Duration};
 
-use super::{
-    ConfigEvent, ConfigEventReceiver, ConfigItemKey, ConfigItemRevision, ConfigItemValue,
-    ConfigProvider,
-};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use dashmap::{DashMap, Entry};
+use etcd_client::{GetOptions, PutOptions};
 use log::{info, warn};
 use serde::Deserialize;
 use tokio::sync::mpsc;
+
+use crate::config::{
+    ConfigEvent, ConfigEventReceiver, ConfigProvider, GetAllEntry, GetEntry, PutEntry,
+};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -141,20 +142,24 @@ impl EtcdConfigProvider {
 
 #[async_trait]
 impl ConfigProvider for EtcdConfigProvider {
-    async fn get_all(
-        &self,
-        prefix: Option<&str>,
-    ) -> Result<Vec<(ConfigItemKey, ConfigItemValue, ConfigItemRevision)>, String> {
+    async fn get_all_raw(&self, prefix: Option<&str>) -> Result<Vec<GetAllEntry<Vec<u8>>>, String> {
         let full_prefix = format!("{}{}", self.prefix, prefix.unwrap_or(""));
-        let get_opts = etcd_client::GetOptions::new().with_prefix();
 
         let mut client = self.client.clone();
-        match client.get(full_prefix.as_str(), Some(get_opts)).await {
+        match client
+            .get(full_prefix.as_str(), Some(GetOptions::new().with_prefix()))
+            .await
+        {
             Ok(resp) => {
                 let mut results = Vec::new();
                 for kv in resp.kvs() {
                     if let Ok(key) = kv.key_str() {
-                        results.push((key.to_string(), kv.value().to_vec(), kv.mod_revision()));
+                        results.push(GetAllEntry {
+                            key: key.to_string(),
+                            value: kv.value().to_vec(),
+                            create_revision: kv.create_revision(),
+                            mod_revision: kv.mod_revision(),
+                        });
                     }
                 }
                 Ok(results)
@@ -163,17 +168,18 @@ impl ConfigProvider for EtcdConfigProvider {
         }
     }
 
-    async fn get(
-        &self,
-        key: &str,
-    ) -> Result<Option<(ConfigItemValue, ConfigItemRevision)>, String> {
+    async fn get_raw(&self, key: &str) -> Result<Option<GetEntry<Vec<u8>>>, String> {
         let key = format!("{}{}", self.prefix, key);
 
         let mut client = self.client.clone();
         match client.get(key.as_str(), None).await {
             Ok(resp) => {
                 if let Some(kv) = resp.kvs().first() {
-                    Ok(Some((kv.value().to_vec(), kv.mod_revision())))
+                    Ok(Some(GetEntry {
+                        value: kv.value().to_vec(),
+                        create_revision: kv.create_revision(),
+                        mod_revision: kv.mod_revision(),
+                    }))
                 } else {
                     Ok(None)
                 }
@@ -182,8 +188,34 @@ impl ConfigProvider for EtcdConfigProvider {
         }
     }
 
-    async fn put(&self) {
-        todo!()
+    async fn put_raw(&self, key: &str, value: Vec<u8>) -> Result<PutEntry<Vec<u8>>, String> {
+        let key = format!("{}{}", self.prefix, key);
+
+        let mut client = self.client.clone();
+        match client
+            .put(key, value, Some(PutOptions::new().with_prev_key()))
+            .await
+        {
+            Ok(resp) => match resp.prev_key() {
+                Some(kv) => Ok(PutEntry::Updated(GetEntry {
+                    value: kv.value().to_vec(),
+                    create_revision: kv.create_revision(),
+                    mod_revision: kv.mod_revision(),
+                })),
+                None => Ok(PutEntry::Created),
+            },
+            Err(err) => Err(format!("etcd put failed: {}", err)),
+        }
+    }
+
+    async fn delete(&self, key: &str) -> Result<i64, String> {
+        let key = format!("{}{}", self.prefix, key);
+
+        let mut client = self.client.clone();
+        match client.delete(key, None).await {
+            Ok(resp) => Ok(resp.deleted()),
+            Err(err) => Err(format!("etcd delete failed: {}", err)),
+        }
     }
 
     async fn watch(&self, prefix: Option<&str>) -> Result<ConfigEventReceiver> {
