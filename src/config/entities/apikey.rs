@@ -4,10 +4,11 @@ use crate::config::{
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
+use utoipa::ToSchema;
 
 use super::{EntityStore, ResourceEntry};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiKey {
     pub key: String,
     pub allowed_models: Vec<String>,

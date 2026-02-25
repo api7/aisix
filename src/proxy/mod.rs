@@ -31,10 +31,9 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         config: crate::config::Config,
-        resources: crate::config::entities::ResourceRegistry,
+        resources: Arc<crate::config::entities::ResourceRegistry>,
     ) -> Self {
         let config = Arc::new(config);
-        let resources = Arc::new(resources);
         Self { config, resources }
     }
 

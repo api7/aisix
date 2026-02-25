@@ -56,8 +56,8 @@ pub struct ProviderModel {
     #[serde(skip)]
     pub name: String,
 
-    #[schema(pattern = "^(deepseek|gemini|openai|mock)/.+$")]
     #[serde(rename = "model")]
+    #[schema(pattern = "^(deepseek|gemini|openai|mock)/.+$")]
     pub original_model: String,
 }
 
@@ -66,6 +66,7 @@ pub struct Model {
     pub name: String,
 
     #[serde(flatten)]
+    #[schema(inline)]
     pub model: ProviderModel,
     pub provider_config: ProviderConfig,
 

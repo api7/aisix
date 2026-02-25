@@ -4,6 +4,8 @@ mod providers;
 mod proxy;
 mod utils;
 
+use std::sync::Arc;
+
 use log::info;
 use tokio::select;
 
@@ -19,7 +21,7 @@ async fn main() {
     let config_provider = config::create_provider(config.clone())
         .await
         .expect("Failed to create config provider");
-    let resources = ResourceRegistry::new(config_provider.clone()).await;
+    let resources = Arc::new(ResourceRegistry::new(config_provider.clone()).await);
 
     providers::init_client();
 
@@ -28,7 +30,7 @@ async fn main() {
             info!("Received Ctrl+C, shutting down");
         }
         _ = serve_proxy(proxy::AppState::new(config.clone(), resources.clone())) => {}
-        _ = serve_admin(admin::AppState::new(config.clone(), config_provider)) => {}
+        _ = serve_admin(admin::AppState::new(config.clone(), config_provider, resources)) => {}
     }
 
     if cfg!(feature = "trace") {
