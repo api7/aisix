@@ -210,10 +210,7 @@ async fn update(state: AppState, key: &str, body: Bytes) -> Response {
         Ok(data) => {
             if data
                 .iter()
-                .filter(|item| item.value.key == api_key.key && item.key != key)
-                .collect::<Vec<_>>()
-                .len()
-                > 0
+                .any(|item| item.value.key == api_key.key && item.key != key)
             {
                 return APIError::BadRequest("API key already exists".to_string()).into_response();
             }

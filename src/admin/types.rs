@@ -72,3 +72,27 @@ impl IntoResponse for APIError {
         }
     }
 }
+
+#[derive(Serialize, ToSchema)]
+#[serde(tag = "error_msg")]
+pub enum AuthError {
+    MissingKey,
+    InvalidKey,
+}
+
+impl IntoResponse for AuthError {
+    fn into_response(self) -> Response {
+        match self {
+            AuthError::MissingKey => (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error_msg": "Missing API key"})),
+            )
+                .into_response(),
+            AuthError::InvalidKey => (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error_msg": "Invalid API key"})),
+            )
+                .into_response(),
+        }
+    }
+}

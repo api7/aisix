@@ -32,6 +32,10 @@ deployment:
       - "http://127.0.0.1:2379"
     prefix: /aisix
     timeout: 30
+  admin:
+    admin_key:
+      - key: "admin"
+      - key: "admin2"
 ```
 
 ### Admin API

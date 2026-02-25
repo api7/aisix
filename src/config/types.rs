@@ -4,8 +4,19 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 
 #[derive(Clone, Debug, Deserialize)]
+pub struct AdminKey {
+    pub key: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct DeploymentAdmin {
+    pub admin_key: Option<Vec<AdminKey>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct Deployment {
     pub etcd: super::etcd::Config,
+    pub admin: Option<DeploymentAdmin>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
