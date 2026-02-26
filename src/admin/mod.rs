@@ -148,7 +148,7 @@ async fn auth(
         None => return Err(AuthError::MissingKey.into_response()),
     };
 
-    if admin_keys.iter().any(|item| item.key == api_key) {
+    if !admin_keys.iter().any(|item| item.key == api_key) {
         return Err(AuthError::InvalidKey.into_response());
     }
 
