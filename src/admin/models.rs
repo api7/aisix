@@ -19,7 +19,7 @@ use crate::{
 
 static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
     json!({
-        "$schema": "http://json-schema.org/draft/2020-12/schema#",
+        "$schema": "https://json-schema.org/draft/2020-12/schema#",
         "type": "object",
         "properties": {
             "name": {"type": "string"},

@@ -11,7 +11,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use http::StatusCode;
 use utoipa::{
     Modify, OpenApi,
     openapi::security::{

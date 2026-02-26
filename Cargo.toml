@@ -64,7 +64,7 @@ skp-ratelimit = { git = "https://github.com/bzp2010/skp-ratelimit.git", branch =
 ] }
 rand = "0.10.0"
 http-body = "1.0.1"
-jsonschema = "0.42.1"
+jsonschema = { version = "0.42.1", default-features = false }
 uuid = { version = "1.21.0", features = ["v4"] }
 utoipa = "5.4.0"
 utoipa-scalar = { version = "0.3", features = ["axum"] }
