@@ -244,3 +244,14 @@ pub static HOOK_MANAGER: LazyLock<HookManager> = LazyLock::new(|| {
 
     manager
 });
+
+// For models endpoint, only register auth hook to avoid unnecessary functions
+// Temporary use, awaiting refactoring
+pub static HOOK_MANAGER_AUTH_ONLY: LazyLock<HookManager> = LazyLock::new(|| {
+    let mut manager = HookManager::new();
+
+    // Register built-in hooks
+    manager.register(Arc::new(auth::AuthHook::new()));
+
+    manager
+});
