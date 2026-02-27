@@ -124,12 +124,7 @@ pub async fn get(State(state): State<AppState>, Path(id): Path<String>) -> Respo
     )
 )]
 pub async fn post(State(state): State<AppState>, body: Bytes) -> Response {
-    update(
-        state,
-        &format!("/apikeys/{}", Uuid::new_v4().to_string()),
-        body,
-    )
-    .await
+    update(state, &Uuid::new_v4().to_string(), body).await
 }
 
 #[utoipa::path(
@@ -149,7 +144,7 @@ pub async fn post(State(state): State<AppState>, body: Bytes) -> Response {
     )
 )]
 pub async fn put(State(state): State<AppState>, Path(id): Path<String>, body: Bytes) -> Response {
-    update(state, &format!("/apikeys/{}", id), body).await
+    update(state, &id, body).await
 }
 
 #[utoipa::path(
@@ -175,7 +170,9 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<String>) -> Re
     }
 }
 
-async fn update(state: AppState, key: &str, body: Bytes) -> Response {
+async fn update(state: AppState, id: &str, body: Bytes) -> Response {
+    let key = format!("/apikeys/{}", id);
+
     let model = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(value) => value,
         Err(err) => {
@@ -199,8 +196,8 @@ async fn update(state: AppState, key: &str, body: Bytes) -> Response {
     };
 
     // Check if the API key already exists: fast path
-    if let Some((found_key, _)) = state.resources.apikeys.get_by_key(&api_key.key)
-        && found_key != key
+    if let Some((found_id, _)) = state.resources.apikeys.get_by_key(&api_key.key)
+        && found_id != id
     {
         return APIError::BadRequest("API key already exists".to_string()).into_response();
     }
@@ -208,10 +205,9 @@ async fn update(state: AppState, key: &str, body: Bytes) -> Response {
     // Check if the API key already exists: slow path
     match state.config_provider.get_all::<ApiKey>("/apikeys").await {
         Ok(data) => {
-            if data
-                .iter()
-                .any(|item| item.value.key == api_key.key && item.key != key)
-            {
+            if data.iter().any(|item| {
+                return item.value.key == api_key.key && item.key != key;
+            }) {
                 return APIError::BadRequest("API key already exists".to_string()).into_response();
             }
         }

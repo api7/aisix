@@ -35,14 +35,8 @@ pub enum ConfigEvent {
 }
 pub type ConfigEventReceiver = mpsc::Receiver<ConfigEvent>;
 
-pub struct GetAllEntry<T> {
-    pub key: String,
-    pub value: T,
-    pub create_revision: ConfigItemRevision,
-    pub mod_revision: ConfigItemRevision,
-}
-
 pub struct GetEntry<T> {
+    pub key: String,
     pub value: T,
     pub create_revision: ConfigItemRevision,
     pub mod_revision: ConfigItemRevision,
@@ -55,7 +49,7 @@ pub enum PutEntry<T> {
 
 #[async_trait]
 pub trait ConfigProvider: Send + Sync {
-    async fn get_all_raw(&self, prefix: Option<&str>) -> Result<Vec<GetAllEntry<Vec<u8>>>, String>;
+    async fn get_all_raw(&self, prefix: Option<&str>) -> Result<Vec<GetEntry<Vec<u8>>>, String>;
 
     async fn get_raw(&self, key: &str) -> Result<Option<GetEntry<Vec<u8>>>, String>;
 
@@ -70,12 +64,12 @@ impl dyn ConfigProvider {
     pub async fn get_all<T: serde::de::DeserializeOwned + Send>(
         &self,
         prefix: &str,
-    ) -> Result<Vec<GetAllEntry<T>>, String> {
+    ) -> Result<Vec<GetEntry<T>>, String> {
         let items = self.get_all_raw(Some(prefix)).await?;
         Ok(items
             .iter()
             .filter_map(|item| match serde_json::from_slice::<T>(&item.value) {
-                Ok(parsed) => Some(GetAllEntry {
+                Ok(parsed) => Some(GetEntry {
                     key: item.key.clone(),
                     value: parsed,
                     create_revision: item.create_revision,
@@ -86,7 +80,7 @@ impl dyn ConfigProvider {
                     None
                 }
             })
-            .collect::<Vec<GetAllEntry<T>>>())
+            .collect::<Vec<GetEntry<T>>>())
     }
 
     pub async fn get<T: serde::de::DeserializeOwned + Send>(
@@ -95,11 +89,13 @@ impl dyn ConfigProvider {
     ) -> Result<Option<GetEntry<T>>, String> {
         match self.get_raw(key).await? {
             Some(GetEntry {
+                key,
                 value,
                 create_revision,
                 mod_revision,
             }) => match serde_json::from_slice::<T>(&value) {
                 Ok(parsed) => Ok(Some(GetEntry {
+                    key,
                     value: parsed,
                     create_revision,
                     mod_revision,
@@ -121,10 +117,12 @@ impl dyn ConfigProvider {
         match self.put_raw(key, value_bytes).await? {
             PutEntry::Created => Ok(PutEntry::Created),
             PutEntry::Updated(GetEntry {
+                key,
                 value,
                 create_revision,
                 mod_revision,
             }) => Ok(PutEntry::Updated(GetEntry {
+                key: key.clone(),
                 value: serde_json::from_slice::<T>(&value)
                     .map_err(|err| format!("Failed to parse config item {}: {}", key, err))?,
                 create_revision,

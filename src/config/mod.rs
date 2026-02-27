@@ -1,5 +1,5 @@
 pub mod entities;
-mod etcd;
+pub mod etcd;
 mod types;
 
 use std::sync::Arc;

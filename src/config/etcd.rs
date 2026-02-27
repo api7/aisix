@@ -8,9 +8,7 @@ use log::{info, warn};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-use crate::config::{
-    ConfigEvent, ConfigEventReceiver, ConfigProvider, GetAllEntry, GetEntry, PutEntry,
-};
+use crate::config::{ConfigEvent, ConfigEventReceiver, ConfigProvider, GetEntry, PutEntry};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -142,7 +140,7 @@ impl EtcdConfigProvider {
 
 #[async_trait]
 impl ConfigProvider for EtcdConfigProvider {
-    async fn get_all_raw(&self, prefix: Option<&str>) -> Result<Vec<GetAllEntry<Vec<u8>>>, String> {
+    async fn get_all_raw(&self, prefix: Option<&str>) -> Result<Vec<GetEntry<Vec<u8>>>, String> {
         let full_prefix = format!("{}{}", self.prefix, prefix.unwrap_or(""));
 
         let mut client = self.client.clone();
@@ -154,8 +152,11 @@ impl ConfigProvider for EtcdConfigProvider {
                 let mut results = Vec::new();
                 for kv in resp.kvs() {
                     if let Ok(key) = kv.key_str() {
-                        results.push(GetAllEntry {
-                            key: key.to_string(),
+                        results.push(GetEntry {
+                            key: key
+                                .strip_prefix(&self.prefix)
+                                .unwrap_or_else(|| key)
+                                .to_string(),
                             value: kv.value().to_vec(),
                             create_revision: kv.create_revision(),
                             mod_revision: kv.mod_revision(),
@@ -169,13 +170,14 @@ impl ConfigProvider for EtcdConfigProvider {
     }
 
     async fn get_raw(&self, key: &str) -> Result<Option<GetEntry<Vec<u8>>>, String> {
-        let key = format!("{}{}", self.prefix, key);
+        let full_key = format!("{}{}", self.prefix, key);
 
         let mut client = self.client.clone();
-        match client.get(key.as_str(), None).await {
+        match client.get(full_key.as_str(), None).await {
             Ok(resp) => {
                 if let Some(kv) = resp.kvs().first() {
                     Ok(Some(GetEntry {
+                        key: key.to_string(),
                         value: kv.value().to_vec(),
                         create_revision: kv.create_revision(),
                         mod_revision: kv.mod_revision(),
@@ -189,15 +191,16 @@ impl ConfigProvider for EtcdConfigProvider {
     }
 
     async fn put_raw(&self, key: &str, value: Vec<u8>) -> Result<PutEntry<Vec<u8>>, String> {
-        let key = format!("{}{}", self.prefix, key);
+        let full_key = format!("{}{}", self.prefix, key);
 
         let mut client = self.client.clone();
         match client
-            .put(key, value, Some(PutOptions::new().with_prev_key()))
+            .put(full_key, value, Some(PutOptions::new().with_prev_key()))
             .await
         {
             Ok(resp) => match resp.prev_key() {
                 Some(kv) => Ok(PutEntry::Updated(GetEntry {
+                    key: key.to_string(),
                     value: kv.value().to_vec(),
                     create_revision: kv.create_revision(),
                     mod_revision: kv.mod_revision(),
@@ -209,10 +212,10 @@ impl ConfigProvider for EtcdConfigProvider {
     }
 
     async fn delete(&self, key: &str) -> Result<i64, String> {
-        let key = format!("{}{}", self.prefix, key);
+        let full_key = format!("{}{}", self.prefix, key);
 
         let mut client = self.client.clone();
-        match client.delete(key, None).await {
+        match client.delete(full_key, None).await {
             Ok(resp) => Ok(resp.deleted()),
             Err(err) => Err(format!("etcd delete failed: {}", err)),
         }

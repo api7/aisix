@@ -1,3 +1,10 @@
+mod apikey;
+pub mod models;
+pub mod types;
+
+pub use apikey::ApiKey;
+pub use models::Model;
+
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 use arc_swap::ArcSwap;
@@ -5,14 +12,7 @@ use log::{info, warn};
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc::Receiver;
 
-use crate::config::{ConfigEvent, ConfigProvider, GetAllEntry};
-
-mod apikey;
-pub mod models;
-pub mod types;
-
-pub use apikey::ApiKey;
-pub use models::Model;
+use crate::config::{ConfigEvent, ConfigProvider, GetEntry};
 
 #[derive(Clone)]
 pub struct ResourceRegistry {
@@ -143,7 +143,7 @@ impl<T: DeserializeOwned + Clone + Send + Sync + 'static> EntityStore<T> {
         info!("{} Starting full load, prefix={}", entity_name, prefix);
         match provider.get_all_raw(Some(prefix)).await {
             Ok(kvs) => {
-                for GetAllEntry {
+                for GetEntry {
                     key,
                     value,
                     create_revision: _,
