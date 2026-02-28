@@ -3,19 +3,60 @@ mod metric;
 mod rate_limit;
 mod validate_model;
 
-use std::sync::{Arc, LazyLock};
+use std::{
+    ops::{Deref, DerefMut},
+    sync::{Arc, LazyLock},
+};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use axum::{extract::Request, http::HeaderMap, response::Response};
+use axum::{
+    extract::{FromRequestParts, Request},
+    http::HeaderMap,
+    response::Response,
+};
+use http::request::Parts;
 
-use crate::proxy::handlers::{
-    chat_completions::{ChatCompletionChunk, ChatCompletionResponse, ChatCompletionUsage},
-    embeddings::{EmbeddingResponse, EmbeddingUsage},
+use crate::proxy::{
+    AppState,
+    handlers::{
+        chat_completions::{ChatCompletionChunk, ChatCompletionResponse, ChatCompletionUsage},
+        embeddings::{EmbeddingResponse, EmbeddingUsage},
+    },
 };
 
 /// Hook context containing request metadata and state
-pub type Context = http::Extensions;
+pub struct Context(http::Extensions);
+
+impl Context {
+    pub fn new() -> Self {
+        Self(http::Extensions::new())
+    }
+}
+
+impl FromRequestParts<AppState> for Context {
+    type Rejection = ();
+
+    async fn from_request_parts(_: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        let mut ctx = http::Extensions::new();
+        ctx.insert(state.clone());
+        Ok(Self(ctx))
+    }
+}
+
+impl Deref for Context {
+    type Target = http::Extensions;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Context {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 /// Hook action result
 pub enum HookAction {

@@ -20,14 +20,12 @@ use crate::{
 pub use types::*;
 
 pub async fn embeddings(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Extension(mut request_data): Extension<EmbeddingRequest>,
+    mut hook_ctx: Context,
     mut request: Request,
 ) -> Response {
     // PRE CALL HOOKS START
-    let mut hook_ctx = Context::new();
-
-    hook_ctx.insert(state);
     hook_ctx.insert(RequestModel(request_data.model));
 
     let action = HOOK_MANAGER

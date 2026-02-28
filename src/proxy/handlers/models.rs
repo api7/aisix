@@ -62,12 +62,12 @@ impl IntoResponse for ModelError {
 }
 
 #[fastrace::trace]
-pub async fn list_models(State(state): State<AppState>, mut request: Request) -> Response {
+pub async fn list_models(
+    State(state): State<AppState>,
+    mut hook_ctx: Context,
+    mut request: Request,
+) -> Response {
     // PRE CALL HOOKS START
-    let mut hook_ctx = Context::new();
-
-    hook_ctx.insert(state.clone());
-
     let action = HOOK_MANAGER_AUTH_ONLY
         .execute_pre_call(&mut hook_ctx, &mut request)
         .await;
