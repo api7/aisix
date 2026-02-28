@@ -16,10 +16,6 @@ use utils::{CheckPhase, RateLimitResponse, RateLimitState, run_check};
 pub struct RateLimitHook;
 
 impl RateLimitHook {
-    pub fn new() -> Self {
-        Self
-    }
-
     fn get_resources(ctx: &mut Context) -> (ResourceEntry<ApiKey>, ResourceEntry<Model>) {
         let api_key = ctx
             .get::<ResourceEntry<ApiKey>>()

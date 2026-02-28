@@ -4,8 +4,9 @@ mod rate_limit;
 mod validate_model;
 
 use std::{
+    any::Any,
     ops::{Deref, DerefMut},
-    sync::{Arc, LazyLock},
+    sync::LazyLock,
 };
 
 use anyhow::Result;
@@ -25,14 +26,10 @@ use crate::proxy::{
     },
 };
 
+pub use auth::AuthHook;
+
 /// Hook context containing request metadata and state
 pub struct Context(http::Extensions);
-
-impl Context {
-    pub fn new() -> Self {
-        Self(http::Extensions::new())
-    }
-}
 
 impl FromRequestParts<AppState> for Context {
     type Rejection = ();
@@ -126,7 +123,8 @@ impl TokenUsage {
 
 /// Proxy hook trait for implementing custom hooks
 #[async_trait]
-pub trait ProxyHook: Send + Sync {
+#[allow(unused)]
+pub trait ProxyHook: Any + Send + Sync {
     /// Hook name for debugging/logging
     fn name(&self) -> &str;
 
@@ -181,15 +179,16 @@ pub trait ProxyHook: Send + Sync {
 
 /// Hook manager for registering and executing hooks
 pub struct HookManager {
-    pub hooks: Vec<Arc<dyn ProxyHook>>,
+    pub hooks: Vec<Box<dyn ProxyHook>>,
 }
 
+#[allow(unused)]
 impl HookManager {
     pub fn new() -> Self {
         Self { hooks: vec![] }
     }
 
-    pub fn register(&mut self, hook: Arc<dyn ProxyHook>) {
+    pub fn register(&mut self, hook: Box<dyn ProxyHook>) {
         self.hooks.push(hook);
     }
 
@@ -198,8 +197,15 @@ impl HookManager {
         &self,
         ctx: &mut Context,
         req: &mut Request,
+        hooks: Option<&[std::any::TypeId]>,
     ) -> Result<HookAction> {
         for hook in &self.hooks {
+            let type_id = (&**hook as &dyn Any).type_id();
+
+            if hooks.is_some_and(|hooks| !hooks.contains(&type_id)) {
+                continue;
+            }
+
             match hook.pre_call(ctx, req).await? {
                 HookAction::Continue => continue,
                 HookAction::EarlyReturn(resp) => return Ok(HookAction::EarlyReturn(resp)),
@@ -278,21 +284,10 @@ pub static HOOK_MANAGER: LazyLock<HookManager> = LazyLock::new(|| {
     let mut manager = HookManager::new();
 
     // Register built-in hooks
-    manager.register(Arc::new(auth::AuthHook::new()));
-    manager.register(Arc::new(validate_model::ValidateModelHook::new()));
-    manager.register(Arc::new(rate_limit::RateLimitHook::new()));
-    manager.register(Arc::new(metric::MetricHook::new()));
-
-    manager
-});
-
-// For models endpoint, only register auth hook to avoid unnecessary functions
-// Temporary use, awaiting refactoring
-pub static HOOK_MANAGER_AUTH_ONLY: LazyLock<HookManager> = LazyLock::new(|| {
-    let mut manager = HookManager::new();
-
-    // Register built-in hooks
-    manager.register(Arc::new(auth::AuthHook::new()));
+    manager.register(Box::new(auth::AuthHook));
+    manager.register(Box::new(validate_model::ValidateModelHook));
+    manager.register(Box::new(rate_limit::RateLimitHook));
+    manager.register(Box::new(metric::MetricHook));
 
     manager
 });

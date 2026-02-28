@@ -8,12 +8,6 @@ use crate::proxy::{
 
 pub struct MetricHook;
 
-impl MetricHook {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
 #[async_trait]
 impl ProxyHook for MetricHook {
     fn name(&self) -> &str {

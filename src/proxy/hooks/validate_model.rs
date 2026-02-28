@@ -59,12 +59,6 @@ impl IntoResponse for ValidatedModelError {
 
 pub struct ValidateModelHook;
 
-impl ValidateModelHook {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
 #[async_trait]
 impl ProxyHook for ValidateModelHook {
     fn name(&self) -> &str {

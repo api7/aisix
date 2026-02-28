@@ -29,7 +29,7 @@ pub async fn embeddings(
     hook_ctx.insert(RequestModel(request_data.model));
 
     let action = HOOK_MANAGER
-        .execute_pre_call(&mut hook_ctx, &mut request)
+        .execute_pre_call(&mut hook_ctx, &mut request, None)
         .await;
 
     match action {

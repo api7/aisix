@@ -26,12 +26,6 @@ impl IntoResponse for AuthError {
 
 pub struct AuthHook;
 
-impl AuthHook {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
 #[async_trait]
 impl ProxyHook for AuthHook {
     fn name(&self) -> &str {

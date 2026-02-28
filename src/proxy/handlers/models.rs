@@ -13,7 +13,7 @@ use crate::{
     config::entities::{ApiKey, ResourceEntry},
     proxy::{
         AppState,
-        hooks::{Context, HOOK_MANAGER_AUTH_ONLY, HookAction},
+        hooks::{Context, HOOK_MANAGER, HookAction},
     },
 };
 
@@ -68,8 +68,12 @@ pub async fn list_models(
     mut request: Request,
 ) -> Response {
     // PRE CALL HOOKS START
-    let action = HOOK_MANAGER_AUTH_ONLY
-        .execute_pre_call(&mut hook_ctx, &mut request)
+    let action = HOOK_MANAGER
+        .execute_pre_call(
+            &mut hook_ctx,
+            &mut request,
+            Some(&[std::any::TypeId::of::<crate::proxy::hooks::AuthHook>()]),
+        )
         .await;
 
     match action {
