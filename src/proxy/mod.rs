@@ -1,14 +1,14 @@
+mod handlers;
+pub mod hooks;
+mod middlewares;
+
 use std::sync::Arc;
 
 use axum::{
     Router,
-    middleware::from_fn,
+    middleware::{from_fn, from_fn_with_state},
     routing::{get, post},
 };
-
-mod handlers;
-mod hooks;
-mod middlewares;
 
 // types
 pub mod types {
@@ -57,6 +57,7 @@ pub fn create_router(state: AppState) -> Router {
                 middlewares::parse_body::<handlers::embeddings::EmbeddingRequest>,
             )),
         )
+        .layer(from_fn_with_state(state.clone(), middlewares::auth))
         .layer(from_fn(middlewares::trace))
         .with_state(state)
 }

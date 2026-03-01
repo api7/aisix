@@ -25,11 +25,7 @@ impl From<Bytes> for RawRequestBody {
 pub struct RequestModel(pub String);
 
 /// Middleware to parse request body and store in Extensions
-///
-/// Usage:
-/// ```rust
-/// .layer(from_fn(parse_body::<ChatCompletionRequest>))
-/// ```
+/// TODO: move back to extractor?
 pub async fn parse_body<T>(req: Request, next: Next) -> Result<Response, Response>
 where
     T: DeserializeOwned + Clone + Send + Sync + 'static,
