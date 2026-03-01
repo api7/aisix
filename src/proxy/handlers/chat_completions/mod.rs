@@ -18,7 +18,7 @@ use crate::{
     providers::{Provider, create_provider},
     proxy::{
         AppState,
-        hooks::{Context, HOOK_MANAGER, HookAction, ResponseData, TokenUsage},
+        hooks::{HOOK_FILTER_ALL, HOOK_MANAGER, HookAction, HookContext, ResponseData, TokenUsage},
         middlewares::RequestModel,
     },
 };
@@ -30,14 +30,14 @@ pub async fn chat_completions(
     State(_state): State<AppState>,
     Extension(mut request_data): Extension<ChatCompletionRequest>,
     Extension(span_ctx): Extension<SpanContext>,
-    mut hook_ctx: Context,
+    mut hook_ctx: HookContext,
     mut request: Request,
 ) -> Response {
     // PRE CALL HOOKS START
     hook_ctx.insert(RequestModel(request_data.model));
 
     let action = HOOK_MANAGER
-        .execute_pre_call(&mut hook_ctx, &mut request, None)
+        .pre_call(&mut hook_ctx, &mut request, HOOK_FILTER_ALL)
         .await;
 
     match action {
@@ -89,7 +89,7 @@ pub async fn chat_completions(
 async fn handle_regular_request(
     provider: Box<dyn Provider>,
     request: ChatCompletionRequest,
-    hook_ctx: Context,
+    hook_ctx: HookContext,
 ) -> Response {
     let mut hook_ctx = hook_ctx;
     match provider.chat_completion(request).await {
@@ -97,7 +97,7 @@ async fn handle_regular_request(
             // Execute post_call_success hooks
             let response_data = ResponseData::ChatCompletion(response.clone());
             if let Err(err) = HOOK_MANAGER
-                .execute_post_call_success(&mut hook_ctx, &response_data)
+                .execute_post_call_success(&mut hook_ctx, &response_data, HOOK_FILTER_ALL)
                 .await
             {
                 error!("Hook post_call_success error: {}", err);
@@ -106,7 +106,7 @@ async fn handle_regular_request(
             // Build response and add headers
             let mut resp = Json(response).into_response();
             if let Err(err) = HOOK_MANAGER
-                .execute_post_call_headers(&mut hook_ctx, resp.headers_mut())
+                .execute_post_call_headers(&mut hook_ctx, resp.headers_mut(), HOOK_FILTER_ALL)
                 .await
             {
                 error!("Hook post_call_headers error: {}", err);
@@ -125,7 +125,7 @@ async fn handle_regular_request(
 async fn handle_stream_request(
     provider: Box<dyn Provider>,
     request: ChatCompletionRequest,
-    hook_ctx: Context,
+    hook_ctx: HookContext,
     start_time: Instant,
     span_ctx: SpanContext,
 ) -> Response {
@@ -165,6 +165,7 @@ async fn handle_stream_request(
                                     .execute_post_call_streaming(
                                         &mut hook_ctx,
                                         &TokenUsage::from_chat_completion(usage),
+                                        HOOK_FILTER_ALL,
                                     )
                                     .await
                                 {

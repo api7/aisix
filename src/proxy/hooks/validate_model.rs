@@ -5,7 +5,7 @@ use http::StatusCode;
 use log::error;
 use serde_json::json;
 
-use super::{Context, HookAction, ProxyHook};
+use super::{HookContext, HookAction, ProxyHook};
 use crate::{
     config::entities::{ApiKey, ResourceEntry},
     proxy::{AppState, middlewares::RequestModel},
@@ -65,7 +65,7 @@ impl ProxyHook for ValidateModelHook {
         "validate_model"
     }
 
-    async fn pre_call(&self, ctx: &mut Context, _req: &mut Request) -> Result<HookAction> {
+    async fn pre_call(&self, ctx: &mut HookContext, _req: &mut Request) -> Result<HookAction> {
         let request_model = match ctx.get::<RequestModel>().cloned() {
             Some(model) => model,
             None => {

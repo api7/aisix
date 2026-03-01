@@ -8,7 +8,7 @@ use axum::{extract::Request, http::HeaderMap, response::IntoResponse};
 
 use crate::{
     config::entities::{ApiKey, Model, ResourceEntry},
-    proxy::hooks::{Context, HookAction, ProxyHook, ResponseData, TokenUsage},
+    proxy::hooks::{HookAction, HookContext, ProxyHook, ResponseData, TokenUsage},
 };
 use types::*;
 use utils::{CheckPhase, RateLimitResponse, RateLimitState, run_check};
@@ -16,7 +16,7 @@ use utils::{CheckPhase, RateLimitResponse, RateLimitState, run_check};
 pub struct RateLimitHook;
 
 impl RateLimitHook {
-    fn get_resources(ctx: &mut Context) -> (ResourceEntry<ApiKey>, ResourceEntry<Model>) {
+    fn get_resources(ctx: &mut HookContext) -> (ResourceEntry<ApiKey>, ResourceEntry<Model>) {
         let api_key = ctx
             .get::<ResourceEntry<ApiKey>>()
             .cloned()
@@ -28,12 +28,12 @@ impl RateLimitHook {
         (api_key, model)
     }
 
-    fn get_rate_limit_state(ctx: &mut Context) -> &mut RateLimitState {
+    fn get_rate_limit_state(ctx: &mut HookContext) -> &mut RateLimitState {
         ctx.get_mut::<RateLimitState>()
             .expect("rate limit state should be initialized in context")
     }
 
-    async fn run_post_check(&self, ctx: &mut Context, total_tokens: u64) {
+    async fn run_post_check(&self, ctx: &mut HookContext, total_tokens: u64) {
         let (api_key, model) = Self::get_resources(ctx);
         let rate_limit_state = Self::get_rate_limit_state(ctx);
         Self::apply_post_check("api_key", &api_key, total_tokens, rate_limit_state).await;
@@ -81,7 +81,7 @@ impl ProxyHook for RateLimitHook {
         "rate_limit"
     }
 
-    async fn pre_call(&self, ctx: &mut Context, _req: &mut Request) -> Result<HookAction> {
+    async fn pre_call(&self, ctx: &mut HookContext, _req: &mut Request) -> Result<HookAction> {
         let (api_key, model) = Self::get_resources(ctx);
         let rate_limit_state = ctx.get_or_insert(RateLimitState::new());
 
@@ -98,18 +98,26 @@ impl ProxyHook for RateLimitHook {
         Ok(HookAction::Continue)
     }
 
-    async fn post_call_success(&self, ctx: &mut Context, response: &ResponseData) -> Result<()> {
+    async fn post_call_success(
+        &self,
+        ctx: &mut HookContext,
+        response: &ResponseData,
+    ) -> Result<()> {
         let usage = response.token_usage();
         self.run_post_check(ctx, usage.total_tokens).await;
         Ok(())
     }
 
-    async fn post_call_streaming(&self, ctx: &mut Context, usage: &TokenUsage) -> Result<()> {
+    async fn post_call_streaming(&self, ctx: &mut HookContext, usage: &TokenUsage) -> Result<()> {
         self.run_post_check(ctx, usage.total_tokens).await;
         Ok(())
     }
 
-    async fn post_call_headers(&self, ctx: &mut Context, headers: &mut HeaderMap) -> Result<()> {
+    async fn post_call_headers(
+        &self,
+        ctx: &mut HookContext,
+        headers: &mut HeaderMap,
+    ) -> Result<()> {
         let rate_limit_state = Self::get_rate_limit_state(ctx);
         rate_limit_state.add_headers(headers);
         Ok(())

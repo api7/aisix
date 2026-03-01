@@ -12,7 +12,7 @@ use crate::{
     providers::create_provider,
     proxy::{
         AppState,
-        hooks::{Context, HOOK_MANAGER, HookAction, ResponseData},
+        hooks::{HOOK_FILTER_ALL, HOOK_MANAGER, HookAction, HookContext, ResponseData},
         middlewares::RequestModel,
     },
 };
@@ -22,14 +22,14 @@ pub use types::*;
 pub async fn embeddings(
     State(_state): State<AppState>,
     Extension(mut request_data): Extension<EmbeddingRequest>,
-    mut hook_ctx: Context,
+    mut hook_ctx: HookContext,
     mut request: Request,
 ) -> Response {
     // PRE CALL HOOKS START
     hook_ctx.insert(RequestModel(request_data.model));
 
     let action = HOOK_MANAGER
-        .execute_pre_call(&mut hook_ctx, &mut request, None)
+        .pre_call(&mut hook_ctx, &mut request, HOOK_FILTER_ALL)
         .await;
 
     match action {
@@ -60,7 +60,7 @@ pub async fn embeddings(
             // Execute post_call_success hooks
             let response_data = ResponseData::Embedding(response.clone());
             if let Err(err) = HOOK_MANAGER
-                .execute_post_call_success(&mut hook_ctx, &response_data)
+                .execute_post_call_success(&mut hook_ctx, &response_data, HOOK_FILTER_ALL)
                 .await
             {
                 error!("Hook post_call_success error: {}", err);
@@ -69,7 +69,7 @@ pub async fn embeddings(
             // Build response and add headers
             let mut resp = Json(response).into_response();
             if let Err(err) = HOOK_MANAGER
-                .execute_post_call_headers(&mut hook_ctx, resp.headers_mut())
+                .execute_post_call_headers(&mut hook_ctx, resp.headers_mut(), HOOK_FILTER_ALL)
                 .await
             {
                 error!("Hook post_call_headers error: {}", err);

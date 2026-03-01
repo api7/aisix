@@ -13,7 +13,7 @@ use crate::{
     config::entities::{ApiKey, ResourceEntry},
     proxy::{
         AppState,
-        hooks::{Context, HOOK_MANAGER, HookAction},
+        hooks::{HOOK_FILTER_NONE, HOOK_MANAGER, HookAction, HookContext},
     },
 };
 
@@ -64,16 +64,12 @@ impl IntoResponse for ModelError {
 #[fastrace::trace]
 pub async fn list_models(
     State(state): State<AppState>,
-    mut hook_ctx: Context,
+    mut hook_ctx: HookContext,
     mut request: Request,
 ) -> Response {
     // PRE CALL HOOKS START
     let action = HOOK_MANAGER
-        .execute_pre_call(
-            &mut hook_ctx,
-            &mut request,
-            Some(&[std::any::TypeId::of::<crate::proxy::hooks::AuthHook>()]),
-        )
+        .pre_call(&mut hook_ctx, &mut request, HOOK_FILTER_NONE)
         .await;
 
     match action {
@@ -86,7 +82,6 @@ pub async fn list_models(
         }
         _ => {}
     }
-
     // PRE CALL HOOKS END
 
     let api_key = hook_ctx

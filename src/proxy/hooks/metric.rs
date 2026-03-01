@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::proxy::{
-    hooks::{Context, ProxyHook, ResponseData},
+    hooks::{HookContext, ProxyHook, ResponseData},
     middlewares::RequestModel,
 };
 
@@ -14,7 +14,7 @@ impl ProxyHook for MetricHook {
         "metric"
     }
 
-    async fn post_call_success(&self, ctx: &mut Context, response: &ResponseData) -> Result<()> {
+    async fn post_call_success(&self, ctx: &mut HookContext, response: &ResponseData) -> Result<()> {
         // token count
         let request_model = ctx
             .get::<RequestModel>()

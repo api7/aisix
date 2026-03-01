@@ -1,4 +1,3 @@
-mod auth;
 mod metric;
 mod rate_limit;
 mod validate_model;
@@ -18,30 +17,46 @@ use axum::{
 };
 use http::request::Parts;
 
-use crate::proxy::{
-    AppState,
-    handlers::{
-        chat_completions::{ChatCompletionChunk, ChatCompletionResponse, ChatCompletionUsage},
-        embeddings::{EmbeddingResponse, EmbeddingUsage},
+use crate::{
+    config::entities::{ApiKey, ResourceEntry},
+    proxy::{
+        AppState,
+        handlers::{
+            chat_completions::{ChatCompletionChunk, ChatCompletionResponse, ChatCompletionUsage},
+            embeddings::{EmbeddingResponse, EmbeddingUsage},
+        },
     },
 };
 
-pub use auth::AuthHook;
+pub const HOOK_FILTER_ALL: fn(&Box<dyn ProxyHook>) -> bool = |_| true;
+pub const HOOK_FILTER_NONE: fn(&Box<dyn ProxyHook>) -> bool = |_| false;
 
 /// Hook context containing request metadata and state
-pub struct Context(http::Extensions);
+pub struct HookContext(http::Extensions);
 
-impl FromRequestParts<AppState> for Context {
+impl HookContext {
+    pub fn new() -> Self {
+        Self(http::Extensions::new())
+    }
+}
+
+impl FromRequestParts<AppState> for HookContext {
     type Rejection = ();
 
-    async fn from_request_parts(_: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
         let mut ctx = http::Extensions::new();
         ctx.insert(state.clone());
+        ctx.insert(parts.extensions.remove::<ResourceEntry<ApiKey>>().expect(
+            "Authentication middleware should have inserted ApiKey into request extensions",
+        ));
         Ok(Self(ctx))
     }
 }
 
-impl Deref for Context {
+impl Deref for HookContext {
     type Target = http::Extensions;
 
     fn deref(&self) -> &Self::Target {
@@ -49,7 +64,7 @@ impl Deref for Context {
     }
 }
 
-impl DerefMut for Context {
+impl DerefMut for HookContext {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
@@ -130,17 +145,21 @@ pub trait ProxyHook: Any + Send + Sync {
 
     /// Pre-call hook: executed before provider call
     /// Can modify request or return early response
-    async fn pre_call(&self, _ctx: &mut Context, _req: &mut Request) -> Result<HookAction> {
+    async fn pre_call(&self, _ctx: &mut HookContext, _req: &mut Request) -> Result<HookAction> {
         Ok(HookAction::Continue)
     }
 
     /// Moderation hook: run parallel input checks (optional)
-    async fn moderation(&self, _ctx: &Context) -> Result<()> {
+    async fn moderation(&self, _ctx: &HookContext) -> Result<()> {
         Ok(())
     }
 
     /// Post-call success hook: executed after successful provider response
-    async fn post_call_success(&self, _ctx: &mut Context, _response: &ResponseData) -> Result<()> {
+    async fn post_call_success(
+        &self,
+        _ctx: &mut HookContext,
+        _response: &ResponseData,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -149,7 +168,7 @@ pub trait ProxyHook: Any + Send + Sync {
     /// Default: return original stream without wrapping
     async fn post_call_streaming_chunk(
         &self,
-        _ctx: &Context,
+        _ctx: &HookContext,
         stream: futures::stream::BoxStream<'static, Result<ChatCompletionChunk>>,
     ) -> Result<futures::stream::BoxStream<'static, Result<ChatCompletionChunk>>> {
         Ok(stream)
@@ -157,7 +176,7 @@ pub trait ProxyHook: Any + Send + Sync {
 
     /// Post-call streaming hook: called once after stream ends
     /// Used for rate limit post-check and other operations requiring complete usage data
-    async fn post_call_streaming(&self, _ctx: &mut Context, _usage: &TokenUsage) -> Result<()> {
+    async fn post_call_streaming(&self, _ctx: &mut HookContext, _usage: &TokenUsage) -> Result<()> {
         Ok(())
     }
 
@@ -165,14 +184,18 @@ pub trait ProxyHook: Any + Send + Sync {
     /// Can transform error or return custom response
     async fn post_call_failure(
         &self,
-        _ctx: &mut Context,
+        _ctx: &mut HookContext,
         _error: &anyhow::Error,
     ) -> Result<HookAction> {
         Ok(HookAction::Continue)
     }
 
     /// Post-call headers hook: add custom headers to response
-    async fn post_call_headers(&self, _ctx: &mut Context, _headers: &mut HeaderMap) -> Result<()> {
+    async fn post_call_headers(
+        &self,
+        _ctx: &mut HookContext,
+        _headers: &mut HeaderMap,
+    ) -> Result<()> {
         Ok(())
     }
 }
@@ -188,24 +211,25 @@ impl HookManager {
         Self { hooks: vec![] }
     }
 
-    pub fn register(&mut self, hook: Box<dyn ProxyHook>) {
+    pub fn register(&mut self, hook: Box<dyn ProxyHook>) -> &mut Self {
         self.hooks.push(hook);
+        self
     }
 
     /// Execute all pre_call hooks in order
-    pub async fn execute_pre_call(
+    pub async fn pre_call<F>(
         &self,
-        ctx: &mut Context,
+        ctx: &mut HookContext,
         req: &mut Request,
-        hooks: Option<&[std::any::TypeId]>,
-    ) -> Result<HookAction> {
+        filter: F,
+    ) -> Result<HookAction>
+    where
+        F: Fn(&Box<dyn ProxyHook>) -> bool,
+    {
         for hook in &self.hooks {
-            let type_id = (&**hook as &dyn Any).type_id();
-
-            if hooks.is_some_and(|hooks| !hooks.contains(&type_id)) {
+            if !filter(hook) {
                 continue;
             }
-
             match hook.pre_call(ctx, req).await? {
                 HookAction::Continue => continue,
                 HookAction::EarlyReturn(resp) => return Ok(HookAction::EarlyReturn(resp)),
@@ -215,48 +239,76 @@ impl HookManager {
     }
 
     /// Execute all post_call_success hooks in order
-    pub async fn execute_post_call_success(
+    pub async fn execute_post_call_success<F>(
         &self,
-        ctx: &mut Context,
+        ctx: &mut HookContext,
         response: &ResponseData,
-    ) -> Result<()> {
+        filter: F,
+    ) -> Result<()>
+    where
+        F: Fn(&Box<dyn ProxyHook>) -> bool,
+    {
         for hook in &self.hooks {
+            if !filter(hook) {
+                continue;
+            }
             hook.post_call_success(ctx, response).await?;
         }
         Ok(())
     }
 
     /// Execute all post_call_streaming_chunk hooks (wrap stream)
-    pub async fn execute_post_call_streaming_chunk(
+    pub async fn execute_post_call_streaming_chunk<F>(
         &self,
-        ctx: &Context,
+        ctx: &HookContext,
         mut stream: futures::stream::BoxStream<'static, Result<ChatCompletionChunk>>,
-    ) -> Result<futures::stream::BoxStream<'static, Result<ChatCompletionChunk>>> {
+        filter: F,
+    ) -> Result<futures::stream::BoxStream<'static, Result<ChatCompletionChunk>>>
+    where
+        F: Fn(&Box<dyn ProxyHook>) -> bool,
+    {
         for hook in &self.hooks {
+            if !filter(hook) {
+                continue;
+            }
             stream = hook.post_call_streaming_chunk(ctx, stream).await?;
         }
         Ok(stream)
     }
 
     /// Execute all post_call_streaming hooks (after stream ends)
-    pub async fn execute_post_call_streaming(
+    pub async fn execute_post_call_streaming<F>(
         &self,
-        ctx: &mut Context,
+        ctx: &mut HookContext,
         usage: &TokenUsage,
-    ) -> Result<()> {
+        filter: F,
+    ) -> Result<()>
+    where
+        F: Fn(&Box<dyn ProxyHook>) -> bool,
+    {
         for hook in &self.hooks {
+            if !filter(hook) {
+                continue;
+            }
             hook.post_call_streaming(ctx, usage).await?;
         }
         Ok(())
     }
 
     /// Execute all post_call_failure hooks in order
-    pub async fn execute_post_call_failure(
+    pub async fn execute_post_call_failure<F>(
         &self,
-        ctx: &mut Context,
+        ctx: &mut HookContext,
         error: &anyhow::Error,
-    ) -> Result<HookAction> {
+        filter: F,
+    ) -> Result<HookAction>
+    where
+        F: Fn(&Box<dyn ProxyHook>) -> bool,
+    {
         for hook in &self.hooks {
+            if !filter(hook) {
+                continue;
+            }
             match hook.post_call_failure(ctx, error).await? {
                 HookAction::Continue => continue,
                 HookAction::EarlyReturn(resp) => return Ok(HookAction::EarlyReturn(resp)),
@@ -266,28 +318,30 @@ impl HookManager {
     }
 
     /// Execute all post_call_headers hooks in order
-    pub async fn execute_post_call_headers(
+    pub async fn execute_post_call_headers<F>(
         &self,
-        ctx: &mut Context,
+        ctx: &mut HookContext,
         headers: &mut HeaderMap,
-    ) -> Result<()> {
+        filter: F,
+    ) -> Result<()>
+    where
+        F: Fn(&Box<dyn ProxyHook>) -> bool,
+    {
         for hook in &self.hooks {
+            if !filter(hook) {
+                continue;
+            }
             hook.post_call_headers(ctx, headers).await?;
         }
         Ok(())
     }
 }
 
-// Global hook manager, initialized at startup and never changed
-// No RwLock needed since it's read-only after initialization
 pub static HOOK_MANAGER: LazyLock<HookManager> = LazyLock::new(|| {
     let mut manager = HookManager::new();
-
-    // Register built-in hooks
-    manager.register(Box::new(auth::AuthHook));
-    manager.register(Box::new(validate_model::ValidateModelHook));
-    manager.register(Box::new(rate_limit::RateLimitHook));
-    manager.register(Box::new(metric::MetricHook));
-
+    manager
+        .register(Box::new(validate_model::ValidateModelHook))
+        .register(Box::new(rate_limit::RateLimitHook))
+        .register(Box::new(metric::MetricHook));
     manager
 });
