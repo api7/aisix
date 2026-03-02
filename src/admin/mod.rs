@@ -22,7 +22,7 @@ use utoipa_scalar::{Scalar, Servable as ScalarServable};
 
 use crate::admin::types::AuthError;
 
-const PATH_PREFIX: &str = "/aisix/admin";
+pub const PATH_PREFIX: &str = "/aisix/admin";
 
 #[derive(OpenApi)]
 #[openapi(
