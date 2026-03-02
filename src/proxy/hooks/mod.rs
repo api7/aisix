@@ -13,9 +13,10 @@ use async_trait::async_trait;
 use axum::{
     extract::{FromRequestParts, Request},
     http::HeaderMap,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use http::request::Parts;
+use thiserror::Error;
 
 use crate::{
     config::entities::{ApiKey, ResourceEntry},
@@ -70,12 +71,18 @@ impl DerefMut for HookContext {
     }
 }
 
-/// Hook action result
-pub enum HookAction {
-    /// Continue normal execution
-    Continue,
-    /// Return early with custom response
-    EarlyReturn(Response),
+#[derive(Debug, Error)]
+pub enum HookError {
+    #[error("Return response")]
+    RawResponse(Response),
+}
+
+impl IntoResponse for HookError {
+    fn into_response(self) -> Response {
+        match self {
+            HookError::RawResponse(resp) => resp,
+        }
+    }
 }
 
 /// Response data wrapper for different response types
@@ -108,7 +115,7 @@ impl ResponseData {
 /// Token usage statistics
 #[derive(Debug, Clone)]
 pub struct TokenUsage {
-    /// Prompt tokens (None for embeddings and other types that don't support it)
+    /// Prompt tokens
     pub prompt_tokens: Option<u64>,
     /// Completion tokens (None for embeddings and other types that don't support it)
     pub completion_tokens: Option<u64>,
@@ -126,10 +133,10 @@ impl TokenUsage {
         }
     }
 
-    /// Create from EmbeddingResponse usage (only total tokens)
+    /// Create from EmbeddingResponse usage
     pub fn from_embedding(usage: &EmbeddingUsage) -> Self {
         Self {
-            prompt_tokens: None,
+            prompt_tokens: Some(usage.prompt_tokens as u64),
             completion_tokens: None,
             total_tokens: usage.total_tokens as u64,
         }
@@ -145,12 +152,12 @@ pub trait ProxyHook: Any + Send + Sync {
 
     /// Pre-call hook: executed before provider call
     /// Can modify request or return early response
-    async fn pre_call(&self, _ctx: &mut HookContext, _req: &mut Request) -> Result<HookAction> {
-        Ok(HookAction::Continue)
+    async fn pre_call(&self, _ctx: &mut HookContext, _req: &mut Request) -> Result<(), HookError> {
+        Ok(())
     }
 
     /// Moderation hook: run parallel input checks (optional)
-    async fn moderation(&self, _ctx: &HookContext) -> Result<()> {
+    async fn moderation(&self, _ctx: &HookContext) -> Result<(), HookError> {
         Ok(())
     }
 
@@ -159,7 +166,7 @@ pub trait ProxyHook: Any + Send + Sync {
         &self,
         _ctx: &mut HookContext,
         _response: &ResponseData,
-    ) -> Result<()> {
+    ) -> Result<(), HookError> {
         Ok(())
     }
 
@@ -176,7 +183,11 @@ pub trait ProxyHook: Any + Send + Sync {
 
     /// Post-call streaming hook: called once after stream ends
     /// Used for rate limit post-check and other operations requiring complete usage data
-    async fn post_call_streaming(&self, _ctx: &mut HookContext, _usage: &TokenUsage) -> Result<()> {
+    async fn post_call_streaming(
+        &self,
+        _ctx: &mut HookContext,
+        _usage: &TokenUsage,
+    ) -> Result<(), HookError> {
         Ok(())
     }
 
@@ -186,8 +197,8 @@ pub trait ProxyHook: Any + Send + Sync {
         &self,
         _ctx: &mut HookContext,
         _error: &anyhow::Error,
-    ) -> Result<HookAction> {
-        Ok(HookAction::Continue)
+    ) -> Result<(), HookError> {
+        Ok(())
     }
 
     /// Post-call headers hook: add custom headers to response
@@ -195,7 +206,7 @@ pub trait ProxyHook: Any + Send + Sync {
         &self,
         _ctx: &mut HookContext,
         _headers: &mut HeaderMap,
-    ) -> Result<()> {
+    ) -> Result<(), HookError> {
         Ok(())
     }
 }
@@ -222,7 +233,7 @@ impl HookManager {
         ctx: &mut HookContext,
         req: &mut Request,
         filter: F,
-    ) -> Result<HookAction>
+    ) -> Result<(), HookError>
     where
         F: Fn(&Box<dyn ProxyHook>) -> bool,
     {
@@ -230,21 +241,18 @@ impl HookManager {
             if !filter(hook) {
                 continue;
             }
-            match hook.pre_call(ctx, req).await? {
-                HookAction::Continue => continue,
-                HookAction::EarlyReturn(resp) => return Ok(HookAction::EarlyReturn(resp)),
-            }
+            hook.pre_call(ctx, req).await?;
         }
-        Ok(HookAction::Continue)
+        Ok(())
     }
 
     /// Execute all post_call_success hooks in order
-    pub async fn execute_post_call_success<F>(
+    pub async fn post_call_success<F>(
         &self,
         ctx: &mut HookContext,
         response: &ResponseData,
         filter: F,
-    ) -> Result<()>
+    ) -> Result<(), HookError>
     where
         F: Fn(&Box<dyn ProxyHook>) -> bool,
     {
@@ -258,7 +266,7 @@ impl HookManager {
     }
 
     /// Execute all post_call_streaming_chunk hooks (wrap stream)
-    pub async fn execute_post_call_streaming_chunk<F>(
+    pub async fn post_call_streaming_chunk<F>(
         &self,
         ctx: &HookContext,
         mut stream: futures::stream::BoxStream<'static, Result<ChatCompletionChunk>>,
@@ -277,12 +285,13 @@ impl HookManager {
     }
 
     /// Execute all post_call_streaming hooks (after stream ends)
-    pub async fn execute_post_call_streaming<F>(
+    /// TODO: do not return HookError?
+    pub async fn post_call_streaming<F>(
         &self,
         ctx: &mut HookContext,
         usage: &TokenUsage,
         filter: F,
-    ) -> Result<()>
+    ) -> Result<(), HookError>
     where
         F: Fn(&Box<dyn ProxyHook>) -> bool,
     {
@@ -296,12 +305,12 @@ impl HookManager {
     }
 
     /// Execute all post_call_failure hooks in order
-    pub async fn execute_post_call_failure<F>(
+    pub async fn post_call_failure<F>(
         &self,
         ctx: &mut HookContext,
         error: &anyhow::Error,
         filter: F,
-    ) -> Result<HookAction>
+    ) -> Result<(), HookError>
     where
         F: Fn(&Box<dyn ProxyHook>) -> bool,
     {
@@ -309,21 +318,18 @@ impl HookManager {
             if !filter(hook) {
                 continue;
             }
-            match hook.post_call_failure(ctx, error).await? {
-                HookAction::Continue => continue,
-                HookAction::EarlyReturn(resp) => return Ok(HookAction::EarlyReturn(resp)),
-            }
+            hook.post_call_failure(ctx, error).await?;
         }
-        Ok(HookAction::Continue)
+        Ok(())
     }
 
     /// Execute all post_call_headers hooks in order
-    pub async fn execute_post_call_headers<F>(
+    pub async fn post_call_headers<F>(
         &self,
         ctx: &mut HookContext,
         headers: &mut HeaderMap,
         filter: F,
-    ) -> Result<()>
+    ) -> Result<(), HookError>
     where
         F: Fn(&Box<dyn ProxyHook>) -> bool,
     {

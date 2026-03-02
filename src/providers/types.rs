@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Debug, Error)]
 pub enum ProviderError {
     #[error("Not implemented")]
     NotYetImplemented,

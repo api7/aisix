@@ -61,6 +61,7 @@ impl From<RateLimitConfig> for Vec<(RateLimitMetric, RateLimitRule)> {
 }
 
 /// Snapshot of rate limit state for a single metric dimension
+#[allow(unused)]
 #[derive(Debug, Clone)]
 pub struct RateLimitInfo {
     pub limit: u64,

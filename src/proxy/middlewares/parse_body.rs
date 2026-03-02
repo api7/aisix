@@ -10,6 +10,7 @@ use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
+#[allow(unused)]
 #[derive(Clone)]
 pub struct RawRequestBody {
     pub bytes: Bytes,

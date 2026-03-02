@@ -1,6 +1,9 @@
 use axum::{Json, response::IntoResponse};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::proxy::hooks::HookError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -42,9 +45,12 @@ pub struct EmbeddingResponse {
     pub usage: Option<EmbeddingUsage>,
 }
 
+#[derive(Debug, Error)]
 pub enum EmbeddingError {
+    #[error("Provider error: {0}")]
     ProviderError(String),
-    InternalError(String), //TODO more specific error definitions
+    #[error("Hook error")]
+    HookError(#[from] HookError),
 }
 
 impl IntoResponse for EmbeddingError {
@@ -61,17 +67,7 @@ impl IntoResponse for EmbeddingError {
                 })),
             )
                 .into_response(),
-            EmbeddingError::InternalError(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!("Internal error: {}", err),
-                        "type": "server_error",
-                        "code": "internal_error"
-                    }
-                })),
-            )
-                .into_response(),
+            EmbeddingError::HookError(err) => err.into_response(),
         }
     }
 }

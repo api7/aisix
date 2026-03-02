@@ -5,15 +5,14 @@ use axum::{
     extract::{Request, State},
     response::{IntoResponse, Response},
 };
-use http::StatusCode;
-use log::error;
 use serde::Serialize;
+use thiserror::Error;
 
 use crate::{
     config::entities::{ApiKey, ResourceEntry},
     proxy::{
         AppState,
-        hooks::{HOOK_FILTER_NONE, HOOK_MANAGER, HookAction, HookContext},
+        hooks::{HOOK_FILTER_NONE, HOOK_MANAGER, HookContext, HookError},
     },
 };
 
@@ -39,24 +38,16 @@ pub struct ModelList {
     data: Vec<Model>,
 }
 
+#[derive(Debug, Error)]
 pub enum ModelError {
-    InternalError, //TODO more specific error definitions
+    #[error("Hook error")]
+    HookError(#[from] HookError),
 }
 
 impl IntoResponse for ModelError {
     fn into_response(self) -> Response {
         match self {
-            ModelError::InternalError => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": "Internal error",
-                        "type": "server_error",
-                        "code": "internal_error"
-                    }
-                })),
-            )
-                .into_response(),
+            ModelError::HookError(err) => err.into_response(),
         }
     }
 }
@@ -66,23 +57,10 @@ pub async fn list_models(
     State(state): State<AppState>,
     mut hook_ctx: HookContext,
     mut request: Request,
-) -> Response {
-    // PRE CALL HOOKS START
-    let action = HOOK_MANAGER
+) -> Result<Response, ModelError> {
+    HOOK_MANAGER
         .pre_call(&mut hook_ctx, &mut request, HOOK_FILTER_NONE)
-        .await;
-
-    match action {
-        Ok(HookAction::EarlyReturn(response)) => {
-            return response;
-        }
-        Err(err) => {
-            error!("Hook pre_call error: {}", err);
-            return (ModelError::InternalError).into_response();
-        }
-        _ => {}
-    }
-    // PRE CALL HOOKS END
+        .await?;
 
     let api_key = hook_ctx
         .get::<ResourceEntry<ApiKey>>()
@@ -94,7 +72,7 @@ pub async fn list_models(
         .unwrap_or_else(|_| std::time::Duration::new(0, 0))
         .as_secs();
 
-    Json(ModelList {
+    Ok(Json(ModelList {
         object: "list",
         data: state
             .resources()
@@ -115,5 +93,5 @@ pub async fn list_models(
             })
             .collect(),
     })
-    .into_response()
+    .into_response())
 }

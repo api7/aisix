@@ -5,10 +5,10 @@ use http::StatusCode;
 use log::error;
 use serde_json::json;
 
-use super::{HookContext, HookAction, ProxyHook};
+use super::{HookContext, ProxyHook};
 use crate::{
     config::entities::{ApiKey, ResourceEntry},
-    proxy::{AppState, middlewares::RequestModel},
+    proxy::{AppState, hooks::HookError, middlewares::RequestModel},
 };
 
 pub enum ValidatedModelError {
@@ -65,12 +65,12 @@ impl ProxyHook for ValidateModelHook {
         "validate_model"
     }
 
-    async fn pre_call(&self, ctx: &mut HookContext, _req: &mut Request) -> Result<HookAction> {
+    async fn pre_call(&self, ctx: &mut HookContext, _req: &mut Request) -> Result<(), HookError> {
         let request_model = match ctx.get::<RequestModel>().cloned() {
             Some(model) => model,
             None => {
                 error!("Request model not found in context");
-                return Ok(HookAction::EarlyReturn(
+                return Err(HookError::RawResponse(
                     (ValidatedModelError::MissingModelField).into_response(),
                 ));
             }
@@ -85,7 +85,7 @@ impl ProxyHook for ValidateModelHook {
         let model = match state.resources().models.get_by_name(&model_name) {
             Some(model) => model,
             None => {
-                return Ok(HookAction::EarlyReturn(
+                return Err(HookError::RawResponse(
                     ValidatedModelError::ModelNotFound(model_name.clone()).into_response(),
                 ));
             }
@@ -95,7 +95,7 @@ impl ProxyHook for ValidateModelHook {
             Some(api_key) => api_key,
             None => {
                 error!("API key not found in context");
-                return Ok(HookAction::EarlyReturn(
+                return Err(HookError::RawResponse(
                     (StatusCode::INTERNAL_SERVER_ERROR).into_response(),
                 ));
             }
@@ -103,14 +103,13 @@ impl ProxyHook for ValidateModelHook {
 
         // Check if API key has access to this model
         if !api_key.allowed_models.contains(&model_name) {
-            return Ok(HookAction::EarlyReturn(
+            return Err(HookError::RawResponse(
                 ValidatedModelError::AccessForbidden(model_name.clone()).into_response(),
             ));
         }
 
         ctx.insert(model);
 
-        // Add your validation logic here
-        Ok(HookAction::Continue)
+        Ok(())
     }
 }

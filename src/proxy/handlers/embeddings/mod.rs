@@ -12,7 +12,7 @@ use crate::{
     providers::create_provider,
     proxy::{
         AppState,
-        hooks::{HOOK_FILTER_ALL, HOOK_MANAGER, HookAction, HookContext, ResponseData},
+        hooks::{HOOK_FILTER_ALL, HOOK_MANAGER, HookContext, ResponseData},
         middlewares::RequestModel,
     },
 };
@@ -24,25 +24,13 @@ pub async fn embeddings(
     Extension(mut request_data): Extension<EmbeddingRequest>,
     mut hook_ctx: HookContext,
     mut request: Request,
-) -> Response {
+) -> Result<Response, EmbeddingError> {
     // PRE CALL HOOKS START
     hook_ctx.insert(RequestModel(request_data.model));
 
-    let action = HOOK_MANAGER
+    HOOK_MANAGER
         .pre_call(&mut hook_ctx, &mut request, HOOK_FILTER_ALL)
-        .await;
-
-    match action {
-        Ok(HookAction::EarlyReturn(response)) => {
-            return response;
-        }
-        Err(err) => {
-            error!("Hook pre_call error: {}", err);
-            return (EmbeddingError::InternalError(err.to_string())).into_response();
-        }
-        _ => {}
-    }
-
+        .await?;
     // PRE CALL HOOKS END
 
     //TODO: safe unwrap
@@ -60,7 +48,7 @@ pub async fn embeddings(
             // Execute post_call_success hooks
             let response_data = ResponseData::Embedding(response.clone());
             if let Err(err) = HOOK_MANAGER
-                .execute_post_call_success(&mut hook_ctx, &response_data, HOOK_FILTER_ALL)
+                .post_call_success(&mut hook_ctx, &response_data, HOOK_FILTER_ALL)
                 .await
             {
                 error!("Hook post_call_success error: {}", err);
@@ -69,17 +57,21 @@ pub async fn embeddings(
             // Build response and add headers
             let mut resp = Json(response).into_response();
             if let Err(err) = HOOK_MANAGER
-                .execute_post_call_headers(&mut hook_ctx, resp.headers_mut(), HOOK_FILTER_ALL)
+                .post_call_headers(&mut hook_ctx, resp.headers_mut(), HOOK_FILTER_ALL)
                 .await
             {
                 error!("Hook post_call_headers error: {}", err);
             }
 
-            resp
+            Ok(resp)
         }
         Err(err) => {
             error!("Error generating embeddings: {}", err);
-            (EmbeddingError::ProviderError(err.to_string())).into_response()
+            let err: anyhow::Error = err.into();
+            HOOK_MANAGER
+                .post_call_failure(&mut hook_ctx, &err, HOOK_FILTER_ALL)
+                .await?;
+            Err(EmbeddingError::ProviderError(err.to_string()))
         }
     }
 }

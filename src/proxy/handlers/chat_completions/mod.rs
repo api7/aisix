@@ -18,7 +18,7 @@ use crate::{
     providers::{Provider, create_provider},
     proxy::{
         AppState,
-        hooks::{HOOK_FILTER_ALL, HOOK_MANAGER, HookAction, HookContext, ResponseData, TokenUsage},
+        hooks::{HOOK_FILTER_ALL, HOOK_MANAGER, HookContext, ResponseData, TokenUsage},
         middlewares::RequestModel,
     },
 };
@@ -32,33 +32,17 @@ pub async fn chat_completions(
     Extension(span_ctx): Extension<SpanContext>,
     mut hook_ctx: HookContext,
     mut request: Request,
-) -> Response {
-    // PRE CALL HOOKS START
+) -> Result<Response, ChatCompletionError> {
     hook_ctx.insert(RequestModel(request_data.model));
-
-    let action = HOOK_MANAGER
+    HOOK_MANAGER
         .pre_call(&mut hook_ctx, &mut request, HOOK_FILTER_ALL)
-        .await;
-
-    match action {
-        Ok(HookAction::EarlyReturn(response)) => {
-            return response;
-        }
-        Err(err) => {
-            error!("Hook pre_call error: {}", err);
-            return (ChatCompletionError::InternalError(err.to_string())).into_response();
-        }
-        _ => {}
-    }
-
-    // PRE CALL HOOKS END
+        .await?;
 
     let model = hook_ctx.get::<ResourceEntry<Model>>().cloned().unwrap(); //TODO: safe unwrap
 
     let provider = create_provider(&model.provider_config);
 
     // Replace request model name with real model name
-    //TODO safe unwrap
     request_data.model = model.model.name.clone();
 
     // Check if it's a streaming request
@@ -66,9 +50,9 @@ pub async fn chat_completions(
 
     let start_time = Instant::now();
     let response = if is_stream {
-        handle_stream_request(provider, request_data, hook_ctx, start_time, span_ctx).await
+        handle_stream_request(provider, request_data, hook_ctx, start_time, span_ctx).await?
     } else {
-        let response = handle_regular_request(provider, request_data, hook_ctx).await;
+        let response = handle_regular_request(provider, request_data, hook_ctx).await?;
 
         let duration = start_time.elapsed().as_millis() as u64;
         crate::utils::metrics::METRIC_LLM_LATENCY.record(
@@ -82,7 +66,7 @@ pub async fn chat_completions(
         response
     };
 
-    response
+    Ok(response)
 }
 
 #[fastrace::trace]
@@ -90,33 +74,33 @@ async fn handle_regular_request(
     provider: Box<dyn Provider>,
     request: ChatCompletionRequest,
     hook_ctx: HookContext,
-) -> Response {
+) -> Result<Response, ChatCompletionError> {
     let mut hook_ctx = hook_ctx;
     match provider.chat_completion(request).await {
         Ok(response) => {
-            // Execute post_call_success hooks
-            let response_data = ResponseData::ChatCompletion(response.clone());
-            if let Err(err) = HOOK_MANAGER
-                .execute_post_call_success(&mut hook_ctx, &response_data, HOOK_FILTER_ALL)
-                .await
-            {
-                error!("Hook post_call_success error: {}", err);
-            }
+            HOOK_MANAGER
+                .post_call_success(
+                    &mut hook_ctx,
+                    &ResponseData::ChatCompletion(response.clone()),
+                    HOOK_FILTER_ALL,
+                )
+                .await?;
 
             // Build response and add headers
             let mut resp = Json(response).into_response();
-            if let Err(err) = HOOK_MANAGER
-                .execute_post_call_headers(&mut hook_ctx, resp.headers_mut(), HOOK_FILTER_ALL)
-                .await
-            {
-                error!("Hook post_call_headers error: {}", err);
-            }
+            HOOK_MANAGER
+                .post_call_headers(&mut hook_ctx, resp.headers_mut(), HOOK_FILTER_ALL)
+                .await?;
 
-            resp
+            Ok(resp)
         }
         Err(err) => {
             error!("Provider request failed: {}", err);
-            ChatCompletionError::ProviderError(err.to_string()).into_response()
+            let err: anyhow::Error = err.into();
+            HOOK_MANAGER
+                .post_call_failure(&mut hook_ctx, &err, HOOK_FILTER_ALL)
+                .await?;
+            Ok(ChatCompletionError::ProviderError(err.to_string()).into_response())
         }
     }
 }
@@ -128,7 +112,7 @@ async fn handle_stream_request(
     hook_ctx: HookContext,
     start_time: Instant,
     span_ctx: SpanContext,
-) -> Response {
+) -> Result<Response, ChatCompletionError> {
     use futures::stream::StreamExt;
 
     let model = hook_ctx
@@ -159,10 +143,12 @@ async fn handle_stream_request(
                                 span.add_event(TraceEvent::new("first token arrived"));
                             }
 
+                            //TODO: add chunk-level hook call here
+
                             // Record token usage for last chunk
                             if let Some(usage) = &chunk.usage {
                                 if let Err(err) = HOOK_MANAGER
-                                    .execute_post_call_streaming(
+                                    .post_call_streaming(
                                         &mut hook_ctx,
                                         &TokenUsage::from_chat_completion(usage),
                                         HOOK_FILTER_ALL,
@@ -207,11 +193,11 @@ async fn handle_stream_request(
                     }
                 },
             );
-            Sse::new(sse_stream).into_response()
+            Ok(Sse::new(sse_stream).into_response())
         }
         Err(err) => {
             error!("Provider stream request failed: {}", err);
-            (ChatCompletionError::ProviderError(err.to_string())).into_response()
+            Ok(ChatCompletionError::ProviderError(err.to_string()).into_response())
         }
     }
 }

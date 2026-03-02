@@ -1,6 +1,7 @@
 use axum::{Json, response::IntoResponse};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -106,9 +107,12 @@ pub struct ChatCompletionChunk {
     pub usage: Option<ChatCompletionUsage>,
 }
 
+#[derive(Debug, Error)]
 pub enum ChatCompletionError {
+    #[error("Provider error: {0}")]
     ProviderError(String),
-    InternalError(String), //TODO more specific error definitions
+    #[error("Hook error")]
+    HookError(#[from] crate::proxy::hooks::HookError),
 }
 
 impl IntoResponse for ChatCompletionError {
@@ -125,17 +129,7 @@ impl IntoResponse for ChatCompletionError {
                 })),
             )
                 .into_response(),
-            ChatCompletionError::InternalError(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!("Internal error: {}", err),
-                        "type": "server_error",
-                        "code": "internal_error"
-                    }
-                })),
-            )
-                .into_response(),
+            ChatCompletionError::HookError(err) => err.into_response(),
         }
     }
 }

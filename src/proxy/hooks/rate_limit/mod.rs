@@ -8,7 +8,7 @@ use axum::{extract::Request, http::HeaderMap, response::IntoResponse};
 
 use crate::{
     config::entities::{ApiKey, Model, ResourceEntry},
-    proxy::hooks::{HookAction, HookContext, ProxyHook, ResponseData, TokenUsage},
+    proxy::hooks::{HookContext, HookError, ProxyHook, ResponseData, TokenUsage},
 };
 use types::*;
 use utils::{CheckPhase, RateLimitResponse, RateLimitState, run_check};
@@ -81,34 +81,38 @@ impl ProxyHook for RateLimitHook {
         "rate_limit"
     }
 
-    async fn pre_call(&self, ctx: &mut HookContext, _req: &mut Request) -> Result<HookAction> {
+    async fn pre_call(&self, ctx: &mut HookContext, _req: &mut Request) -> Result<(), HookError> {
         let (api_key, model) = Self::get_resources(ctx);
         let rate_limit_state = ctx.get_or_insert(RateLimitState::new());
 
         if let Some(resp) =
             Self::apply_pre_check(api_key.id.clone(), &api_key, rate_limit_state).await
         {
-            return Ok(HookAction::EarlyReturn(resp));
+            return Err(HookError::RawResponse(resp));
         }
         if let Some(resp) = Self::apply_pre_check(model.id.clone(), &model, rate_limit_state).await
         {
-            return Ok(HookAction::EarlyReturn(resp));
+            return Err(HookError::RawResponse(resp));
         }
 
-        Ok(HookAction::Continue)
+        Ok(())
     }
 
     async fn post_call_success(
         &self,
         ctx: &mut HookContext,
         response: &ResponseData,
-    ) -> Result<()> {
+    ) -> Result<(), HookError> {
         let usage = response.token_usage();
         self.run_post_check(ctx, usage.total_tokens).await;
         Ok(())
     }
 
-    async fn post_call_streaming(&self, ctx: &mut HookContext, usage: &TokenUsage) -> Result<()> {
+    async fn post_call_streaming(
+        &self,
+        ctx: &mut HookContext,
+        usage: &TokenUsage,
+    ) -> Result<(), HookError> {
         self.run_post_check(ctx, usage.total_tokens).await;
         Ok(())
     }
@@ -117,7 +121,7 @@ impl ProxyHook for RateLimitHook {
         &self,
         ctx: &mut HookContext,
         headers: &mut HeaderMap,
-    ) -> Result<()> {
+    ) -> Result<(), HookError> {
         let rate_limit_state = Self::get_rate_limit_state(ctx);
         rate_limit_state.add_headers(headers);
         Ok(())
