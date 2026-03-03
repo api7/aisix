@@ -13,6 +13,7 @@ use crate::{
     admin::{
         AppState,
         types::{APIError, DeleteResponse, ItemResponse, ListResponse},
+        utils::format_jsonschema_error,
     },
     config::{PutEntry, entities::Model},
 };
@@ -31,6 +32,7 @@ static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
             "rate_limit": {"type": "object"}
         },
         "required": ["name", "model", "provider_config"],
+        "additionalProperties": false,
         "allOf": [
             {
                 "if": {
@@ -249,13 +251,14 @@ async fn update(state: AppState, key: &str, body: Bytes) -> Response {
         }
     };
 
-    match SCHEMA_VALIDATOR.validate(&model) {
-        Ok(_) => {}
-        Err(err) => {
-            return APIError::BadRequest(format!("JSON schema validation error: {}", err))
-                .into_response();
-        }
-    };
+    let evaluation = SCHEMA_VALIDATOR.evaluate(&model);
+    if !evaluation.flag().valid {
+        return APIError::BadRequest(format!(
+            "JSON schema validation error: {}",
+            format_jsonschema_error(&evaluation)
+        ))
+        .into_response();
+    }
 
     match state.config_provider.put(&key, &model).await {
         Ok(res) => match res {
@@ -281,5 +284,89 @@ async fn update(state: AppState, key: &str, body: Bytes) -> Response {
                 .into_response(),
         },
         Err(err) => APIError::InternalError(err).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{SCHEMA_VALIDATOR, format_jsonschema_error};
+
+    #[rstest::rstest]
+    #[case(json!({ // ok
+        "name": "test",
+        "model": "openai/gpt-5",
+        "provider_config": { "api_key": "test_key" },
+    }), true, None)]
+    #[case(json!({ // missing name
+        "model": "mock/mock",
+        "provider_config": {},
+    }), false, Some(r#"property "/" validation failed: "name" is a required property"#))]
+    #[case(json!({ // missing model
+        "name": "test",
+        "provider_config": {},
+    }), false, Some(r#"property "/" validation failed: "model" is a required property"#))]
+    #[case(json!({ // missing provider_config
+        "name": "test",
+        "model": "deepseek/deepseek-chat",
+    }), false, Some(r#"property "/" validation failed: "provider_config" is a required property"#))]
+    #[case(json!({ // invalid name type
+        "name": 123,
+        "model": "mock/mock",
+        "provider_config": {},
+    }), false, Some(r#"property "/name" validation failed: 123 is not of type "string""#))]
+    #[case(json!({ // invalid model type
+        "name": "test",
+        "model": 123,
+        "provider_config": {},
+    }), false, Some(r#"property "/model" validation failed: 123 is not of type "string"
+property "/provider_config" validation failed: "api_key" is a required property
+property "/provider_config" validation failed: "api_key" is a required property
+property "/provider_config" validation failed: "api_key" is a required property"#))]
+    #[case(json!({ // invalid model pattern
+        "name": "test",
+        "model": "invalid",
+        "provider_config": {},
+    }), false, Some(r#"property "/model" validation failed: "invalid" does not match "^(deepseek|gemini|openai|mock)/.+$""#))]
+    #[case(json!({ // invalid provider_config type
+        "name": "test",
+        "model": "mock/mock",
+        "provider_config": 123,
+    }), false, Some(r#"property "/provider_config" validation failed: 123 is not of type "object""#))]
+    #[case(json!({ // invalid provider_config for specific vendor
+        "name": "test",
+        "model": "deepseek/deepseek-chat",
+        "provider_config": {},
+    }), false, Some(r#"property "/provider_config" validation failed: "api_key" is a required property"#))]
+    #[case(json!({ // invalid provider_config additional property
+        "name": "test",
+        "model": "deepseek/deepseek-chat",
+        "provider_config": {
+            "api_key": "test_key",
+            "additional": "not allowed"
+        },
+    }), false, Some(r#"property "/provider_config" validation failed: Additional properties are not allowed ('additional' was unexpected)"#))]
+    #[case(json!({ // invalid root additional property
+        "name": "test",
+        "model": "deepseek/deepseek-chat",
+        "provider_config": { "api_key": "test_key" },
+        "extra": "not allowed"
+    }), false, Some(r#"property "/" validation failed: Additional properties are not allowed ('extra' was unexpected)"#))]
+    fn schemas(
+        #[case] input: serde_json::Value,
+        #[case] ok: bool,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let evaluation = SCHEMA_VALIDATOR.evaluate(&input);
+
+        assert_eq!(evaluation.flag().valid, ok, "unexpected evaluation result");
+        if !ok {
+            assert_eq!(
+                format_jsonschema_error(&evaluation),
+                expected_error.unwrap(),
+                "unexpected error message"
+            );
+        }
     }
 }

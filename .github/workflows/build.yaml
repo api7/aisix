@@ -15,11 +15,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Setup Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
       - name: Setup dependencies
         run: sudo apt update && sudo apt install -y protobuf-compiler
 
       - name: Setup environment
         run: sudo docker compose -f ci/docker-compose.yaml up -d
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
 
       - name: Run tests
         run: cargo test --verbose

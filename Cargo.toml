@@ -36,8 +36,6 @@ async-trait = "0.1"
 futures = "0.3"
 bytes = "1.0"
 arc-swap = "1.7"
-aws-config = { version = "1.1.7", features = ["behavior-version-latest"] }
-aws-sdk-bedrockruntime = "1.120.0"
 anyhow = "1.0.100"
 fastrace = { version = "0.7.16", features = ["enable"] }
 fastrace-axum = "0.1.3"
@@ -53,7 +51,6 @@ logforth = { version = "0.29.1", features = [
   "diagnostic-fastrace",
   "append-fastrace",
 ] }
-clap = { version = "4.5.54", features = ["derive"] }
 http = "1.4.0"
 opentelemetry-semantic-conventions = "0.31.0"
 pin-project = "1.1.10"
@@ -73,3 +70,4 @@ utoipa-scalar = { version = "0.3", features = ["axum"] }
 tokio-test = "0.4"
 assert_matches = "1.5"
 pretty_assertions = "1.4"
+rstest = "0.26"
