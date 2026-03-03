@@ -294,29 +294,29 @@ mod tests {
     use super::{SCHEMA_VALIDATOR, format_jsonschema_error};
 
     #[rstest::rstest]
-    #[case(json!({ // ok
+    #[case::ok(json!({
         "name": "test",
         "model": "openai/gpt-5",
         "provider_config": { "api_key": "test_key" },
     }), true, None)]
-    #[case(json!({ // missing name
+    #[case::missing_name(json!({
         "model": "mock/mock",
         "provider_config": {},
     }), false, Some(r#"property "/" validation failed: "name" is a required property"#))]
-    #[case(json!({ // missing model
+    #[case::missing_model(json!({
         "name": "test",
         "provider_config": {},
     }), false, Some(r#"property "/" validation failed: "model" is a required property"#))]
-    #[case(json!({ // missing provider_config
+    #[case::missing_provider_config(json!({
         "name": "test",
         "model": "deepseek/deepseek-chat",
     }), false, Some(r#"property "/" validation failed: "provider_config" is a required property"#))]
-    #[case(json!({ // invalid name type
+    #[case::invalid_name_type(json!({
         "name": 123,
         "model": "mock/mock",
         "provider_config": {},
     }), false, Some(r#"property "/name" validation failed: 123 is not of type "string""#))]
-    #[case(json!({ // invalid model type
+    #[case::invalid_model_type(json!({
         "name": "test",
         "model": 123,
         "provider_config": {},
@@ -324,22 +324,22 @@ mod tests {
 property "/provider_config" validation failed: "api_key" is a required property
 property "/provider_config" validation failed: "api_key" is a required property
 property "/provider_config" validation failed: "api_key" is a required property"#))]
-    #[case(json!({ // invalid model pattern
+    #[case::invalid_model_pattern(json!({
         "name": "test",
         "model": "invalid",
         "provider_config": {},
     }), false, Some(r#"property "/model" validation failed: "invalid" does not match "^(deepseek|gemini|openai|mock)/.+$""#))]
-    #[case(json!({ // invalid provider_config type
+    #[case::invalid_provider_config_type(json!({
         "name": "test",
         "model": "mock/mock",
         "provider_config": 123,
     }), false, Some(r#"property "/provider_config" validation failed: 123 is not of type "object""#))]
-    #[case(json!({ // invalid provider_config for specific vendor
+    #[case::invalid_provider_config_for_specific_vendor(json!({
         "name": "test",
         "model": "deepseek/deepseek-chat",
         "provider_config": {},
     }), false, Some(r#"property "/provider_config" validation failed: "api_key" is a required property"#))]
-    #[case(json!({ // invalid provider_config additional property
+    #[case::invalid_provider_config_additional_property(json!({
         "name": "test",
         "model": "deepseek/deepseek-chat",
         "provider_config": {
@@ -347,19 +347,19 @@ property "/provider_config" validation failed: "api_key" is a required property"
             "additional": "not allowed"
         },
     }), false, Some(r#"property "/provider_config" validation failed: Additional properties are not allowed ('additional' was unexpected)"#))]
-    #[case(json!({ // invalid root additional property
+    #[case::invalid_root_additional_property(json!({
         "name": "test",
         "model": "deepseek/deepseek-chat",
         "provider_config": { "api_key": "test_key" },
         "extra": "not allowed"
     }), false, Some(r#"property "/" validation failed: Additional properties are not allowed ('extra' was unexpected)"#))]
-    #[case(json!({ // ok with rate_limit
+    #[case::ok_with_rate_limit(json!({
         "name": "test",
         "model": "openai/gpt-5",
         "provider_config": { "api_key": "test_key" },
         "rate_limit": {},
     }), true, None)]
-    #[case(json!({ // invalid rate_limit type
+    #[case::invalid_rate_limit_type(json!({
         "name": "test",
         "model": "openai/gpt-5",
         "provider_config": { "api_key": "test_key" },

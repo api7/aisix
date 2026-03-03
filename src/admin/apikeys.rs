@@ -254,39 +254,39 @@ mod tests {
     use super::{SCHEMA_VALIDATOR, format_jsonschema_error};
 
     #[rstest::rstest]
-    #[case(json!({ // ok
+    #[case::ok(json!({
         "key": "sk-test",
         "allowed_models": [],
     }), true, None)]
-    #[case(json!({ // ok with rate_limit
+    #[case::ok_with_rate_limit(json!({
         "key": "sk-test",
         "allowed_models": ["openai/gpt-4"],
         "rate_limit": {},
     }), true, None)]
-    #[case(json!({ // missing key
+    #[case::missing_key(json!({
         "allowed_models": [],
     }), false, Some(r#"property "/" validation failed: "key" is a required property"#))]
-    #[case(json!({ // missing allowed_models
+    #[case::missing_allowed_models(json!({
         "key": "sk-test",
     }), false, Some(r#"property "/" validation failed: "allowed_models" is a required property"#))]
-    #[case(json!({ // invalid key type
+    #[case::invalid_key_type(json!({
         "key": 123,
         "allowed_models": [],
     }), false, Some(r#"property "/key" validation failed: 123 is not of type "string""#))]
-    #[case(json!({ // invalid allowed_models type
+    #[case::invalid_allowed_models_type(json!({
         "key": "sk-test",
         "allowed_models": "not-an-array",
     }), false, Some(r#"property "/allowed_models" validation failed: "not-an-array" is not of type "array""#))]
-    #[case(json!({ // invalid allowed_models element type
+    #[case::invalid_allowed_models_element_type(json!({
         "key": "sk-test",
         "allowed_models": [1],
     }), false, Some(r#"property "/allowed_models" validation failed: 1 at index 0 is not of type "string""#))]
-    #[case(json!({ // invalid rate_limit type
+    #[case::invalid_rate_limit_type(json!({
         "key": "sk-test",
         "allowed_models": [],
         "rate_limit": 123,
     }), false, Some(r#"property "/rate_limit" validation failed: 123 is not of type "object""#))]
-    #[case(json!({ // additional property not allowed
+    #[case::invalid_root_additional_property(json!({
         "key": "sk-test",
         "allowed_models": [],
         "extra": "not allowed",
