@@ -1,5 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, stream::BoxStream};
+use serde::Serialize;
 
 use crate::{
     providers::ProviderError,
@@ -33,11 +34,11 @@ pub async fn chat_completion(
     Ok(completion)
 }
 
-pub async fn chat_completion_stream(
+pub async fn chat_completion_stream<T: Serialize>(
     client: reqwest::Client,
     url: &str,
     api_key: &str,
-    request: ChatCompletionRequest,
+    request: T,
 ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
     let response = client
         .post(url)

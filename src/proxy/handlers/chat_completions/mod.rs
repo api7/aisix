@@ -1,6 +1,6 @@
 mod types;
 
-use std::{convert::Infallible, time::Instant};
+use std::convert::Infallible;
 
 use axum::{
     Json,
@@ -48,22 +48,10 @@ pub async fn chat_completions(
     // Check if it's a streaming request
     let is_stream = request_data.stream.unwrap_or(false);
 
-    let start_time = Instant::now();
     let response = if is_stream {
-        handle_stream_request(provider, request_data, hook_ctx, start_time, span_ctx).await?
+        handle_stream_request(provider, request_data, hook_ctx, span_ctx).await?
     } else {
-        let response = handle_regular_request(provider, request_data, hook_ctx).await?;
-
-        let duration = start_time.elapsed().as_millis() as u64;
-        crate::utils::metrics::METRIC_LLM_LATENCY.record(
-            duration,
-            &[opentelemetry::KeyValue::new(
-                "model",
-                model.model.name.clone(),
-            )],
-        );
-
-        response
+        handle_regular_request(provider, request_data, hook_ctx).await?
     };
 
     Ok(response)
@@ -110,53 +98,52 @@ async fn handle_stream_request(
     provider: Box<dyn Provider>,
     request: ChatCompletionRequest,
     hook_ctx: HookContext,
-    start_time: Instant,
     span_ctx: SpanContext,
 ) -> Result<Response, ChatCompletionError> {
     use futures::stream::StreamExt;
 
-    let model = hook_ctx
-        .get::<ResourceEntry<Model>>()
-        .unwrap() //TODO: safe unwrap
-        .model
-        .clone();
     match provider.chat_completion_stream(request).await {
         Ok(stream) => {
             let stream_span = Span::root("sse_connection", span_ctx);
 
             let sse_stream = futures::stream::unfold(
-                (stream, stream_span, 0, model, hook_ctx, start_time, false),
-                |(mut stream, span, idx, model, mut hook_ctx, start_time, done)| async move {
+                (stream, stream_span, 0, hook_ctx, false),
+                |(mut stream, span, idx, mut hook_ctx, done)| async move {
                     if done {
+                        if let Err(err) = HOOK_MANAGER
+                            .post_call_streaming(&mut hook_ctx, HOOK_FILTER_ALL)
+                            .await
+                        {
+                            error!("Hook post_call_streaming error: {}", err);
+                        }
+
                         drop(span);
                         return None;
                     }
                     match stream.next().await {
                         Some(Ok(chunk)) => {
-                            // Record first-token latency once
+                            // Record first-token event
                             if idx == 0 {
-                                let latency = start_time.elapsed().as_millis() as u64;
-                                crate::utils::metrics::METRIC_LLM_FIRST_TOKEN_LATENCY.record(
-                                    latency,
-                                    &[opentelemetry::KeyValue::new("model", model.name.clone())],
-                                );
                                 span.add_event(TraceEvent::new("first token arrived"));
                             }
 
-                            //TODO: add chunk-level hook call here
-
-                            // Record token usage for last chunk
+                            // Record token usage
                             if let Some(usage) = &chunk.usage {
-                                if let Err(err) = HOOK_MANAGER
-                                    .post_call_streaming(
-                                        &mut hook_ctx,
-                                        &TokenUsage::from_chat_completion(usage),
-                                        HOOK_FILTER_ALL,
-                                    )
-                                    .await
-                                {
-                                    error!("Hook post_call_streaming error: {}", err);
-                                }
+                                hook_ctx.insert(TokenUsage::from_chat_completion(usage));
+                            }
+
+                            if let Err(err) = HOOK_MANAGER
+                                .post_call_streaming_chunk(
+                                    &mut hook_ctx,
+                                    &chunk,
+                                    idx,
+                                    HOOK_FILTER_ALL,
+                                )
+                                .await
+                            {
+                                error!("Hook post_call_streaming_chunk error: {}", err);
+                                drop(span);
+                                return None;
                             }
 
                             let event = match serde_json::to_string(&chunk) {
@@ -168,28 +155,17 @@ async fn handle_stream_request(
                                     Ok(SseEvent::default().data(""))
                                 }
                             };
-                            Some((
-                                event,
-                                (stream, span, idx + 1, model, hook_ctx, start_time, false),
-                            ))
+                            Some((event, (stream, span, idx + 1, hook_ctx, false)))
                         }
                         Some(Err(err)) => {
                             error!("Stream error: {}", err);
-                            // Drop span here too so it captures the correct end time
                             drop(span);
                             None
                         }
-                        None => {
-                            let duration = start_time.elapsed().as_millis() as u64;
-                            crate::utils::metrics::METRIC_LLM_LATENCY.record(
-                                duration,
-                                &[opentelemetry::KeyValue::new("model", model.name.clone())],
-                            );
-                            Some((
-                                Ok(SseEvent::default().data("[DONE]")),
-                                (stream, span, idx + 1, model, hook_ctx, start_time, true),
-                            ))
-                        }
+                        None => Some((
+                            Ok(SseEvent::default().data("[DONE]")),
+                            (stream, span, idx + 1, hook_ctx, true),
+                        )),
                     }
                 },
             );

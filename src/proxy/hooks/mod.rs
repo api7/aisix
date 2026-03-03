@@ -171,23 +171,17 @@ pub trait ProxyHook: Any + Send + Sync {
     }
 
     /// Post-call streaming chunk hook: wrap the entire stream for real-time processing
-    /// Used for guardrails and real-time content filtering on each chunk
-    /// Default: return original stream without wrapping
     async fn post_call_streaming_chunk(
         &self,
-        _ctx: &HookContext,
-        stream: futures::stream::BoxStream<'static, Result<ChatCompletionChunk>>,
-    ) -> Result<futures::stream::BoxStream<'static, Result<ChatCompletionChunk>>> {
-        Ok(stream)
+        _ctx: &mut HookContext,
+        _chunk: &ChatCompletionChunk,
+        _idx: i32,
+    ) -> Result<(), HookError> {
+        Ok(())
     }
 
     /// Post-call streaming hook: called once after stream ends
-    /// Used for rate limit post-check and other operations requiring complete usage data
-    async fn post_call_streaming(
-        &self,
-        _ctx: &mut HookContext,
-        _usage: &TokenUsage,
-    ) -> Result<(), HookError> {
+    async fn post_call_streaming(&self, _ctx: &mut HookContext) -> Result<(), HookError> {
         Ok(())
     }
 
@@ -268,28 +262,9 @@ impl HookManager {
     /// Execute all post_call_streaming_chunk hooks (wrap stream)
     pub async fn post_call_streaming_chunk<F>(
         &self,
-        ctx: &HookContext,
-        mut stream: futures::stream::BoxStream<'static, Result<ChatCompletionChunk>>,
-        filter: F,
-    ) -> Result<futures::stream::BoxStream<'static, Result<ChatCompletionChunk>>>
-    where
-        F: Fn(&Box<dyn ProxyHook>) -> bool,
-    {
-        for hook in &self.hooks {
-            if !filter(hook) {
-                continue;
-            }
-            stream = hook.post_call_streaming_chunk(ctx, stream).await?;
-        }
-        Ok(stream)
-    }
-
-    /// Execute all post_call_streaming hooks (after stream ends)
-    /// TODO: do not return HookError?
-    pub async fn post_call_streaming<F>(
-        &self,
         ctx: &mut HookContext,
-        usage: &TokenUsage,
+        chunk: &ChatCompletionChunk,
+        idx: i32,
         filter: F,
     ) -> Result<(), HookError>
     where
@@ -299,7 +274,26 @@ impl HookManager {
             if !filter(hook) {
                 continue;
             }
-            hook.post_call_streaming(ctx, usage).await?;
+            hook.post_call_streaming_chunk(ctx, chunk, idx).await?;
+        }
+        Ok(())
+    }
+
+    /// Execute all post_call_streaming hooks (after stream ends)
+    /// TODO: do not return HookError?
+    pub async fn post_call_streaming<F>(
+        &self,
+        ctx: &mut HookContext,
+        filter: F,
+    ) -> Result<(), HookError>
+    where
+        F: Fn(&Box<dyn ProxyHook>) -> bool,
+    {
+        for hook in &self.hooks {
+            if !filter(hook) {
+                continue;
+            }
+            hook.post_call_streaming(ctx).await?;
         }
         Ok(())
     }

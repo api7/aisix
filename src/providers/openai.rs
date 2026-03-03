@@ -14,6 +14,18 @@ use crate::{
 pub const IDENTIFIER: &str = "openai";
 const DEFAULT_API_BASE: &str = "https://api.openai.com/v1";
 
+#[derive(Serialize)]
+struct OpenAIChatCompletionRequestStreamOptions {
+    include_usage: bool,
+}
+
+#[derive(Serialize)]
+struct OpenAIChatCompletionRequest<T: Serialize> {
+    #[serde(flatten)]
+    inner: T,
+    stream_options: OpenAIChatCompletionRequestStreamOptions,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct OpenAIProviderConfig {
     pub api_key: String,
@@ -68,6 +80,13 @@ impl Provider for OpenAIProvider {
             "{}/chat/completions",
             self.config.api_base.as_deref().unwrap_or(DEFAULT_API_BASE)
         );
+
+        let request = OpenAIChatCompletionRequest {
+            inner: request,
+            stream_options: OpenAIChatCompletionRequestStreamOptions {
+                include_usage: true,
+            },
+        };
         chat_completion_stream(self.client.clone(), &url, &self.config.api_key, request).await
     }
 }
