@@ -1,17 +1,22 @@
+mod apikeys_api;
+mod auth;
+mod models_api;
+
 use std::sync::Arc;
 
 use axum::Router;
-
-mod auth;
+use uuid::Uuid;
 
 pub const TEST_ADMIN_KEY: &str = "test_admin_key";
 
-pub async fn create_router() -> Router {
+pub async fn create_router(etcd_prefix: Option<&str>) -> Router {
     let config = ai_gateway::config::Config {
         deployment: ai_gateway::config::Deployment {
             etcd: ai_gateway::config::etcd::Config {
-                host: vec!["http://localhost:2379".to_string()],
-                prefix: "/test".to_string(),
+                host: vec!["http://127.0.0.1:2379".to_string()],
+                prefix: etcd_prefix
+                    .unwrap_or(&format!("/{}", Uuid::new_v4()))
+                    .to_string(),
                 timeout: 5,
                 user: None,
                 password: None,
