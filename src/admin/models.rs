@@ -353,6 +353,18 @@ property "/provider_config" validation failed: "api_key" is a required property"
         "provider_config": { "api_key": "test_key" },
         "extra": "not allowed"
     }), false, Some(r#"property "/" validation failed: Additional properties are not allowed ('extra' was unexpected)"#))]
+    #[case(json!({ // ok with rate_limit
+        "name": "test",
+        "model": "openai/gpt-5",
+        "provider_config": { "api_key": "test_key" },
+        "rate_limit": {},
+    }), true, None)]
+    #[case(json!({ // invalid rate_limit type
+        "name": "test",
+        "model": "openai/gpt-5",
+        "provider_config": { "api_key": "test_key" },
+        "rate_limit": 123,
+    }), false, Some(r#"property "/rate_limit" validation failed: 123 is not of type "object""#))]
     fn schemas(
         #[case] input: serde_json::Value,
         #[case] ok: bool,

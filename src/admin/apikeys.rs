@@ -13,6 +13,7 @@ use crate::{
     admin::{
         AppState,
         types::{APIError, DeleteResponse, ItemResponse, ListResponse},
+        utils::format_jsonschema_error,
     },
     config::{PutEntry, entities::ApiKey},
 };
@@ -29,7 +30,8 @@ static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
             },
             "rate_limit": {"type": "object"}
         },
-        "required": ["key", "allowed_models"]
+        "required": ["key", "allowed_models"],
+        "additionalProperties": false
     })
 });
 static SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> =
@@ -173,22 +175,23 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<String>) -> Re
 async fn update(state: AppState, id: &str, body: Bytes) -> Response {
     let key = format!("/apikeys/{}", id);
 
-    let model = match serde_json::from_slice::<serde_json::Value>(&body) {
+    let api_key = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(value) => value,
         Err(err) => {
             return APIError::BadRequest(format!("Invalid JSON: {}", err)).into_response();
         }
     };
 
-    match SCHEMA_VALIDATOR.validate(&model) {
-        Ok(_) => {}
-        Err(err) => {
-            return APIError::BadRequest(format!("JSON schema validation error: {}", err))
-                .into_response();
-        }
-    };
+    let evaluation = SCHEMA_VALIDATOR.evaluate(&api_key);
+    if !evaluation.flag().valid {
+        return APIError::BadRequest(format!(
+            "JSON schema validation error: {}",
+            format_jsonschema_error(&evaluation)
+        ))
+        .into_response();
+    }
 
-    let api_key = match serde_json::from_value::<ApiKey>(model.clone()) {
+    let api_key = match serde_json::from_value::<ApiKey>(api_key) {
         Ok(value) => value,
         Err(err) => {
             return APIError::BadRequest(format!("Invalid API key data: {}", err)).into_response();
@@ -205,9 +208,10 @@ async fn update(state: AppState, id: &str, body: Bytes) -> Response {
     // Check if the API key already exists: slow path
     match state.config_provider.get_all::<ApiKey>("/apikeys").await {
         Ok(data) => {
-            if data.iter().any(|item| {
-                return item.value.key == api_key.key && item.key != key;
-            }) {
+            if data
+                .iter()
+                .any(|item| item.value.key == api_key.key && item.key != key)
+            {
                 return APIError::BadRequest("API key already exists".to_string()).into_response();
             }
         }
@@ -216,13 +220,13 @@ async fn update(state: AppState, id: &str, body: Bytes) -> Response {
         }
     }
 
-    match state.config_provider.put(&key, &model).await {
+    match state.config_provider.put(&key, &api_key).await {
         Ok(res) => match res {
             PutEntry::Created => (
                 StatusCode::CREATED,
                 ItemResponse {
                     key: key.to_string(),
-                    value: model,
+                    value: api_key,
                     created_index: None,
                     modified_index: None,
                 },
@@ -232,7 +236,7 @@ async fn update(state: AppState, id: &str, body: Bytes) -> Response {
                 StatusCode::OK,
                 ItemResponse {
                     key: key.to_string(),
-                    value: model,
+                    value: api_key,
                     created_index: None,
                     modified_index: None,
                 },
@@ -240,5 +244,67 @@ async fn update(state: AppState, id: &str, body: Bytes) -> Response {
                 .into_response(),
         },
         Err(err) => APIError::InternalError(err).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{SCHEMA_VALIDATOR, format_jsonschema_error};
+
+    #[rstest::rstest]
+    #[case(json!({ // ok
+        "key": "sk-test",
+        "allowed_models": [],
+    }), true, None)]
+    #[case(json!({ // ok with rate_limit
+        "key": "sk-test",
+        "allowed_models": ["openai/gpt-4"],
+        "rate_limit": {},
+    }), true, None)]
+    #[case(json!({ // missing key
+        "allowed_models": [],
+    }), false, Some(r#"property "/" validation failed: "key" is a required property"#))]
+    #[case(json!({ // missing allowed_models
+        "key": "sk-test",
+    }), false, Some(r#"property "/" validation failed: "allowed_models" is a required property"#))]
+    #[case(json!({ // invalid key type
+        "key": 123,
+        "allowed_models": [],
+    }), false, Some(r#"property "/key" validation failed: 123 is not of type "string""#))]
+    #[case(json!({ // invalid allowed_models type
+        "key": "sk-test",
+        "allowed_models": "not-an-array",
+    }), false, Some(r#"property "/allowed_models" validation failed: "not-an-array" is not of type "array""#))]
+    #[case(json!({ // invalid allowed_models element type
+        "key": "sk-test",
+        "allowed_models": [1],
+    }), false, Some(r#"property "/allowed_models" validation failed: 1 at index 0 is not of type "string""#))]
+    #[case(json!({ // invalid rate_limit type
+        "key": "sk-test",
+        "allowed_models": [],
+        "rate_limit": 123,
+    }), false, Some(r#"property "/rate_limit" validation failed: 123 is not of type "object""#))]
+    #[case(json!({ // additional property not allowed
+        "key": "sk-test",
+        "allowed_models": [],
+        "extra": "not allowed",
+    }), false, Some(r#"property "/" validation failed: Additional properties are not allowed ('extra' was unexpected)"#))]
+    fn schemas(
+        #[case] input: serde_json::Value,
+        #[case] ok: bool,
+        #[case] expected_error: Option<&str>,
+    ) {
+        let evaluation = SCHEMA_VALIDATOR.evaluate(&input);
+
+        assert_eq!(evaluation.flag().valid, ok, "unexpected evaluation result");
+        if !ok {
+            assert_eq!(
+                format_jsonschema_error(&evaluation),
+                expected_error.unwrap(),
+                "unexpected error message"
+            );
+        }
     }
 }
