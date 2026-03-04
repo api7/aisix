@@ -127,7 +127,7 @@ pub async fn trace(mut req: Request, next: Next) -> Response<TimedBody> {
     .await;
 
     let (parts, body) = response.into_parts();
-    let status = parts.status.clone();
+    let status = parts.status;
 
     let metric_attrs = [
         opentelemetry::KeyValue::new("method", method.to_string()),
@@ -181,7 +181,7 @@ fn generate_span(req: &Request) -> (Span, SpanContext) {
         .headers()
         .get(TRACEPARENT_HEADER)
         .and_then(|traceparent| SpanContext::decode_w3c_traceparent(traceparent.to_str().ok()?))
-        .unwrap_or_else(|| SpanContext::random());
+        .unwrap_or_else(SpanContext::random);
 
-    (Span::root(name, parent), parent.clone())
+    (Span::root(name, parent), parent)
 }

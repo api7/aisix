@@ -112,11 +112,11 @@ impl<'de> Deserialize<'de> for Model {
         Ok(Model {
             name: raw.name,
             model: ProviderModel {
-                provider: provider,
+                provider,
                 name: provider_model,
                 original_model: raw.model,
             },
-            provider_config: provider_config,
+            provider_config,
             rate_limit: raw.rate_limit,
         })
     }
@@ -128,7 +128,7 @@ impl HasRateLimit for ResourceEntry<Model> {
     }
 
     fn rate_limit_key(&self, metric: RateLimitMetric) -> String {
-        format!("model:{}:{}", self.name, metric.to_string())
+        format!("model:{}:{}", self.name, metric)
     }
 }
 

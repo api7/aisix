@@ -5,7 +5,7 @@ pub fn format_jsonschema_error(evaluation: &jsonschema::Evaluation) -> String {
             let path = err.instance_location.as_str();
             format!(
                 "property \"{}\" validation failed: {}",
-                path.is_empty().then(|| "/").unwrap_or(path),
+                if path.is_empty() { "/" } else { path },
                 err.error,
             )
         })

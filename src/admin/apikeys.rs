@@ -35,7 +35,7 @@ static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
     })
 });
 static SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> =
-    LazyLock::new(|| jsonschema::validator_for(&*SCHEMA).expect("Invalid JSON schema for API Key"));
+    LazyLock::new(|| jsonschema::validator_for(&SCHEMA).expect("Invalid JSON schema for API Key"));
 pub const OPENAPI_TAG: &str = "API Keys";
 
 #[utoipa::path(

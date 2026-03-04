@@ -153,10 +153,7 @@ impl ConfigProvider for EtcdConfigProvider {
                 for kv in resp.kvs() {
                     if let Ok(key) = kv.key_str() {
                         results.push(GetEntry {
-                            key: key
-                                .strip_prefix(&self.prefix)
-                                .unwrap_or_else(|| key)
-                                .to_string(),
+                            key: key.strip_prefix(&self.prefix).unwrap_or(key).to_string(),
                             value: kv.value().to_vec(),
                             create_revision: kv.create_revision(),
                             mod_revision: kv.mod_revision(),

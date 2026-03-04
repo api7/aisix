@@ -35,6 +35,12 @@ pub const HOOK_FILTER_NONE: fn(&Box<dyn ProxyHook>) -> bool = |_| false;
 /// Hook context containing request metadata and state
 pub struct HookContext(http::Extensions);
 
+impl Default for HookContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HookContext {
     pub fn new() -> Self {
         Self(http::Extensions::new())
@@ -208,6 +214,12 @@ pub trait ProxyHook: Any + Send + Sync {
 /// Hook manager for registering and executing hooks
 pub struct HookManager {
     pub hooks: Vec<Box<dyn ProxyHook>>,
+}
+
+impl Default for HookManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[allow(unused)]

@@ -22,7 +22,7 @@ impl HasRateLimit for ResourceEntry<ApiKey> {
     }
 
     fn rate_limit_key(&self, metric: RateLimitMetric) -> String {
-        format!("apikey:{}:{}", self.key, metric.to_string())
+        format!("apikey:{}:{}", self.key, metric)
     }
 }
 

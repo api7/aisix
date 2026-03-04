@@ -56,6 +56,12 @@ pub struct ResourceStore<T> {
     latest_mod_revision: Arc<ArcSwap<i64>>,
 }
 
+impl<T: Clone> Default for ResourceStore<T> {
+    fn default() -> Self {
+        ResourceStore::new()
+    }
+}
+
 impl<T: Clone> ResourceStore<T> {
     pub fn new() -> Self {
         Self {
@@ -100,7 +106,7 @@ impl<T: Clone> ResourceStore<T> {
 
     pub fn get(&self, key: &str) -> Option<ResourceEntry<T>> {
         let current: arc_swap::Guard<Arc<HashMap<String, ResourceEntry<T>>>> = self.data.load();
-        current.get(key).map(|entry| entry.clone())
+        current.get(key).cloned()
     }
 
     pub fn snapshot(&self) -> HashMap<String, ResourceEntry<T>> {
@@ -116,6 +122,8 @@ impl<T: Clone> ResourceStore<T> {
         **current
     }
 }
+
+pub type EntityValidator<T> = Arc<dyn Fn(&str, &T) -> Result<(), String> + Send + Sync>;
 
 /// Generic Entity Store that automatically subscribes to config prefixes and handles JSON deserialization
 #[derive(Clone)]
@@ -135,7 +143,7 @@ impl<T: DeserializeOwned + Clone + Send + Sync + 'static> EntityStore<T> {
         provider: Arc<dyn ConfigProvider + Send + Sync>,
         prefix: &str,
         entity_name: &str,
-        validator: Option<Arc<dyn Fn(&str, &T) -> Result<(), String> + Send + Sync>>,
+        validator: Option<EntityValidator<T>>,
     ) -> Self {
         let store = ResourceStore::new();
 
@@ -251,7 +259,7 @@ impl<T: DeserializeOwned + Clone + Send + Sync + 'static> EntityStore<T> {
         rx: &mut Receiver<ConfigEvent>,
         entity_name: &str,
         prefix: &str,
-        validator: Option<Arc<dyn Fn(&str, &T) -> Result<(), String> + Send + Sync>>,
+        validator: Option<EntityValidator<T>>,
     ) {
         info!("{} Watch started, prefix={}", entity_name, prefix);
 

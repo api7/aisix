@@ -90,7 +90,7 @@ pub trait RateLimiter: Send + Sync {
 }
 
 static RATE_LIMITER: LazyLock<Arc<dyn RateLimiter>> =
-    LazyLock::new(|| Arc::new(local::LocalRateLimiter::default()));
+    LazyLock::new(|| Arc::new(local::LocalRateLimiter));
 
 pub fn get_rate_limiter() -> Arc<dyn RateLimiter> {
     RATE_LIMITER.clone()

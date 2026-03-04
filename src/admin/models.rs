@@ -101,7 +101,7 @@ static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
     })
 });
 static SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> =
-    LazyLock::new(|| jsonschema::validator_for(&*SCHEMA).expect("Invalid JSON schema for Model"));
+    LazyLock::new(|| jsonschema::validator_for(&SCHEMA).expect("Invalid JSON schema for Model"));
 pub const OPENAPI_TAG: &str = "AI Models";
 
 #[utoipa::path(
@@ -192,12 +192,7 @@ pub async fn get(State(state): State<AppState>, Path(id): Path<String>) -> Respo
     )
 )]
 pub async fn post(State(state): State<AppState>, body: Bytes) -> Response {
-    update(
-        state,
-        &format!("/models/{}", Uuid::new_v4().to_string()),
-        body,
-    )
-    .await
+    update(state, &format!("/models/{}", Uuid::new_v4()), body).await
 }
 
 #[utoipa::path(
@@ -260,7 +255,7 @@ async fn update(state: AppState, key: &str, body: Bytes) -> Response {
         .into_response();
     }
 
-    match state.config_provider.put(&key, &model).await {
+    match state.config_provider.put(key, &model).await {
         Ok(res) => match res {
             PutEntry::Created => (
                 StatusCode::CREATED,

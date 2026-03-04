@@ -37,7 +37,7 @@ pub mod configs {
     };
 }
 
-static REQWEST_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| reqwest::Client::new());
+static REQWEST_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
 
 pub fn init_client() {
     let _ = REQWEST_CLIENT.clone();
