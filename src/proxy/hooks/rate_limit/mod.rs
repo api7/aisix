@@ -5,13 +5,13 @@ mod utils;
 use anyhow::Result;
 use async_trait::async_trait;
 use axum::{extract::Request, http::HeaderMap, response::IntoResponse};
+use types::*;
+use utils::{CheckPhase, RateLimitResponse, RateLimitState, run_check};
 
 use crate::{
     config::entities::{ApiKey, Model, ResourceEntry},
     proxy::hooks::{HookContext, HookError, ProxyHook, ResponseData, TokenUsage},
 };
-use types::*;
-use utils::{CheckPhase, RateLimitResponse, RateLimitState, run_check};
 
 pub struct RateLimitHook;
 

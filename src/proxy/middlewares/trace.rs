@@ -3,10 +3,12 @@
 //! 2. Generate access logs
 //! 3. Record request count and latency metrics
 
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use std::time::Instant;
+use std::{
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Instant,
+};
 
 use axum::{
     Error,

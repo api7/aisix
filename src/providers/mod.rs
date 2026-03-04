@@ -5,10 +5,12 @@ mod openai;
 mod openai_compatible;
 mod types;
 
+use std::sync::LazyLock;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use std::sync::LazyLock;
+use types::ProviderError;
 
 use crate::{
     config::entities::models::ProviderConfig,
@@ -17,7 +19,6 @@ use crate::{
         EmbeddingResponse,
     },
 };
-use types::ProviderError;
 
 // Re-export identifiers
 pub mod identifiers {

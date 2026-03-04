@@ -12,6 +12,7 @@ use axum::{
 };
 use fastrace::prelude::{Event as TraceEvent, *};
 use log::error;
+pub use types::*;
 
 use crate::{
     config::entities::{Model, ResourceEntry},
@@ -22,8 +23,6 @@ use crate::{
         middlewares::RequestModel,
     },
 };
-
-pub use types::*;
 
 #[fastrace::trace]
 pub async fn chat_completions(

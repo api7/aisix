@@ -41,6 +41,8 @@ async fn main() {
 }
 
 fn init_observability() {
+    use std::{borrow::Cow, time::Duration};
+
     use fastrace::collector::Config;
     use fastrace_opentelemetry::OpenTelemetryReporter;
     use logforth::{
@@ -54,7 +56,6 @@ fn init_observability() {
         Resource,
         metrics::{PeriodicReader, SdkMeterProvider, Temporality},
     };
-    use std::{borrow::Cow, time::Duration};
 
     // log
     logforth::starter_log::builder()

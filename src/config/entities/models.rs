@@ -1,3 +1,8 @@
+use std::{collections::HashMap, sync::Arc};
+
+use serde::{Deserialize, Serialize, de::Error};
+use utoipa::ToSchema;
+
 use super::{ConfigProvider, EntityStore};
 use crate::{
     config::entities::{
@@ -6,9 +11,6 @@ use crate::{
     },
     providers::{configs, identifiers},
 };
-use serde::{Deserialize, Serialize, de::Error};
-use std::{collections::HashMap, sync::Arc};
-use utoipa::ToSchema;
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(untagged)]

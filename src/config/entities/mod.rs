@@ -2,13 +2,12 @@ mod apikey;
 pub mod models;
 pub mod types;
 
-pub use apikey::ApiKey;
-pub use models::Model;
-
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
+pub use apikey::ApiKey;
 use arc_swap::ArcSwap;
 use log::{info, warn};
+pub use models::Model;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc::Receiver;
 

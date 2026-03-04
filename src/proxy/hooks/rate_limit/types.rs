@@ -8,9 +8,8 @@ use async_trait::async_trait;
 use skp_ratelimit::Quota;
 use thiserror::Error;
 
-use crate::config::entities::types::{RateLimit as RateLimitConfig, RateLimitMetric};
-
 use super::local;
+use crate::config::entities::types::{RateLimit as RateLimitConfig, RateLimitMetric};
 
 /// Rate limit error types
 #[derive(Debug, Clone, Error)]

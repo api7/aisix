@@ -63,10 +63,13 @@ impl RateLimiter for LocalRateLimiter {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{CheckPhase, RateLimitState, run_check};
-    use super::*;
-    use crate::config::entities::types::{HasRateLimit, RateLimit, RateLimitMetric};
     use http::HeaderMap;
+
+    use super::{
+        super::{CheckPhase, RateLimitState, run_check},
+        *,
+    };
+    use crate::config::entities::types::{HasRateLimit, RateLimit, RateLimitMetric};
 
     // --- MockEntity helper shared by integration tests ---
 
@@ -102,7 +105,7 @@ mod tests {
     /// Verifies that a request within quota succeeds and decrements the remaining count
     #[tokio::test]
     async fn test_local_rate_limiter_allows_within_limit() {
-        let limiter = LocalRateLimiter::default();
+        let limiter = LocalRateLimiter;
         let rule = RateLimitRule::new(10, 60);
 
         let result = limiter.incoming("test_key_1", rule, 1, true).await;
@@ -117,7 +120,7 @@ mod tests {
     /// Verifies that requests beyond quota are rejected with RateLimitError::Exceeded
     #[tokio::test]
     async fn test_local_rate_limiter_rejects_exceeding_limit() {
-        let limiter = LocalRateLimiter::default();
+        let limiter = LocalRateLimiter;
         let rule = RateLimitRule::new(3, 60);
         let key = "test_key_2";
 
@@ -145,7 +148,7 @@ mod tests {
     /// Verifies that check-only mode doesn't decrement the counter
     #[tokio::test]
     async fn test_local_rate_limiter_check_only_mode() {
-        let limiter = LocalRateLimiter::default();
+        let limiter = LocalRateLimiter;
         let rule = RateLimitRule::new(10, 60);
         let key = "test_key_3";
 
@@ -169,7 +172,7 @@ mod tests {
     /// Verifies that custom cost values are properly deducted from the quota
     #[tokio::test]
     async fn test_local_rate_limiter_custom_cost() {
-        let limiter = LocalRateLimiter::default();
+        let limiter = LocalRateLimiter;
         let rule = RateLimitRule::new(100, 60);
         let key = "test_key_4";
 
@@ -188,7 +191,7 @@ mod tests {
     /// Verifies that different keys have independent rate limit counters
     #[tokio::test]
     async fn test_local_rate_limiter_key_isolation() {
-        let limiter = LocalRateLimiter::default();
+        let limiter = LocalRateLimiter;
         let rule = RateLimitRule::new(5, 60);
 
         // Use up limit for key1
@@ -211,7 +214,7 @@ mod tests {
     /// Verifies that the window duration is correctly set to 60 seconds for per-minute limits
     #[tokio::test]
     async fn test_local_rate_limiter_per_minute_window() {
-        let limiter = LocalRateLimiter::default();
+        let limiter = LocalRateLimiter;
         let rule = RateLimitRule::new(10, 60); // 60 seconds window
 
         let result = limiter.incoming("test_key_5", rule, 1, true).await;
@@ -227,7 +230,7 @@ mod tests {
     /// Verifies that the window duration is correctly set to 86400 seconds for per-day limits
     #[tokio::test]
     async fn test_local_rate_limiter_per_day_window() {
-        let limiter = LocalRateLimiter::default();
+        let limiter = LocalRateLimiter;
         let rule = RateLimitRule::new(1000, 86400); // 86400 seconds (1 day) window
 
         let result = limiter.incoming("test_key_6", rule, 1, true).await;

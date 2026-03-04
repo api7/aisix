@@ -1,12 +1,13 @@
+use std::{collections::HashMap, sync::Arc};
+
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+use super::{EntityStore, ResourceEntry};
 use crate::config::{
     ConfigProvider,
     entities::types::{HasRateLimit, RateLimit, RateLimitMetric},
 };
-use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
-use utoipa::ToSchema;
-
-use super::{EntityStore, ResourceEntry};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiKey {

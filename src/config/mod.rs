@@ -5,7 +5,6 @@ mod types;
 use std::sync::Arc;
 
 use anyhow::Result;
-
 pub use types::*;
 
 /// Load configuration file

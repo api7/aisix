@@ -6,6 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use log::error;
+pub use types::*;
 
 use crate::{
     config::entities::{Model, ResourceEntry},
@@ -16,8 +17,6 @@ use crate::{
         middlewares::RequestModel,
     },
 };
-
-pub use types::*;
 
 pub async fn embeddings(
     State(_state): State<AppState>,

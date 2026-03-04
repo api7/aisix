@@ -69,7 +69,7 @@ impl EtcdConfigProvider {
         prefix: String,
         txs: Arc<DashMap<String, mpsc::Sender<ConfigEvent>>>,
     ) -> Result<()> {
-        let (_watcher, mut stream) = client
+        let mut stream = client
             .watch(
                 prefix.as_str(),
                 Some(etcd_client::WatchOptions::new().with_prefix()),

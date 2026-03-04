@@ -2,8 +2,10 @@ use ai_gateway::admin::PATH_PREFIX;
 use axum::body::Body;
 use http::{Method, StatusCode};
 
-use crate::admin::{TEST_ADMIN_KEY, create_router};
-use crate::utils::http::{build_req, oneshot_json};
+use crate::{
+    admin::{TEST_ADMIN_KEY, create_router},
+    utils::http::{build_req, oneshot_json},
+};
 
 fn apikeys_url(path: &str) -> String {
     format!("{PATH_PREFIX}/apikeys{path}")
@@ -35,7 +37,7 @@ async fn test_crud() {
         .as_str()
         .expect("response should contain key")
         .split('/')
-        .last()
+        .next_back()
         .expect("key should contain id")
         .to_string();
 
@@ -132,7 +134,7 @@ async fn test_duplicate_key_rejected() {
         .as_str()
         .expect("response should contain key")
         .split('/')
-        .last()
+        .next_back()
         .expect("key should contain id")
         .to_string();
 

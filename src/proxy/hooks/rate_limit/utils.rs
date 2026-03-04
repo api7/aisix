@@ -253,8 +253,9 @@ impl IntoResponse for RateLimitResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
 
     /// Test format_duration function with seconds only
     /// Verifies that durations less than 60 seconds are formatted as "Xs"
