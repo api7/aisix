@@ -5,10 +5,17 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
-    pub role: String,
     pub content: String,
+    pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatCompletionResponseFormat {
+    pub r#type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,7 +26,8 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f32>,
     //TODO logit_bias
-    //TODO logprobs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<bool>,
     //TODO max_completion_tokens
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
@@ -34,7 +42,8 @@ pub struct ChatCompletionRequest {
     //TODO prompt_cache_key
     //TODO prompt_cache_retention
     //TODO reasoning_effort
-    //TODO response_format
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ChatCompletionResponseFormat>,
     //TODO safety_identifier
     //TODO service_tier
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -47,7 +56,8 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     //TODO tool_choice
     //TODO tools
-    //TODO top_logprobs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]

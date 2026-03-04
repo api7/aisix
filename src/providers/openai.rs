@@ -6,9 +6,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     providers::{
         Provider, ProviderError,
-        openai_compatible::{chat_completion, chat_completion_stream},
+        openai_compatible::{URLFormatter, chat_completion, chat_completion_stream, embedding},
     },
-    proxy::types::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
+    proxy::types::{
+        ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingRequest,
+        EmbeddingResponse,
+    },
 };
 
 pub const IDENTIFIER: &str = "openai";
@@ -23,7 +26,17 @@ struct OpenAIChatCompletionRequestStreamOptions {
 struct OpenAIChatCompletionRequest<T: Serialize> {
     #[serde(flatten)]
     inner: T,
-    stream_options: OpenAIChatCompletionRequestStreamOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<OpenAIChatCompletionRequestStreamOptions>,
+}
+
+impl From<ChatCompletionRequest> for OpenAIChatCompletionRequest<ChatCompletionRequest> {
+    fn from(request: ChatCompletionRequest) -> Self {
+        Self {
+            inner: request,
+            stream_options: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -51,42 +64,59 @@ impl OpenAIProvider {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(unused)]
     pub fn with_base_url(mut self, base_url: String) -> Self {
         self.config.api_base = Some(base_url);
         self
     }
 }
 
+impl URLFormatter for OpenAIProvider {
+    fn format_url(&self, endpoint: &str) -> String {
+        format!(
+            "{}/{}",
+            self.config.api_base.as_deref().unwrap_or(DEFAULT_API_BASE),
+            endpoint
+        )
+    }
+}
+
 #[async_trait]
 impl Provider for OpenAIProvider {
-    #[fastrace::trace(properties = { "request": "{request:?}" })]
+    #[fastrace::trace]
     async fn chat_completion(
         &self,
         request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, ProviderError> {
-        let url = format!(
-            "{}/chat/completions",
-            self.config.api_base.as_deref().unwrap_or(DEFAULT_API_BASE)
-        );
-        chat_completion(self.client.clone(), &url, &self.config.api_key, request).await
+        let url = self.format_url("chat/completions");
+        chat_completion(
+            self.client.clone(),
+            &url,
+            &self.config.api_key,
+            OpenAIChatCompletionRequest::from(request),
+        )
+        .await
     }
 
     async fn chat_completion_stream(
         &self,
         request: ChatCompletionRequest,
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
-        let url = format!(
-            "{}/chat/completions",
-            self.config.api_base.as_deref().unwrap_or(DEFAULT_API_BASE)
-        );
+        let url = self.format_url("chat/completions");
 
-        let request = OpenAIChatCompletionRequest {
-            inner: request,
-            stream_options: OpenAIChatCompletionRequestStreamOptions {
-                include_usage: true,
-            },
-        };
+        let mut request = OpenAIChatCompletionRequest::from(request);
+        request.inner.stream = Some(true);
+        request.stream_options = Some(OpenAIChatCompletionRequestStreamOptions {
+            include_usage: true,
+        });
         chat_completion_stream(self.client.clone(), &url, &self.config.api_key, request).await
+    }
+
+    async fn embedding(
+        &self,
+        request: EmbeddingRequest,
+    ) -> Result<EmbeddingResponse, ProviderError> {
+        let url = self.format_url("embeddings");
+        embedding(self.client.clone(), &url, &self.config.api_key, request).await
     }
 }

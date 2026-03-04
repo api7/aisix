@@ -14,8 +14,9 @@ use axum::{
 pub mod types {
     pub use super::handlers::{
         chat_completions::{
-            ChatCompletionChoice, ChatCompletionChunk, ChatCompletionRequest,
-            ChatCompletionResponse, ChatCompletionUsage, ChatMessage,
+            ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice,
+            ChatCompletionChunkDelta, ChatCompletionRequest, ChatCompletionResponse,
+            ChatCompletionUsage, ChatMessage,
         },
         embeddings::{EmbeddingRequest, EmbeddingResponse},
     };

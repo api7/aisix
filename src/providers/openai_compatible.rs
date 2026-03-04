@@ -5,16 +5,19 @@ use serde::Serialize;
 use crate::{
     providers::ProviderError,
     proxy::types::{
-        ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingRequest,
-        EmbeddingResponse,
+        ChatCompletionChunk, ChatCompletionResponse, EmbeddingRequest, EmbeddingResponse,
     },
 };
 
-pub async fn chat_completion(
+pub trait URLFormatter {
+    fn format_url(&self, endpoint: &str) -> String;
+}
+
+pub async fn chat_completion<T: Serialize>(
     client: reqwest::Client,
     url: &str,
     api_key: &str,
-    request: ChatCompletionRequest,
+    request: T,
 ) -> Result<ChatCompletionResponse, ProviderError> {
     let response = client
         .post(url)
