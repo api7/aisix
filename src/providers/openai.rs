@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     providers::{
-        Provider, ProviderError,
-        openai_compatible::{URLFormatter, chat_completion, chat_completion_stream, embedding},
+        Provider, ProviderError, URLFormatter,
+        openai_compatible::{chat_completion, chat_completion_stream, embedding},
     },
     proxy::types::{
         ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, EmbeddingRequest,
@@ -53,18 +53,16 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
-    #[fastrace::trace]
     pub fn new(client: Client, api_key: String) -> Self {
         Self {
             config: OpenAIProviderConfig {
                 api_key: api_key.clone(),
-                api_base: Some(DEFAULT_API_BASE.to_string()),
+                api_base: None,
             },
             client,
         }
     }
 
-    #[allow(unused)]
     pub fn with_base_url(mut self, base_url: String) -> Self {
         self.config.api_base = Some(base_url);
         self

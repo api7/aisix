@@ -15,6 +15,7 @@ use crate::{
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(untagged)]
 pub enum ProviderConfig {
+    Anthropic(configs::AnthropicProviderConfig),
     DeepSeek(configs::DeepSeekProviderConfig),
     Gemini(configs::GeminiProviderConfig),
     OpenAI(configs::OpenAIProviderConfig),
@@ -27,6 +28,11 @@ impl ProviderConfig {
         json_value: &serde_json::Value,
     ) -> Result<Self, serde_json::Error> {
         match provider {
+            identifiers::ANTHROPIC => {
+                let config =
+                    serde_json::from_value::<configs::AnthropicProviderConfig>(json_value.clone())?;
+                Ok(ProviderConfig::Anthropic(config))
+            }
             identifiers::DEEPSEEK => {
                 let config =
                     serde_json::from_value::<configs::DeepSeekProviderConfig>(json_value.clone())?;
@@ -51,6 +57,7 @@ impl ProviderConfig {
     }
 }
 
+pub static MODELS_PATTERN: &str = "^(anthropic|deepseek|gemini|openai|mock)/.+$";
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ProviderModel {
     #[serde(skip)]
@@ -59,7 +66,7 @@ pub struct ProviderModel {
     pub name: String,
 
     #[serde(rename = "model")]
-    #[schema(pattern = "^(deepseek|gemini|openai|mock)/.+$")]
+    #[schema(pattern = "^(anthropic|deepseek|gemini|openai|mock)/.+$")]
     pub original_model: String,
 }
 

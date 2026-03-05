@@ -58,6 +58,8 @@ etcdctl put /aisix/models/deepseek-chat '{"name":"@my-ds/chat","model":"deepseek
 etcdctl put /aisix/models/mock '{"name":"mock","model":"mock/mock","provider_config":{},"rate_limit":{"tpm":150}}'
 
 etcdctl put /aisix/models/gemini-2_5-flash '{"name":"@my-gemini/gemini-2.5-flash","model":"gemini/gemini-2.5-flash","provider_config":{"api_key":"<your_key>"}}'
+
+etcdctl put /aisix/models/anthropic-sonnet-4_5 '{"name":"@my-anthropic/sonnet-4.5","model":"anthropic/claude-sonnet-4-6","provider_config":{"api_key":"<your_key>"}}'
 ```
 
 #### Embeddings

@@ -15,7 +15,10 @@ use crate::{
         types::{APIError, DeleteResponse, ItemResponse, ListResponse},
         utils::format_jsonschema_error,
     },
-    config::{PutEntry, entities::Model},
+    config::{
+        PutEntry,
+        entities::{Model, models::MODELS_PATTERN},
+    },
 };
 
 static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
@@ -26,7 +29,7 @@ static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
             "name": {"type": "string"},
             "model": {
                 "type": "string",
-                "pattern": "^(deepseek|gemini|openai|mock)/.+$"
+                "pattern": MODELS_PATTERN
             },
             "provider_config": {"type": "object"},
             "rate_limit": {"type": "object"}
@@ -37,33 +40,7 @@ static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
             {
                 "if": {
                     "properties": {
-                        "model": { "pattern": "^deepseek/" }
-                    },
-                    "required": ["model"]
-                },
-                "then": {
-                    "properties": {
-                        "provider_config": { "$ref": "#/$defs/openai_compatible" }
-                    }
-                }
-            },
-            {
-                "if": {
-                    "properties": {
-                        "model": { "pattern": "^gemini/" }
-                    },
-                    "required": ["model"]
-                },
-                "then": {
-                    "properties": {
-                        "provider_config": { "$ref": "#/$defs/openai_compatible" }
-                    }
-                }
-            },
-            {
-                "if": {
-                    "properties": {
-                        "model": { "pattern": "^openai/" }
+                        "model": { "pattern": "^(anthropic|deepseek|gemini|openai)/.+$" }
                     },
                     "required": ["model"]
                 },
@@ -287,6 +264,7 @@ mod tests {
     use serde_json::json;
 
     use super::{SCHEMA_VALIDATOR, format_jsonschema_error};
+    use crate::config::entities::models::MODELS_PATTERN;
 
     #[rstest::rstest]
     #[case::ok(json!({
@@ -297,43 +275,41 @@ mod tests {
     #[case::missing_name(json!({
         "model": "mock/mock",
         "provider_config": {},
-    }), false, Some(r#"property "/" validation failed: "name" is a required property"#))]
+    }), false, Some(r#"property "/" validation failed: "name" is a required property"#.to_string()))]
     #[case::missing_model(json!({
         "name": "test",
         "provider_config": {},
-    }), false, Some(r#"property "/" validation failed: "model" is a required property"#))]
+    }), false, Some(r#"property "/" validation failed: "model" is a required property"#.to_string()))]
     #[case::missing_provider_config(json!({
         "name": "test",
         "model": "deepseek/deepseek-chat",
-    }), false, Some(r#"property "/" validation failed: "provider_config" is a required property"#))]
+    }), false, Some(r#"property "/" validation failed: "provider_config" is a required property"#.to_string()))]
     #[case::invalid_name_type(json!({
         "name": 123,
         "model": "mock/mock",
         "provider_config": {},
-    }), false, Some(r#"property "/name" validation failed: 123 is not of type "string""#))]
+    }), false, Some(r#"property "/name" validation failed: 123 is not of type "string""#.to_string()))]
     #[case::invalid_model_type(json!({
         "name": "test",
         "model": 123,
         "provider_config": {},
     }), false, Some(r#"property "/model" validation failed: 123 is not of type "string"
-property "/provider_config" validation failed: "api_key" is a required property
-property "/provider_config" validation failed: "api_key" is a required property
-property "/provider_config" validation failed: "api_key" is a required property"#))]
+property "/provider_config" validation failed: "api_key" is a required property"#.to_string()))]
     #[case::invalid_model_pattern(json!({
         "name": "test",
         "model": "invalid",
         "provider_config": {},
-    }), false, Some(r#"property "/model" validation failed: "invalid" does not match "^(deepseek|gemini|openai|mock)/.+$""#))]
+    }), false, Some(format!(r#"property "/model" validation failed: "invalid" does not match "{}""#, MODELS_PATTERN)))]
     #[case::invalid_provider_config_type(json!({
         "name": "test",
         "model": "mock/mock",
         "provider_config": 123,
-    }), false, Some(r#"property "/provider_config" validation failed: 123 is not of type "object""#))]
+    }), false, Some(r#"property "/provider_config" validation failed: 123 is not of type "object""#.to_string()))]
     #[case::invalid_provider_config_for_specific_vendor(json!({
         "name": "test",
         "model": "deepseek/deepseek-chat",
         "provider_config": {},
-    }), false, Some(r#"property "/provider_config" validation failed: "api_key" is a required property"#))]
+    }), false, Some(r#"property "/provider_config" validation failed: "api_key" is a required property"#.to_string()))]
     #[case::invalid_provider_config_additional_property(json!({
         "name": "test",
         "model": "deepseek/deepseek-chat",
@@ -341,13 +317,13 @@ property "/provider_config" validation failed: "api_key" is a required property"
             "api_key": "test_key",
             "additional": "not allowed"
         },
-    }), false, Some(r#"property "/provider_config" validation failed: Additional properties are not allowed ('additional' was unexpected)"#))]
+    }), false, Some(r#"property "/provider_config" validation failed: Additional properties are not allowed ('additional' was unexpected)"#.to_string()))]
     #[case::invalid_root_additional_property(json!({
         "name": "test",
         "model": "deepseek/deepseek-chat",
         "provider_config": { "api_key": "test_key" },
         "extra": "not allowed"
-    }), false, Some(r#"property "/" validation failed: Additional properties are not allowed ('extra' was unexpected)"#))]
+    }), false, Some(r#"property "/" validation failed: Additional properties are not allowed ('extra' was unexpected)"#.to_string()))]
     #[case::ok_with_rate_limit(json!({
         "name": "test",
         "model": "openai/gpt-5",
@@ -359,11 +335,11 @@ property "/provider_config" validation failed: "api_key" is a required property"
         "model": "openai/gpt-5",
         "provider_config": { "api_key": "test_key" },
         "rate_limit": 123,
-    }), false, Some(r#"property "/rate_limit" validation failed: 123 is not of type "object""#))]
+    }), false, Some(r#"property "/rate_limit" validation failed: 123 is not of type "object""#.to_string()))]
     fn schemas(
         #[case] input: serde_json::Value,
         #[case] ok: bool,
-        #[case] expected_error: Option<&str>,
+        #[case] expected_error: Option<String>,
     ) {
         let evaluation = SCHEMA_VALIDATOR.evaluate(&input);
 

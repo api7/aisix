@@ -9,10 +9,6 @@ use crate::{
     },
 };
 
-pub trait URLFormatter {
-    fn format_url(&self, endpoint: &str) -> String;
-}
-
 pub async fn chat_completion<T: Serialize>(
     client: reqwest::Client,
     url: &str,

@@ -1,3 +1,4 @@
+mod anthropic;
 mod deepseek;
 mod gemini;
 mod mock;
@@ -22,8 +23,9 @@ use crate::{
 
 // Re-export identifiers
 pub mod identifiers {
-    use super::{deepseek, gemini, mock, openai};
+    use super::{anthropic, deepseek, gemini, mock, openai};
 
+    pub const ANTHROPIC: &str = anthropic::IDENTIFIER;
     pub const DEEPSEEK: &str = deepseek::IDENTIFIER;
     pub const GEMINI: &str = gemini::IDENTIFIER;
     pub const MOCK: &str = mock::IDENTIFIER;
@@ -33,8 +35,8 @@ pub mod identifiers {
 // Re-export provider config types
 pub mod configs {
     pub use super::{
-        deepseek::DeepSeekProviderConfig, gemini::GeminiProviderConfig, mock::MockProviderConfig,
-        openai::OpenAIProviderConfig,
+        anthropic::AnthropicProviderConfig, deepseek::DeepSeekProviderConfig,
+        gemini::GeminiProviderConfig, mock::MockProviderConfig, openai::OpenAIProviderConfig,
     };
 }
 
@@ -47,18 +49,38 @@ pub fn init_client() {
 #[fastrace::trace(short_name = true)]
 pub fn create_provider(config: &ProviderConfig) -> Box<dyn Provider> {
     match config {
-        ProviderConfig::OpenAI(config) => Box::new(openai::OpenAIProvider::new(
-            REQWEST_CLIENT.clone(),
-            config.api_key.clone(),
-        )),
-        ProviderConfig::DeepSeek(config) => Box::new(deepseek::DeepSeekProvider::new(
-            REQWEST_CLIENT.clone(),
-            config.api_key.clone(),
-        )),
-        ProviderConfig::Gemini(config) => Box::new(gemini::GeminiProvider::new(
-            REQWEST_CLIENT.clone(),
-            config.api_key.clone(),
-        )),
+        ProviderConfig::Anthropic(config) => {
+            let mut provider =
+                anthropic::AnthropicProvider::new(REQWEST_CLIENT.clone(), config.api_key.clone());
+            if let Some(api_base) = config.api_base.clone() {
+                provider = provider.with_base_url(api_base);
+            }
+            Box::new(provider)
+        }
+        ProviderConfig::OpenAI(config) => {
+            let mut provider =
+                openai::OpenAIProvider::new(REQWEST_CLIENT.clone(), config.api_key.clone());
+            if let Some(api_base) = config.api_base.clone() {
+                provider = provider.with_base_url(api_base);
+            }
+            Box::new(provider)
+        }
+        ProviderConfig::DeepSeek(config) => {
+            let mut provider =
+                deepseek::DeepSeekProvider::new(REQWEST_CLIENT.clone(), config.api_key.clone());
+            if let Some(api_base) = config.api_base.clone() {
+                provider = provider.with_base_url(api_base);
+            }
+            Box::new(provider)
+        }
+        ProviderConfig::Gemini(config) => {
+            let mut provider =
+                gemini::GeminiProvider::new(REQWEST_CLIENT.clone(), config.api_key.clone());
+            if let Some(api_base) = config.api_base.clone() {
+                provider = provider.with_base_url(api_base);
+            }
+            Box::new(provider)
+        }
         ProviderConfig::Mock(_config) => Box::new(mock::MockProvider::default()),
     }
 }
@@ -85,4 +107,8 @@ pub trait Provider: Send + Sync {
     ) -> Result<EmbeddingResponse, ProviderError> {
         Err(ProviderError::NotYetImplemented)
     }
+}
+
+trait URLFormatter {
+    fn format_url(&self, endpoint: &str) -> String;
 }
