@@ -1,10 +1,10 @@
-mod apikey;
+pub mod apikeys;
 pub mod models;
 pub mod types;
 
 use std::{collections::HashMap, ops::Deref, sync::Arc};
 
-pub use apikey::ApiKey;
+pub use apikeys::ApiKey;
 use arc_swap::ArcSwap;
 use log::{info, warn};
 pub use models::Model;
@@ -16,13 +16,13 @@ use crate::config::{ConfigEvent, ConfigProvider, GetEntry};
 #[derive(Clone)]
 pub struct ResourceRegistry {
     pub models: models::ModelsStore,
-    pub apikeys: apikey::ApiKeysStore,
+    pub apikeys: apikeys::ApiKeysStore,
 }
 
 impl ResourceRegistry {
     pub async fn new(provider: Arc<dyn ConfigProvider + Send + Sync>) -> Self {
         let models = models::ModelsStore::new(provider.clone()).await;
-        let apikeys = apikey::ApiKeysStore::new(provider).await;
+        let apikeys = apikeys::ApiKeysStore::new(provider).await;
 
         Self { models, apikeys }
     }
@@ -122,7 +122,7 @@ impl<T: Clone> ResourceStore<T> {
     }
 }
 
-pub type EntityValidator<T> = Arc<dyn Fn(&str, &T) -> Result<(), String> + Send + Sync>;
+pub type EntityValidator<T> = fn(&str, &T) -> Result<(), String>;
 
 /// Generic Entity Store that automatically subscribes to config prefixes and handles JSON deserialization
 #[derive(Clone)]
@@ -214,17 +214,10 @@ impl<T: DeserializeOwned + Clone + Send + Sync + 'static> EntityStore<T> {
                 let store_clone = store.clone();
                 let entity_name = entity_name.to_string();
                 let prefix = prefix.to_string();
-                let validator_clone = validator.clone();
 
                 tokio::spawn(async move {
-                    Self::consume_events(
-                        store_clone,
-                        &mut rx,
-                        &entity_name,
-                        &prefix,
-                        validator_clone,
-                    )
-                    .await;
+                    Self::consume_events(store_clone, &mut rx, &entity_name, &prefix, validator)
+                        .await;
                 });
             }
             Err(_) => {

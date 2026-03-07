@@ -1,19 +1,46 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use utoipa::ToSchema;
 
 use super::{EntityStore, ResourceEntry};
-use crate::config::{
-    ConfigProvider,
-    entities::types::{HasRateLimit, RateLimit, RateLimitMetric},
+use crate::{
+    config::{
+        ConfigProvider,
+        entities::types::{HasRateLimit, RateLimit, RateLimitMetric},
+    },
+    utils::jsonschema::format_evaluation_error,
 };
+
+static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema#",
+        "type": "object",
+        "properties": {
+            "key": {"type": "string"},
+            "allowed_models": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "rate_limit": {"type": "object"}
+        },
+        "required": ["key", "allowed_models"],
+        "additionalProperties": false
+    })
+});
+pub static SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> =
+    LazyLock::new(|| jsonschema::validator_for(&SCHEMA).expect("Invalid JSON schema for API Key"));
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiKey {
     pub key: String,
     pub allowed_models: Vec<String>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
 }
 
@@ -27,6 +54,21 @@ impl HasRateLimit for ResourceEntry<ApiKey> {
     }
 }
 
+fn validate(key: &str, value: &ApiKey) -> Result<(), String> {
+    let evaluation = SCHEMA_VALIDATOR.evaluate(
+        &serde_json::to_value(value)
+            .map_err(|e| format!("Failed to serialize API key for validation: {}", e))?,
+    );
+    if !evaluation.flag().valid {
+        return Err(format!(
+            r#"JSON schema validation error on apikey "{key}": {}"#,
+            format_evaluation_error(&evaluation)
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct ApiKeysStore {
     store: EntityStore<ApiKey>,
@@ -35,7 +77,7 @@ pub struct ApiKeysStore {
 impl ApiKeysStore {
     pub async fn new(provider: Arc<dyn ConfigProvider + Send + Sync>) -> Self {
         Self {
-            store: EntityStore::new(provider, "/apikeys/", "apikeys", None).await,
+            store: EntityStore::new(provider, "/apikeys/", "apikeys", Some(validate)).await,
         }
     }
 

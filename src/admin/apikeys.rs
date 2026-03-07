@@ -1,41 +1,23 @@
-use std::sync::LazyLock;
-
 use axum::{
     extract::{Path, State},
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
 use http::StatusCode;
-use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
     admin::{
         AppState,
         types::{APIError, DeleteResponse, ItemResponse, ListResponse},
-        utils::format_jsonschema_error,
     },
-    config::{PutEntry, entities::ApiKey},
+    config::{
+        PutEntry,
+        entities::{ApiKey, apikeys::SCHEMA_VALIDATOR},
+    },
+    utils::jsonschema::format_evaluation_error,
 };
 
-static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema#",
-        "type": "object",
-        "properties": {
-            "key": {"type": "string"},
-            "allowed_models": {
-                "type": "array",
-                "items": { "type": "string" }
-            },
-            "rate_limit": {"type": "object"}
-        },
-        "required": ["key", "allowed_models"],
-        "additionalProperties": false
-    })
-});
-static SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> =
-    LazyLock::new(|| jsonschema::validator_for(&SCHEMA).expect("Invalid JSON schema for API Key"));
 pub const OPENAPI_TAG: &str = "API Keys";
 
 #[utoipa::path(
@@ -186,7 +168,7 @@ async fn update(state: AppState, id: &str, body: Bytes) -> Response {
     if !evaluation.flag().valid {
         return APIError::BadRequest(format!(
             "JSON schema validation error: {}",
-            format_jsonschema_error(&evaluation)
+            format_evaluation_error(&evaluation)
         ))
         .into_response();
     }
@@ -251,7 +233,7 @@ async fn update(state: AppState, id: &str, body: Bytes) -> Response {
 mod tests {
     use serde_json::json;
 
-    use super::{SCHEMA_VALIDATOR, format_jsonschema_error};
+    use super::{SCHEMA_VALIDATOR, format_evaluation_error};
 
     #[rstest::rstest]
     #[case::ok(json!({
@@ -301,7 +283,7 @@ mod tests {
         assert_eq!(evaluation.flag().valid, ok, "unexpected evaluation result");
         if !ok {
             assert_eq!(
-                format_jsonschema_error(&evaluation),
+                format_evaluation_error(&evaluation),
                 expected_error.unwrap(),
                 "unexpected error message"
             );

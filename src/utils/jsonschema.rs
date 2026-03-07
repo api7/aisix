@@ -1,4 +1,4 @@
-pub fn format_jsonschema_error(evaluation: &jsonschema::Evaluation) -> String {
+pub fn format_evaluation_error(evaluation: &jsonschema::Evaluation) -> String {
     evaluation
         .iter_errors()
         .map(|err| {

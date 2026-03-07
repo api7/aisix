@@ -1,7 +1,6 @@
 mod apikeys;
 mod models;
 mod types;
-mod utils;
 
 use std::sync::Arc;
 

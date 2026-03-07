@@ -1,6 +1,10 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 
 use serde::{Deserialize, Serialize, de::Error};
+use serde_json::json;
 use utoipa::ToSchema;
 
 use super::{ConfigProvider, EntityStore};
@@ -10,7 +14,67 @@ use crate::{
         types::{HasRateLimit, RateLimit, RateLimitMetric},
     },
     providers::{configs, identifiers},
+    utils::jsonschema::format_evaluation_error,
 };
+
+static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema#",
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "model": {
+                "type": "string",
+                "pattern": MODELS_PATTERN
+            },
+            "provider_config": {"type": "object"},
+            "rate_limit": {"type": "object"}
+        },
+        "required": ["name", "model", "provider_config"],
+        "additionalProperties": false,
+        "allOf": [
+            {
+                "if": {
+                    "properties": {
+                        "model": { "pattern": "^(anthropic|deepseek|gemini|openai)/.+$" }
+                    },
+                    "required": ["model"]
+                },
+                "then": {
+                    "properties": {
+                        "provider_config": { "$ref": "#/$defs/openai_compatible" }
+                    }
+                }
+            },
+            {
+                "if": {
+                    "properties": {
+                        "model": { "pattern": "^mock/" }
+                    },
+                    "required": ["model"]
+                },
+                "then": {
+                    "properties": {
+                        "provider_config": { "additionalProperties": false }
+                    },
+                }
+            }
+        ],
+        "$defs": {
+            "openai_compatible": {
+                "type": "object",
+                "required": ["api_key"],
+                "properties": {
+                    "api_key": {"type": "string"},
+                    "api_base": {"type": "string"}
+                },
+                "additionalProperties": false
+            }
+        }
+    })
+});
+pub static SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> =
+    LazyLock::new(|| jsonschema::validator_for(&SCHEMA).expect("Invalid JSON schema for Model"));
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(untagged)]
@@ -141,6 +205,21 @@ impl HasRateLimit for ResourceEntry<Model> {
     }
 }
 
+fn validate(key: &str, value: &Model) -> Result<(), String> {
+    let evaluation = SCHEMA_VALIDATOR.evaluate(
+        &serde_json::to_value(value)
+            .map_err(|e| format!("Failed to serialize model for validation: {}", e))?,
+    );
+    if !evaluation.flag().valid {
+        return Err(format!(
+            r#"JSON schema validation error on model "{key}": {}"#,
+            format_evaluation_error(&evaluation)
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct ModelsStore {
     store: EntityStore<Model>,
@@ -149,7 +228,7 @@ pub struct ModelsStore {
 impl ModelsStore {
     pub async fn new(provider: Arc<dyn ConfigProvider + Send + Sync>) -> Self {
         Self {
-            store: EntityStore::new(provider, "/models/", "models", None).await,
+            store: EntityStore::new(provider, "/models/", "models", Some(validate)).await,
         }
     }
 
