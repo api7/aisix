@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use utoipa::ToSchema;
 
-use super::{EntityStore, ResourceEntry};
+use super::{EntityStore, IndexFn, ResourceEntry};
 use crate::{
     config::{
         ConfigProvider,
@@ -74,14 +74,17 @@ pub struct ApiKeysStore {
     store: EntityStore<ApiKey>,
 }
 
+static INDEX_FNS: &[IndexFn<ApiKey>] = &[("by_key", |k: &ApiKey| Some(k.key.clone()))];
+
 impl ApiKeysStore {
     pub async fn new(provider: Arc<dyn ConfigProvider + Send + Sync>) -> Self {
         Self {
-            store: EntityStore::new(provider, "/apikeys/", "apikeys", Some(validate)).await,
+            store: EntityStore::new(provider, "/apikeys/", "apikeys", Some(validate), INDEX_FNS)
+                .await,
         }
     }
 
-    pub fn list(&self) -> HashMap<String, ResourceEntry<ApiKey>> {
+    pub fn list(&self) -> Arc<HashMap<String, ResourceEntry<ApiKey>>> {
         self.store.list()
     }
 
@@ -89,14 +92,8 @@ impl ApiKeysStore {
         self.store.get(username)
     }
 
-    pub fn get_by_key(&self, api_key: &str) -> Option<(String, ResourceEntry<ApiKey>)> {
-        //TODO pre-computed map
-        for (username, apikey) in self.store.list().into_iter() {
-            if apikey.key == api_key {
-                return Some((username, apikey));
-            }
-        }
-        None
+    pub fn get_by_key(&self, api_key: &str) -> Option<ResourceEntry<ApiKey>> {
+        self.store.get_by_secondary("by_key", api_key)
     }
 
     #[fastrace::trace]

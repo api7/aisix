@@ -76,7 +76,7 @@ pub async fn auth(
     };
 
     req.extensions_mut()
-        .insert::<ResourceEntry<ApiKey>>(api_key.1);
+        .insert::<ResourceEntry<ApiKey>>(api_key);
 
     Ok(next.run(req).await)
 }

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize, de::Error};
 use serde_json::json;
 use utoipa::ToSchema;
 
-use super::{ConfigProvider, EntityStore};
+use super::{ConfigProvider, EntityStore, IndexFn};
 use crate::{
     config::entities::{
         ResourceEntry,
@@ -225,14 +225,17 @@ pub struct ModelsStore {
     store: EntityStore<Model>,
 }
 
+static INDEX_FNS: &[IndexFn<Model>] = &[("by_name", |m: &Model| Some(m.name.clone()))];
+
 impl ModelsStore {
     pub async fn new(provider: Arc<dyn ConfigProvider + Send + Sync>) -> Self {
         Self {
-            store: EntityStore::new(provider, "/models/", "models", Some(validate)).await,
+            store: EntityStore::new(provider, "/models/", "models", Some(validate), INDEX_FNS)
+                .await,
         }
     }
 
-    pub fn list(&self) -> HashMap<String, ResourceEntry<Model>> {
+    pub fn list(&self) -> Arc<HashMap<String, ResourceEntry<Model>>> {
         self.store.list()
     }
 
@@ -241,12 +244,7 @@ impl ModelsStore {
     }
 
     pub fn get_by_name(&self, name: &str) -> Option<ResourceEntry<Model>> {
-        for model in self.store.list().values() {
-            if model.name == name {
-                return Some(model.clone());
-            }
-        }
-        None
+        self.store.get_by_secondary("by_name", name)
     }
 
     pub fn latest_mod_revision(&self) -> i64 {

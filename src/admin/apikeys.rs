@@ -181,8 +181,8 @@ async fn update(state: AppState, id: &str, body: Bytes) -> Response {
     };
 
     // Check if the API key already exists: fast path
-    if let Some((found_id, _)) = state.resources.apikeys.get_by_key(&api_key.key)
-        && found_id != id
+    if let Some(found) = state.resources.apikeys.get_by_key(&api_key.key)
+        && found.id != id
     {
         return APIError::BadRequest("API key already exists".to_string()).into_response();
     }
