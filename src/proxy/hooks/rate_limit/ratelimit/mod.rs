@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use skp_ratelimit::Quota;
 use thiserror::Error;
 
-use super::local;
+mod local;
+pub mod utils;
+
 use crate::config::entities::types::{RateLimit as RateLimitConfig, RateLimitMetric};
 
 /// Rate limit error types
@@ -89,7 +91,7 @@ pub trait RateLimiter: Send + Sync {
 }
 
 static RATE_LIMITER: LazyLock<Arc<dyn RateLimiter>> =
-    LazyLock::new(|| Arc::new(local::LocalRateLimiter));
+    LazyLock::new(|| Arc::new(self::local::LocalRateLimiter));
 
 pub fn get_rate_limiter() -> Arc<dyn RateLimiter> {
     RATE_LIMITER.clone()

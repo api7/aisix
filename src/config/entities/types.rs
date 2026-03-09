@@ -9,7 +9,7 @@ pub enum RateLimitMetric {
     TPD,
     RPM,
     RPD,
-    //TODO concurrency
+    Concurrency,
 }
 
 impl Display for RateLimitMetric {
@@ -19,6 +19,7 @@ impl Display for RateLimitMetric {
             RateLimitMetric::TPD => write!(f, "tpd"),
             RateLimitMetric::RPM => write!(f, "rpm"),
             RateLimitMetric::RPD => write!(f, "rpd"),
+            RateLimitMetric::Concurrency => write!(f, "concurrency"),
         }
     }
 }

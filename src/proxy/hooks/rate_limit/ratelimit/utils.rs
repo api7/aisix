@@ -77,6 +77,7 @@ impl RateLimitState {
                 RateLimitMetric::TPM | RateLimitMetric::TPD => {
                     self.token_info = Some(Self::choose_stricter(self.token_info.clone(), info));
                 }
+                RateLimitMetric::Concurrency => {}
             }
         }
     }
@@ -144,8 +145,9 @@ pub enum CheckPhase {
 
 impl CheckPhase {
     fn should_skip(self, metric: &RateLimitMetric) -> bool {
-        matches!(self, Self::Post(_))
-            && matches!(metric, RateLimitMetric::RPM | RateLimitMetric::RPD)
+        matches!(metric, RateLimitMetric::Concurrency)
+            || (matches!(self, Self::Post(_))
+                && matches!(metric, RateLimitMetric::RPM | RateLimitMetric::RPD))
     }
     fn commit(self, metric: &RateLimitMetric) -> bool {
         match self {

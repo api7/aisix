@@ -65,11 +65,11 @@ impl RateLimiter for LocalRateLimiter {
 mod tests {
     use http::HeaderMap;
 
-    use super::{
-        super::{CheckPhase, RateLimitState, run_check},
-        *,
+    use super::*;
+    use crate::{
+        config::entities::types::{HasRateLimit, RateLimit, RateLimitMetric},
+        proxy::hooks::rate_limit::ratelimit::utils::{CheckPhase, RateLimitState, run_check},
     };
-    use crate::config::entities::types::{HasRateLimit, RateLimit, RateLimitMetric};
 
     // --- MockEntity helper shared by integration tests ---
 
