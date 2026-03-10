@@ -26,15 +26,15 @@ impl Display for RateLimitMetric {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RateLimit {
-    #[serde(rename = "tpm")]
+    #[serde(rename = "tpm", skip_serializing_if = "Option::is_none")]
     pub token_per_minute: Option<u64>,
-    #[serde(rename = "tpd")]
+    #[serde(rename = "tpd", skip_serializing_if = "Option::is_none")]
     pub token_per_day: Option<u64>,
-    #[serde(rename = "rpm")]
+    #[serde(rename = "rpm", skip_serializing_if = "Option::is_none")]
     pub request_per_minute: Option<u64>,
-    #[serde(rename = "rpd")]
+    #[serde(rename = "rpd", skip_serializing_if = "Option::is_none")]
     pub request_per_day: Option<u64>,
-    #[serde(rename = "concurrency")]
+    #[serde(rename = "concurrency", skip_serializing_if = "Option::is_none")]
     pub request_concurrency: Option<u64>,
 }
 
