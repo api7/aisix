@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use types::ProviderError;
+pub use types::ProviderError;
 
 use crate::{
     config::entities::models::ProviderConfig,

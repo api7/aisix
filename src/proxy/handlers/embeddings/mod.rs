@@ -1,5 +1,7 @@
 mod types;
 
+use std::time::Duration;
+
 use axum::{
     Json,
     extract::{Extension, Request, State},
@@ -16,6 +18,7 @@ use crate::{
         hooks::{HOOK_FILTER_ALL, HOOK_MANAGER, HookContext, ResponseData},
         middlewares::RequestModel,
     },
+    utils::future::maybe_timeout,
 };
 
 pub async fn embeddings(
@@ -36,12 +39,13 @@ pub async fn embeddings(
     let model = hook_ctx.get::<ResourceEntry<Model>>().cloned().unwrap();
 
     let provider = create_provider(&model.provider_config);
+    let timeout = model.timeout.map(Duration::from_millis);
 
     // Replace request model name with real model name
     request_data.model = model.model.name.clone();
 
-    match provider.embedding(request_data).await {
-        Ok(mut response) => {
+    match maybe_timeout(timeout, provider.embedding(request_data)).await {
+        Ok(Ok(mut response)) => {
             response.model = hook_ctx.get::<RequestModel>().cloned().unwrap().0; //TODO: safe unwrap
 
             // Execute post_call_success hooks
@@ -64,13 +68,10 @@ pub async fn embeddings(
 
             Ok(resp)
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             error!("Error generating embeddings: {}", err);
-            let err: anyhow::Error = err.into();
-            HOOK_MANAGER
-                .post_call_failure(&mut hook_ctx, &err, HOOK_FILTER_ALL)
-                .await?;
-            Err(EmbeddingError::ProviderError(err.to_string()))
+            Err(EmbeddingError::ProviderError(err))
         }
+        Err(err) => Err(EmbeddingError::Timeout(err)),
     }
 }

@@ -2,6 +2,9 @@ use axum::{Json, response::IntoResponse};
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::time::error::Elapsed;
+
+use crate::{providers::ProviderError, proxy::hooks::HookError};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -120,9 +123,11 @@ pub struct ChatCompletionChunk {
 #[derive(Debug, Error)]
 pub enum ChatCompletionError {
     #[error("Provider error: {0}")]
-    ProviderError(String),
+    ProviderError(#[from] ProviderError),
+    #[error("Request timed out")]
+    Timeout(#[from] Elapsed),
     #[error("Hook error")]
-    HookError(#[from] crate::proxy::hooks::HookError),
+    HookError(#[from] HookError),
 }
 
 impl IntoResponse for ChatCompletionError {
@@ -135,6 +140,17 @@ impl IntoResponse for ChatCompletionError {
                         "message": format!("Provider error: {}", err),
                         "type": "server_error",
                         "code": "provider_error"
+                    }
+                })),
+            )
+                .into_response(),
+            ChatCompletionError::Timeout(_) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": "Provider request timed out",
+                        "type": "server_error",
+                        "code": "request_timeout"
                     }
                 })),
             )

@@ -28,6 +28,10 @@ static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
                 "pattern": MODELS_PATTERN
             },
             "provider_config": {"type": "object"},
+            "timeout": {
+                "type": "integer",
+                "minimum": 0
+            },
             "rate_limit": {"type": "object"}
         },
         "required": ["name", "model", "provider_config"],
@@ -144,6 +148,9 @@ pub struct Model {
     pub provider_config: ProviderConfig,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
 }
 
@@ -157,6 +164,7 @@ impl<'de> Deserialize<'de> for Model {
             name: String,
             model: String,
             provider_config: serde_json::Value,
+            timeout: Option<u64>,
             rate_limit: Option<RateLimit>,
         }
 
@@ -190,6 +198,7 @@ impl<'de> Deserialize<'de> for Model {
                 original_model: raw.model,
             },
             provider_config,
+            timeout: raw.timeout,
             rate_limit: raw.rate_limit,
         })
     }

@@ -1,6 +1,6 @@
 mod types;
 
-use std::convert::Infallible;
+use std::{convert::Infallible, time::Duration};
 
 use axum::{
     Json,
@@ -11,17 +11,19 @@ use axum::{
     },
 };
 use fastrace::prelude::{Event as TraceEvent, *};
+use futures::stream::BoxStream;
 use log::error;
 pub use types::*;
 
 use crate::{
     config::entities::{Model, ResourceEntry},
-    providers::{Provider, create_provider},
+    providers::{Provider, ProviderError, create_provider},
     proxy::{
         AppState,
         hooks::{HOOK_FILTER_ALL, HOOK_MANAGER, HookContext, ResponseData, TokenUsage},
         middlewares::RequestModel,
     },
+    utils::future::maybe_timeout,
 };
 
 #[fastrace::trace]
@@ -40,6 +42,7 @@ pub async fn chat_completions(
     let model = hook_ctx.get::<ResourceEntry<Model>>().cloned().unwrap(); //TODO: safe unwrap
 
     let provider = create_provider(&model.provider_config);
+    let timeout = model.timeout.map(Duration::from_millis);
 
     // Replace request model name with real model name
     request_data.model = model.model.name.clone();
@@ -48,9 +51,9 @@ pub async fn chat_completions(
     let is_stream = request_data.stream.unwrap_or(false);
 
     let response = if is_stream {
-        handle_stream_request(provider, request_data, hook_ctx, span_ctx).await?
+        handle_stream_request(provider, request_data, &mut hook_ctx, span_ctx, timeout).await?
     } else {
-        handle_regular_request(provider, request_data, hook_ctx).await?
+        handle_regular_request(provider, request_data, &mut hook_ctx, timeout).await?
     };
 
     Ok(response)
@@ -60,14 +63,14 @@ pub async fn chat_completions(
 async fn handle_regular_request(
     provider: Box<dyn Provider>,
     request: ChatCompletionRequest,
-    hook_ctx: HookContext,
+    hook_ctx: &mut HookContext,
+    timeout: Option<Duration>,
 ) -> Result<Response, ChatCompletionError> {
-    let mut hook_ctx = hook_ctx;
-    match provider.chat_completion(request).await {
+    match maybe_timeout(timeout, provider.chat_completion(request)).await? {
         Ok(response) => {
             HOOK_MANAGER
                 .post_call_success(
-                    &mut hook_ctx,
+                    hook_ctx,
                     &ResponseData::ChatCompletion(response.clone()),
                     HOOK_FILTER_ALL,
                 )
@@ -76,18 +79,14 @@ async fn handle_regular_request(
             // Build response and add headers
             let mut resp = Json(response).into_response();
             HOOK_MANAGER
-                .post_call_headers(&mut hook_ctx, resp.headers_mut(), HOOK_FILTER_ALL)
+                .post_call_headers(hook_ctx, resp.headers_mut(), HOOK_FILTER_ALL)
                 .await?;
 
             Ok(resp)
         }
         Err(err) => {
             error!("Provider request failed: {}", err);
-            let err: anyhow::Error = err.into();
-            HOOK_MANAGER
-                .post_call_failure(&mut hook_ctx, &err, HOOK_FILTER_ALL)
-                .await?;
-            Ok(ChatCompletionError::ProviderError(err.to_string()).into_response())
+            Err(ChatCompletionError::ProviderError(err))
         }
     }
 }
@@ -96,17 +95,47 @@ async fn handle_regular_request(
 async fn handle_stream_request(
     provider: Box<dyn Provider>,
     request: ChatCompletionRequest,
-    hook_ctx: HookContext,
+    hook_ctx: &mut HookContext,
     span_ctx: SpanContext,
+    timeout: Option<Duration>,
 ) -> Result<Response, ChatCompletionError> {
     use futures::stream::StreamExt;
 
-    match provider.chat_completion_stream(request).await {
+    let res: Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> =
+        match maybe_timeout(timeout, async {
+            let mut stream = match provider.chat_completion_stream(request).await {
+                Ok(stream) => stream,
+                Err(err) => return Err(err),
+            };
+
+            let first_chunk = match stream.next().await {
+                Some(res) => res,
+                None => {
+                    return Err(ProviderError::ServiceError(
+                        http::StatusCode::BAD_GATEWAY,
+                        "Upstream provider returned empty stream".to_string(),
+                    ));
+                }
+            };
+
+            Ok(
+                Box::pin(futures::stream::once(async move { first_chunk }).chain(stream))
+                    as BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
+            )
+        })
+        .await
+        {
+            Ok(res) => res,
+            Err(err) => Err(ChatCompletionError::Timeout(err))?,
+        };
+
+    match res {
         Ok(stream) => {
+            let stream_hook_ctx = std::mem::take(hook_ctx);
             let stream_span = Span::root("sse_connection", span_ctx);
 
             let sse_stream = futures::stream::unfold(
-                (stream, stream_span, 0, hook_ctx, false),
+                (stream, stream_span, 0, stream_hook_ctx, false),
                 |(mut stream, span, idx, mut hook_ctx, done)| async move {
                     if done {
                         if let Err(err) = HOOK_MANAGER
@@ -172,7 +201,7 @@ async fn handle_stream_request(
         }
         Err(err) => {
             error!("Provider stream request failed: {}", err);
-            Ok(ChatCompletionError::ProviderError(err.to_string()).into_response())
+            Err(ChatCompletionError::ProviderError(err))
         }
     }
 }
