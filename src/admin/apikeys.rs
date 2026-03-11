@@ -146,7 +146,7 @@ pub async fn put(State(state): State<AppState>, Path(id): Path<String>, body: By
     )
 )]
 pub async fn delete(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let key = format!("/apikeys/{}", id);
+    let key = format!("/apikeys/{id}");
     match state.config_provider.delete(&key).await {
         Ok(deleted) if deleted > 0 => DeleteResponse { deleted, key }.into_response(),
         Ok(_) => APIError::NotFound(format!("API key with ID {} not found", id)).into_response(),
@@ -155,7 +155,7 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<String>) -> Re
 }
 
 async fn update(state: AppState, id: &str, body: Bytes) -> Response {
-    let key = format!("/apikeys/{}", id);
+    let key = format!("/apikeys/{id}");
 
     let api_key = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(value) => value,

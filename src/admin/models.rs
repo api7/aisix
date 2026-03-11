@@ -108,7 +108,7 @@ pub async fn get(State(state): State<AppState>, Path(id): Path<String>) -> Respo
     )
 )]
 pub async fn post(State(state): State<AppState>, body: Bytes) -> Response {
-    update(state, &format!("/models/{}", Uuid::new_v4()), body).await
+    update(state, &Uuid::new_v4().to_string(), body).await
 }
 
 #[utoipa::path(
@@ -128,7 +128,7 @@ pub async fn post(State(state): State<AppState>, body: Bytes) -> Response {
     )
 )]
 pub async fn put(State(state): State<AppState>, Path(id): Path<String>, body: Bytes) -> Response {
-    update(state, &format!("/models/{}", id), body).await
+    update(state, &id, body).await
 }
 
 #[utoipa::path(
@@ -154,7 +154,9 @@ pub async fn delete(State(state): State<AppState>, Path(id): Path<String>) -> Re
     }
 }
 
-async fn update(state: AppState, key: &str, body: Bytes) -> Response {
+async fn update(state: AppState, id: &str, body: Bytes) -> Response {
+    let key = format!("/models/{id}");
+
     let model = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(value) => value,
         Err(err) => {
@@ -171,7 +173,37 @@ async fn update(state: AppState, key: &str, body: Bytes) -> Response {
         .into_response();
     }
 
-    match state.config_provider.put(key, &model).await {
+    let model = match serde_json::from_value::<Model>(model) {
+        Ok(value) => value,
+        Err(err) => {
+            return APIError::BadRequest(format!("Invalid model data: {}", err)).into_response();
+        }
+    };
+
+    // Check if the model name already exists: fast path
+    if let Some(found) = state.resources.models.get_by_name(&model.name)
+        && found.id != id
+    {
+        return APIError::BadRequest("Model name already exists".to_string()).into_response();
+    }
+
+    // Check if the model name already exists: slow path
+    match state.config_provider.get_all::<Model>("/models").await {
+        Ok(data) => {
+            if data
+                .iter()
+                .any(|item| item.value.name == model.name && item.key != key)
+            {
+                return APIError::BadRequest("Model name already exists".to_string())
+                    .into_response();
+            }
+        }
+        Err(err) => {
+            return APIError::InternalError(err).into_response();
+        }
+    }
+
+    match state.config_provider.put(&key, &model).await {
         Ok(res) => match res {
             PutEntry::Created => (
                 StatusCode::CREATED,

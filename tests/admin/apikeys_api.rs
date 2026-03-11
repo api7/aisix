@@ -119,6 +119,47 @@ async fn test_put_status_codes() {
 }
 
 #[tokio::test]
+async fn test_put_duplicate_key_rejected() {
+    let router = create_router(None).await;
+
+    let first_apikey = serde_json::json!({
+        "key": "sk-put-dup-a",
+        "allowed_models": []
+    });
+    let second_apikey = serde_json::json!({
+        "key": "sk-put-dup-b",
+        "allowed_models": []
+    });
+
+    let (status, _) = oneshot_json(
+        &router,
+        req(Method::PUT, "/put-dup-apikey-a", Some(first_apikey.clone())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _) = oneshot_json(
+        &router,
+        req(Method::PUT, "/put-dup-apikey-b", Some(second_apikey)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // update apikey-b to reuse apikey-a's key should be rejected
+    let (status, body) = oneshot_json(
+        &router,
+        req(Method::PUT, "/put-dup-apikey-b", Some(first_apikey)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "PUT should reject duplicate API key"
+    );
+    assert_eq!(body["error_msg"], "API key already exists");
+}
+
+#[tokio::test]
 async fn test_duplicate_key_rejected() {
     let router = create_router(None).await;
     let apikey_body = serde_json::json!({

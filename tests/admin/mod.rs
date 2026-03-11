@@ -15,7 +15,7 @@ pub async fn create_router(etcd_prefix: Option<&str>) -> Router {
             etcd: ai_gateway::config::etcd::Config {
                 host: vec!["http://127.0.0.1:2379".to_string()],
                 prefix: etcd_prefix
-                    .unwrap_or(&format!("/{}", Uuid::new_v4()))
+                    .unwrap_or(&format!("/test/{}", Uuid::new_v4()))
                     .to_string(),
                 timeout: 5,
                 user: None,
