@@ -249,6 +249,54 @@ deployment:
       - key: "admin"
 ```
 
+## Git Commit Guidelines
+
+### Commit Message Format
+
+Follow [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+<type>: <subject>
+
+<body>
+```
+
+Types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `ci`
+
+### Example
+
+```
+docs: rewrite README for open source users
+
+- Add features list, architecture diagram, quick start guide
+- Include API reference for Proxy and Admin APIs
+- Document configuration options for models and API keys
+```
+
+### Rules
+
+1. **Subject line**: Brief description of the change (imperative mood)
+2. **Body**: Bullet points explaining what changed and why (optional for trivial changes)
+3. **NO Co-authored-by**: Do not add `Co-authored-by:` trailers
+4. **NO attribution links**: Do not add "Ultraworked with" or similar attribution
+5. **Keep it minimal**: Only include information relevant to the change itself
+
+### Anti-Patterns
+
+```
+# WRONG - contains unnecessary attribution
+docs: rewrite README
+
+Ultraworked with [SomeTool](https://...)
+Co-authored-by: Bot <bot@example.com>
+
+# CORRECT - clean and focused
+docs: rewrite README
+
+- Add features list and architecture diagram
+- Include API reference documentation
+```
+
 ## CI/CD
 
 GitHub Actions workflow (`.github/workflows/build.yaml`):
