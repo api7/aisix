@@ -18,6 +18,17 @@ jobs:
       - name: Setup Rust toolchain
         run: rustup toolchain install stable --profile minimal
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+
+      - name: Setup PNPM
+        uses: pnpm/action-setup@v4
+        with:
+          #cache: true
+          package_json_file: ui/package.json
+
       - name: Setup dependencies
         run: sudo apt update && sudo apt install -y protobuf-compiler
 
@@ -27,6 +38,9 @@ jobs:
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
 
+      - name: Build UI
+        run: cd ui && pnpm install --frozen-lockfile && pnpm build
+
       - name: Run Lint
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
@@ -34,7 +48,7 @@ jobs:
         run: cargo test --verbose
 
       - name: Build
-        run: cargo build --verbose
+        run: ls ui && ls ui/dist && cargo build --verbose
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

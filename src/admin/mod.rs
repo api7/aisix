@@ -1,6 +1,7 @@
 mod apikeys;
 mod models;
 mod types;
+mod ui;
 
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ use axum::{
     Router,
     extract::{Request, State},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::get,
 };
 use utoipa::{
@@ -114,6 +115,9 @@ pub fn create_router(state: AppState) -> Router {
                 )
                 .layer(axum::middleware::from_fn_with_state(state.clone(), auth)),
         )
+        .route("/ui", get(|| async { Redirect::to("/ui/") }))
+        .route("/ui/", get(ui::handler))
+        .route("/ui/{*path}", get(ui::handler))
         .merge(Scalar::with_url("/openapi", ApiDoc::openapi()))
         .with_state(state)
 }

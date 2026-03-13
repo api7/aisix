@@ -1,6 +1,7 @@
 mod apikeys_api;
 mod auth;
 mod models_api;
+mod ui;
 
 use std::sync::Arc;
 

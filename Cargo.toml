@@ -56,6 +56,12 @@ jsonschema = { version = "0.44.1", default-features = false }
 uuid = { version = "1.21.0", features = ["v4"] }
 utoipa = "5.4.0"
 utoipa-scalar = { version = "0.3", features = ["axum"] }
+rust-embed = { version = "8.11.0", default-features = false, features = [
+  "axum-ex",
+  "debug-embed",
+  "deterministic-timestamps",
+] }
+mime_guess = "2.0.5"
 
 [dev-dependencies]
 tokio-test = "0.4"
