@@ -1,5 +1,6 @@
 mod apikeys;
 mod models;
+mod playground;
 mod types;
 mod ui;
 
@@ -10,7 +11,7 @@ use axum::{
     extract::{Request, State},
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
-    routing::get,
+    routing::{get, post},
 };
 use utoipa::{
     Modify, OpenApi,
@@ -71,10 +72,11 @@ impl Modify for SecurityAddon {
 
 #[derive(Clone)]
 pub struct AppState {
-    #[allow(dead_code)]
+    #[allow(unused)]
     config: Arc<crate::config::Config>,
     config_provider: Arc<dyn crate::config::ConfigProvider>,
     resources: Arc<crate::config::entities::ResourceRegistry>,
+    proxy_router: Option<Router>,
 }
 
 impl AppState {
@@ -82,13 +84,19 @@ impl AppState {
         config: crate::config::Config,
         config_provider: Arc<dyn crate::config::ConfigProvider>,
         resources: Arc<crate::config::entities::ResourceRegistry>,
+        proxy_router: Option<Router>,
     ) -> Self {
         let config = Arc::new(config);
         Self {
             config,
             config_provider,
             resources,
+            proxy_router,
         }
+    }
+
+    pub fn proxy_router(&self) -> Option<Router> {
+        self.proxy_router.clone()
     }
 }
 
@@ -114,6 +122,11 @@ pub fn create_router(state: AppState) -> Router {
                         ),
                 )
                 .layer(axum::middleware::from_fn_with_state(state.clone(), auth)),
+        )
+        // These routes use API key authentication instead of Admin key authentication.
+        .nest(
+            "/playground",
+            Router::new().route("/chat/completions", post(playground::chat_completions)),
         )
         .route("/ui", get(|| async { Redirect::to("/ui/") }))
         .route("/ui/", get(ui::handler))

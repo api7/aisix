@@ -61,7 +61,7 @@ function DashboardLayout() {
           </Sheet>
 
           {/* Main content — each page owns its header and body */}
-          <main className="flex flex-1 flex-col overflow-auto">
+          <main className="flex flex-1 flex-col overflow-hidden">
             <Outlet />
           </main>
         </div>

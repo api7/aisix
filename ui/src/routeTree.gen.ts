@@ -12,7 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as LayoutRouteImport } from './routes/_layout'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as LayoutSettingsRouteImport } from './routes/_layout/settings'
-import { Route as LayoutPlaygroundRouteImport } from './routes/_layout/playground'
+import { Route as LayoutPlaygroundIndexRouteImport } from './routes/_layout/playground/index'
 import { Route as LayoutModelsIndexRouteImport } from './routes/_layout/models/index'
 import { Route as LayoutApikeysIndexRouteImport } from './routes/_layout/apikeys/index'
 import { Route as LayoutModelsCreateRouteImport } from './routes/_layout/models/create'
@@ -34,9 +34,9 @@ const LayoutSettingsRoute = LayoutSettingsRouteImport.update({
   path: '/settings',
   getParentRoute: () => LayoutRoute,
 } as any)
-const LayoutPlaygroundRoute = LayoutPlaygroundRouteImport.update({
-  id: '/playground',
-  path: '/playground',
+const LayoutPlaygroundIndexRoute = LayoutPlaygroundIndexRouteImport.update({
+  id: '/playground/',
+  path: '/playground/',
   getParentRoute: () => LayoutRoute,
 } as any)
 const LayoutModelsIndexRoute = LayoutModelsIndexRouteImport.update({
@@ -72,7 +72,6 @@ const LayoutApikeysIdRoute = LayoutApikeysIdRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
-  '/playground': typeof LayoutPlaygroundRoute
   '/settings': typeof LayoutSettingsRoute
   '/apikeys/$id': typeof LayoutApikeysIdRoute
   '/apikeys/create': typeof LayoutApikeysCreateRoute
@@ -80,10 +79,10 @@ export interface FileRoutesByFullPath {
   '/models/create': typeof LayoutModelsCreateRoute
   '/apikeys/': typeof LayoutApikeysIndexRoute
   '/models/': typeof LayoutModelsIndexRoute
+  '/playground/': typeof LayoutPlaygroundIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
-  '/playground': typeof LayoutPlaygroundRoute
   '/settings': typeof LayoutSettingsRoute
   '/apikeys/$id': typeof LayoutApikeysIdRoute
   '/apikeys/create': typeof LayoutApikeysCreateRoute
@@ -91,12 +90,12 @@ export interface FileRoutesByTo {
   '/models/create': typeof LayoutModelsCreateRoute
   '/apikeys': typeof LayoutApikeysIndexRoute
   '/models': typeof LayoutModelsIndexRoute
+  '/playground': typeof LayoutPlaygroundIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/_layout': typeof LayoutRouteWithChildren
-  '/_layout/playground': typeof LayoutPlaygroundRoute
   '/_layout/settings': typeof LayoutSettingsRoute
   '/_layout/apikeys/$id': typeof LayoutApikeysIdRoute
   '/_layout/apikeys/create': typeof LayoutApikeysCreateRoute
@@ -104,12 +103,12 @@ export interface FileRoutesById {
   '/_layout/models/create': typeof LayoutModelsCreateRoute
   '/_layout/apikeys/': typeof LayoutApikeysIndexRoute
   '/_layout/models/': typeof LayoutModelsIndexRoute
+  '/_layout/playground/': typeof LayoutPlaygroundIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
-    | '/playground'
     | '/settings'
     | '/apikeys/$id'
     | '/apikeys/create'
@@ -117,10 +116,10 @@ export interface FileRouteTypes {
     | '/models/create'
     | '/apikeys/'
     | '/models/'
+    | '/playground/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
-    | '/playground'
     | '/settings'
     | '/apikeys/$id'
     | '/apikeys/create'
@@ -128,11 +127,11 @@ export interface FileRouteTypes {
     | '/models/create'
     | '/apikeys'
     | '/models'
+    | '/playground'
   id:
     | '__root__'
     | '/'
     | '/_layout'
-    | '/_layout/playground'
     | '/_layout/settings'
     | '/_layout/apikeys/$id'
     | '/_layout/apikeys/create'
@@ -140,6 +139,7 @@ export interface FileRouteTypes {
     | '/_layout/models/create'
     | '/_layout/apikeys/'
     | '/_layout/models/'
+    | '/_layout/playground/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -170,11 +170,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LayoutSettingsRouteImport
       parentRoute: typeof LayoutRoute
     }
-    '/_layout/playground': {
-      id: '/_layout/playground'
+    '/_layout/playground/': {
+      id: '/_layout/playground/'
       path: '/playground'
-      fullPath: '/playground'
-      preLoaderRoute: typeof LayoutPlaygroundRouteImport
+      fullPath: '/playground/'
+      preLoaderRoute: typeof LayoutPlaygroundIndexRouteImport
       parentRoute: typeof LayoutRoute
     }
     '/_layout/models/': {
@@ -223,7 +223,6 @@ declare module '@tanstack/react-router' {
 }
 
 interface LayoutRouteChildren {
-  LayoutPlaygroundRoute: typeof LayoutPlaygroundRoute
   LayoutSettingsRoute: typeof LayoutSettingsRoute
   LayoutApikeysIdRoute: typeof LayoutApikeysIdRoute
   LayoutApikeysCreateRoute: typeof LayoutApikeysCreateRoute
@@ -231,10 +230,10 @@ interface LayoutRouteChildren {
   LayoutModelsCreateRoute: typeof LayoutModelsCreateRoute
   LayoutApikeysIndexRoute: typeof LayoutApikeysIndexRoute
   LayoutModelsIndexRoute: typeof LayoutModelsIndexRoute
+  LayoutPlaygroundIndexRoute: typeof LayoutPlaygroundIndexRoute
 }
 
 const LayoutRouteChildren: LayoutRouteChildren = {
-  LayoutPlaygroundRoute: LayoutPlaygroundRoute,
   LayoutSettingsRoute: LayoutSettingsRoute,
   LayoutApikeysIdRoute: LayoutApikeysIdRoute,
   LayoutApikeysCreateRoute: LayoutApikeysCreateRoute,
@@ -242,6 +241,7 @@ const LayoutRouteChildren: LayoutRouteChildren = {
   LayoutModelsCreateRoute: LayoutModelsCreateRoute,
   LayoutApikeysIndexRoute: LayoutApikeysIndexRoute,
   LayoutModelsIndexRoute: LayoutModelsIndexRoute,
+  LayoutPlaygroundIndexRoute: LayoutPlaygroundIndexRoute,
 }
 
 const LayoutRouteWithChildren =

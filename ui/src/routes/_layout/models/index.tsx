@@ -2,6 +2,7 @@ import { Link, createFileRoute, useNavigate } from '@tanstack/react-router';
 import { createColumnHelper, type ColumnDef } from '@tanstack/react-table';
 import { Pencil, Plus, Trash2 } from 'lucide-react';
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 
 import { PageHeader } from '@/components/layout/page-header';
 import { Badge } from '@/components/ui/badge';
@@ -21,6 +22,7 @@ type ModelRow = ItemResponse<Model> & { id: string };
 const col = createColumnHelper<ModelRow>();
 
 function ModelsPage() {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const { data, isLoading, isError } = useModels();
   const deleteModel = useDeleteModel();
@@ -59,7 +61,7 @@ function ModelsPage() {
       ),
     }),
     col.accessor('id', {
-      header: 'ID',
+      header: () => t('models.columns.id'),
       size: 300,
       cell: (info) => (
         <span className="font-mono text-xs text-muted-foreground">
@@ -68,14 +70,14 @@ function ModelsPage() {
       ),
     }),
     col.accessor('value.name', {
-      header: 'Name',
+      header: () => t('models.columns.name'),
       size: 300,
       cell: (info) => (
         <span className="text-sm font-medium">{info.getValue()}</span>
       ),
     }),
     col.accessor('value.model', {
-      header: 'Model',
+      header: () => t('models.columns.model'),
       cell: (info) => (
         <Badge variant="secondary" className="font-mono text-xs">
           {info.getValue()}
@@ -85,7 +87,9 @@ function ModelsPage() {
     col.display({
       id: 'actions',
       size: 96,
-      header: () => <div className="text-right">Action</div>,
+      header: () => (
+        <div className="text-right">{t('models.columns.action')}</div>
+      ),
       cell: ({ row }) => (
         <div className="flex justify-end">
           <Button
@@ -122,7 +126,7 @@ function ModelsPage() {
   return (
     <div className="flex h-full flex-col">
       <PageHeader>
-        <h1 className="flex-1 text-xl font-semibold">Models</h1>
+        <h1 className="flex-1 text-xl font-semibold">{t('models.title')}</h1>
         {selectedKeys.length > 0 && (
           <Button
             variant="outline"
@@ -131,13 +135,13 @@ function ModelsPage() {
             disabled={deleteModel.isPending}
           >
             <Trash2 className="mr-1.5 h-4 w-4 text-destructive" />
-            Delete ({selectedKeys.length})
+            {t('common.delete')} ({selectedKeys.length})
           </Button>
         )}
         <Button asChild size="lg">
           <Link to="/models/create">
             <Plus className="mr-1.5 h-4 w-4" />
-            Add Model
+            {t('models.addModel')}
           </Link>
         </Button>
       </PageHeader>
@@ -146,12 +150,12 @@ function ModelsPage() {
         <div className="mb-4 flex items-center justify-between">
           <p className="text-sm text-muted-foreground">
             {isLoading
-              ? 'Loading…'
-              : `${items.length} model${items.length !== 1 ? 's' : ''}`}
+              ? t('common.loading')
+              : t('models.count', { count: items.length })}
           </p>
           <Input
             className="w-80"
-            placeholder="Search models…"
+            placeholder={t('models.search')}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
           />
@@ -162,15 +166,15 @@ function ModelsPage() {
           data={items}
           isLoading={isLoading}
           isError={isError}
-          errorMessage="Failed to load models."
+          errorMessage={t('models.errorLoad')}
           emptyMessage={
             <span>
-              No models yet.{' '}
+              {t('models.empty')}{' '}
               <Link
                 to="/models/create"
                 className="underline underline-offset-2"
               >
-                Add one
+                {t('models.emptyAction')}
               </Link>
             </span>
           }

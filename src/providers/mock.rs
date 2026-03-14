@@ -92,6 +92,21 @@ impl Provider for MockProvider {
             usage: None,
         });
 
+        let time = format!(
+            "{:?}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        );
+        let latest_message = request
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+
         // Content tokens
         let content_tokens = vec![
             "Hello",
@@ -119,6 +134,22 @@ impl Provider for MockProvider {
             " assist",
             " you",
             ".",
+            " Your",
+            " message",
+            " is",
+            " \"",
+            &latest_message,
+            "\".",
+            " Current",
+            " time",
+            ": ",
+            &time,
+            ". Have",
+            " a",
+            " great",
+            " day",
+            "!",
+            " 👋",
         ];
 
         for token in content_tokens {

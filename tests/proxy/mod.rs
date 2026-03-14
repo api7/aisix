@@ -40,6 +40,7 @@ pub async fn create_routers(etcd_prefix: Option<&str>) -> (Router, Router) {
         config.clone(),
         config_provider,
         resources.clone(),
+        None,
     ));
     let proxy_router =
         ai_gateway::proxy::create_router(ai_gateway::proxy::AppState::new(config, resources));

@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 
 import { Button } from '@/components/ui/button';
 import {
@@ -14,6 +15,7 @@ import { Label } from '@/components/ui/label';
 import { useAdminKey } from '@/hooks/use-admin-key';
 
 export function AdminKeyModal() {
+  const { t } = useTranslation();
   const { isModalOpen, closeModal, setKey, key: current } = useAdminKey();
   const [draft, setDraft] = useState(current ?? '');
 
@@ -31,20 +33,19 @@ export function AdminKeyModal() {
     >
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Enter Admin API Key</DialogTitle>
+          <DialogTitle>{t('adminKeyModal.title')}</DialogTitle>
           <DialogDescription>
-            Your key is stored locally in your browser and never sent to any
-            server except the gateway admin API.
+            {t('adminKeyModal.description')}
           </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-2 py-2">
-          <Label htmlFor="admin-key">API Key</Label>
+          <Label htmlFor="admin-key">{t('adminKeyModal.label')}</Label>
           <Input
             autoFocus
             id="admin-key"
             type="password"
-            placeholder="Please enter the admin key"
+            placeholder={t('adminKeyModal.placeholder')}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleSave()}
@@ -54,11 +55,11 @@ export function AdminKeyModal() {
         <DialogFooter>
           {current && (
             <Button variant="ghost" onClick={closeModal}>
-              Cancel
+              {t('adminKeyModal.cancel')}
             </Button>
           )}
           <Button onClick={handleSave} disabled={!draft.trim()}>
-            Save Key
+            {t('adminKeyModal.save')}
           </Button>
         </DialogFooter>
       </DialogContent>

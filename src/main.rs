@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use ai_gateway::*;
+use axum::Router;
 use log::info;
 use tokio::select;
 
@@ -19,16 +20,19 @@ async fn main() {
 
     providers::init_client();
 
+    let proxy_state = proxy::AppState::new(config.clone(), resources.clone());
+    let proxy_router = proxy::create_router(proxy_state);
+
     select! {
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl+C, shutting down");
         }
-        res = serve_proxy(proxy::AppState::new(config.clone(), resources.clone())) => {
+        res = serve_proxy(proxy_router.clone()) => {
             if let Err(e) = res {
                 eprintln!("Proxy server error: {}", e);
             }
         }
-        res = serve_admin(admin::AppState::new(config.clone(), config_provider, resources)) => {
+        res = serve_admin(admin::AppState::new(config.clone(), config_provider, resources, Some(proxy_router))) => {
             if let Err(e) = res {
                 eprintln!("Admin server error: {}", e);
             }
@@ -115,14 +119,14 @@ fn init_observability() {
     let _ = opentelemetry::global::meter("ai-gateway");
 }
 
-async fn serve_proxy(state: proxy::AppState) -> Result<(), std::io::Error> {
+async fn serve_proxy(router: Router) -> Result<(), std::io::Error> {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
 
     info!("Server listening on http://0.0.0.0:3000");
 
     axum::serve(
         listener,
-        proxy::create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await
 }

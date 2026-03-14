@@ -40,6 +40,7 @@ pub async fn create_router(etcd_prefix: Option<&str>) -> Router {
         config,
         config_provider.clone(),
         Arc::new(ai_gateway::config::entities::ResourceRegistry::new(config_provider).await),
+        None,
     );
 
     ai_gateway::admin::create_router(state)

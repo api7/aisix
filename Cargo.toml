@@ -62,10 +62,10 @@ rust-embed = { version = "8.11.0", default-features = false, features = [
   "deterministic-timestamps",
 ] }
 mime_guess = "2.0.5"
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
 assert_matches = "1.5"
 pretty_assertions = "1.4"
 rstest = "0.26"
-tower = { version = "0.5.3", default-features = false, features = ["util"] }
