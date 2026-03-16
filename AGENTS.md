@@ -6,6 +6,8 @@ AI Gateway codebase guide for agentic coding assistants.
 
 Rust-based AI gateway proxy supporting OpenAI, Anthropic, Gemini, and DeepSeek APIs. Built with Axum for HTTP, Tokio for async runtime, and etcd for configuration storage.
 
+Includes a React-based admin UI (in `ui/`) for managing models, API keys, and a playground for testing chat completions.
+
 ## Build, Lint, and Test Commands
 
 ### Build
@@ -18,6 +20,16 @@ cargo build --release          # Release build
 ```bash
 RUST_LOG=info cargo run                    # Standard run
 RUST_LOG=info cargo run --features trace   # With OTel tracing
+```
+
+### UI Development
+```bash
+cd ui
+pnpm install                               # Install dependencies
+pnpm dev                                   # Start dev server
+pnpm build                                 # Build for production
+pnpm lint                                  # Run ESLint
+pnpm typecheck                             # Type check without emit
 ```
 
 ### Lint
@@ -197,8 +209,11 @@ src/
 ├── lib.rs               # Library exports
 ├── admin/               # Admin API (port 3001)
 │   ├── mod.rs
-│   ├── apikeys.rs
-│   └── models.rs
+│   ├── apikeys.rs       # API key CRUD
+│   ├── models.rs        # Model CRUD
+│   ├── playground.rs    # Playground chat completions
+│   ├── types.rs         # Admin types
+│   └── ui.rs            # Static UI file server
 ├── config/              # Configuration loading
 │   ├── mod.rs
 │   ├── etcd.rs          # etcd provider
@@ -206,25 +221,44 @@ src/
 ├── providers/           # AI provider implementations
 │   ├── mod.rs           # Provider trait
 │   ├── openai.rs
+│   ├── openai_compatible.rs
 │   ├── anthropic/
 │   ├── gemini.rs
+│   ├── deepseek.rs
 │   └── mock.rs
 ├── proxy/               # Proxy API (port 3000)
 │   ├── mod.rs
 │   ├── handlers/        # Request handlers
 │   ├── middlewares/     # Auth, tracing, body parsing
-│   └── hooks/           # Rate limiting, metrics
-└── utils/               # Utilities (jsonschema, metrics)
+│   └── hooks/           # Rate limiting, concurrency, metrics
+│       └── rate_limit/
+│           ├── mod.rs
+│           ├── concurrent/  # Concurrency limiting
+│           └── ratelimit/    # Token/request rate limiting
+└── utils/               # Utilities (jsonschema, metrics, future)
+
+ui/                      # React admin UI
+├── src/
+│   ├── components/      # UI components (shadcn/ui based)
+│   ├── routes/          # TanStack Router routes
+│   ├── lib/             # API client, queries
+│   └── i18n/            # Internationalization
+└── package.json
 
 tests/
 ├── api.rs               # Test entry point
 ├── admin/               # Admin API tests
+│   ├── apikeys_api.rs
+│   ├── models_api.rs
+│   └── ui.rs
 ├── proxy/               # Proxy tests
+│   └── timeout.rs
 └── utils/               # Test utilities
 ```
 
 ## Key Dependencies
 
+### Rust
 - `axum` — Web framework
 - `tokio` — Async runtime
 - `reqwest` — HTTP client for upstream providers
@@ -233,6 +267,18 @@ tests/
 - `etcd-client` — etcd client
 - `fastrace` — Distributed tracing
 - `utoipa` — OpenAPI generation
+- `rust-embed` — Embed static files (UI)
+- `skp-ratelimit` — Rate limiting
+- `jsonschema` — JSON Schema validation
+
+### UI (React)
+- `@tanstack/react-router` — File-based routing
+- `@tanstack/react-query` — Data fetching
+- `@tanstack/react-table` — Table components
+- `shadcn/ui` — UI component library
+- `tailwindcss` — Styling
+- `monaco-editor` — Code editor (JSON config)
+- `i18next` — Internationalization
 
 ## Configuration
 
