@@ -64,11 +64,11 @@ fn init_observability() {
     // log
     logforth::starter_log::builder()
         .dispatch(|d| {
-            d.filter(EnvFilterBuilder::from_default_env().build())
+            d.filter(EnvFilterBuilder::from_default_env_or("info").build())
                 .append(Stdout::default().with_layout(TextLayout::default()))
         })
         .dispatch(|d| {
-            d.filter(EnvFilterBuilder::from_default_env().build())
+            d.filter(EnvFilterBuilder::from_default_env_or("info").build())
                 .append(FastraceEvent::default())
         })
         .apply();
