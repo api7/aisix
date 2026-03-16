@@ -14,6 +14,7 @@ Includes a React-based admin UI (in `ui/`) for managing models, API keys, and a 
 ```bash
 cargo build                    # Debug build
 cargo build --release          # Release build
+cargo build --features trace   # Build with OTel tracing support
 ```
 
 ### Run
@@ -29,7 +30,9 @@ pnpm install                               # Install dependencies
 pnpm dev                                   # Start dev server
 pnpm build                                 # Build for production
 pnpm lint                                  # Run ESLint
-pnpm typecheck                             # Type check without emit
+pnpm format                               # Format with Prettier
+pnpm typecheck                            # Type check without emit
+pnpm preview                              # Preview production build
 ```
 
 ### Lint
@@ -41,6 +44,7 @@ Clippy warnings are treated as errors. Fix all warnings before committing.
 ### Test
 ```bash
 cargo test                                    # Run all tests
+cargo test --verbose                          # Run tests with verbose output
 cargo test --test api                         # Run specific test file (tests/api.rs)
 cargo test test_crud                          # Run specific test by name
 cargo test --test admin::models_api           # Run tests in specific module
@@ -217,43 +221,95 @@ src/
 ├── config/              # Configuration loading
 │   ├── mod.rs
 │   ├── etcd.rs          # etcd provider
+│   ├── types.rs         # Config types
 │   └── entities/        # Data models (ApiKey, Model)
+│       ├── mod.rs
+│       ├── apikeys.rs
+│       ├── models.rs
+│       └── types.rs
 ├── providers/           # AI provider implementations
 │   ├── mod.rs           # Provider trait
+│   ├── types.rs         # Provider types
 │   ├── openai.rs
 │   ├── openai_compatible.rs
 │   ├── anthropic/
+│   │   ├── mod.rs
+│   │   ├── types.rs
+│   │   └── README.md
 │   ├── gemini.rs
 │   ├── deepseek.rs
 │   └── mock.rs
 ├── proxy/               # Proxy API (port 3000)
 │   ├── mod.rs
 │   ├── handlers/        # Request handlers
+│   │   ├── mod.rs
+│   │   ├── models.rs
+│   │   ├── chat_completions/
+│   │   │   ├── mod.rs
+│   │   │   └── types.rs
+│   │   └── embeddings/
+│   │       ├── mod.rs
+│   │       └── types.rs
 │   ├── middlewares/     # Auth, tracing, body parsing
-│   └── hooks/           # Rate limiting, concurrency, metrics
+│   │   ├── mod.rs
+│   │   ├── auth.rs
+│   │   ├── parse_body.rs
+│   │   └── trace.rs
+│   └── hooks/           # Rate limiting, metrics, validation
+│       ├── mod.rs
+│       ├── metric.rs
+│       ├── validate_model.rs
 │       └── rate_limit/
 │           ├── mod.rs
 │           ├── concurrent/  # Concurrency limiting
 │           └── ratelimit/    # Token/request rate limiting
-└── utils/               # Utilities (jsonschema, metrics, future)
+└── utils/               # Utilities
+    ├── mod.rs
+    ├── future.rs
+    ├── jsonschema.rs
+    └── metrics.rs
 
 ui/                      # React admin UI
 ├── src/
+│   ├── assets/          # Static assets
 │   ├── components/      # UI components (shadcn/ui based)
+│   │   ├── apikeys/
+│   │   ├── layout/
+│   │   ├── models/
+│   │   ├── playground/
+│   │   ├── theme-provider.tsx
+│   │   └── ui/
+│   ├── hooks/           # Custom React hooks
+│   ├── i18n/            # Internationalization
+│   ├── lib/             # API client, queries, utilities
+│   │   ├── api/
+│   │   │   ├── client.ts
+│   │   │   └── types.ts
+│   │   ├── queries/
+│   │   │   ├── apikeys.ts
+│   │   │   ├── models.ts
+│   │   │   └── index.ts
+│   │   └── utils.ts
 │   ├── routes/          # TanStack Router routes
-│   ├── lib/             # API client, queries
-│   └── i18n/            # Internationalization
+│   ├── index.css
+│   ├── main.tsx
+│   └── routeTree.gen.ts
 └── package.json
 
 tests/
 ├── api.rs               # Test entry point
 ├── admin/               # Admin API tests
+│   ├── mod.rs
 │   ├── apikeys_api.rs
+│   ├── auth.rs
 │   ├── models_api.rs
 │   └── ui.rs
 ├── proxy/               # Proxy tests
+│   ├── mod.rs
 │   └── timeout.rs
 └── utils/               # Test utilities
+    ├── mod.rs
+    └── http.rs
 ```
 
 ## Key Dependencies
@@ -265,20 +321,32 @@ tests/
 - `serde`/`serde_json` — Serialization
 - `anyhow`/`thiserror` — Error handling
 - `etcd-client` — etcd client
-- `fastrace` — Distributed tracing
-- `utoipa` — OpenAPI generation
+- `fastrace` + `fastrace-*` — Distributed tracing (axum, opentelemetry, reqwest integrations)
+- `opentelemetry` + `opentelemetry-*` — OpenTelemetry SDK for tracing export
+- `logforth` — Logging with fastrace integration
+- `utoipa` + `utoipa-scalar` — OpenAPI generation and Scalar UI
 - `rust-embed` — Embed static files (UI)
 - `skp-ratelimit` — Rate limiting
 - `jsonschema` — JSON Schema validation
+- `async-trait` — Async trait support
+- `config` — Configuration file parsing
+- `dashmap` — Concurrent map for rate limiting
+- `uuid` — UUID generation
+- `tower` — Middleware utilities
+- `openssl` + `tokio-openssl` — TLS support
 
 ### UI (React)
 - `@tanstack/react-router` — File-based routing
 - `@tanstack/react-query` — Data fetching
 - `@tanstack/react-table` — Table components
-- `shadcn/ui` — UI component library
+- `@tanstack/react-form` — Form state management
+- `shadcn/ui` — UI component library (via `radix-ui`)
 - `tailwindcss` — Styling
-- `monaco-editor` — Code editor (JSON config)
-- `i18next` — Internationalization
+- `@monaco-editor/react` — Code editor (JSON config)
+- `i18next` + `react-i18next` — Internationalization
+- `lucide-react` — Icon library
+- `next-themes` — Theme switching (dark mode)
+- `openai` — OpenAI SDK for playground
 
 ## Configuration
 
@@ -346,9 +414,15 @@ docs: rewrite README
 ## CI/CD
 
 GitHub Actions workflow (`.github/workflows/build.yaml`):
-1. `cargo clippy` — Lint (warnings = error)
-2. `cargo test` — Run tests
-3. `cargo build` — Build binary
+1. Setup dependencies (protobuf-compiler, pnpm)
+2. Setup Node.js (LTS)
+3. Setup Rust toolchain (stable)
+4. Setup environment (docker compose for etcd)
+5. Build UI (`pnpm install && pnpm build`)
+6. `cargo clippy` — Lint (warnings = error)
+7. `cargo test` — Run tests
+8. `cargo build --features trace` — Build binary with tracing
+9. Upload artifact (debug binary)
 
 ## VSCode Setup
 
