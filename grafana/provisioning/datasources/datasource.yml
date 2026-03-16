@@ -1,0 +1,11 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # For Docker network: use http://prometheus:9090
+    # On Linux: add --add-host=host.docker.internal:host-gateway
+    url: http://host.docker.internal:9090
+    isDefault: true
+    editable: true
