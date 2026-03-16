@@ -80,6 +80,8 @@ function PlaygroundPage() {
 
     patchColumn(column.id, { isLoading: true, error: undefined });
 
+    let pendingAssistantId: string | undefined;
+
     try {
       let customBody: Record<string, unknown> | null = null;
       let streamMode = column.params.stream;
@@ -132,6 +134,7 @@ function PlaygroundPage() {
 
       if (streamMode) {
         const assistantId = crypto.randomUUID();
+        pendingAssistantId = assistantId;
         setColumns((prev) =>
           prev.map((c) =>
             c.id === column.id
@@ -202,10 +205,20 @@ function PlaygroundPage() {
         );
       }
     } catch (e) {
-      patchColumn(column.id, {
-        isLoading: false,
-        error: String(e instanceof Error ? e.message : e),
-      });
+      setColumns((prev) =>
+        prev.map((c) =>
+          c.id === column.id
+            ? {
+                ...c,
+                isLoading: false,
+                error: String(e instanceof Error ? e.message : e),
+                messages: pendingAssistantId
+                  ? c.messages.filter((m) => m.id !== pendingAssistantId)
+                  : c.messages,
+              }
+            : c,
+        ),
+      );
     }
   }
 

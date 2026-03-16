@@ -39,9 +39,8 @@ jobs:
 
       - name: Build UI
         run: |
-          cd ui
-          pnpm install --frozen-lockfile
-          pnpm build
+          pnpm -C ui install --frozen-lockfile
+          pnpm -C ui build
 
       - name: Run Lint
         run: cargo clippy --all-targets --all-features --locked -- -D warnings

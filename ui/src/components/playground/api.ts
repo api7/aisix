@@ -16,7 +16,7 @@ const PLAYGROUND_API_ROOT = '/playground';
 function createPlaygroundClient(apiKey: string): OpenAI {
   return new OpenAI({
     apiKey,
-    baseURL: PLAYGROUND_API_ROOT,
+    baseURL: new URL(PLAYGROUND_API_ROOT, window.location.origin).toString(),
     dangerouslyAllowBrowser: true,
   });
 }
