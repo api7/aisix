@@ -1,9 +1,9 @@
-# AISIX AI Gateway
-
 [![Build Status](https://github.com/api7/ai-gateway-stash/actions/workflows/build.yaml/badge.svg?branch=main)](https://github.com/api7/ai-gateway-stash/actions/workflows/build.yaml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/api7/ai-gateway-stash/blob/main/LICENSE)
 
-<br/>
+<p align="center">
+  <img src="./docs/images/aisix_logo.svg" alt="AISIX AI Gateway" width="400" />
+</p>
 
 <p align="center">
   <strong>A high-performance, Rust-based AI Gateway for unified LLM access.</strong><br/>

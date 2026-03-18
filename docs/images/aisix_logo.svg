@@ -1,0 +1,37 @@
+<svg width="600" height="120" viewBox="0 0 600 120" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="grad-aisix" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#00F2FE" />
+            <stop offset="100%" stop-color="#4FACFE" />
+        </linearGradient>
+        
+        <linearGradient id="grad-gateway" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#B16CEA" />
+            <stop offset="100%" stop-color="#FF5E69" />
+        </linearGradient>
+    </defs>
+
+    <g transform="translate(300, 80)" text-anchor="middle">
+        <!-- AISIX Text -->
+        <text x="-155" y="0" font-family="'Arial Black', Impact, sans-serif" font-weight="900" font-size="76" font-style="italic" fill="url(#grad-aisix)" letter-spacing="4" stroke="url(#grad-aisix)" stroke-width="1.5">
+            AISIX
+        </text>
+        <!-- AI Gateway Text -->
+        <text x="145" y="-5" font-family="'Arial Black', Impact, sans-serif" font-weight="900" font-size="46" fill="url(#grad-gateway)" letter-spacing="1" stroke="url(#grad-gateway)" stroke-width="1">
+            AI Gateway
+        </text>
+    </g>
+
+    <!-- Tech Accents -->
+    <g transform="translate(-100, -30)">
+        <path d="M 120 140 L 200 140 L 220 120" stroke="url(#grad-aisix)" stroke-width="4" fill="none" opacity="0.8" />
+        <circle cx="120" cy="140" r="5" fill="#00F2FE" />
+        <circle cx="205" cy="135" r="2" fill="#00F2FE" />
+        <circle cx="215" cy="125" r="2" fill="#00F2FE" />
+        
+        <path d="M 690 60 L 610 60 L 590 80" stroke="url(#grad-gateway)" stroke-width="4" fill="none" opacity="0.8" />
+        <circle cx="690" cy="60" r="5" fill="#FF5E69" />
+        <circle cx="605" cy="65" r="2" fill="#FF5E69" />
+        <circle cx="595" cy="75" r="2" fill="#FF5E69" />
+    </g>
+</svg>
