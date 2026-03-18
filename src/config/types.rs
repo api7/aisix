@@ -1,15 +1,32 @@
+use std::net::SocketAddr;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use validator::Validate;
+
+pub mod defaults {
+    use super::*;
+
+    pub fn listen() -> SocketAddr {
+        "0.0.0.0:3000".parse().unwrap()
+    }
+
+    pub fn admin_listen() -> SocketAddr {
+        "127.0.0.1:3001".parse().unwrap()
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AdminKey {
     pub key: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Validate)]
 pub struct DeploymentAdmin {
+    #[serde(default = "defaults::admin_listen")]
+    pub listen: SocketAddr,
     pub admin_key: Option<Vec<AdminKey>>,
 }
 
@@ -19,9 +36,11 @@ pub struct Deployment {
     pub admin: Option<DeploymentAdmin>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Validate)]
 pub struct Config {
     pub deployment: Deployment,
+    #[serde(default = "defaults::listen")]
+    pub listen: SocketAddr,
 }
 
 type ConfigItemKey = String;

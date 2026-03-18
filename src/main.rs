@@ -1,18 +1,22 @@
-use std::sync::Arc;
+use std::{process::exit, sync::Arc};
 
-use ai_gateway::*;
+use ai_gateway::{config::Config, *};
 use axum::Router;
-use log::info;
+use log::{error, info};
 use tokio::select;
+use validator::Validate;
 
 #[tokio::main]
 async fn main() {
     init_observability();
 
-    let config = config::load().expect("Failed to load configuration");
-    info!("Loaded config: {:?}", config);
+    let config = Arc::new(config::load().expect("Failed to load configuration"));
+    if let Err(e) = config.validate() {
+        error!("Configuration validation error: {}", e);
+        exit(1);
+    }
 
-    let config_provider = config::create_provider(config.clone())
+    let config_provider = config::create_provider(&config)
         .await
         .expect("Failed to create config provider");
     let resources =
@@ -20,21 +24,24 @@ async fn main() {
 
     providers::init_client();
 
-    let proxy_state = proxy::AppState::new(config.clone(), resources.clone());
-    let proxy_router = proxy::create_router(proxy_state);
+    let proxy_router =
+        proxy::create_router(proxy::AppState::new(config.clone(), resources.clone()));
 
+    let mut exception = false;
     select! {
         _ = tokio::signal::ctrl_c() => {
-            info!("Received Ctrl+C, shutting down");
+            info!("Stopping, see you next time!");
         }
-        res = serve_proxy(proxy_router.clone()) => {
+        res = serve_proxy(config.clone(), proxy_router.clone()) => {
             if let Err(e) = res {
-                eprintln!("Proxy server error: {}", e);
+                error!("Proxy server error: {}", e);
+                exception = true;
             }
         }
-        res = serve_admin(admin::AppState::new(config.clone(), config_provider, resources, Some(proxy_router))) => {
+        res = serve_admin(config.clone(), admin::AppState::new(config, config_provider, resources, Some(proxy_router))) => {
             if let Err(e) = res {
-                eprintln!("Admin server error: {}", e);
+                error!("Admin server error: {}", e);
+                exception = true;
             }
         }
     }
@@ -42,6 +49,7 @@ async fn main() {
     if cfg!(feature = "trace") {
         fastrace::flush();
     }
+    exit(if exception { 1 } else { 0 });
 }
 
 fn init_observability() {
@@ -119,10 +127,11 @@ fn init_observability() {
     let _ = opentelemetry::global::meter("ai-gateway");
 }
 
-async fn serve_proxy(router: Router) -> Result<(), std::io::Error> {
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+async fn serve_proxy(config: Arc<Config>, router: Router) -> Result<(), std::io::Error> {
+    let addr = config.listen;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    info!("Server listening on http://0.0.0.0:3000");
+    info!("Proxy API listening on http://{}", addr);
 
     axum::serve(
         listener,
@@ -131,10 +140,16 @@ async fn serve_proxy(router: Router) -> Result<(), std::io::Error> {
     .await
 }
 
-async fn serve_admin(state: admin::AppState) -> Result<(), std::io::Error> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3001").await?;
+async fn serve_admin(config: Arc<Config>, state: admin::AppState) -> Result<(), std::io::Error> {
+    let addr = config
+        .deployment
+        .admin
+        .as_ref()
+        .map(|admin| admin.listen)
+        .unwrap_or_else(crate::config::defaults::admin_listen);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    info!("Admin API listening on http://127.0.0.1:3001");
+    info!("Admin API listening on http://{}", addr);
 
     axum::serve(
         listener,

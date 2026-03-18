@@ -10,6 +10,8 @@ use axum::{
     routing::{get, post},
 };
 
+use crate::config::{Config, entities::ResourceRegistry};
+
 // types
 pub mod types {
     pub use super::handlers::{
@@ -25,20 +27,16 @@ pub mod types {
 #[derive(Clone)]
 pub struct AppState {
     #[allow(dead_code)]
-    config: Arc<crate::config::Config>,
-    resources: Arc<crate::config::entities::ResourceRegistry>,
+    config: Arc<Config>,
+    resources: Arc<ResourceRegistry>,
 }
 
 impl AppState {
-    pub fn new(
-        config: crate::config::Config,
-        resources: Arc<crate::config::entities::ResourceRegistry>,
-    ) -> Self {
-        let config = Arc::new(config);
+    pub fn new(config: Arc<Config>, resources: Arc<ResourceRegistry>) -> Self {
         Self { config, resources }
     }
 
-    pub fn resources(&self) -> Arc<crate::config::entities::ResourceRegistry> {
+    pub fn resources(&self) -> Arc<ResourceRegistry> {
         self.resources.clone()
     }
 }

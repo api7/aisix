@@ -22,7 +22,10 @@ use utoipa::{
 };
 use utoipa_scalar::{Scalar, Servable as ScalarServable};
 
-use crate::admin::types::AuthError;
+use crate::{
+    admin::types::AuthError,
+    config::{Config, ConfigProvider, entities::ResourceRegistry},
+};
 
 pub const PATH_PREFIX: &str = "/aisix/admin";
 
@@ -72,21 +75,19 @@ impl Modify for SecurityAddon {
 
 #[derive(Clone)]
 pub struct AppState {
-    #[allow(unused)]
-    config: Arc<crate::config::Config>,
-    config_provider: Arc<dyn crate::config::ConfigProvider>,
-    resources: Arc<crate::config::entities::ResourceRegistry>,
+    config: Arc<Config>,
+    config_provider: Arc<dyn ConfigProvider>,
+    resources: Arc<ResourceRegistry>,
     proxy_router: Option<Router>,
 }
 
 impl AppState {
     pub fn new(
-        config: crate::config::Config,
-        config_provider: Arc<dyn crate::config::ConfigProvider>,
-        resources: Arc<crate::config::entities::ResourceRegistry>,
+        config: Arc<Config>,
+        config_provider: Arc<dyn ConfigProvider>,
+        resources: Arc<ResourceRegistry>,
         proxy_router: Option<Router>,
     ) -> Self {
-        let config = Arc::new(config);
         Self {
             config,
             config_provider,

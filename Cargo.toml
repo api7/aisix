@@ -63,6 +63,7 @@ rust-embed = { version = "8.11.0", default-features = false, features = [
 ] }
 mime_guess = "2.0.5"
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
+validator = { version = "0.20", features = ["derive"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

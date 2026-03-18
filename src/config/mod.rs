@@ -15,7 +15,7 @@ pub fn load() -> Result<Config, config::ConfigError> {
         .try_deserialize::<Config>()
 }
 
-pub async fn create_provider(config: Config) -> Result<Arc<dyn ConfigProvider>> {
+pub async fn create_provider(config: &Config) -> Result<Arc<dyn ConfigProvider>> {
     Ok(Arc::new(
         etcd::EtcdConfigProvider::new(config.deployment.etcd.clone()).await?,
     ))
