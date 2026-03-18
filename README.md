@@ -1,10 +1,88 @@
-# ai-gateway
+# AISIX AI Gateway
 
-## Prerequisites
+[![Build Status](https://github.com/api7/ai-gateway-stash/actions/workflows/build.yaml/badge.svg?branch=main)](https://github.com/api7/ai-gateway-stash/actions/workflows/build.yaml)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/api7/ai-gateway-stash/blob/main/LICENSE)
+
+<br/>
+
+<p align="center">
+  <strong>A high-performance, Rust-based AI Gateway for unified LLM access.</strong><br/>
+  <em>OpenAI-compatible API across OpenAI, Anthropic, Gemini, DeepSeek, and more.</em><br/><br/>
+  🦀 <strong>Rust</strong> • 🔌 <strong>OpenAI Compatible</strong> • 🗄️ <strong>etcd</strong>
+</p>
+
+
+## Why AISIX
+
+- 🦀 **Rust + Tokio** — Extreme performance with low resource footprint; ships as a single binary
+- 🔌 **OpenAI-Compatible** — One API to call all LLMs; drop-in replacement with zero code changes
+- ⚡ **Dynamic Config** — Hot-reload via etcd; update models and keys without restarting
+- 🛡️ **Enterprise-Grade Control** — API key auth, rate limiting (RPM / TPM / concurrent), and per-model access control
+- 📊 **Observability** — OpenTelemetry distributed tracing and Prometheus metrics out of the box
+- 🎨 **Admin UI** — Built-in management dashboard for models, API keys, and a chat playground
+
+---
+
+## Features
+
+### 🌐 Multi-Provider Support
+
+| Provider | Chat Completions | Streaming | Embeddings |
+|---|:---:|:---:|:---:|
+| 🟢 OpenAI | ✅ | ✅ | ✅ |
+| 🟠 Anthropic | ✅ | ✅ | — |
+| 🔵 Gemini | ✅ | ✅ | ✅ |
+| 🐋 DeepSeek | ✅ | ✅ | — |
+| 🔌 OpenAI-Compatible | ✅ | ✅ | ✅ |
+
+### 🚦 Traffic Management
+
+- Rate limiting — RPM, TPM, and concurrent request limits
+- Per-model and per-key access control
+- Request validation with JSON Schema
+
+### 🛡️ Security & Auth
+
+- API key authentication on all proxy requests
+- Per-key model allowlist
+- Admin API key protection
+
+### 📊 Observability
+
+- OpenTelemetry distributed tracing (Jaeger / Zipkin)
+- Prometheus metrics export
+- Structured logging via [`logforth`](https://crates.io/crates/logforth)
+
+### 🎨 Admin & Management
+
+- RESTful Admin API with OpenAPI spec + Scalar UI
+- React-based Admin Dashboard
+- Model CRUD / API Key CRUD / Chat Playground
+- etcd-backed dynamic configuration (no restarts needed)
+
+---
+
+## Architecture
+
+<a href="#architecture"><img src="docs/images/architecture_basic.png" alt="AISIX Architecture" width="789" /></a>
+
+---
+
+## Quick Start
+
+*Will link to new documentation about development setup and contribution guidelines*
+
+---
+
+## Development
+
+*Will link to new documentation about development setup and contribution guidelines*
+
+### Prerequisites
 
 - Rust (latest stable/nightly version)
 
-## Build and Run
+### Build & Run
 
 1. Build UI
 
@@ -35,49 +113,28 @@
     RUST_LOG=info cargo run --features trace
     ```
 
-## Provision config data
+## Roadmap
+- [ ] Load Balancing / Fallback across providers
+- [ ] Prompt caching
+- [ ] Cost tracking & usage analytics
+- [ ] More providers (Azure, Bedrock, Ollama...)
+- [ ] Kubernetes Helm chart
+- [ ] New protocol support
+    - [ ] OpenAI Responses API
+    - [ ] Anthropic Messages API
+    - [ ] Google Gemini GenerateContent API
+- [ ] Multimodal APIs: Image, audio, video
+- [ ] MCP proxy
 
-### Config file (config.yaml)
+## Community
+<!-- Inspired by Apache APISIX and Kong community entry points -->
 
-```yaml
-deployment:
-  etcd:
-    host:
-      - "http://127.0.0.1:2379"
-    prefix: /aisix
-    timeout: 30
-  admin:
-    admin_key:
-      - key: "admin"
-      - key: "admin2"
-```
+- Use [GitHub Discussions](https://github.com/api7/ai-gateway-stash/discussions) for questions, ideas, and architecture discussions
+- Use [GitHub Issues](https://github.com/api7/ai-gateway-stash/issues) for bug reports, feature requests, and actionable tasks
+- Follow repository activity for ongoing documentation and product updates
 
-### Admin API
+---
 
-Access OpenAPI spec at [http://127.0.0.1:3001/openapi](http://127.0.0.1:3001/openapi) and use the API endpoints to manage resources.
+## License
 
-### ETCD
-
-#### Chat Completions
-
-```bash
-etcdctl put /aisix/apikeys/user1 '{"key":"user1","allowed_models": ["@my-ds/chat","@my-gemini/gemini-2.5-flash","mock", "@my-gemini/embed"],"rate_limit": {"rpm": 10}}'
-
-etcdctl put /aisix/apikeys/user1 '{"key":"user1","allowed_models": ["@my-ds/chat","@my-gemini/gemini-2.5-flash","mock", "@my-gemini/embed"]}'
-
-etcdctl put /aisix/apikeys/user2 '{"key":"user2","allowed_models": []}'
-
-etcdctl put /aisix/models/deepseek-chat '{"name":"@my-ds/chat","model":"deepseek/deepseek-chat","provider_config":{"api_key":"<your_key>"}}'
-
-etcdctl put /aisix/models/mock '{"name":"mock","model":"mock/mock","provider_config":{},"rate_limit":{"tpm":150}}'
-
-etcdctl put /aisix/models/gemini-2_5-flash '{"name":"@my-gemini/gemini-2.5-flash","model":"gemini/gemini-2.5-flash","provider_config":{"api_key":"<your_key>"}}'
-
-etcdctl put /aisix/models/anthropic-sonnet-4_5 '{"name":"@my-anthropic/sonnet-4.5","model":"anthropic/claude-sonnet-4-6","provider_config":{"api_key":"<your_key>"}}'
-```
-
-#### Embeddings
-
-```bash
-etcdctl put /aisix/models/gemini-embedding '{"name":"@my-gemini/embed","model":"gemini/gemini-embedding-001","provider_config":{"api_key":"<your_key>"}}'
-```
+This project is licensed under the [Apache License 2.0](LICENSE).
