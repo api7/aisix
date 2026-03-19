@@ -2,15 +2,26 @@ use std::{process::exit, sync::Arc};
 
 use ai_gateway::{config::Config, *};
 use axum::Router;
+use clap::Parser;
 use log::{error, info};
 use tokio::select;
 use validator::Validate;
 
+#[derive(Parser, Debug)]
+#[command(version)]
+struct Args {
+    /// Path to the configuration file
+    #[arg(short, long)]
+    config: Option<String>,
+}
+
 #[tokio::main]
 async fn main() {
+    let args = Args::parse();
+
     init_observability();
 
-    let config = Arc::new(config::load().expect("Failed to load configuration"));
+    let config = Arc::new(config::load(args.config).expect("Failed to load configuration"));
     if let Err(e) = config.validate() {
         error!("Configuration validation error: {}", e);
         exit(1);

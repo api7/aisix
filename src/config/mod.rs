@@ -8,9 +8,11 @@ use anyhow::Result;
 pub use types::*;
 
 /// Load configuration file
-pub fn load() -> Result<Config, config::ConfigError> {
+pub fn load(config_file: Option<String>) -> Result<Config, config::ConfigError> {
     config::Config::builder()
-        .add_source(config::File::with_name("config"))
+        .add_source(config::File::with_name(
+            config_file.as_deref().unwrap_or("config"),
+        ))
         .build()?
         .try_deserialize::<Config>()
 }
