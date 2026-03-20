@@ -64,7 +64,7 @@
 
 ## Architecture
 
-<a href="#architecture"><img src="docs/images/architecture_basic.png" alt="AISIX Architecture" width="100%" /></a>
+<a href="#architecture"><img src="docs/images/architecture_basic.svg" alt="AISIX Architecture" width="100%" /></a>
 
 ---
 
