@@ -1,6 +1,6 @@
 # Observability
 
-AI Gateway exports traces and metrics via OpenTelemetry (OTLP).
+AI Gateway exports traces and metrics through OpenTelemetry (OTLP).
 
 ```
 AI Gateway ──OTLP gRPC──► Jaeger    (traces)   :4317
@@ -8,9 +8,21 @@ AI Gateway ──OTLP gRPC──► Jaeger    (traces)   :4317
                                          └──► Grafana  (dashboard) :3100
 ```
 
+## At a Glance
+
+- Metrics are pushed from AI Gateway to Prometheus OTLP HTTP receiver.
+- Traces are exported from AI Gateway to Jaeger OTLP gRPC receiver.
+- Grafana reads from Prometheus and provides dashboards.
+
+### Important Semantics
+
+- `http://127.0.0.1:9090/api/v1/otlp/v1/metrics` is a write endpoint for OTLP push.
+- It is not a Prometheus scrape endpoint.
+- `scrape_configs` in `prometheus.yml` is only for pull-based targets (for example, Prometheus itself).
+
 ## Prerequisites
 
-Build with trace feature enabled:
+Build AI Gateway with trace feature enabled:
 
 ```bash
 cargo build --release --features trace
@@ -18,7 +30,7 @@ cargo build --release --features trace
 
 Metrics are always enabled. Tracing requires `--features trace`.
 
-## Quick Start
+## Quick Start (Local)
 
 ### 1. Jaeger (Traces)
 
@@ -32,25 +44,44 @@ docker run --rm --name jaeger -d \
 
 ### 2. Prometheus (Metrics)
 
+Create a minimal `prometheus.yml`:
+
+```bash
+cat > prometheus.yml <<EOF
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+EOF
+```
+
+Run Prometheus with OTLP receiver enabled:
+
 ```bash
 docker run --rm --name prometheus -d \
   -p 9090:9090 \
   quay.io/prometheus/prometheus:v3.1.0 \
+  -v $(pwd)/prometheus.yml:/etc/prometheus/prometheus.yml \
   --web.enable-otlp-receiver
 ```
+
+`--web.enable-otlp-receiver` is required so Prometheus can accept pushed OTLP metrics.
 
 ### 3. Grafana (Dashboard)
 
 ```bash
 docker run --rm --name grafana -d \
-  --add-host=host.docker.internal:host-gateway \
   -p 3100:3000 \
   -v $(pwd)/grafana/provisioning:/etc/grafana/provisioning:ro \
   -v $(pwd)/grafana/dashboards:/var/lib/grafana/dashboards:ro \
+  --add-host=host.docker.internal:host-gateway \
   grafana/grafana:latest
 ```
 
-> `--add-host` is required on Linux. macOS/Windows Docker Desktop resolves `host.docker.internal` automatically.
+`--add-host` is required on Linux. macOS/Windows Docker Desktop resolves `host.docker.internal` automatically.
 
 ### 4. Start AI Gateway
 
@@ -58,13 +89,28 @@ docker run --rm --name grafana -d \
 RUST_LOG=info ./target/release/ai-gateway
 ```
 
-## Web UI
+## Service URLs
 
 | Service | URL |
 |---------|-----|
 | Jaeger | http://localhost:16686 |
 | Prometheus | http://localhost:9090 |
 | Grafana | http://localhost:3100 (admin / admin) |
+
+## Verify
+
+### Verify Traces
+
+1. Send a request to the proxy API.
+2. Open Jaeger at `http://localhost:16686`.
+3. Select service `ai-gateway`, then click `Find Traces`.
+
+### Verify Metrics
+
+1. Open Prometheus at `http://localhost:9090`.
+2. Run a query such as `aisix_request_count_total`.
+3. Open Grafana at `http://localhost:3100` (admin/admin).
+4. Go to Dashboards and open `AI Gateway`.
 
 ## Metrics Reference
 
@@ -102,7 +148,7 @@ Each histogram produces three series: `_bucket` (for quantiles), `_count` (numbe
 
 ## Grafana Dashboard
 
-The `grafana/` directory contains provisioning configs that auto-load a pre-built dashboard:
+The `grafana/` directory contains provisioning configs that auto-load a built-in dashboard:
 
 ```
 grafana/
@@ -118,27 +164,6 @@ Dashboard panels:
 - **Request Throughput** — QPS by endpoint, QPS by status code
 - **Latency** — Request P50/P90/P99, LLM P50/P90/P99, first token latency by model, LLM latency by model
 - **Token Usage** — Prompt vs completion rate, usage by model, cumulative tokens, distribution pie chart
-
-## Verify
-
-### Traces
-
-1. Send a request to the proxy API
-2. Open Jaeger UI (http://localhost:16686) → select service `ai-gateway` → Find Traces
-
-### Metrics
-
-**Prometheus UI:**
-
-1. Open http://localhost:9090
-2. Enter query in the expression input, e.g., `aisix_request_count_total`
-3. Click "Execute" to view results
-
-**Grafana Dashboard:**
-
-1. Open http://localhost:3100 (login: admin / admin)
-2. Navigate to Dashboards → "AI Gateway"
-3. View pre-built panels for requests, latency, and token usage
 
 ## Stop
 
