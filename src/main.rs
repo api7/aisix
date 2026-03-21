@@ -5,7 +5,6 @@ use axum::Router;
 use clap::Parser;
 use log::{error, info};
 use tokio::select;
-use validator::Validate;
 
 #[derive(Parser, Debug)]
 #[command(version)]
@@ -22,10 +21,6 @@ async fn main() {
     init_observability();
 
     let config = Arc::new(config::load(args.config).expect("Failed to load configuration"));
-    if let Err(e) = config.validate() {
-        error!("Configuration validation error: {}", e);
-        exit(1);
-    }
 
     let config_provider = config::create_provider(&config)
         .await
@@ -139,32 +134,65 @@ fn init_observability() {
 }
 
 async fn serve_proxy(config: Arc<Config>, router: Router) -> Result<(), std::io::Error> {
-    let addr = config.listen;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-
-    info!("Proxy API listening on http://{}", addr);
-
-    axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    serve(
+        "Proxy",
+        config.server.proxy.listen,
+        &config.server.proxy.tls,
+        router,
     )
     .await
 }
 
 async fn serve_admin(config: Arc<Config>, state: admin::AppState) -> Result<(), std::io::Error> {
-    let addr = config
-        .deployment
-        .admin
-        .as_ref()
-        .map(|admin| admin.listen)
-        .unwrap_or_else(crate::config::defaults::admin_listen);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-
-    info!("Admin API listening on http://{}", addr);
-
-    axum::serve(
-        listener,
-        admin::create_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    serve(
+        "Admin",
+        config.server.admin.listen,
+        &config.server.admin.tls,
+        admin::create_router(state),
     )
     .await
+}
+
+async fn serve(
+    name: &str,
+    addr: std::net::SocketAddr,
+    tls: &config::ServerCommonTls,
+    router: Router,
+) -> Result<(), std::io::Error> {
+    if tls.enabled {
+        let Some(cert) = tls.cert_file.as_deref() else {
+            error!("{} TLS cert_file is required when TLS is enabled", name);
+            exit(1);
+        };
+
+        if !std::path::Path::new(cert).exists() {
+            error!("{} TLS cert_file '{}' does not exist", name, cert);
+            exit(1);
+        }
+
+        let Some(key) = tls.key_file.as_deref() else {
+            error!("{} TLS key_file is required when TLS is enabled", name);
+            exit(1);
+        };
+
+        if !std::path::Path::new(key).exists() {
+            error!("{} TLS key_file '{}' does not exist", name, key);
+            exit(1);
+        }
+
+        info!("{} API listening on https://{}", name, addr);
+        let tls_config = axum_server::tls_openssl::OpenSSLConfig::from_pem_file(cert, key)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        axum_server::bind_openssl(addr, tls_config)
+            .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .await
+    } else {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        info!("{} API listening on http://{}", name, addr);
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    }
 }

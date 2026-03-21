@@ -157,13 +157,10 @@ async fn auth(
         },
     };
 
-    let admin_keys = match &state.config.deployment.admin {
-        Some(admin) => match &admin.admin_key {
-            Some(keys) => keys,
-            None => return Err(AuthError::MissingKey.into_response()),
-        },
-        None => return Err(AuthError::MissingKey.into_response()),
-    };
+    let admin_keys = &state.config.deployment.admin.admin_key;
+    if admin_keys.is_empty() {
+        return Err(AuthError::MissingKey.into_response());
+    }
 
     if !admin_keys.iter().any(|item| item.key == api_key) {
         return Err(AuthError::InvalidKey.into_response());

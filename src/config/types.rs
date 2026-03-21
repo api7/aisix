@@ -4,7 +4,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::sync::mpsc;
-use validator::Validate;
+
+use crate::config::etcd;
 
 pub mod defaults {
     use super::*;
@@ -16,6 +17,10 @@ pub mod defaults {
     pub fn admin_listen() -> SocketAddr {
         "127.0.0.1:3001".parse().unwrap()
     }
+
+    pub fn server() -> Server {
+        Server::default()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -23,24 +28,76 @@ pub struct AdminKey {
     pub key: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Validate)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct DeploymentAdmin {
-    #[serde(default = "defaults::admin_listen")]
-    pub listen: SocketAddr,
-    pub admin_key: Option<Vec<AdminKey>>,
+    #[serde(default = "Vec::new")]
+    pub admin_key: Vec<AdminKey>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Deployment {
+    #[serde(default)]
+    pub etcd: etcd::Config,
+    #[serde(default)]
+    pub admin: DeploymentAdmin,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ServerCommonTls {
+    #[serde(default)]
+    pub enabled: bool,
+    pub cert_file: Option<String>,
+    pub key_file: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct Deployment {
-    pub etcd: super::etcd::Config,
-    pub admin: Option<DeploymentAdmin>,
-}
-
-#[derive(Clone, Debug, Deserialize, Validate)]
-pub struct Config {
-    pub deployment: Deployment,
+pub struct ServerProxy {
     #[serde(default = "defaults::listen")]
     pub listen: SocketAddr,
+    #[serde(default)]
+    pub tls: ServerCommonTls,
+}
+
+impl Default for ServerProxy {
+    fn default() -> Self {
+        Self {
+            listen: defaults::listen(),
+            tls: ServerCommonTls::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ServerAdmin {
+    #[serde(default = "defaults::admin_listen")]
+    pub listen: SocketAddr,
+    #[serde(default)]
+    pub tls: ServerCommonTls,
+}
+
+impl Default for ServerAdmin {
+    fn default() -> Self {
+        Self {
+            listen: defaults::admin_listen(),
+            tls: ServerCommonTls::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Server {
+    #[serde(default)]
+    pub proxy: ServerProxy,
+    #[serde(default)]
+    pub admin: ServerAdmin,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+pub struct Config {
+    #[serde(default)]
+    pub deployment: Deployment,
+    #[serde(default)]
+    pub server: Server,
 }
 
 type ConfigItemKey = String;

@@ -1,10 +1,14 @@
 import { ChildProcess, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { unlink, writeFile } from 'node:fs/promises';
+import { Agent as httpsAgent } from 'node:https';
+import { text } from 'node:stream/consumers';
 
 import deepmerge from '@fastify/deepmerge';
 import { file } from 'tmp-promise';
 import type { PartialDeep } from 'type-fest';
+
+import { client } from './http.js';
 
 export interface AppConfig {
   deployment: {
@@ -14,11 +18,27 @@ export interface AppConfig {
       timeout: number;
     };
     admin?: {
-      listen?: string;
       admin_key?: { key: string }[];
     };
   };
-  listen?: string;
+  server: {
+    proxy: {
+      listen?: string;
+      tls?: {
+        enabled?: boolean;
+        cert_file?: string;
+        key_file?: string;
+      };
+    };
+    admin: {
+      listen?: string;
+      tls?: {
+        enabled?: boolean;
+        cert_file?: string;
+        key_file?: string;
+      };
+    };
+  };
 }
 
 export const defaultConfig = (overrides?: PartialDeep<AppConfig>): AppConfig =>
@@ -26,7 +46,7 @@ export const defaultConfig = (overrides?: PartialDeep<AppConfig>): AppConfig =>
     {
       deployment: {
         etcd: {
-          host: ['http://localhost:2379'],
+          host: ['http://127.0.0.1:2379'],
           prefix: '/ai',
           timeout: 5000,
         },
@@ -34,6 +54,10 @@ export const defaultConfig = (overrides?: PartialDeep<AppConfig>): AppConfig =>
     },
     (overrides as AppConfig) ?? {},
   );
+
+export const tlsSkipVerify = new httpsAgent({
+  rejectUnauthorized: false,
+});
 
 export const randomPort = () =>
   Math.floor(Math.random() * (65535 - 1024)) + 1024;
@@ -71,10 +95,17 @@ export class App {
     return new Promise<App>((resolve, reject) => {
       let exited = false;
 
-      appProcess.on('exit', (code) => {
+      appProcess.on('exit', async (code) => {
         exited = true;
         cleanup();
-        reject(new Error(`Process exited early with code ${code}`));
+
+        const stdout = await text(appProcess.stdout!);
+        const stderr = await text(appProcess.stderr!);
+        reject(
+          new Error(
+            `Process exited early with code ${code}.\nStdout: ${stdout}.\nStderr: ${stderr}`,
+          ),
+        );
       });
       appProcess.on('error', reject);
 
@@ -87,7 +118,7 @@ export class App {
     });
   }
 
-  public async waitForReady(port?: number): Promise<App> {
+  public async waitForReady(portOrURL?: number | string): Promise<App> {
     let times = 100;
     while (times-- > 0) {
       // If the process exits while waiting for ready, this is considered an unexpected exit.
@@ -95,9 +126,18 @@ export class App {
         throw new Error(ERR_UNEXPECTED_EXIT);
 
       try {
-        await fetch(`http://localhost:${port ?? 3000}`);
+        await client.get(
+          portOrURL
+            ? typeof portOrURL == 'number'
+              ? `http://127.0.0.1:${portOrURL}`
+              : portOrURL
+            : `http://127.0.0.1:3000/`,
+          { httpsAgent: tlsSkipVerify },
+        );
         return this;
-      } catch (error) {}
+      } catch (_err) {
+        //
+      }
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     throw new Error('Server failed to start');

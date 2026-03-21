@@ -19,14 +19,30 @@ pub async fn create_routers(etcd_prefix: Option<&str>) -> (Router, Router) {
                 user: None,
                 password: None,
             },
-            admin: Some(ai_gateway::config::DeploymentAdmin {
-                listen: "127.0.0.1:3001".parse().unwrap(),
-                admin_key: Some(vec![ai_gateway::config::AdminKey {
+            admin: ai_gateway::config::DeploymentAdmin {
+                admin_key: vec![ai_gateway::config::AdminKey {
                     key: TEST_ADMIN_KEY.to_string(),
-                }]),
-            }),
+                }],
+            },
         },
-        listen: "127.0.0.1:3000".parse().unwrap(),
+        server: ai_gateway::config::Server {
+            proxy: ai_gateway::config::ServerProxy {
+                listen: "127.0.0.1:3000".parse().unwrap(),
+                tls: ai_gateway::config::ServerCommonTls {
+                    enabled: false,
+                    cert_file: None,
+                    key_file: None,
+                },
+            },
+            admin: ai_gateway::config::ServerAdmin {
+                listen: "127.0.0.1:3001".parse().unwrap(),
+                tls: ai_gateway::config::ServerCommonTls {
+                    enabled: false,
+                    cert_file: None,
+                    key_file: None,
+                },
+            },
+        },
     });
 
     let config_provider = Arc::new(

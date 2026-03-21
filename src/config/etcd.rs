@@ -19,6 +19,18 @@ pub struct Config {
     pub password: Option<String>,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            host: vec!["http://127.0.0.1:2379".to_string()],
+            prefix: "/aisix".to_string(),
+            timeout: 5,
+            user: None,
+            password: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct EtcdConfigProvider {
     client: etcd_client::Client,

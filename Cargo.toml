@@ -9,8 +9,14 @@ trace = []
 [dependencies]
 log = { version = "0.4.29", features = ["kv", "kv_serde"] }
 tokio = { version = "1", features = ["full", "test-util"] }
-reqwest = { version = "0.13", features = ["json", "stream"] }
-openssl = { version = "0.10" }
+reqwest = { version = "0.13", default-features = false, features = [
+  "charset",
+  "system-proxy",
+  "json",
+  "stream",
+  "native-tls",
+] }
+openssl = { version = "0.10.76" }
 tokio-openssl = "0.6"
 clap = { version = "4.6.0", features = ["derive"] }
 config = "0.15"
@@ -53,8 +59,8 @@ skp-ratelimit = { git = "https://github.com/bzp2010/skp-ratelimit.git", branch =
   "memory",
 ] }
 rand = "0.10.0"
-jsonschema = { version = "0.44.1", default-features = false }
-uuid = { version = "1.21.0", features = ["v4"] }
+jsonschema = { version = "0.45", default-features = false }
+uuid = { version = "1.22.0", features = ["v4"] }
 utoipa = "5.4.0"
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 rust-embed = { version = "8.11.0", default-features = false, features = [
@@ -65,9 +71,13 @@ rust-embed = { version = "8.11.0", default-features = false, features = [
 mime_guess = "2.0.5"
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
 validator = { version = "0.20", features = ["derive"] }
+axum-server = { version = "0.8.0", default-features = false, features = [
+  "tls-openssl",
+] }
 
 [dev-dependencies]
 tokio-test = "0.4"
 assert_matches = "1.5"
 pretty_assertions = "1.4"
 rstest = "0.26"
+tempfile = "3"
