@@ -22,7 +22,7 @@ describe('proxy server', () => {
 
   let server: App | undefined;
 
-  afterEach(() => server?.exit());
+  afterEach(async () => await server?.exit());
 
   test('listen http (default addr)', async () => {
     server = await (await App.spawn()).waitForReady();
@@ -179,7 +179,7 @@ describe('admin server', () => {
 
   let server: App | undefined;
 
-  afterEach(() => server?.exit());
+  afterEach(async () => await server?.exit());
 
   test('listen http (default addr)', async () => {
     server = await (await App.spawn()).waitForReady(3001);
