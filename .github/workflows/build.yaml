@@ -54,7 +54,7 @@ jobs:
           pnpm -C tests/e2e test
 
       - name: Build
-        run: cargo build --verbose --features trace
+        run: cargo build --verbose
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

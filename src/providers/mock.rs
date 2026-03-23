@@ -27,7 +27,7 @@ pub struct MockProvider {
 
 #[async_trait]
 impl Provider for MockProvider {
-    #[fastrace::trace(properties = { "request": "{request:?}" })]
+    #[fastrace::trace]
     async fn chat_completion(
         &self,
         request: ChatCompletionRequest,

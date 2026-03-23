@@ -14,13 +14,11 @@ Includes a React-based admin UI (in `ui/`) for managing models, API keys, and a 
 ```bash
 cargo build                    # Debug build
 cargo build --release          # Release build
-cargo build --features trace   # Build with OTel tracing support
 ```
 
 ### Run
 ```bash
 RUST_LOG=info cargo run                    # Standard run
-RUST_LOG=info cargo run --features trace   # With OTel tracing
 ```
 
 ### UI Development
@@ -421,7 +419,7 @@ GitHub Actions workflow (`.github/workflows/build.yaml`):
 5. Build UI (`pnpm install && pnpm build`)
 6. `cargo clippy` — Lint (warnings = error)
 7. `cargo test` — Run tests
-8. `cargo build --features trace` — Build binary with tracing
+8. `cargo build` — Build binary
 9. Upload artifact (debug binary)
 
 ## VSCode Setup

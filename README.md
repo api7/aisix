@@ -99,18 +99,7 @@
 2. Build gateway
 
     ```bash
-    RUST_LOG=info cargo run
-
-    ## Or enable OTel-based tracing support
-    docker run --rm --name jaeger \
-      -p 16686:16686 \
-      -p 4317:4317 \
-      -p 4318:4318 \
-      -p 5778:5778 \
-      -p 9411:9411 \
-      cr.jaegertracing.io/jaegertracing/jaeger:2.14.0
-
-    RUST_LOG=info cargo run --features trace
+    cargo run
     ```
 
 ## Roadmap

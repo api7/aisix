@@ -3,9 +3,6 @@ name = "ai-gateway"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-trace = []
-
 [dependencies]
 log = { version = "0.4.29", features = ["kv", "kv_serde"] }
 tokio = { version = "1", features = ["full", "test-util"] }

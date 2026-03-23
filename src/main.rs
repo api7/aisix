@@ -70,14 +70,14 @@ fn init_observability() -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
         layout::TextLayout,
     };
     use metrics_exporter_otel::OpenTelemetryRecorder;
-    use opentelemetry::{InstrumentationScope, KeyValue, metrics::MeterProvider};
+    use opentelemetry::{InstrumentationScope, metrics::MeterProvider};
     use opentelemetry_otlp::SpanExporter;
     use opentelemetry_sdk::{
         Resource,
         metrics::{PeriodicReader, SdkMeterProvider},
     };
 
-    const SERVICE_NAME: &str = "ai-gateway";
+    const INSTRUMENTATION_NAME: &str = "ai-gateway";
 
     let (tx, rx) = oneshot::channel::<()>();
 
@@ -94,44 +94,29 @@ fn init_observability() -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
         .apply();
 
     // trace
-    if cfg!(feature = "trace") {
-        let reporter = OpenTelemetryReporter::new(
-            SpanExporter::builder()
-                .build()
-                .expect("initialize otlp exporter"),
-            Cow::Owned(
-                Resource::builder()
-                    .with_attributes([KeyValue::new("service.name", SERVICE_NAME)])
-                    .build(),
-            ),
-            InstrumentationScope::builder(SERVICE_NAME)
-                .with_version(env!("CARGO_PKG_VERSION"))
-                .build(),
-        );
-        fastrace::set_reporter(
-            reporter,
-            Config::default().report_interval(Duration::from_secs(1)),
-        );
-    }
+    let reporter = OpenTelemetryReporter::new(
+        SpanExporter::builder()
+            .build()
+            .expect("initialize otlp exporter"),
+        Cow::Owned(Resource::builder().build()),
+        InstrumentationScope::builder(INSTRUMENTATION_NAME)
+            .with_version(env!("CARGO_PKG_VERSION"))
+            .build(),
+    );
+    fastrace::set_reporter(
+        reporter,
+        Config::default().report_interval(Duration::from_secs(1)),
+    );
 
     // metric
     let exporter = opentelemetry_otlp::MetricExporter::builder()
         .build()
         .unwrap();
 
-    let reader = PeriodicReader::builder(exporter)
-        .with_interval(std::time::Duration::from_secs(10))
-        .build();
+    let reader = PeriodicReader::builder(exporter).build();
 
-    let meter_provider = SdkMeterProvider::builder()
-        .with_resource(
-            Resource::builder()
-                .with_attributes([KeyValue::new("service.name", SERVICE_NAME)])
-                .build(),
-        )
-        .with_reader(reader)
-        .build();
-    let meter = meter_provider.meter(SERVICE_NAME);
+    let meter_provider = SdkMeterProvider::builder().with_reader(reader).build();
+    let meter = meter_provider.meter(INSTRUMENTATION_NAME);
 
     metrics::set_global_recorder(OpenTelemetryRecorder::new(meter))
         .expect("initialize metrics recorder");
@@ -141,9 +126,7 @@ fn init_observability() -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let shutdown_handle = tokio::spawn(async move {
         let _ = rx.await;
 
-        if cfg!(feature = "trace") {
-            fastrace::flush();
-        }
+        fastrace::flush();
 
         if let Err(e) = meter_provider.shutdown() {
             error!("Error shutting down meter provider: {}", e);
