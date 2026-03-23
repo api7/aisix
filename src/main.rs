@@ -71,11 +71,13 @@ fn init_observability() -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     };
     use metrics_exporter_otel::OpenTelemetryRecorder;
     use opentelemetry::{InstrumentationScope, KeyValue, metrics::MeterProvider};
-    use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+    use opentelemetry_otlp::SpanExporter;
     use opentelemetry_sdk::{
         Resource,
-        metrics::{PeriodicReader, SdkMeterProvider, Temporality},
+        metrics::{PeriodicReader, SdkMeterProvider},
     };
+
+    const SERVICE_NAME: &str = "ai-gateway";
 
     let (tx, rx) = oneshot::channel::<()>();
 
@@ -95,19 +97,14 @@ fn init_observability() -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     if cfg!(feature = "trace") {
         let reporter = OpenTelemetryReporter::new(
             SpanExporter::builder()
-                .with_tonic()
-                //TODO make endpoint configurable
-                .with_endpoint("http://127.0.0.1:4317".to_string())
-                .with_protocol(opentelemetry_otlp::Protocol::Grpc)
-                .with_timeout(opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT)
                 .build()
                 .expect("initialize otlp exporter"),
             Cow::Owned(
                 Resource::builder()
-                    .with_attributes([KeyValue::new("service.name", "ai-gateway")])
+                    .with_attributes([KeyValue::new("service.name", SERVICE_NAME)])
                     .build(),
             ),
-            InstrumentationScope::builder("ai-gateway")
+            InstrumentationScope::builder(SERVICE_NAME)
                 .with_version(env!("CARGO_PKG_VERSION"))
                 .build(),
         );
@@ -119,9 +116,6 @@ fn init_observability() -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
 
     // metric
     let exporter = opentelemetry_otlp::MetricExporter::builder()
-        .with_http()
-        .with_temporality(Temporality::default())
-        .with_endpoint("http://127.0.0.1:9090/api/v1/otlp/v1/metrics")
         .build()
         .unwrap();
 
@@ -129,8 +123,15 @@ fn init_observability() -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
         .with_interval(std::time::Duration::from_secs(10))
         .build();
 
-    let meter_provider = SdkMeterProvider::builder().with_reader(reader).build();
-    let meter = meter_provider.meter("ai-gateway");
+    let meter_provider = SdkMeterProvider::builder()
+        .with_resource(
+            Resource::builder()
+                .with_attributes([KeyValue::new("service.name", SERVICE_NAME)])
+                .build(),
+        )
+        .with_reader(reader)
+        .build();
+    let meter = meter_provider.meter(SERVICE_NAME);
 
     metrics::set_global_recorder(OpenTelemetryRecorder::new(meter))
         .expect("initialize metrics recorder");

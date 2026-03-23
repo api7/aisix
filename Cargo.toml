@@ -41,9 +41,11 @@ anyhow = "1.0.100"
 fastrace = { version = "0.7.16", features = ["enable"] }
 fastrace-axum = "0.2.0"
 fastrace-opentelemetry = "0.16.0"
-opentelemetry = "0.31.0"
-opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic"] }
-opentelemetry_sdk = "0.31.0"
+opentelemetry = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "965078315b58ae14725721735f1c8e2bc2d3b445" }
+opentelemetry-otlp = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "965078315b58ae14725721735f1c8e2bc2d3b445", features = [
+  "grpc-tonic",
+] }
+opentelemetry_sdk = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "965078315b58ae14725721735f1c8e2bc2d3b445" }
 fastrace-tracing = "0.1.1"
 fastrace-reqwest = "0.3.0"
 logforth = { version = "0.29.1", features = [
@@ -83,3 +85,8 @@ assert_matches = "1.5"
 pretty_assertions = "1.4"
 rstest = "0.26"
 tempfile = "3"
+
+[patch.crates-io]
+opentelemetry = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "965078315b58ae14725721735f1c8e2bc2d3b445" }
+opentelemetry_sdk = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "965078315b58ae14725721735f1c8e2bc2d3b445" }
+opentelemetry-otlp = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "965078315b58ae14725721735f1c8e2bc2d3b445" }
