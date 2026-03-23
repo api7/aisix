@@ -4,13 +4,14 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::{
     providers::{Provider, types::ProviderError},
     proxy::types::{
         ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice,
         ChatCompletionChunkDelta, ChatCompletionRequest, ChatCompletionResponse,
-        ChatCompletionUsage, ChatMessage,
+        ChatCompletionUsage, ChatMessage, EmbeddingRequest, EmbeddingResponse,
     },
 };
 
@@ -200,4 +201,72 @@ impl Provider for MockProvider {
 
         Ok(stream)
     }
+
+    async fn embedding(
+        &self,
+        request: EmbeddingRequest,
+    ) -> Result<EmbeddingResponse, ProviderError> {
+        let inputs = embedding_inputs(&request);
+        let prompt_tokens = inputs
+            .iter()
+            .map(|input| estimated_tokens(input))
+            .sum::<u32>();
+
+        let data = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                json!({
+                    "object": "embedding",
+                    "embedding": deterministic_embedding(input, 16),
+                    "index": index as i32,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let response = serde_json::from_value::<EmbeddingResponse>(json!({
+            "object": "list",
+            "data": data,
+            "model": request.model,
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "total_tokens": prompt_tokens,
+            }
+        }))?;
+
+        Ok(response)
+    }
+}
+
+fn embedding_inputs(request: &EmbeddingRequest) -> Vec<String> {
+    let value = serde_json::to_value(&request.input).unwrap_or(Value::Null);
+    match value {
+        Value::String(single) => vec![single],
+        Value::Array(values) => values
+            .into_iter()
+            .filter_map(|item| item.as_str().map(str::to_owned))
+            .collect(),
+        _ => vec![],
+    }
+}
+
+fn estimated_tokens(input: &str) -> u32 {
+    let count = input.split_whitespace().count() as u32;
+    if count == 0 { 1 } else { count }
+}
+
+fn deterministic_embedding(input: &str, dim: usize) -> Vec<f32> {
+    let mut state: u64 = 0xcbf29ce484222325;
+    for byte in input.bytes() {
+        state ^= byte as u64;
+        state = state.wrapping_mul(0x100000001b3);
+    }
+
+    (0..dim)
+        .map(|idx| {
+            let mixed = state.rotate_left((idx as u32 * 7) % 64)
+                ^ (idx as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15);
+            ((mixed % 2000) as f32 / 1000.0) - 1.0
+        })
+        .collect()
 }
