@@ -20,6 +20,7 @@ use axum::{
 use fastrace::prelude::*;
 use http_body::Frame;
 use log::info;
+use metrics::{counter, histogram};
 use opentelemetry_semantic_conventions::trace::{
     HTTP_REQUEST_METHOD, HTTP_RESPONSE_STATUS_CODE, HTTP_ROUTE, URL_PATH,
 };
@@ -29,7 +30,9 @@ pub const TRACEPARENT_HEADER: &str = "traceparent";
 pub struct TimedBody {
     start_time: Instant,
     inner: Body,
-    metric_attrs: [opentelemetry::KeyValue; 3],
+    metric_method: String,
+    metric_endpoint: String,
+    metric_status_code: u16,
     latency_recorded: bool,
 }
 
@@ -76,8 +79,14 @@ impl TimedBody {
         if self.latency_recorded {
             return;
         }
-        let latency = self.start_time.elapsed().as_millis() as u64;
-        crate::utils::metrics::METRIC_REQUEST_LATENCY.record(latency, &self.metric_attrs);
+        let latency = self.start_time.elapsed().as_millis() as f64;
+        histogram!(
+            crate::utils::metrics::REQUEST_LATENCY_KEY,
+            "method" => self.metric_method.clone(),
+            "endpoint" => self.metric_endpoint.clone(),
+            "status_code" => self.metric_status_code.to_string(),
+        )
+        .record(latency);
         self.latency_recorded = true;
     }
 }
@@ -131,24 +140,21 @@ pub async fn trace(mut req: Request, next: Next) -> Response<TimedBody> {
     let (parts, body) = response.into_parts();
     let status = parts.status;
 
-    let metric_attrs = [
-        opentelemetry::KeyValue::new("method", method.to_string()),
-        opentelemetry::KeyValue::new(
-            "endpoint",
-            matched_path
-                .clone()
-                .map(|p| p.as_str().to_string())
-                .unwrap_or("-".to_string()),
-        ),
-        opentelemetry::KeyValue::new("status_code", status.as_u16() as i64),
-    ];
+    let metric_method = method.to_string();
+    let metric_endpoint = matched_path
+        .clone()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or("-".to_string());
+    let metric_status_code = status.as_u16();
 
     let response = Response::from_parts(
         parts,
         TimedBody {
             start_time,
             inner: body,
-            metric_attrs: metric_attrs.clone(),
+            metric_method: metric_method.clone(),
+            metric_endpoint: metric_endpoint.clone(),
+            metric_status_code,
             latency_recorded: false,
         },
     );
@@ -167,7 +173,13 @@ pub async fn trace(mut req: Request, next: Next) -> Response<TimedBody> {
         user_agent
     );
 
-    crate::utils::metrics::METRIC_REQUEST_COUNT.add(1, &metric_attrs);
+    counter!(
+        crate::utils::metrics::REQUEST_COUNT_KEY,
+        "method" => metric_method,
+        "endpoint" => metric_endpoint,
+        "status_code" => metric_status_code.to_string(),
+    )
+    .increment(1);
 
     response
 }

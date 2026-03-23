@@ -4,7 +4,7 @@ use ai_gateway::{config::Config, *};
 use axum::Router;
 use clap::Parser;
 use log::{error, info};
-use tokio::select;
+use tokio::{select, sync::oneshot};
 
 #[derive(Parser, Debug)]
 #[command(version)]
@@ -18,7 +18,7 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
-    init_observability();
+    let (ob_shutdown_signal, ob_shutdown_task) = init_observability();
 
     let config = Arc::new(config::load(args.config).expect("Failed to load configuration"));
 
@@ -52,13 +52,14 @@ async fn main() {
         }
     }
 
-    if cfg!(feature = "trace") {
-        fastrace::flush();
-    }
+    let _ = ob_shutdown_signal.send(());
+    ob_shutdown_task
+        .await
+        .expect("Failed to shutdown observability");
     exit(if exception { 1 } else { 0 });
 }
 
-fn init_observability() {
+fn init_observability() -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     use std::{borrow::Cow, time::Duration};
 
     use fastrace::collector::Config;
@@ -68,12 +69,15 @@ fn init_observability() {
         filter::env_filter::EnvFilterBuilder,
         layout::TextLayout,
     };
-    use opentelemetry::{InstrumentationScope, KeyValue};
+    use metrics_exporter_otel::OpenTelemetryRecorder;
+    use opentelemetry::{InstrumentationScope, KeyValue, metrics::MeterProvider};
     use opentelemetry_otlp::{SpanExporter, WithExportConfig};
     use opentelemetry_sdk::{
         Resource,
         metrics::{PeriodicReader, SdkMeterProvider, Temporality},
     };
+
+    let (tx, rx) = oneshot::channel::<()>();
 
     // log
     logforth::starter_log::builder()
@@ -125,12 +129,30 @@ fn init_observability() {
         .with_interval(std::time::Duration::from_secs(10))
         .build();
 
-    let provider = SdkMeterProvider::builder().with_reader(reader).build();
+    let meter_provider = SdkMeterProvider::builder().with_reader(reader).build();
+    let meter = meter_provider.meter("ai-gateway");
 
-    // TODO: provider.shutdown()
-    opentelemetry::global::set_meter_provider(provider.clone());
+    metrics::set_global_recorder(OpenTelemetryRecorder::new(meter))
+        .expect("initialize metrics recorder");
+    ai_gateway::utils::metrics::describe_metrics();
 
-    let _ = opentelemetry::global::meter("ai-gateway");
+    // shuting down signal handler
+    let shutdown_handle = tokio::spawn(async move {
+        let _ = rx.await;
+
+        if cfg!(feature = "trace") {
+            fastrace::flush();
+        }
+
+        if let Err(e) = meter_provider.shutdown() {
+            error!("Error shutting down meter provider: {}", e);
+        }
+
+        logforth::core::default_logger().flush();
+        logforth::core::default_logger().exit();
+    });
+
+    (tx, shutdown_handle)
 }
 
 async fn serve_proxy(config: Arc<Config>, router: Router) -> Result<(), std::io::Error> {

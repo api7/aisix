@@ -1,43 +1,55 @@
-use std::sync::LazyLock;
+use metrics::{Unit, describe_counter, describe_histogram};
 
-use opentelemetry::metrics::{Counter, Histogram, Meter};
+#[derive(Clone, Copy)]
+pub struct MetricDef {
+    pub key: &'static str,
+    pub description: &'static str,
+    pub unit: Unit,
+}
 
-static METER: LazyLock<Meter> = LazyLock::new(|| opentelemetry::global::meter("ai-gateway"));
+pub const REQUEST_COUNT_KEY: &str = "aisix_request_count";
+pub const TOKEN_COUNT_KEY: &str = "aisix_token_count";
+pub const REQUEST_LATENCY_KEY: &str = "aisix_request_latency";
+pub const LLM_LATENCY_KEY: &str = "aisix_llm_latency";
+pub const LLM_FIRST_TOKEN_LATENCY_KEY: &str = "aisix_llm_first_token_latency";
 
-pub static METRIC_REQUEST_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("aisix_request_count")
-        .with_description("Total number of requests processed")
-        .build()
-});
+pub const COUNTER_METRICS: [MetricDef; 2] = [
+    MetricDef {
+        key: REQUEST_COUNT_KEY,
+        description: "Total number of requests processed",
+        unit: Unit::Count,
+    },
+    MetricDef {
+        key: TOKEN_COUNT_KEY,
+        description: "Total number of tokens processed",
+        unit: Unit::Count,
+    },
+];
 
-pub static METRIC_TOKEN_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("aisix_token_count")
-        .with_description("Total number of tokens processed")
-        .build()
-});
+pub const HISTOGRAM_METRICS: [MetricDef; 3] = [
+    MetricDef {
+        key: REQUEST_LATENCY_KEY,
+        description: "Request latency",
+        unit: Unit::Milliseconds,
+    },
+    MetricDef {
+        key: LLM_LATENCY_KEY,
+        description: "LLM provider latency",
+        unit: Unit::Milliseconds,
+    },
+    MetricDef {
+        key: LLM_FIRST_TOKEN_LATENCY_KEY,
+        description: "LLM provider first token latency (only for streaming requests)",
+        unit: Unit::Milliseconds,
+    },
+];
 
-pub static METRIC_REQUEST_LATENCY: LazyLock<Histogram<u64>> = LazyLock::new(|| {
-    METER
-        .u64_histogram("aisix_request_latency")
-        .with_description("Request latency")
-        .with_unit("ms")
-        .build()
-});
+pub fn describe_metrics() {
+    for metric in COUNTER_METRICS {
+        describe_counter!(metric.key, metric.unit, metric.description);
+    }
 
-pub static METRIC_LLM_LATENCY: LazyLock<Histogram<u64>> = LazyLock::new(|| {
-    METER
-        .u64_histogram("aisix_llm_latency")
-        .with_description("LLM provider latency")
-        .with_unit("ms")
-        .build()
-});
-
-pub static METRIC_LLM_FIRST_TOKEN_LATENCY: LazyLock<Histogram<u64>> = LazyLock::new(|| {
-    METER
-        .u64_histogram("aisix_llm_first_token_latency")
-        .with_description("LLM provider first token latency (only for streaming requests)")
-        .with_unit("ms")
-        .build()
-});
+    for metric in HISTOGRAM_METRICS {
+        describe_histogram!(metric.key, metric.unit, metric.description);
+    }
+}

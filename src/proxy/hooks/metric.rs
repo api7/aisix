@@ -4,6 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use axum::extract::Request;
 use log::error;
+use metrics::{counter, histogram};
 
 use crate::proxy::{
     hooks::{HookContext, HookError, ProxyHook, ResponseData, TokenUsage},
@@ -31,36 +32,34 @@ impl MetricHook {
     }
 
     fn record_llm_latency(model_name: String, ctx: &HookContext) {
-        crate::utils::metrics::METRIC_LLM_LATENCY.record(
-            MetricHook::get_start_time(ctx).elapsed().as_millis() as u64,
-            &[opentelemetry::KeyValue::new("model", model_name)],
-        );
+        histogram!(
+            crate::utils::metrics::LLM_LATENCY_KEY,
+            "model" => model_name,
+        )
+        .record(MetricHook::get_start_time(ctx).elapsed().as_millis() as f64);
     }
 
     fn record_token_usage(model_name: String, usage: &TokenUsage) {
-        crate::utils::metrics::METRIC_TOKEN_COUNT.add(
-            usage.prompt_tokens.unwrap_or(0),
-            &[
-                opentelemetry::KeyValue::new("type", "prompt"),
-                opentelemetry::KeyValue::new("model", model_name.clone()),
-            ],
-        );
+        counter!(
+            crate::utils::metrics::TOKEN_COUNT_KEY,
+            "type" => "prompt",
+            "model" => model_name.clone(),
+        )
+        .increment(usage.prompt_tokens.unwrap_or(0));
 
-        crate::utils::metrics::METRIC_TOKEN_COUNT.add(
-            usage.completion_tokens.unwrap_or(0),
-            &[
-                opentelemetry::KeyValue::new("type", "completion"),
-                opentelemetry::KeyValue::new("model", model_name.clone()),
-            ],
-        );
+        counter!(
+            crate::utils::metrics::TOKEN_COUNT_KEY,
+            "type" => "completion",
+            "model" => model_name.clone(),
+        )
+        .increment(usage.completion_tokens.unwrap_or(0));
 
-        crate::utils::metrics::METRIC_TOKEN_COUNT.add(
-            usage.total_tokens,
-            &[
-                opentelemetry::KeyValue::new("type", "total"),
-                opentelemetry::KeyValue::new("model", model_name),
-            ],
-        );
+        counter!(
+            crate::utils::metrics::TOKEN_COUNT_KEY,
+            "type" => "total",
+            "model" => model_name,
+        )
+        .increment(usage.total_tokens);
     }
 }
 
@@ -100,10 +99,11 @@ impl ProxyHook for MetricHook {
         if idx == 0 {
             let model_name = MetricHook::get_request_model_name(ctx);
 
-            crate::utils::metrics::METRIC_LLM_FIRST_TOKEN_LATENCY.record(
-                MetricHook::get_start_time(ctx).elapsed().as_millis() as u64,
-                &[opentelemetry::KeyValue::new("model", model_name)],
-            );
+            histogram!(
+                crate::utils::metrics::LLM_FIRST_TOKEN_LATENCY_KEY,
+                "model" => model_name,
+            )
+            .record(MetricHook::get_start_time(ctx).elapsed().as_millis() as f64);
         }
 
         Ok(())
