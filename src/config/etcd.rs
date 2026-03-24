@@ -1,14 +1,28 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use dashmap::{DashMap, Entry};
-use etcd_client::{GetOptions, PutOptions};
-use log::{info, warn};
+use etcd_client::{GetOptions, PutOptions, WatchOptions};
+use log::{debug, info, warn};
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use tokio::{
+    sync::{Notify, mpsc},
+    task::JoinHandle,
+    time::sleep,
+};
 
 use crate::config::{ConfigEvent, ConfigEventReceiver, ConfigProvider, GetEntry, PutEntry};
+
+/// Maximum backoff delay between reconnect attempts.
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Initial backoff delay.
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+/// Timeout for waiting the watch supervisor task to stop on shutdown.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -31,32 +45,41 @@ impl Default for Config {
     }
 }
 
-#[derive(Clone)]
 pub struct EtcdConfigProvider {
     client: etcd_client::Client,
     prefix: String,
     txs: Arc<DashMap<String, mpsc::Sender<ConfigEvent>>>,
+    /// Signals the supervisor loop to stop.
+    shutdown: Arc<Notify>,
+    /// Handle to the watch supervisor task; taken on shutdown.
+    supervisor_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl EtcdConfigProvider {
     pub async fn new(config: Config) -> Result<Self> {
         let client = Self::connect_client(&config).await?;
-
         let txs = Arc::new(DashMap::<String, mpsc::Sender<ConfigEvent>>::new());
+        let shutdown = Arc::new(Notify::new());
 
-        let prefix = config.prefix.clone();
-        Self::spawn_watch_loop(client.clone(), prefix.clone(), txs.clone()).await?;
+        let handle = Self::spawn_supervisor(
+            client.clone(),
+            config.prefix.clone(),
+            txs.clone(),
+            shutdown.clone(),
+        );
 
         Ok(Self {
             client,
             prefix: config.prefix.clone(),
             txs,
+            shutdown,
+            supervisor_handle: Mutex::new(Some(handle)),
         })
     }
 
     async fn connect_client(config: &Config) -> Result<etcd_client::Client> {
         let mut opts = etcd_client::ConnectOptions::default()
-            .with_timeout(Duration::from_secs(config.timeout as u64));
+            .with_connect_timeout(Duration::from_secs(config.timeout as u64));
 
         if let (Some(user), Some(password)) = (config.user.clone(), config.password.clone()) {
             opts = opts.with_user(user, password);
@@ -65,88 +88,191 @@ impl EtcdConfigProvider {
         etcd_client::Client::connect(
             config
                 .host
-                .clone()
                 .iter()
                 .map(|h: &String| h.as_str())
                 .collect::<Vec<&str>>(),
             Some(opts),
         )
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to etcd: {}", e))
+        .map_err(|e| anyhow::anyhow!("Failed to connect to etcd: {e}"))
     }
 
-    //TODO auto re-connect on failure
-    async fn spawn_watch_loop(
+    /// Spawn the long-running supervisor task that manages the watch stream
+    /// lifecycle: reconnects on failure, resumes from the last seen revision,
+    /// and triggers a full resync when etcd compaction makes resumption
+    /// impossible.
+    fn spawn_supervisor(
         mut client: etcd_client::Client,
         prefix: String,
         txs: Arc<DashMap<String, mpsc::Sender<ConfigEvent>>>,
-    ) -> Result<()> {
-        let mut stream = client
-            .watch(
-                prefix.as_str(),
-                Some(etcd_client::WatchOptions::new().with_prefix()),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to start etcd watch: {}", e))?;
-
-        info!("Started etcd prefix watch: {}", prefix);
-
+        shutdown: Arc<Notify>,
+    ) -> JoinHandle<()> {
         tokio::spawn(async move {
-            while let Ok(msg) = stream.message().await {
-                let resp = match msg {
-                    Some(resp) => resp,
-                    None => {
-                        warn!("Watch stream ended, preparing to retry");
-                        break;
+            // The revision from which the next watch attempt should start.
+            // 0 means "from newest" (first connect or after resync).
+            let mut start_revision: i64 = 0;
+            let mut backoff = INITIAL_BACKOFF;
+            let mut attempt: u32 = 0;
+
+            'supervisor: loop {
+                // Build watch options: resume from last seen revision when possible.
+                let watch_opts = if start_revision > 0 {
+                    WatchOptions::new()
+                        .with_prefix()
+                        .with_start_revision(start_revision)
+                } else {
+                    WatchOptions::new().with_prefix()
+                };
+
+                debug!(
+                    "etcd watch: connecting (attempt={attempt}, start_revision={start_revision})"
+                );
+
+                // Establish the watch stream, with shutdown interruptibility.
+                let stream_result = tokio::select! {
+                    biased;
+                    _ = shutdown.notified() => {
+                        info!("etcd watch supervisor: shutdown requested before stream open");
+                        break 'supervisor;
+                    }
+                    r = client.watch(prefix.as_str(), Some(watch_opts)) => r,
+                };
+
+                let mut stream = match stream_result {
+                    Ok(s) => {
+                        attempt = 0;
+                        backoff = INITIAL_BACKOFF;
+                        debug!("etcd watch: stream established (start_revision={start_revision})");
+                        s
+                    }
+                    Err(err) => {
+                        warn!("etcd watch: failed to establish stream (attempt={attempt}): {err}");
+                        attempt += 1;
+                        if Self::backoff_or_shutdown(&shutdown, backoff).await {
+                            break 'supervisor;
+                        }
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                        continue 'supervisor;
                     }
                 };
 
-                if resp.canceled() {
-                    warn!("Watch was canceled, preparing to retry");
-                    break;
-                }
-
-                for event in resp.events() {
-                    if let Some(kv) = event.kv() {
-                        let key = match kv.key_str() {
-                            Ok(k) => k.to_string(),
-                            Err(err) => {
-                                warn!("Failed to parse watch key: {}", err);
-                                continue;
-                            }
-                        };
-
-                        let targets: Vec<mpsc::Sender<ConfigEvent>> = {
-                            txs.iter()
-                                .filter(|entry| key.starts_with(entry.key().as_str()))
-                                .map(|entry| entry.value().clone())
-                                .collect()
-                        };
-
-                        if targets.is_empty() {
-                            continue;
+                // Consume the stream until it ends or shutdown is requested.
+                loop {
+                    let msg = tokio::select! {
+                        biased;
+                        _ = shutdown.notified() => {
+                            info!("etcd watch supervisor: shutdown requested");
+                            break 'supervisor;
                         }
+                        m = stream.message() => m,
+                    };
 
-                        let payload = match event.event_type() {
-                            etcd_client::EventType::Put => {
-                                ConfigEvent::Put((key, kv.value().to_vec(), kv.mod_revision()))
+                    match msg {
+                        Err(err) => {
+                            warn!("etcd watch: stream error, will reconnect: {err}");
+                            break; // inner loop → reconnect in outer loop
+                        }
+                        Ok(None) => {
+                            warn!("etcd watch: stream ended, will reconnect");
+                            break;
+                        }
+                        Ok(Some(resp)) => {
+                            if resp.canceled() {
+                                let compact_rev = resp.compact_revision();
+                                if compact_rev > 0 {
+                                    debug!(
+                                        "etcd watch: canceled due to compaction \
+                                         (compact_revision={compact_rev}), triggering resync",
+                                    );
+                                    Self::broadcast(&txs, ConfigEvent::Resync).await;
+                                    // After a full resync the consumer will reach the
+                                    // current head; reset so the next watch starts
+                                    // from newest rather than a compacted revision.
+                                    start_revision = 0;
+                                } else {
+                                    warn!("etcd watch: canceled, will reconnect");
+                                }
+                                break;
                             }
-                            etcd_client::EventType::Delete => {
-                                ConfigEvent::Delete((key, kv.mod_revision()))
-                            }
-                        };
 
-                        for tx in targets {
-                            if let Err(err) = tx.send(payload.clone()).await {
-                                warn!("Failed to dispatch watch event: {}", err);
+                            for event in resp.events() {
+                                if let Some(kv) = event.kv() {
+                                    let key = match kv.key_str() {
+                                        Ok(k) => k.to_string(),
+                                        Err(err) => {
+                                            warn!("etcd watch: failed to parse key: {err}");
+                                            continue;
+                                        }
+                                    };
+
+                                    let targets: Vec<mpsc::Sender<ConfigEvent>> = txs
+                                        .iter()
+                                        .filter(|e| key.starts_with(e.key().as_str()))
+                                        .map(|e| e.value().clone())
+                                        .collect();
+
+                                    if targets.is_empty() {
+                                        continue;
+                                    }
+
+                                    let payload = match event.event_type() {
+                                        etcd_client::EventType::Put => ConfigEvent::Put((
+                                            key,
+                                            kv.value().to_vec(),
+                                            kv.mod_revision(),
+                                        )),
+                                        etcd_client::EventType::Delete => {
+                                            ConfigEvent::Delete((key, kv.mod_revision()))
+                                        }
+                                    };
+
+                                    // Advance resume point past the last processed event.
+                                    if let ConfigEvent::Put((_, _, rev))
+                                    | ConfigEvent::Delete((_, rev)) = &payload
+                                    {
+                                        start_revision = rev + 1;
+                                    }
+
+                                    for tx in targets {
+                                        if let Err(err) = tx.send(payload.clone()).await {
+                                            warn!("etcd watch: failed to dispatch event: {err}");
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
-            }
-        });
 
-        Ok(())
+                // Back-off before reconnecting (unless shutdown was requested).
+                attempt += 1;
+                if Self::backoff_or_shutdown(&shutdown, backoff).await {
+                    break 'supervisor;
+                }
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+
+            debug!("etcd watch supervisor: exited");
+        })
+    }
+
+    /// Broadcast an event to all registered subscribers.
+    async fn broadcast(txs: &DashMap<String, mpsc::Sender<ConfigEvent>>, event: ConfigEvent) {
+        for entry in txs.iter() {
+            if let Err(err) = entry.value().send(event.clone()).await {
+                warn!("etcd watch: failed to broadcast event: {}", err);
+            }
+        }
+    }
+
+    /// Sleep for `delay`, but return early (returning `true`) if shutdown is
+    /// requested. Returns `false` when the sleep completes normally.
+    async fn backoff_or_shutdown(shutdown: &Notify, delay: Duration) -> bool {
+        tokio::select! {
+            biased;
+            _ = shutdown.notified() => true,
+            _ = sleep(delay) => false,
+        }
     }
 }
 
@@ -195,7 +321,7 @@ impl ConfigProvider for EtcdConfigProvider {
                     Ok(None)
                 }
             }
-            Err(err) => Err(format!("etcd get all failed: {}", err)),
+            Err(err) => Err(format!("etcd get failed: {}", err)),
         }
     }
 
@@ -241,5 +367,27 @@ impl ConfigProvider for EtcdConfigProvider {
                 Ok(rx)
             }
         }
+    }
+
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        // Signal the supervisor to stop.
+        self.shutdown.notify_one();
+
+        // Close all dispatch channels so consumers see channel-closed.
+        self.txs.clear();
+
+        // Wait for the supervisor task to exit (with timeout).
+        let handle = self.supervisor_handle.lock().unwrap().take();
+        if let Some(h) = handle {
+            match tokio::time::timeout(SHUTDOWN_WAIT, h).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("etcd supervisor task panicked: {}", e),
+                Err(_) => warn!(
+                    "etcd supervisor task did not stop within {:?}",
+                    SHUTDOWN_WAIT
+                ),
+            }
+        }
+        Ok(())
     }
 }

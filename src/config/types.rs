@@ -108,6 +108,9 @@ type ConfigItemRevision = i64;
 pub enum ConfigEvent {
     Put((ConfigItemKey, ConfigItemValue, ConfigItemRevision)),
     Delete((ConfigItemKey, ConfigItemRevision)),
+    /// Signals the consumer to perform a full resync from the config provider.
+    /// Sent when the watch stream cannot be resumed (e.g., etcd compaction).
+    Resync,
 }
 pub type ConfigEventReceiver = mpsc::Receiver<ConfigEvent>;
 
@@ -134,6 +137,12 @@ pub trait ConfigProvider: Send + Sync {
     async fn delete(&self, key: &str) -> Result<i64, String>;
 
     async fn watch(&self, prefix: Option<&str>) -> Result<ConfigEventReceiver>;
+
+    /// Gracefully shut down the provider:
+    /// - stop background tasks
+    /// - close connections
+    /// - etc.
+    async fn shutdown(&self) -> anyhow::Result<()>;
 }
 
 impl dyn ConfigProvider {

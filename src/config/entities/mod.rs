@@ -173,6 +173,44 @@ impl<T: Clone + 'static> ResourceStore<T> {
     fn latest_mod_revision(&self) -> i64 {
         self.data.load().mod_revision
     }
+
+    /// Atomically replace the entire store contents with the provided entries.
+    fn replace_from_entries(&self, entries: Vec<(String, T, i64)>) {
+        let mut new_primary: HashMap<String, ResourceEntry<T>> =
+            HashMap::with_capacity(entries.len());
+        let mut new_secondary: HashMap<&'static str, HashMap<String, String>> = self
+            .index_fns
+            .iter()
+            .map(|(name, _)| (*name, HashMap::new()))
+            .collect();
+        let mut max_rev = 0i64;
+
+        for (key, value, revision) in entries {
+            for (name, key_fn) in self.index_fns {
+                if let Some(sec_key) = key_fn(&value) {
+                    new_secondary
+                        .entry(name)
+                        .or_default()
+                        .insert(sec_key, key.clone());
+                }
+            }
+            new_primary.insert(
+                key.clone(),
+                ResourceEntry {
+                    id: key,
+                    value,
+                    revision,
+                },
+            );
+            max_rev = max_rev.max(revision);
+        }
+
+        self.data.store(Arc::new(StoreData {
+            primary: Arc::new(new_primary),
+            secondary: new_secondary,
+            mod_revision: max_rev,
+        }));
+    }
 }
 
 pub type EntityValidator<T> = fn(&str, &T) -> Result<(), String>;
@@ -205,43 +243,7 @@ impl<T: DeserializeOwned + Clone + Send + Sync + 'static> EntityStore<T> {
         info!("{} starting full load, prefix={}", entity_name, prefix);
         match provider.get_all::<T>(prefix).await {
             Ok(kvs) => {
-                for GetEntry {
-                    key,
-                    value,
-                    create_revision: _,
-                    mod_revision,
-                } in kvs
-                {
-                    // Extract relative path
-                    let base_prefix = if let Some(idx) = key.find(prefix) {
-                        &key[..idx + prefix.len()]
-                    } else {
-                        key.as_str()
-                    };
-
-                    let relative_key = key
-                        .strip_prefix(base_prefix)
-                        .unwrap_or(&key)
-                        .trim_start_matches('/')
-                        .to_string();
-
-                    // Apply validator check and store (value is already deserialized by get_all)
-                    if let Some(ref v) = validator {
-                        match v(&relative_key, &value) {
-                            Ok(_) => {
-                                store.upsert(relative_key.clone(), value, mod_revision);
-                            }
-                            Err(err) => {
-                                warn!(
-                                    "{} validation failed, key={}: {}",
-                                    entity_name, relative_key, err
-                                );
-                            }
-                        }
-                    } else {
-                        store.upsert(relative_key.clone(), value, mod_revision);
-                    }
-                }
+                Self::apply_full_load(&store, kvs, prefix, entity_name, validator);
                 info!("{} full load completed", entity_name);
             }
             Err(err) => {
@@ -258,17 +260,22 @@ impl<T: DeserializeOwned + Clone + Send + Sync + 'static> EntityStore<T> {
                 let store_clone = store.clone();
                 let entity_name = entity_name.to_string();
                 let prefix = prefix.to_string();
+                let provider_clone = provider.clone();
 
                 tokio::spawn(async move {
-                    Self::consume_events(store_clone, &mut rx, &entity_name, &prefix, validator)
-                        .await;
+                    Self::consume_events(
+                        store_clone,
+                        &mut rx,
+                        &entity_name,
+                        &prefix,
+                        validator,
+                        provider_clone,
+                    )
+                    .await;
                 });
             }
             Err(_) => {
-                warn!(
-                    "Duplicate registration of {} prefix watch ignored: {}",
-                    entity_name, prefix
-                );
+                warn!("Duplicate registration of {entity_name} prefix watch ignored: {prefix}");
             }
         }
 
@@ -294,32 +301,72 @@ impl<T: DeserializeOwned + Clone + Send + Sync + 'static> EntityStore<T> {
         self.store.latest_mod_revision()
     }
 
+    /// Normalise a full etcd key to a bare relative key by stripping the
+    /// watched prefix and any leading slashes.
+    fn relative_key(key: &str, prefix: &str) -> String {
+        let base_prefix = if let Some(idx) = key.find(prefix) {
+            &key[..idx + prefix.len()]
+        } else {
+            key
+        };
+        key.strip_prefix(base_prefix)
+            .unwrap_or(key)
+            .trim_start_matches('/')
+            .to_string()
+    }
+
+    /// Load `kvs` into `store`, atomically replacing its contents.
+    /// Shared by startup full-load and the `Resync` handler.
+    /// Returns the max `mod_revision` of the loaded entries, or 0 if empty.
+    fn apply_full_load(
+        store: &ResourceStore<T>,
+        kvs: Vec<GetEntry<T>>,
+        prefix: &str,
+        entity_name: &str,
+        validator: Option<EntityValidator<T>>,
+    ) -> i64 {
+        let mut entries: Vec<(String, T, i64)> = Vec::with_capacity(kvs.len());
+        for GetEntry {
+            key,
+            value,
+            create_revision: _,
+            mod_revision,
+        } in kvs
+        {
+            let relative_key = Self::relative_key(&key, prefix);
+            let mut skip = false;
+            if let Some(ref v) = validator
+                && let Err(err) = v(&relative_key, &value)
+            {
+                warn!(
+                    "{} validation failed, key={}: {}",
+                    entity_name, relative_key, err
+                );
+                skip = true;
+            }
+            if !skip {
+                entries.push((relative_key, value, mod_revision));
+            }
+        }
+        let max_rev = entries.iter().map(|(_, _, r)| *r).max().unwrap_or(0);
+        store.replace_from_entries(entries);
+        max_rev
+    }
+
     async fn consume_events(
         store: ResourceStore<T>,
         rx: &mut Receiver<ConfigEvent>,
         entity_name: &str,
         prefix: &str,
         validator: Option<EntityValidator<T>>,
+        provider: Arc<dyn ConfigProvider>,
     ) {
         info!("{} watch started, prefix={}", entity_name, prefix);
-
-        let normalize_key = |key: String| {
-            let base_prefix = if let Some(idx) = key.find(prefix) {
-                &key[..idx + prefix.len()]
-            } else {
-                key.as_str()
-            };
-
-            key.strip_prefix(base_prefix)
-                .unwrap_or(&key)
-                .trim_start_matches('/')
-                .to_string()
-        };
 
         while let Some(event) = rx.recv().await {
             match event {
                 ConfigEvent::Put((key, value, mod_revision)) => {
-                    let relative_key = normalize_key(key.clone());
+                    let relative_key = Self::relative_key(&key, prefix);
 
                     match serde_json::from_slice::<T>(&value) {
                         Ok(parsed) => {
@@ -348,7 +395,7 @@ impl<T: DeserializeOwned + Clone + Send + Sync + 'static> EntityStore<T> {
                     }
                 }
                 ConfigEvent::Delete((key, mod_revision)) => {
-                    let relative_key = normalize_key(key.clone());
+                    let relative_key = Self::relative_key(&key, prefix);
 
                     if !store.delete(relative_key.as_str(), mod_revision) {
                         info!(
@@ -357,10 +404,30 @@ impl<T: DeserializeOwned + Clone + Send + Sync + 'static> EntityStore<T> {
                         );
                     }
                 }
+                ConfigEvent::Resync => {
+                    warn!(
+                        "{} Resync requested, performing full reload, prefix={}",
+                        entity_name, prefix
+                    );
+                    match provider.get_all::<T>(prefix).await {
+                        Ok(kvs) => {
+                            let max_rev =
+                                Self::apply_full_load(&store, kvs, prefix, entity_name, validator);
+                            info!(
+                                "{} full resync completed (max_rev={})",
+                                entity_name, max_rev
+                            );
+                        }
+                        Err(err) => {
+                            warn!(
+                                "{} full resync failed: {}, retaining stale snapshot",
+                                entity_name, err
+                            );
+                        }
+                    }
+                }
             }
         }
-
-        warn!("{} Watch ended, waiting to be restarted", entity_name);
     }
 }
 
@@ -569,6 +636,10 @@ mod tests {
                 .unwrap()
                 .take()
                 .expect("MockProvider::watch called more than once"))
+        }
+
+        async fn shutdown(&self) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 

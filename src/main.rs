@@ -44,12 +44,17 @@ async fn main() {
                 exception = true;
             }
         }
-        res = serve_admin(config.clone(), admin::AppState::new(config, config_provider, resources, Some(proxy_router))) => {
+        res = serve_admin(config.clone(), admin::AppState::new(config, config_provider.clone(), resources, Some(proxy_router))) => {
             if let Err(e) = res {
                 error!("Admin server error: {}", e);
                 exception = true;
             }
         }
+    }
+
+    if let Err(e) = config_provider.shutdown().await {
+        error!("Config provider shutdown error: {}", e);
+        exception = true;
     }
 
     let _ = ob_shutdown_signal.send(());
