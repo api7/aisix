@@ -59,3 +59,38 @@ jobs:
         - registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-quickstart:
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.ACCESS_KEY_SECRET }}
+          aws-region: us-west-2
+
+      - name: Upload quickstart files to S3
+        run: |
+          aws s3 cp quickstart/quickstart.sh \
+            s3://api7ai-docs-resources/aisix/quickstart \
+            --content-type "text/x-shellscript"
+          aws s3 cp quickstart/docker-compose.yaml \
+            s3://api7ai-docs-resources/aisix/docker-compose.yaml \
+            --content-type "text/yaml"
+          aws s3 cp quickstart/config.yaml \
+            s3://api7ai-docs-resources/aisix/config.yaml \
+            --content-type "text/yaml"
+
+      - name: Invalidate CloudFront
+        if: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID != '' }}
+        uses: chetan/invalidate-cloudfront-action@v2
+        env:
+          DISTRIBUTION: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+          PATHS: /aisix/quickstart /aisix/docker-compose.yaml /aisix/config.yaml

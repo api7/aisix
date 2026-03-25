@@ -2,7 +2,7 @@
 set -e
 
 REPO="api7/aisix"
-BASE_URL="https://raw.githubusercontent.com/${REPO}/${AISIX_REF:-main}/quickstart"
+BASE_URL="${AISIX_BASE_URL:-https://run.api7.ai/aisix}"
 
 # --- Colors ---
 info()  { printf '\033[1;34m[aisix]\033[0m %s\n' "$1"; }
