@@ -1,0 +1,61 @@
+name: Docker
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image for smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: aisix:smoke-test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run smoke tests
+        run: |
+          chmod +x ci/smoke-test.sh
+          ci/smoke-test.sh
+        env:
+          AISIX_IMAGE: aisix:smoke-test
+
+  build:
+    needs: [smoke-test]
+    uses: docker/github-builder/.github/workflows/build.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    with:
+      output: image
+      push: true
+      platforms: linux/amd64,linux/arm64
+      cache: true
+      cache-mode: max
+      sbom: true
+      set-meta-annotations: true
+      set-meta-labels: true
+      meta-images: ghcr.io/${{ github.repository }}
+      meta-tags: |
+        type=semver,pattern={{version}}
+        type=semver,pattern={{major}}.{{minor}}
+        type=raw,value=latest
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}

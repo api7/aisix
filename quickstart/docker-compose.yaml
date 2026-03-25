@@ -1,0 +1,29 @@
+services:
+  aisix:
+    image: ${AISIX_IMAGE:-ghcr.io/api7/aisix:latest}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - ./config.yaml:/etc/aisix/config.yaml:ro
+    depends_on:
+      etcd:
+        condition: service_healthy
+    environment:
+      RUST_LOG: info
+
+  etcd:
+    image: gcr.io/etcd-development/etcd:v3.6.8
+    restart: unless-stopped
+    command:
+      - etcd
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    expose:
+      - "2379"

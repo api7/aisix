@@ -1,0 +1,9 @@
+target/
+ui/node_modules/
+.git/
+.github/
+ci/
+docs/
+grafana/
+*.md
+LICENSE
