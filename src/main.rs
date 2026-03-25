@@ -1,6 +1,6 @@
 use std::{process::exit, sync::Arc};
 
-use ai_gateway::{config::Config, *};
+use aisix::{config::Config, *};
 use axum::Router;
 use clap::Parser;
 use log::{error, info};
@@ -82,7 +82,7 @@ fn init_observability() -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
         metrics::{PeriodicReader, SdkMeterProvider},
     };
 
-    const INSTRUMENTATION_NAME: &str = "ai-gateway";
+    const INSTRUMENTATION_NAME: &str = "aisix";
 
     let (tx, rx) = oneshot::channel::<()>();
 
@@ -125,7 +125,7 @@ fn init_observability() -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
 
     metrics::set_global_recorder(OpenTelemetryRecorder::new(meter))
         .expect("initialize metrics recorder");
-    ai_gateway::utils::metrics::describe_metrics();
+    utils::metrics::describe_metrics();
 
     // shuting down signal handler
     let shutdown_handle = tokio::spawn(async move {

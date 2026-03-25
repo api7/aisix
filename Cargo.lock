@@ -26,7 +26,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ai-gateway"
+name = "aisix"
 version = "0.1.0"
 dependencies = [
  "anyhow",

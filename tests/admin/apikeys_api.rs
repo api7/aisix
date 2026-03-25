@@ -1,4 +1,4 @@
-use ai_gateway::admin::PATH_PREFIX;
+use aisix::admin::PATH_PREFIX;
 use axum::body::Body;
 use http::{Method, StatusCode};
 

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use ai_gateway::admin::PATH_PREFIX;
+use aisix::admin::PATH_PREFIX;
 use axum::{Router, body::Body};
 use http::{Method, StatusCode};
 

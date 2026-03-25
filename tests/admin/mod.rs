@@ -11,9 +11,9 @@ use uuid::Uuid;
 pub const TEST_ADMIN_KEY: &str = "test_admin_key";
 
 pub async fn create_router(etcd_prefix: Option<&str>) -> Router {
-    let config = Arc::new(ai_gateway::config::Config {
-        deployment: ai_gateway::config::Deployment {
-            etcd: ai_gateway::config::etcd::Config {
+    let config = Arc::new(aisix::config::Config {
+        deployment: aisix::config::Deployment {
+            etcd: aisix::config::etcd::Config {
                 host: vec!["http://127.0.0.1:2379".to_string()],
                 prefix: etcd_prefix
                     .unwrap_or(&format!("/test/{}", Uuid::new_v4()))
@@ -22,24 +22,24 @@ pub async fn create_router(etcd_prefix: Option<&str>) -> Router {
                 user: None,
                 password: None,
             },
-            admin: ai_gateway::config::DeploymentAdmin {
-                admin_key: vec![ai_gateway::config::AdminKey {
+            admin: aisix::config::DeploymentAdmin {
+                admin_key: vec![aisix::config::AdminKey {
                     key: TEST_ADMIN_KEY.to_string(),
                 }],
             },
         },
-        server: ai_gateway::config::Server {
-            proxy: ai_gateway::config::ServerProxy {
+        server: aisix::config::Server {
+            proxy: aisix::config::ServerProxy {
                 listen: "127.0.0.1:3000".parse().unwrap(),
-                tls: ai_gateway::config::ServerCommonTls {
+                tls: aisix::config::ServerCommonTls {
                     enabled: false,
                     cert_file: None,
                     key_file: None,
                 },
             },
-            admin: ai_gateway::config::ServerAdmin {
+            admin: aisix::config::ServerAdmin {
                 listen: "127.0.0.1:3001".parse().unwrap(),
-                tls: ai_gateway::config::ServerCommonTls {
+                tls: aisix::config::ServerCommonTls {
                     enabled: false,
                     cert_file: None,
                     key_file: None,
@@ -49,17 +49,17 @@ pub async fn create_router(etcd_prefix: Option<&str>) -> Router {
     });
 
     let config_provider = Arc::new(
-        ai_gateway::config::etcd::EtcdConfigProvider::new(config.deployment.etcd.clone())
+        aisix::config::etcd::EtcdConfigProvider::new(config.deployment.etcd.clone())
             .await
             .unwrap(),
     );
 
-    let state = ai_gateway::admin::AppState::new(
+    let state = aisix::admin::AppState::new(
         config,
         config_provider.clone(),
-        Arc::new(ai_gateway::config::entities::ResourceRegistry::new(config_provider).await),
+        Arc::new(aisix::config::entities::ResourceRegistry::new(config_provider).await),
         None,
     );
 
-    ai_gateway::admin::create_router(state)
+    aisix::admin::create_router(state)
 }
