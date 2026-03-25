@@ -1,6 +1,11 @@
 # AGENTS.md
 
-AI Gateway codebase guide for agentic coding assistants.
+> **For AI coding assistants** (OpenCode, Cursor, Copilot, etc.): This file is
+> your primary context source for this codebase. Use it to understand the
+> project structure, coding conventions, and build commands.
+>
+> **For human contributors**: See [CONTRIBUTING.md](CONTRIBUTING.md) for the
+> contribution guide.
 
 ## Project Overview
 
@@ -12,25 +17,25 @@ Includes a React-based admin UI (in `ui/`) for managing models, API keys, and a 
 
 ### Build
 ```bash
-cargo build                    # Debug build
-cargo build --release          # Release build
+cargo build           # Debug build
+cargo build --release # Release build
 ```
 
 ### Run
 ```bash
-RUST_LOG=info cargo run                    # Standard run
+RUST_LOG=info cargo run
 ```
 
 ### UI Development
 ```bash
 cd ui
-pnpm install                               # Install dependencies
-pnpm dev                                   # Start dev server
-pnpm build                                 # Build for production
-pnpm lint                                  # Run ESLint
-pnpm format                               # Format with Prettier
-pnpm typecheck                            # Type check without emit
-pnpm preview                              # Preview production build
+pnpm install    # Install dependencies
+pnpm dev        # Start dev server
+pnpm build      # Build for production
+pnpm lint       # Run ESLint
+pnpm format     # Format with Prettier
+pnpm typecheck  # Type check without emit
+pnpm preview    # Preview production build
 ```
 
 ### Lint
@@ -41,18 +46,24 @@ Clippy warnings are treated as errors. Fix all warnings before committing.
 
 ### Test
 ```bash
-cargo test                                    # Run all tests
-cargo test --verbose                          # Run tests with verbose output
-cargo test --test api                         # Run specific test file (tests/api.rs)
-cargo test test_crud                          # Run specific test by name
-cargo test --test admin::models_api           # Run tests in specific module
-cargo test -- --nocapture                     # Show test output
+cargo test                             # Run all tests
+cargo test --verbose                   # Run tests with verbose output
+cargo test --test api                  # Run specific test file (tests/api.rs)
+cargo test test_crud                   # Run specific test by name
+cargo test --test admin::models_api    # Run tests in specific module
+cargo test -- --nocapture              # Show test output
+```
+
+### E2E Test
+```bash
+pnpm -C tests/e2e install --frozen-lockfile  # Install e2e dependencies
+pnpm -C tests/e2e test                       # Run all e2e tests
 ```
 
 ### Format
 ```bash
-cargo fmt                                     # Format all code
-cargo fmt -- --check                          # Check formatting without changes
+cargo fmt          # Format all code
+cargo fmt -- --check  # Check formatting without changes
 ```
 
 ## Code Style Guidelines
@@ -305,9 +316,16 @@ tests/
 ├── proxy/               # Proxy tests
 │   ├── mod.rs
 │   └── timeout.rs
-└── utils/               # Test utilities
-    ├── mod.rs
-    └── http.rs
+├── utils/               # Test utilities
+│   ├── mod.rs
+│   └── http.rs
+└── e2e/                 # End-to-end tests (TypeScript/Vitest)
+    ├── tests/
+    │   ├── admin/       # Admin API e2e tests
+    │   ├── proxy/       # Proxy e2e tests
+    │   └── server.test.ts
+    ├── utils/           # E2E test utilities
+    └── vitest.config.ts
 ```
 
 ## Key Dependencies
