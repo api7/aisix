@@ -1,5 +1,5 @@
-[![Build Status](https://github.com/api7/ai-gateway-stash/actions/workflows/build.yaml/badge.svg?branch=main)](https://github.com/api7/ai-gateway-stash/actions/workflows/build.yaml)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/api7/ai-gateway-stash/blob/main/LICENSE)
+[![Build Status](https://github.com/api7/aisix/actions/workflows/build.yaml/badge.svg?branch=main)](https://github.com/api7/aisix/actions/workflows/build.yaml)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/api7/aisix/blob/main/LICENSE)
 
 <p align="center">
   <img src="./docs/images/aisix_logo.svg" alt="AISIX AI Gateway" width="400" />
@@ -76,11 +76,14 @@
 
 ## Development
 
-*Will link to new documentation about development setup and contribution guidelines*
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contribution guide including branching, code style, and PR expectations.
 
 ### Prerequisites
 
-- Rust (latest stable/nightly version)
+- [Rust](https://rustup.rs/) (latest stable)
+- [Node.js](https://nodejs.org/) LTS + [pnpm](https://pnpm.io/) (`corepack enable pnpm`)
+- [Docker](https://docs.docker.com/get-docker/) & Docker Compose (for etcd and the test environment)
+- `protobuf-compiler` — `sudo apt install protobuf-compiler` (Debian/Ubuntu) or `brew install protobuf` (macOS)
 
 ### Build & Run
 
@@ -116,10 +119,10 @@
 - [ ] MCP proxy
 
 ## Community
-<!-- Inspired by Apache APISIX and Kong community entry points -->
 
-- Use [GitHub Discussions](https://github.com/api7/ai-gateway-stash/discussions) for questions, ideas, and architecture discussions
-- Use [GitHub Issues](https://github.com/api7/ai-gateway-stash/issues) for bug reports, feature requests, and actionable tasks
+- Contribute via [CONTRIBUTING.md](CONTRIBUTING.md) — setup, code style, and PR guidelines
+- Use [GitHub Discussions](https://github.com/api7/aisix/discussions) for questions, ideas, and architecture discussions
+- Use [GitHub Issues](https://github.com/api7/aisix/issues) for bug reports, feature requests, and actionable tasks
 - Follow repository activity for ongoing documentation and product updates
 
 ---
