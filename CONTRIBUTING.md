@@ -14,6 +14,7 @@ Thank you for your interest in contributing to AISIX! This guide covers everythi
 - [Commit Guidelines](#commit-guidelines)
 - [Submitting a Pull Request](#submitting-a-pull-request)
 - [CI/CD](#cicd)
+- [Security](#security)
 - [License](#license)
 
 ---
@@ -317,6 +318,13 @@ The GitHub Actions workflow (`.github/workflows/build.yaml`) runs on every push 
 | Build | `cargo build --verbose` |
 
 The CI environment uses `ci/docker-compose.yaml` to start etcd and other required services.
+
+---
+
+## Security
+
+If you discover a security vulnerability, please **do not** open a public GitHub issue.
+Follow the process described in [SECURITY.md](./SECURITY.md) to report it privately.
 
 ---
 
