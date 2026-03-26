@@ -73,6 +73,9 @@ validator = { version = "0.20", features = ["derive"] }
 axum-server = { version = "0.8.0", default-features = false, features = [
   "tls-openssl",
 ] }
+backon = { version = "1.6.0", default-features = false, features = [
+  "tokio-sleep",
+] }
 
 [dev-dependencies]
 tokio-test = "0.4"

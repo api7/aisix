@@ -5,9 +5,10 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use backon::{ConstantBuilder, Retryable};
 use dashmap::{DashMap, Entry};
 use etcd_client::{GetOptions, PutOptions, WatchOptions};
-use log::{debug, info, warn};
+use log::{debug, error, warn};
 use serde::Deserialize;
 use tokio::{
     sync::{Notify, mpsc},
@@ -57,7 +58,15 @@ pub struct EtcdConfigProvider {
 
 impl EtcdConfigProvider {
     pub async fn new(config: Config) -> Result<Self> {
-        let client = Self::connect_client(&config).await?;
+        let client = (|| Self::connect_client(&config))
+            .retry(
+                ConstantBuilder::default()
+                    .with_delay(Duration::from_secs(5))
+                    .with_max_times(5),
+            )
+            .notify(|err, dur| error!("Failed to connect to etcd: {err}, retrying after {:?}", dur))
+            .await
+            .map_err(|err| anyhow!("Failed to connect to etcd: {err}, retry exhausted"))?;
         let txs = Arc::new(DashMap::<String, mpsc::Sender<ConfigEvent>>::new());
         let shutdown = Arc::new(Notify::new());
 
@@ -77,7 +86,7 @@ impl EtcdConfigProvider {
         })
     }
 
-    async fn connect_client(config: &Config) -> Result<etcd_client::Client> {
+    async fn connect_client(config: &Config) -> Result<etcd_client::Client, etcd_client::Error> {
         let mut opts = etcd_client::ConnectOptions::default()
             .with_connect_timeout(Duration::from_secs(config.timeout as u64));
 
@@ -85,16 +94,17 @@ impl EtcdConfigProvider {
             opts = opts.with_user(user, password);
         }
 
-        etcd_client::Client::connect(
+        let mut client = etcd_client::Client::connect(
             config
                 .host
                 .iter()
                 .map(|h: &String| h.as_str())
-                .collect::<Vec<&str>>(),
+                .collect::<Vec<_>>(),
             Some(opts),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to etcd: {e}"))
+        .await?;
+
+        client.status().await.map(|_| Ok(client))?
     }
 
     /// Spawn the long-running supervisor task that manages the watch stream
@@ -132,7 +142,7 @@ impl EtcdConfigProvider {
                 let stream_result = tokio::select! {
                     biased;
                     _ = shutdown.notified() => {
-                        info!("etcd watch supervisor: shutdown requested before stream open");
+                        debug!("etcd watch supervisor: shutdown requested before stream open");
                         break 'supervisor;
                     }
                     r = client.watch(prefix.as_str(), Some(watch_opts)) => r,
@@ -161,7 +171,7 @@ impl EtcdConfigProvider {
                     let msg = tokio::select! {
                         biased;
                         _ = shutdown.notified() => {
-                            info!("etcd watch supervisor: shutdown requested");
+                            debug!("etcd watch supervisor: shutdown requested");
                             break 'supervisor;
                         }
                         m = stream.message() => m,
