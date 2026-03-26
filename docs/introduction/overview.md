@@ -84,8 +84,8 @@ AISIX is valued for the following characteristics:
 
 ## Related Docs
 
-- [Quick Start](./getting-started/quick-start.md) — Deploy the AI gateway in under 5 minutes
-- [Provider Abstraction](./core-concepts/provider-abstraction.md) — How AISIX routes to OpenAI, Gemini, Anthropic, and DeepSeek
-- [Dynamic Configuration](./core-concepts/dynamic-configuration.md) — Hot-reload models and API keys without restarts
-- [Rate Limiting](./guides/rate-limiting.md) — Control LLM costs with RPM, TPM, and concurrency limits
-- [Observability](./observability.md) — OpenTelemetry tracing and Prometheus metrics for LLM traffic
+- [Quick Start](../getting-started/quick-start.md) — Deploy the AI gateway in under 5 minutes
+- [Provider Abstraction](../core-concepts/provider-abstraction.md) — How AISIX routes to OpenAI, Gemini, Anthropic, and DeepSeek
+- [Dynamic Configuration](../core-concepts/dynamic-configuration.md) — Hot-reload models and API keys without restarts
+- [Rate Limiting](../guides/rate-limiting.md) — Control LLM costs with RPM, TPM, and concurrency limits
+- [Observability](../observability.md) — OpenTelemetry tracing and Prometheus metrics for LLM traffic

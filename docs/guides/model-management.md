@@ -103,7 +103,7 @@ If the model is not found, it returns a `400 Bad Request` error:
 ```json
 {
   "error": {
-    "message": "Model my-nonexistent-model not found",
+    "message": "Model 'my-nonexistent-model' not found",
     "type": "invalid_request_error",
     "code": "model_not_found"
   }

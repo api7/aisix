@@ -1,5 +1,5 @@
 ---
-slug: /aisix/guides/request-streaming
+slug: /guides/request-streaming
 title: Request Streaming
 description: Learn how to handle real-time, streaming responses in AISIX.
 ---

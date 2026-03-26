@@ -29,7 +29,7 @@ RUST_LOG=info cargo run
 ### UI Development
 ```bash
 cd ui
-pnpm install    # Install dependencies
+pnpm install --frozen-lockfile    # Install dependencies
 pnpm dev        # Start dev server
 pnpm build      # Build for production
 pnpm lint       # Run ESLint
@@ -146,6 +146,10 @@ impl IntoResponse for AuthError {
 pub trait Provider: Send + Sync {
     async fn chat_completion(&self, request: ChatCompletionRequest) 
         -> Result<ChatCompletionResponse, ProviderError>;
+    async fn chat_completion_stream(&self, request: ChatCompletionRequest) 
+        -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError>;
+    async fn embedding(&self, request: EmbeddingRequest) 
+        -> Result<EmbeddingResponse, ProviderError>;
 }
 ```
 
@@ -349,14 +353,22 @@ tests/
 - `dashmap` — Concurrent map for rate limiting
 - `uuid` — UUID generation
 - `tower` — Middleware utilities
-- `openssl` + `tokio-openssl` — TLS support
+- `clap` — CLI argument parsing
+- `validator` — Input validation
+- `axum-server` — Axum server runtime with TLS support
+- `backon` — Retry with backoff
+- `metrics` + `metrics-exporter-otel` — Prometheus metrics export
+- `opentelemetry-semantic-conventions` — OpenTelemetry semantic conventions
+- `fastrace-tracing` + `fastrace-reqwest` — Additional fastrace integrations
+- `openssl` + `tokio-openssl` — TLS support for inbound connections (axum-server SNI)
+- `reqwest` (`native-tls`) — TLS for outbound connections to upstream providers
 
 ### UI (React)
 - `@tanstack/react-router` — File-based routing
 - `@tanstack/react-query` — Data fetching
 - `@tanstack/react-table` — Table components
 - `@tanstack/react-form` — Form state management
-- `shadcn/ui` — UI component library (via `radix-ui`)
+- `shadcn` — UI component library (via `radix-ui`)
 - `tailwindcss` — Styling
 - `@monaco-editor/react` — Code editor (JSON config)
 - `i18next` + `react-i18next` — Internationalization
@@ -434,11 +446,12 @@ GitHub Actions workflow (`.github/workflows/build.yaml`):
 2. Setup Node.js (LTS)
 3. Setup Rust toolchain (stable)
 4. Setup environment (docker compose for etcd)
-5. Build UI (`pnpm install && pnpm build`)
+5. Build UI (`pnpm -C ui install --frozen-lockfile && pnpm -C ui build`)
 6. `cargo clippy` — Lint (warnings = error)
 7. `cargo test` — Run tests
-8. `cargo build` — Build binary
-9. Upload artifact (debug binary)
+8. E2E Test (`pnpm -C tests/e2e install --frozen-lockfile && pnpm -C tests/e2e test`)
+9. `cargo build` — Build binary
+10. Upload artifact (debug binary)
 
 ## VSCode Setup
 

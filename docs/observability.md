@@ -15,6 +15,8 @@ AI Gateway ──OTLP gRPC──► Jaeger    (traces)   :4317
                                          └──► Grafana  (dashboard) :3100
 ```
 
+> **Note:** Traces use the OTLP gRPC protocol, while metrics use the OTLP HTTP protocol.
+
 ## At a Glance: What AISIX Exports
 
 - Metrics are pushed from AI Gateway to Prometheus OTLP HTTP receiver.

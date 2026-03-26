@@ -69,7 +69,7 @@ If the key is valid and authorized for the model, the request proceeds. Otherwis
 
 If authentication fails, AISIX returns a `401 Unauthorized` error with one of the following messages in the response body:
 
--   `Missing API key`: If the `Authorization` header is not provided.
+-   `Missing API key in request`: If the `Authorization` header is not provided.
 -   `Invalid API key`: If the provided API key does not exist in the configuration.
 
 If the key is valid but not authorized for the requested model, the `ValidateModelHook` returns a `403 Forbidden` error with a detailed JSON body:

@@ -111,6 +111,20 @@ When a rate limit is exceeded, AISIX returns a `429 Too Many Requests` error wit
 
 The response also includes a `Retry-After` header indicating how many seconds the client should wait before making another request.
 
+### Concurrency Limit
+
+When the concurrent request limit is exceeded, AISIX returns a `429 Too Many Requests` error with a different error code:
+
+```json
+{
+  "error": {
+    "message": "Concurrency limit exceeded for model 'openai-gpt4-mini'",
+    "type": "rate_limit_error",
+    "code": "concurrency_limit_exceeded"
+  }
+}
+```
+
 ## Related Docs
 
 - [Authentication](./authentication.md) — How API keys are validated before rate limits are applied

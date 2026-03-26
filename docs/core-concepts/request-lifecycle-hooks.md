@@ -53,7 +53,7 @@ AISIX includes several built-in hooks that are enabled by default:
 
 | Hook | Stage(s) | Description |
 | :--- | :--- | :--- |
-| `ValidateModelHook` | `pre_call` | Validates the requested model exists, is correctly configured, and the API key is authorized to access it. Returns `400 Bad Request` if the model is not found, or `403 Forbidden` if access is denied. |
+| `ValidateModelHook` | `pre_call` | Validates the request contains a `model` field, the model exists, and the API key is authorized to access it. Returns `400 Bad Request` if the model field is missing or the model is not found, or `403 Forbidden` if access is denied. |
 | `RateLimitHook` | `pre_call`, `post_call` | Enforces rate limits. In `pre_call`, it checks if the request count exceeds the limit. In `post_call`, it updates the token usage counters. |
 | `MetricHook` | `post_call` | Collects and exposes metrics (e.g., token counts, request latency) for observability via Prometheus. |
 

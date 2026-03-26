@@ -37,7 +37,7 @@
 
 ### 🚦 Traffic Management
 
-- Rate limiting — RPM, TPM, and concurrent request limits
+- Rate limiting — RPM, RPD, TPM, TPD, and concurrent request limits
 - Per-model and per-key access control
 - Request validation with JSON Schema
 
