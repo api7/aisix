@@ -1,7 +1,7 @@
 ---
 slug: /ai-gateway/core-concepts/model-and-api-key
 title: 'First-Class Citizens: Model and API Key'
-description: Learn about the core entities in AISIX: Models and API Keys.
+description: 'Learn about the core entities in AISIX: Models and API Keys.'
 ---
 
 In AISIX, **Models** and **API Keys** are the two fundamental resources, or *first-class citizens*, that drive its functionality. Understanding their roles and relationship is key to managing your AI services.
