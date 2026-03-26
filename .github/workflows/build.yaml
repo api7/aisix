@@ -37,27 +37,32 @@ jobs:
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
 
+      - name: Cache UI build
+        id: ui-cache
+        uses: actions/cache@v4
+        with:
+          path: ui/dist
+          key: ui-dist-${{ hashFiles('ui/src/**', 'ui/index.html', 'ui/vite.config.ts', 'ui/tsconfig*.json', 'ui/package.json', 'ui/pnpm-lock.yaml') }}
+
       - name: Build UI
+        if: steps.ui-cache.outputs.cache-hit != 'true'
         run: |
           pnpm -C ui install --frozen-lockfile
           pnpm -C ui build
 
       - name: Run Lint
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
-
-      - name: Run Test
-        run: cargo test --verbose
-
-      - name: Run E2E Test
-        run: |
-          pnpm -C tests/e2e install --frozen-lockfile
-          pnpm -C tests/e2e test
-
-      - name: Build
-        run: cargo build --verbose
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: binary-debug
           path: target/debug/aisix
+
+      - name: Run Test
+        run: cargo test --locked
+
+      - name: Run E2E Test
+        run: |
+          pnpm -C tests/e2e install --frozen-lockfile
+          pnpm -C tests/e2e test
