@@ -1,0 +1,21 @@
+# The `notify-docs-update.yaml` workflow automatically triggers a repository dispatch event whenever documentation files are updated in the `main` branch of `api7/aisix`. 
+# This event notifies the `api7/aisix-docs` repository to initiate a sync process.
+name: Notify Docs Update
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch docs update event
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          # Personal Access Token (PAT) with repo scope
+          token: ${{ secrets.DOCS_SYNC_TOKEN }}
+          repository: api7/aisix-docs
+          event-type: docs-update
