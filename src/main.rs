@@ -1,6 +1,7 @@
 use std::{process::exit, sync::Arc};
 
 use aisix::{config::Config, *};
+use anyhow::{Context, Result};
 use axum::Router;
 use clap::Parser;
 use log::{error, info};
@@ -15,16 +16,17 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let (ob_shutdown_signal, ob_shutdown_task) = init_observability();
+    let (ob_shutdown_signal, ob_shutdown_task) =
+        init_observability().context("failed to initialize observability")?;
 
-    let config = Arc::new(config::load(args.config).expect("Failed to load configuration"));
+    let config = Arc::new(config::load(args.config).context("failed to load configuration")?);
 
     let config_provider = config::create_provider(&config)
         .await
-        .expect("Failed to create config provider");
+        .context("failed to create config provider")?;
     let resources =
         Arc::new(config::entities::ResourceRegistry::new(config_provider.clone()).await);
 
@@ -35,8 +37,11 @@ async fn main() {
 
     let mut exception = false;
     select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("Stopping, see you next time!");
+        res = tokio::signal::ctrl_c() => {
+            if let Err(e) = res {
+                error!("Failed to listen for shutdown signal: {}", e);
+                exception = true;
+            }
         }
         res = serve_proxy(config.clone(), proxy_router.clone()) => {
             if let Err(e) = res {
@@ -57,14 +62,16 @@ async fn main() {
         exception = true;
     }
 
+    info!("Stopping, see you next time!");
     let _ = ob_shutdown_signal.send(());
     ob_shutdown_task
         .await
-        .expect("Failed to shutdown observability");
+        .context("failed to shutdown observability")?;
+
     exit(if exception { 1 } else { 0 });
 }
 
-fn init_observability() -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+fn init_observability() -> Result<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)> {
     use std::{borrow::Cow, time::Duration};
 
     use fastrace::collector::Config;
@@ -89,7 +96,7 @@ fn init_observability() -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     // log
     logforth::starter_log::builder()
         .dispatch(|d| {
-            d.filter(EnvFilterBuilder::from_default_env_or("info").build())
+            d.filter(EnvFilterBuilder::from_default_env_or("info,opentelemetry_sdk=off").build())
                 .append(Stdout::default().with_layout(TextLayout::default()))
         })
         .dispatch(|d| {
@@ -102,7 +109,7 @@ fn init_observability() -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let reporter = OpenTelemetryReporter::new(
         SpanExporter::builder()
             .build()
-            .expect("initialize otlp exporter"),
+            .context("failed to initialize otlp exporter")?,
         Cow::Owned(Resource::builder().build()),
         InstrumentationScope::builder(INSTRUMENTATION_NAME)
             .with_version(env!("CARGO_PKG_VERSION"))
@@ -114,9 +121,7 @@ fn init_observability() -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     );
 
     // metric
-    let exporter = opentelemetry_otlp::MetricExporter::builder()
-        .build()
-        .unwrap();
+    let exporter = opentelemetry_otlp::MetricExporter::builder().build()?;
 
     let reader = PeriodicReader::builder(exporter).build();
 
@@ -124,10 +129,10 @@ fn init_observability() -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let meter = meter_provider.meter(INSTRUMENTATION_NAME);
 
     metrics::set_global_recorder(OpenTelemetryRecorder::new(meter))
-        .expect("initialize metrics recorder");
+        .context("failed to initialize metrics recorder")?;
     utils::metrics::describe_metrics();
 
-    // shuting down signal handler
+    // shutting down signal handler
     let shutdown_handle = tokio::spawn(async move {
         let _ = rx.await;
 
@@ -141,7 +146,7 @@ fn init_observability() -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
         logforth::core::default_logger().exit();
     });
 
-    (tx, shutdown_handle)
+    Ok((tx, shutdown_handle))
 }
 
 async fn serve_proxy(config: Arc<Config>, router: Router) -> Result<(), std::io::Error> {

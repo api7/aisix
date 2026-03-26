@@ -11,11 +11,11 @@ pub mod defaults {
     use super::*;
 
     pub fn listen() -> SocketAddr {
-        "0.0.0.0:3000".parse().unwrap()
+        SocketAddr::from(([0, 0, 0, 0], 3000))
     }
 
     pub fn admin_listen() -> SocketAddr {
-        "127.0.0.1:3001".parse().unwrap()
+        SocketAddr::from(([127, 0, 0, 1], 3001))
     }
 
     pub fn server() -> Server {

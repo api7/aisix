@@ -1,9 +1,6 @@
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use backon::{ConstantBuilder, Retryable};
 use dashmap::{DashMap, Entry};
@@ -11,7 +8,7 @@ use etcd_client::{GetOptions, PutOptions, WatchOptions};
 use log::{debug, error, warn};
 use serde::Deserialize;
 use tokio::{
-    sync::{Notify, mpsc},
+    sync::{Mutex, Notify, mpsc},
     task::JoinHandle,
     time::sleep,
 };
@@ -22,8 +19,6 @@ use crate::config::{ConfigEvent, ConfigEventReceiver, ConfigProvider, GetEntry, 
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Initial backoff delay.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-/// Timeout for waiting the watch supervisor task to stop on shutdown.
-const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -66,7 +61,7 @@ impl EtcdConfigProvider {
             )
             .notify(|err, dur| error!("Failed to connect to etcd: {err}, retrying after {:?}", dur))
             .await
-            .map_err(|err| anyhow!("Failed to connect to etcd: {err}, retry exhausted"))?;
+            .context("failed to connect to etcd and retry exhausted")?;
         let txs = Arc::new(DashMap::<String, mpsc::Sender<ConfigEvent>>::new());
         let shutdown = Arc::new(Notify::new());
 
@@ -379,23 +374,22 @@ impl ConfigProvider for EtcdConfigProvider {
         }
     }
 
-    async fn shutdown(&self) -> anyhow::Result<()> {
+    async fn shutdown(&self) -> Result<()> {
         // Signal the supervisor to stop.
         self.shutdown.notify_one();
 
         // Close all dispatch channels so consumers see channel-closed.
         self.txs.clear();
 
-        // Wait for the supervisor task to exit (with timeout).
-        let handle = self.supervisor_handle.lock().unwrap().take();
-        if let Some(h) = handle {
-            match tokio::time::timeout(SHUTDOWN_WAIT, h).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("etcd supervisor task panicked: {}", e),
-                Err(_) => warn!(
-                    "etcd supervisor task did not stop within {:?}",
-                    SHUTDOWN_WAIT
-                ),
+        let handle = self.supervisor_handle.lock().await.take();
+        if let Some(mut h) = handle {
+            match tokio::time::timeout(Duration::from_secs(10), &mut h).await {
+                Ok(joined) => joined.context("failed to shutdown watch supervisor")?,
+                Err(_) => {
+                    return Err(anyhow!(
+                        "timed out waiting for watch supervisor to shutdown"
+                    ));
+                }
             }
         }
         Ok(())

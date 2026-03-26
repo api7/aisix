@@ -47,10 +47,7 @@ impl Provider for MockProvider {
                     role: "assistant".to_string(),
                     content: format!(
                         "Hello! 👋 Current time: {:?}",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_nanos() as u64
+                        epoch_duration().as_nanos() as u64
                     ),
                 },
                 finish_reason: Some("stop".to_string()),
@@ -68,10 +65,7 @@ impl Provider for MockProvider {
         request: ChatCompletionRequest,
     ) -> Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> {
         let id = "ae343f5c-6383-4c33-90e3-26421324b5c5".to_string();
-        let created = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let created = epoch_duration().as_secs();
         let model = request.model.clone();
 
         let mut chunks: Vec<ChatCompletionChunk> = Vec::new();
@@ -93,13 +87,7 @@ impl Provider for MockProvider {
             usage: None,
         });
 
-        let time = format!(
-            "{:?}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64
-        );
+        let time = format!("{:?}", epoch_duration().as_nanos() as u64);
         let latest_message = request
             .messages
             .iter()
@@ -236,6 +224,12 @@ impl Provider for MockProvider {
 
         Ok(response)
     }
+}
+
+fn epoch_duration() -> Duration {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after UNIX_EPOCH")
 }
 
 fn embedding_inputs(request: &EmbeddingRequest) -> Vec<String> {
