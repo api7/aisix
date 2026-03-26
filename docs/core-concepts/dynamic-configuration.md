@@ -1,6 +1,6 @@
 ---
 slug: /core-concepts/dynamic-configuration
-title: 'Dynamic Configuration: Hot-Reload AI Gateway Without Restarts'
+title: 'Dynamic Configuration'
 description: 'AISIX supports dynamic LLM configuration via etcd. Update models and API keys in real time across all gateway nodes — no restarts required. Powered by a decoupled control and data plane.'
 keywords: ['dynamic LLM configuration', 'hot reload AI gateway', 'AI gateway without restart', 'etcd LLM proxy', 'real-time gateway config']
 ---

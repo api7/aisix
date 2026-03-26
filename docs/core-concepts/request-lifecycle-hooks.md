@@ -1,6 +1,6 @@
 ---
 slug: /core-concepts/request-lifecycle-hooks
-title: 'Request Lifecycle and Hooks: AI Gateway Processing Pipeline'
+title: 'Request Lifecycle and Hooks'
 description: 'Understand how AISIX processes every LLM request through a hook-based pipeline — covering authentication, model validation, rate limiting, and metrics collection.'
 keywords: ['LLM request pipeline', 'AI gateway hooks', 'request lifecycle', 'AI gateway middleware', 'LLM proxy pipeline']
 ---

@@ -1,5 +1,5 @@
 ---
-title: 'Observability: OpenTelemetry Tracing and Prometheus Metrics for AISIX'
+title: 'Observability'
 slug: /observability
 description: 'Monitor LLM traffic with OpenTelemetry distributed tracing and Prometheus metrics. Gain full visibility into AI gateway performance, token usage, and request latency.'
 keywords: ['OpenTelemetry LLM observability', 'LLM metrics Prometheus', 'AI gateway monitoring', 'distributed tracing LLM', 'AI gateway Grafana dashboard']

@@ -1,6 +1,6 @@
 ---
 slug: /guides/authentication
-title: 'Authentication: Securing LLM API Access in AISIX'
+title: 'Authentication'
 description: 'Secure your AI gateway with API key authentication and model allowlists. Learn how AISIX validates every LLM request and enforces per-key access control.'
 keywords: ['LLM API security', 'AI gateway authentication', 'API key validation', 'LLM access control', 'AI gateway authorization']
 ---

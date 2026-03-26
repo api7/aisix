@@ -1,5 +1,5 @@
 ---
-title: 'Quick Start: Deploy AISIX AI Gateway in 5 Minutes'
+title: 'Quick Start'
 slug: /getting-started/quick-start
 description: 'Deploy the AISIX open source AI gateway with Docker in under 5 minutes. Configure LLM models, create API keys, and make your first OpenAI-compatible request.'
 keywords: ['deploy AI gateway', 'LLM proxy setup', 'quick start AI gateway', 'LLM API gateway Docker', 'open source AI gateway']

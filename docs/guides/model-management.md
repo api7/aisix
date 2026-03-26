@@ -1,6 +1,6 @@
 ---
 slug: /guides/model-management
-title: 'Model Management: Configure LLM Models in AISIX'
+title: 'Model Management'
 description: 'Create, update, and delete LLM models in the AISIX AI gateway via the Admin API. Configure provider routing, upstream credentials, and per-model rate limits.'
 keywords: ['LLM model configuration', 'AI gateway model management', 'configure LLM provider', 'model CRUD AI gateway', 'LLM routing configuration']
 ---

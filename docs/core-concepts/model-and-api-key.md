@@ -1,6 +1,6 @@
 ---
 slug: /core-concepts/model-and-api-key
-title: 'Models and API Keys: Core Configuration in AISIX AI Gateway'
+title: 'Models and API Keys'
 description: 'Learn how Models and API Keys work in AISIX. Models define LLM routing and rate limits; API Keys control authentication and per-client access to LLM providers.'
 keywords: ['LLM model configuration', 'API key management', 'AI gateway access control', 'LLM rate limiting', 'multi-provider LLM routing']
 ---

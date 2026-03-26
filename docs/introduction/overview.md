@@ -1,5 +1,5 @@
 ---
-title: 'AISIX AI Gateway: Open Source LLM Proxy for Enterprise'
+title: 'Introduction'
 slug: /overview
 description: 'AISIX is an open source AI gateway and LLM proxy built in Rust. Manage multi-provider LLM access, enforce rate limits, and gain full observability — without restarting.'
 keywords: ['open source AI gateway', 'LLM proxy', 'LLM API gateway', 'multi-provider LLM management', 'OpenAI-compatible gateway', 'Rust AI gateway']

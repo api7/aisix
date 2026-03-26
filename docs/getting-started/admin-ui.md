@@ -1,5 +1,5 @@
 ---
-title: 'Admin UI: AI Gateway Management Dashboard'
+title: 'Admin UI'
 slug: /getting-started/admin-ui
 description: 'Use the AISIX Admin UI to manage LLM models, API keys, and test chat completions in the browser. Includes a built-in AI gateway dashboard and Chat Playground.'
 keywords: ['AI gateway dashboard', 'LLM model management UI', 'AI gateway admin', 'Chat Playground', 'LLM API key management']

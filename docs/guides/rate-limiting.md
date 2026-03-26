@@ -1,6 +1,6 @@
 ---
 slug: /guides/rate-limiting
-title: 'Rate Limiting: Control LLM Costs and API Quotas in AISIX'
+title: 'Rate Limiting'
 description: 'Enforce RPM, TPM, and concurrency limits on LLM models and API keys in AISIX. Prevent runaway AI costs, protect upstream providers, and return standard 429 rate limit headers.'
 keywords: ['LLM rate limiting', 'AI API rate limiting', 'token-based throttling', 'concurrent LLM requests', 'AI gateway quota management']
 ---

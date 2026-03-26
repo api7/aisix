@@ -1,6 +1,6 @@
 ---
 slug: /core-concepts/provider-abstraction
-title: 'Provider Abstraction: Multi-Provider LLM Proxy'
+title: 'Provider Abstraction'
 description: 'AISIX acts as a multi-provider LLM proxy with a unified OpenAI-compatible API. Route traffic to OpenAI, Anthropic, Gemini, or DeepSeek by changing a single model prefix.'
 keywords: ['multi-provider LLM proxy', 'OpenAI-compatible gateway', 'LLM provider abstraction', 'AI gateway routing', 'OpenAI Anthropic Gemini proxy']
 ---
