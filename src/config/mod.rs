@@ -9,11 +9,19 @@ pub use types::*;
 
 /// Load configuration file
 pub fn load(config_file: Option<String>) -> Result<Config, config::ConfigError> {
-    config::Config::builder()
-        .add_source(config::File::with_name(
-            config_file.as_deref().unwrap_or("config"),
-        ))
+    let mut builder = config::Config::builder();
+
+    if let Some(ref file) = config_file {
+        // If a config file is specified, it must exist
+        builder = builder.add_source(config::File::with_name(file).required(true));
+    } else {
+        // If no config file is specified, use the default "config" file, which is optional
+        builder = builder.add_source(config::File::with_name("config").required(false));
+    }
+
+    builder
         .build()?
+        // If the file cannot be found, the `Config::default()` will be used.
         .try_deserialize::<Config>()
 }
 
