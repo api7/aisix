@@ -8,7 +8,7 @@ COPY ui/ ui/
 RUN cd ui && pnpm build
 
 # Stage 2: Build Rust binary
-FROM rust:1.85-bookworm AS builder
+FROM rust:bookworm AS builder
 RUN apt-get update && apt-get install -y protobuf-compiler pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
