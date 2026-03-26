@@ -116,9 +116,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contribution guide including
     ```
 
 ## Roadmap
+
+- [ ] Guardrails: content filtering and safety checks
 - [ ] Load Balancing / Fallback across providers
-- [ ] Prompt caching
 - [ ] Cost tracking & usage analytics
+- [ ] Semantic caching: cache responses based on query intent, not exact match
 - [ ] More providers (Azure, Bedrock, Ollama...)
 - [ ] Kubernetes Helm chart
 - [ ] New protocol support
@@ -127,7 +129,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contribution guide including
     - [ ] Google Gemini GenerateContent API
 - [ ] Multimodal APIs: Image, audio, video
 - [ ] MCP proxy
-- [ ] Guardrails: content filtering and safety checks
 
 ## Community
 
