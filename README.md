@@ -118,10 +118,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contribution guide including
 ## Roadmap
 
 - [ ] Guardrails: content filtering and safety checks
-- [ ] Load Balancing / Fallback across providers
+- [ ] Load Balancing / Fallback: across providers
 - [ ] Cost tracking & usage analytics
 - [ ] Semantic caching: cache responses based on query intent, not exact match
-- [ ] More providers (Azure, Bedrock, Ollama...)
+- [ ] More providers: Azure, Bedrock, Ollama...
 - [ ] Kubernetes Helm chart
 - [ ] New protocol support
     - [ ] OpenAI Responses API
