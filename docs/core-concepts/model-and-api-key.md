@@ -56,11 +56,20 @@ AISIX uses an explicit whitelist for access control. The `allowed_models` array 
 
 > **Important**: If `allowed_models` is an empty array (`[]`), the API Key cannot access **any** Model. There is no implicit "allow all" behavior.
 
-### Authentication Flow
+### Authentication and Access Control Flow
+
+AISIX validates requests through a two-stage process:
+
+**Stage 1: Authentication Middleware**
 
 1. A client sends a request with an `Authorization: Bearer <key>` header.
-2. AISIX extracts the `<key>` and finds the corresponding API Key entity.
-3. It checks the `model` field from the client's request body.
-4. It verifies if the requested model `name` is in the API Key's `allowed_models` list.
+2. AISIX extracts the `<key>` and verifies it exists in the configuration.
+3. If the key is missing or invalid, the request is rejected with a `401 Unauthorized` error.
 
-If the model is in the list, the request proceeds. Otherwise, AISIX rejects the request with a `403 Forbidden` error.
+**Stage 2: Model Access Validation**
+
+4. After successful authentication, AISIX checks the `model` field from the client's request body.
+5. It verifies if the requested model `name` is in the API Key's `allowed_models` list.
+6. If the model is not in the list, the request is rejected with a `403 Forbidden` error.
+
+If both stages pass, the request proceeds to the upstream provider.

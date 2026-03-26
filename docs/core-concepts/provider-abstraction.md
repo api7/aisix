@@ -32,7 +32,7 @@ AISIX has built-in support for several LLM providers. The `model` field in your 
 | Provider | `model` Prefix | Upstream API Endpoint (Default) |
 | :--- | :--- | :--- |
 | OpenAI | `openai/` | `https://api.openai.com/v1` |
-| Google Gemini | `gemini/` | `https://generativelanguage.googleapis.com/v1beta` |
+| Google Gemini | `gemini/` | `https://generativelanguage.googleapis.com/v1beta` (note: uses `/v1beta` endpoint) |
 | DeepSeek | `deepseek/` | `https://api.deepseek.com/v1` |
 | Anthropic | `anthropic/` | `https://api.anthropic.com/v1` |
 

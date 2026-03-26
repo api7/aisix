@@ -105,3 +105,5 @@ Requests to Anthropic use:
 ```
 
 `api_base` is optional; defaults to `https://api.anthropic.com/v1`.
+
+**Note**: Anthropic requires the `anthropic-version: 2023-06-01` header for Messages API requests. This is handled automatically by the provider.

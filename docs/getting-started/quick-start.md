@@ -45,7 +45,7 @@ export ADMIN_KEY=<your-admin-key>
 
 ## Step 2: Configure a Model
 
-Tell AISIX which upstream LLM to use. This example uses OpenAI's `gpt-4`:
+Tell AISIX which upstream LLM to use. This example uses OpenAI's `gpt-4o-mini`:
 
 ```bash
 curl -X POST http://127.0.0.1:3001/aisix/admin/models \
@@ -53,7 +53,7 @@ curl -X POST http://127.0.0.1:3001/aisix/admin/models \
   -H "Content-Type: application/json" \
   -d '{
     "name": "openai-gpt4",
-    "model": "openai/gpt-4",
+    "model": "openai/gpt-4o-mini",
     "provider_config": {
       "api_key": "<YOUR_OPENAI_API_KEY>"
     }

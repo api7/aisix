@@ -1,9 +1,9 @@
 # AGENTS.md
 
-> **For AI coding assistants** (OpenCode, Cursor, Copilot, etc.): This file is
-> your primary context source for this codebase. Use it to understand the
-> project structure, coding conventions, and build commands.
->
+> **For AI coding assistants** (OpenCode, Cursor, Copilot, etc.): This file is the
+> primary context source for AI assistants working on this codebase. Use it to
+> understand project structure, coding conventions, and build commands.
+
 > **For human contributors**: See [CONTRIBUTING.md](CONTRIBUTING.md) for the
 > contribution guide.
 
