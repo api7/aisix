@@ -1,7 +1,8 @@
 ---
-slug: /aisix/core-concepts/model-and-api-key
-title: 'First-Class Citizens: Model and API Key'
-description: 'Learn about the core entities in AISIX: Models and API Keys.'
+slug: /core-concepts/model-and-api-key
+title: 'Models and API Keys: Core Configuration in AISIX AI Gateway'
+description: 'Learn how Models and API Keys work in AISIX. Models define LLM routing and rate limits; API Keys control authentication and per-client access to LLM providers.'
+keywords: ['LLM model configuration', 'API key management', 'AI gateway access control', 'LLM rate limiting', 'multi-provider LLM routing']
 ---
 
 In AISIX, **Models** and **API Keys** are the two fundamental resources, or *first-class citizens*, that drive its functionality. Understanding their roles and relationship is key to managing your AI services.
@@ -73,3 +74,9 @@ AISIX validates requests through a two-stage process:
 6. If the model is not in the list, the request is rejected with a `403 Forbidden` error.
 
 If both stages pass, the request proceeds to the upstream provider.
+
+## Related Docs
+
+- [Authentication](../guides/authentication.md) — How API key validation works in the request pipeline
+- [Rate Limiting](../guides/rate-limiting.md) — Configure RPM, TPM, and concurrency limits on Models and API Keys
+- [Provider Abstraction](./provider-abstraction.md) — How AISIX routes requests to the correct LLM provider

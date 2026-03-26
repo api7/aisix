@@ -1,7 +1,8 @@
 ---
-slug: /aisix/guides/model-management
-title: Model Management
-description: Learn how to configure and manage models in AISIX.
+slug: /guides/model-management
+title: 'Model Management: Configure LLM Models in AISIX'
+description: 'Create, update, and delete LLM models in the AISIX AI gateway via the Admin API. Configure provider routing, upstream credentials, and per-model rate limits.'
+keywords: ['LLM model configuration', 'AI gateway model management', 'configure LLM provider', 'model CRUD AI gateway', 'LLM routing configuration']
 ---
 
 In AISIX, a **Model** is a virtual entity that represents a specific upstream AI model. This guide explains how to create and manage `Model` entities.
@@ -108,3 +109,9 @@ If the model is not found, it returns a `400 Bad Request` error:
   }
 }
 ```
+
+## Related Docs
+
+- [Authentication](./authentication.md) — How to create API keys and control per-model access
+- [Rate Limiting](./rate-limiting.md) — Add RPM, TPM, and concurrency limits to your LLM models
+- [Provider Abstraction](../core-concepts/provider-abstraction.md) — How AISIX maps model prefixes to upstream LLM providers

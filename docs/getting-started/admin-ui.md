@@ -1,7 +1,8 @@
 ---
-title: Admin UI
-slug: /aisix/getting-started/admin-ui
-description: Use the AISIX Admin UI and Chat Playground to manage models, API keys, and test completions.
+title: 'Admin UI: AI Gateway Management Dashboard'
+slug: /getting-started/admin-ui
+description: 'Use the AISIX Admin UI to manage LLM models, API keys, and test chat completions in the browser. Includes a built-in AI gateway dashboard and Chat Playground.'
+keywords: ['AI gateway dashboard', 'LLM model management UI', 'AI gateway admin', 'Chat Playground', 'LLM API key management']
 ---
 
 AISIX includes a built-in **Admin UI** for managing models and API keys, and a **Chat Playground** for testing chat completions — all from your browser.
@@ -54,3 +55,9 @@ pnpm dev
 ```
 
 This starts the Vite dev server at `http://localhost:5173`. API requests are proxied to AISIX on `127.0.0.1:3001`.
+
+## Related Docs
+
+- [Model Management](../guides/model-management.md) — Full CRUD reference for managing LLM models via the Admin API
+- [Authentication](../guides/authentication.md) — How to create and manage API keys for gateway access
+- [Rate Limiting](../guides/rate-limiting.md) — Configure per-model and per-key LLM rate limits

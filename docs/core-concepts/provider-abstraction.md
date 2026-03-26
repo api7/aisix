@@ -1,10 +1,11 @@
 ---
-slug: /aisix/core-concepts/provider-abstraction
-title: 'Provider Abstraction'
-description: Learn how AISIX provides a unified API for diverse LLM providers.
+slug: /core-concepts/provider-abstraction
+title: 'Provider Abstraction: Multi-Provider LLM Proxy'
+description: 'AISIX acts as a multi-provider LLM proxy with a unified OpenAI-compatible API. Route traffic to OpenAI, Anthropic, Gemini, or DeepSeek by changing a single model prefix.'
+keywords: ['multi-provider LLM proxy', 'OpenAI-compatible gateway', 'LLM provider abstraction', 'AI gateway routing', 'OpenAI Anthropic Gemini proxy']
 ---
 
-AISIX is a universal gateway for Large Language Models (LLMs). It solves the challenge of different provider APIs, authentication, and data formats through a **Provider Abstraction** layer.
+AISIX is an open source, multi-provider LLM proxy that eliminates vendor lock-in by exposing a single OpenAI-compatible API regardless of the upstream provider. It solves the challenge of different provider APIs, authentication, and data formats through a **Provider Abstraction** layer — letting teams switch between OpenAI, Anthropic, Google Gemini, and DeepSeek without changing client code.
 
 ## A Unified, OpenAI-Compatible API
 
@@ -39,3 +40,9 @@ AISIX has built-in support for several LLM providers. The `model` field in your 
 For example, to configure a Model for DeepSeek's chat model, your `model` field would be `deepseek/deepseek-chat`.
 
 This provider-based architecture makes AISIX highly extensible. Adding support for a new LLM provider requires creating a new struct that implements the `Provider` trait, including request/response transformation logic (input normalization, output parsing, error mapping) to ensure compatibility with the OpenAI-compatible API surface.
+
+## Related Docs
+
+- [Quick Start](../getting-started/quick-start.md) — Configure your first LLM model and make a proxied request
+- [Model Management](../guides/model-management.md) — Full CRUD reference for creating and updating LLM models
+- [Observability](../observability.md) — Monitor per-provider LLM latency and token usage with Prometheus

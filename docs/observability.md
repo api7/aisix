@@ -1,4 +1,11 @@
-# Observability
+---
+title: 'Observability: OpenTelemetry Tracing and Prometheus Metrics for AISIX'
+slug: /observability
+description: 'Monitor LLM traffic with OpenTelemetry distributed tracing and Prometheus metrics. Gain full visibility into AI gateway performance, token usage, and request latency.'
+keywords: ['OpenTelemetry LLM observability', 'LLM metrics Prometheus', 'AI gateway monitoring', 'distributed tracing LLM', 'AI gateway Grafana dashboard']
+---
+
+# Observability: LLM Metrics and Distributed Tracing
 
 AI Gateway exports traces and metrics through OpenTelemetry (OTLP).
 
@@ -8,7 +15,7 @@ AI Gateway ──OTLP gRPC──► Jaeger    (traces)   :4317
                                          └──► Grafana  (dashboard) :3100
 ```
 
-## At a Glance
+## At a Glance: What AISIX Exports
 
 - Metrics are pushed from AI Gateway to Prometheus OTLP HTTP receiver.
 - Traces are exported from AI Gateway to Jaeger OTLP gRPC receiver.
@@ -170,3 +177,8 @@ Dashboard panels:
 ```bash
 docker stop jaeger prometheus grafana
 ```
+
+## Related Docs
+
+- [Overview](./introduction/overview.md) — Architecture of the AISIX AI gateway and its observability design
+- [Request Lifecycle and Hooks](./core-concepts/request-lifecycle-hooks.md) — How the `MetricHook` collects LLM token and latency data

@@ -1,7 +1,8 @@
 ---
-slug: /aisix/guides/rate-limiting
-title: Rate Limiting
-description: Control costs and prevent abuse with AISIX's powerful rate limiting.
+slug: /guides/rate-limiting
+title: 'Rate Limiting: Control LLM Costs and API Quotas in AISIX'
+description: 'Enforce RPM, TPM, and concurrency limits on LLM models and API keys in AISIX. Prevent runaway AI costs, protect upstream providers, and return standard 429 rate limit headers.'
+keywords: ['LLM rate limiting', 'AI API rate limiting', 'token-based throttling', 'concurrent LLM requests', 'AI gateway quota management']
 ---
 
 Rate limiting is a critical feature for managing AI service usage, controlling costs, and protecting your upstream services from abuse. AISIX provides a flexible rate limiting engine that can be applied to both API Keys and Models.
@@ -109,3 +110,9 @@ When a rate limit is exceeded, AISIX returns a `429 Too Many Requests` error wit
 ```
 
 The response also includes a `Retry-After` header indicating how many seconds the client should wait before making another request.
+
+## Related Docs
+
+- [Authentication](./authentication.md) — How API keys are validated before rate limits are applied
+- [Request Lifecycle and Hooks](../core-concepts/request-lifecycle-hooks.md) — Where `RateLimitHook` fits in the LLM request processing pipeline
+- [Model Management](./model-management.md) — How to configure per-model rate limits via the Admin API

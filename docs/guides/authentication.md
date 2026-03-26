@@ -1,7 +1,8 @@
 ---
-slug: /aisix/guides/authentication
-title: Authentication
-description: Learn how to secure your AI Gateway with API keys.
+slug: /guides/authentication
+title: 'Authentication: Securing LLM API Access in AISIX'
+description: 'Secure your AI gateway with API key authentication and model allowlists. Learn how AISIX validates every LLM request and enforces per-key access control.'
+keywords: ['LLM API security', 'AI gateway authentication', 'API key validation', 'LLM access control', 'AI gateway authorization']
 ---
 
 Authentication is the first line of defense for your AI services. AISIX uses API keys to ensure that only authorized clients can access your models. This guide covers creating and managing API keys and how authentication and model access validation work.
@@ -82,3 +83,8 @@ If the key is valid but not authorized for the requested model, the `ValidateMod
   }
 }
 ```
+
+## Related Docs
+
+- [Models and API Keys](../core-concepts/model-and-api-key.md) — Deep dive into the Model and API Key entities and their relationship
+- [Rate Limiting](./rate-limiting.md) — Add usage limits to API keys alongside access control

@@ -6,13 +6,13 @@
 </p>
 
 <p align="center">
-  <strong>A high-performance, Rust-based AI Gateway for unified LLM access.</strong><br/>
-  <em>OpenAI-compatible API across OpenAI, Anthropic, Gemini, DeepSeek, and more.</em><br/><br/>
+  <strong>An open source, high-performance AI Gateway and LLM proxy built in Rust.</strong><br/>
+  <em>Unified OpenAI-compatible API for OpenAI, Anthropic, Gemini, DeepSeek, and any OpenAI-compatible provider.</em><br/><br/>
   🦀 <strong>Rust</strong> • 🔌 <strong>OpenAI Compatible</strong> • 🗄️ <strong>etcd</strong>
 </p>
 
 
-## Why AISIX
+## Why Teams Use AISIX as Their Enterprise AI Gateway
 
 - 🦀 **Rust + Tokio** — Extreme performance with low resource footprint; ships as a single binary
 - 🔌 **OpenAI-Compatible** — One API to call all LLMs; drop-in replacement with zero code changes

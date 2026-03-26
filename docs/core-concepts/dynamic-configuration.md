@@ -1,10 +1,11 @@
 ---
-slug: /aisix/core-concepts/dynamic-configuration
-title: 'Dynamic Configuration'
-description: Discover how AISIX achieves real-time configuration updates without restarts.
+slug: /core-concepts/dynamic-configuration
+title: 'Dynamic Configuration: Hot-Reload AI Gateway Without Restarts'
+description: 'AISIX supports dynamic LLM configuration via etcd. Update models and API keys in real time across all gateway nodes — no restarts required. Powered by a decoupled control and data plane.'
+keywords: ['dynamic LLM configuration', 'hot reload AI gateway', 'AI gateway without restart', 'etcd LLM proxy', 'real-time gateway config']
 ---
 
-A key feature of AISIX is its dynamic configuration. You can modify Models and API Keys at any time, and the changes take effect instantly across the gateway cluster without restarts. This is possible due to its decoupled architecture, which separates the control plane from the data plane.
+A key feature of AISIX as an enterprise AI gateway is its dynamic configuration. You can modify Models and API Keys at any time, and the changes hot-reload instantly across all gateway nodes without service interruption. This is possible due to its decoupled architecture, which separates the control plane from the data plane — a standard pattern in production LLM proxy deployments.
 
 ## Control Plane vs. Data Plane
 
@@ -56,3 +57,8 @@ Dynamic configuration works as follows:
 4.  **In-Memory Cache Update**: Upon receiving a notification, each AISIX instance fetches the updated configuration and refreshes its in-memory cache. This update is atomic and lock-free, designed to minimize performance impact.
 
 This architecture ensures that configuration changes are propagated to all gateway nodes in near real-time, providing a responsive and manageable system.
+
+## Related Docs
+
+- [Overview](../introduction/overview.md) — Architecture overview of AISIX's control and data plane design
+- [Model Management](../guides/model-management.md) — How to create and update LLM models via the Admin API

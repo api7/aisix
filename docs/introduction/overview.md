@@ -1,14 +1,15 @@
 ---
-title: AISIX AI Gateway Overview
-slug: /aisix/overview
-description: Discover AISIX AI Gateway, a dynamic, high-performance AI gateway for cloud-native environments, built in Rust. Learn about its architecture, features, and how it simplifies interaction with Large Language Models (LLMs).
+title: 'AISIX AI Gateway: Open Source LLM Proxy for Enterprise'
+slug: /overview
+description: 'AISIX is an open source AI gateway and LLM proxy built in Rust. Manage multi-provider LLM access, enforce rate limits, and gain full observability — without restarting.'
+keywords: ['open source AI gateway', 'LLM proxy', 'LLM API gateway', 'multi-provider LLM management', 'OpenAI-compatible gateway', 'Rust AI gateway']
 ---
 
 AISIX AI Gateway (hereafter AISIX) is a modern, high-performance AI gateway designed for the era of Large Language Models (LLMs). Built in Rust, it provides a robust, scalable, and flexible solution for managing, securing, and observing interactions with various LLM providers.
 
 This document provides a high-level overview of AISIX, its architecture, and its key features.
 
-## Why Choose AISIX?
+## Why Teams Choose AISIX for Enterprise LLM Management
 
 Integrating LLMs into products introduces challenges in managing diverse APIs, controlling costs, ensuring security, and maintaining performance. AISIX addresses these by providing a unified control plane for all AI-related traffic.
 
@@ -80,3 +81,11 @@ AISIX is valued for the following characteristics:
 - **Provider Agnostic**: The provider abstraction makes it easy to add support for new LLM providers, preventing vendor lock-in.
 
 - **Cloud-Native**: As a lightweight, stateless container, AISIX is ideal for cloud-native environments and can be easily deployed and scaled on platforms like Kubernetes.
+
+## Related Docs
+
+- [Quick Start](./getting-started/quick-start.md) — Deploy the AI gateway in under 5 minutes
+- [Provider Abstraction](./core-concepts/provider-abstraction.md) — How AISIX routes to OpenAI, Gemini, Anthropic, and DeepSeek
+- [Dynamic Configuration](./core-concepts/dynamic-configuration.md) — Hot-reload models and API keys without restarts
+- [Rate Limiting](./guides/rate-limiting.md) — Control LLM costs with RPM, TPM, and concurrency limits
+- [Observability](./observability.md) — OpenTelemetry tracing and Prometheus metrics for LLM traffic

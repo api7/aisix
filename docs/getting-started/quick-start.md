@@ -1,7 +1,8 @@
 ---
-title: Quick Start
-slug: /aisix/getting-started/quick-start
-description: Get AISIX AI Gateway up and running in under 5 minutes with Docker.
+title: 'Quick Start: Deploy AISIX AI Gateway in 5 Minutes'
+slug: /getting-started/quick-start
+description: 'Deploy the AISIX open source AI gateway with Docker in under 5 minutes. Configure LLM models, create API keys, and make your first OpenAI-compatible request.'
+keywords: ['deploy AI gateway', 'LLM proxy setup', 'quick start AI gateway', 'LLM API gateway Docker', 'open source AI gateway']
 ---
 
 This guide walks you through starting AISIX with a single command and making your first AI request in under 5 minutes.
@@ -157,6 +158,7 @@ After creating a new model, update your API key's `allowed_models` list to grant
 
 ## Next Steps
 
-- **Explore More Providers**: Add other supported providers like **DeepSeek**. The process is the same: create a new model with the `deepseek/deepseek-chat` prefix and your DeepSeek API key, then update your API key to allow access.
-- **Configure Rate Limiting**: Add rate limits to your models and API keys to control costs and prevent abuse.
-- **Admin UI**: AISIX includes a built-in Admin UI and Chat Playground. See [Admin UI](./admin-ui.md).
+- **Manage Models via UI**: AISIX includes a built-in dashboard for managing LLM models and API keys without curl. See [Admin UI](./admin-ui.md).
+- **Add More Providers**: Add Anthropic, Gemini, or DeepSeek models using the same pattern — see [Model Management](../guides/model-management.md) for a full CRUD reference.
+- **Control LLM Costs**: Configure RPM, TPM, and concurrency limits to prevent runaway usage. See [Rate Limiting](../guides/rate-limiting.md).
+- **Secure Access**: Understand how API key authentication and model allowlists work in [Authentication](../guides/authentication.md).

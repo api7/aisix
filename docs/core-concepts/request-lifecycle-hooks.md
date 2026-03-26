@@ -1,7 +1,8 @@
 ---
-slug: /aisix/core-concepts/request-lifecycle-hooks
-title: 'Request Lifecycle and Hooks'
-description: Understand how AISIX processes a request and how hooks extend its functionality.
+slug: /core-concepts/request-lifecycle-hooks
+title: 'Request Lifecycle and Hooks: AI Gateway Processing Pipeline'
+description: 'Understand how AISIX processes every LLM request through a hook-based pipeline — covering authentication, model validation, rate limiting, and metrics collection.'
+keywords: ['LLM request pipeline', 'AI gateway hooks', 'request lifecycle', 'AI gateway middleware', 'LLM proxy pipeline']
 ---
 
 At the heart of AISIX is a flexible request processing pipeline built on a system of **Hooks**. This section explains the journey of an AI request through the gateway and how hooks implement key features.
@@ -65,3 +66,9 @@ The hook system is divided into two stages:
 -   **`post_call`**: Runs **after** a response is received from the provider. It is used for logging, metrics collection, and logic that needs to inspect the final response data.
 
 This phased approach ensures a clean separation of concerns.
+
+## Related Docs
+
+- [Rate Limiting](../guides/rate-limiting.md) — How the `RateLimitHook` enforces RPM, TPM, and concurrency limits
+- [Authentication](../guides/authentication.md) — How the authentication middleware and `ValidateModelHook` secure LLM access
+- [Observability](../observability.md) — How the `MetricHook` exposes LLM metrics to Prometheus
