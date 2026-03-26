@@ -1,5 +1,5 @@
 ---
-slug: /ai-gateway/guides/rate-limiting
+slug: /aisix/guides/rate-limiting
 title: Rate Limiting
 description: Control costs and prevent abuse with AISIX's powerful rate limiting.
 ---

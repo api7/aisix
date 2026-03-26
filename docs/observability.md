@@ -86,7 +86,7 @@ docker run --rm --name grafana -d \
 ### 4. Start AI Gateway
 
 ```bash
-RUST_LOG=info ./target/release/ai-gateway
+RUST_LOG=info ./target/release/aisix
 ```
 
 ## Service URLs
@@ -103,7 +103,7 @@ RUST_LOG=info ./target/release/ai-gateway
 
 1. Send a request to the proxy API.
 2. Open Jaeger at `http://localhost:16686`.
-3. Select service `ai-gateway`, then click `Find Traces`.
+3. Select service `aisix`, then click `Find Traces`.
 
 ### Verify Metrics
 
@@ -155,7 +155,7 @@ grafana/
 ├── provisioning/
 │   ├── datasources/datasource.yml
 │   └── dashboards/dashboards.yml
-└── dashboards/ai-gateway.json
+└── dashboards/aisix.json
 ```
 
 Dashboard panels:

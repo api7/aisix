@@ -1,5 +1,5 @@
 ---
-slug: /ai-gateway/guides/request-streaming
+slug: /aisix/guides/request-streaming
 title: Request Streaming
 description: Learn how to handle real-time, streaming responses in AISIX.
 ---

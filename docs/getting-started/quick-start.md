@@ -1,6 +1,6 @@
 ---
 title: Quick Start
-slug: /ai-gateway/getting-started/quick-start
+slug: /aisix/getting-started/quick-start
 description: Get AISIX AI Gateway up and running in 5 minutes.
 ---
 
@@ -25,8 +25,8 @@ Ensure you have the following installed:
 Clone the AISIX repository:
 
 ```bash
-git clone https://github.com/api7/ai-gateway-stash.git
-cd ai-gateway-stash
+git clone https://github.com/api7/aisix.git
+cd aisix
 ```
 
 ## Step 2: Modify the Admin Key (Recommended)

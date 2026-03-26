@@ -1,6 +1,6 @@
 ---
 title: Admin UI
-slug: /ai-gateway/getting-started/admin-ui
+slug: /aisix/getting-started/admin-ui
 description: Build and use the AISIX Admin UI and Chat Playground.
 ---
 

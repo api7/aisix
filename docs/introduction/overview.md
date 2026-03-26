@@ -1,6 +1,6 @@
 ---
 title: AISIX AI Gateway Overview
-slug: /ai-gateway/overview
+slug: /aisix/overview
 description: Discover AISIX AI Gateway, a dynamic, high-performance AI gateway for cloud-native environments, built in Rust. Learn about its architecture, features, and how it simplifies interaction with Large Language Models (LLMs).
 ---
 

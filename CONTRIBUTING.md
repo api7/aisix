@@ -170,7 +170,7 @@ cargo test -- --nocapture
 ### E2E tests (TypeScript / Vitest)
 
 The E2E test suite runs the gateway binary directly — it requires:
-1. A built binary at `target/debug/ai-gateway`
+1. A built binary at `target/debug/aisix`
 2. etcd and other required services running (`ci/docker-compose.yaml`)
 
 ```bash

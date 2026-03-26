@@ -15,13 +15,13 @@ COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY build.rs ./
 COPY --from=ui-builder /app/ui/dist ui/dist
-RUN cargo build --release && strip target/release/ai-gateway
+RUN cargo build --release && strip target/release/aisix
 
 # Stage 3: Runtime (Google Distroless — minimal CVE surface)
 # cc-debian12 already includes OpenSSL, CA certificates, and tzdata.
 FROM gcr.io/distroless/cc-debian12:nonroot
 
-COPY --from=builder /app/target/release/ai-gateway /usr/local/bin/aisix
+COPY --from=builder /app/target/release/aisix /usr/local/bin/aisix
 COPY config.yaml /etc/aisix/config.yaml
 
 EXPOSE 3000 3001

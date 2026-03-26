@@ -1,5 +1,5 @@
 ---
-slug: /ai-gateway/core-concepts/provider-abstraction
+slug: /aisix/core-concepts/provider-abstraction
 title: 'Provider Abstraction'
 description: Learn how AISIX provides a unified API for diverse LLM providers.
 ---

@@ -1,5 +1,5 @@
 ---
-slug: /ai-gateway/core-concepts/dynamic-configuration
+slug: /aisix/core-concepts/dynamic-configuration
 title: 'Dynamic Configuration'
 description: Discover how AISIX achieves real-time configuration updates without restarts.
 ---

@@ -612,7 +612,7 @@
     }
   ],
   "schemaVersion": 39,
-  "tags": ["ai-gateway"],
+  "tags": ["aisix"],
   "templating": {
     "list": [
       {
@@ -638,7 +638,7 @@
   "time": { "from": "now-1h", "to": "now" },
   "timepicker": {},
   "timezone": "browser",
-  "title": "AI Gateway",
-  "uid": "ai-gateway-overview",
+  "title": "AISIX",
+  "uid": "aisix-overview",
   "version": 1
 }

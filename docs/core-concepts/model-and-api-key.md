@@ -1,5 +1,5 @@
 ---
-slug: /ai-gateway/core-concepts/model-and-api-key
+slug: /aisix/core-concepts/model-and-api-key
 title: 'First-Class Citizens: Model and API Key'
 description: 'Learn about the core entities in AISIX: Models and API Keys.'
 ---

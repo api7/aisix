@@ -1,5 +1,5 @@
 ---
-slug: /ai-gateway/core-concepts/request-lifecycle-hooks
+slug: /aisix/core-concepts/request-lifecycle-hooks
 title: 'Request Lifecycle and Hooks'
 description: Understand how AISIX processes a request and how hooks extend its functionality.
 ---

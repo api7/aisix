@@ -1,5 +1,5 @@
 ---
-slug: /ai-gateway/guides/authentication
+slug: /aisix/guides/authentication
 title: Authentication
 description: Learn how to secure your AI Gateway with API keys.
 ---

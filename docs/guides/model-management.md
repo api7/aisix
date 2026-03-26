@@ -1,5 +1,5 @@
 ---
-slug: /ai-gateway/guides/model-management
+slug: /aisix/guides/model-management
 title: Model Management
 description: Learn how to configure and manage models in AISIX.
 ---
