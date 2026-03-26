@@ -7,12 +7,16 @@ set -euo pipefail
 #
 # Usage:
 #   AISIX_IMAGE=aisix:smoke-test ./ci/smoke-test.sh
+#
+# When services are already running (e.g. started via quickstart), set:
+#   SKIP_COMPOSE=1 ADMIN_KEY=<your-key> ./ci/smoke-test.sh
 
 # --- Configuration ---
-ADMIN_KEY="admin"
+ADMIN_KEY="${ADMIN_KEY:-admin}"
 ADMIN_URL="http://127.0.0.1:3001"
 PROXY_URL="http://127.0.0.1:3000"
 COMPOSE_FILE="quickstart/docker-compose.yaml"
+SKIP_COMPOSE="${SKIP_COMPOSE:-0}"
 
 # --- Helpers ---
 info()  { printf '\033[1;34m[smoke]\033[0m %s\n' "$1"; }
@@ -23,7 +27,6 @@ cleanup() {
     info "Cleaning up..."
     docker compose -f "$COMPOSE_FILE" down -v 2>/dev/null || true
 }
-trap cleanup EXIT
 
 assert_status() {
     local description="$1" expected="$2" actual="$3"
@@ -31,14 +34,21 @@ assert_status() {
         ok "PASS: $description (HTTP $actual)"
     else
         fail "FAIL: $description — expected HTTP $expected, got HTTP $actual"
-        docker compose -f "$COMPOSE_FILE" logs aisix
+        if [ "$SKIP_COMPOSE" = "0" ]; then
+            docker compose -f "$COMPOSE_FILE" logs aisix
+        fi
         exit 1
     fi
 }
 
-# --- Start services ---
-info "Starting services with image: ${AISIX_IMAGE:-ghcr.io/api7/aisix:latest}"
-docker compose -f "$COMPOSE_FILE" up -d
+# --- Start services (unless already running) ---
+if [ "$SKIP_COMPOSE" = "0" ]; then
+    trap cleanup EXIT
+    info "Starting services with image: ${AISIX_IMAGE:-ghcr.io/api7/aisix:latest}"
+    docker compose -f "$COMPOSE_FILE" up -d
+else
+    info "Skipping docker compose (SKIP_COMPOSE=1), using already-running services"
+fi
 
 # --- Wait for readiness ---
 info "Waiting for AISIX to be ready (timeout 60s)..."
@@ -53,7 +63,9 @@ done
 
 if [ $elapsed -ge 60 ]; then
     fail "AISIX did not become ready within 60 seconds"
-    docker compose -f "$COMPOSE_FILE" logs aisix
+    if [ "$SKIP_COMPOSE" = "0" ]; then
+        docker compose -f "$COMPOSE_FILE" logs aisix
+    fi
     exit 1
 fi
 ok "AISIX is ready (${elapsed}s)"
@@ -89,7 +101,9 @@ if echo "$body" | grep -q "smoke-test-model"; then
     ok "PASS: Model 'smoke-test-model' found in list"
 else
     fail "FAIL: Model 'smoke-test-model' not found in response"
-    docker compose -f "$COMPOSE_FILE" logs aisix
+    if [ "$SKIP_COMPOSE" = "0" ]; then
+        docker compose -f "$COMPOSE_FILE" logs aisix
+    fi
     exit 1
 fi
 

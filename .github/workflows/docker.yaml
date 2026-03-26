@@ -93,3 +93,22 @@ jobs:
         env:
           DISTRIBUTION: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
           PATHS: /aisix/quickstart /aisix/docker-compose.yaml /aisix/config.yaml
+
+  verify:
+    needs: [publish-quickstart]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install via quickstart
+        run: curl -fsSL https://run.api7.ai/aisix/quickstart | sh
+
+      - name: Extract admin key
+        run: |
+          ADMIN_KEY=$(grep -A2 'admin_key:' ~/.aisix/config.yaml | grep 'key:' | tail -1 | awk '{print $NF}')
+          echo "ADMIN_KEY=${ADMIN_KEY}" >> "$GITHUB_ENV"
+
+      - name: Run smoke tests against quickstart instance
+        run: |
+          chmod +x ci/smoke-test.sh
+          SKIP_COMPOSE=1 ci/smoke-test.sh
