@@ -127,6 +127,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contribution guide including
     - [ ] Google Gemini GenerateContent API
 - [ ] Multimodal APIs: Image, audio, video
 - [ ] MCP proxy
+- [ ] Guardrails: content filtering and safety checks
 
 ## Community
 
