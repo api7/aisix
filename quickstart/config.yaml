@@ -5,8 +5,11 @@ deployment:
     prefix: /aisix
     timeout: 30
   admin:
-    listen: 0.0.0.0:3001
     admin_key:
       - key: admin
 
-listen: 0.0.0.0:3000
+server:
+  proxy:
+    listen: 0.0.0.0:3000
+  admin:
+    listen: 0.0.0.0:3001
