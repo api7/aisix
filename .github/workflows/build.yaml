@@ -13,7 +13,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # 6.0.2
 
       - name: Setup dependencies
         run: |
@@ -22,7 +22,7 @@ jobs:
           corepack enable pnpm
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # 6.3.0
         with:
           node-version: lts/*
           cache: "pnpm"
@@ -35,11 +35,11 @@ jobs:
         run: sudo docker compose -f ci/docker-compose.yaml up -d
 
       - name: Setup Rust cache
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 #2.9.1
 
       - name: Cache UI build
         id: ui-cache
-        uses: actions/cache@v4
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # 5.0.4
         with:
           path: ui/dist
           key: ui-dist-${{ hashFiles('ui/src/**', 'ui/index.html', 'ui/vite.config.ts', 'ui/tsconfig*.json', 'ui/package.json', 'ui/pnpm-lock.yaml') }}
@@ -54,7 +54,7 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # 7.0.0
         with:
           name: binary-debug
           path: target/debug/aisix
