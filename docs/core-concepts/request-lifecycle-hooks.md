@@ -21,12 +21,12 @@ graph TD
 
     subgraph Pre-Call Hooks
         C1[Validate Model Hook]
-        C2[Rate Limit Hook (Pre-Check)]
+        C2["Rate Limit Hook (Pre-Check)"]
         C3[...]
     end
 
     subgraph Post-Call Hooks
-        E1[Rate Limit Hook (Post-Check)]
+        E1["Rate Limit Hook (Post-Check)"]
         E2[Metrics Hook]
         E3[...]
     end
