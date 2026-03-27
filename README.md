@@ -133,6 +133,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contribution guide including
 ## Community
 
 - Contribute via [CONTRIBUTING.md](CONTRIBUTING.md) — setup, code style, and PR guidelines
+- Join our [Discord server](https://discord.gg/mAZzcRtP) for real-time chat with the community and maintainers
 - Use [GitHub Discussions](https://github.com/api7/aisix/discussions) for questions, ideas, and architecture discussions
 - Use [GitHub Issues](https://github.com/api7/aisix/issues) for bug reports, feature requests, and actionable tasks
 - Follow repository activity for ongoing documentation and product updates
