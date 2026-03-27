@@ -3,6 +3,8 @@ name: Docker
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
@@ -42,20 +44,25 @@ jobs:
       packages: write
     with:
       output: image
-      push: true
+      push: ${{ github.event_name == 'push' }}
       platforms: linux/amd64,linux/arm64
       cache: true
       cache-mode: max
       sbom: true
       set-meta-annotations: true
       set-meta-labels: true
-      meta-images: ghcr.io/${{ github.repository }}
+      meta-images: |
+        docker.io/${{ github.repository }}
+        ghcr.io/${{ github.repository }}
       meta-tags: |
         type=semver,pattern={{version}}
         type=semver,pattern={{major}}.{{minor}}
-        type=raw,value=latest
+        type=raw,value=dev,enable={{is_default_branch}}
     secrets:
       registry-auths: |
+        - registry: docker.io
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
         - registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
