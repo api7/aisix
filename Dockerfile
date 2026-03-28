@@ -1,6 +1,6 @@
 # Stage 1: Build UI
-FROM node:20-slim AS ui-builder
-RUN corepack enable
+FROM node:lts-slim AS ui-builder
+RUN corepack enable pnpm
 WORKDIR /app
 COPY ui/package.json ui/pnpm-lock.yaml ui/
 RUN cd ui && pnpm install --frozen-lockfile
@@ -15,7 +15,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY build.rs ./
 COPY --from=ui-builder /app/ui/dist ui/dist
-RUN cargo build --release && strip target/release/aisix
+RUN cargo build --locked --release
 
 # Stage 3: Runtime (Google Distroless — minimal CVE surface)
 # cc-debian12 already includes OpenSSL, CA certificates, and tzdata.

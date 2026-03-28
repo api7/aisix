@@ -2,7 +2,10 @@ name: Docker
 
 on:
   push:
+    branches: ["main"]
     tags: ["v*"]
+  pull_request:
+    branches: ["main"]
   workflow_dispatch:
 
 permissions:
@@ -12,7 +15,8 @@ jobs:
   smoke-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # 6.0.2
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # 6.0.2
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # 4.0.0
@@ -42,20 +46,25 @@ jobs:
       packages: write
     with:
       output: image
-      push: true
+      push: ${{ github.event_name == 'push' }}
       platforms: linux/amd64,linux/arm64
       cache: true
       cache-mode: max
       sbom: true
       set-meta-annotations: true
       set-meta-labels: true
-      meta-images: ghcr.io/${{ github.repository }}
+      meta-images: |
+        docker.io/${{ github.repository }}
+        ghcr.io/${{ github.repository }}
       meta-tags: |
         type=semver,pattern={{version}}
         type=semver,pattern={{major}}.{{minor}}
-        type=raw,value=latest
+        type=raw,value=dev,enable={{is_default_branch}}
     secrets:
       registry-auths: |
+        - registry: docker.io
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
         - registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
