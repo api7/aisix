@@ -22,7 +22,7 @@ The following table describes the Model configuration fields:
 | `name` | String | A unique, human-readable name for the Model. This is the identifier clients use in their requests. | `my-gpt4-mini` |
 | `model` | String | The identifier for the upstream model, formatted as `{provider}/{model_id}`. The `provider` part tells AISIX which driver to use, and `model_id` is passed to the provider. | `openai/gpt-4.1-mini` |
 | `provider_config` | Object | Provider-specific configuration for credentials. For current providers, this is where you place the API key for the upstream service. | `{"api_key": "sk-..."}` |
-| `rate_limit` | Object | (Optional) Rules to limit the request rate and token usage for this Model. See [Rate Limiting](./rate-limiting.md) for details. | `{"rpm": 100, "tpm": 10000}` |
+| `rate_limit` | Object | (Optional) Rules to limit the request rate and token usage for this Model. See [Rate Limiting](../guides/rate-limiting.md) for details. | `{"rpm": 100, "tpm": 10000}` |
 
 ### Model as a Routing Target
 
@@ -49,7 +49,7 @@ An **API Key** is a credential used to authenticate clients. It is the primary i
 | :--- | :--- | :--- | :--- |
 | `key` | String | The secret key string that clients must provide in the `Authorization` header. | `aisix-user-key-xxxxxxxx` |
 | `allowed_models` | Array of Strings | A list of Model `name`s this API Key is permitted to access. This is a strict whitelist. | `["my-gpt4-mini", "my-gemini-pro"]` |
-| `rate_limit` | Object | (Optional) Rules to limit the request rate and token usage for this API Key. | `{"rpd": 1000, "tpd": 1000000}` |
+| `rate_limit` | Object | (Optional) Rules to limit the request rate and token usage for this API Key. See [Rate Limiting](../guides/rate-limiting.md) for details. | `{"rpd": 1000, "tpd": 1000000}` |
 
 ### The Whitelist Model: `allowed_models`
 
