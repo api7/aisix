@@ -31,39 +31,36 @@ AISIX uses a decoupled architecture, separating the Control Plane (configuration
 
 Here is a diagram illustrating the basic architecture:
 
-```mermaid
-graph TD
-    subgraph "Management & Configuration (Control Plane)"
-        Admin[Admin User] --> AdminUI[Admin UI / Dashboard]
-        AdminUI --> AdminAPI[Admin API]
-        AdminAPI --> Etcd[(etcd)]
-    end
+<img src="../images/architecture_std.png" alt="AISIX Architecture Diagram" style="width:100%; max-width:800px; margin: 20px auto; display: block;" />
 
-    subgraph "Request Path (Data Plane)"
-        Client[Client App] --> AISIX[AISIX AI Gateway]
-        AISIX --> Auth{Authentication}
-        Auth --> ModelV{Model Validation}
-        ModelV --> RateLimit{Rate Limiting}
-        RateLimit --> Proxy[Proxy to Upstream]
-    end
+**Components:**
 
-    subgraph "Upstream LLM Providers"
-        OpenAI[OpenAI]
-        Gemini[Google Gemini]
-        DeepSeek[DeepSeek]
-        Anthropic[Anthropic]
-    end
+| Component | Plane | Role |
+| :--- | :--- | :--- |
+| **Client App** | — | Sends requests to the AISIX Proxy API (port 3000) |
+| **AISIX Gateway** | Data Plane | Stateless Rust proxy that processes requests through a hook pipeline |
+| **etcd** | Control Plane | Stores API keys, models, and rate limit config; watched by the gateway for hot-reload |
+| **Admin API** | Control Plane | REST API for managing configuration in etcd (port 3001) |
+| **Admin UI** | Control Plane | Optional React dashboard and chat playground backed by the Admin API |
+| **Upstream Providers** | — | OpenAI, Google Gemini, DeepSeek, and Anthropic |
 
-    Proxy --> OpenAI
-    Proxy --> Gemini
-    Proxy --> DeepSeek
-    Proxy --> Anthropic
+**Request Flow (Data Plane):**
 
-    Etcd -.->|Watch Config| AISIX
-
-    style AISIX fill:#009639,stroke:#fff,color:#fff
-    style Etcd fill:#f96,stroke:#333,stroke-width:2px
+```text
+Client -> AISIX Gateway -> [Auth] -> [Model Validation] -> [Rate Limit] -> Upstream Provider
 ```
+
+**Config Flows (Control Plane):**
+
+```text
+# Manage configuration via Admin UI:
+Admin User -> Admin UI -> Admin API -> etcd <-- AISIX Gateway(watch etcd for changes)
+
+# Manage configuration via Admin API:
+Admin User ------------------------> Admin API -> etcd <-- AISIX Gateway(watch etcd for changes)
+```
+
+
 <br/>
 
 This decoupled design ensures that the Data Plane continues to operate with its last known configuration even if the Control Plane is temporarily unavailable, guaranteeing uninterrupted service.
