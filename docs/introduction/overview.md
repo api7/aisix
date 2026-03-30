@@ -33,6 +33,33 @@ Here is a diagram illustrating the basic architecture:
 
 <img src="../images//architecture_std.png" alt="AISIX Architecture Diagram" style="width:100%; max-width:800px; margin: 20px auto; display: block;" />
 
+**Components:**
+
+| Component | Plane | Role |
+| :--- | :--- | :--- |
+| **Client App** | — | Sends requests to the AISIX Proxy API (port 3000) |
+| **AISIX Gateway** | Data Plane | Stateless Rust proxy that processes requests through a hook pipeline |
+| **etcd** | Control Plane | Stores API keys, models, and rate limit config; watched by the gateway for hot-reload |
+| **Admin API** | Control Plane | REST API for managing configuration in etcd (port 3001) |
+| **Admin UI** | Control Plane | Optional React dashboard and chat playground backed by the Admin API |
+| **Upstream Providers** | — | OpenAI, Google Gemini, DeepSeek, and Anthropic |
+
+**Request Flow (Data Plane):**
+
+```text
+Client -> AISIX Gateway -> [Auth] -> [Model Validation] -> [Rate Limit] -> Upstream Provider
+```
+
+**Config Flows (Control Plane):**
+
+```text
+# Manage configuration via Admin UI:
+Admin User -> Admin UI -> Admin API -> etcd <-- AISIX Gateway(watch etcd for changes)
+
+# Manage configuration via Admin API:
+Admin User ------------------------> Admin API -> etcd <-- AISIX Gateway(watch etcd for changes)
+```
+
 
 <br/>
 
