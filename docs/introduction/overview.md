@@ -31,39 +31,9 @@ AISIX uses a decoupled architecture, separating the Control Plane (configuration
 
 Here is a diagram illustrating the basic architecture:
 
-```mermaid
-graph TD
-    subgraph "Management & Configuration (Control Plane)"
-        Admin[Admin User] --> AdminUI[Admin UI / Dashboard]
-        AdminUI --> AdminAPI[Admin API]
-        AdminAPI --> Etcd[(etcd)]
-    end
+<img src="../images//architecture_std.png" alt="AISIX Architecture Diagram" style="width:100%; max-width:800px; margin: 20px auto; display: block;" />
 
-    subgraph "Request Path (Data Plane)"
-        Client[Client App] --> AISIX[AISIX AI Gateway]
-        AISIX --> Auth{Authentication}
-        Auth --> ModelV{Model Validation}
-        ModelV --> RateLimit{Rate Limiting}
-        RateLimit --> Proxy[Proxy to Upstream]
-    end
 
-    subgraph "Upstream LLM Providers"
-        OpenAI[OpenAI]
-        Gemini[Google Gemini]
-        DeepSeek[DeepSeek]
-        Anthropic[Anthropic]
-    end
-
-    Proxy --> OpenAI
-    Proxy --> Gemini
-    Proxy --> DeepSeek
-    Proxy --> Anthropic
-
-    Etcd -.->|Watch Config| AISIX
-
-    style AISIX fill:#009639,stroke:#fff,color:#fff
-    style Etcd fill:#f96,stroke:#333,stroke-width:2px
-```
 <br/>
 
 This decoupled design ensures that the Data Plane continues to operate with its last known configuration even if the Control Plane is temporarily unavailable, guaranteeing uninterrupted service.
