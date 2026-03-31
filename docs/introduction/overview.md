@@ -31,7 +31,7 @@ AISIX uses a decoupled architecture, separating the Control Plane (configuration
 
 Here is a diagram illustrating the basic architecture:
 
-<img src="../images/architecture_std.svg" alt="AISIX Architecture Diagram" style={{width:'100%', maxWidth:'800px', margin:'20px auto', display:'block'}} />
+<img src="https://static.api7.ai/uploads/2026/03/31/JoOfEAtE_architecture_std.svg" alt="AISIX Architecture Diagram" style={{width:'100%', margin:'20px auto', display:'block'}} />
 
 **Components:**
 

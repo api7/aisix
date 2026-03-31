@@ -2,7 +2,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/api7/aisix/blob/main/LICENSE)
 
 <p align="center">
-  <img src="./docs/images/aisix_logo.svg" alt="AISIX AI Gateway" width="400" />
+  <img src="https://static.api7.ai/uploads/2026/03/31/3lPRxpKO_aisix_logo.svg" alt="AISIX AI Gateway" width="400" />
 </p>
 
 <p align="center">
@@ -64,7 +64,7 @@
 
 ## Architecture
 
-<a href="#architecture"><img src="docs/images/architecture_basic.svg" alt="AISIX Architecture" width="100%" /></a>
+<a href="#architecture"><img src="https://static.api7.ai/uploads/2026/03/31/vMurpFmX_architecture_basic.svg" alt="AISIX Architecture" width="100%" /></a>
 
 ---
 
