@@ -39,7 +39,8 @@ pub async fn chat_completions(
         .pre_call(&mut hook_ctx, &mut request, HOOK_FILTER_ALL)
         .await?;
 
-    let model = hook_ctx.get::<ResourceEntry<Model>>().cloned().unwrap(); //TODO: safe unwrap
+    let model = hook_ctx.get::<ResourceEntry<Model>>().cloned()
+        .expect("ValidateModelHook must insert Model into HookContext before chat_completions handler");
 
     let provider = create_provider(&model.provider_config);
     let timeout = model.timeout.map(Duration::from_millis);
