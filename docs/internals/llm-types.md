@@ -1,6 +1,6 @@
-# Gateway Types Deep Dive
+# LLM Types Deep Dive
 
-This document describes the Layer 1 type system for the gateway. It covers the wire models for the supported chat APIs plus the shared metadata and error types used by later bridge and provider code.
+This document describes the Layer 1 type system for the LLM subsystem. It covers the wire models for the supported chat APIs plus the shared metadata and error types used by later bridge and provider code.
 
 ## Namespace boundaries
 
@@ -67,7 +67,7 @@ The tests cover overwrite behavior, derived totals, and preservation of explicit
 
 ## GatewayError
 
-`gateway::error::GatewayError` is the common error surface for the gateway layer.
+`gateway::error::GatewayError` is the common error surface for the LLM subsystem.
 
 It separates four concerns:
 
@@ -79,6 +79,6 @@ It separates four concerns:
 Two helper methods make this usable from higher layers:
 
 - `is_retryable()` centralizes retry policy
-- `status_code()` maps gateway failures to proxy-facing HTTP status codes
+- `status_code()` maps failures to proxy-facing HTTP status codes
 
-This keeps the later Gateway and proxy code from duplicating provider error classification logic.
+This keeps the later LLM runtime and proxy code from duplicating provider error classification logic.
