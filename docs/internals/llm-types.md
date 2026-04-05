@@ -48,8 +48,8 @@ Its main differences from the hub format are:
 
 It currently has three buckets:
 
-- `anthropic_extras` for Anthropic-only request data
-- `responses_extras` for Responses-only state such as `previous_response_id`
+- `anthropic_messages_extras` for Anthropic Messages-specific request data
+- `openai_responses_extras` for OpenAI Responses-specific state such as `previous_response_id`
 - `passthrough` for arbitrary provider-specific values
 
 This lets future `to_hub()` implementations return a normalized hub request without losing format-specific data that must be restored later.

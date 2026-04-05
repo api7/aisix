@@ -17,6 +17,18 @@ use serde_json::Value;
 /// Responses API request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesApiRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_management: Option<Vec<ContextManagement>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<ConversationReference>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<String>>,
+
     pub model: String,
     pub input: ResponsesInput,
 
@@ -25,6 +37,9 @@ pub struct ResponsesApiRequest {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<u32>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
@@ -39,10 +54,40 @@ pub struct ResponsesApiRequest {
     pub tool_choice: Option<Value>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<ResponsePrompt>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningConfig>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safety_identifier: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<ResponsesStreamOptions>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<ResponseTextConfig>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u8>,
 
     /// Server-side state: chain to a previous response.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -52,7 +97,84 @@ pub struct ResponsesApiRequest {
     pub store: Option<bool>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub truncation: Option<String>,
+    pub truncation: Option<Truncation>,
+}
+
+/// Context management configuration for Responses requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextManagement {
+    pub r#type: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_threshold: Option<u32>,
+}
+
+/// Conversation reference for a Responses request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ConversationReference {
+    Id(String),
+    Descriptor { id: String },
+}
+
+/// Prompt template reference used by the Responses API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsePrompt {
+    pub id: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variables: Option<Value>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// Prompt cache retention policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PromptCacheRetention {
+    #[serde(rename = "in-memory")]
+    InMemory,
+    #[serde(rename = "24h")]
+    TwentyFourHours,
+}
+
+/// Reasoning controls for reasoning-capable models.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generate_summary: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+/// Streaming-specific configuration for the Responses API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesStreamOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_obfuscation: Option<bool>,
+}
+
+/// Text response configuration for the Responses API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseTextConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<Value>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<String>,
+}
+
+/// Truncation mode for the Responses API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Truncation {
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "disabled")]
+    Disabled,
 }
 
 /// Input to the Responses API — either a simple string or structured items.
@@ -96,6 +218,8 @@ pub enum ResponsesContentPart {
     InputImage {
         #[serde(skip_serializing_if = "Option::is_none")]
         image_url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
@@ -296,6 +420,75 @@ mod tests {
     }
 
     #[test]
+    fn request_with_current_openai_fields() {
+        let json = json!({
+            "background": true,
+            "context_management": [{"type": "compact", "compact_threshold": 4}],
+            "conversation": {"id": "conv_123"},
+            "include": [
+                "message.input_image.image_url",
+                "message.output_text.logprobs"
+            ],
+            "model": "gpt-5.4",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Describe this image"},
+                    {"type": "input_image", "file_id": "file_123", "detail": "high"}
+                ]
+            }],
+            "instructions": "Be brief",
+            "max_output_tokens": 256,
+            "max_tool_calls": 3,
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "parallel_tool_calls": true,
+            "prompt": {
+                "id": "pmpt_123",
+                "variables": {"topic": "weather"},
+                "version": "3"
+            },
+            "prompt_cache_key": "cache-key-1",
+            "prompt_cache_retention": "in-memory",
+            "reasoning": {
+                "effort": "medium",
+                "generate_summary": "auto"
+            },
+            "safety_identifier": "user_123",
+            "service_tier": "auto",
+            "stream": true,
+            "stream_options": {"include_obfuscation": true},
+            "metadata": {"trace_id": "abc"},
+            "text": {
+                "format": {"type": "json_schema"},
+                "verbosity": "low"
+            },
+            "top_logprobs": 5,
+            "store": true,
+            "truncation": "auto"
+        });
+
+        let req: ResponsesApiRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.background, Some(true));
+        assert_eq!(req.max_tool_calls, Some(3));
+        assert!(
+            matches!(req.conversation, Some(ConversationReference::Descriptor { ref id }) if id == "conv_123")
+        );
+        assert!(matches!(
+            req.prompt_cache_retention,
+            Some(PromptCacheRetention::InMemory)
+        ));
+        assert!(matches!(req.truncation, Some(Truncation::Auto)));
+        assert_eq!(req.top_logprobs, Some(5));
+
+        let serialized = serde_json::to_value(&req).unwrap();
+        assert_eq!(serialized["prompt_cache_retention"], "in-memory");
+        assert_eq!(serialized["truncation"], "auto");
+        assert_eq!(serialized["stream_options"]["include_obfuscation"], true);
+    }
+
+    #[test]
     fn request_items_input() {
         let json = json!({
             "model": "gpt-4.1",
@@ -482,6 +675,30 @@ mod tests {
             );
         } else {
             panic!("Expected Message with Parts");
+        }
+    }
+
+    #[test]
+    fn input_image_supports_file_id() {
+        let json = json!({
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_image", "file_id": "file_123", "detail": "high"}
+            ]
+        });
+
+        let item: ResponsesInputItem = serde_json::from_value(json).unwrap();
+        if let ResponsesInputItem::Message {
+            content: ResponsesContent::Parts(parts),
+            ..
+        } = item
+        {
+            assert!(
+                matches!(parts[0], ResponsesContentPart::InputImage { file_id: Some(ref file_id), .. } if file_id == "file_123")
+            );
+        } else {
+            panic!("Expected Message with image part");
         }
     }
 }

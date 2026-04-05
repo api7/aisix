@@ -5,7 +5,13 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::anthropic::CacheControl;
+use super::{
+    anthropic::CacheControl,
+    openai::responses::{
+        ContextManagement, ConversationReference, PromptCacheRetention, ReasoningConfig,
+        ResponsePrompt, ResponseTextConfig, ResponsesStreamOptions, Truncation,
+    },
+};
 
 /// Unified usage metrics across all modalities.
 ///
@@ -15,8 +21,11 @@ use super::anthropic::CacheControl;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Usage {
     // ── Text tokens ──
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u32>,
 
     // ── Multimodal tokens ──
@@ -38,8 +47,17 @@ impl Usage {
     /// Merge partial usage from another source (e.g., a streaming update).
     ///
     /// Non-None fields in `other` overwrite the corresponding fields in `self`.
-    /// After merging, `total_tokens` is auto-computed if not explicitly set.
+    /// If `total_tokens` was previously auto-derived, it is recomputed after
+    /// input or output token updates to avoid stale totals.
     pub fn merge(&mut self, other: &Usage) {
+        let previous_auto_total = match (self.input_tokens, self.output_tokens) {
+            (Some(input_tokens), Some(output_tokens)) => Some(input_tokens + output_tokens),
+            _ => None,
+        };
+        let had_explicit_total =
+            self.total_tokens.is_some() && self.total_tokens != previous_auto_total;
+        let token_counts_updated = other.input_tokens.is_some() || other.output_tokens.is_some();
+
         if other.input_tokens.is_some() {
             self.input_tokens = other.input_tokens;
         }
@@ -64,11 +82,16 @@ impl Usage {
         if other.cache_read_input_tokens.is_some() {
             self.cache_read_input_tokens = other.cache_read_input_tokens;
         }
-        // Auto-compute total if not explicitly set
-        if self.total_tokens.is_none()
-            && let (Some(i), Some(o)) = (self.input_tokens, self.output_tokens)
+
+        if other.total_tokens.is_some() {
+            return;
+        }
+
+        if (self.total_tokens.is_none() || (token_counts_updated && !had_explicit_total))
+            && let (Some(input_tokens), Some(output_tokens)) =
+                (self.input_tokens, self.output_tokens)
         {
-            self.total_tokens = Some(i + o);
+            self.total_tokens = Some(input_tokens + output_tokens);
         }
     }
 }
@@ -79,26 +102,41 @@ impl Usage {
 /// Populated during `ChatFormat::to_hub()`, consumed during `ChatFormat::from_hub()`.
 #[derive(Debug, Clone, Default)]
 pub struct BridgeContext {
-    pub anthropic_extras: Option<AnthropicExtras>,
-    pub responses_extras: Option<ResponsesExtras>,
+    pub anthropic_messages_extras: Option<AnthropicMessagesExtras>,
+    pub openai_responses_extras: Option<OpenAIResponsesExtras>,
     /// Catch-all for fields that don't map to any known extras.
     pub passthrough: HashMap<String, Value>,
 }
 
-/// Anthropic-specific fields preserved across hub bridging.
+/// Anthropic Messages-specific fields preserved across hub bridging.
 #[derive(Debug, Clone)]
-pub struct AnthropicExtras {
+pub struct AnthropicMessagesExtras {
     pub metadata: Option<Value>,
     pub system_cache_control: Option<CacheControl>,
 }
 
-/// Responses API-specific fields preserved across hub bridging.
+/// OpenAI Responses-specific fields preserved across hub bridging.
 #[derive(Debug, Clone)]
-pub struct ResponsesExtras {
+pub struct OpenAIResponsesExtras {
     pub previous_response_id: Option<String>,
     pub instructions: Option<String>,
     pub store: Option<bool>,
     pub metadata: Option<Value>,
+    pub background: Option<bool>,
+    pub context_management: Option<Vec<ContextManagement>>,
+    pub conversation: Option<ConversationReference>,
+    pub include: Option<Vec<String>>,
+    pub max_tool_calls: Option<u32>,
+    pub prompt: Option<ResponsePrompt>,
+    pub prompt_cache_key: Option<String>,
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
+    pub reasoning: Option<ReasoningConfig>,
+    pub safety_identifier: Option<String>,
+    pub service_tier: Option<String>,
+    pub stream_options: Option<ResponsesStreamOptions>,
+    pub text: Option<ResponseTextConfig>,
+    pub top_logprobs: Option<u8>,
+    pub truncation: Option<Truncation>,
 }
 
 #[cfg(test)]
@@ -165,5 +203,29 @@ mod tests {
         assert_eq!(deserialized.total_tokens, Some(300));
         assert_eq!(deserialized.cache_creation_input_tokens, Some(10));
         assert!(deserialized.image_tokens.is_none());
+    }
+
+    #[test]
+    fn usage_merge_recomputes_previous_derived_total() {
+        let mut base = Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            total_tokens: Some(30),
+            ..Default::default()
+        };
+
+        let update = Usage {
+            output_tokens: Some(50),
+            ..Default::default()
+        };
+
+        base.merge(&update);
+        assert_eq!(base.total_tokens, Some(60));
+    }
+
+    #[test]
+    fn usage_serde_skips_null_fields() {
+        let json = serde_json::to_value(Usage::default()).unwrap();
+        assert_eq!(json, serde_json::json!({}));
     }
 }
