@@ -6,7 +6,7 @@
 //!
 //! In the gateway, requests to `/v1/responses` are bridged to the hub
 //! (Chat Completions) format for cross-provider compatibility, with
-//! `NativeResponsesSupport` providing a bypass for providers that
+//! `NativeOpenAIResponsesSupport` providing a bypass for providers that
 //! natively support the Responses API (e.g., OpenAI).
 
 use serde::{Deserialize, Serialize};

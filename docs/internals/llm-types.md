@@ -1,4 +1,4 @@
-# LLM Types Deep Dive
+# LLM Type and Trait System
 
 This document describes the Layer 1 type system for the LLM subsystem. It covers the wire models for the supported chat APIs plus the shared metadata and error types used by later bridge and provider code.
 
@@ -82,3 +82,69 @@ Two helper methods make this usable from higher layers:
 - `status_code()` maps failures to proxy-facing HTTP status codes
 
 This keeps the later LLM runtime and proxy code from duplicating provider error classification logic.
+
+## Trait stack
+
+The type layer and the trait layer are tightly coupled, so they are documented together here.
+
+Two independent axes shape the design:
+
+- API format semantics such as OpenAI Chat, Anthropic Messages, and OpenAI Responses
+- provider-specific behavior such as endpoint shape, auth headers, request transforms, and native bypasses
+
+`ChatFormat` models the first axis. `ProviderMeta`, `ChatTransform`, and `ProviderCapabilities` model the second.
+
+### `ChatFormat`
+
+`ChatFormat` defines a complete external chat protocol:
+
+- request type
+- non-streaming response type
+- streaming chunk type
+- bridge rules to and from the hub format
+
+The hub format remains OpenAI Chat. Every format therefore explains how to:
+
+- convert its request into a hub request plus `BridgeContext`
+- convert a hub response back into its own response type
+- convert a hub stream into its own stream events
+
+The trait also includes a native escape hatch for providers that can serve the source format directly.
+
+### Explicit stream state
+
+Two stream-state associated types are explicit:
+
+- `BridgeState` for hub-to-format conversion
+- `NativeStreamState` for provider-native streaming conversion
+
+That keeps stream state typed and local to the format implementation instead of hiding it behind erased containers.
+
+### Provider layering
+
+The provider side is split into three layers.
+
+`ProviderMeta` contains stable metadata such as provider name, default base URL, endpoint path, stream reader kind, and auth header construction.
+
+`ChatTransform` contains hub-to-provider request and response mapping. Its default behavior is intentionally OpenAI-compatible: serialize the request, apply `CompatQuirks`, deserialize the response, and treat SSE `data:` lines as OpenAI-style chunks.
+
+`ProviderCapabilities` is capability discovery. It returns typed trait objects such as `as_native_anthropic_messages()` and `as_native_openai_responses()` instead of booleans, so a provider cannot claim support for a feature without also exposing the methods behind that feature.
+
+### Native support traits
+
+`NativeAnthropicMessagesSupport` and `NativeOpenAIResponsesSupport` are optional extensions layered on top of `ChatTransform`.
+
+`NativeHandler` is the small type-erased enum that carries those typed trait objects across format dispatch boundaries.
+
+### `CompatQuirks`
+
+`CompatQuirks` is the declarative escape hatch for OpenAI-compatible providers that are almost, but not exactly, compatible.
+
+The current implementation supports:
+
+- removing unsupported parameters
+- renaming request parameters
+- forcing `stream_options.include_usage` when a provider requires usage in streaming mode
+- recording provider-specific stream termination markers and tool-argument behavior
+
+This keeps provider-specific compatibility patches out of custom transform implementations unless the provider genuinely needs bespoke logic.
