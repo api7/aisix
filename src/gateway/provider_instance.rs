@@ -25,6 +25,17 @@ impl fmt::Debug for ProviderAuth {
     }
 }
 
+impl ProviderAuth {
+    pub fn api_key(&self) -> Result<&str> {
+        match self {
+            Self::ApiKey(api_key) => Ok(api_key),
+            Self::None => Err(GatewayError::Validation(
+                "provider requires api key authentication".into(),
+            )),
+        }
+    }
+}
+
 /// Runtime provider configuration: definition, auth, and deployment overrides.
 #[derive(Clone)]
 pub struct ProviderInstance {
@@ -205,6 +216,21 @@ mod tests {
             "ApiKey(REDACTED)"
         );
         assert_eq!(format!("{:?}", ProviderAuth::None), "None");
+    }
+
+    #[test]
+    fn provider_auth_api_key_requires_api_key_variant() {
+        assert_eq!(
+            ProviderAuth::ApiKey("sk-secret".into()).api_key().unwrap(),
+            "sk-secret"
+        );
+
+        let error = ProviderAuth::None.api_key().unwrap_err();
+        assert!(matches!(
+            error,
+            GatewayError::Validation(message)
+                if message.contains("api key authentication")
+        ));
     }
 
     #[test]
