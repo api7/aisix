@@ -3,7 +3,7 @@
 //! These types represent Anthropic's native `/v1/messages` API format.
 //! They are used both for:
 //! - **Inbound** requests to the gateway's `/v1/messages` endpoint (as a `ChatFormat`)
-//! - **Native** Anthropic provider communication (via `NativeAnthropicSupport`)
+//! - **Native** Anthropic provider communication (via `NativeAnthropicMessagesSupport`)
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
