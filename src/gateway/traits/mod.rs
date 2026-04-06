@@ -8,6 +8,8 @@ pub use native::{
     NativeOpenAIResponsesSupport, OpenAIResponsesNativeStreamState,
 };
 pub use provider::{
-    ChatTransform, CompatQuirks, EmbedTransform, ImageGenTransform, ProviderAuth,
-    ProviderCapabilities, ProviderMeta, StreamReaderKind, SttTransform, TtsTransform,
+    ChatTransform, CompatQuirks, EmbedTransform, ImageGenTransform, ProviderCapabilities,
+    ProviderMeta, StreamReaderKind, SttTransform, TtsTransform,
 };
+
+pub use crate::gateway::provider_instance::ProviderAuth;
