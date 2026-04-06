@@ -25,6 +25,26 @@ impl fmt::Debug for ProviderAuth {
     }
 }
 
+impl ProviderAuth {
+    pub fn api_key(&self) -> Result<&str> {
+        match self {
+            Self::ApiKey(api_key) => Ok(api_key),
+            Self::None => Err(GatewayError::Validation(
+                "missing ProviderAuth::ApiKey value".into(),
+            )),
+        }
+    }
+
+    pub fn api_key_for(&self, provider: &str) -> Result<&str> {
+        self.api_key().map_err(|error| match error {
+            GatewayError::Validation(message) => {
+                GatewayError::Validation(format!("provider {}: {}", provider, message))
+            }
+            other => other,
+        })
+    }
+}
+
 /// Runtime provider configuration: definition, auth, and deployment overrides.
 #[derive(Clone)]
 pub struct ProviderInstance {
@@ -205,6 +225,33 @@ mod tests {
             "ApiKey(REDACTED)"
         );
         assert_eq!(format!("{:?}", ProviderAuth::None), "None");
+    }
+
+    #[test]
+    fn provider_auth_api_key_requires_api_key_variant() {
+        assert_eq!(
+            ProviderAuth::ApiKey("sk-secret".into()).api_key().unwrap(),
+            "sk-secret"
+        );
+
+        let error = ProviderAuth::None.api_key().unwrap_err();
+        assert!(matches!(
+            error,
+            GatewayError::Validation(message)
+                if message.contains("ProviderAuth::ApiKey")
+        ));
+    }
+
+    #[test]
+    fn provider_auth_api_key_for_adds_provider_context() {
+        let error = ProviderAuth::None.api_key_for("deepseek").unwrap_err();
+
+        assert!(matches!(
+            error,
+            GatewayError::Validation(message)
+                if message.contains("deepseek")
+                    && message.contains("ProviderAuth::ApiKey")
+        ));
     }
 
     #[test]

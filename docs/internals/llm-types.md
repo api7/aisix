@@ -134,6 +134,10 @@ The provider side is split into three layers.
 
 `ProviderCapabilities` is capability discovery. It returns typed trait objects such as `as_native_anthropic_messages()` and `as_native_openai_responses()` instead of booleans, so a provider cannot claim support for a feature without also exposing the methods behind that feature.
 
+For OpenAI-compatible providers, the concrete definition can stay very small. The `provider!()` macro generates `ProviderMeta`, a default `ChatTransform`, and an empty `ProviderCapabilities` implementation from a declarative block of base URL, auth shape, stream reader kind, and compatibility quirks.
+
+`OpenAIDef` remains hand-written because it needs its own default quirk profile, while `DeepSeek` is the first macro-generated provider in the new stack.
+
 ### Runtime provider instances
 
 `ProviderInstance` binds a shared provider definition to runtime auth, base URL overrides, and custom headers.
