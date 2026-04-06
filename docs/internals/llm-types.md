@@ -111,6 +111,8 @@ The hub format remains OpenAI Chat. Every format therefore explains how to:
 
 The trait also includes a native escape hatch for providers that can serve the source format directly.
 
+`OpenAIChatFormat` is the identity implementation of that contract: hub requests, responses, and streamed chunks pass through unchanged, and the format exposes no native bypass because OpenAI Chat is already the hub representation.
+
 ### Explicit stream state
 
 Two stream-state associated types are explicit:
