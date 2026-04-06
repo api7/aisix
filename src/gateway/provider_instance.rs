@@ -3,7 +3,10 @@ use std::{collections::HashMap, fmt, sync::Arc};
 use http::HeaderMap;
 use reqwest::Url;
 
-use crate::gateway::{error::Result, traits::ProviderCapabilities};
+use crate::gateway::{
+    error::{GatewayError, Result},
+    traits::ProviderCapabilities,
+};
 
 /// Authentication material bound to a provider instance at runtime.
 #[derive(Clone, Default)]
@@ -32,18 +35,24 @@ pub struct ProviderInstance {
 }
 
 impl ProviderInstance {
-    pub fn effective_base_url(&self) -> Url {
-        self.base_url_override.clone().unwrap_or_else(|| {
-            self.def
-                .default_base_url()
-                .parse()
-                .expect("provider default_base_url must be a valid URL")
+    pub fn effective_base_url(&self) -> Result<Url> {
+        if let Some(base_url) = &self.base_url_override {
+            return Ok(base_url.clone());
+        }
+
+        self.def.default_base_url().parse().map_err(|error| {
+            GatewayError::Validation(format!(
+                "provider {} has invalid default_base_url {}: {}",
+                self.def.name(),
+                self.def.default_base_url(),
+                error
+            ))
         })
     }
 
-    pub fn build_url(&self, model: &str) -> String {
-        let base_url = self.effective_base_url();
-        self.def.build_url(base_url.as_str(), model)
+    pub fn build_url(&self, model: &str) -> Result<String> {
+        let base_url = self.effective_base_url()?;
+        Ok(self.def.build_url(base_url.as_str(), model))
     }
 
     pub fn build_headers(&self) -> Result<HeaderMap> {
@@ -75,9 +84,16 @@ pub struct ProviderRegistryBuilder {
 }
 
 impl ProviderRegistryBuilder {
-    pub fn register<P: ProviderCapabilities + 'static>(mut self, provider: P) -> Self {
+    pub fn register<P: ProviderCapabilities + 'static>(mut self, provider: P) -> Result<Self> {
+        if self.defs.contains_key(provider.name()) {
+            return Err(GatewayError::Validation(format!(
+                "provider {} is already registered",
+                provider.name()
+            )));
+        }
+
         self.defs.insert(provider.name(), Arc::new(provider));
-        self
+        Ok(self)
     }
 
     pub fn build(self) -> ProviderRegistry {
@@ -101,6 +117,10 @@ mod tests {
     };
 
     struct DummyProvider;
+
+    struct InvalidUrlProvider;
+
+    struct DuplicateDummyProvider;
 
     impl ProviderMeta for DummyProvider {
         fn name(&self) -> &'static str {
@@ -134,6 +154,50 @@ mod tests {
 
     impl ProviderCapabilities for DummyProvider {}
 
+    impl ProviderMeta for InvalidUrlProvider {
+        fn name(&self) -> &'static str {
+            "invalid-url"
+        }
+
+        fn default_base_url(&self) -> &'static str {
+            "not a url"
+        }
+
+        fn stream_reader_kind(&self) -> StreamReaderKind {
+            StreamReaderKind::Sse
+        }
+
+        fn build_auth_headers(&self, _auth: &ProviderAuth) -> Result<HeaderMap> {
+            Ok(HeaderMap::new())
+        }
+    }
+
+    impl ChatTransform for InvalidUrlProvider {}
+
+    impl ProviderCapabilities for InvalidUrlProvider {}
+
+    impl ProviderMeta for DuplicateDummyProvider {
+        fn name(&self) -> &'static str {
+            "dummy"
+        }
+
+        fn default_base_url(&self) -> &'static str {
+            "https://duplicate.example.com"
+        }
+
+        fn stream_reader_kind(&self) -> StreamReaderKind {
+            StreamReaderKind::Sse
+        }
+
+        fn build_auth_headers(&self, _auth: &ProviderAuth) -> Result<HeaderMap> {
+            Ok(HeaderMap::new())
+        }
+    }
+
+    impl ChatTransform for DuplicateDummyProvider {}
+
+    impl ProviderCapabilities for DuplicateDummyProvider {}
+
     #[test]
     fn provider_auth_debug_redacts_api_key() {
         assert_eq!(
@@ -153,9 +217,28 @@ mod tests {
         };
 
         assert_eq!(
-            instance.build_url("demo-model"),
+            instance.build_url("demo-model").unwrap(),
             "https://api.example.com/v1/models/demo-model/chat"
         );
+    }
+
+    #[test]
+    fn provider_instance_invalid_default_base_url_returns_validation_error() {
+        let instance = ProviderInstance {
+            def: Arc::new(InvalidUrlProvider),
+            auth: ProviderAuth::None,
+            base_url_override: None,
+            custom_headers: HeaderMap::new(),
+        };
+
+        let error = instance.effective_base_url().unwrap_err();
+
+        assert!(matches!(
+            error,
+            GatewayError::Validation(message)
+                if message.contains("invalid-url")
+                    && message.contains("default_base_url")
+        ));
     }
 
     #[test]
@@ -180,10 +263,30 @@ mod tests {
 
     #[test]
     fn provider_registry_registers_and_looks_up_definitions() {
-        let registry = ProviderRegistry::builder().register(DummyProvider).build();
+        let registry = ProviderRegistry::builder()
+            .register(DummyProvider)
+            .unwrap()
+            .build();
 
         let provider = registry.get("dummy").unwrap();
         assert_eq!(provider.name(), "dummy");
         assert!(registry.get("missing").is_none());
+    }
+
+    #[test]
+    fn provider_registry_rejects_duplicate_names() {
+        let error = ProviderRegistry::builder()
+            .register(DummyProvider)
+            .unwrap()
+            .register(DuplicateDummyProvider)
+            .err()
+            .unwrap();
+
+        assert!(matches!(
+            error,
+            GatewayError::Validation(message)
+                if message.contains("dummy")
+                    && message.contains("already registered")
+        ));
     }
 }

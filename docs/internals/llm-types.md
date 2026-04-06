@@ -136,7 +136,11 @@ The provider side is split into three layers.
 
 `ProviderInstance` binds a shared provider definition to runtime auth, base URL overrides, and custom headers.
 
+It validates provider default base URLs when no override is supplied, so bad provider metadata surfaces as a normal validation error instead of a process crash.
+
 `ProviderRegistry` stores immutable `Arc<dyn ProviderCapabilities>` definitions so higher layers can resolve a provider by name and cheaply clone the shared definition into request-scoped runtime instances.
+
+The registry builder rejects duplicate provider names up front, which keeps later registration mistakes from silently shadowing an earlier definition.
 
 ### Native support traits
 
