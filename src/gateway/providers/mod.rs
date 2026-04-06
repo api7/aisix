@@ -1,7 +1,9 @@
+pub mod anthropic;
 pub mod deepseek;
 pub mod macros;
 pub mod openai;
 
+pub use anthropic::AnthropicDef;
 pub use deepseek::DeepSeek;
 pub use openai::OpenAIDef;
 
@@ -10,6 +12,7 @@ use crate::gateway::{error::Result, provider_instance::ProviderRegistry};
 pub fn default_provider_registry() -> Result<ProviderRegistry> {
     let builder = ProviderRegistry::builder()
         .register(OpenAIDef)?
+        .register(AnthropicDef)?
         .register(DeepSeek)?;
     Ok(builder.build())
 }
@@ -23,6 +26,7 @@ mod tests {
         let registry = default_provider_registry().unwrap();
 
         assert_eq!(registry.get("openai").unwrap().name(), "openai");
+        assert_eq!(registry.get("anthropic").unwrap().name(), "anthropic");
         assert_eq!(registry.get("deepseek").unwrap().name(), "deepseek");
         assert!(registry.get("missing").is_none());
     }

@@ -123,6 +123,9 @@ pub type ToolCallAccumulatorKey = (u32, usize);
 pub struct ChatStreamState {
     pub chunk_index: usize,
     pub tool_call_accumulators: HashMap<ToolCallAccumulatorKey, ToolCallAccumulator>,
+    pub response_id: Option<String>,
+    pub response_model: Option<String>,
+    pub response_created: Option<u64>,
     pub input_tokens: u32,
     pub output_tokens: u32,
 }
