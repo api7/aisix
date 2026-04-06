@@ -115,11 +115,14 @@ pub struct ToolCallAccumulator {
     pub arguments: String,
 }
 
+/// Key for partially assembled tool calls: (choice_index, tool_call_index).
+pub type ToolCallAccumulatorKey = (u32, usize);
+
 /// Stateful data used while transforming provider chunks into hub chunks.
 #[derive(Debug, Clone, Default)]
 pub struct ChatStreamState {
     pub chunk_index: usize,
-    pub tool_call_accumulators: HashMap<usize, ToolCallAccumulator>,
+    pub tool_call_accumulators: HashMap<ToolCallAccumulatorKey, ToolCallAccumulator>,
     pub input_tokens: u32,
     pub output_tokens: u32,
 }
@@ -131,7 +134,7 @@ mod tests {
     use http::HeaderMap;
     use serde_json::json;
 
-    use super::ChatFormat;
+    use super::{ChatFormat, ChatStreamState, ToolCallAccumulator};
     use crate::gateway::{
         error::GatewayError,
         traits::{
@@ -280,5 +283,34 @@ mod tests {
             if message.contains("parse_native_response called on a non-native format")
                 && message.contains("dummy-native-provider")
         ));
+    }
+
+    #[test]
+    fn stream_state_separates_tool_call_accumulators_by_choice_and_index() {
+        let mut state = ChatStreamState::default();
+        state.tool_call_accumulators.insert(
+            (0, 0),
+            ToolCallAccumulator {
+                arguments: "first".into(),
+                ..Default::default()
+            },
+        );
+        state.tool_call_accumulators.insert(
+            (1, 0),
+            ToolCallAccumulator {
+                arguments: "second".into(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(state.tool_call_accumulators.len(), 2);
+        assert_eq!(
+            state.tool_call_accumulators.get(&(0, 0)).unwrap().arguments,
+            "first"
+        );
+        assert_eq!(
+            state.tool_call_accumulators.get(&(1, 0)).unwrap().arguments,
+            "second"
+        );
     }
 }

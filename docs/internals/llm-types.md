@@ -120,6 +120,8 @@ Two stream-state associated types are explicit:
 
 That keeps stream state typed and local to the format implementation instead of hiding it behind erased containers.
 
+Hub stream state also keeps partially assembled tool calls keyed by `(choice_index, tool_call_index)`, because tool call indices are scoped to a streamed choice rather than globally unique across the whole chunk stream.
+
 ### Provider layering
 
 The provider side is split into three layers.
