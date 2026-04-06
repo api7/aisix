@@ -52,3 +52,13 @@ pub enum NativeHandler<'a> {
     AnthropicMessages(&'a dyn NativeAnthropicMessagesSupport),
     OpenAIResponses(&'a dyn NativeOpenAIResponsesSupport),
 }
+
+impl NativeHandler<'_> {
+    /// Returns the provider name behind this native handler.
+    pub fn provider_name(&self) -> &'static str {
+        match self {
+            Self::AnthropicMessages(handler) => handler.name(),
+            Self::OpenAIResponses(handler) => handler.name(),
+        }
+    }
+}

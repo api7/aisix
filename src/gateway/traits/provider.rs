@@ -70,12 +70,34 @@ pub trait ChatTransform: ProviderMeta {
         _state: &mut ChatStreamState,
     ) -> Result<Vec<ChatCompletionChunk>> {
         let quirks = self.default_quirks();
-        if raw.trim().is_empty() || raw.starts_with(quirks.stream_done_signal) {
+        let trimmed = raw.trim();
+        let done_signal = quirks.stream_done_signal.trim();
+        let normalized_done_signal = done_signal
+            .strip_prefix("data:")
+            .map(str::trim_start)
+            .unwrap_or(done_signal);
+
+        if trimmed.is_empty()
+            || trimmed == done_signal
+            || trimmed == normalized_done_signal
+            || trimmed.starts_with(':')
+            || trimmed.starts_with("event:")
+            || trimmed.starts_with("id:")
+            || trimmed.starts_with("retry:")
+        {
             return Ok(vec![]);
         }
 
-        let line = raw.strip_prefix("data: ").unwrap_or(raw);
-        let chunk = serde_json::from_str(line)
+        let Some(line) = trimmed.strip_prefix("data:") else {
+            return Ok(vec![]);
+        };
+
+        let payload = line.trim_start();
+        if payload.is_empty() || payload == done_signal || payload == normalized_done_signal {
+            return Ok(vec![]);
+        }
+
+        let chunk = serde_json::from_str(payload)
             .map_err(|error| GatewayError::Transform(error.to_string()))?;
         Ok(vec![chunk])
     }
@@ -179,9 +201,36 @@ pub trait ImageGenTransform: Send + Sync + 'static {}
 
 #[cfg(test)]
 mod tests {
+    use http::HeaderMap;
     use serde_json::json;
 
-    use super::CompatQuirks;
+    use super::{ChatTransform, CompatQuirks, ProviderAuth, ProviderMeta, StreamReaderKind};
+    use crate::gateway::traits::chat_format::ChatStreamState;
+
+    struct DummyProvider;
+
+    impl ProviderMeta for DummyProvider {
+        fn name(&self) -> &'static str {
+            "dummy"
+        }
+
+        fn default_base_url(&self) -> &'static str {
+            "https://example.com"
+        }
+
+        fn stream_reader_kind(&self) -> StreamReaderKind {
+            StreamReaderKind::Sse
+        }
+
+        fn build_auth_headers(
+            &self,
+            _auth: &ProviderAuth,
+        ) -> crate::gateway::error::Result<HeaderMap> {
+            Ok(HeaderMap::new())
+        }
+    }
+
+    impl ChatTransform for DummyProvider {}
 
     #[test]
     fn apply_to_request_removes_and_renames_fields() {
@@ -231,5 +280,85 @@ mod tests {
         quirks.apply_to_request(&mut body);
 
         assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn transform_stream_chunk_ignores_sse_control_lines() {
+        let provider = DummyProvider;
+        let mut state = ChatStreamState::default();
+
+        assert!(
+            provider
+                .transform_stream_chunk(": keep-alive", &mut state)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            provider
+                .transform_stream_chunk("event: message", &mut state)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            provider
+                .transform_stream_chunk("id: 123", &mut state)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            provider
+                .transform_stream_chunk("retry: 5000", &mut state)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            provider
+                .transform_stream_chunk("not-an-sse-payload", &mut state)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn transform_stream_chunk_ignores_done_signals() {
+        let provider = DummyProvider;
+        let mut state = ChatStreamState::default();
+
+        assert!(
+            provider
+                .transform_stream_chunk("data: [DONE]", &mut state)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            provider
+                .transform_stream_chunk("[DONE]", &mut state)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn transform_stream_chunk_parses_only_data_payload() {
+        let provider = DummyProvider;
+        let mut state = ChatStreamState::default();
+        let payload = json!({
+            "id": "chatcmpl-123",
+            "object": "chat.completion.chunk",
+            "created": 1677652288,
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "Hello"}
+            }]
+        });
+
+        let chunks = provider
+            .transform_stream_chunk(&format!("data: {}", payload), &mut state)
+            .unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].id, "chatcmpl-123");
+        assert_eq!(chunks[0].choices[0].delta.content.as_deref(), Some("Hello"));
     }
 }

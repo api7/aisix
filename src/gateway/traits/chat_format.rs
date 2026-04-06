@@ -74,7 +74,7 @@ pub trait ChatFormat: Send + Sync + 'static {
     {
         let _ = (native, request, stream);
         Err(GatewayError::NativeNotSupported {
-            provider: "unknown".into(),
+            provider: native.provider_name().into(),
         })
     }
 
@@ -91,7 +91,10 @@ pub trait ChatFormat: Send + Sync + 'static {
         Self: Sized,
     {
         let _ = (native, body);
-        unreachable!("parse_native_response called on a non-native format")
+        Err(GatewayError::Bridge(format!(
+            "parse_native_response called on a non-native format for provider {}",
+            native.provider_name()
+        )))
     }
 
     /// Serialize a chunk into the JSON payload used by SSE framing.
@@ -119,4 +122,163 @@ pub struct ChatStreamState {
     pub tool_call_accumulators: HashMap<usize, ToolCallAccumulator>,
     pub input_tokens: u32,
     pub output_tokens: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use http::HeaderMap;
+    use serde_json::json;
+
+    use super::ChatFormat;
+    use crate::gateway::{
+        error::GatewayError,
+        traits::{
+            NativeHandler, NativeOpenAIResponsesSupport, ProviderAuth, ProviderMeta,
+            StreamReaderKind, provider::ChatTransform,
+        },
+        types::{
+            common::BridgeContext,
+            openai::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
+        },
+    };
+
+    struct DummyNativeProvider;
+
+    impl ProviderMeta for DummyNativeProvider {
+        fn name(&self) -> &'static str {
+            "dummy-native-provider"
+        }
+
+        fn default_base_url(&self) -> &'static str {
+            "https://example.com"
+        }
+
+        fn stream_reader_kind(&self) -> StreamReaderKind {
+            StreamReaderKind::Sse
+        }
+
+        fn build_auth_headers(
+            &self,
+            _auth: &ProviderAuth,
+        ) -> crate::gateway::error::Result<HeaderMap> {
+            Ok(HeaderMap::new())
+        }
+    }
+
+    impl ChatTransform for DummyNativeProvider {}
+
+    impl NativeOpenAIResponsesSupport for DummyNativeProvider {
+        fn native_openai_responses_endpoint(&self, _model: &str) -> Cow<'static, str> {
+            Cow::Borrowed("/v1/responses")
+        }
+
+        fn transform_openai_responses_request(
+            &self,
+            _req: &crate::gateway::types::openai::responses::ResponsesApiRequest,
+        ) -> crate::gateway::error::Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+
+        fn transform_openai_responses_response(
+            &self,
+            _body: serde_json::Value,
+        ) -> crate::gateway::error::Result<
+            crate::gateway::types::openai::responses::ResponsesApiResponse,
+        > {
+            unreachable!("not used in this test")
+        }
+
+        fn transform_openai_responses_stream_chunk(
+            &self,
+            _raw: &str,
+            _state: &mut crate::gateway::traits::OpenAIResponsesNativeStreamState,
+        ) -> crate::gateway::error::Result<
+            Vec<crate::gateway::types::openai::responses::ResponsesApiStreamEvent>,
+        > {
+            Ok(vec![])
+        }
+    }
+
+    struct DummyFormat;
+
+    impl ChatFormat for DummyFormat {
+        type Request = serde_json::Value;
+        type Response = serde_json::Value;
+        type StreamChunk = serde_json::Value;
+        type BridgeState = ();
+        type NativeStreamState = ();
+
+        fn name() -> &'static str {
+            "dummy"
+        }
+
+        fn is_stream(_req: &Self::Request) -> bool {
+            false
+        }
+
+        fn extract_model(_req: &Self::Request) -> &str {
+            "dummy-model"
+        }
+
+        fn to_hub(
+            _req: &Self::Request,
+        ) -> crate::gateway::error::Result<(ChatCompletionRequest, BridgeContext)> {
+            unreachable!("not used in this test")
+        }
+
+        fn from_hub(
+            _resp: &ChatCompletionResponse,
+            _ctx: &BridgeContext,
+        ) -> crate::gateway::error::Result<Self::Response> {
+            unreachable!("not used in this test")
+        }
+
+        fn from_hub_stream(
+            _chunk: &ChatCompletionChunk,
+            _state: &mut Self::BridgeState,
+            _ctx: &BridgeContext,
+        ) -> crate::gateway::error::Result<Vec<Self::StreamChunk>> {
+            Ok(vec![])
+        }
+
+        fn transform_native_stream_chunk(
+            _provider: &dyn crate::gateway::traits::ProviderCapabilities,
+            _raw: &str,
+            _state: &mut Self::NativeStreamState,
+        ) -> crate::gateway::error::Result<Vec<Self::StreamChunk>> {
+            Ok(vec![])
+        }
+
+        fn serialize_chunk_payload(chunk: &Self::StreamChunk) -> String {
+            serde_json::to_string(chunk).unwrap()
+        }
+    }
+
+    #[test]
+    fn default_call_native_uses_provider_name() {
+        let provider = DummyNativeProvider;
+        let native = NativeHandler::OpenAIResponses(&provider);
+
+        let error = DummyFormat::call_native(&native, &json!({}), false).unwrap_err();
+        assert!(matches!(
+            error,
+            GatewayError::NativeNotSupported { provider } if provider == "dummy-native-provider"
+        ));
+    }
+
+    #[test]
+    fn default_parse_native_response_returns_bridge_error() {
+        let provider = DummyNativeProvider;
+        let native = NativeHandler::OpenAIResponses(&provider);
+
+        let error = DummyFormat::parse_native_response(&native, json!({})).unwrap_err();
+        assert!(matches!(
+            error,
+            GatewayError::Bridge(message)
+            if message.contains("parse_native_response called on a non-native format")
+                && message.contains("dummy-native-provider")
+        ));
+    }
 }
