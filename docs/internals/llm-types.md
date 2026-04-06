@@ -124,6 +124,8 @@ That keeps stream state typed and local to the format implementation instead of 
 
 Hub stream state also keeps partially assembled tool calls keyed by `(choice_index, tool_call_index)`, because tool call indices are scoped to a streamed choice rather than globally unique across the whole chunk stream.
 
+The same stream state also carries response metadata such as streamed `id`, `model`, and `created` values so provider-specific SSE adapters can emit well-formed hub chunks even when later provider events omit that metadata.
+
 ### Provider layering
 
 The provider side is split into three layers.
@@ -137,6 +139,8 @@ The provider side is split into three layers.
 For OpenAI-compatible providers, the concrete definition can stay very small. The `provider!()` macro generates `ProviderMeta`, a default `ChatTransform`, and an empty `ProviderCapabilities` implementation from a declarative block of base URL, auth shape, stream reader kind, and compatibility quirks.
 
 `OpenAIDef` remains hand-written because it needs its own default quirk profile, while `DeepSeek` is the first macro-generated provider in the new stack.
+
+`AnthropicDef` is the first hand-written non-OpenAI-compatible provider in the new stack. It combines a custom `ChatTransform` with `NativeAnthropicMessagesSupport` so Anthropic Messages requests can bypass the hub format when the caller already speaks the native protocol.
 
 ### Runtime provider instances
 
