@@ -132,6 +132,12 @@ The provider side is split into three layers.
 
 `ProviderCapabilities` is capability discovery. It returns typed trait objects such as `as_native_anthropic_messages()` and `as_native_openai_responses()` instead of booleans, so a provider cannot claim support for a feature without also exposing the methods behind that feature.
 
+### Runtime provider instances
+
+`ProviderInstance` binds a shared provider definition to runtime auth, base URL overrides, and custom headers.
+
+`ProviderRegistry` stores immutable `Arc<dyn ProviderCapabilities>` definitions so higher layers can resolve a provider by name and cheaply clone the shared definition into request-scoped runtime instances.
+
 ### Native support traits
 
 `NativeAnthropicMessagesSupport` and `NativeOpenAIResponsesSupport` are optional extensions layered on top of `ChatTransform`.

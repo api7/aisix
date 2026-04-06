@@ -1,33 +1,17 @@
-use std::{borrow::Cow, fmt};
+use std::borrow::Cow;
 
 use http::HeaderMap;
 use serde_json::{Map, Value};
 
 use crate::gateway::{
     error::{GatewayError, Result},
+    provider_instance::ProviderAuth,
     traits::{
         chat_format::ChatStreamState,
         native::{NativeAnthropicMessagesSupport, NativeOpenAIResponsesSupport},
     },
     types::openai::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
 };
-
-/// Authentication material used by provider definitions.
-#[derive(Clone, Default)]
-pub enum ProviderAuth {
-    ApiKey(String),
-    #[default]
-    None,
-}
-
-impl fmt::Debug for ProviderAuth {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ApiKey(_) => f.write_str("ApiKey(REDACTED)"),
-            Self::None => f.write_str("None"),
-        }
-    }
-}
 
 /// Provider metadata with no data transformation logic.
 pub trait ProviderMeta: Send + Sync + 'static {
@@ -215,8 +199,8 @@ mod tests {
     use http::HeaderMap;
     use serde_json::json;
 
-    use super::{ChatTransform, CompatQuirks, ProviderAuth, ProviderMeta, StreamReaderKind};
-    use crate::gateway::traits::chat_format::ChatStreamState;
+    use super::{ChatTransform, CompatQuirks, ProviderMeta, StreamReaderKind};
+    use crate::gateway::{provider_instance::ProviderAuth, traits::chat_format::ChatStreamState};
 
     struct DummyProvider;
 
@@ -242,15 +226,6 @@ mod tests {
     }
 
     impl ChatTransform for DummyProvider {}
-
-    #[test]
-    fn provider_auth_debug_redacts_api_key() {
-        assert_eq!(
-            format!("{:?}", ProviderAuth::ApiKey("sk-secret".into())),
-            "ApiKey(REDACTED)"
-        );
-        assert_eq!(format!("{:?}", ProviderAuth::None), "None");
-    }
 
     #[test]
     fn apply_to_request_removes_and_renames_fields() {
