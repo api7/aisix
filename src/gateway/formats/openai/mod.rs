@@ -52,13 +52,13 @@ impl ChatFormat for OpenAIChatFormat {
     }
 
     fn transform_native_stream_chunk(
-        _provider: &dyn ProviderCapabilities,
+        provider: &dyn ProviderCapabilities,
         _raw: &str,
         _state: &mut Self::NativeStreamState,
     ) -> Result<Vec<Self::StreamChunk>> {
-        Err(GatewayError::Bridge(
-            "OpenAIChatFormat has no native stream path".into(),
-        ))
+        Err(GatewayError::NativeNotSupported {
+            provider: provider.name().into(),
+        })
     }
 
     fn serialize_chunk_payload(chunk: &Self::StreamChunk) -> String {
@@ -219,14 +219,14 @@ mod tests {
     }
 
     #[test]
-    fn native_stream_path_returns_bridge_error() {
+    fn native_stream_path_returns_native_not_supported_error() {
         let provider = DummyProvider;
         let error = OpenAIChatFormat::transform_native_stream_chunk(&provider, "data: {}", &mut ())
             .unwrap_err();
 
         assert!(matches!(
             error,
-            GatewayError::Bridge(message) if message.contains("no native stream path")
+            GatewayError::NativeNotSupported { provider } if provider == "dummy"
         ));
         assert!(OpenAIChatFormat::native_support(&provider).is_none());
     }
