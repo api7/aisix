@@ -72,7 +72,7 @@ pub trait ChatFormat: Send + Sync + 'static {
     where
         Self: Sized,
     {
-        let _ = (native, request, stream);
+        let _ = (request, stream);
         Err(GatewayError::NativeNotSupported {
             provider: native.provider_name().into(),
         })
@@ -90,7 +90,7 @@ pub trait ChatFormat: Send + Sync + 'static {
     where
         Self: Sized,
     {
-        let _ = (native, body);
+        let _ = body;
         Err(GatewayError::Bridge(format!(
             "parse_native_response called on a non-native format for provider {}",
             native.provider_name()
