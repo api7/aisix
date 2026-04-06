@@ -30,9 +30,18 @@ impl ProviderAuth {
         match self {
             Self::ApiKey(api_key) => Ok(api_key),
             Self::None => Err(GatewayError::Validation(
-                "provider requires api key authentication".into(),
+                "missing ProviderAuth::ApiKey value".into(),
             )),
         }
+    }
+
+    pub fn api_key_for(&self, provider: &str) -> Result<&str> {
+        self.api_key().map_err(|error| match error {
+            GatewayError::Validation(message) => {
+                GatewayError::Validation(format!("provider {}: {}", provider, message))
+            }
+            other => other,
+        })
     }
 }
 
@@ -229,7 +238,19 @@ mod tests {
         assert!(matches!(
             error,
             GatewayError::Validation(message)
-                if message.contains("api key authentication")
+                if message.contains("ProviderAuth::ApiKey")
+        ));
+    }
+
+    #[test]
+    fn provider_auth_api_key_for_adds_provider_context() {
+        let error = ProviderAuth::None.api_key_for("deepseek").unwrap_err();
+
+        assert!(matches!(
+            error,
+            GatewayError::Validation(message)
+                if message.contains("deepseek")
+                    && message.contains("ProviderAuth::ApiKey")
         ));
     }
 

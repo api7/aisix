@@ -19,7 +19,7 @@ impl ProviderMeta for OpenAIDef {
 
     fn build_auth_headers(&self, auth: &ProviderAuth) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        let value = HeaderValue::from_str(&format!("Bearer {}", auth.api_key()?))
+        let value = HeaderValue::from_str(&format!("Bearer {}", auth.api_key_for(self.name())?))
             .map_err(|error| GatewayError::Validation(error.to_string()))?;
         headers.insert(AUTHORIZATION, value);
         Ok(headers)
@@ -73,5 +73,20 @@ mod tests {
         let body = provider.transform_request(&request).unwrap();
 
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn openai_def_reports_provider_name_for_missing_api_key() {
+        let provider = OpenAIDef;
+        let error = provider
+            .build_auth_headers(&ProviderAuth::None)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::gateway::error::GatewayError::Validation(message)
+                if message.contains("openai")
+                    && message.contains("ProviderAuth::ApiKey")
+        ));
     }
 }

@@ -19,7 +19,10 @@ macro_rules! provider {
             auth: &$crate::gateway::provider_instance::ProviderAuth,
         ) -> $crate::gateway::error::Result<http::HeaderMap> {
             let mut headers = http::HeaderMap::new();
-            let value = http::HeaderValue::from_str(&format!("Bearer {}", auth.api_key()?))
+            let value = http::HeaderValue::from_str(&format!(
+                "Bearer {}",
+                auth.api_key_for(self.name())?
+            ))
                 .map_err(|error| $crate::gateway::error::GatewayError::Validation(error.to_string()))?;
             headers.insert(http::header::AUTHORIZATION, value);
             Ok(headers)
@@ -31,10 +34,12 @@ macro_rules! provider {
             &self,
             auth: &$crate::gateway::provider_instance::ProviderAuth,
         ) -> $crate::gateway::error::Result<http::HeaderMap> {
+            const HEADER_NAME: http::header::HeaderName =
+                http::header::HeaderName::from_static($header);
             let mut headers = http::HeaderMap::new();
-            let value = http::HeaderValue::from_str(auth.api_key()?)
+            let value = http::HeaderValue::from_str(auth.api_key_for(self.name())?)
                 .map_err(|error| $crate::gateway::error::GatewayError::Validation(error.to_string()))?;
-            headers.insert(http::header::HeaderName::from_static($header), value);
+            headers.insert(HEADER_NAME, value);
             Ok(headers)
         }
     };
@@ -188,5 +193,20 @@ mod tests {
         assert_eq!(headers["x-api-key"], "secret-key");
         assert_eq!(quirks.unsupported_params, &["seed"]);
         assert!(quirks.tool_args_may_be_object);
+    }
+
+    #[test]
+    fn macro_generated_provider_reports_provider_name_for_missing_api_key() {
+        let provider = MacroTestProvider;
+        let error = provider
+            .build_auth_headers(&ProviderAuth::None)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::gateway::error::GatewayError::Validation(message)
+                if message.contains("macro-test")
+                    && message.contains("ProviderAuth::ApiKey")
+        ));
     }
 }
