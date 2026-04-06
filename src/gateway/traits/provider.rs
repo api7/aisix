@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, fmt};
 
 use http::HeaderMap;
 use serde_json::{Map, Value};
@@ -13,11 +13,20 @@ use crate::gateway::{
 };
 
 /// Authentication material used by provider definitions.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub enum ProviderAuth {
     ApiKey(String),
     #[default]
     None,
+}
+
+impl fmt::Debug for ProviderAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ApiKey(_) => f.write_str("ApiKey(REDACTED)"),
+            Self::None => f.write_str("None"),
+        }
+    }
 }
 
 /// Provider metadata with no data transformation logic.
@@ -168,7 +177,9 @@ impl CompatQuirks {
         }
 
         for (from, to) in self.param_renames {
-            if let Some(value) = map.remove(*from) {
+            if let Some(value) = map.remove(*from)
+                && !map.contains_key(*to)
+            {
                 map.insert((*to).to_string(), value);
             }
         }
@@ -233,6 +244,15 @@ mod tests {
     impl ChatTransform for DummyProvider {}
 
     #[test]
+    fn provider_auth_debug_redacts_api_key() {
+        assert_eq!(
+            format!("{:?}", ProviderAuth::ApiKey("sk-secret".into())),
+            "ApiKey(REDACTED)"
+        );
+        assert_eq!(format!("{:?}", ProviderAuth::None), "None");
+    }
+
+    #[test]
     fn apply_to_request_removes_and_renames_fields() {
         let quirks = CompatQuirks {
             unsupported_params: &["seed"],
@@ -250,6 +270,23 @@ mod tests {
         assert_eq!(body.get("seed"), None);
         assert_eq!(body["max_completion_tokens"], 256);
         assert_eq!(body["temperature"], 0.2);
+    }
+
+    #[test]
+    fn apply_to_request_preserves_explicit_destination_value() {
+        let quirks = CompatQuirks {
+            param_renames: &[("max_tokens", "max_completion_tokens")],
+            ..CompatQuirks::NONE
+        };
+        let mut body = json!({
+            "max_tokens": 256,
+            "max_completion_tokens": 128
+        });
+
+        quirks.apply_to_request(&mut body);
+
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["max_completion_tokens"], 128);
     }
 
     #[test]
