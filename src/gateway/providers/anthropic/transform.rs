@@ -28,18 +28,30 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 pub(crate) fn openai_to_anthropic_request(
     request: &ChatCompletionRequest,
 ) -> Result<AnthropicMessagesRequest> {
+    if let Some(n) = request.n
+        && n != 1
+    {
+        return Err(GatewayError::Bridge(format!(
+            "Anthropic provider only supports n=1, got {}",
+            n
+        )));
+    }
+
     let (messages, system) = openai_messages_to_anthropic(&request.messages)?;
     let tools = request
         .tools
         .as_ref()
         .map(|tools| openai_tools_to_anthropic(tools))
         .transpose()?;
-    let tool_choice = request
-        .tool_choice
-        .as_ref()
-        .map(|choice| openai_tool_choice_to_anthropic(choice, tools.is_some()))
-        .transpose()?
-        .flatten();
+    let tool_choice = match (request.tool_choice.as_ref(), tools.as_ref()) {
+        (Some(_), None) => {
+            return Err(GatewayError::Bridge(
+                "Anthropic provider requires tools when tool_choice is set".into(),
+            ));
+        }
+        (Some(choice), Some(_)) => openai_tool_choice_to_anthropic(choice)?,
+        (None, _) => None,
+    };
 
     Ok(AnthropicMessagesRequest {
         model: request.model.clone(),
@@ -431,19 +443,15 @@ fn openai_tools_to_anthropic(tools: &[Tool]) -> Result<Vec<AnthropicTool>> {
         .collect()
 }
 
-fn openai_tool_choice_to_anthropic(
-    choice: &ToolChoice,
-    has_tools: bool,
-) -> Result<Option<AnthropicToolChoice>> {
+fn openai_tool_choice_to_anthropic(choice: &ToolChoice) -> Result<Option<AnthropicToolChoice>> {
     match choice {
         ToolChoice::Mode(mode) => match mode.as_str() {
             "auto" => Ok(Some(AnthropicToolChoice::Auto)),
             "required" => Ok(Some(AnthropicToolChoice::Any)),
-            "none" if has_tools => Err(GatewayError::Bridge(
+            "none" => Err(GatewayError::Bridge(
                 "Anthropic provider cannot faithfully represent tool_choice=none when tools are present"
                     .into(),
             )),
-            "none" => Ok(None),
             other => Err(GatewayError::Bridge(format!(
                 "unsupported OpenAI tool_choice mode {} for Anthropic provider",
                 other
@@ -563,6 +571,8 @@ fn map_anthropic_stop_reason(stop_reason: Option<&str>) -> Option<String> {
 fn parse_sse_data<T: DeserializeOwned>(raw: &str) -> Result<Option<T>> {
     let trimmed = raw.trim();
     if trimmed.is_empty()
+        || trimmed == "[DONE]"
+        || trimmed == "data: [DONE]"
         || trimmed.starts_with(':')
         || trimmed.starts_with("event:")
         || trimmed.starts_with("id:")
@@ -576,7 +586,7 @@ fn parse_sse_data<T: DeserializeOwned>(raw: &str) -> Result<Option<T>> {
     };
 
     let payload = line.trim_start();
-    if payload.is_empty() {
+    if payload.is_empty() || payload == "[DONE]" {
         return Ok(None);
     }
 
@@ -834,8 +844,48 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert!(
+            parse_anthropic_native_sse("data: [DONE]")
+                .unwrap()
+                .is_empty()
+        );
 
         let events = parse_anthropic_native_sse(r#"data: {"type":"ping"}"#).unwrap();
         assert!(matches!(events.as_slice(), [AnthropicStreamEvent::Ping]));
+    }
+
+    #[test]
+    fn transform_request_rejects_unsupported_n_values() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "n": 2
+        }))
+        .unwrap();
+
+        let error = openai_to_anthropic_request(&request).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::gateway::error::GatewayError::Bridge(message)
+                if message.contains("n=1")
+                    && message.contains('2')
+        ));
+    }
+
+    #[test]
+    fn transform_request_rejects_tool_choice_without_tools() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tool_choice": "auto"
+        }))
+        .unwrap();
+
+        let error = openai_to_anthropic_request(&request).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::gateway::error::GatewayError::Bridge(message)
+                if message.contains("requires tools")
+        ));
     }
 }
