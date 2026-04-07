@@ -62,6 +62,8 @@ impl<F: ChatFormat> BridgedStream<F> {
                 (Some(input_tokens), Some(output_tokens)) => Some(input_tokens + output_tokens),
                 _ => None,
             },
+            cache_creation_input_tokens: state.cache_creation_input_tokens,
+            cache_read_input_tokens: state.cache_read_input_tokens,
             ..Default::default()
         }
     }

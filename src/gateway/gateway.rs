@@ -154,11 +154,9 @@ impl Gateway {
 
         let body: Value = response.json().await.map_err(GatewayError::Http)?;
         let response = F::parse_native_response(native, body)?;
+        let usage = F::response_usage(&response);
 
-        Ok(ChatResponse::Complete {
-            response,
-            usage: Usage::default(),
-        })
+        Ok(ChatResponse::Complete { response, usage })
     }
 
     async fn call_chat_hub(
@@ -932,7 +930,8 @@ mod tests {
                 "usage": {
                     "prompt_tokens": 7,
                     "completion_tokens": 9,
-                    "total_tokens": 16
+                    "total_tokens": 16,
+                    "prompt_tokens_details": {"cached_tokens": 2}
                 }
             }))
             .unwrap(),
@@ -1008,7 +1007,10 @@ mod tests {
         assert!(matches!(
             message_delta,
             crate::gateway::types::anthropic::AnthropicStreamEvent::MessageDelta { usage, .. }
-                if usage.input_tokens == 7 && usage.output_tokens == 9
+                if usage.input_tokens == 5
+                    && usage.output_tokens == 9
+                    && usage.cache_creation_input_tokens == 0
+                    && usage.cache_read_input_tokens == 2
         ));
         assert!(matches!(
             message_stop,
@@ -1019,6 +1021,7 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(7));
         assert_eq!(usage.output_tokens, Some(9));
         assert_eq!(usage.total_tokens, Some(16));
+        assert_eq!(usage.cache_read_input_tokens, Some(2));
 
         server.abort();
     }
@@ -1048,7 +1051,9 @@ mod tests {
                         "stop_sequence": null,
                         "usage": {
                             "input_tokens": 3,
-                            "output_tokens": 4
+                            "output_tokens": 4,
+                            "cache_creation_input_tokens": 5,
+                            "cache_read_input_tokens": 2
                         }
                     }))
                 }
@@ -1082,13 +1087,123 @@ mod tests {
             &response.content[0],
             AnthropicContentBlock::Text { text, .. } if text == "hello from native"
         ));
-        assert!(usage.input_tokens.is_none());
-        assert!(usage.output_tokens.is_none());
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(4));
+        assert_eq!(usage.total_tokens, Some(14));
+        assert_eq!(usage.cache_creation_input_tokens, Some(5));
+        assert_eq!(usage.cache_read_input_tokens, Some(2));
 
         let observed = observed.lock().await.take().unwrap();
         assert_eq!(observed.0.as_deref(), Some("anthropic-secret"));
         assert_eq!(observed.1["messages"][0]["role"], "user");
         assert_eq!(observed.1["messages"][0]["content"], "hello");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messages_stream_native_anthropic_reports_cache_usage() {
+        let sse_body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet-20241022\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":2}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":4,\"input_tokens\":3,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":2}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let router = Router::new().route(
+            "/v1/messages",
+            post(move || async move {
+                http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from(sse_body))
+                    .unwrap()
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(AnthropicDef),
+            auth: ProviderAuth::ApiKey("anthropic-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .unwrap();
+
+        let response = gateway.messages(&request, &instance).await.unwrap();
+        let ChatResponse::Stream {
+            mut stream,
+            usage_rx,
+        } = response
+        else {
+            panic!("expected stream response")
+        };
+
+        let message_start = stream.next().await.unwrap().unwrap();
+        let block_start = stream.next().await.unwrap().unwrap();
+        let block_delta = stream.next().await.unwrap().unwrap();
+        let block_stop = stream.next().await.unwrap().unwrap();
+        let message_delta = stream.next().await.unwrap().unwrap();
+        let message_stop = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+
+        assert!(matches!(
+            message_start,
+            crate::gateway::types::anthropic::AnthropicStreamEvent::MessageStart { message }
+                if message.usage.input_tokens == 3
+                    && message.usage.output_tokens == 1
+                    && message.usage.cache_creation_input_tokens == 5
+                    && message.usage.cache_read_input_tokens == 2
+        ));
+        assert!(matches!(
+            block_start,
+            crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockStart { index, .. }
+                if index == 0
+        ));
+        assert!(matches!(
+            block_delta,
+            crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockDelta { index, delta }
+                if index == 0
+                    && matches!(&delta, crate::gateway::types::anthropic::ContentDelta::TextDelta { text } if text == "hello")
+        ));
+        assert!(matches!(
+            block_stop,
+            crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockStop { index }
+                if index == 0
+        ));
+        assert!(matches!(
+            message_delta,
+            crate::gateway::types::anthropic::AnthropicStreamEvent::MessageDelta { usage, .. }
+                if usage.input_tokens == 3
+                    && usage.output_tokens == 4
+                    && usage.cache_creation_input_tokens == 5
+                    && usage.cache_read_input_tokens == 2
+        ));
+        assert!(matches!(
+            message_stop,
+            crate::gateway::types::anthropic::AnthropicStreamEvent::MessageStop
+        ));
+
+        let usage = usage_rx.await.unwrap();
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(4));
+        assert_eq!(usage.total_tokens, Some(14));
+        assert_eq!(usage.cache_creation_input_tokens, Some(5));
+        assert_eq!(usage.cache_read_input_tokens, Some(2));
 
         server.abort();
     }

@@ -10,8 +10,8 @@ use crate::gateway::{
         anthropic::{
             AnthropicContent, AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest,
             AnthropicMessagesResponse, AnthropicMetadata, AnthropicStreamEvent, AnthropicTool,
-            AnthropicToolChoice, AnthropicUsage, ContentDelta, ImageSource, SystemBlock,
-            SystemPrompt,
+            AnthropicToolChoice, AnthropicUsage, ContentDelta, DeltaUsage, ImageSource,
+            SystemBlock, SystemPrompt,
         },
         openai::{
             ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice,
@@ -60,6 +60,7 @@ pub(crate) fn openai_to_anthropic_request(
             .max_tokens
             .or(request.max_completion_tokens)
             .unwrap_or(DEFAULT_MAX_TOKENS),
+        cache_control: None,
         system,
         temperature: request.temperature,
         top_p: request.top_p,
@@ -108,7 +109,7 @@ pub(crate) fn parse_anthropic_sse_to_openai(
             state.response_id = Some(message.id.clone());
             state.response_model = Some(message.model.clone());
             state.response_created = Some(now_unix_secs());
-            state.input_tokens = Some(message.usage.input_tokens);
+            apply_anthropic_usage_to_stream_state(state, &message.usage);
 
             Ok(vec![ChatCompletionChunk {
                 id: message.id,
@@ -132,7 +133,9 @@ pub(crate) fn parse_anthropic_sse_to_openai(
             index,
             content_block,
         } => match content_block {
-            AnthropicContentBlock::ToolUse { id, name, input } => {
+            AnthropicContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 let initial_arguments = initial_tool_arguments(&input)?;
                 let accumulator = state
                     .tool_call_accumulators
@@ -206,14 +209,16 @@ pub(crate) fn parse_anthropic_sse_to_openai(
             }
         },
         AnthropicStreamEvent::MessageDelta { delta, usage } => {
-            state.output_tokens = Some(usage.output_tokens);
-            if usage.input_tokens > 0 {
-                state.input_tokens = Some(usage.input_tokens);
-            }
+            apply_anthropic_delta_usage_to_stream_state(state, &usage);
 
             let usage = match (state.input_tokens, state.output_tokens) {
                 (Some(input_tokens), Some(output_tokens)) => {
-                    Some(stream_usage_to_openai_usage(input_tokens, output_tokens))
+                    Some(stream_usage_to_openai_usage_with_cached(
+                        input_tokens,
+                        output_tokens,
+                        state.cache_creation_input_tokens.unwrap_or(0)
+                            + state.cache_read_input_tokens.unwrap_or(0),
+                    ))
                 }
                 _ => None,
             };
@@ -333,6 +338,7 @@ fn openai_assistant_message_to_anthropic(
                         error
                     ))
                 })?,
+                cache_control: None,
             });
         }
     }
@@ -365,6 +371,7 @@ fn openai_tool_message_to_anthropic(
                 None => None,
             },
             is_error: None,
+            cache_control: None,
         }]),
     })
 }
@@ -402,6 +409,7 @@ fn content_to_anthropic_blocks(
                 }),
                 ContentPart::ImageUrl { image_url } => Ok(AnthropicContentBlock::Image {
                     source: image_url_to_source(&image_url.url)?,
+                    cache_control: None,
                 }),
             })
             .collect(),
@@ -489,7 +497,7 @@ fn anthropic_blocks_to_openai_message(
                 text_segments.push(text.clone());
                 rich_parts.push(ContentPart::Text { text: text.clone() });
             }
-            AnthropicContentBlock::Image { source } => {
+            AnthropicContentBlock::Image { source, .. } => {
                 has_non_text_part = true;
                 rich_parts.push(ContentPart::ImageUrl {
                     image_url: ImageUrl {
@@ -498,7 +506,9 @@ fn anthropic_blocks_to_openai_message(
                     },
                 });
             }
-            AnthropicContentBlock::ToolUse { id, name, input } => {
+            AnthropicContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 tool_calls.push(ToolCall {
                     id: id.clone(),
                     r#type: "function".into(),
@@ -553,14 +563,39 @@ fn anthropic_usage_to_openai_usage(usage: &AnthropicUsage) -> ChatCompletionUsag
     }
 }
 
-fn stream_usage_to_openai_usage(input_tokens: u32, output_tokens: u32) -> ChatCompletionUsage {
+fn stream_usage_to_openai_usage_with_cached(
+    input_tokens: u32,
+    output_tokens: u32,
+    cached_tokens: u32,
+) -> ChatCompletionUsage {
     ChatCompletionUsage {
         prompt_tokens: input_tokens,
         completion_tokens: output_tokens,
         total_tokens: input_tokens + output_tokens,
-        prompt_tokens_details: None,
+        prompt_tokens_details: (cached_tokens > 0).then_some(PromptTokensDetails {
+            cached_tokens: Some(cached_tokens),
+            audio_tokens: None,
+        }),
         completion_tokens_details: None,
     }
+}
+
+fn apply_anthropic_usage_to_stream_state(state: &mut ChatStreamState, usage: &AnthropicUsage) {
+    state.input_tokens = Some(
+        usage.input_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens,
+    );
+    state.output_tokens = Some(usage.output_tokens);
+    state.cache_creation_input_tokens = Some(usage.cache_creation_input_tokens);
+    state.cache_read_input_tokens = Some(usage.cache_read_input_tokens);
+}
+
+fn apply_anthropic_delta_usage_to_stream_state(state: &mut ChatStreamState, usage: &DeltaUsage) {
+    state.input_tokens = Some(
+        usage.input_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens,
+    );
+    state.output_tokens = Some(usage.output_tokens);
+    state.cache_creation_input_tokens = Some(usage.cache_creation_input_tokens);
+    state.cache_read_input_tokens = Some(usage.cache_read_input_tokens);
 }
 
 fn map_anthropic_stop_reason(stop_reason: Option<&str>) -> Option<String> {
@@ -797,7 +832,7 @@ mod tests {
         let mut state = ChatStreamState::default();
 
         let start = parse_anthropic_sse_to_openai(
-            r#"data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":"assistant","model":"claude-3-5-sonnet-20241022","usage":{"input_tokens":7}}}"#,
+            r#"data: {"type":"message_start","message":{"id":"msg_123","type":"message","role":"assistant","model":"claude-3-5-sonnet-20241022","usage":{"input_tokens":7,"output_tokens":1,"cache_creation_input_tokens":3,"cache_read_input_tokens":2}}}"#,
             &mut state,
         )
         .unwrap();
@@ -812,7 +847,7 @@ mod tests {
         )
         .unwrap();
         let finish = parse_anthropic_sse_to_openai(
-            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":11,"input_tokens":7}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":11,"input_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":2}}"#,
             &mut state,
         )
         .unwrap();
@@ -838,7 +873,19 @@ mod tests {
             finish[0].choices[0].finish_reason.as_deref(),
             Some("tool_calls")
         );
-        assert_eq!(finish[0].usage.as_ref().unwrap().total_tokens, 18);
+        assert_eq!(finish[0].usage.as_ref().unwrap().prompt_tokens, 12);
+        assert_eq!(finish[0].usage.as_ref().unwrap().total_tokens, 23);
+        assert_eq!(
+            finish[0]
+                .usage
+                .as_ref()
+                .unwrap()
+                .prompt_tokens_details
+                .as_ref()
+                .unwrap()
+                .cached_tokens,
+            Some(5)
+        );
     }
 
     #[test]

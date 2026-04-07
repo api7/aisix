@@ -90,6 +90,11 @@ pub trait ChatFormat: Send + Sync + 'static {
         Usage::default()
     }
 
+    /// Extract usage from a native non-streaming response.
+    fn response_usage(_response: &Self::Response) -> Usage {
+        Usage::default()
+    }
+
     /// Parse a native non-streaming response into this format.
     fn parse_native_response(native: &NativeHandler<'_>, body: Value) -> Result<Self::Response>
     where
@@ -133,6 +138,8 @@ pub struct ChatStreamState {
     pub response_created: Option<u64>,
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
+    pub cache_creation_input_tokens: Option<u32>,
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 #[cfg(test)]

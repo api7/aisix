@@ -78,6 +78,14 @@ impl Stream for HubChunkStream {
                                 if let Some(usage) = &chunk.usage {
                                     this.state.input_tokens = Some(usage.prompt_tokens);
                                     this.state.output_tokens = Some(usage.completion_tokens);
+                                    if this.state.cache_creation_input_tokens.is_none()
+                                        && this.state.cache_read_input_tokens.is_none()
+                                    {
+                                        this.state.cache_read_input_tokens = usage
+                                            .prompt_tokens_details
+                                            .as_ref()
+                                            .and_then(|details| details.cached_tokens);
+                                    }
                                 }
                             }
 
