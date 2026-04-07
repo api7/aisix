@@ -10,12 +10,13 @@ The current implementation is intentionally narrow:
 
 ## Files
 
-The current slice is implemented in two files:
+The current slice spans three areas:
 
 - `gateway::gateway` in `src/gateway/gateway.rs`
+- `gateway::formats` in `src/gateway/formats/`
 - `gateway::types::response` in `src/gateway/types/response.rs`
 
-`gateway::mod.rs` re-exports `Gateway`, and `gateway::types::mod.rs` re-exports `ChatResponse`.
+`gateway::mod.rs` re-exports `Gateway`, `gateway::formats::mod.rs` re-exports the current chat format entry points, and `gateway::types::mod.rs` re-exports `ChatResponse`.
 
 ## Core Flow
 
@@ -94,8 +95,9 @@ The gateway layer will later grow non-chat entry points such as embeddings, TTS,
 This module does not attempt to finish the full Layer 3 design.
 
 - `SessionStore` is not wired yet
-- only `chat_completion()` is implemented as a convenience helper today
-- `messages()` and `responses()` remain deferred until their corresponding formats land
+- `chat_completion()` and `messages()` are implemented as convenience helpers today
+- `responses()` remains deferred until its corresponding format lands
+- `AnthropicMessagesFormat` still rejects non-native hub streaming; only its native provider path can stream today
 - only `StreamReaderKind::Sse` is wired today; `AwsEventStream` and `JsonArrayStream` are still deferred
 - native complete-call usage extraction is still format-specific future work
 

@@ -7,11 +7,12 @@ use tokio::sync::oneshot;
 
 use crate::gateway::{
     error::{GatewayError, Result},
-    formats::OpenAIChatFormat,
+    formats::{AnthropicMessagesFormat, OpenAIChatFormat},
     provider_instance::{ProviderInstance, ProviderRegistry},
     streams::{BridgedStream, HubChunkStream, NativeStream, sse_reader},
     traits::{ChatFormat, NativeHandler, StreamReaderKind},
     types::{
+        anthropic::AnthropicMessagesRequest,
         common::Usage,
         openai::{ChatCompletionRequest, ChatCompletionResponse},
         response::ChatResponse,
@@ -89,6 +90,17 @@ impl Gateway {
         instance: &ProviderInstance,
     ) -> Result<ChatResponse<OpenAIChatFormat>> {
         self.chat::<OpenAIChatFormat>(request, instance).await
+    }
+
+    /// Convenience wrapper for the Anthropic Messages format.
+    #[fastrace::trace]
+    pub async fn messages(
+        &self,
+        request: &AnthropicMessagesRequest,
+        instance: &ProviderInstance,
+    ) -> Result<ChatResponse<AnthropicMessagesFormat>> {
+        self.chat::<AnthropicMessagesFormat>(request, instance)
+            .await
     }
 
     async fn send_chat_request(
@@ -299,11 +311,13 @@ mod tests {
     use crate::gateway::{
         error::{GatewayError, Result},
         provider_instance::{ProviderAuth, ProviderInstance, ProviderRegistry},
+        providers::AnthropicDef,
         traits::{
             ChatFormat, ChatTransform, NativeHandler, NativeOpenAIResponsesSupport,
             OpenAIResponsesNativeStreamState, ProviderCapabilities, ProviderMeta, StreamReaderKind,
         },
         types::{
+            anthropic::{AnthropicContentBlock, AnthropicMessagesRequest},
             common::{BridgeContext, Usage},
             openai::{
                 ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
@@ -799,6 +813,211 @@ mod tests {
         let observed = observed.lock().await.take().unwrap();
         assert_eq!(observed.0.as_deref(), Some("Bearer native-secret"));
         assert_eq!(observed.1, request);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messages_bridges_hub_response_into_anthropic_format() {
+        let observed: Arc<Mutex<ObservedRequest>> = Arc::new(Mutex::new(None));
+        let observed_clone = Arc::clone(&observed);
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let observed = Arc::clone(&observed_clone);
+                async move {
+                    let auth = headers
+                        .get(AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    *observed.lock().await = Some((auth, body));
+
+                    Json(json!({
+                        "id": "chatcmpl-456",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": "gpt-test",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "hello from hub"
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 7,
+                            "completion_tokens": 9,
+                            "total_tokens": 16,
+                            "prompt_tokens_details": {"cached_tokens": 2}
+                        }
+                    }))
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(HubTestProvider),
+            auth: ProviderAuth::ApiKey("hub-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-test",
+            "max_tokens": 256,
+            "top_k": 5,
+            "system": "You are helpful.",
+            "messages": [{"role": "user", "content": "hello"}],
+            "metadata": {"user_id": "user-123"}
+        }))
+        .unwrap();
+
+        let response = gateway.messages(&request, &instance).await.unwrap();
+        let ChatResponse::Complete { response, usage } = response else {
+            panic!("expected complete response")
+        };
+
+        assert_eq!(response.id, "chatcmpl-456");
+        assert_eq!(response.r#type, "message");
+        assert_eq!(response.role, "assistant");
+        assert_eq!(response.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(response.usage.input_tokens, 5);
+        assert_eq!(response.usage.output_tokens, 9);
+        assert_eq!(response.usage.cache_read_input_tokens, 2);
+        assert!(matches!(
+            &response.content[0],
+            AnthropicContentBlock::Text { text, .. } if text == "hello from hub"
+        ));
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(9));
+        assert_eq!(usage.total_tokens, Some(16));
+
+        let observed = observed.lock().await.take().unwrap();
+        assert_eq!(observed.0.as_deref(), Some("Bearer hub-secret"));
+        assert_eq!(observed.1["messages"][0]["role"], "system");
+        assert_eq!(observed.1["messages"][1]["role"], "user");
+        assert_eq!(observed.1["user"], "user-123");
+        assert_eq!(observed.1["top_k"], 5);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messages_reject_hub_streaming_before_dispatch() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_clone = Arc::clone(&request_count);
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let request_count = Arc::clone(&request_count_clone);
+                async move {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "id": "chatcmpl-789",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": "gpt-test",
+                        "choices": []
+                    }))
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(HubTestProvider),
+            auth: ProviderAuth::ApiKey("hub-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-test",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .unwrap();
+
+        let result = gateway.messages(&request, &instance).await;
+        assert!(matches!(
+            result,
+            Err(GatewayError::Bridge(message))
+                if message.contains("hub streaming bridge")
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messages_use_native_anthropic_path_when_supported() {
+        let observed: Arc<Mutex<ObservedRequest>> = Arc::new(Mutex::new(None));
+        let observed_clone = Arc::clone(&observed);
+        let router = Router::new().route(
+            "/v1/messages",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let observed = Arc::clone(&observed_clone);
+                async move {
+                    let auth = headers
+                        .get("x-api-key")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    *observed.lock().await = Some((auth, body));
+
+                    Json(json!({
+                        "id": "msg_123",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "hello from native"}],
+                        "model": "claude-3-5-sonnet-20241022",
+                        "stop_reason": "end_turn",
+                        "stop_sequence": null,
+                        "usage": {
+                            "input_tokens": 3,
+                            "output_tokens": 4
+                        }
+                    }))
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(AnthropicDef),
+            auth: ProviderAuth::ApiKey("anthropic-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 256,
+            "system": "You are helpful.",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let response = gateway.messages(&request, &instance).await.unwrap();
+        let ChatResponse::Complete { response, usage } = response else {
+            panic!("expected complete response")
+        };
+
+        assert_eq!(response.id, "msg_123");
+        assert_eq!(response.model, "claude-3-5-sonnet-20241022");
+        assert!(matches!(
+            &response.content[0],
+            AnthropicContentBlock::Text { text, .. } if text == "hello from native"
+        ));
+        assert!(usage.input_tokens.is_none());
+        assert!(usage.output_tokens.is_none());
+
+        let observed = observed.lock().await.take().unwrap();
+        assert_eq!(observed.0.as_deref(), Some("anthropic-secret"));
+        assert_eq!(observed.1["messages"][0]["role"], "user");
+        assert_eq!(observed.1["messages"][0]["content"], "hello");
 
         server.abort();
     }
