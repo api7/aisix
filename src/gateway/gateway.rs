@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use http::StatusCode;
 use serde_json::Value;
 
@@ -22,9 +24,15 @@ pub struct Gateway {
 impl Gateway {
     /// Creates a new gateway with the provided provider registry.
     pub fn new(registry: ProviderRegistry) -> Self {
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("failed to build gateway reqwest client with configured timeouts");
+
         Self {
             registry,
-            http_client: reqwest::Client::new(),
+            http_client,
         }
     }
 
@@ -34,6 +42,7 @@ impl Gateway {
     }
 
     /// Non-streaming typed chat entry point.
+    #[fastrace::trace]
     pub async fn chat<F: ChatFormat>(
         &self,
         request: &F::Request,
@@ -59,6 +68,7 @@ impl Gateway {
     }
 
     /// Convenience wrapper for the OpenAI Chat format.
+    #[fastrace::trace]
     pub async fn chat_completion(
         &self,
         request: &ChatCompletionRequest,
@@ -159,7 +169,14 @@ fn extract_chat_usage_from_response(response: &ChatCompletionResponse) -> Option
 
 async fn provider_error(response: reqwest::Response, provider: &str) -> GatewayError {
     let status = response.status();
-    let body = response.json().await.unwrap_or(Value::Null);
+    let body = response
+        .bytes()
+        .await
+        .map(|bytes| {
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+        })
+        .unwrap_or(Value::Null);
 
     GatewayError::Provider {
         status,
@@ -175,7 +192,7 @@ mod tests {
 
     use axum::{Json, Router, routing::post};
     use http::{
-        HeaderMap, HeaderValue,
+        HeaderMap, HeaderValue, StatusCode,
         header::{AUTHORIZATION, HeaderName},
     };
     use reqwest::Url;
@@ -503,7 +520,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_rejects_streaming_requests_until_pr_4_2() {
+    async fn chat_rejects_streaming_requests_until_streaming_is_implemented() {
         let gateway = Gateway::new(ProviderRegistry::builder().build());
         let instance = ProviderInstance {
             def: Arc::new(HubTestProvider),
@@ -524,6 +541,47 @@ mod tests {
             Err(GatewayError::Validation(message))
                 if message.contains("streaming requests") && message.contains(OpenAIChatFormat::name())
         ));
+    }
+
+    #[tokio::test]
+    async fn chat_completion_preserves_non_json_provider_error_body() {
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { (StatusCode::BAD_GATEWAY, "upstream exploded") }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(HubTestProvider),
+            auth: ProviderAuth::ApiKey("hub-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let result = gateway.chat_completion(&request, &instance).await;
+        match result {
+            Err(GatewayError::Provider {
+                status,
+                body,
+                provider,
+                retryable,
+            }) => {
+                assert_eq!(status, StatusCode::BAD_GATEWAY);
+                assert_eq!(body, Value::String("upstream exploded".into()));
+                assert_eq!(provider, "hub-test");
+                assert!(retryable);
+            }
+            Err(other) => panic!("unexpected gateway error: {other}"),
+            Ok(_) => panic!("expected provider error"),
+        }
+
+        server.abort();
     }
 
     fn bearer_headers(provider: &str, auth: &ProviderAuth) -> Result<HeaderMap> {
