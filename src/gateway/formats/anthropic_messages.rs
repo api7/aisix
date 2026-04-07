@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde_json::{Value, json};
 
 use crate::gateway::{
@@ -7,24 +9,44 @@ use crate::gateway::{
         anthropic::{
             AnthropicContent, AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest,
             AnthropicMessagesResponse, AnthropicStreamEvent, AnthropicTool, AnthropicToolChoice,
-            AnthropicUsage, CacheControl, ImageSource, SystemPrompt,
+            AnthropicUsage, CacheControl, ContentDelta, DeltaUsage, ImageSource, InputUsage,
+            MessageDelta, MessageStartPayload, SystemPrompt,
         },
         common::{AnthropicMessagesExtras, BridgeContext},
         openai::{
-            ChatCompletionRequest, ChatCompletionResponse, ChatCompletionUsage, ChatMessage,
-            ContentPart, FunctionCall, FunctionDefinition, ImageUrl, MessageContent, StopCondition,
-            Tool, ToolCall, ToolChoice, ToolChoiceFunction,
+            ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
+            ChatCompletionUsage, ChatMessage, ContentPart, FunctionCall, FunctionDefinition,
+            ImageUrl, MessageContent, StopCondition, Tool, ToolCall, ToolChoice,
+            ToolChoiceFunction,
         },
     },
 };
 
 pub struct AnthropicMessagesFormat;
 
+#[derive(Debug, Clone, Default)]
+pub struct AnthropicBridgeState {
+    message_started: bool,
+    current_block_index: usize,
+    current_block_type: Option<AnthropicBlockType>,
+    current_block_open: bool,
+    stop_reason: Option<String>,
+    input_tokens: u32,
+    output_tokens: u32,
+    tool_block_map: HashMap<usize, usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnthropicBlockType {
+    Text,
+    ToolUse,
+}
+
 impl ChatFormat for AnthropicMessagesFormat {
     type Request = AnthropicMessagesRequest;
     type Response = AnthropicMessagesResponse;
     type StreamChunk = AnthropicStreamEvent;
-    type BridgeState = ();
+    type BridgeState = AnthropicBridgeState;
     type NativeStreamState = AnthropicMessagesNativeStreamState;
 
     fn name() -> &'static str {
@@ -44,11 +66,6 @@ impl ChatFormat for AnthropicMessagesFormat {
             system_prompt_to_hub_messages(req.system.as_ref())?;
         for message in &req.messages {
             messages.extend(anthropic_message_to_hub_messages(message)?);
-        }
-        if req.stream.unwrap_or(false) {
-            return Err(GatewayError::Bridge(
-                "Anthropic messages hub streaming bridge is not implemented yet".into(),
-            ));
         }
 
         let metadata = req
@@ -97,13 +114,41 @@ impl ChatFormat for AnthropicMessagesFormat {
     }
 
     fn from_hub_stream(
-        _chunk: &crate::gateway::types::openai::ChatCompletionChunk,
-        _state: &mut Self::BridgeState,
+        chunk: &ChatCompletionChunk,
+        state: &mut Self::BridgeState,
         _ctx: &BridgeContext,
     ) -> Result<Vec<Self::StreamChunk>> {
-        Err(GatewayError::Bridge(
-            "Anthropic messages hub streaming bridge is not implemented yet".into(),
-        ))
+        anthropic_bridge_state_machine(chunk, state)
+    }
+
+    fn stream_end_events(
+        state: &mut Self::BridgeState,
+        _ctx: &BridgeContext,
+    ) -> Vec<Self::StreamChunk> {
+        if !state.message_started {
+            return vec![];
+        }
+
+        let mut events = Vec::new();
+        if state.current_block_open {
+            events.push(AnthropicStreamEvent::ContentBlockStop {
+                index: state.current_block_index,
+            });
+            state.current_block_open = false;
+            state.current_block_type = None;
+        }
+        events.push(AnthropicStreamEvent::MessageDelta {
+            delta: MessageDelta {
+                stop_reason: state.stop_reason.clone(),
+                stop_sequence: None,
+            },
+            usage: DeltaUsage {
+                output_tokens: state.output_tokens,
+                input_tokens: state.input_tokens,
+            },
+        });
+        events.push(AnthropicStreamEvent::MessageStop);
+        events
     }
 
     fn native_support(provider: &dyn ProviderCapabilities) -> Option<NativeHandler<'_>>
@@ -617,13 +662,189 @@ fn hub_message(role: &str, content: Option<MessageContent>) -> ChatMessage {
     }
 }
 
+fn anthropic_bridge_state_machine(
+    chunk: &ChatCompletionChunk,
+    state: &mut AnthropicBridgeState,
+) -> Result<Vec<AnthropicStreamEvent>> {
+    if chunk.choices.len() > 1 {
+        return Err(GatewayError::Bridge(
+            "Anthropic stream bridge cannot represent multiple OpenAI choices".into(),
+        ));
+    }
+
+    if let Some(usage) = &chunk.usage {
+        state.input_tokens = usage.prompt_tokens;
+        state.output_tokens = usage.completion_tokens;
+    }
+
+    let Some(choice) = chunk.choices.first() else {
+        return Ok(vec![]);
+    };
+
+    if choice.index != 0 {
+        return Err(GatewayError::Bridge(format!(
+            "Anthropic stream bridge only supports OpenAI choice index 0, got {}",
+            choice.index
+        )));
+    }
+
+    if let Some(role) = choice.delta.role.as_deref()
+        && role != "assistant"
+    {
+        return Err(GatewayError::Bridge(format!(
+            "Anthropic stream bridge requires assistant deltas, got {}",
+            role
+        )));
+    }
+
+    let mut events = Vec::new();
+    if !state.message_started {
+        state.message_started = true;
+        events.push(AnthropicStreamEvent::MessageStart {
+            message: MessageStartPayload {
+                id: chunk.id.clone(),
+                r#type: "message".into(),
+                role: "assistant".into(),
+                model: chunk.model.clone(),
+                usage: InputUsage {
+                    input_tokens: state.input_tokens,
+                },
+            },
+        });
+    }
+
+    if let Some(content) = choice.delta.content.as_ref()
+        && !content.is_empty()
+    {
+        ensure_text_block_open(state, &mut events);
+        events.push(AnthropicStreamEvent::ContentBlockDelta {
+            index: state.current_block_index,
+            delta: ContentDelta::TextDelta {
+                text: content.clone(),
+            },
+        });
+    }
+
+    if let Some(tool_calls) = choice.delta.tool_calls.as_ref() {
+        for tool_call in tool_calls {
+            let block_index = if let Some(&block_index) = state.tool_block_map.get(&tool_call.index)
+            {
+                if !state.current_block_open
+                    || state.current_block_type != Some(AnthropicBlockType::ToolUse)
+                    || state.current_block_index != block_index
+                {
+                    return Err(GatewayError::Bridge(
+                        "Anthropic stream bridge does not support interleaved OpenAI tool call deltas"
+                            .into(),
+                    ));
+                }
+                block_index
+            } else {
+                let tool_id = tool_call.id.as_deref().ok_or_else(|| {
+                    GatewayError::Bridge(
+                        "Anthropic stream bridge requires tool call ids on the first delta".into(),
+                    )
+                })?;
+                let function = tool_call.function.as_ref().ok_or_else(|| {
+                    GatewayError::Bridge(
+                        "Anthropic stream bridge requires function metadata on the first tool delta"
+                            .into(),
+                    )
+                })?;
+                let tool_name = function.name.as_deref().ok_or_else(|| {
+                    GatewayError::Bridge(
+                        "Anthropic stream bridge requires function names on the first tool delta"
+                            .into(),
+                    )
+                })?;
+
+                close_current_block(state, &mut events);
+                let block_index = state.current_block_index;
+                state.tool_block_map.insert(tool_call.index, block_index);
+                state.current_block_type = Some(AnthropicBlockType::ToolUse);
+                state.current_block_open = true;
+                events.push(AnthropicStreamEvent::ContentBlockStart {
+                    index: block_index,
+                    content_block: AnthropicContentBlock::ToolUse {
+                        id: tool_id.to_string(),
+                        name: tool_name.to_string(),
+                        input: json!({}),
+                    },
+                });
+                block_index
+            };
+
+            if let Some(arguments) = tool_call
+                .function
+                .as_ref()
+                .and_then(|function| function.arguments.as_ref())
+                && !arguments.is_empty()
+            {
+                events.push(AnthropicStreamEvent::ContentBlockDelta {
+                    index: block_index,
+                    delta: ContentDelta::InputJsonDelta {
+                        partial_json: arguments.clone(),
+                    },
+                });
+            }
+        }
+    }
+
+    if let Some(finish_reason) = choice.finish_reason.as_deref() {
+        state.stop_reason = Some(openai_finish_reason_to_anthropic_stream(finish_reason));
+    }
+
+    Ok(events)
+}
+
+fn ensure_text_block_open(
+    state: &mut AnthropicBridgeState,
+    events: &mut Vec<AnthropicStreamEvent>,
+) {
+    if state.current_block_open && state.current_block_type == Some(AnthropicBlockType::Text) {
+        return;
+    }
+
+    close_current_block(state, events);
+    events.push(AnthropicStreamEvent::ContentBlockStart {
+        index: state.current_block_index,
+        content_block: AnthropicContentBlock::Text {
+            text: String::new(),
+            cache_control: None,
+        },
+    });
+    state.current_block_type = Some(AnthropicBlockType::Text);
+    state.current_block_open = true;
+}
+
+fn close_current_block(state: &mut AnthropicBridgeState, events: &mut Vec<AnthropicStreamEvent>) {
+    if !state.current_block_open {
+        return;
+    }
+
+    events.push(AnthropicStreamEvent::ContentBlockStop {
+        index: state.current_block_index,
+    });
+    state.current_block_index += 1;
+    state.current_block_type = None;
+    state.current_block_open = false;
+}
+
+fn openai_finish_reason_to_anthropic_stream(finish_reason: &str) -> String {
+    match finish_reason {
+        "stop" => "end_turn".into(),
+        "length" => "max_tokens".into(),
+        "tool_calls" => "tool_use".into(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::AnthropicMessagesFormat;
     use crate::gateway::{
-        error::GatewayError,
         traits::ChatFormat,
         types::{
             anthropic::AnthropicMessagesRequest, common::BridgeContext,
@@ -694,20 +915,87 @@ mod tests {
     }
 
     #[test]
-    fn request_to_hub_rejects_streaming_until_hub_stream_bridge_lands() {
-        let request: AnthropicMessagesRequest = serde_json::from_value(json!({
-            "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 256,
-            "messages": [{"role": "user", "content": "hello"}],
-            "stream": true
-        }))
-        .unwrap();
+    fn from_hub_stream_emits_text_lifecycle_and_end_events() {
+        let mut state = super::AnthropicBridgeState::default();
+        let first_chunk: crate::gateway::types::openai::ChatCompletionChunk =
+            serde_json::from_value(json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "gpt-test",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": "hello"
+                    },
+                    "finish_reason": null
+                }]
+            }))
+            .unwrap();
+        let usage_chunk: crate::gateway::types::openai::ChatCompletionChunk =
+            serde_json::from_value(json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "gpt-test",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 9,
+                    "total_tokens": 16
+                }
+            }))
+            .unwrap();
 
-        let result = AnthropicMessagesFormat::to_hub(&request);
+        let events = AnthropicMessagesFormat::from_hub_stream(
+            &first_chunk,
+            &mut state,
+            &BridgeContext::default(),
+        )
+        .unwrap();
         assert!(matches!(
-            result,
-            Err(GatewayError::Bridge(message))
-                if message.contains("hub streaming bridge")
+            &events[0],
+            crate::gateway::types::anthropic::AnthropicStreamEvent::MessageStart { message }
+                if message.id == "chatcmpl-123" && message.usage.input_tokens == 0
+        ));
+        assert!(matches!(
+            &events[1],
+            crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockStart { index, .. }
+                if *index == 0
+        ));
+        assert!(matches!(
+            &events[2],
+            crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockDelta { index, delta }
+                if *index == 0
+                    && matches!(delta, crate::gateway::types::anthropic::ContentDelta::TextDelta { text } if text == "hello")
+        ));
+
+        assert!(
+            AnthropicMessagesFormat::from_hub_stream(
+                &usage_chunk,
+                &mut state,
+                &BridgeContext::default(),
+            )
+            .unwrap()
+            .is_empty()
+        );
+
+        let end_events =
+            AnthropicMessagesFormat::stream_end_events(&mut state, &BridgeContext::default());
+        assert!(matches!(
+            &end_events[0],
+            crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockStop { index }
+                if *index == 0
+        ));
+        assert!(matches!(
+            &end_events[1],
+            crate::gateway::types::anthropic::AnthropicStreamEvent::MessageDelta { delta, usage }
+                if delta.stop_reason.is_none() && usage.input_tokens == 7 && usage.output_tokens == 9
+        ));
+        assert!(matches!(
+            &end_events[2],
+            crate::gateway::types::anthropic::AnthropicStreamEvent::MessageStop
         ));
     }
 
@@ -766,24 +1054,91 @@ mod tests {
     }
 
     #[test]
-    fn hub_stream_bridge_is_not_implemented_yet() {
-        let chunk: crate::gateway::types::openai::ChatCompletionChunk =
+    fn from_hub_stream_maps_tool_use_deltas() {
+        let mut state = super::AnthropicBridgeState::default();
+        let first_chunk: crate::gateway::types::openai::ChatCompletionChunk =
             serde_json::from_value(json!({
                 "id": "chatcmpl-123",
                 "object": "chat.completion.chunk",
                 "created": 1,
                 "model": "gpt-test",
-                "choices": []
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": "{\"city\""
+                            }
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            }))
+            .unwrap();
+        let second_chunk: crate::gateway::types::openai::ChatCompletionChunk =
+            serde_json::from_value(json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "gpt-test",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {
+                                "arguments": ":\"SF\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
             }))
             .unwrap();
 
-        let result =
-            AnthropicMessagesFormat::from_hub_stream(&chunk, &mut (), &BridgeContext::default());
-
+        let first_events = AnthropicMessagesFormat::from_hub_stream(
+            &first_chunk,
+            &mut state,
+            &BridgeContext::default(),
+        )
+        .unwrap();
         assert!(matches!(
-            result,
-            Err(GatewayError::Bridge(message))
-                if message.contains("hub streaming bridge")
+            &first_events[1],
+            crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockStart { index, content_block }
+                if *index == 0
+                    && matches!(content_block, crate::gateway::types::anthropic::AnthropicContentBlock::ToolUse { name, .. } if name == "get_weather")
+        ));
+        assert!(matches!(
+            &first_events[2],
+            crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockDelta { index, delta }
+                if *index == 0
+                    && matches!(delta, crate::gateway::types::anthropic::ContentDelta::InputJsonDelta { partial_json } if partial_json == "{\"city\"")
+        ));
+
+        let second_events = AnthropicMessagesFormat::from_hub_stream(
+            &second_chunk,
+            &mut state,
+            &BridgeContext::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            &second_events[0],
+            crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockDelta { index, delta }
+                if *index == 0
+                    && matches!(delta, crate::gateway::types::anthropic::ContentDelta::InputJsonDelta { partial_json } if partial_json == ":\"SF\"}")
+        ));
+
+        let end_events =
+            AnthropicMessagesFormat::stream_end_events(&mut state, &BridgeContext::default());
+        assert!(matches!(
+            &end_events[1],
+            crate::gateway::types::anthropic::AnthropicStreamEvent::MessageDelta { delta, .. }
+                if delta.stop_reason.as_deref() == Some("tool_use")
         ));
     }
 }

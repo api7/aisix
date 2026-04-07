@@ -97,7 +97,6 @@ This module does not attempt to finish the full Layer 3 design.
 - `SessionStore` is not wired yet
 - `chat_completion()` and `messages()` are implemented as convenience helpers today
 - `responses()` remains deferred until its corresponding format lands
-- `AnthropicMessagesFormat` still rejects non-native hub streaming; only its native provider path can stream today
 - only `StreamReaderKind::Sse` is wired today; `AwsEventStream` and `JsonArrayStream` are still deferred
 - native complete-call usage extraction is still format-specific future work
 

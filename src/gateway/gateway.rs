@@ -905,22 +905,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn messages_reject_hub_streaming_before_dispatch() {
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let request_count_clone = Arc::clone(&request_count);
+    async fn messages_stream_hub_chunks_into_anthropic_events_and_usage() {
+        let sse_body = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::to_string(&json!({
+                "id": "chatcmpl-789",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "gpt-test",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": "hello"
+                    },
+                    "finish_reason": null
+                }]
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "id": "chatcmpl-789",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "gpt-test",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 9,
+                    "total_tokens": 16
+                }
+            }))
+            .unwrap(),
+        );
         let router = Router::new().route(
             "/v1/chat/completions",
             post(move || {
-                let request_count = Arc::clone(&request_count_clone);
+                let sse_body = sse_body.clone();
                 async move {
-                    request_count.fetch_add(1, Ordering::SeqCst);
-                    Json(json!({
-                        "id": "chatcmpl-789",
-                        "object": "chat.completion",
-                        "created": 1,
-                        "model": "gpt-test",
-                        "choices": []
-                    }))
+                    http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(axum::body::Body::from(sse_body))
+                        .unwrap()
                 }
             }),
         );
@@ -941,13 +967,58 @@ mod tests {
         }))
         .unwrap();
 
-        let result = gateway.messages(&request, &instance).await;
+        let response = gateway.messages(&request, &instance).await.unwrap();
+        let ChatResponse::Stream {
+            mut stream,
+            usage_rx,
+        } = response
+        else {
+            panic!("expected streaming response")
+        };
+
+        let message_start = stream.next().await.unwrap().unwrap();
+        let block_start = stream.next().await.unwrap().unwrap();
+        let block_delta = stream.next().await.unwrap().unwrap();
+        let block_stop = stream.next().await.unwrap().unwrap();
+        let message_delta = stream.next().await.unwrap().unwrap();
+        let message_stop = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+
         assert!(matches!(
-            result,
-            Err(GatewayError::Bridge(message))
-                if message.contains("hub streaming bridge")
+            message_start,
+            crate::gateway::types::anthropic::AnthropicStreamEvent::MessageStart { message }
+                if message.id == "chatcmpl-789"
         ));
-        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            block_start,
+            crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockStart { index, .. }
+                if index == 0
+        ));
+        assert!(matches!(
+            block_delta,
+            crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockDelta { index, delta }
+                if index == 0
+                    && matches!(&delta, crate::gateway::types::anthropic::ContentDelta::TextDelta { text } if text == "hello")
+        ));
+        assert!(matches!(
+            block_stop,
+            crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockStop { index }
+                if index == 0
+        ));
+        assert!(matches!(
+            message_delta,
+            crate::gateway::types::anthropic::AnthropicStreamEvent::MessageDelta { usage, .. }
+                if usage.input_tokens == 7 && usage.output_tokens == 9
+        ));
+        assert!(matches!(
+            message_stop,
+            crate::gateway::types::anthropic::AnthropicStreamEvent::MessageStop
+        ));
+
+        let usage = usage_rx.await.unwrap();
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(9));
+        assert_eq!(usage.total_tokens, Some(16));
 
         server.abort();
     }
