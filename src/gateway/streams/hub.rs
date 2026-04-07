@@ -14,6 +14,18 @@ use crate::gateway::{
     types::openai::ChatCompletionChunk,
 };
 
+/// Buffered hub stream adapter for provider-produced raw stream lines.
+///
+/// `HubChunkStream` preserves output ordering when one raw input item expands
+/// into multiple `ChatCompletionChunk` values. The first transformed chunk is
+/// returned immediately and the remaining chunks are queued in `buffer` for
+/// subsequent polls.
+///
+/// The stream mutates `state` as transformed chunks flow through it. In
+/// particular, provider-specific stream metadata and the latest observed usage
+/// totals are accumulated there so later pipeline stages can inspect them.
+/// Provider-specific transformation behavior is delegated to `def`, held as an
+/// `Arc<dyn ProviderCapabilities>`.
 #[pin_project]
 pub struct HubChunkStream {
     #[pin]
@@ -24,6 +36,11 @@ pub struct HubChunkStream {
 }
 
 impl HubChunkStream {
+    /// Creates a `HubChunkStream` from raw provider stream lines.
+    ///
+    /// The input stream must preserve line order. The returned stream stays
+    /// `Send` as long as the input stream is `Send`, and every polled raw line
+    /// is transformed through the supplied provider definition.
     pub fn new(
         inner: impl Stream<Item = Result<String>> + Send + 'static,
         def: Arc<dyn ProviderCapabilities>,
