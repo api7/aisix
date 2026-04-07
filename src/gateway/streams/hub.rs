@@ -76,8 +76,8 @@ impl Stream for HubChunkStream {
                             this.state.chunk_index += chunks.len();
                             for chunk in &chunks {
                                 if let Some(usage) = &chunk.usage {
-                                    this.state.input_tokens = usage.prompt_tokens;
-                                    this.state.output_tokens = usage.completion_tokens;
+                                    this.state.input_tokens = Some(usage.prompt_tokens);
+                                    this.state.output_tokens = Some(usage.completion_tokens);
                                 }
                             }
 
@@ -175,8 +175,8 @@ mod tests {
         let chunk = stream.next().await.unwrap().unwrap();
 
         assert_eq!(chunk.usage.as_ref().unwrap().prompt_tokens, 7);
-        assert_eq!(stream.state.input_tokens, 7);
-        assert_eq!(stream.state.output_tokens, 11);
+        assert_eq!(stream.state.input_tokens, Some(7));
+        assert_eq!(stream.state.output_tokens, Some(11));
         assert_eq!(stream.state.chunk_index, 1);
     }
 

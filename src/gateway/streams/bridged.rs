@@ -56,8 +56,12 @@ impl<F: ChatFormat> BridgedStream<F> {
 
     fn usage_from_hub_state(state: &ChatStreamState) -> Usage {
         Usage {
-            input_tokens: Some(state.input_tokens),
-            output_tokens: Some(state.output_tokens),
+            input_tokens: state.input_tokens,
+            output_tokens: state.output_tokens,
+            total_tokens: match (state.input_tokens, state.output_tokens) {
+                (Some(input_tokens), Some(output_tokens)) => Some(input_tokens + output_tokens),
+                _ => None,
+            },
             ..Default::default()
         }
     }
@@ -292,13 +296,14 @@ mod tests {
         let usage = usage_rx.await.unwrap();
         assert_eq!(usage.input_tokens, Some(7));
         assert_eq!(usage.output_tokens, Some(11));
+        assert_eq!(usage.total_tokens, Some(18));
     }
 
     #[tokio::test]
     async fn bridged_stream_buffers_multi_chunk_bridge_output_and_end_events() {
         let raw_stream = futures::stream::iter(vec![Ok("data: buffered".to_string())]);
         let hub_stream = HubChunkStream::new(raw_stream, Arc::new(DummyProvider));
-        let (usage_tx, _usage_rx) = oneshot::channel();
+        let (usage_tx, usage_rx) = oneshot::channel();
         let mut stream =
             BridgedStream::<BufferingFormat>::new(hub_stream, BridgeContext::default(), usage_tx);
 
@@ -308,6 +313,11 @@ mod tests {
         assert_eq!(stream.next().await.unwrap().unwrap(), "second-2b");
         assert_eq!(stream.next().await.unwrap().unwrap(), "end-2");
         assert!(stream.next().await.is_none());
+
+        let usage = usage_rx.await.unwrap();
+        assert!(usage.input_tokens.is_none());
+        assert!(usage.output_tokens.is_none());
+        assert!(usage.total_tokens.is_none());
     }
 
     #[tokio::test]
@@ -326,6 +336,7 @@ mod tests {
         let usage = usage_rx.await.unwrap();
         assert_eq!(usage.input_tokens, Some(7));
         assert_eq!(usage.output_tokens, Some(11));
+        assert_eq!(usage.total_tokens, Some(18));
     }
 
     fn chunk_with_content(content: &str, usage: Option<(u32, u32)>) -> ChatCompletionChunk {

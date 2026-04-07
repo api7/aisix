@@ -70,7 +70,9 @@ Instead of going through hub `ChatCompletionChunk` values, it passes each raw pr
 
 Whenever a transformed hub chunk carries `usage`, the stream copies `prompt_tokens` and `completion_tokens` into `ChatStreamState`. This keeps token accounting outside individual provider transforms while still making the latest usage totals available to later pipeline stages.
 
-`BridgedStream` reports those latest hub totals through a oneshot channel on both normal completion and premature drop. `NativeStream` exposes the same completion and drop hook, but today it can only send an empty `Usage` value because there is not yet a generic trait hook for reading native usage totals back out of `NativeStreamState`.
+`BridgedStream` reports those latest hub totals through a oneshot channel on both normal completion and premature drop. It only fills fields that were actually observed in the hub stream, and it derives `total_tokens` when both sides are known.
+
+`NativeStream` exposes the same completion and drop hook, but today it can only send an empty `Usage` value because there is not yet a generic trait hook for reading native usage totals back out of `NativeStreamState`.
 
 ## Stream State
 

@@ -126,8 +126,8 @@ pub struct ChatStreamState {
     pub response_id: Option<String>,
     pub response_model: Option<String>,
     pub response_created: Option<u64>,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
 }
 
 #[cfg(test)]

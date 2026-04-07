@@ -259,7 +259,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_stream_drop_reports_partial_usage() {
+    async fn native_stream_drop_sends_empty_usage_signal() {
         let raw_stream = futures::stream::iter(vec![Ok("data: single".to_string())]);
         let (usage_tx, usage_rx) = oneshot::channel();
         let mut stream = NativeStream::<CountingNativeFormat>::new(
