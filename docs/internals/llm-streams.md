@@ -72,7 +72,7 @@ Whenever a transformed hub chunk carries `usage`, the stream copies `prompt_toke
 
 `BridgedStream` reports those latest hub totals through a oneshot channel on both normal completion and premature drop. It only fills fields that were actually observed in the hub stream, and it derives `total_tokens` when both sides are known.
 
-`NativeStream` exposes the same completion and drop hook, but today it can only send an empty `Usage` value because there is not yet a generic trait hook for reading native usage totals back out of `NativeStreamState`.
+`NativeStream` exposes the same completion and drop hook through `ChatFormat::native_usage()`. Formats that do not override that hook still send an empty `Usage` value, but native-capable formats can now report their own accumulated usage snapshot without coupling the generic stream adapter to any one state shape.
 
 ## Stream State
 
@@ -90,9 +90,9 @@ Those metadata fields are required because some providers only emit response ide
 
 This implementation is intentionally narrow.
 
-- only the SSE reader is implemented in this slice
+- only the SSE reader kind is implemented in this slice
 - `JsonArrayStream` and `AwsEventStream` readers are still future work
 - the legacy providers under `src/providers/` still keep their own SSE splitting logic
-- native usage reporting is not yet extracted generically from `NativeStreamState`
+- no production native format has started overriding `ChatFormat::native_usage()` yet
 
 That keeps the stream-layer work focused on buffering correctness, polling order, and handoff between provider, hub, and format-specific stream representations.

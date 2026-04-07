@@ -7,7 +7,7 @@ use crate::gateway::{
     error::{GatewayError, Result},
     traits::{NativeHandler, ProviderCapabilities},
     types::{
-        common::BridgeContext,
+        common::{BridgeContext, Usage},
         openai::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
     },
 };
@@ -84,6 +84,11 @@ pub trait ChatFormat: Send + Sync + 'static {
         raw: &str,
         state: &mut Self::NativeStreamState,
     ) -> Result<Vec<Self::StreamChunk>>;
+
+    /// Snapshot native usage accumulated while processing a native stream.
+    fn native_usage(_state: &Self::NativeStreamState) -> Usage {
+        Usage::default()
+    }
 
     /// Parse a native non-streaming response into this format.
     fn parse_native_response(native: &NativeHandler<'_>, body: Value) -> Result<Self::Response>

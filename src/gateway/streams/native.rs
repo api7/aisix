@@ -22,10 +22,9 @@ use crate::gateway::{
 /// adapters, it preserves ordering when one raw line expands into multiple
 /// output items by queueing the remainder in `buffer`.
 ///
-/// Usage reporting is still wired through `usage_tx`, but the current generic
-/// native stream layer does not yet expose a format-independent way to read
-/// accumulated native usage from `NativeStreamState`, so completion and drop
-/// currently report an empty `Usage` value.
+/// Usage reporting is wired through `usage_tx` by asking the format for a
+/// snapshot via `ChatFormat::native_usage()`. Formats that do not override that
+/// hook still report an empty `Usage` value.
 #[pin_project(PinnedDrop)]
 pub struct NativeStream<F: ChatFormat> {
     #[pin]
@@ -54,9 +53,9 @@ impl<F: ChatFormat> NativeStream<F> {
         }
     }
 
-    fn send_usage(usage_tx: &mut Option<oneshot::Sender<Usage>>) {
+    fn send_usage(usage_tx: &mut Option<oneshot::Sender<Usage>>, usage: Usage) {
         if let Some(tx) = usage_tx.take() {
-            let _ = tx.send(Usage::default());
+            let _ = tx.send(usage);
         }
     }
 }
@@ -99,7 +98,8 @@ impl<F: ChatFormat> Stream for NativeStream<F> {
                 Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
                 Poll::Ready(None) => {
                     *this.ended = true;
-                    Self::send_usage(this.usage_tx);
+                    let usage = F::native_usage(this.native_state);
+                    Self::send_usage(this.usage_tx, usage);
                     return Poll::Ready(None);
                 }
                 Poll::Pending => return Poll::Pending,
@@ -112,7 +112,8 @@ impl<F: ChatFormat> Stream for NativeStream<F> {
 impl<F: ChatFormat> PinnedDrop for NativeStream<F> {
     fn drop(self: Pin<&mut Self>) {
         let this = self.project();
-        NativeStream::<F>::send_usage(this.usage_tx);
+        let usage = F::native_usage(this.native_state);
+        NativeStream::<F>::send_usage(this.usage_tx, usage);
     }
 }
 
@@ -130,7 +131,7 @@ mod tests {
         provider_instance::ProviderAuth,
         traits::{ChatFormat, ChatTransform, ProviderCapabilities, ProviderMeta, StreamReaderKind},
         types::{
-            common::BridgeContext,
+            common::{BridgeContext, Usage},
             openai::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
         },
     };
@@ -162,6 +163,12 @@ mod tests {
 
     impl ProviderCapabilities for DummyProvider {}
 
+    #[derive(Default)]
+    struct CountingNativeState {
+        sequence: usize,
+        usage: Usage,
+    }
+
     struct CountingNativeFormat;
 
     impl ChatFormat for CountingNativeFormat {
@@ -169,7 +176,7 @@ mod tests {
         type Response = Value;
         type StreamChunk = String;
         type BridgeState = ();
-        type NativeStreamState = usize;
+        type NativeStreamState = CountingNativeState;
 
         fn name() -> &'static str {
             "counting-native"
@@ -213,19 +220,35 @@ mod tests {
 
             match raw {
                 "data: buffered" => {
-                    *state += 1;
+                    state.sequence += 1;
+                    state.usage = Usage {
+                        input_tokens: Some(3),
+                        output_tokens: Some(5),
+                        total_tokens: Some(8),
+                        ..Default::default()
+                    };
                     Ok(vec![
-                        format!("native-{}a", *state),
-                        format!("native-{}b", *state),
+                        format!("native-{}a", state.sequence),
+                        format!("native-{}b", state.sequence),
                     ])
                 }
                 "data: skip" => Ok(vec![]),
                 "data: single" => {
-                    *state += 1;
-                    Ok(vec![format!("native-{state}")])
+                    state.sequence += 1;
+                    state.usage = Usage {
+                        input_tokens: Some(5),
+                        output_tokens: Some(8),
+                        total_tokens: Some(13),
+                        ..Default::default()
+                    };
+                    Ok(vec![format!("native-{}", state.sequence)])
                 }
                 _ => Ok(vec![]),
             }
+        }
+
+        fn native_usage(state: &Self::NativeStreamState) -> Usage {
+            state.usage.clone()
         }
 
         fn serialize_chunk_payload(chunk: &Self::StreamChunk) -> String {
@@ -253,13 +276,13 @@ mod tests {
         assert!(stream.next().await.is_none());
 
         let usage = usage_rx.await.unwrap();
-        assert!(usage.input_tokens.is_none());
-        assert!(usage.output_tokens.is_none());
-        assert!(usage.total_tokens.is_none());
+        assert_eq!(usage.input_tokens, Some(5));
+        assert_eq!(usage.output_tokens, Some(8));
+        assert_eq!(usage.total_tokens, Some(13));
     }
 
     #[tokio::test]
-    async fn native_stream_drop_sends_empty_usage_signal() {
+    async fn native_stream_drop_reports_partial_native_usage() {
         let raw_stream = futures::stream::iter(vec![Ok("data: single".to_string())]);
         let (usage_tx, usage_rx) = oneshot::channel();
         let mut stream = NativeStream::<CountingNativeFormat>::new(
@@ -273,8 +296,8 @@ mod tests {
         drop(stream);
 
         let usage = usage_rx.await.unwrap();
-        assert!(usage.input_tokens.is_none());
-        assert!(usage.output_tokens.is_none());
-        assert!(usage.total_tokens.is_none());
+        assert_eq!(usage.input_tokens, Some(5));
+        assert_eq!(usage.output_tokens, Some(8));
+        assert_eq!(usage.total_tokens, Some(13));
     }
 }
