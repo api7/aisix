@@ -140,6 +140,8 @@ For OpenAI-compatible providers, the concrete definition can stay very small. Th
 
 `OpenAIDef` remains hand-written because it needs its own default quirk profile, while `DeepSeek` is the first macro-generated provider in the new stack.
 
+`GoogleDef` currently stays on Gemini's OpenAI-compatible endpoint in the staged implementation, so it is also expressed as a small provider definition instead of a native Gemini transform. That keeps the migration incremental while leaving room for a later native Gemini provider.
+
 `AnthropicDef` is the first hand-written non-OpenAI-compatible provider in the new stack. It combines a custom `ChatTransform` with `NativeAnthropicMessagesSupport` so Anthropic Messages requests can bypass the hub format when the caller already speaks the native protocol.
 
 ### Runtime provider instances
