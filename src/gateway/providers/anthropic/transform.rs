@@ -11,7 +11,7 @@ use crate::gateway::{
             AnthropicContent, AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest,
             AnthropicMessagesResponse, AnthropicMetadata, AnthropicStreamEvent, AnthropicTool,
             AnthropicToolChoice, AnthropicUsage, ContentDelta, DeltaUsage, ImageSource,
-            SystemBlock, SystemPrompt,
+            MessageStartUsage, SystemBlock, SystemPrompt,
         },
         openai::{
             ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice,
@@ -109,7 +109,7 @@ pub(crate) fn parse_anthropic_sse_to_openai(
             state.response_id = Some(message.id.clone());
             state.response_model = Some(message.model.clone());
             state.response_created = Some(now_unix_secs());
-            apply_anthropic_usage_to_stream_state(state, &message.usage);
+            apply_anthropic_message_start_usage_to_stream_state(state, &message.usage);
 
             Ok(vec![ChatCompletionChunk {
                 id: message.id,
@@ -580,22 +580,45 @@ fn stream_usage_to_openai_usage_with_cached(
     }
 }
 
-fn apply_anthropic_usage_to_stream_state(state: &mut ChatStreamState, usage: &AnthropicUsage) {
-    state.input_tokens = Some(
-        usage.input_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens,
-    );
-    state.output_tokens = Some(usage.output_tokens);
-    state.cache_creation_input_tokens = Some(usage.cache_creation_input_tokens);
-    state.cache_read_input_tokens = Some(usage.cache_read_input_tokens);
+fn apply_anthropic_message_start_usage_to_stream_state(
+    state: &mut ChatStreamState,
+    usage: &MessageStartUsage,
+) {
+    if let Some(input_tokens) = usage.input_tokens {
+        state.input_tokens = Some(
+            input_tokens
+                + usage.cache_creation_input_tokens.unwrap_or(0)
+                + usage.cache_read_input_tokens.unwrap_or(0),
+        );
+    }
+    if let Some(output_tokens) = usage.output_tokens {
+        state.output_tokens = Some(output_tokens);
+    }
+    if let Some(cache_creation_input_tokens) = usage.cache_creation_input_tokens {
+        state.cache_creation_input_tokens = Some(cache_creation_input_tokens);
+    }
+    if let Some(cache_read_input_tokens) = usage.cache_read_input_tokens {
+        state.cache_read_input_tokens = Some(cache_read_input_tokens);
+    }
 }
 
 fn apply_anthropic_delta_usage_to_stream_state(state: &mut ChatStreamState, usage: &DeltaUsage) {
-    state.input_tokens = Some(
-        usage.input_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens,
-    );
-    state.output_tokens = Some(usage.output_tokens);
-    state.cache_creation_input_tokens = Some(usage.cache_creation_input_tokens);
-    state.cache_read_input_tokens = Some(usage.cache_read_input_tokens);
+    if let Some(input_tokens) = usage.input_tokens {
+        state.input_tokens = Some(
+            input_tokens
+                + usage.cache_creation_input_tokens.unwrap_or(0)
+                + usage.cache_read_input_tokens.unwrap_or(0),
+        );
+    }
+    if let Some(output_tokens) = usage.output_tokens {
+        state.output_tokens = Some(output_tokens);
+    }
+    if let Some(cache_creation_input_tokens) = usage.cache_creation_input_tokens {
+        state.cache_creation_input_tokens = Some(cache_creation_input_tokens);
+    }
+    if let Some(cache_read_input_tokens) = usage.cache_read_input_tokens {
+        state.cache_read_input_tokens = Some(cache_read_input_tokens);
+    }
 }
 
 fn map_anthropic_stop_reason(stop_reason: Option<&str>) -> Option<String> {

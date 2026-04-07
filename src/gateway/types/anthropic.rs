@@ -266,7 +266,22 @@ pub struct MessageStartPayload {
     pub r#type: String,
     pub role: String,
     pub model: String,
-    pub usage: AnthropicUsage,
+    pub usage: MessageStartUsage,
+}
+
+/// Usage reported at `message_start`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MessageStartUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<AnthropicCacheCreation>,
 }
 
 /// Content delta within a `content_block_delta` event.
@@ -291,13 +306,14 @@ pub struct MessageDelta {
 /// Usage reported in `message_delta`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DeltaUsage {
-    pub output_tokens: u32,
-    #[serde(default)]
-    pub input_tokens: u32,
-    #[serde(default)]
-    pub cache_creation_input_tokens: u32,
-    #[serde(default)]
-    pub cache_read_input_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 /// Anthropic API error body.
@@ -460,7 +476,8 @@ mod tests {
         assert_eq!(event.event_type(), "message_start");
         if let AnthropicStreamEvent::MessageStart { message } = &event {
             assert_eq!(message.id, "msg_123");
-            assert_eq!(message.usage.input_tokens, 25);
+            assert_eq!(message.usage.input_tokens, Some(25));
+            assert!(message.usage.output_tokens.is_none());
         } else {
             panic!("Expected MessageStart");
         }
@@ -506,7 +523,8 @@ mod tests {
         assert_eq!(event.event_type(), "message_delta");
         if let AnthropicStreamEvent::MessageDelta { delta, usage } = &event {
             assert_eq!(delta.stop_reason.as_deref(), Some("end_turn"));
-            assert_eq!(usage.output_tokens, 50);
+            assert_eq!(usage.output_tokens, Some(50));
+            assert_eq!(usage.input_tokens, Some(0));
         } else {
             panic!("Expected MessageDelta");
         }

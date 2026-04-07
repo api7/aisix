@@ -1007,10 +1007,10 @@ mod tests {
         assert!(matches!(
             message_delta,
             crate::gateway::types::anthropic::AnthropicStreamEvent::MessageDelta { usage, .. }
-                if usage.input_tokens == 5
-                    && usage.output_tokens == 9
-                    && usage.cache_creation_input_tokens == 0
-                    && usage.cache_read_input_tokens == 2
+                if usage.input_tokens == Some(5)
+                    && usage.output_tokens == Some(9)
+                    && usage.cache_creation_input_tokens == Some(0)
+                    && usage.cache_read_input_tokens == Some(2)
         ));
         assert!(matches!(
             message_stop,
@@ -1164,10 +1164,10 @@ mod tests {
         assert!(matches!(
             message_start,
             crate::gateway::types::anthropic::AnthropicStreamEvent::MessageStart { message }
-                if message.usage.input_tokens == 3
-                    && message.usage.output_tokens == 1
-                    && message.usage.cache_creation_input_tokens == 5
-                    && message.usage.cache_read_input_tokens == 2
+                if message.usage.input_tokens == Some(3)
+                    && message.usage.output_tokens == Some(1)
+                    && message.usage.cache_creation_input_tokens == Some(5)
+                    && message.usage.cache_read_input_tokens == Some(2)
         ));
         assert!(matches!(
             block_start,
@@ -1188,10 +1188,10 @@ mod tests {
         assert!(matches!(
             message_delta,
             crate::gateway::types::anthropic::AnthropicStreamEvent::MessageDelta { usage, .. }
-                if usage.input_tokens == 3
-                    && usage.output_tokens == 4
-                    && usage.cache_creation_input_tokens == 5
-                    && usage.cache_read_input_tokens == 2
+                if usage.input_tokens == Some(3)
+                    && usage.output_tokens == Some(4)
+                    && usage.cache_creation_input_tokens == Some(5)
+                    && usage.cache_read_input_tokens == Some(2)
         ));
         assert!(matches!(
             message_stop,

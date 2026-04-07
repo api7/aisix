@@ -10,7 +10,7 @@ use crate::gateway::{
             AnthropicContent, AnthropicContentBlock, AnthropicMessage, AnthropicMessagesRequest,
             AnthropicMessagesResponse, AnthropicStreamEvent, AnthropicTool, AnthropicToolChoice,
             AnthropicUsage, CacheControl, ContentDelta, DeltaUsage, ImageSource, MessageDelta,
-            MessageStartPayload, SystemPrompt,
+            MessageStartPayload, MessageStartUsage, SystemPrompt,
         },
         common::{AnthropicMessagesExtras, BridgeContext, Usage},
         openai::{
@@ -33,10 +33,10 @@ pub struct AnthropicBridgeState {
     current_block_type: Option<AnthropicBlockType>,
     current_block_open: bool,
     stop_reason: Option<String>,
-    input_tokens: u32,
-    output_tokens: u32,
-    cache_creation_input_tokens: u32,
-    cache_read_input_tokens: u32,
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+    cache_creation_input_tokens: Option<u32>,
+    cache_read_input_tokens: Option<u32>,
     tool_block_map: HashMap<usize, usize>,
 }
 
@@ -650,15 +650,20 @@ fn anthropic_usage_to_common_usage(usage: &AnthropicUsage) -> Usage {
 }
 
 fn anthropic_delta_usage_to_common_usage(usage: &DeltaUsage) -> Usage {
-    let input_tokens =
-        usage.input_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens;
+    let input_tokens = usage.input_tokens.map(|input_tokens| {
+        input_tokens
+            + usage.cache_creation_input_tokens.unwrap_or(0)
+            + usage.cache_read_input_tokens.unwrap_or(0)
+    });
 
     Usage {
-        input_tokens: Some(input_tokens),
-        output_tokens: Some(usage.output_tokens),
-        total_tokens: Some(input_tokens + usage.output_tokens),
-        cache_creation_input_tokens: Some(usage.cache_creation_input_tokens),
-        cache_read_input_tokens: Some(usage.cache_read_input_tokens),
+        input_tokens,
+        output_tokens: usage.output_tokens,
+        total_tokens: input_tokens
+            .zip(usage.output_tokens)
+            .map(|(input_tokens, output_tokens)| input_tokens + output_tokens),
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
         ..Default::default()
     }
 }
@@ -669,12 +674,37 @@ fn update_native_usage_from_event(
 ) {
     match event {
         AnthropicStreamEvent::MessageStart { message } => {
-            state.usage = anthropic_usage_to_common_usage(&message.usage);
+            state
+                .usage
+                .merge(&anthropic_message_start_usage_to_common_usage(
+                    &message.usage,
+                ));
         }
         AnthropicStreamEvent::MessageDelta { usage, .. } => {
-            state.usage = anthropic_delta_usage_to_common_usage(usage);
+            state
+                .usage
+                .merge(&anthropic_delta_usage_to_common_usage(usage));
         }
         _ => {}
+    }
+}
+
+fn anthropic_message_start_usage_to_common_usage(usage: &MessageStartUsage) -> Usage {
+    let input_tokens = usage.input_tokens.map(|input_tokens| {
+        input_tokens
+            + usage.cache_creation_input_tokens.unwrap_or(0)
+            + usage.cache_read_input_tokens.unwrap_or(0)
+    });
+
+    Usage {
+        input_tokens,
+        output_tokens: usage.output_tokens,
+        total_tokens: input_tokens
+            .zip(usage.output_tokens)
+            .map(|(input_tokens, output_tokens)| input_tokens + output_tokens),
+        cache_creation_input_tokens: usage.cache_creation_input_tokens,
+        cache_read_input_tokens: usage.cache_read_input_tokens,
+        ..Default::default()
     }
 }
 
@@ -751,10 +781,10 @@ fn anthropic_bridge_state_machine(
             .as_ref()
             .and_then(|details| details.cached_tokens)
             .unwrap_or(0);
-        state.input_tokens = usage.prompt_tokens.saturating_sub(cached_tokens);
-        state.output_tokens = usage.completion_tokens;
-        state.cache_creation_input_tokens = 0;
-        state.cache_read_input_tokens = cached_tokens;
+        state.input_tokens = Some(usage.prompt_tokens.saturating_sub(cached_tokens));
+        state.output_tokens = Some(usage.completion_tokens);
+        state.cache_creation_input_tokens = Some(0);
+        state.cache_read_input_tokens = Some(cached_tokens);
     }
 
     let Some(choice) = chunk.choices.first() else {
@@ -786,7 +816,7 @@ fn anthropic_bridge_state_machine(
                 r#type: "message".into(),
                 role: "assistant".into(),
                 model: chunk.model.clone(),
-                usage: AnthropicUsage {
+                usage: MessageStartUsage {
                     input_tokens: state.input_tokens,
                     output_tokens: state.output_tokens,
                     cache_creation_input_tokens: state.cache_creation_input_tokens,
@@ -1056,7 +1086,9 @@ mod tests {
         assert!(matches!(
             &events[0],
             crate::gateway::types::anthropic::AnthropicStreamEvent::MessageStart { message }
-                if message.id == "chatcmpl-123" && message.usage.input_tokens == 0
+                if message.id == "chatcmpl-123"
+                    && message.usage.input_tokens.is_none()
+                    && message.usage.output_tokens.is_none()
         ));
         assert!(matches!(
             &events[1],
@@ -1091,10 +1123,10 @@ mod tests {
             &end_events[1],
             crate::gateway::types::anthropic::AnthropicStreamEvent::MessageDelta { delta, usage }
                 if delta.stop_reason.is_none()
-                    && usage.input_tokens == 5
-                    && usage.output_tokens == 9
-                    && usage.cache_creation_input_tokens == 0
-                    && usage.cache_read_input_tokens == 2
+                    && usage.input_tokens == Some(5)
+                    && usage.output_tokens == Some(9)
+                    && usage.cache_creation_input_tokens == Some(0)
+                    && usage.cache_read_input_tokens == Some(2)
         ));
         assert!(matches!(
             &end_events[2],
