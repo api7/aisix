@@ -1,20 +1,24 @@
 # LLM Stream Core
 
-This document describes the first part of the Layer 3 stream pipeline.
+This document describes the current Layer 3 stream pipeline.
 
-The current implementation introduces two building blocks:
+The current implementation introduces four building blocks:
 
 - `sse_reader` in `gateway::streams::reader`
 - `HubChunkStream` in `gateway::streams::hub`
+- `BridgedStream` in `gateway::streams::bridged`
+- `NativeStream` in `gateway::streams::native`
 
 ## Scope
 
-This slice only covers the hub-facing stream foundation.
+This slice now covers both hub-facing and native stream adapters.
 
 - `sse_reader` turns a byte stream into complete SSE lines.
 - `HubChunkStream` turns provider stream lines into hub `ChatCompletionChunk` values.
+- `BridgedStream` turns hub chunks into a concrete `ChatFormat` stream.
+- `NativeStream` bypasses hub chunks and lets a `ChatFormat` decode native provider stream lines directly.
 
-`BridgedStream` and `NativeStream` are intentionally deferred to later steps.
+Gateway request execution still sits in a later step, but the reusable stream adapters are now in place.
 
 ## `sse_reader`
 
@@ -41,11 +45,32 @@ Its polling behavior is deliberately ordered:
 
 That fixes the earlier class of bug where a provider transform could return multiple chunks for one raw input line and only the first chunk would be observed.
 
+## `BridgedStream`
+
+`BridgedStream` sits one layer above `HubChunkStream`.
+
+Its behavior mirrors the hub adapter:
+
+1. drain any already buffered format-specific chunks
+2. poll `HubChunkStream` only when that buffer is empty
+3. call `ChatFormat::from_hub_stream()` for each hub chunk
+4. return the first bridged chunk immediately and queue the rest
+
+When the hub stream ends, `BridgedStream` also calls `ChatFormat::stream_end_events()` so formats can emit explicit terminators such as final SSE events.
+
+## `NativeStream`
+
+`NativeStream` is the direct counterpart for native-format paths.
+
+Instead of going through hub `ChatCompletionChunk` values, it passes each raw provider stream line to `ChatFormat::transform_native_stream_chunk()`. Buffering rules are the same: if one input line expands into multiple output items, the adapter returns the first one immediately and preserves the rest for later polls.
+
 ## Usage Accumulation
 
-`HubChunkStream` also centralizes usage tracking.
+`HubChunkStream` still centralizes hub-token tracking.
 
 Whenever a transformed hub chunk carries `usage`, the stream copies `prompt_tokens` and `completion_tokens` into `ChatStreamState`. This keeps token accounting outside individual provider transforms while still making the latest usage totals available to later pipeline stages.
+
+`BridgedStream` reports those latest hub totals through a oneshot channel on both normal completion and premature drop. `NativeStream` exposes the same completion and drop hook, but today it can only send an empty `Usage` value because there is not yet a generic trait hook for reading native usage totals back out of `NativeStreamState`.
 
 ## Stream State
 
@@ -65,6 +90,7 @@ This implementation is intentionally narrow.
 
 - only the SSE reader is implemented in this slice
 - `JsonArrayStream` and `AwsEventStream` readers are still future work
-- no format bridging happens here yet; this stream only produces hub chunks
+- the legacy providers under `src/providers/` still keep their own SSE splitting logic
+- native usage reporting is not yet extracted generically from `NativeStreamState`
 
-That keeps the first stream-layer step focused on correctness of buffering, polling order, and usage propagation.
+That keeps the stream-layer work focused on buffering correctness, polling order, and handoff between provider, hub, and format-specific stream representations.
