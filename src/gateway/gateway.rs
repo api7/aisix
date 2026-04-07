@@ -1,12 +1,15 @@
-use std::time::Duration;
+use std::{pin::Pin, time::Duration};
 
+use futures::Stream;
 use http::StatusCode;
 use serde_json::Value;
+use tokio::sync::oneshot;
 
 use crate::gateway::{
     error::{GatewayError, Result},
     formats::OpenAIChatFormat,
     provider_instance::{ProviderInstance, ProviderRegistry},
+    streams::{BridgedStream, HubChunkStream, NativeStream, sse_reader},
     traits::{ChatFormat, NativeHandler},
     types::{
         common::Usage,
@@ -48,18 +51,27 @@ impl Gateway {
         request: &F::Request,
         instance: &ProviderInstance,
     ) -> Result<ChatResponse<F>> {
-        if F::is_stream(request) {
-            return Err(GatewayError::Validation(format!(
-                "streaming requests for format {} are not implemented yet",
-                F::name()
-            )));
-        }
+        let stream = F::is_stream(request);
 
         if let Some(native) = F::native_support(instance.def.as_ref()) {
-            return self.call_chat_native::<F>(&native, instance, request).await;
+            return self
+                .call_chat_native::<F>(&native, instance, request, stream)
+                .await;
         }
 
         let (hub_request, ctx) = F::to_hub(request)?;
+
+        if stream {
+            let hub_stream = self.call_chat_hub_stream(instance, &hub_request).await?;
+            let (usage_tx, usage_rx) = oneshot::channel();
+            let bridged_stream = BridgedStream::<F>::new(hub_stream, ctx, usage_tx);
+
+            return Ok(ChatResponse::Stream {
+                stream: Box::pin(bridged_stream),
+                usage_rx,
+            });
+        }
+
         let hub_response = self.call_chat_hub(instance, &hub_request).await?;
         let usage = extract_chat_usage_from_response(&hub_response).unwrap_or_default();
         let response = F::from_hub(&hub_response, &ctx)?;
@@ -82,8 +94,9 @@ impl Gateway {
         native: &NativeHandler<'_>,
         instance: &ProviderInstance,
         request: &F::Request,
+        stream: bool,
     ) -> Result<ChatResponse<F>> {
-        let (endpoint_path, body) = F::call_native(native, request, false)?;
+        let (endpoint_path, body) = F::call_native(native, request, stream)?;
         let base_url = instance.effective_base_url()?;
         let url = join_url(base_url.as_str(), &endpoint_path);
         let headers = instance.build_headers()?;
@@ -99,6 +112,18 @@ impl Gateway {
 
         if !response.status().is_success() {
             return Err(provider_error(response, instance.def.name()).await);
+        }
+
+        if stream {
+            let raw_chunks =
+                select_chat_stream_reader(instance.def.stream_reader_kind(), response)?;
+            let (usage_tx, usage_rx) = oneshot::channel();
+            let native_stream = NativeStream::<F>::new(raw_chunks, instance.def.clone(), usage_tx);
+
+            return Ok(ChatResponse::Stream {
+                stream: Box::pin(native_stream),
+                usage_rx,
+            });
         }
 
         let body: Value = response.json().await.map_err(GatewayError::Http)?;
@@ -134,6 +159,45 @@ impl Gateway {
 
         let body: Value = response.json().await.map_err(GatewayError::Http)?;
         instance.def.transform_response(body)
+    }
+
+    async fn call_chat_hub_stream(
+        &self,
+        instance: &ProviderInstance,
+        request: &ChatCompletionRequest,
+    ) -> Result<HubChunkStream> {
+        let provider_body = instance.def.transform_request(request)?;
+        let url = instance.build_url(&request.model)?;
+        let headers = instance.build_headers()?;
+
+        let response = self
+            .http_client
+            .post(url)
+            .headers(headers)
+            .json(&provider_body)
+            .send()
+            .await
+            .map_err(GatewayError::Http)?;
+
+        if !response.status().is_success() {
+            return Err(provider_error(response, instance.def.name()).await);
+        }
+
+        let raw_chunks = select_chat_stream_reader(instance.def.stream_reader_kind(), response)?;
+        Ok(HubChunkStream::new(raw_chunks, instance.def.clone()))
+    }
+}
+
+fn select_chat_stream_reader(
+    kind: crate::gateway::traits::StreamReaderKind,
+    response: reqwest::Response,
+) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+    match kind {
+        crate::gateway::traits::StreamReaderKind::Sse => Ok(sse_reader(response.bytes_stream())),
+        other => Err(GatewayError::Validation(format!(
+            "stream reader kind {:?} is not implemented yet",
+            other
+        ))),
     }
 }
 
@@ -191,9 +255,10 @@ mod tests {
     use std::{borrow::Cow, sync::Arc};
 
     use axum::{Json, Router, routing::post};
+    use futures::StreamExt;
     use http::{
         HeaderMap, HeaderValue, StatusCode,
-        header::{AUTHORIZATION, HeaderName},
+        header::{AUTHORIZATION, CONTENT_TYPE, HeaderName},
     };
     use reqwest::Url;
     use serde_json::{Value, json};
@@ -202,14 +267,13 @@ mod tests {
     use super::Gateway;
     use crate::gateway::{
         error::{GatewayError, Result},
-        formats::OpenAIChatFormat,
         provider_instance::{ProviderAuth, ProviderInstance, ProviderRegistry},
         traits::{
             ChatFormat, ChatTransform, NativeHandler, NativeOpenAIResponsesSupport,
             OpenAIResponsesNativeStreamState, ProviderCapabilities, ProviderMeta, StreamReaderKind,
         },
         types::{
-            common::BridgeContext,
+            common::{BridgeContext, Usage},
             openai::{
                 ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
                 responses::{ResponsesApiRequest, ResponsesApiResponse, ResponsesApiStreamEvent},
@@ -225,6 +289,13 @@ mod tests {
     struct NativeTestProvider;
 
     struct DummyNativeFormat;
+
+    #[derive(Default)]
+    struct StreamingNativeState {
+        usage: Usage,
+    }
+
+    struct StreamingNativeFormat;
 
     impl ProviderMeta for HubTestProvider {
         fn name(&self) -> &'static str {
@@ -383,6 +454,107 @@ mod tests {
         }
     }
 
+    impl ChatFormat for StreamingNativeFormat {
+        type Request = Value;
+        type Response = Value;
+        type StreamChunk = Value;
+        type BridgeState = ();
+        type NativeStreamState = StreamingNativeState;
+
+        fn name() -> &'static str {
+            "streaming_native"
+        }
+
+        fn is_stream(req: &Self::Request) -> bool {
+            req.get("stream").and_then(Value::as_bool).unwrap_or(false)
+        }
+
+        fn extract_model(req: &Self::Request) -> &str {
+            req.get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("streaming-native-model")
+        }
+
+        fn to_hub(_req: &Self::Request) -> Result<(ChatCompletionRequest, BridgeContext)> {
+            unreachable!("not used in this test")
+        }
+
+        fn from_hub(
+            _resp: &ChatCompletionResponse,
+            _ctx: &BridgeContext,
+        ) -> Result<Self::Response> {
+            unreachable!("not used in this test")
+        }
+
+        fn from_hub_stream(
+            _chunk: &ChatCompletionChunk,
+            _state: &mut Self::BridgeState,
+            _ctx: &BridgeContext,
+        ) -> Result<Vec<Self::StreamChunk>> {
+            unreachable!("not used in this test")
+        }
+
+        fn native_support(provider: &dyn ProviderCapabilities) -> Option<NativeHandler<'_>>
+        where
+            Self: Sized,
+        {
+            provider
+                .as_native_openai_responses()
+                .map(NativeHandler::OpenAIResponses)
+        }
+
+        fn call_native(
+            _native: &NativeHandler<'_>,
+            request: &Self::Request,
+            stream: bool,
+        ) -> Result<(String, Value)>
+        where
+            Self: Sized,
+        {
+            let path = if stream {
+                "/v1/native-stream"
+            } else {
+                "/v1/native"
+            };
+            Ok((path.into(), request.clone()))
+        }
+
+        fn transform_native_stream_chunk(
+            _provider: &dyn ProviderCapabilities,
+            raw: &str,
+            state: &mut Self::NativeStreamState,
+        ) -> Result<Vec<Self::StreamChunk>> {
+            match raw {
+                "data: buffered" => Ok(vec![json!({"value": "first"}), json!({"value": "second"})]),
+                "data: usage" => {
+                    state.usage = Usage {
+                        input_tokens: Some(5),
+                        output_tokens: Some(8),
+                        total_tokens: Some(13),
+                        ..Default::default()
+                    };
+                    Ok(vec![])
+                }
+                _ => Ok(vec![]),
+            }
+        }
+
+        fn parse_native_response(_native: &NativeHandler<'_>, body: Value) -> Result<Self::Response>
+        where
+            Self: Sized,
+        {
+            Ok(body)
+        }
+
+        fn native_usage(state: &Self::NativeStreamState) -> Usage {
+            state.usage.clone()
+        }
+
+        fn serialize_chunk_payload(chunk: &Self::StreamChunk) -> String {
+            serde_json::to_string(chunk).unwrap()
+        }
+    }
+
     #[tokio::test]
     async fn chat_completion_uses_hub_path_and_extracts_usage() {
         let observed: Arc<Mutex<ObservedRequest>> = Arc::new(Mutex::new(None));
@@ -520,12 +692,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_rejects_streaming_requests_until_streaming_is_implemented() {
+    async fn chat_completion_streams_hub_chunks_and_reports_usage() {
+        let sse_body = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::to_string(&json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "gpt-test",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": "hello from stream"
+                    },
+                    "finish_reason": null
+                }]
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "gpt-test",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 9,
+                    "total_tokens": 16
+                }
+            }))
+            .unwrap(),
+        );
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let sse_body = sse_body.clone();
+                async move {
+                    http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(axum::body::Body::from(sse_body))
+                        .unwrap()
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
         let gateway = Gateway::new(ProviderRegistry::builder().build());
         let instance = ProviderInstance {
             def: Arc::new(HubTestProvider),
-            auth: ProviderAuth::None,
-            base_url_override: None,
+            auth: ProviderAuth::ApiKey("hub-secret".into()),
+            base_url_override: Some(base_url),
             custom_headers: HeaderMap::new(),
         };
         let request: ChatCompletionRequest = serde_json::from_value(json!({
@@ -535,12 +753,87 @@ mod tests {
         }))
         .unwrap();
 
-        let result = gateway.chat_completion(&request, &instance).await;
-        assert!(matches!(
-            result,
-            Err(GatewayError::Validation(message))
-                if message.contains("streaming requests") && message.contains(OpenAIChatFormat::name())
-        ));
+        let response = gateway.chat_completion(&request, &instance).await.unwrap();
+        let ChatResponse::Stream {
+            mut stream,
+            usage_rx,
+        } = response
+        else {
+            panic!("expected streaming response")
+        };
+
+        let first = stream.next().await.unwrap().unwrap();
+        let usage_chunk = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+
+        assert_eq!(
+            first.choices[0].delta.content.as_deref(),
+            Some("hello from stream")
+        );
+        assert_eq!(usage_chunk.usage.as_ref().unwrap().total_tokens, 16);
+
+        let usage = usage_rx.await.unwrap();
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(9));
+        assert_eq!(usage.total_tokens, Some(16));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_streams_native_chunks_and_reports_usage() {
+        let router = Router::new().route(
+            "/v1/native-stream",
+            post(|| async {
+                http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from("data: buffered\n\ndata: usage\n\n"))
+                    .unwrap()
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(NativeTestProvider),
+            auth: ProviderAuth::ApiKey("native-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request = json!({
+            "model": "native-model",
+            "stream": true
+        });
+
+        let response = gateway
+            .chat::<StreamingNativeFormat>(&request, &instance)
+            .await
+            .unwrap();
+        let ChatResponse::Stream {
+            mut stream,
+            usage_rx,
+        } = response
+        else {
+            panic!("expected streaming response")
+        };
+
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            json!({"value": "first"})
+        );
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            json!({"value": "second"})
+        );
+        assert!(stream.next().await.is_none());
+
+        let usage = usage_rx.await.unwrap();
+        assert_eq!(usage.input_tokens, Some(5));
+        assert_eq!(usage.output_tokens, Some(8));
+        assert_eq!(usage.total_tokens, Some(13));
+
+        server.abort();
     }
 
     #[tokio::test]
