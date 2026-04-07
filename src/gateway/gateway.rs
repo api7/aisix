@@ -867,6 +867,7 @@ mod tests {
         let request: AnthropicMessagesRequest = serde_json::from_value(json!({
             "model": "gpt-test",
             "max_tokens": 256,
+            "top_k": 5,
             "system": "You are helpful.",
             "messages": [{"role": "user", "content": "hello"}],
             "metadata": {"user_id": "user-123"}
@@ -898,6 +899,55 @@ mod tests {
         assert_eq!(observed.1["messages"][0]["role"], "system");
         assert_eq!(observed.1["messages"][1]["role"], "user");
         assert_eq!(observed.1["user"], "user-123");
+        assert_eq!(observed.1["top_k"], 5);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messages_reject_hub_streaming_before_dispatch() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_clone = Arc::clone(&request_count);
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let request_count = Arc::clone(&request_count_clone);
+                async move {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "id": "chatcmpl-789",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": "gpt-test",
+                        "choices": []
+                    }))
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(HubTestProvider),
+            auth: ProviderAuth::ApiKey("hub-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-test",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .unwrap();
+
+        let result = gateway.messages(&request, &instance).await;
+        assert!(matches!(
+            result,
+            Err(GatewayError::Bridge(message))
+                if message.contains("hub streaming bridge")
+        ));
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
 
         server.abort();
     }

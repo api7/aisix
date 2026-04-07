@@ -45,6 +45,11 @@ impl ChatFormat for AnthropicMessagesFormat {
         for message in &req.messages {
             messages.extend(anthropic_message_to_hub_messages(message)?);
         }
+        if req.stream.unwrap_or(false) {
+            return Err(GatewayError::Bridge(
+                "Anthropic messages hub streaming bridge is not implemented yet".into(),
+            ));
+        }
 
         let metadata = req
             .metadata
@@ -60,33 +65,31 @@ impl ChatFormat for AnthropicMessagesFormat {
                 system_cache_control,
             });
         }
+        let mut hub_request = ChatCompletionRequest {
+            messages,
+            model: req.model.clone(),
+            max_tokens: Some(req.max_tokens),
+            stop: stop_sequences_to_openai(req.stop_sequences.as_ref()),
+            stream: req.stream,
+            temperature: req.temperature,
+            top_p: req.top_p,
+            tools: req
+                .tools
+                .as_ref()
+                .map(|tools| anthropic_tools_to_openai(tools))
+                .transpose()?,
+            tool_choice: anthropic_tool_choice_to_openai(req.tool_choice.as_ref())?,
+            user: req
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.user_id.clone()),
+            ..Default::default()
+        };
         if let Some(top_k) = req.top_k {
-            ctx.passthrough.insert("top_k".into(), json!(top_k));
+            hub_request.extra.insert("top_k".into(), json!(top_k));
         }
 
-        Ok((
-            ChatCompletionRequest {
-                messages,
-                model: req.model.clone(),
-                max_tokens: Some(req.max_tokens),
-                stop: stop_sequences_to_openai(req.stop_sequences.as_ref()),
-                stream: req.stream,
-                temperature: req.temperature,
-                top_p: req.top_p,
-                tools: req
-                    .tools
-                    .as_ref()
-                    .map(|tools| anthropic_tools_to_openai(tools))
-                    .transpose()?,
-                tool_choice: anthropic_tool_choice_to_openai(req.tool_choice.as_ref())?,
-                user: req
-                    .metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.user_id.clone()),
-                ..Default::default()
-            },
-            ctx,
-        ))
+        Ok((hub_request, ctx))
     }
 
     fn from_hub(resp: &ChatCompletionResponse, _ctx: &BridgeContext) -> Result<Self::Response> {
@@ -665,8 +668,7 @@ mod tests {
             }],
             "tool_choice": {"type": "auto"},
             "top_k": 5,
-            "stop_sequences": ["DONE"],
-            "stream": true
+            "stop_sequences": ["DONE"]
         }))
         .unwrap();
 
@@ -680,15 +682,33 @@ mod tests {
         assert_eq!(hub.messages[1].role, "assistant");
         assert_eq!(hub.messages[2].role, "tool");
         assert_eq!(hub.messages[2].tool_call_id.as_deref(), Some("tool_1"));
+        assert_eq!(hub.extra["top_k"], 5);
         assert!(
             matches!(hub.tool_choice, Some(crate::gateway::types::openai::ToolChoice::Mode(ref mode)) if mode == "auto")
         );
         assert_eq!(hub.tools.as_ref().unwrap()[0].function.name, "get_weather");
-        assert_eq!(ctx.passthrough["top_k"], 5);
 
         let extras = ctx.anthropic_messages_extras.unwrap();
         assert_eq!(extras.metadata.unwrap()["user_id"], "user-123");
         assert_eq!(extras.system_cache_control.unwrap().r#type, "ephemeral");
+    }
+
+    #[test]
+    fn request_to_hub_rejects_streaming_until_hub_stream_bridge_lands() {
+        let request: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .unwrap();
+
+        let result = AnthropicMessagesFormat::to_hub(&request);
+        assert!(matches!(
+            result,
+            Err(GatewayError::Bridge(message))
+                if message.contains("hub streaming bridge")
+        ));
     }
 
     #[test]
