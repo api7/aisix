@@ -18,6 +18,9 @@ pub struct AnthropicMessagesRequest {
     pub max_tokens: u32,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<SystemPrompt>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -66,6 +69,8 @@ pub struct SystemBlock {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CacheControl {
     pub r#type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
 }
 
 /// Anthropic request metadata.
@@ -102,13 +107,19 @@ pub enum AnthropicContentBlock {
     },
 
     #[serde(rename = "image")]
-    Image { source: ImageSource },
+    Image {
+        source: ImageSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
 
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
         name: String,
         input: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
 
     #[serde(rename = "tool_result")]
@@ -118,6 +129,8 @@ pub enum AnthropicContentBlock {
         content: Option<AnthropicContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
 }
 
@@ -168,12 +181,25 @@ pub struct AnthropicMessagesResponse {
 /// Anthropic usage metrics.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AnthropicUsage {
+    #[serde(default)]
     pub input_tokens: u32,
+    #[serde(default)]
     pub output_tokens: u32,
     #[serde(default)]
     pub cache_creation_input_tokens: u32,
     #[serde(default)]
     pub cache_read_input_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<AnthropicCacheCreation>,
+}
+
+/// Optional detailed cache creation breakdown returned by newer Claude APIs.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AnthropicCacheCreation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_5m_input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_1h_input_tokens: Option<u32>,
 }
 
 // ── Streaming event types ──
@@ -240,13 +266,22 @@ pub struct MessageStartPayload {
     pub r#type: String,
     pub role: String,
     pub model: String,
-    pub usage: InputUsage,
+    pub usage: MessageStartUsage,
 }
 
-/// Input usage reported at message start.
+/// Usage reported at `message_start`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct InputUsage {
-    pub input_tokens: u32,
+pub struct MessageStartUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<AnthropicCacheCreation>,
 }
 
 /// Content delta within a `content_block_delta` event.
@@ -271,9 +306,14 @@ pub struct MessageDelta {
 /// Usage reported in `message_delta`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DeltaUsage {
-    pub output_tokens: u32,
-    #[serde(default)]
-    pub input_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 /// Anthropic API error body.
@@ -337,6 +377,23 @@ mod tests {
         } else {
             panic!("Expected system blocks");
         }
+    }
+
+    #[test]
+    fn request_with_top_level_cache_control_and_ttl() {
+        let json = json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 1024,
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+
+        let req: AnthropicMessagesRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.cache_control.as_ref().unwrap().r#type, "ephemeral");
+        assert_eq!(
+            req.cache_control.as_ref().unwrap().ttl.as_deref(),
+            Some("1h")
+        );
     }
 
     #[test]
@@ -419,7 +476,8 @@ mod tests {
         assert_eq!(event.event_type(), "message_start");
         if let AnthropicStreamEvent::MessageStart { message } = &event {
             assert_eq!(message.id, "msg_123");
-            assert_eq!(message.usage.input_tokens, 25);
+            assert_eq!(message.usage.input_tokens, Some(25));
+            assert!(message.usage.output_tokens.is_none());
         } else {
             panic!("Expected MessageStart");
         }
@@ -465,7 +523,8 @@ mod tests {
         assert_eq!(event.event_type(), "message_delta");
         if let AnthropicStreamEvent::MessageDelta { delta, usage } = &event {
             assert_eq!(delta.stop_reason.as_deref(), Some("end_turn"));
-            assert_eq!(usage.output_tokens, 50);
+            assert_eq!(usage.output_tokens, Some(50));
+            assert_eq!(usage.input_tokens, Some(0));
         } else {
             panic!("Expected MessageDelta");
         }

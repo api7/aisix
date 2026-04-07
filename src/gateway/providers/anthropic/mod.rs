@@ -164,7 +164,7 @@ mod tests {
         let events = provider
             .transform_anthropic_messages_stream_chunk(
                 r#"data: {"type":"ping"}"#,
-                &mut AnthropicMessagesNativeStreamState,
+                &mut AnthropicMessagesNativeStreamState::default(),
             )
             .unwrap();
 

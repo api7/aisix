@@ -7,13 +7,16 @@ use crate::gateway::{
     traits::provider::ChatTransform,
     types::{
         anthropic::{AnthropicMessagesRequest, AnthropicMessagesResponse, AnthropicStreamEvent},
+        common::Usage,
         openai::responses::{ResponsesApiRequest, ResponsesApiResponse, ResponsesApiStreamEvent},
     },
 };
 
 /// Stateful data for native Anthropic Messages streaming transforms.
 #[derive(Debug, Clone, Default)]
-pub struct AnthropicMessagesNativeStreamState;
+pub struct AnthropicMessagesNativeStreamState {
+    pub usage: Usage,
+}
 
 /// Stateful data for native OpenAI Responses streaming transforms.
 #[derive(Debug, Clone, Default)]

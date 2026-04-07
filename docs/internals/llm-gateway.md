@@ -63,10 +63,10 @@ The sequence is:
 
 1. `F::call_native()` chooses the endpoint path and request body
 2. `Gateway::call_chat_native()` executes the HTTP POST against the provider instance base URL
-3. for complete calls, `F::parse_native_response()` parses the JSON response into `F::Response`
+3. for complete calls, `F::parse_native_response()` parses the JSON response into `F::Response`, then `F::response_usage()` can extract a `Usage` snapshot from that typed response
 4. for stream calls, `NativeStream<F>` converts provider-native chunks into `F::StreamChunk` and sends final `Usage` through a oneshot channel
 
-The gateway currently returns `Usage::default()` for native complete calls because there is not yet a generic format hook for extracting usage out of arbitrary native response types.
+Native complete calls no longer hard-code `Usage::default()`. Formats can now report native complete-call usage through `ChatFormat::response_usage()`, while formats that keep the default hook still return an empty `Usage` value.
 
 ## `ChatResponse<F>`
 
@@ -97,9 +97,8 @@ This module does not attempt to finish the full Layer 3 design.
 - `SessionStore` is not wired yet
 - `chat_completion()` and `messages()` are implemented as convenience helpers today
 - `responses()` remains deferred until its corresponding format lands
-- `AnthropicMessagesFormat` still rejects non-native hub streaming; only its native provider path can stream today
 - only `StreamReaderKind::Sse` is wired today; `AwsEventStream` and `JsonArrayStream` are still deferred
-- native complete-call usage extraction is still format-specific future work
+- native complete-call usage reporting depends on each format implementing `ChatFormat::response_usage()`; formats that do not override it still return empty usage
 
 ## Why This Slice Exists
 
