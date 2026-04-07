@@ -71,6 +71,7 @@ impl ChatFormat for AnthropicMessagesFormat {
                 "Anthropic top-level cache_control is not supported by hub bridging".into(),
             ));
         }
+        ensure_no_message_cache_controls_for_hub(&req.messages)?;
 
         let (mut messages, system_cache_control) =
             system_prompt_to_hub_messages(req.system.as_ref())?;
@@ -649,11 +650,17 @@ fn anthropic_usage_to_common_usage(usage: &AnthropicUsage) -> Usage {
     }
 }
 
-fn anthropic_delta_usage_to_common_usage(usage: &DeltaUsage) -> Usage {
+fn anthropic_delta_usage_to_common_usage(usage: &DeltaUsage, previous: &Usage) -> Usage {
+    let cache_creation_input_tokens = usage
+        .cache_creation_input_tokens
+        .or(previous.cache_creation_input_tokens);
+    let cache_read_input_tokens = usage
+        .cache_read_input_tokens
+        .or(previous.cache_read_input_tokens);
     let input_tokens = usage.input_tokens.map(|input_tokens| {
         input_tokens
-            + usage.cache_creation_input_tokens.unwrap_or(0)
-            + usage.cache_read_input_tokens.unwrap_or(0)
+            + cache_creation_input_tokens.unwrap_or(0)
+            + cache_read_input_tokens.unwrap_or(0)
     });
 
     Usage {
@@ -683,9 +690,38 @@ fn update_native_usage_from_event(
         AnthropicStreamEvent::MessageDelta { usage, .. } => {
             state
                 .usage
-                .merge(&anthropic_delta_usage_to_common_usage(usage));
+                .merge(&anthropic_delta_usage_to_common_usage(usage, &state.usage));
         }
         _ => {}
+    }
+}
+
+fn ensure_no_message_cache_controls_for_hub(messages: &[AnthropicMessage]) -> Result<()> {
+    for message in messages {
+        let AnthropicContent::Blocks(blocks) = &message.content else {
+            continue;
+        };
+
+        if blocks
+            .iter()
+            .any(|block| anthropic_block_cache_control(block).is_some())
+        {
+            return Err(GatewayError::Bridge(
+                "Anthropic per-block cache_control on user/assistant messages is not supported by hub bridging"
+                    .into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn anthropic_block_cache_control(block: &AnthropicContentBlock) -> Option<&CacheControl> {
+    match block {
+        AnthropicContentBlock::Text { cache_control, .. }
+        | AnthropicContentBlock::Image { cache_control, .. }
+        | AnthropicContentBlock::ToolUse { cache_control, .. }
+        | AnthropicContentBlock::ToolResult { cache_control, .. } => cache_control.as_ref(),
     }
 }
 
@@ -1365,6 +1401,28 @@ mod tests {
         let error = AnthropicMessagesFormat::to_hub(&request).unwrap_err();
         assert!(
             matches!(error, GatewayError::Bridge(message) if message.contains("top-level cache_control"))
+        );
+    }
+
+    #[test]
+    fn to_hub_rejects_non_system_message_cache_control() {
+        let request: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 256,
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "hello",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }]
+        }))
+        .unwrap();
+
+        let error = AnthropicMessagesFormat::to_hub(&request).unwrap_err();
+        assert!(
+            matches!(error, GatewayError::Bridge(message) if message.contains("per-block cache_control"))
         );
     }
 }

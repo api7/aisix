@@ -1113,7 +1113,7 @@ mod tests {
             "event: content_block_stop\n",
             "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
             "event: message_delta\n",
-            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":4,\"input_tokens\":3,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":2}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":4,\"input_tokens\":3}}\n\n",
             "event: message_stop\n",
             "data: {\"type\":\"message_stop\"}\n\n"
         );
@@ -1190,8 +1190,8 @@ mod tests {
             crate::gateway::types::anthropic::AnthropicStreamEvent::MessageDelta { usage, .. }
                 if usage.input_tokens == Some(3)
                     && usage.output_tokens == Some(4)
-                    && usage.cache_creation_input_tokens == Some(5)
-                    && usage.cache_read_input_tokens == Some(2)
+                    && usage.cache_creation_input_tokens.is_none()
+                    && usage.cache_read_input_tokens.is_none()
         ));
         assert!(matches!(
             message_stop,

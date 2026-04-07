@@ -606,8 +606,8 @@ fn apply_anthropic_delta_usage_to_stream_state(state: &mut ChatStreamState, usag
     if let Some(input_tokens) = usage.input_tokens {
         state.input_tokens = Some(
             input_tokens
-                + usage.cache_creation_input_tokens.unwrap_or(0)
-                + usage.cache_read_input_tokens.unwrap_or(0),
+                + state.cache_creation_input_tokens.unwrap_or(0)
+                + state.cache_read_input_tokens.unwrap_or(0),
         );
     }
     if let Some(output_tokens) = usage.output_tokens {
@@ -870,7 +870,7 @@ mod tests {
         )
         .unwrap();
         let finish = parse_anthropic_sse_to_openai(
-            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":11,"input_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":2}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":11,"input_tokens":7}}"#,
             &mut state,
         )
         .unwrap();
