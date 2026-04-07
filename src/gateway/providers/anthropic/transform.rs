@@ -108,7 +108,7 @@ pub(crate) fn parse_anthropic_sse_to_openai(
             state.response_id = Some(message.id.clone());
             state.response_model = Some(message.model.clone());
             state.response_created = Some(now_unix_secs());
-            state.input_tokens = message.usage.input_tokens;
+            state.input_tokens = Some(message.usage.input_tokens);
 
             Ok(vec![ChatCompletionChunk {
                 id: message.id,
@@ -206,10 +206,17 @@ pub(crate) fn parse_anthropic_sse_to_openai(
             }
         },
         AnthropicStreamEvent::MessageDelta { delta, usage } => {
-            state.output_tokens = usage.output_tokens;
+            state.output_tokens = Some(usage.output_tokens);
             if usage.input_tokens > 0 {
-                state.input_tokens = usage.input_tokens;
+                state.input_tokens = Some(usage.input_tokens);
             }
+
+            let usage = match (state.input_tokens, state.output_tokens) {
+                (Some(input_tokens), Some(output_tokens)) => {
+                    Some(stream_usage_to_openai_usage(input_tokens, output_tokens))
+                }
+                _ => None,
+            };
 
             Ok(vec![build_stream_chunk(
                 state,
@@ -219,10 +226,7 @@ pub(crate) fn parse_anthropic_sse_to_openai(
                     tool_calls: None,
                 },
                 map_anthropic_stop_reason(delta.stop_reason.as_deref()),
-                Some(stream_usage_to_openai_usage(
-                    state.input_tokens,
-                    state.output_tokens,
-                )),
+                usage,
             )?])
         }
         AnthropicStreamEvent::ContentBlockStop { .. }
