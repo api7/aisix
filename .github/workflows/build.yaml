@@ -54,16 +54,21 @@ jobs:
       - name: Run Lint
         run: cargo clippy --all-targets --locked -- -D warnings
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # 7.0.0
-        with:
-          name: binary-debug
-          path: target/debug/aisix
+      - name: Build
+        run: cargo build --locked
 
       - name: Run Test
         run: cargo test --locked
 
       - name: Run E2E Test
         run: |
-          pnpm -C tests/e2e install --frozen-lockfile
-          pnpm -C tests/e2e test
+          ls -lah
+          ls -lah target/debug
+          pnpm -C tests install --frozen-lockfile
+          pnpm -C tests test
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # 7.0.0
+        with:
+          name: binary-debug
+          path: target/debug/aisix

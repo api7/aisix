@@ -6,8 +6,8 @@ import {
   bearerAuthHeader,
   extractIdFromStorageKey,
   startIsolatedAdminApp,
-} from '../../utils/admin.js';
-import { App } from '../../utils/setup.js';
+} from '../utils/admin.js';
+import { App } from '../utils/setup.js';
 
 const ADMIN_KEY = 'test_admin_key';
 

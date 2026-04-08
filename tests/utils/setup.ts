@@ -2,6 +2,7 @@ import { ChildProcess, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { unlink, writeFile } from 'node:fs/promises';
 import { Agent as httpsAgent } from 'node:https';
+import path from 'node:path';
 import { text } from 'node:stream/consumers';
 
 import deepmerge from '@fastify/deepmerge';
@@ -10,6 +11,9 @@ import type { PartialDeep } from 'type-fest';
 
 import { client } from './http.js';
 
+export const testRootPath = (subPath: string) => path.resolve(subPath);
+
+const APP_BINARY = testRootPath('../target/debug/aisix');
 export interface AppConfig {
   deployment: {
     etcd: {
@@ -87,7 +91,7 @@ export class App {
 
     await writeFile(path, JSON.stringify(config ?? defaultConfig()));
 
-    const appProcess = spawn('../../target/debug/aisix', ['--config', path]);
+    const appProcess = spawn(APP_BINARY, ['--config', path]);
 
     return new Promise<App>((resolve, reject) => {
       let exited = false;
@@ -156,6 +160,10 @@ export class App {
     } catch {
       this.process.kill('SIGKILL');
     }
-    await unlink(this.configPath);
+    try {
+      await unlink(this.configPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
   }
 }

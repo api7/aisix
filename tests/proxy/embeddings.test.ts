@@ -6,10 +6,10 @@ import {
   adminPost,
   bearerAuthHeader,
   startIsolatedAdminApp,
-} from '../../utils/admin.js';
-import { client } from '../../utils/http.js';
-import { proxyAuthHeader, proxyPost } from '../../utils/proxy.js';
-import { App } from '../../utils/setup.js';
+} from '../utils/admin.js';
+import { client } from '../utils/http.js';
+import { proxyAuthHeader, proxyPost } from '../utils/proxy.js';
+import { App } from '../utils/setup.js';
 
 const ADMIN_KEY = 'test_admin_key_embeddings_proxy';
 const AUTHORIZED_KEY = 'sk-proxy-embeddings-authorized';

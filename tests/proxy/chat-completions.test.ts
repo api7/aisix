@@ -6,23 +6,27 @@ import {
   adminPost,
   bearerAuthHeader,
   startIsolatedAdminApp,
-} from '../../utils/admin.js';
-import { client } from '../../utils/http.js';
+} from '../utils/admin.js';
+import { client } from '../utils/http.js';
+import {
+  MockUpstream,
+  buildOpenAiProviderConfig,
+  buildOpenAiProviderModel,
+  startOpenAiMockUpstream,
+} from '../utils/mock-upstream.js';
 import {
   parseSseDataEvents,
   proxyAuthHeader,
   proxyPost,
-} from '../../utils/proxy.js';
-import { App } from '../../utils/setup.js';
+} from '../utils/proxy.js';
+import { App } from '../utils/setup.js';
 
-const ADMIN_KEY = 'test_admin_key_chat_sim';
-const AUTHORIZED_KEY = 'sk-proxy-sim-authorized';
-const LIMITED_KEY = 'sk-proxy-sim-limited';
+const ADMIN_KEY = 'test_admin_key_chat_proxy';
+const AUTHORIZED_KEY = 'sk-proxy-chat-authorized';
+const LIMITED_KEY = 'sk-proxy-chat-limited';
+const UPSTREAM_API_KEY = 'upstream-key-chat-proxy';
+const UPSTREAM_MODEL = 'test-model';
 const PROXY_CHAT_URL = 'http://127.0.0.1:3000/v1/chat/completions';
-
-// llm-d-inference-sim listens on port 18000 (mapped from container port 8000)
-const SIM_API_BASE = 'http://127.0.0.1:18000/v1';
-const SIM_MODEL = 'sim-model';
 
 const waitConfigPropagation = async () => {
   await new Promise((resolve) => setTimeout(resolve, 500));
@@ -34,40 +38,52 @@ const sdkClient = (apiKey: string) =>
     baseURL: 'http://127.0.0.1:3000/v1',
   });
 
-describe('proxy /v1/chat/completions (llm-d sim)', () => {
+const expectSdkErrorStatus = (err: unknown, expectedStatus: number) => {
+  const status =
+    typeof err === 'object' && err !== null && 'status' in err
+      ? Number((err as { status: unknown }).status)
+      : Number.NaN;
+
+  expect(Number.isFinite(status)).toBe(true);
+  expect(status).toBe(expectedStatus);
+};
+
+describe('proxy /v1/chat/completions', () => {
   let server: App | undefined;
-  let simModelName = '';
+  let upstream: MockUpstream | undefined;
+  let mockModelName = '';
   let restrictedModelName = '';
 
   beforeEach(async () => {
     server = await startIsolatedAdminApp(ADMIN_KEY);
+    upstream = await startOpenAiMockUpstream();
 
-    simModelName = `sim-chat-${randomUUID()}`;
-    restrictedModelName = `sim-chat-restricted-${randomUUID()}`;
+    mockModelName = `mock-chat-${randomUUID()}`;
+    restrictedModelName = `mock-chat-restricted-${randomUUID()}`;
 
-    const simModelResp = await adminPost(
+    const mockModelResp = await adminPost(
       '/models',
       {
-        name: simModelName,
-        model: `openai/${SIM_MODEL}`,
-        provider_config: {
-          api_key: 'unused',
-          api_base: SIM_API_BASE,
-        },
+        name: mockModelName,
+        model: buildOpenAiProviderModel(UPSTREAM_MODEL),
+        provider_config: buildOpenAiProviderConfig(
+          upstream.baseUrl,
+          UPSTREAM_API_KEY,
+        ),
       },
       bearerAuthHeader(ADMIN_KEY),
     );
-    expect(simModelResp.status).toBe(201);
+    expect(mockModelResp.status).toBe(201);
 
     const restrictedModelResp = await adminPost(
       '/models',
       {
         name: restrictedModelName,
-        model: `openai/${SIM_MODEL}`,
-        provider_config: {
-          api_key: 'unused',
-          api_base: SIM_API_BASE,
-        },
+        model: buildOpenAiProviderModel(UPSTREAM_MODEL),
+        provider_config: buildOpenAiProviderConfig(
+          upstream.baseUrl,
+          UPSTREAM_API_KEY,
+        ),
       },
       bearerAuthHeader(ADMIN_KEY),
     );
@@ -77,7 +93,7 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
       '/apikeys',
       {
         key: AUTHORIZED_KEY,
-        allowed_models: [simModelName, restrictedModelName],
+        allowed_models: [mockModelName, restrictedModelName],
       },
       bearerAuthHeader(ADMIN_KEY),
     );
@@ -87,7 +103,7 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
       '/apikeys',
       {
         key: LIMITED_KEY,
-        allowed_models: [simModelName],
+        allowed_models: [mockModelName],
       },
       bearerAuthHeader(ADMIN_KEY),
     );
@@ -96,14 +112,19 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
     await waitConfigPropagation();
   });
 
-  afterEach(async () => await server?.exit());
+  afterEach(async () => {
+    await upstream?.close();
+    await server?.exit();
+  });
 
-  test('authorized sim model returns normal response', async () => {
+  test('authorized upstream-backed model returns normal response', async () => {
     const resp = await proxyPost(
       '/v1/chat/completions',
       {
-        model: simModelName,
-        messages: [{ role: 'user', content: 'hello from sim' }],
+        model: mockModelName,
+        messages: [
+          { role: 'user', content: 'hello from upstream-backed test' },
+        ],
       },
       AUTHORIZED_KEY,
     );
@@ -113,6 +134,31 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
     expect(Array.isArray(resp.data.choices)).toBe(true);
     expect(resp.data.choices[0].message.role).toBe('assistant');
     expect(typeof resp.data.choices[0].message.content).toBe('string');
+    expect(resp.data.choices[0].message.content).toBe(
+      'hello from mock upstream',
+    );
+
+    const recorded = upstream?.takeRecordedRequests() ?? [];
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]?.headers.authorization).toBe(
+      `Bearer ${UPSTREAM_API_KEY}`,
+    );
+    expect(
+      (
+        recorded[0]?.bodyJson as {
+          model: string;
+          messages: Array<{ content: string }>;
+        }
+      ).model,
+    ).toBe(UPSTREAM_MODEL);
+    expect(
+      (
+        recorded[0]?.bodyJson as {
+          model: string;
+          messages: Array<{ content: string }>;
+        }
+      ).messages[0]?.content,
+    ).toBe('hello from upstream-backed test');
   }, 15_000);
 
   test('unauthorized model returns forbidden error', async () => {
@@ -143,7 +189,7 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
 
   test('missing auth header returns 401', async () => {
     const resp = await client.post(PROXY_CHAT_URL, {
-      model: simModelName,
+      model: mockModelName,
       messages: [{ role: 'user', content: 'missing auth' }],
     });
 
@@ -155,10 +201,10 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
     const resp = await proxyPost(
       '/v1/chat/completions',
       {
-        model: simModelName,
+        model: mockModelName,
         messages: [{ role: 'user', content: 'invalid auth' }],
       },
-      'sk-invalid-sim',
+      'sk-invalid-chat',
     );
 
     expect(resp.status).toBe(401);
@@ -182,7 +228,7 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
     const resp = await proxyPost(
       '/v1/chat/completions',
       {
-        model: simModelName,
+        model: mockModelName,
       },
       AUTHORIZED_KEY,
     );
@@ -209,7 +255,7 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
     const resp = await proxyPost(
       '/v1/chat/completions',
       {
-        model: simModelName,
+        model: mockModelName,
         messages: [{ role: 'user', content: 'please echo this sentence' }],
       },
       AUTHORIZED_KEY,
@@ -222,13 +268,13 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
     expect(Array.isArray(resp.data.choices)).toBe(true);
     expect(typeof resp.data.choices[0].index).toBe('number');
     expect(resp.data.choices[0].message.role).toBe('assistant');
-  }, 15_000);
+  });
 
   test('stream response includes [DONE] marker', async () => {
     const resp = await proxyPost(
       '/v1/chat/completions',
       {
-        model: simModelName,
+        model: mockModelName,
         stream: true,
         messages: [{ role: 'user', content: 'stream once' }],
       },
@@ -242,13 +288,13 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
     const events = parseSseDataEvents(String(resp.data));
     expect(events.length).toBeGreaterThan(0);
     expect(events.includes('[DONE]')).toBe(true);
-  }, 15_000);
+  });
 
   test('stream chunks are parseable chat.completion.chunk objects', async () => {
     const resp = await proxyPost(
       '/v1/chat/completions',
       {
-        model: simModelName,
+        model: mockModelName,
         stream: true,
         messages: [{ role: 'user', content: 'stream parse check' }],
       },
@@ -280,13 +326,13 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
         expect(chunk.usage).toBeDefined();
       }
     }
-  }, 15_000);
+  });
 
   test('accepts common optional parameters', async () => {
     const resp = await proxyPost(
       '/v1/chat/completions',
       {
-        model: simModelName,
+        model: mockModelName,
         messages: [{ role: 'user', content: 'optional params test' }],
         max_tokens: 16,
         temperature: 0.2,
@@ -305,7 +351,7 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
     const resp = await proxyPost(
       '/v1/chat/completions',
       {
-        model: simModelName,
+        model: mockModelName,
         messages: [{ role: 'user', content: '你好，测试 emoji 😀 与中文' }],
       },
       AUTHORIZED_KEY,
@@ -313,13 +359,13 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
 
     expect(resp.status).toBe(200);
     expect(resp.data.choices[0].message.role).toBe('assistant');
-  }, 15_000);
+  });
 
   test('response includes numeric usage fields', async () => {
     const resp = await proxyPost(
       '/v1/chat/completions',
       {
-        model: simModelName,
+        model: mockModelName,
         messages: [{ role: 'user', content: 'usage field check' }],
       },
       AUTHORIZED_KEY,
@@ -330,13 +376,13 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
     expect(typeof resp.data.usage.completion_tokens).toBe('number');
     expect(typeof resp.data.usage.total_tokens).toBe('number');
     expect(resp.data.usage.total_tokens).toBeGreaterThan(0);
-  }, 15_000);
+  });
 
   test('OpenAI SDK chat completion request works', async () => {
     const sdk = sdkClient(AUTHORIZED_KEY);
 
     const response = await sdk.chat.completions.create({
-      model: simModelName,
+      model: mockModelName,
       messages: [{ role: 'user', content: 'sdk chat completion test' }],
       temperature: 0,
     });
@@ -346,13 +392,13 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
     expect(response.model.length).toBeGreaterThan(0);
     expect(response.choices[0]?.message.role).toBe('assistant');
     expect(typeof response.usage?.total_tokens).toBe('number');
-  }, 15_000);
+  });
 
   test('OpenAI SDK streaming chat request works', async () => {
     const sdk = sdkClient(AUTHORIZED_KEY);
 
     const stream = await sdk.chat.completions.create({
-      model: simModelName,
+      model: mockModelName,
       messages: [{ role: 'user', content: 'sdk stream completion test' }],
       stream: true,
     });
@@ -371,25 +417,19 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
 
     expect(chunkCount).toBeGreaterThan(0);
     expect(usageChunkCount).toBeGreaterThan(0);
-  }, 15_000);
+  });
 
   test('OpenAI SDK invalid key returns 401', async () => {
     const sdk = sdkClient(`sk-invalid-${randomUUID()}`);
 
     try {
       await sdk.chat.completions.create({
-        model: simModelName,
+        model: mockModelName,
         messages: [{ role: 'user', content: 'sdk invalid key test' }],
       });
       throw new Error('expected sdk request to fail');
     } catch (err) {
-      const status =
-        typeof err === 'object' && err !== null && 'status' in err
-          ? Number((err as { status: unknown }).status)
-          : Number.NaN;
-
-      expect(Number.isFinite(status)).toBe(true);
-      expect(status).toBe(401);
+      expectSdkErrorStatus(err, 401);
     }
   });
 });
