@@ -1,7 +1,13 @@
 import { randomUUID } from 'node:crypto';
 
-import { client } from '../../utils/http.js';
-import { App, defaultConfig } from '../../utils/setup.js';
+import { client } from '../utils/http.js';
+import {
+  MockUpstream,
+  buildOpenAiProviderConfig,
+  buildOpenAiProviderModel,
+  startOpenAiMockUpstream,
+} from '../utils/mock-upstream.js';
+import { App, defaultConfig } from '../utils/setup.js';
 
 const ADMIN_KEY = 'test-admin-key-timeout';
 const PROXY_KEY = 'sk-proxy-timeout';
@@ -11,8 +17,11 @@ const ADMIN_PREFIX = '/aisix/admin';
 
 describe('proxy timeout', () => {
   let server: App | undefined;
+  let upstream: MockUpstream | undefined;
 
   beforeEach(async () => {
+    upstream = await startOpenAiMockUpstream({ responseDelayMs: 200 });
+
     server = await (
       await App.spawn(
         defaultConfig({
@@ -30,8 +39,11 @@ describe('proxy timeout', () => {
       `${ADMIN_URL}${ADMIN_PREFIX}/models`,
       {
         name: 'timeout-model',
-        model: 'mock/mock',
-        provider_config: {},
+        model: buildOpenAiProviderModel('timeout-model'),
+        provider_config: buildOpenAiProviderConfig(
+          upstream.baseUrl,
+          'upstream-key-timeout',
+        ),
         timeout: 50,
       },
       { headers: { Authorization: `Bearer ${ADMIN_KEY}` } },
@@ -52,7 +64,10 @@ describe('proxy timeout', () => {
     await new Promise((resolve) => setTimeout(resolve, 500));
   });
 
-  afterEach(async () => await server?.exit());
+  afterEach(async () => {
+    await upstream?.close();
+    await server?.exit();
+  });
 
   test('chat completion returns 504 when upstream exceeds model timeout', async () => {
     const res = await client.post(

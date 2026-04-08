@@ -1,6 +1,6 @@
-import { ADMIN_BASE_URL, startIsolatedAdminApp } from '../../utils/admin.js';
-import { client } from '../../utils/http.js';
-import { App } from '../../utils/setup.js';
+import { ADMIN_BASE_URL, startIsolatedAdminApp } from '../utils/admin.js';
+import { client } from '../utils/http.js';
+import { App } from '../utils/setup.js';
 
 describe('admin ui', () => {
   let server: App | undefined;

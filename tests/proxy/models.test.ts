@@ -4,9 +4,9 @@ import {
   adminPost,
   bearerAuthHeader,
   startIsolatedAdminApp,
-} from '../../utils/admin.js';
-import { proxyGet } from '../../utils/proxy.js';
-import { App } from '../../utils/setup.js';
+} from '../utils/admin.js';
+import { proxyGet } from '../utils/proxy.js';
+import { App } from '../utils/setup.js';
 
 const ADMIN_KEY = 'test_admin_key_models_proxy';
 const PROXY_KEY = 'sk-proxy-models';

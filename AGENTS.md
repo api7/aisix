@@ -56,8 +56,8 @@ cargo test -- --nocapture              # Show test output
 
 ### E2E Test
 ```bash
-pnpm -C tests/e2e install --frozen-lockfile  # Install e2e dependencies
-pnpm -C tests/e2e test                       # Run all e2e tests
+pnpm -C tests install --frozen-lockfile  # Install e2e dependencies
+pnpm -C tests test                       # Run all e2e tests
 ```
 
 ### Format
@@ -449,7 +449,7 @@ GitHub Actions workflow (`.github/workflows/build.yaml`):
 5. Build UI (`pnpm -C ui install --frozen-lockfile && pnpm -C ui build`)
 6. `cargo clippy` — Lint (warnings = error)
 7. `cargo test` — Run tests
-8. E2E Test (`pnpm -C tests/e2e install --frozen-lockfile && pnpm -C tests/e2e test`)
+8. E2E Test (`pnpm -C tests install --frozen-lockfile && pnpm -C tests test`)
 9. `cargo build` — Build binary
 10. Upload artifact (debug binary)
 

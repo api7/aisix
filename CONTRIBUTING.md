@@ -178,10 +178,10 @@ The E2E test suite runs the gateway binary directly — it requires:
 cargo build
 
 # Install E2E test dependencies
-pnpm -C tests/e2e install --frozen-lockfile
+pnpm -C tests install --frozen-lockfile
 
 # Run E2E tests
-pnpm -C tests/e2e test
+pnpm -C tests test
 ```
 
 ### Admin UI checks
@@ -297,7 +297,7 @@ fix: handle empty etcd prefix in config loader
    cargo fmt -- --check
    cargo clippy --all-targets --all-features --locked -- -D warnings
    cargo test
-   cargo build && pnpm -C tests/e2e install --frozen-lockfile && pnpm -C tests/e2e test
+  cargo build && pnpm -C tests install --frozen-lockfile && pnpm -C tests test
    ```
 4. Commit using Conventional Commits format.
 5. Open a pull request against `main`. Describe **why** the change is needed, not just what it does.
@@ -314,7 +314,7 @@ The GitHub Actions workflow (`.github/workflows/build.yaml`) runs on every push 
 | Build UI | `pnpm -C ui install --frozen-lockfile && pnpm -C ui build` |
 | Lint | `cargo clippy --all-targets --all-features --locked -- -D warnings` |
 | Test | `cargo test --verbose` |
-| E2E Test | `pnpm -C tests/e2e install --frozen-lockfile && pnpm -C tests/e2e test` |
+| E2E Test | `pnpm -C tests install --frozen-lockfile && pnpm -C tests test` |
 | Build | `cargo build --verbose` |
 
 The CI environment uses `ci/docker-compose.yaml` to start etcd and other required services.

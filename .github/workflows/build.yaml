@@ -65,5 +65,5 @@ jobs:
 
       - name: Run E2E Test
         run: |
-          pnpm -C tests/e2e install --frozen-lockfile
-          pnpm -C tests/e2e test
+          pnpm -C tests install --frozen-lockfile
+          pnpm -C tests test

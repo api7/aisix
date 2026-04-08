@@ -87,7 +87,7 @@ export class App {
 
     await writeFile(path, JSON.stringify(config ?? defaultConfig()));
 
-    const appProcess = spawn('../../target/debug/aisix', ['--config', path]);
+    const appProcess = spawn('../target/debug/aisix', ['--config', path]);
 
     return new Promise<App>((resolve, reject) => {
       let exited = false;

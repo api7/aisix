@@ -1,13 +1,13 @@
 import path from 'node:path';
 
-import { client } from '../utils/http.js';
+import { client } from './utils/http.js';
 import {
   App,
   ERR_UNEXPECTED_EARLY_EXIT,
   defaultConfig,
   randomPort,
   tlsSkipVerify,
-} from '../utils/setup.js';
+} from './utils/setup.js';
 
 const INVALID_LISTEN_ADDR = 'invalid-listen-addr';
 const ERR_PORT_IN_USE = 'Address already in use';
