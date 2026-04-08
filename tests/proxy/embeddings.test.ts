@@ -8,12 +8,20 @@ import {
   startIsolatedAdminApp,
 } from '../utils/admin.js';
 import { client } from '../utils/http.js';
+import {
+  OpenAiMockUpstream,
+  buildOpenAiProviderConfig,
+  buildOpenAiProviderModel,
+  startOpenAiMockUpstream,
+} from '../utils/mock-upstream.js';
 import { proxyAuthHeader, proxyPost } from '../utils/proxy.js';
 import { App } from '../utils/setup.js';
 
 const ADMIN_KEY = 'test_admin_key_embeddings_proxy';
 const AUTHORIZED_KEY = 'sk-proxy-embeddings-authorized';
 const LIMITED_KEY = 'sk-proxy-embeddings-limited';
+const UPSTREAM_API_KEY = 'upstream-key-embeddings';
+const FAILING_UPSTREAM_API_KEY = 'upstream-key-embeddings-failing';
 const PROXY_EMBEDDINGS_URL = 'http://127.0.0.1:3000/v1/embeddings';
 
 const waitConfigPropagation = async () => {
@@ -38,6 +46,8 @@ const expectSdkErrorStatus = (err: unknown, expectedStatus: number) => {
 
 describe('proxy /v1/embeddings', () => {
   let server: App | undefined;
+  let upstream: OpenAiMockUpstream | undefined;
+  let failingUpstream: OpenAiMockUpstream | undefined;
 
   let embeddingModelName = '';
   let forbiddenModelName = '';
@@ -45,6 +55,18 @@ describe('proxy /v1/embeddings', () => {
 
   beforeEach(async () => {
     server = await startIsolatedAdminApp(ADMIN_KEY);
+    upstream = await startOpenAiMockUpstream();
+    failingUpstream = await startOpenAiMockUpstream({
+      embeddings: {
+        status: 500,
+        errorBody: {
+          error: {
+            message: 'mock embeddings upstream error',
+            type: 'mock_embeddings_upstream_error',
+          },
+        },
+      },
+    });
 
     embeddingModelName = `embedding-${randomUUID()}`;
     forbiddenModelName = `embedding-forbidden-${randomUUID()}`;
@@ -54,8 +76,11 @@ describe('proxy /v1/embeddings', () => {
       '/models',
       {
         name: embeddingModelName,
-        model: 'mock/mock',
-        provider_config: {},
+        model: buildOpenAiProviderModel(embeddingModelName),
+        provider_config: buildOpenAiProviderConfig(
+          upstream.apiBase,
+          UPSTREAM_API_KEY,
+        ),
       },
       bearerAuthHeader(ADMIN_KEY),
     );
@@ -65,8 +90,11 @@ describe('proxy /v1/embeddings', () => {
       '/models',
       {
         name: forbiddenModelName,
-        model: 'mock/mock',
-        provider_config: {},
+        model: buildOpenAiProviderModel(forbiddenModelName),
+        provider_config: buildOpenAiProviderConfig(
+          upstream.apiBase,
+          UPSTREAM_API_KEY,
+        ),
       },
       bearerAuthHeader(ADMIN_KEY),
     );
@@ -76,11 +104,11 @@ describe('proxy /v1/embeddings', () => {
       '/models',
       {
         name: failingUpstreamModelName,
-        model: 'openai/failing-embedding-model',
-        provider_config: {
-          api_key: 'invalid-key',
-          api_base: 'http://127.0.0.1:1/v1',
-        },
+        model: buildOpenAiProviderModel(failingUpstreamModelName),
+        provider_config: buildOpenAiProviderConfig(
+          failingUpstream.apiBase,
+          FAILING_UPSTREAM_API_KEY,
+        ),
       },
       bearerAuthHeader(ADMIN_KEY),
     );
@@ -109,7 +137,11 @@ describe('proxy /v1/embeddings', () => {
     await waitConfigPropagation();
   });
 
-  afterEach(async () => await server?.exit());
+  afterEach(async () => {
+    await failingUpstream?.close();
+    await upstream?.close();
+    await server?.exit();
+  });
 
   test('authorized embeddings request returns success response', async () => {
     const resp = await proxyPost(
@@ -132,6 +164,15 @@ describe('proxy /v1/embeddings', () => {
     expect(typeof resp.data.usage.prompt_tokens).toBe('number');
     expect(typeof resp.data.usage.total_tokens).toBe('number');
     expect(resp.data.usage.total_tokens).toBeGreaterThan(0);
+
+    const recorded = upstream?.takeRecordedRequests() ?? [];
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]?.headers.authorization).toBe(
+      `Bearer ${UPSTREAM_API_KEY}`,
+    );
+    expect((recorded[0]?.bodyJson as { model: string }).model).toBe(
+      embeddingModelName,
+    );
   });
 
   test('accessing forbidden embeddings model returns 403', async () => {

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import { client } from '../utils/http.js';
 import {
-  MockUpstream,
+  OpenAiMockUpstream,
   buildOpenAiProviderConfig,
   buildOpenAiProviderModel,
   startOpenAiMockUpstream,
@@ -17,7 +17,7 @@ const ADMIN_PREFIX = '/aisix/admin';
 
 describe('proxy timeout', () => {
   let server: App | undefined;
-  let upstream: MockUpstream | undefined;
+  let upstream: OpenAiMockUpstream | undefined;
 
   beforeEach(async () => {
     upstream = await startOpenAiMockUpstream({ responseDelayMs: 200 });
@@ -41,7 +41,7 @@ describe('proxy timeout', () => {
         name: 'timeout-model',
         model: buildOpenAiProviderModel('timeout-model'),
         provider_config: buildOpenAiProviderConfig(
-          upstream.baseUrl,
+          upstream.apiBase,
           'upstream-key-timeout',
         ),
         timeout: 50,

@@ -1,6 +1,6 @@
 export {
-  MockUpstream,
-  startMockUpstream as startOpenAiMockUpstream,
+  OpenAiMockUpstream,
+  startOpenAiMockUpstream,
   type OpenAiMockUpstreamOptions,
   type RecordedRequest,
 } from '../fixtures/mock-upstream.js';
@@ -8,9 +8,9 @@ export {
 export const buildOpenAiProviderModel = (model: string) => `openai/${model}`;
 
 export const buildOpenAiProviderConfig = (
-  baseUrl: string,
+  apiBase: string,
   apiKey = 'upstream-key',
 ) => ({
   api_key: apiKey,
-  api_base: `${baseUrl}/v1`,
+  api_base: apiBase,
 });

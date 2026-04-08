@@ -1,9 +1,5 @@
 import { once } from 'node:events';
-import {
-  createServer,
-  type IncomingHttpHeaders,
-  type Server,
-} from 'node:http';
+import { type IncomingHttpHeaders, type Server, createServer } from 'node:http';
 import type { AddressInfo, Socket } from 'node:net';
 
 export interface RecordedRequest {
@@ -22,10 +18,24 @@ export interface OpenAiMockUpstreamOptions {
   errorBody?: Record<string, unknown>;
   nonStreamBody?: Record<string, unknown>;
   streamEvents?: Array<Record<string, unknown> | '[DONE]'>;
+  embeddings?: {
+    model?: string;
+    responseDelayMs?: number;
+    status?: number;
+    errorBody?: Record<string, unknown>;
+    body?: Record<string, unknown>;
+  };
 }
 
 const sleep = async (ms: number) =>
   new Promise((resolve) => setTimeout(resolve, ms));
+
+const OPENAI_CHAT_COMPLETION_PATHS = new Set([
+  '/v1/chat/completions',
+  '/chat/completions',
+]);
+
+const OPENAI_EMBEDDINGS_PATHS = new Set(['/v1/embeddings', '/embeddings']);
 
 const readBody = async (req: NodeJS.ReadableStream) => {
   const chunks: Buffer[] = [];
@@ -112,6 +122,24 @@ const defaultStreamEvents = (model: string) => [
   '[DONE]' as const,
 ];
 
+const defaultEmbeddingsBody = (model: string, inputCount: number) => {
+  const dataLength = Math.max(inputCount, 1);
+
+  return {
+    object: 'list',
+    data: Array.from({ length: dataLength }, (_, index) => ({
+      object: 'embedding',
+      embedding: [0.01 + index, 0.02 + index, 0.03 + index, 0.04 + index],
+      index,
+    })),
+    model,
+    usage: {
+      prompt_tokens: dataLength * 3,
+      total_tokens: dataLength * 3,
+    },
+  };
+};
+
 const parseJsonBody = (bodyText: string) => {
   if (!bodyText) {
     return null;
@@ -124,10 +152,7 @@ const parseJsonBody = (bodyText: string) => {
   }
 };
 
-const requestModel = (
-  bodyJson: unknown,
-  fallbackModel: string,
-) => {
+const requestModel = (bodyJson: unknown, fallbackModel: string) => {
   if (
     typeof bodyJson === 'object' &&
     bodyJson !== null &&
@@ -152,13 +177,35 @@ const requestStream = (bodyJson: unknown) => {
   return false;
 };
 
-export class MockUpstream {
+const embeddingInputCount = (bodyJson: unknown) => {
+  if (
+    typeof bodyJson !== 'object' ||
+    bodyJson === null ||
+    !('input' in bodyJson)
+  ) {
+    return 1;
+  }
+
+  const input = (bodyJson as Record<string, unknown>).input;
+  if (Array.isArray(input)) {
+    return input.length || 1;
+  }
+
+  return 1;
+};
+
+export class OpenAiMockUpstream {
   constructor(
     private readonly server: Server,
     private readonly sockets: Set<Socket>,
     private readonly requests: RecordedRequest[],
-    readonly baseUrl: string,
+    readonly origin: string,
+    readonly apiBase: string,
   ) {}
+
+  get baseUrl() {
+    return this.origin;
+  }
 
   recordedRequests() {
     return [...this.requests];
@@ -180,16 +227,25 @@ export class MockUpstream {
   }
 }
 
-export const startMockUpstream = async (
+export const startOpenAiMockUpstream = async (
   options: OpenAiMockUpstreamOptions = {},
 ) => {
   const requests: RecordedRequest[] = [];
   const sockets = new Set<Socket>();
 
   const server = createServer(async (req, res) => {
+    if (req.method !== 'POST') {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({ error: { message: 'mock upstream route not found' } }),
+      );
+      return;
+    }
+
+    const url = req.url ?? '/';
     if (
-      req.method !== 'POST' ||
-      (req.url !== '/v1/chat/completions' && req.url !== '/chat/completions')
+      !OPENAI_CHAT_COMPLETION_PATHS.has(url) &&
+      !OPENAI_EMBEDDINGS_PATHS.has(url)
     ) {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(
@@ -207,6 +263,41 @@ export const startMockUpstream = async (
       bodyText,
       bodyJson,
     });
+
+    if (OPENAI_EMBEDDINGS_PATHS.has(url)) {
+      if (options.embeddings?.responseDelayMs) {
+        await sleep(options.embeddings.responseDelayMs);
+      }
+
+      const model = requestModel(
+        bodyJson,
+        options.embeddings?.model ?? options.model ?? 'test-embedding-model',
+      );
+      const status = options.embeddings?.status ?? 200;
+      if (status >= 400) {
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify(
+            options.embeddings?.errorBody ?? {
+              error: {
+                message: 'mock embeddings upstream error',
+                type: 'mock_embeddings_upstream_error',
+              },
+            },
+          ),
+        );
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify(
+          options.embeddings?.body ??
+            defaultEmbeddingsBody(model, embeddingInputCount(bodyJson)),
+        ),
+      );
+      return;
+    }
 
     if (options.responseDelayMs) {
       await sleep(options.responseDelayMs);
@@ -253,7 +344,9 @@ export const startMockUpstream = async (
     }
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(options.nonStreamBody ?? defaultNonStreamBody(model)));
+    res.end(
+      JSON.stringify(options.nonStreamBody ?? defaultNonStreamBody(model)),
+    );
   });
 
   server.on('connection', (socket) => {
@@ -265,10 +358,13 @@ export const startMockUpstream = async (
   await once(server, 'listening');
 
   const address = server.address() as AddressInfo;
-  return new MockUpstream(
+  const origin = `http://127.0.0.1:${address.port}`;
+
+  return new OpenAiMockUpstream(
     server,
     sockets,
     requests,
-    `http://127.0.0.1:${address.port}`,
+    origin,
+    `${origin}/v1`,
   );
 };

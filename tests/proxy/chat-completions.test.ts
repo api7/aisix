@@ -9,7 +9,7 @@ import {
 } from '../utils/admin.js';
 import { client } from '../utils/http.js';
 import {
-  MockUpstream,
+  OpenAiMockUpstream,
   buildOpenAiProviderConfig,
   buildOpenAiProviderModel,
   startOpenAiMockUpstream,
@@ -50,7 +50,7 @@ const expectSdkErrorStatus = (err: unknown, expectedStatus: number) => {
 
 describe('proxy /v1/chat/completions', () => {
   let server: App | undefined;
-  let upstream: MockUpstream | undefined;
+  let upstream: OpenAiMockUpstream | undefined;
   let mockModelName = '';
   let restrictedModelName = '';
 
@@ -67,7 +67,7 @@ describe('proxy /v1/chat/completions', () => {
         name: mockModelName,
         model: buildOpenAiProviderModel(UPSTREAM_MODEL),
         provider_config: buildOpenAiProviderConfig(
-          upstream.baseUrl,
+          upstream.apiBase,
           UPSTREAM_API_KEY,
         ),
       },
@@ -81,7 +81,7 @@ describe('proxy /v1/chat/completions', () => {
         name: restrictedModelName,
         model: buildOpenAiProviderModel(UPSTREAM_MODEL),
         provider_config: buildOpenAiProviderConfig(
-          upstream.baseUrl,
+          upstream.apiBase,
           UPSTREAM_API_KEY,
         ),
       },
