@@ -280,6 +280,7 @@ impl StreamState {
                         delta: ChatCompletionChunkDelta {
                             role: Some("assistant".to_string()),
                             content: Some(String::new()),
+                            tool_calls: None,
                         },
                         finish_reason: None,
                     }],
@@ -300,6 +301,7 @@ impl StreamState {
                         delta: ChatCompletionChunkDelta {
                             role: None,
                             content: Some(text),
+                            tool_calls: None,
                         },
                         finish_reason: None,
                     }],
@@ -321,6 +323,7 @@ impl StreamState {
                         delta: ChatCompletionChunkDelta {
                             role: None,
                             content: None,
+                            tool_calls: None,
                         },
                         finish_reason: map_stop_reason(&delta.stop_reason),
                     }],
@@ -348,6 +351,7 @@ impl StreamState {
                             "[Anthropic error: {} - {}]",
                             error.r#type, error.message
                         )),
+                        tool_calls: None,
                     },
                     finish_reason: Some("stop".to_string()),
                 }],

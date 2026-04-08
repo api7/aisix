@@ -12,14 +12,18 @@ import {
   OpenAiMockUpstream,
   buildOpenAiProviderConfig,
   buildOpenAiProviderModel,
+  buildOpenAiToolCallStreamEvents,
   startOpenAiMockUpstream,
 } from '../utils/mock-upstream.js';
-import {
-  parseSseDataEvents,
-  proxyAuthHeader,
-  proxyPost,
-} from '../utils/proxy.js';
+import { proxyAuthHeader, proxyPost } from '../utils/proxy.js';
 import { App } from '../utils/setup.js';
+import {
+  expectParseableChatCompletionChunks,
+  expectSdkErrorStatus,
+  expectStreamHasDoneMarker,
+  expectStreamHasToolCallDeltas,
+  expectStreamHasUsageChunk,
+} from '../utils/stream-assert.js';
 
 const ADMIN_KEY = 'test_admin_key_chat_proxy';
 const AUTHORIZED_KEY = 'sk-proxy-chat-authorized';
@@ -37,16 +41,6 @@ const sdkClient = (apiKey: string) =>
     apiKey,
     baseURL: 'http://127.0.0.1:3000/v1',
   });
-
-const expectSdkErrorStatus = (err: unknown, expectedStatus: number) => {
-  const status =
-    typeof err === 'object' && err !== null && 'status' in err
-      ? Number((err as { status: unknown }).status)
-      : Number.NaN;
-
-  expect(Number.isFinite(status)).toBe(true);
-  expect(status).toBe(expectedStatus);
-};
 
 describe('proxy /v1/chat/completions', () => {
   let server: App | undefined;
@@ -285,9 +279,7 @@ describe('proxy /v1/chat/completions', () => {
     expect(resp.status).toBe(200);
     expect(String(resp.headers['content-type'])).toContain('text/event-stream');
 
-    const events = parseSseDataEvents(String(resp.data));
-    expect(events.length).toBeGreaterThan(0);
-    expect(events.includes('[DONE]')).toBe(true);
+    expectStreamHasDoneMarker(String(resp.data));
   });
 
   test('stream chunks are parseable chat.completion.chunk objects', async () => {
@@ -302,30 +294,81 @@ describe('proxy /v1/chat/completions', () => {
       { responseType: 'text' },
     );
 
-    const events = parseSseDataEvents(String(resp.data)).filter(
-      (item) => item !== '[DONE]',
+    expectParseableChatCompletionChunks(String(resp.data));
+  });
+
+  test('stream request forwards include_usage to upstream and emits usage chunk', async () => {
+    const resp = await proxyPost(
+      '/v1/chat/completions',
+      {
+        model: mockModelName,
+        stream: true,
+        messages: [{ role: 'user', content: 'stream usage forwarding check' }],
+      },
+      AUTHORIZED_KEY,
+      { responseType: 'text' },
     );
 
-    expect(events.length).toBeGreaterThan(0);
+    expect(resp.status).toBe(200);
 
-    for (const item of events) {
-      const chunk = JSON.parse(item) as {
-        object: string;
-        usage?: {
-          prompt_tokens: number;
-          completion_tokens: number;
-          total_tokens: number;
-        };
-        choices: Array<{ index: number }>;
-      };
-      expect(chunk.object).toBe('chat.completion.chunk');
-      expect(Array.isArray(chunk.choices)).toBe(true);
-      if (chunk.choices.length > 0) {
-        expect(typeof chunk.choices[0].index).toBe('number');
-      } else {
-        expect(chunk.usage).toBeDefined();
-      }
-    }
+    const usageChunks = expectStreamHasUsageChunk(String(resp.data));
+    expect(usageChunks).toHaveLength(1);
+
+    const recorded = upstream?.takeRecordedRequests() ?? [];
+    expect(recorded).toHaveLength(1);
+
+    const bodyJson = recorded[0]?.bodyJson as {
+      model: string;
+      stream: boolean;
+      stream_options?: { include_usage?: boolean };
+    };
+
+    expect(bodyJson.model).toBe(UPSTREAM_MODEL);
+    expect(bodyJson.stream).toBe(true);
+    expect(bodyJson.stream_options?.include_usage).toBe(true);
+  });
+
+  test('stream response preserves tool call deltas from external upstream', async () => {
+    upstream?.configure({
+      streamEvents: buildOpenAiToolCallStreamEvents(UPSTREAM_MODEL),
+    });
+
+    const resp = await proxyPost(
+      '/v1/chat/completions',
+      {
+        model: mockModelName,
+        stream: true,
+        messages: [{ role: 'user', content: 'please emit a tool call delta' }],
+      },
+      AUTHORIZED_KEY,
+      { responseType: 'text' },
+    );
+
+    expect(resp.status).toBe(200);
+
+    const { toolCallDeltas } = expectStreamHasToolCallDeltas(String(resp.data));
+    const combinedArguments = toolCallDeltas
+      .map((toolCall) => toolCall.function?.arguments ?? '')
+      .join('');
+
+    expect(toolCallDeltas[0]?.id).toBe('call_weather_1');
+    expect(
+      toolCallDeltas.some(
+        (toolCall) => toolCall.function?.name === 'get_weather',
+      ),
+    ).toBe(true);
+    expect(combinedArguments).toBe('{"city":"Shanghai"}');
+
+    const recorded = upstream?.takeRecordedRequests() ?? [];
+    expect(recorded).toHaveLength(1);
+
+    const bodyJson = recorded[0]?.bodyJson as {
+      stream: boolean;
+      stream_options?: { include_usage?: boolean };
+    };
+
+    expect(bodyJson.stream).toBe(true);
+    expect(bodyJson.stream_options?.include_usage).toBe(true);
   });
 
   test('accepts common optional parameters', async () => {

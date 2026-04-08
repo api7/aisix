@@ -10,6 +10,8 @@ export interface RecordedRequest {
   bodyJson: unknown;
 }
 
+export type OpenAiMockStreamEvent = Record<string, unknown> | '[DONE]';
+
 export interface OpenAiMockUpstreamOptions {
   model?: string;
   responseDelayMs?: number;
@@ -17,7 +19,7 @@ export interface OpenAiMockUpstreamOptions {
   status?: number;
   errorBody?: Record<string, unknown>;
   nonStreamBody?: Record<string, unknown>;
-  streamEvents?: Array<Record<string, unknown> | '[DONE]'>;
+  streamEvents?: OpenAiMockStreamEvent[];
   embeddings?: {
     model?: string;
     responseDelayMs?: number;
@@ -122,6 +124,119 @@ const defaultStreamEvents = (model: string) => [
   '[DONE]' as const,
 ];
 
+export const buildOpenAiToolCallStreamEvents = (
+  model: string,
+): OpenAiMockStreamEvent[] => [
+  {
+    id: 'chatcmpl-tool-e2e-mock',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: { role: 'assistant' },
+        finish_reason: null,
+      },
+    ],
+  },
+  {
+    id: 'chatcmpl-tool-e2e-mock',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: {
+          tool_calls: [
+            {
+              index: 0,
+              id: 'call_weather_1',
+              type: 'function',
+              function: {
+                name: 'get_weather',
+                arguments: '',
+              },
+            },
+          ],
+        },
+        finish_reason: null,
+      },
+    ],
+  },
+  {
+    id: 'chatcmpl-tool-e2e-mock',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: {
+          tool_calls: [
+            {
+              index: 0,
+              function: {
+                arguments: '{"city":"Shang',
+              },
+            },
+          ],
+        },
+        finish_reason: null,
+      },
+    ],
+  },
+  {
+    id: 'chatcmpl-tool-e2e-mock',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: {
+          tool_calls: [
+            {
+              index: 0,
+              function: {
+                arguments: 'hai"}',
+              },
+            },
+          ],
+        },
+        finish_reason: null,
+      },
+    ],
+  },
+  {
+    id: 'chatcmpl-tool-e2e-mock',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: {},
+        finish_reason: 'tool_calls',
+      },
+    ],
+  },
+  {
+    id: 'chatcmpl-tool-e2e-mock',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model,
+    choices: [],
+    usage: {
+      prompt_tokens: 12,
+      completion_tokens: 7,
+      total_tokens: 19,
+    },
+  },
+  '[DONE]' as const,
+];
+
 const defaultEmbeddingsBody = (model: string, inputCount: number) => {
   const dataLength = Math.max(inputCount, 1);
 
@@ -194,11 +309,27 @@ const embeddingInputCount = (bodyJson: unknown) => {
   return 1;
 };
 
+const mergeOptions = (
+  current: OpenAiMockUpstreamOptions,
+  next: Partial<OpenAiMockUpstreamOptions>,
+): OpenAiMockUpstreamOptions => ({
+  ...current,
+  ...next,
+  embeddings:
+    next.embeddings === undefined
+      ? current.embeddings
+      : {
+          ...(current.embeddings ?? {}),
+          ...next.embeddings,
+        },
+});
+
 export class OpenAiMockUpstream {
   constructor(
     private readonly server: Server,
     private readonly sockets: Set<Socket>,
     private readonly requests: RecordedRequest[],
+    private readonly state: { options: OpenAiMockUpstreamOptions },
     readonly origin: string,
     readonly apiBase: string,
   ) {}
@@ -217,6 +348,10 @@ export class OpenAiMockUpstream {
     return recorded;
   }
 
+  configure(options: Partial<OpenAiMockUpstreamOptions>) {
+    this.state.options = mergeOptions(this.state.options, options);
+  }
+
   async close() {
     for (const socket of this.sockets) {
       socket.destroy();
@@ -232,6 +367,7 @@ export const startOpenAiMockUpstream = async (
 ) => {
   const requests: RecordedRequest[] = [];
   const sockets = new Set<Socket>();
+  const state = { options };
 
   const server = createServer(async (req, res) => {
     if (req.method !== 'POST') {
@@ -264,21 +400,23 @@ export const startOpenAiMockUpstream = async (
       bodyJson,
     });
 
+    const current = state.options;
+
     if (OPENAI_EMBEDDINGS_PATHS.has(url)) {
-      if (options.embeddings?.responseDelayMs) {
-        await sleep(options.embeddings.responseDelayMs);
+      if (current.embeddings?.responseDelayMs) {
+        await sleep(current.embeddings.responseDelayMs);
       }
 
       const model = requestModel(
         bodyJson,
-        options.embeddings?.model ?? options.model ?? 'test-embedding-model',
+        current.embeddings?.model ?? current.model ?? 'test-embedding-model',
       );
-      const status = options.embeddings?.status ?? 200;
+      const status = current.embeddings?.status ?? 200;
       if (status >= 400) {
         res.writeHead(status, { 'Content-Type': 'application/json' });
         res.end(
           JSON.stringify(
-            options.embeddings?.errorBody ?? {
+            current.embeddings?.errorBody ?? {
               error: {
                 message: 'mock embeddings upstream error',
                 type: 'mock_embeddings_upstream_error',
@@ -292,24 +430,24 @@ export const startOpenAiMockUpstream = async (
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(
         JSON.stringify(
-          options.embeddings?.body ??
+          current.embeddings?.body ??
             defaultEmbeddingsBody(model, embeddingInputCount(bodyJson)),
         ),
       );
       return;
     }
 
-    if (options.responseDelayMs) {
-      await sleep(options.responseDelayMs);
+    if (current.responseDelayMs) {
+      await sleep(current.responseDelayMs);
     }
 
-    const model = requestModel(bodyJson, options.model ?? 'test-model');
-    const status = options.status ?? 200;
+    const model = requestModel(bodyJson, current.model ?? 'test-model');
+    const status = current.status ?? 200;
     if (status >= 400) {
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(
         JSON.stringify(
-          options.errorBody ?? {
+          current.errorBody ?? {
             error: {
               message: 'mock upstream error',
               type: 'mock_upstream_error',
@@ -327,15 +465,15 @@ export const startOpenAiMockUpstream = async (
         Connection: 'keep-alive',
       });
 
-      for (const event of options.streamEvents ?? defaultStreamEvents(model)) {
+      for (const event of current.streamEvents ?? defaultStreamEvents(model)) {
         if (typeof event === 'string') {
           res.write(`data: ${event}\n\n`);
         } else {
           res.write(`data: ${JSON.stringify(event)}\n\n`);
         }
 
-        if (options.eventDelayMs) {
-          await sleep(options.eventDelayMs);
+        if (current.eventDelayMs) {
+          await sleep(current.eventDelayMs);
         }
       }
 
@@ -345,7 +483,7 @@ export const startOpenAiMockUpstream = async (
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(
-      JSON.stringify(options.nonStreamBody ?? defaultNonStreamBody(model)),
+      JSON.stringify(current.nonStreamBody ?? defaultNonStreamBody(model)),
     );
   });
 
@@ -364,6 +502,7 @@ export const startOpenAiMockUpstream = async (
     server,
     sockets,
     requests,
+    state,
     origin,
     `${origin}/v1`,
   );
