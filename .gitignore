@@ -12,7 +12,6 @@ ui/dist/
 ui/.vite/
 ui/.cache/
 *.tsbuildinfo
-tests/node_modules/
 
 # Editors
 .vscode/launch.json

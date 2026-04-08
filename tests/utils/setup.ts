@@ -11,7 +11,7 @@ import type { PartialDeep } from 'type-fest';
 
 import { client } from './http.js';
 
-export const testRootPath = (subPath: string) => path.resolve(`./${subPath}`);
+export const testRootPath = (subPath: string) => path.resolve(subPath);
 
 const APP_BINARY = testRootPath('../target/debug/aisix');
 export interface AppConfig {
