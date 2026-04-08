@@ -31,7 +31,7 @@ describe('admin apikeys', () => {
       '/apikeys',
       {
         key: 'sk-test-crud',
-        allowed_models: ['mock/mock'],
+        allowed_models: ['test-model-a'],
       },
       auth,
     );
@@ -46,21 +46,21 @@ describe('admin apikeys', () => {
       `/apikeys/${id}`,
       {
         key: 'sk-test-crud',
-        allowed_models: ['mock/mock', 'openai/gpt-4'],
+        allowed_models: ['test-model-a', 'test-model-b'],
       },
       auth,
     );
     expect(updateResp.status).toBe(200);
     expect(updateResp.data.value.allowed_models).toStrictEqual([
-      'mock/mock',
-      'openai/gpt-4',
+      'test-model-a',
+      'test-model-b',
     ]);
 
     const getResp = await adminGet(`/apikeys/${id}`, auth);
     expect(getResp.status).toBe(200);
     expect(getResp.data.value.allowed_models).toStrictEqual([
-      'mock/mock',
-      'openai/gpt-4',
+      'test-model-a',
+      'test-model-b',
     ]);
 
     const deleteResp = await adminDelete(`/apikeys/${id}`, auth);
