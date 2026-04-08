@@ -6,16 +6,19 @@ import {
   ERR_UNEXPECTED_EARLY_EXIT,
   defaultConfig,
   randomPort,
+  testRootPath,
   tlsSkipVerify,
 } from './utils/setup.js';
 
 const INVALID_LISTEN_ADDR = 'invalid-listen-addr';
 const ERR_PORT_IN_USE = 'Address already in use';
 
-const CERT_FILE = path.resolve('fixtures/tls/server.cer');
-const KEY_FILE = path.resolve('fixtures/tls/server.key');
-const NON_EXISTENT_CERT_FILE = path.resolve('fixtures/tls/server-ne.cer');
-const NON_EXISTENT_KEY_FILE = path.resolve('fixtures/tls/server-ne.key');
+const FIXTURES_DIR = testRootPath('fixtures/tls');
+
+const CERT_FILE = path.join(FIXTURES_DIR, 'server.cer');
+const KEY_FILE = path.join(FIXTURES_DIR, 'server.key');
+const NON_EXISTENT_CERT_FILE = path.join(FIXTURES_DIR, 'server-ne.cer');
+const NON_EXISTENT_KEY_FILE = path.join(FIXTURES_DIR, 'server-ne.key');
 
 describe('proxy server', () => {
   const expectedStatus = 401;
