@@ -57,12 +57,6 @@ jobs:
       - name: Build
         run: cargo build --locked
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # 7.0.0
-        with:
-          name: binary-debug
-          path: target/debug/aisix
-
       - name: Run Test
         run: cargo test --locked
 
@@ -72,3 +66,9 @@ jobs:
           ls -lah target/debug
           pnpm -C tests install --frozen-lockfile
           pnpm -C tests test
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # 7.0.0
+        with:
+          name: binary-debug
+          path: target/debug/aisix
