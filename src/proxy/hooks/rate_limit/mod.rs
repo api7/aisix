@@ -167,11 +167,12 @@ impl ProxyHook for RateLimitHook {
     }
 
     async fn post_call_streaming(&self, ctx: &mut HookContext) -> Result<(), HookError> {
-        let usage = ctx
+        let total_tokens = ctx
             .get::<TokenUsage>()
-            .expect("TokenUsage should be in context");
+            .map(|usage| usage.total_tokens)
+            .unwrap_or(0);
 
-        self.run_post_check(ctx, usage.total_tokens).await;
+        self.run_post_check(ctx, total_tokens).await;
         Ok(())
     }
 

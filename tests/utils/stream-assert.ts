@@ -43,6 +43,15 @@ export const expectStreamHasDoneMarker = (sseBody: string) => {
   return events;
 };
 
+export const expectStreamStopsBeforeDone = (sseBody: string) => {
+  const events = parseSseDataEvents(sseBody);
+
+  expect(events.length).toBeGreaterThan(0);
+  expect(events).not.toContain('[DONE]');
+
+  return events;
+};
+
 export const expectParseableChatCompletionChunks = (sseBody: string) => {
   const events = expectStreamHasDoneMarker(sseBody).filter(
     (item) => item !== '[DONE]',

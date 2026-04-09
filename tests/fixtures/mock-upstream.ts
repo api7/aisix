@@ -16,6 +16,7 @@ export interface OpenAiMockUpstreamOptions {
   model?: string;
   responseDelayMs?: number;
   eventDelayMs?: number;
+  disconnectAfterEvents?: number;
   status?: number;
   errorBody?: Record<string, unknown>;
   nonStreamBody?: Record<string, unknown>;
@@ -465,11 +466,29 @@ export const startOpenAiMockUpstream = async (
         Connection: 'keep-alive',
       });
 
+      if (current.disconnectAfterEvents === 0) {
+        res.flushHeaders();
+        res.socket?.destroy();
+        return;
+      }
+
+      let sentEvents = 0;
       for (const event of current.streamEvents ?? defaultStreamEvents(model)) {
         if (typeof event === 'string') {
           res.write(`data: ${event}\n\n`);
         } else {
           res.write(`data: ${JSON.stringify(event)}\n\n`);
+        }
+
+        sentEvents += 1;
+
+        if (
+          current.disconnectAfterEvents !== undefined &&
+          sentEvents >= current.disconnectAfterEvents
+        ) {
+          await new Promise((resolve) => setImmediate(resolve));
+          res.socket?.destroy();
+          return;
         }
 
         if (current.eventDelayMs) {

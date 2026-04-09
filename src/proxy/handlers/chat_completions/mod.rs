@@ -102,29 +102,7 @@ async fn handle_stream_request(
     use futures::stream::StreamExt;
 
     let res: Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> =
-        match maybe_timeout(timeout, async {
-            let mut stream = match provider.chat_completion_stream(request).await {
-                Ok(stream) => stream,
-                Err(err) => return Err(err),
-            };
-
-            let first_chunk = match stream.next().await {
-                Some(res) => res,
-                None => {
-                    return Err(ProviderError::ServiceError(
-                        http::StatusCode::BAD_GATEWAY,
-                        "Upstream provider returned empty stream".to_string(),
-                    ));
-                }
-            };
-
-            Ok(
-                Box::pin(futures::stream::once(async move { first_chunk }).chain(stream))
-                    as BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
-            )
-        })
-        .await
-        {
+        match maybe_timeout(timeout, provider.chat_completion_stream(request)).await {
             Ok(res) => res,
             Err(err) => Err(ChatCompletionError::Timeout(err))?,
         };
@@ -135,8 +113,8 @@ async fn handle_stream_request(
             let stream_span = Span::root("sse_connection", span_ctx);
 
             let sse_stream = futures::stream::unfold(
-                (stream, stream_span, 0, stream_hook_ctx, false),
-                |(mut stream, span, idx, mut hook_ctx, done)| async move {
+                (stream, stream_span, 0, stream_hook_ctx, false, false),
+                |(mut stream, span, idx, mut hook_ctx, done, saw_chunk)| async move {
                     if done {
                         if let Err(err) = HOOK_MANAGER
                             .post_call_streaming(&mut hook_ctx, HOOK_FILTER_ALL)
@@ -183,17 +161,31 @@ async fn handle_stream_request(
                                     Ok(SseEvent::default().data(""))
                                 }
                             };
-                            Some((event, (stream, span, idx + 1, hook_ctx, false)))
+                            Some((event, (stream, span, idx + 1, hook_ctx, false, true)))
                         }
                         Some(Err(err)) => {
                             error!("Stream error: {}", err);
                             drop(span);
                             None
                         }
-                        None => Some((
-                            Ok(SseEvent::default().data("[DONE]")),
-                            (stream, span, idx + 1, hook_ctx, true),
-                        )),
+                        None => {
+                            if saw_chunk {
+                                Some((
+                                    Ok(SseEvent::default().data("[DONE]")),
+                                    (stream, span, idx + 1, hook_ctx, true, saw_chunk),
+                                ))
+                            } else {
+                                if let Err(err) = HOOK_MANAGER
+                                    .post_call_streaming(&mut hook_ctx, HOOK_FILTER_ALL)
+                                    .await
+                                {
+                                    error!("Hook post_call_streaming error: {}", err);
+                                }
+
+                                drop(span);
+                                None
+                            }
+                        }
                     }
                 },
             );
