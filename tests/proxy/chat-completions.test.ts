@@ -376,15 +376,17 @@ describe('proxy /v1/chat/completions', () => {
     expect(bodyJson.stream_options?.include_usage).toBe(true);
   });
 
-  test('streaming response emits no events when upstream disconnects before first chunk', async () => {
-    upstream?.configure({ disconnectAfterEvents: 0 });
+  test('streaming response emits no events when upstream returns an empty stream', async () => {
+    upstream?.configure({ streamEvents: [] });
 
     const resp = await proxyPost(
       '/v1/chat/completions',
       {
         model: mockModelName,
         stream: true,
-        messages: [{ role: 'user', content: 'disconnect before first chunk' }],
+        messages: [
+          { role: 'user', content: 'empty stream before first chunk' },
+        ],
       },
       AUTHORIZED_KEY,
       { responseType: 'text' },
