@@ -81,6 +81,7 @@ impl Provider for MockProvider {
                 delta: ChatCompletionChunkDelta {
                     role: Some("assistant".to_string()),
                     content: Some("".to_string()),
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],
@@ -152,6 +153,7 @@ impl Provider for MockProvider {
                     delta: ChatCompletionChunkDelta {
                         role: None,
                         content: Some(token.to_string()),
+                        tool_calls: None,
                     },
                     finish_reason: None,
                 }],
@@ -170,6 +172,7 @@ impl Provider for MockProvider {
                 delta: ChatCompletionChunkDelta {
                     role: None,
                     content: Some("".to_string()),
+                    tool_calls: None,
                 },
                 finish_reason: Some("stop".to_string()),
             }],

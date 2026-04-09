@@ -1,7 +1,9 @@
 export {
+  buildOpenAiToolCallStreamEvents,
   OpenAiMockUpstream,
   startOpenAiMockUpstream,
   type OpenAiMockUpstreamOptions,
+  type OpenAiMockStreamEvent,
   type RecordedRequest,
 } from '../fixtures/mock-upstream.js';
 

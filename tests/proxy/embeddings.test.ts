@@ -16,6 +16,7 @@ import {
 } from '../utils/mock-upstream.js';
 import { proxyAuthHeader, proxyPost } from '../utils/proxy.js';
 import { App } from '../utils/setup.js';
+import { expectSdkErrorStatus } from '../utils/stream-assert.js';
 
 const ADMIN_KEY = 'test_admin_key_embeddings_proxy';
 const AUTHORIZED_KEY = 'sk-proxy-embeddings-authorized';
@@ -33,16 +34,6 @@ const sdkClient = (apiKey: string) =>
     apiKey,
     baseURL: 'http://127.0.0.1:3000/v1',
   });
-
-const expectSdkErrorStatus = (err: unknown, expectedStatus: number) => {
-  const status =
-    typeof err === 'object' && err !== null && 'status' in err
-      ? Number((err as { status: unknown }).status)
-      : Number.NaN;
-
-  expect(Number.isFinite(status)).toBe(true);
-  expect(status).toBe(expectedStatus);
-};
 
 describe('proxy /v1/embeddings', () => {
   let server: App | undefined;

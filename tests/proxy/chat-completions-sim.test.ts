@@ -8,12 +8,13 @@ import {
   startIsolatedAdminApp,
 } from '../utils/admin.js';
 import { client } from '../utils/http.js';
-import {
-  parseSseDataEvents,
-  proxyAuthHeader,
-  proxyPost,
-} from '../utils/proxy.js';
+import { proxyAuthHeader, proxyPost } from '../utils/proxy.js';
 import { App } from '../utils/setup.js';
+import {
+  expectParseableChatCompletionChunks,
+  expectSdkErrorStatus,
+  expectStreamHasDoneMarker,
+} from '../utils/stream-assert.js';
 
 const ADMIN_KEY = 'test_admin_key_chat_sim';
 const AUTHORIZED_KEY = 'sk-proxy-sim-authorized';
@@ -239,9 +240,7 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
     expect(resp.status).toBe(200);
     expect(String(resp.headers['content-type'])).toContain('text/event-stream');
 
-    const events = parseSseDataEvents(String(resp.data));
-    expect(events.length).toBeGreaterThan(0);
-    expect(events.includes('[DONE]')).toBe(true);
+    expectStreamHasDoneMarker(String(resp.data));
   }, 15_000);
 
   test('stream chunks are parseable chat.completion.chunk objects', async () => {
@@ -256,30 +255,7 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
       { responseType: 'text' },
     );
 
-    const events = parseSseDataEvents(String(resp.data)).filter(
-      (item) => item !== '[DONE]',
-    );
-
-    expect(events.length).toBeGreaterThan(0);
-
-    for (const item of events) {
-      const chunk = JSON.parse(item) as {
-        object: string;
-        usage?: {
-          prompt_tokens: number;
-          completion_tokens: number;
-          total_tokens: number;
-        };
-        choices: Array<{ index: number }>;
-      };
-      expect(chunk.object).toBe('chat.completion.chunk');
-      expect(Array.isArray(chunk.choices)).toBe(true);
-      if (chunk.choices.length > 0) {
-        expect(typeof chunk.choices[0].index).toBe('number');
-      } else {
-        expect(chunk.usage).toBeDefined();
-      }
-    }
+    expectParseableChatCompletionChunks(String(resp.data));
   }, 15_000);
 
   test('accepts common optional parameters', async () => {
@@ -383,13 +359,7 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
       });
       throw new Error('expected sdk request to fail');
     } catch (err) {
-      const status =
-        typeof err === 'object' && err !== null && 'status' in err
-          ? Number((err as { status: unknown }).status)
-          : Number.NaN;
-
-      expect(Number.isFinite(status)).toBe(true);
-      expect(status).toBe(401);
+      expectSdkErrorStatus(err, 401);
     }
   });
 });
