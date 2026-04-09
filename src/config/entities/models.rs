@@ -49,19 +49,6 @@ static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
                         "provider_config": { "$ref": "#/$defs/openai_compatible" }
                     }
                 }
-            },
-            {
-                "if": {
-                    "properties": {
-                        "model": { "pattern": "^mock/" }
-                    },
-                    "required": ["model"]
-                },
-                "then": {
-                    "properties": {
-                        "provider_config": { "additionalProperties": false }
-                    },
-                }
             }
         ],
         "$defs": {
@@ -87,7 +74,6 @@ pub enum ProviderConfig {
     DeepSeek(configs::DeepSeekProviderConfig),
     Gemini(configs::GeminiProviderConfig),
     OpenAI(configs::OpenAIProviderConfig),
-    Mock(configs::MockProviderConfig),
 }
 
 impl ProviderConfig {
@@ -111,7 +97,6 @@ impl ProviderConfig {
                     serde_json::from_value::<configs::GeminiProviderConfig>(json_value.clone())?;
                 Ok(ProviderConfig::Gemini(config))
             }
-            identifiers::MOCK => Ok(ProviderConfig::Mock(configs::MockProviderConfig {})),
             identifiers::OPENAI => {
                 let config =
                     serde_json::from_value::<configs::OpenAIProviderConfig>(json_value.clone())?;
@@ -125,7 +110,7 @@ impl ProviderConfig {
     }
 }
 
-pub static MODELS_PATTERN: &str = "^(anthropic|deepseek|gemini|openai|mock)/.+$";
+pub static MODELS_PATTERN: &str = "^(anthropic|deepseek|gemini|openai)/.+$";
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ProviderModel {
     #[serde(skip)]
@@ -134,7 +119,7 @@ pub struct ProviderModel {
     pub name: String,
 
     #[serde(rename = "model")]
-    #[schema(pattern = "^(anthropic|deepseek|gemini|openai|mock)/.+$")]
+    #[schema(pattern = "^(anthropic|deepseek|gemini|openai)/.+$")]
     pub original_model: String,
 }
 
@@ -280,8 +265,8 @@ mod tests {
         "provider_config": { "api_key": "test_key" },
     }), true, None)]
     #[case::missing_name(json!({
-        "model": "mock/mock",
-        "provider_config": {},
+        "model": "openai/gpt-5",
+        "provider_config": { "api_key": "test_key" },
     }), false, Some(r#"property "/" validation failed: "name" is a required property"#.to_string()))]
     #[case::missing_model(json!({
         "name": "test",
@@ -293,8 +278,8 @@ mod tests {
     }), false, Some(r#"property "/" validation failed: "provider_config" is a required property"#.to_string()))]
     #[case::invalid_name_type(json!({
         "name": 123,
-        "model": "mock/mock",
-        "provider_config": {},
+        "model": "openai/gpt-5",
+        "provider_config": { "api_key": "test_key" },
     }), false, Some(r#"property "/name" validation failed: 123 is not of type "string""#.to_string()))]
     #[case::invalid_model_type(json!({
         "name": "test",
@@ -309,9 +294,10 @@ property "/provider_config" validation failed: "api_key" is a required property"
     }), false, Some(format!(r#"property "/model" validation failed: "invalid" does not match "{}""#, MODELS_PATTERN)))]
     #[case::invalid_provider_config_type(json!({
         "name": "test",
-        "model": "mock/mock",
+        "model": "openai/gpt-5",
         "provider_config": 123,
-    }), false, Some(r#"property "/provider_config" validation failed: 123 is not of type "object""#.to_string()))]
+    }), false, Some(r#"property "/provider_config" validation failed: 123 is not of type "object"
+property "/provider_config" validation failed: 123 is not of type "object""#.to_string()))]
     #[case::invalid_provider_config_for_specific_vendor(json!({
         "name": "test",
         "model": "deepseek/deepseek-chat",

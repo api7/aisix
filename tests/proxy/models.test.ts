@@ -10,6 +10,8 @@ import { App } from '../utils/setup.js';
 
 const ADMIN_KEY = 'test_admin_key_models_proxy';
 const PROXY_KEY = 'sk-proxy-models';
+const TEST_PROVIDER_MODEL = 'openai/test-proxy-model';
+const TEST_PROVIDER_CONFIG = { api_key: 'unused-proxy-model-key' };
 
 const waitConfigPropagation = async () => {
   await new Promise((resolve) => setTimeout(resolve, 500));
@@ -20,8 +22,8 @@ const createModel = async (name: string) => {
     '/models',
     {
       name,
-      model: 'mock/mock',
-      provider_config: {},
+      model: TEST_PROVIDER_MODEL,
+      provider_config: TEST_PROVIDER_CONFIG,
     },
     bearerAuthHeader(ADMIN_KEY),
   );

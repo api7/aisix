@@ -86,7 +86,7 @@ status=$(curl -s -o /dev/null -w '%{http_code}' \
     -X POST "${ADMIN_URL}/aisix/admin/models" \
     -H "Content-Type: application/json" \
     -H "X-API-KEY: ${ADMIN_KEY}" \
-    -d '{"name":"smoke-test-model","model":"mock/mock","provider_config":{}}')
+    -d '{"name":"smoke-test-model","model":"openai/smoke-test-upstream","provider_config":{"api_key":"unused-smoke-key"}}')
 assert_status "POST /aisix/admin/models" 201 "$status"
 
 # --- Test 4: List models — verify model exists ---
