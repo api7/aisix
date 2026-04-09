@@ -35,8 +35,8 @@ pub async fn embeddings(
         .await?;
     // PRE CALL HOOKS END
 
-    //TODO: safe unwrap
-    let model = hook_ctx.get::<ResourceEntry<Model>>().cloned().unwrap();
+    let model = hook_ctx.get::<ResourceEntry<Model>>().cloned()
+                    .expect("ValidateModelHook must insert Model into HookContext before embeddings handler");
 
     let provider = create_provider(&model.provider_config);
     let timeout = model.timeout.map(Duration::from_millis);
@@ -46,7 +46,10 @@ pub async fn embeddings(
 
     match maybe_timeout(timeout, provider.embedding(request_data)).await {
         Ok(Ok(mut response)) => {
-            response.model = hook_ctx.get::<RequestModel>().cloned().unwrap().0; //TODO: safe unwrap
+            response.model = hook_ctx.get::<RequestModel>().cloned()
+            .expect("RequestModel must be inserted before pre_call hooks")
+            .0;
+
 
             // Execute post_call_success hooks
             let response_data = ResponseData::Embedding(response.clone());
