@@ -15,7 +15,11 @@ import {
   buildOpenAiToolCallStreamEvents,
   startOpenAiMockUpstream,
 } from '../utils/mock-upstream.js';
-import { proxyAuthHeader, proxyPost } from '../utils/proxy.js';
+import {
+  parseSseDataEvents,
+  proxyAuthHeader,
+  proxyPost,
+} from '../utils/proxy.js';
 import { App } from '../utils/setup.js';
 import {
   expectParseableChatCompletionChunks,
@@ -23,6 +27,7 @@ import {
   expectStreamHasDoneMarker,
   expectStreamHasToolCallDeltas,
   expectStreamHasUsageChunk,
+  expectStreamStopsBeforeDone,
 } from '../utils/stream-assert.js';
 
 const ADMIN_KEY = 'test_admin_key_chat_proxy';
@@ -369,6 +374,60 @@ describe('proxy /v1/chat/completions', () => {
 
     expect(bodyJson.stream).toBe(true);
     expect(bodyJson.stream_options?.include_usage).toBe(true);
+  });
+
+  test('streaming response emits no events when upstream disconnects before first chunk', async () => {
+    upstream?.configure({ disconnectAfterEvents: 0 });
+
+    const resp = await proxyPost(
+      '/v1/chat/completions',
+      {
+        model: mockModelName,
+        stream: true,
+        messages: [{ role: 'user', content: 'disconnect before first chunk' }],
+      },
+      AUTHORIZED_KEY,
+      { responseType: 'text' },
+    );
+
+    expect(resp.status).toBe(200);
+    expect(String(resp.headers['content-type'])).toContain('text/event-stream');
+    expect(parseSseDataEvents(String(resp.data))).toHaveLength(0);
+  });
+
+  test('streaming response ends without [DONE] when upstream disconnects mid-stream', async () => {
+    upstream?.configure({ disconnectAfterEvents: 2 });
+
+    const resp = await proxyPost(
+      '/v1/chat/completions',
+      {
+        model: mockModelName,
+        stream: true,
+        messages: [
+          { role: 'user', content: 'disconnect in the middle of stream' },
+        ],
+      },
+      AUTHORIZED_KEY,
+      { responseType: 'text' },
+    );
+
+    expect(resp.status).toBe(200);
+    expect(String(resp.headers['content-type'])).toContain('text/event-stream');
+
+    const events = expectStreamStopsBeforeDone(String(resp.data));
+    expect(events).toHaveLength(2);
+
+    const chunks = events.map(
+      (item) =>
+        JSON.parse(item) as {
+          object: string;
+          choices: Array<{ delta: { content?: string; role?: string } }>;
+        },
+    );
+
+    expect(chunks[0]?.object).toBe('chat.completion.chunk');
+    expect(chunks[0]?.choices[0]?.delta.role).toBe('assistant');
+    expect(chunks[1]?.choices[0]?.delta.content).toBe('from mock upstream');
   });
 
   test('accepts common optional parameters', async () => {
