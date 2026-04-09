@@ -83,7 +83,7 @@ describe('proxy timeout', () => {
     expect(res.data.error.code).toBe('request_timeout');
   });
 
-  test('streaming chat completion returns 504 when first chunk exceeds model timeout', async () => {
+  test('streaming chat completion returns 504 when upstream exceeds model timeout before the stream starts', async () => {
     const res = await client.post(
       `${PROXY_URL}/v1/chat/completions`,
       {

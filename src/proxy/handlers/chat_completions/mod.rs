@@ -101,57 +101,14 @@ async fn handle_stream_request(
 ) -> Result<Response, ChatCompletionError> {
     use futures::stream::StreamExt;
 
-    let res: Result<
-        (
-            BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
-            bool,
-        ),
-        ProviderError,
-    > = match maybe_timeout(timeout, async {
-        let mut stream = match provider.chat_completion_stream(request).await {
-            Ok(stream) => stream,
-            Err(err) => return Err(err),
+    let res: Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> =
+        match maybe_timeout(timeout, provider.chat_completion_stream(request)).await {
+            Ok(res) => res,
+            Err(err) => Err(ChatCompletionError::Timeout(err))?,
         };
 
-        match stream.next().await {
-            Some(first_chunk) => Ok((
-                Box::pin(futures::stream::once(async move { first_chunk }).chain(stream))
-                    as BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
-                true,
-            )),
-            None => Ok((
-                Box::pin(futures::stream::empty())
-                    as BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>,
-                false,
-            )),
-        }
-    })
-    .await
-    {
-        Ok(res) => res,
-        Err(err) => Err(ChatCompletionError::Timeout(err))?,
-    };
-
     match res {
-        Ok((_stream, false)) => {
-            if let Err(err) = HOOK_MANAGER
-                .post_call_streaming(hook_ctx, HOOK_FILTER_ALL)
-                .await
-            {
-                error!("Hook post_call_streaming error: {}", err);
-            }
-
-            Ok((
-                http::StatusCode::OK,
-                [
-                    (http::header::CONTENT_TYPE, "text/event-stream"),
-                    (http::header::CACHE_CONTROL, "no-cache"),
-                ],
-                "",
-            )
-                .into_response())
-        }
-        Ok((stream, _has_initial_chunk)) => {
+        Ok(stream) => {
             let stream_hook_ctx = std::mem::take(hook_ctx);
             let stream_span = Span::root("sse_connection", span_ctx);
 
