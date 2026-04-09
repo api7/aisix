@@ -10,6 +10,8 @@ import {
 import { App } from '../utils/setup.js';
 
 const ADMIN_KEY = 'test_admin_key';
+const TEST_PROVIDER_MODEL = 'openai/test-admin-model';
+const TEST_PROVIDER_CONFIG = { api_key: 'unused-admin-model-key' };
 
 describe('admin models', () => {
   let server: App | undefined;
@@ -31,8 +33,8 @@ describe('admin models', () => {
       '/models',
       {
         name: 'test_model',
-        model: 'mock/mock',
-        provider_config: {},
+        model: TEST_PROVIDER_MODEL,
+        provider_config: TEST_PROVIDER_CONFIG,
       },
       auth,
     );
@@ -47,8 +49,8 @@ describe('admin models', () => {
       `/models/${id}`,
       {
         name: 'updated_model',
-        model: 'mock/mock',
-        provider_config: {},
+        model: TEST_PROVIDER_MODEL,
+        provider_config: TEST_PROVIDER_CONFIG,
       },
       auth,
     );
@@ -72,8 +74,8 @@ describe('admin models', () => {
     const auth = bearerAuthHeader(ADMIN_KEY);
     const body = {
       name: 'put_model',
-      model: 'mock/mock',
-      provider_config: {},
+      model: TEST_PROVIDER_MODEL,
+      provider_config: TEST_PROVIDER_CONFIG,
     };
 
     const firstPut = await adminPut('/models/put-test-fixed-id', body, auth);
@@ -88,14 +90,14 @@ describe('admin models', () => {
 
     const firstModel = {
       name: 'put-dup-name-a',
-      model: 'mock/mock',
-      provider_config: {},
+      model: TEST_PROVIDER_MODEL,
+      provider_config: TEST_PROVIDER_CONFIG,
     };
 
     const secondModel = {
       name: 'put-dup-name-b',
-      model: 'mock/mock',
-      provider_config: {},
+      model: TEST_PROVIDER_MODEL,
+      provider_config: TEST_PROVIDER_CONFIG,
     };
 
     const putA = await adminPut('/models/put-dup-model-a', firstModel, auth);
@@ -113,8 +115,8 @@ describe('admin models', () => {
     const auth = bearerAuthHeader(ADMIN_KEY);
     const body = {
       name: 'duplicate_model_name',
-      model: 'mock/mock',
-      provider_config: {},
+      model: TEST_PROVIDER_MODEL,
+      provider_config: TEST_PROVIDER_CONFIG,
     };
 
     const createResp = await adminPost('/models', body, auth);

@@ -1,7 +1,6 @@
 mod anthropic;
 mod deepseek;
 mod gemini;
-mod mock;
 mod openai;
 mod openai_compatible;
 mod types;
@@ -23,12 +22,11 @@ use crate::{
 
 // Re-export identifiers
 pub mod identifiers {
-    use super::{anthropic, deepseek, gemini, mock, openai};
+    use super::{anthropic, deepseek, gemini, openai};
 
     pub const ANTHROPIC: &str = anthropic::IDENTIFIER;
     pub const DEEPSEEK: &str = deepseek::IDENTIFIER;
     pub const GEMINI: &str = gemini::IDENTIFIER;
-    pub const MOCK: &str = mock::IDENTIFIER;
     pub const OPENAI: &str = openai::IDENTIFIER;
 }
 
@@ -36,7 +34,7 @@ pub mod identifiers {
 pub mod configs {
     pub use super::{
         anthropic::AnthropicProviderConfig, deepseek::DeepSeekProviderConfig,
-        gemini::GeminiProviderConfig, mock::MockProviderConfig, openai::OpenAIProviderConfig,
+        gemini::GeminiProviderConfig, openai::OpenAIProviderConfig,
     };
 }
 
@@ -81,7 +79,6 @@ pub fn create_provider(config: &ProviderConfig) -> Box<dyn Provider> {
             }
             Box::new(provider)
         }
-        ProviderConfig::Mock(_config) => Box::new(mock::MockProvider::default()),
     }
 }
 

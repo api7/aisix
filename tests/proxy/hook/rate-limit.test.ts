@@ -5,11 +5,19 @@ import {
   bearerAuthHeader,
   startIsolatedAdminApp,
 } from '../../utils/admin.js';
+import {
+  OpenAiMockUpstream,
+  buildOpenAiProviderConfig,
+  buildOpenAiProviderModel,
+  startOpenAiMockUpstream,
+} from '../../utils/mock-upstream.js';
 import { proxyPost } from '../../utils/proxy.js';
 import { App } from '../../utils/setup.js';
 
 const ADMIN_KEY = 'test_admin_key_proxy_hook_rate_limit';
 const PROXY_KEY = 'sk-proxy-hook-rate-limit';
+const UPSTREAM_API_KEY = 'upstream-key-rate-limit';
+const UPSTREAM_MODEL = 'rate-limit-upstream-model';
 
 const waitConfigPropagation = async () => {
   await new Promise((resolve) => setTimeout(resolve, 500));
@@ -17,10 +25,12 @@ const waitConfigPropagation = async () => {
 
 describe('proxy hooks rate limit', () => {
   let server: App | undefined;
+  let upstream: OpenAiMockUpstream | undefined;
   let modelName = '';
 
   beforeEach(async () => {
     server = await startIsolatedAdminApp(ADMIN_KEY);
+    upstream = await startOpenAiMockUpstream();
 
     modelName = `rate-limit-model-${randomUUID()}`;
 
@@ -28,8 +38,11 @@ describe('proxy hooks rate limit', () => {
       '/models',
       {
         name: modelName,
-        model: 'mock/mock',
-        provider_config: {},
+        model: buildOpenAiProviderModel(UPSTREAM_MODEL),
+        provider_config: buildOpenAiProviderConfig(
+          upstream.apiBase,
+          UPSTREAM_API_KEY,
+        ),
         rate_limit: {
           tpm: 1000,
         },
@@ -54,7 +67,10 @@ describe('proxy hooks rate limit', () => {
     await waitConfigPropagation();
   });
 
-  afterEach(async () => await server?.exit());
+  afterEach(async () => {
+    await upstream?.close();
+    await server?.exit();
+  });
 
   test('successful responses include rate limit headers', async () => {
     const firstResp = await proxyPost(
