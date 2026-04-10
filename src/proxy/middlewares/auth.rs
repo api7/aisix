@@ -74,7 +74,6 @@ pub async fn auth(
             return Err(AuthError::InvalidApiKey);
         }
     };
-
     req.extensions_mut()
         .insert::<ResourceEntry<ApiKey>>(api_key);
 

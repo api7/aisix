@@ -13,6 +13,7 @@ use crate::{
     proxy::{
         AppState,
         hooks::{HOOK_FILTER_NONE, HOOK_MANAGER, HookContext, HookError},
+        hooks2::RequestContext,
     },
 };
 
@@ -55,6 +56,7 @@ impl IntoResponse for ModelError {
 #[fastrace::trace]
 pub async fn list_models(
     State(state): State<AppState>,
+    request_ctx: RequestContext,
     mut hook_ctx: HookContext,
     mut request: Request,
 ) -> Result<Response, ModelError> {
@@ -62,7 +64,7 @@ pub async fn list_models(
         .pre_call(&mut hook_ctx, &mut request, HOOK_FILTER_NONE)
         .await?;
 
-    let api_key = hook_ctx
+    let api_key = request_ctx
         .get::<ResourceEntry<ApiKey>>()
         .cloned()
         .expect("apikey should exist in context");

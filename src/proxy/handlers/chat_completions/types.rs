@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::time::error::Elapsed;
 
-use crate::{providers::ProviderError, proxy::hooks::HookError};
+use crate::{
+    providers::ProviderError,
+    proxy::{hooks::HookError, hooks2::authorization::AuthorizationError},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -143,6 +146,8 @@ pub struct ChatCompletionChunk {
 
 #[derive(Debug, Error)]
 pub enum ChatCompletionError {
+    #[error("Authorization error: {0}")]
+    AuthorizationError(#[from] AuthorizationError),
     #[error("Provider error: {0}")]
     ProviderError(#[from] ProviderError),
     #[error("Request timed out")]
@@ -154,6 +159,7 @@ pub enum ChatCompletionError {
 impl IntoResponse for ChatCompletionError {
     fn into_response(self) -> axum::response::Response {
         match self {
+            ChatCompletionError::AuthorizationError(err) => err.into_response(),
             ChatCompletionError::ProviderError(err) => (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
