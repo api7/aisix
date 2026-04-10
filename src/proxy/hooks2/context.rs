@@ -30,7 +30,7 @@ impl FromRequestParts<AppState> for RequestContext {
                     "Authentication middleware should have inserted ApiKey into request extensions",
                 )
                 .clone(),
-        ); // TODO: remove instand of clone
+        ); // TODO: remove instead of clone
         Ok(Self {
             app_state: state.clone(),
             extensions: ctx,
