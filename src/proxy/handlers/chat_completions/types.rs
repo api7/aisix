@@ -6,7 +6,7 @@ use tokio::time::error::Elapsed;
 
 use crate::{
     providers::ProviderError,
-    proxy::{hooks::HookError, hooks2::authorization::AuthorizationError},
+    proxy::hooks::{authorization::AuthorizationError, rate_limit::RateLimitHookError},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,18 +148,19 @@ pub struct ChatCompletionChunk {
 pub enum ChatCompletionError {
     #[error("Authorization error: {0}")]
     AuthorizationError(#[from] AuthorizationError),
+    #[error("Rate limit error: {0}")]
+    RateLimitError(#[from] RateLimitHookError),
     #[error("Provider error: {0}")]
     ProviderError(#[from] ProviderError),
     #[error("Request timed out")]
     Timeout(#[from] Elapsed),
-    #[error("Hook error")]
-    HookError(#[from] HookError),
 }
 
 impl IntoResponse for ChatCompletionError {
     fn into_response(self) -> axum::response::Response {
         match self {
             ChatCompletionError::AuthorizationError(err) => err.into_response(),
+            ChatCompletionError::RateLimitError(RateLimitHookError::Raw(resp)) => resp,
             ChatCompletionError::ProviderError(err) => (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
@@ -182,7 +183,6 @@ impl IntoResponse for ChatCompletionError {
                 })),
             )
                 .into_response(),
-            ChatCompletionError::HookError(err) => err.into_response(),
         }
     }
 }

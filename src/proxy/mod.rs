@@ -1,6 +1,5 @@
 mod handlers;
-pub mod hooks;
-mod hooks2;
+mod hooks;
 mod middlewares;
 
 use std::sync::Arc;

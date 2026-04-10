@@ -4,8 +4,7 @@ use std::{convert::Infallible, time::Duration};
 
 use axum::{
     Json,
-    body::Body,
-    extract::{Extension, Request, State},
+    extract::{Extension, State},
     response::{
         IntoResponse, Response,
         sse::{Event as SseEvent, Sse},
@@ -21,9 +20,7 @@ use crate::{
     providers::{Provider, ProviderError, create_provider},
     proxy::{
         AppState,
-        hooks::{HOOK_FILTER_ALL, HOOK_MANAGER, HookContext, ResponseData, TokenUsage},
-        hooks2::{RequestContext, authorization},
-        middlewares::RequestModel,
+        hooks::{self, RequestContext, ResponseData, TokenUsage},
     },
     utils::future::maybe_timeout,
 };
@@ -33,22 +30,18 @@ pub async fn chat_completions(
     State(_state): State<AppState>,
     Extension(span_ctx): Extension<SpanContext>,
     mut request_ctx: RequestContext,
-    mut hook_ctx: HookContext,
     Json(mut request_data): Json<ChatCompletionRequest>,
 ) -> Result<Response, ChatCompletionError> {
-    authorization::check(&mut request_ctx, request_data.model.clone()).await?;
+    hooks::observability::record_start_time(&mut request_ctx).await;
+    hooks::authorization::check(&mut request_ctx, request_data.model.clone()).await?;
+    hooks::rate_limit::pre_check(&mut request_ctx).await?;
 
-    // TODO: remove
-    let _model = request_ctx.get::<ResourceEntry<Model>>().unwrap().clone();
-    hook_ctx.insert(_model);
-    hook_ctx.insert(RequestModel(request_data.model));
-
-    let mut request = Request::new(Body::empty()); //TODO
-    HOOK_MANAGER
-        .pre_call(&mut hook_ctx, &mut request, HOOK_FILTER_ALL)
-        .await?;
-
-    let model = hook_ctx.get::<ResourceEntry<Model>>().cloned().unwrap(); //TODO: safe unwrap
+    let model = request_ctx
+        .extensions()
+        .await
+        .get::<ResourceEntry<Model>>()
+        .cloned()
+        .unwrap(); //TODO: safe unwrap
 
     let provider = create_provider(&model.provider_config);
     let timeout = model.timeout.map(Duration::from_millis);
@@ -60,9 +53,9 @@ pub async fn chat_completions(
     let is_stream = request_data.stream.unwrap_or(false);
 
     let response = if is_stream {
-        handle_stream_request(provider, request_data, &mut hook_ctx, span_ctx, timeout).await?
+        handle_stream_request(provider, request_data, &mut request_ctx, span_ctx, timeout).await?
     } else {
-        handle_regular_request(provider, request_data, &mut hook_ctx, timeout).await?
+        handle_regular_request(provider, request_data, &mut request_ctx, timeout).await?
     };
 
     Ok(response)
@@ -72,24 +65,22 @@ pub async fn chat_completions(
 async fn handle_regular_request(
     provider: Box<dyn Provider>,
     request: ChatCompletionRequest,
-    hook_ctx: &mut HookContext,
+    request_ctx: &mut RequestContext,
     timeout: Option<Duration>,
 ) -> Result<Response, ChatCompletionError> {
     match maybe_timeout(timeout, provider.chat_completion(request)).await? {
         Ok(response) => {
-            HOOK_MANAGER
-                .post_call_success(
-                    hook_ctx,
-                    &ResponseData::ChatCompletion(response.clone()),
-                    HOOK_FILTER_ALL,
-                )
-                .await?;
+            if let Err(err) = hooks::rate_limit::post_check(
+                request_ctx,
+                &ResponseData::ChatCompletion(response.clone()),
+            )
+            .await
+            {
+                error!("Rate limit post_check error: {}", err);
+            }
 
-            // Build response and add headers
             let mut resp = Json(response).into_response();
-            HOOK_MANAGER
-                .post_call_headers(hook_ctx, resp.headers_mut(), HOOK_FILTER_ALL)
-                .await?;
+            hooks::rate_limit::inject_response_headers(request_ctx, resp.headers_mut()).await;
 
             Ok(resp)
         }
@@ -104,7 +95,7 @@ async fn handle_regular_request(
 async fn handle_stream_request(
     provider: Box<dyn Provider>,
     request: ChatCompletionRequest,
-    hook_ctx: &mut HookContext,
+    request_ctx: &mut RequestContext,
     span_ctx: SpanContext,
     timeout: Option<Duration>,
 ) -> Result<Response, ChatCompletionError> {
@@ -118,19 +109,19 @@ async fn handle_stream_request(
 
     match res {
         Ok(stream) => {
-            let stream_hook_ctx = std::mem::take(hook_ctx);
+            let stream_request_ctx = request_ctx.clone(); //TODO
             let stream_span = Span::root("sse_connection", span_ctx);
 
             let sse_stream = futures::stream::unfold(
-                (stream, stream_span, 0, stream_hook_ctx, false, false),
-                |(mut stream, span, idx, mut hook_ctx, done, saw_chunk)| async move {
+                (stream, stream_span, 0, stream_request_ctx, false, false),
+                |(mut stream, span, idx, mut request_ctx, done, saw_chunk)| async move {
                     if done {
-                        if let Err(err) = HOOK_MANAGER
-                            .post_call_streaming(&mut hook_ctx, HOOK_FILTER_ALL)
-                            .await
+                        if let Err(err) =
+                            hooks::rate_limit::post_check_streaming(&mut request_ctx).await
                         {
-                            error!("Hook post_call_streaming error: {}", err);
+                            error!("Rate limit post_check_streaming error: {}", err);
                         }
+                        hooks::observability::record_streaming_usage(&mut request_ctx).await;
 
                         drop(span);
                         return None;
@@ -139,26 +130,17 @@ async fn handle_stream_request(
                         Some(Ok(chunk)) => {
                             // Record first-token event
                             if idx == 0 {
+                                hooks::observability::record_first_token_latency(&mut request_ctx)
+                                    .await;
                                 span.add_event(TraceEvent::new("first token arrived"));
                             }
 
                             // Record token usage
                             if let Some(usage) = &chunk.usage {
-                                hook_ctx.insert(TokenUsage::from_chat_completion(usage));
-                            }
-
-                            if let Err(err) = HOOK_MANAGER
-                                .post_call_streaming_chunk(
-                                    &mut hook_ctx,
-                                    &chunk,
-                                    idx,
-                                    HOOK_FILTER_ALL,
-                                )
-                                .await
-                            {
-                                error!("Hook post_call_streaming_chunk error: {}", err);
-                                drop(span);
-                                return None;
+                                request_ctx
+                                    .extensions_mut()
+                                    .await
+                                    .insert(TokenUsage::from_chat_completion(usage));
                             }
 
                             let event = match serde_json::to_string(&chunk) {
@@ -170,7 +152,7 @@ async fn handle_stream_request(
                                     Ok(SseEvent::default().data(""))
                                 }
                             };
-                            Some((event, (stream, span, idx + 1, hook_ctx, false, true)))
+                            Some((event, (stream, span, idx + 1, request_ctx, false, true)))
                         }
                         Some(Err(err)) => {
                             error!("Stream error: {}", err);
@@ -181,15 +163,17 @@ async fn handle_stream_request(
                             if saw_chunk {
                                 Some((
                                     Ok(SseEvent::default().data("[DONE]")),
-                                    (stream, span, idx + 1, hook_ctx, true, saw_chunk),
+                                    (stream, span, idx + 1, request_ctx, true, saw_chunk),
                                 ))
                             } else {
-                                if let Err(err) = HOOK_MANAGER
-                                    .post_call_streaming(&mut hook_ctx, HOOK_FILTER_ALL)
-                                    .await
+                                // TODO: check why
+                                if let Err(err) =
+                                    hooks::rate_limit::post_check_streaming(&mut request_ctx).await
                                 {
-                                    error!("Hook post_call_streaming error: {}", err);
+                                    error!("Rate limit post_check_streaming error: {}", err);
                                 }
+                                hooks::observability::record_streaming_usage(&mut request_ctx)
+                                    .await;
 
                                 drop(span);
                                 None
