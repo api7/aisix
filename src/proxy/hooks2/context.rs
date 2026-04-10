@@ -45,3 +45,9 @@ impl DerefMut for RequestContext {
         &mut self.extensions
     }
 }
+
+impl RequestContext {
+    pub fn app_state(&self) -> &AppState {
+        &self.app_state
+    }
+}

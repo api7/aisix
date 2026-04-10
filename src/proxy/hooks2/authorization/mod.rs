@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::{
     config::entities::{ApiKey, ResourceEntry},
-    proxy::{AppState, hooks2::RequestContext},
+    proxy::hooks2::RequestContext,
 };
 
 #[derive(Clone)]
@@ -57,13 +57,9 @@ impl IntoResponse for AuthorizationError {
     }
 }
 
+#[fastrace::trace]
 pub async fn check(ctx: &mut RequestContext, model_name: String) -> Result<(), AuthorizationError> {
-    let state = ctx
-        .get::<AppState>()
-        .cloned()
-        .expect("AppState should be in context");
-
-    let model = match state.resources().models.get_by_name(&model_name) {
+    let model = match ctx.app_state().resources().models.get_by_name(&model_name) {
         Some(model) => model,
         None => {
             return Err(AuthorizationError::ModelNotFound(model_name.clone()));
