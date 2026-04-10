@@ -32,6 +32,9 @@ pub async fn embeddings(
     authorization::check(&mut request_ctx, request_data.model.clone()).await?;
 
     // PRE CALL HOOKS START
+    // TODO: remove
+    let _model = request_ctx.get::<ResourceEntry<Model>>().unwrap().clone();
+    hook_ctx.insert(_model);
     hook_ctx.insert(RequestModel(request_data.model));
 
     let mut request = Request::new(Body::empty()); //TODO

@@ -23,6 +23,7 @@ use crate::{
         AppState,
         hooks::{HOOK_FILTER_ALL, HOOK_MANAGER, HookContext, ResponseData, TokenUsage},
         hooks2::{RequestContext, authorization},
+        middlewares::RequestModel,
     },
     utils::future::maybe_timeout,
 };
@@ -36,6 +37,11 @@ pub async fn chat_completions(
     Json(mut request_data): Json<ChatCompletionRequest>,
 ) -> Result<Response, ChatCompletionError> {
     authorization::check(&mut request_ctx, request_data.model.clone()).await?;
+
+    // TODO: remove
+    let _model = request_ctx.get::<ResourceEntry<Model>>().unwrap().clone();
+    hook_ctx.insert(_model);
+    hook_ctx.insert(RequestModel(request_data.model));
 
     let mut request = Request::new(Body::empty()); //TODO
     HOOK_MANAGER
