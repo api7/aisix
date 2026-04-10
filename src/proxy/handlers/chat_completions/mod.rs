@@ -4,6 +4,7 @@ use std::{convert::Infallible, time::Duration};
 
 use axum::{
     Json,
+    body::Body,
     extract::{Extension, Request, State},
     response::{
         IntoResponse, Response,
@@ -29,12 +30,12 @@ use crate::{
 #[fastrace::trace]
 pub async fn chat_completions(
     State(_state): State<AppState>,
-    Extension(mut request_data): Extension<ChatCompletionRequest>,
     Extension(span_ctx): Extension<SpanContext>,
     mut hook_ctx: HookContext,
-    mut request: Request,
+    Json(mut request_data): Json<ChatCompletionRequest>,
 ) -> Result<Response, ChatCompletionError> {
     hook_ctx.insert(RequestModel(request_data.model));
+    let mut request = Request::new(Body::empty()); //TODO
     HOOK_MANAGER
         .pre_call(&mut hook_ctx, &mut request, HOOK_FILTER_ALL)
         .await?;

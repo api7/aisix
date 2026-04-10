@@ -180,7 +180,7 @@ describe('proxy /v1/embeddings', () => {
     expect(resp.data.error.code).toBe('model_access_forbidden');
   });
 
-  test('invalid json for embeddings returns 400 invalid_json', async () => {
+  test('invalid json for embeddings returns extractor error', async () => {
     const resp = await client.post(PROXY_EMBEDDINGS_URL, '{"model":', {
       headers: {
         ...proxyAuthHeader(AUTHORIZED_KEY),
@@ -188,11 +188,11 @@ describe('proxy /v1/embeddings', () => {
       },
     });
 
-    expect(resp.status).toBe(400);
-    expect(resp.data.error.code).toBe('invalid_json');
+    expect(resp.status).toBe(422);
+    expect(typeof resp.data).toBe('string');
   });
 
-  test('missing model field returns 400 invalid_json', async () => {
+  test('missing model field returns extractor rejection', async () => {
     const resp = await proxyPost(
       '/v1/embeddings',
       {
@@ -201,8 +201,8 @@ describe('proxy /v1/embeddings', () => {
       AUTHORIZED_KEY,
     );
 
-    expect(resp.status).toBe(400);
-    expect(resp.data.error.code).toBe('invalid_json');
+    expect(resp.status).toBe(422);
+    expect(typeof resp.data).toBe('string');
   });
 
   test('upstream failure is mapped to 502 provider_error', async () => {

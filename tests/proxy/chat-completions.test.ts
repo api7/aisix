@@ -174,7 +174,7 @@ describe('proxy /v1/chat/completions', () => {
     expect(resp.data.error.code).toBe('model_access_forbidden');
   });
 
-  test('authorized model with invalid json body returns parse error', async () => {
+  test('authorized model with invalid json body returns extractor error', async () => {
     const resp = await client.post(PROXY_CHAT_URL, '{"model":', {
       headers: {
         ...proxyAuthHeader(AUTHORIZED_KEY),
@@ -182,8 +182,8 @@ describe('proxy /v1/chat/completions', () => {
       },
     });
 
-    expect(resp.status).toBe(400);
-    expect(resp.data.error.code).toBe('invalid_json');
+    expect(resp.status).toBe(422);
+    expect(typeof resp.data).toBe('string');
   });
 
   test('missing auth header returns 401', async () => {
@@ -210,7 +210,7 @@ describe('proxy /v1/chat/completions', () => {
     expect(resp.data.error.message).toBe('Invalid API key');
   });
 
-  test('missing model field returns 400 invalid_json', async () => {
+  test('missing model field returns extractor rejection', async () => {
     const resp = await proxyPost(
       '/v1/chat/completions',
       {
@@ -219,11 +219,11 @@ describe('proxy /v1/chat/completions', () => {
       AUTHORIZED_KEY,
     );
 
-    expect(resp.status).toBe(400);
-    expect(resp.data.error.code).toBe('invalid_json');
+    expect(resp.status).toBe(422);
+    expect(typeof resp.data).toBe('string');
   });
 
-  test('missing messages field returns 400 invalid_json', async () => {
+  test('missing messages field returns extractor rejection', async () => {
     const resp = await proxyPost(
       '/v1/chat/completions',
       {
@@ -232,8 +232,8 @@ describe('proxy /v1/chat/completions', () => {
       AUTHORIZED_KEY,
     );
 
-    expect(resp.status).toBe(400);
-    expect(resp.data.error.code).toBe('invalid_json');
+    expect(resp.status).toBe(422);
+    expect(typeof resp.data).toBe('string');
   });
 
   test('nonexistent model returns 400 model_not_found', async () => {

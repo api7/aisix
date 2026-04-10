@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     middleware::{from_fn, from_fn_with_state},
     routing::{get, post},
 };
@@ -23,6 +24,8 @@ pub mod types {
         embeddings::{EmbeddingRequest, EmbeddingResponse},
     };
 }
+
+const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -46,16 +49,10 @@ pub fn create_router(state: AppState) -> Router {
         .merge(Router::new().route("/v1/models", get(handlers::models::list_models)))
         .route(
             "/v1/chat/completions",
-            post(handlers::chat_completions::chat_completions).layer(from_fn(
-                middlewares::parse_body::<handlers::chat_completions::ChatCompletionRequest>,
-            )),
+            post(handlers::chat_completions::chat_completions),
         )
-        .route(
-            "/v1/embeddings",
-            post(handlers::embeddings::embeddings).layer(from_fn(
-                middlewares::parse_body::<handlers::embeddings::EmbeddingRequest>,
-            )),
-        )
+        .route("/v1/embeddings", post(handlers::embeddings::embeddings))
+        .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
         .layer(from_fn_with_state(state.clone(), middlewares::auth))
         .layer(from_fn(middlewares::trace))
         .with_state(state)
