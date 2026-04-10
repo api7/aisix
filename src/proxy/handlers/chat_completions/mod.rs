@@ -31,8 +31,8 @@ use crate::{
 pub async fn chat_completions(
     State(_state): State<AppState>,
     Extension(span_ctx): Extension<SpanContext>,
-    mut hook_ctx: HookContext,
     mut request_ctx: RequestContext,
+    mut hook_ctx: HookContext,
     Json(mut request_data): Json<ChatCompletionRequest>,
 ) -> Result<Response, ChatCompletionError> {
     authorization::check(&mut request_ctx, request_data.model.clone()).await?;

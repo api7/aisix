@@ -25,8 +25,8 @@ use crate::{
 
 pub async fn embeddings(
     State(_state): State<AppState>,
-    mut hook_ctx: HookContext,
     mut request_ctx: RequestContext,
+    mut hook_ctx: HookContext,
     Json(mut request_data): Json<EmbeddingRequest>,
 ) -> Result<Response, EmbeddingError> {
     authorization::check(&mut request_ctx, request_data.model.clone()).await?;

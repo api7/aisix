@@ -22,9 +22,15 @@ impl FromRequestParts<AppState> for RequestContext {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let mut ctx = http::Extensions::new();
-        ctx.insert(parts.extensions.remove::<ResourceEntry<ApiKey>>().expect(
-            "Authentication middleware should have inserted ApiKey into request extensions",
-        ));
+        ctx.insert(
+            parts
+                .extensions
+                .get::<ResourceEntry<ApiKey>>()
+                .expect(
+                    "Authentication middleware should have inserted ApiKey into request extensions",
+                )
+                .clone(),
+        ); // TODO: remove instand of clone
         Ok(Self {
             app_state: state.clone(),
             extensions: ctx,

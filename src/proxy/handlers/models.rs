@@ -56,8 +56,8 @@ impl IntoResponse for ModelError {
 #[fastrace::trace]
 pub async fn list_models(
     State(state): State<AppState>,
-    mut hook_ctx: HookContext,
     request_ctx: RequestContext,
+    mut hook_ctx: HookContext,
     mut request: Request,
 ) -> Result<Response, ModelError> {
     HOOK_MANAGER
