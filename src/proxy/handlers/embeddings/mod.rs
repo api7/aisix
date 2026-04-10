@@ -17,6 +17,7 @@ use crate::{
     proxy::{
         AppState,
         hooks::{HOOK_FILTER_ALL, HOOK_MANAGER, HookContext, ResponseData},
+        hooks2::{RequestContext, authorization},
         middlewares::RequestModel,
     },
     utils::future::maybe_timeout,
@@ -25,8 +26,11 @@ use crate::{
 pub async fn embeddings(
     State(_state): State<AppState>,
     mut hook_ctx: HookContext,
+    mut request_ctx: RequestContext,
     Json(mut request_data): Json<EmbeddingRequest>,
 ) -> Result<Response, EmbeddingError> {
+    authorization::check(&mut request_ctx, request_data.model.clone()).await?;
+
     // PRE CALL HOOKS START
     hook_ctx.insert(RequestModel(request_data.model));
 

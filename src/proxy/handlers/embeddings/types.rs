@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::time::error::Elapsed;
 
-use crate::{providers::ProviderError, proxy::hooks::HookError};
+use crate::{
+    providers::ProviderError,
+    proxy::{hooks::HookError, hooks2::authorization::AuthorizationError},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -48,6 +51,8 @@ pub struct EmbeddingResponse {
 
 #[derive(Debug, Error)]
 pub enum EmbeddingError {
+    #[error("Authorization error: {0}")]
+    AuthorizationError(#[from] AuthorizationError),
     #[error("Provider error: {0}")]
     ProviderError(#[from] ProviderError),
     #[error("Request timed out")]
@@ -59,6 +64,7 @@ pub enum EmbeddingError {
 impl IntoResponse for EmbeddingError {
     fn into_response(self) -> axum::response::Response {
         match self {
+            EmbeddingError::AuthorizationError(err) => err.into_response(),
             EmbeddingError::ProviderError(err) => (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({

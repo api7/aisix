@@ -1,6 +1,5 @@
 mod metric;
 mod rate_limit;
-mod validate_model;
 
 use std::{
     any::Any,
@@ -352,7 +351,6 @@ impl HookManager {
 pub static HOOK_MANAGER: LazyLock<HookManager> = LazyLock::new(|| {
     let mut manager = HookManager::new();
     manager
-        .register(Box::new(validate_model::ValidateModelHook))
         .register(Box::new(rate_limit::RateLimitHook))
         .register(Box::new(metric::MetricHook));
     manager

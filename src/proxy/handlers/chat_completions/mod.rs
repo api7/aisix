@@ -22,7 +22,7 @@ use crate::{
     proxy::{
         AppState,
         hooks::{HOOK_FILTER_ALL, HOOK_MANAGER, HookContext, ResponseData, TokenUsage},
-        middlewares::RequestModel,
+        hooks2::{RequestContext, authorization},
     },
     utils::future::maybe_timeout,
 };
@@ -32,9 +32,11 @@ pub async fn chat_completions(
     State(_state): State<AppState>,
     Extension(span_ctx): Extension<SpanContext>,
     mut hook_ctx: HookContext,
+    mut request_ctx: RequestContext,
     Json(mut request_data): Json<ChatCompletionRequest>,
 ) -> Result<Response, ChatCompletionError> {
-    hook_ctx.insert(RequestModel(request_data.model));
+    authorization::check(&mut request_ctx, request_data.model.clone()).await?;
+
     let mut request = Request::new(Body::empty()); //TODO
     HOOK_MANAGER
         .pre_call(&mut hook_ctx, &mut request, HOOK_FILTER_ALL)
