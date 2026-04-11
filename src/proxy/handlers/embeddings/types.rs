@@ -6,7 +6,7 @@ use tokio::time::error::Elapsed;
 
 use crate::{
     providers::ProviderError,
-    proxy::hooks::{authorization::AuthorizationError, rate_limit::RateLimitHookError},
+    proxy::hooks::{authorization::AuthorizationError, rate_limit::RateLimitError},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,7 +54,7 @@ pub enum EmbeddingError {
     #[error("Authorization error: {0}")]
     AuthorizationError(#[from] AuthorizationError),
     #[error("Rate limit error: {0}")]
-    RateLimitError(#[from] RateLimitHookError),
+    RateLimitError(#[from] RateLimitError),
     #[error("Provider error: {0}")]
     ProviderError(#[from] ProviderError),
     #[error("Request timed out")]
@@ -65,7 +65,7 @@ impl IntoResponse for EmbeddingError {
     fn into_response(self) -> axum::response::Response {
         match self {
             EmbeddingError::AuthorizationError(err) => err.into_response(),
-            EmbeddingError::RateLimitError(RateLimitHookError::Raw(resp)) => resp,
+            EmbeddingError::RateLimitError(RateLimitError::Raw(resp)) => resp,
             EmbeddingError::ProviderError(err) => (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({

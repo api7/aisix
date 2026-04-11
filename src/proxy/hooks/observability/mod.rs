@@ -6,7 +6,7 @@ use metrics::{counter, histogram};
 use crate::proxy::hooks::{RequestContext, ResponseData, TokenUsage, authorization::RequestModel};
 
 #[derive(Clone)]
-pub struct StartTime(Instant);
+struct StartTime(Instant);
 
 async fn get_start_time(ctx: &RequestContext) -> Instant {
     ctx.extensions()
@@ -56,16 +56,19 @@ fn record_token_usage(model_name: String, usage: &TokenUsage) {
     .increment(usage.total_tokens);
 }
 
+/// Records the request start timestamp in the request context.
 pub async fn record_start_time(ctx: &mut RequestContext) {
     ctx.extensions_mut().await.insert(StartTime(Instant::now()));
 }
 
+/// Records latency and token metrics for a non-streaming response.
 pub async fn record_usage(ctx: &mut RequestContext, response: &ResponseData) {
     let model_name = get_request_model_name(ctx).await;
     record_llm_latency(ctx, model_name.clone()).await;
     record_token_usage(model_name, &response.token_usage());
 }
 
+/// Records first-token latency for a streaming response.
 pub async fn record_first_token_latency(ctx: &mut RequestContext) {
     let model_name = get_request_model_name(ctx).await;
 
@@ -76,6 +79,7 @@ pub async fn record_first_token_latency(ctx: &mut RequestContext) {
     .record(get_start_time(ctx).await.elapsed().as_millis() as f64);
 }
 
+/// Records final latency and token metrics for a completed streaming response.
 pub async fn record_streaming_usage(ctx: &mut RequestContext) {
     let model_name = get_request_model_name(ctx).await;
 

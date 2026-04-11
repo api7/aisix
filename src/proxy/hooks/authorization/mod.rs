@@ -84,8 +84,9 @@ pub async fn check(ctx: &mut RequestContext, model_name: String) -> Result<(), A
         return Err(AuthorizationError::AccessForbidden(model_name.clone()));
     }
 
-    ctx.extensions_mut().await.insert(model);
-    ctx.extensions_mut().await.insert(RequestModel(model_name));
+    let mut extensions = ctx.extensions_mut().await;
+    extensions.insert(model);
+    extensions.insert(RequestModel(model_name));
 
     Ok(())
 }

@@ -61,6 +61,13 @@ pub async fn chat_completions(
     Ok(response)
 }
 
+async fn finalize_stream_request(request_ctx: &mut RequestContext) {
+    if let Err(err) = hooks::rate_limit::post_check_streaming(request_ctx).await {
+        error!("Rate limit post_check_streaming error: {}", err);
+    }
+    hooks::observability::record_streaming_usage(request_ctx).await;
+}
+
 #[fastrace::trace]
 async fn handle_regular_request(
     provider: Box<dyn Provider>,
@@ -70,9 +77,11 @@ async fn handle_regular_request(
 ) -> Result<Response, ChatCompletionError> {
     match maybe_timeout(timeout, provider.chat_completion(request)).await? {
         Ok(response) => {
+            let response_data = ResponseData::ChatCompletion(response.clone());
+
             if let Err(err) = hooks::rate_limit::post_check(
                 request_ctx,
-                &ResponseData::ChatCompletion(response.clone()),
+                &response_data,
             )
             .await
             {
@@ -81,6 +90,7 @@ async fn handle_regular_request(
 
             let mut resp = Json(response).into_response();
             hooks::rate_limit::inject_response_headers(request_ctx, resp.headers_mut()).await;
+            hooks::observability::record_usage(request_ctx, &response_data).await;
 
             Ok(resp)
         }
@@ -116,12 +126,7 @@ async fn handle_stream_request(
                 (stream, stream_span, 0, stream_request_ctx, false, false),
                 |(mut stream, span, idx, mut request_ctx, done, saw_chunk)| async move {
                     if done {
-                        if let Err(err) =
-                            hooks::rate_limit::post_check_streaming(&mut request_ctx).await
-                        {
-                            error!("Rate limit post_check_streaming error: {}", err);
-                        }
-                        hooks::observability::record_streaming_usage(&mut request_ctx).await;
+                        finalize_stream_request(&mut request_ctx).await;
 
                         drop(span);
                         return None;
@@ -156,6 +161,7 @@ async fn handle_stream_request(
                         }
                         Some(Err(err)) => {
                             error!("Stream error: {}", err);
+                            finalize_stream_request(&mut request_ctx).await;
                             drop(span);
                             None
                         }
@@ -167,13 +173,7 @@ async fn handle_stream_request(
                                 ))
                             } else {
                                 // TODO: check why
-                                if let Err(err) =
-                                    hooks::rate_limit::post_check_streaming(&mut request_ctx).await
-                                {
-                                    error!("Rate limit post_check_streaming error: {}", err);
-                                }
-                                hooks::observability::record_streaming_usage(&mut request_ctx)
-                                    .await;
+                                finalize_stream_request(&mut request_ctx).await;
 
                                 drop(span);
                                 None

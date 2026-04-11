@@ -20,6 +20,7 @@ use crate::{
     utils::future::maybe_timeout,
 };
 
+#[fastrace::trace]
 pub async fn embeddings(
     State(_state): State<AppState>,
     mut request_ctx: RequestContext,
