@@ -2,191 +2,204 @@ mod concurrent;
 mod ratelimit;
 
 use anyhow::Result;
-use async_trait::async_trait;
-use axum::{extract::Request, http::HeaderMap, response::IntoResponse};
+use axum::{
+    body::Body,
+    response::{IntoResponse, Response},
+};
 use concurrent::{
-    ConcurrencyPermit, ConcurrencyPermits,
+    ConcurrencyPermits,
     utils::{ConcurrencyLimitResponse, ConcurrencyState, run_concurrency_check},
 };
-use ratelimit::{
-    utils::{CheckPhase, RateLimitResponse, RateLimitState, run_check},
-    *,
-};
+use log::error;
+use ratelimit::utils::{CheckPhase, RateLimitResponse, RateLimitState, run_check};
+use thiserror::Error;
 
 use crate::{
     config::entities::{ApiKey, Model, ResourceEntry},
-    proxy::hooks::{HookContext, HookError, ProxyHook, ResponseData, TokenUsage},
+    proxy::hooks::{
+        RequestContext, ResponseData, TokenUsage,
+        rate_limit::ratelimit::RateLimitError as RRateLimitError,
+    },
 };
 
-pub struct RateLimitHook;
+#[derive(Debug, Error)]
+pub enum RateLimitError {
+    #[error("Rate limit exceeded")]
+    Raw(Response<Body>),
+}
 
-impl RateLimitHook {
-    fn get_resources(ctx: &mut HookContext) -> (ResourceEntry<ApiKey>, ResourceEntry<Model>) {
-        let api_key = ctx
-            .get::<ResourceEntry<ApiKey>>()
-            .cloned()
-            .expect("apikey should exist in context");
-        let model = ctx
-            .get::<ResourceEntry<Model>>()
-            .cloned()
-            .expect("model should exist in context");
-        (api_key, model)
-    }
-
-    fn get_rate_limit_state(ctx: &mut HookContext) -> &mut RateLimitState {
-        ctx.get_mut::<RateLimitState>()
-            .expect("rate limit state should be initialized in context")
-    }
-
-    fn get_concurrency_state(ctx: &mut HookContext) -> &mut ConcurrencyState {
-        ctx.get_mut::<ConcurrencyState>()
-            .expect("concurrency state should be initialized in context")
-    }
-
-    async fn run_post_check(&self, ctx: &mut HookContext, total_tokens: u64) {
-        let (api_key, model) = Self::get_resources(ctx);
-        let rate_limit_state = Self::get_rate_limit_state(ctx);
-        Self::apply_post_check("api_key", &api_key, total_tokens, rate_limit_state).await;
-        Self::apply_post_check("model", &model, total_tokens, rate_limit_state).await;
-    }
-
-    async fn apply_pre_check<T: crate::config::entities::types::HasRateLimit>(
-        id: String,
-        entity: &T,
-        state: &mut RateLimitState,
-    ) -> Option<axum::response::Response> {
-        match run_check(entity, CheckPhase::Pre).await {
-            Ok(results) => {
-                state.store_pre_check(results);
-                None
-            }
-            Err((metric, error)) => Some(RateLimitResponse::new(id, metric, error).into_response()),
-        }
-    }
-
-    async fn apply_post_check<T: crate::config::entities::types::HasRateLimit>(
-        name: &str,
-        entity: &T,
-        total_tokens: u64,
-        state: &mut RateLimitState,
-    ) {
-        match run_check(entity, CheckPhase::Post(total_tokens)).await {
-            Ok(results) => state.store_post_check(results),
-            Err((metric, RateLimitError::Internal(msg))) => {
-                log::error!(
-                    "Post-check error for {}: metric={:?}, error={}",
-                    name,
-                    metric,
-                    msg
-                );
-            }
-            Err(_) => {}
-        }
-    }
-
-    /// Run concurrency check for an entity and collect the permit.
-    /// Returns an error response if the concurrency limit is exceeded.
-    async fn apply_concurrency_check<T: crate::config::entities::types::HasRateLimit>(
-        id: String,
-        entity: &T,
-        permits: &mut Vec<ConcurrencyPermit>,
-        concurrency_state: &mut ConcurrencyState,
-    ) -> Option<axum::response::Response> {
-        match run_concurrency_check(entity).await {
-            None => None, // No concurrency limit configured
-            Some(Ok(permit)) => {
-                concurrency_state.store_check(permit.info.clone());
-                permits.push(permit);
-                None
-            }
-            Some(Err(error)) => Some(ConcurrencyLimitResponse::new(id, error).into_response()),
+impl IntoResponse for RateLimitError {
+    fn into_response(self) -> Response {
+        match self {
+            RateLimitError::Raw(resp) => resp,
         }
     }
 }
 
-#[async_trait]
-impl ProxyHook for RateLimitHook {
-    fn name(&self) -> &str {
-        "rate_limit"
+async fn get_resources(ctx: &RequestContext) -> (ResourceEntry<ApiKey>, ResourceEntry<Model>) {
+    let guard = ctx.extensions().await;
+    let api_key = guard
+        .get::<ResourceEntry<ApiKey>>()
+        .cloned()
+        .expect("apikey should exist in context");
+    let model = guard
+        .get::<ResourceEntry<Model>>()
+        .cloned()
+        .expect("model should exist in context");
+    (api_key, model)
+}
+
+async fn run_post_check(ctx: &mut RequestContext, total_tokens: u64) {
+    let (api_key, model) = get_resources(ctx).await;
+    let api_key_result = run_check(&api_key, CheckPhase::Post(total_tokens)).await;
+    let model_result = run_check(&model, CheckPhase::Post(total_tokens)).await;
+
+    let mut guard = ctx.extensions_mut().await;
+    let rate_limit_state = guard
+        .get_mut::<RateLimitState>()
+        .expect("rate limit state should be initialized in context");
+
+    match api_key_result {
+        Ok(results) => rate_limit_state.store_post_check(results),
+        Err((metric, RRateLimitError::Internal(msg))) => {
+            error!("Post-check error for api_key: metric={metric:?}, error={msg}");
+        }
+        Err(_) => {}
     }
 
-    async fn pre_call(&self, ctx: &mut HookContext, _req: &mut Request) -> Result<(), HookError> {
-        let (api_key, model) = Self::get_resources(ctx);
-
-        // --- Rate limit checks ---
-        let rate_limit_state = ctx.get_or_insert(RateLimitState::new());
-
-        if let Some(resp) =
-            Self::apply_pre_check(api_key.id.clone(), &api_key, rate_limit_state).await
-        {
-            return Err(HookError::RawResponse(resp));
+    match model_result {
+        Ok(results) => rate_limit_state.store_post_check(results),
+        Err((metric, RRateLimitError::Internal(msg))) => {
+            error!("Post-check error for model: metric={metric:?}, error={msg}");
         }
-        if let Some(resp) = Self::apply_pre_check(model.id.clone(), &model, rate_limit_state).await
-        {
-            return Err(HookError::RawResponse(resp));
-        }
+        Err(_) => {}
+    }
+}
 
-        // --- Concurrency checks ---
-        let concurrency_state = ctx.get_or_insert(ConcurrencyState::new());
-        let mut permits = Vec::new();
+/// Performs pre-checks for rate limiting and concurrency limits.
+/// Returns `Ok(())` if all checks pass, or `Err(RateLimitHookError)` if any check fails.
+pub async fn pre_check(ctx: &mut RequestContext) -> Result<(), RateLimitError> {
+    let (api_key, model) = get_resources(ctx).await;
+    let api_key_rate_limit_result = run_check(&api_key, CheckPhase::Pre).await;
+    let model_rate_limit_result = run_check(&model, CheckPhase::Pre).await;
 
-        if let Some(resp) = Self::apply_concurrency_check(
-            api_key.id.clone(),
-            &api_key,
-            &mut permits,
-            concurrency_state,
-        )
-        .await
-        {
-            return Err(HookError::RawResponse(resp));
+    // --- Rate limit checks ---
+    {
+        let mut guard = ctx.extensions_mut().await;
+        if guard.get::<RateLimitState>().is_none() {
+            guard.insert(RateLimitState::new());
         }
 
-        if let Some(resp) =
-            Self::apply_concurrency_check(model.id.clone(), &model, &mut permits, concurrency_state)
-                .await
-        {
-            return Err(HookError::RawResponse(resp));
+        let rate_limit_state = guard
+            .get_mut::<RateLimitState>()
+            .expect("rate limit state should be initialized in context");
+
+        match api_key_rate_limit_result {
+            Ok(results) => rate_limit_state.store_pre_check(results),
+            Err((metric, error)) => {
+                return Err(RateLimitError::Raw(
+                    RateLimitResponse::new(api_key.id.clone(), metric, error).into_response(),
+                ));
+            }
         }
 
-        // Store permits in context — they will be released when HookContext is dropped
+        match model_rate_limit_result {
+            Ok(results) => rate_limit_state.store_pre_check(results),
+            Err((metric, error)) => {
+                return Err(RateLimitError::Raw(
+                    RateLimitResponse::new(model.id.clone(), metric, error).into_response(),
+                ));
+            }
+        }
+    }
+
+    // --- Concurrency checks ---
+    let api_key_concurrency_result = run_concurrency_check(&api_key).await;
+    let model_concurrency_result = run_concurrency_check(&model).await;
+    let mut permits = Vec::new();
+
+    {
+        let mut guard = ctx.extensions_mut().await;
+        if guard.get::<ConcurrencyState>().is_none() {
+            guard.insert(ConcurrencyState::new());
+        }
+
+        {
+            let concurrency_state = guard
+                .get_mut::<ConcurrencyState>()
+                .expect("concurrency state should be initialized in context");
+
+            match api_key_concurrency_result {
+                None => {}
+                Some(Ok(permit)) => {
+                    concurrency_state.store_check(permit.info.clone());
+                    permits.push(permit);
+                }
+                Some(Err(error)) => {
+                    return Err(RateLimitError::Raw(
+                        ConcurrencyLimitResponse::new(api_key.id.clone(), error).into_response(),
+                    ));
+                }
+            }
+
+            match model_concurrency_result {
+                None => {}
+                Some(Ok(permit)) => {
+                    concurrency_state.store_check(permit.info.clone());
+                    permits.push(permit);
+                }
+                Some(Err(error)) => {
+                    return Err(RateLimitError::Raw(
+                        ConcurrencyLimitResponse::new(model.id.clone(), error).into_response(),
+                    ));
+                }
+            }
+        }
+
         if !permits.is_empty() {
-            ctx.insert(ConcurrencyPermits(permits));
+            guard.insert(ConcurrencyPermits(permits));
         }
-
-        Ok(())
     }
 
-    async fn post_call_success(
-        &self,
-        ctx: &mut HookContext,
-        response: &ResponseData,
-    ) -> Result<(), HookError> {
-        let usage = response.token_usage();
-        self.run_post_check(ctx, usage.total_tokens).await;
-        Ok(())
-    }
+    Ok(())
+}
 
-    async fn post_call_streaming(&self, ctx: &mut HookContext) -> Result<(), HookError> {
-        let total_tokens = ctx
-            .get::<TokenUsage>()
-            .map(|usage| usage.total_tokens)
-            .unwrap_or(0);
+/// Performs post-checks for rate limiting after the response is generated.
+/// It will record the total token usage and update the rate limit state accordingly.
+/// This should be called for non-streaming responses.
+pub async fn post_check(ctx: &mut RequestContext, response: &ResponseData) -> Result<()> {
+    let usage = response.token_usage();
+    run_post_check(ctx, usage.total_tokens).await;
+    Ok(())
+}
 
-        self.run_post_check(ctx, total_tokens).await;
-        Ok(())
-    }
+/// Performs post-checks for streaming responses after the stream is completed.
+/// It will record the total token usage and update the rate limit state accordingly.
+/// This should be called after the streaming usage is received.
+pub async fn post_check_streaming(ctx: &mut RequestContext) -> Result<()> {
+    let total_tokens = {
+        match ctx.extensions().await.get::<TokenUsage>() {
+            Some(usage) => usage.total_tokens,
+            None => 0,
+        }
+    };
 
-    async fn post_call_headers(
-        &self,
-        ctx: &mut HookContext,
-        headers: &mut HeaderMap,
-    ) -> Result<(), HookError> {
-        let rate_limit_state = Self::get_rate_limit_state(ctx);
+    run_post_check(ctx, total_tokens).await;
+    Ok(())
+}
+
+/// Injects rate limit and concurrency limit headers into the response header.
+pub async fn inject_response_headers(
+    ctx: &mut RequestContext,
+    headers: &mut axum::http::HeaderMap,
+) {
+    let mut guard = ctx.extensions_mut().await;
+
+    if let Some(rate_limit_state) = guard.get_mut::<RateLimitState>() {
         rate_limit_state.add_headers(headers);
+    }
 
-        let concurrency_state = Self::get_concurrency_state(ctx);
+    if let Some(concurrency_state) = guard.get_mut::<ConcurrencyState>() {
         concurrency_state.add_headers(headers);
-
-        Ok(())
     }
 }

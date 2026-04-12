@@ -4,8 +4,7 @@ use std::time::Duration;
 
 use axum::{
     Json,
-    body::Body,
-    extract::{Request, State},
+    extract::State,
     response::{IntoResponse, Response},
 };
 use log::error;
@@ -16,35 +15,28 @@ use crate::{
     providers::create_provider,
     proxy::{
         AppState,
-        hooks::{HOOK_FILTER_ALL, HOOK_MANAGER, HookContext, ResponseData},
-        hooks2::{RequestContext, authorization},
-        middlewares::RequestModel,
+        hooks::{self, RequestContext, ResponseData},
     },
     utils::future::maybe_timeout,
 };
 
+#[fastrace::trace]
 pub async fn embeddings(
     State(_state): State<AppState>,
     mut request_ctx: RequestContext,
-    mut hook_ctx: HookContext,
     Json(mut request_data): Json<EmbeddingRequest>,
 ) -> Result<Response, EmbeddingError> {
-    authorization::check(&mut request_ctx, request_data.model.clone()).await?;
-
-    // PRE CALL HOOKS START
-    // TODO: remove
-    let _model = request_ctx.get::<ResourceEntry<Model>>().unwrap().clone();
-    hook_ctx.insert(_model);
-    hook_ctx.insert(RequestModel(request_data.model));
-
-    let mut request = Request::new(Body::empty()); //TODO
-    HOOK_MANAGER
-        .pre_call(&mut hook_ctx, &mut request, HOOK_FILTER_ALL)
-        .await?;
-    // PRE CALL HOOKS END
+    hooks::observability::record_start_time(&mut request_ctx).await;
+    hooks::authorization::check(&mut request_ctx, request_data.model.clone()).await?;
+    hooks::rate_limit::pre_check(&mut request_ctx).await?;
 
     //TODO: safe unwrap
-    let model = hook_ctx.get::<ResourceEntry<Model>>().cloned().unwrap();
+    let model = request_ctx
+        .extensions()
+        .await
+        .get::<ResourceEntry<Model>>()
+        .cloned()
+        .unwrap();
 
     let provider = create_provider(&model.provider_config);
     let timeout = model.timeout.map(Duration::from_millis);
@@ -53,26 +45,15 @@ pub async fn embeddings(
     request_data.model = model.model.name.clone();
 
     match maybe_timeout(timeout, provider.embedding(request_data)).await {
-        Ok(Ok(mut response)) => {
-            response.model = hook_ctx.get::<RequestModel>().cloned().unwrap().0; //TODO: safe unwrap
-
-            // Execute post_call_success hooks
+        Ok(Ok(response)) => {
             let response_data = ResponseData::Embedding(response.clone());
-            if let Err(err) = HOOK_MANAGER
-                .post_call_success(&mut hook_ctx, &response_data, HOOK_FILTER_ALL)
-                .await
-            {
-                error!("Hook post_call_success error: {}", err);
-            }
-
-            // Build response and add headers
             let mut resp = Json(response).into_response();
-            if let Err(err) = HOOK_MANAGER
-                .post_call_headers(&mut hook_ctx, resp.headers_mut(), HOOK_FILTER_ALL)
-                .await
+            if let Err(err) = hooks::rate_limit::post_check(&mut request_ctx, &response_data).await
             {
-                error!("Hook post_call_headers error: {}", err);
+                error!("Rate limit post_check error: {}", err);
             }
+            hooks::observability::record_usage(&mut request_ctx, &response_data).await;
+            hooks::rate_limit::inject_response_headers(&mut request_ctx, resp.headers_mut()).await;
 
             Ok(resp)
         }

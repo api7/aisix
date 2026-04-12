@@ -2,7 +2,7 @@ use std::time::SystemTime;
 
 use axum::{
     Json,
-    extract::{Request, State},
+    extract::State,
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -10,11 +10,7 @@ use thiserror::Error;
 
 use crate::{
     config::entities::{ApiKey, ResourceEntry},
-    proxy::{
-        AppState,
-        hooks::{HOOK_FILTER_NONE, HOOK_MANAGER, HookContext, HookError},
-        hooks2::RequestContext,
-    },
+    proxy::{AppState, hooks::RequestContext},
 };
 
 // Model structure representing a single model
@@ -40,16 +36,11 @@ pub struct ModelList {
 }
 
 #[derive(Debug, Error)]
-pub enum ModelError {
-    #[error("Hook error")]
-    HookError(#[from] HookError),
-}
+pub enum ModelError {}
 
 impl IntoResponse for ModelError {
     fn into_response(self) -> Response {
-        match self {
-            ModelError::HookError(err) => err.into_response(),
-        }
+        match self {}
     }
 }
 
@@ -57,14 +48,10 @@ impl IntoResponse for ModelError {
 pub async fn list_models(
     State(state): State<AppState>,
     request_ctx: RequestContext,
-    mut hook_ctx: HookContext,
-    mut request: Request,
 ) -> Result<Response, ModelError> {
-    HOOK_MANAGER
-        .pre_call(&mut hook_ctx, &mut request, HOOK_FILTER_NONE)
-        .await?;
-
     let api_key = request_ctx
+        .extensions()
+        .await
         .get::<ResourceEntry<ApiKey>>()
         .cloned()
         .expect("apikey should exist in context");

@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::{
     config::entities::{ApiKey, ResourceEntry},
-    proxy::hooks2::RequestContext,
+    proxy::hooks::RequestContext,
 };
 
 #[derive(Clone)]
@@ -66,7 +66,12 @@ pub async fn check(ctx: &mut RequestContext, model_name: String) -> Result<(), A
         }
     };
 
-    let api_key = match ctx.get::<ResourceEntry<ApiKey>>().cloned() {
+    let api_key = match ctx
+        .extensions()
+        .await
+        .get::<ResourceEntry<ApiKey>>()
+        .cloned()
+    {
         Some(api_key) => api_key,
         None => {
             error!("API key not found in context");
@@ -79,8 +84,9 @@ pub async fn check(ctx: &mut RequestContext, model_name: String) -> Result<(), A
         return Err(AuthorizationError::AccessForbidden(model_name.clone()));
     }
 
-    ctx.insert(model);
-    ctx.insert(RequestModel(model_name));
+    let mut extensions = ctx.extensions_mut().await;
+    extensions.insert(model);
+    extensions.insert(RequestModel(model_name));
 
     Ok(())
 }
