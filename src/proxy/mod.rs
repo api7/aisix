@@ -1,6 +1,8 @@
 mod handlers;
 mod hooks;
 mod middlewares;
+mod provider;
+pub mod types;
 
 use std::sync::Arc;
 
@@ -11,19 +13,10 @@ use axum::{
     routing::{get, post},
 };
 
-use crate::config::{Config, entities::ResourceRegistry};
-
-// types
-pub mod types {
-    pub use super::handlers::{
-        chat_completions::{
-            ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice,
-            ChatCompletionChunkDelta, ChatCompletionRequest, ChatCompletionResponse,
-            ChatCompletionUsage, ChatMessage,
-        },
-        embeddings::{EmbeddingRequest, EmbeddingResponse},
-    };
-}
+use crate::{
+    config::{Config, entities::ResourceRegistry},
+    gateway::Gateway,
+};
 
 const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 
@@ -32,15 +25,28 @@ pub struct AppState {
     #[allow(dead_code)]
     config: Arc<Config>,
     resources: Arc<ResourceRegistry>,
+    gateway: Arc<Gateway>,
 }
 
 impl AppState {
-    pub fn new(config: Arc<Config>, resources: Arc<ResourceRegistry>) -> Self {
-        Self { config, resources }
+    pub fn new(
+        config: Arc<Config>,
+        resources: Arc<ResourceRegistry>,
+        gateway: Arc<Gateway>,
+    ) -> Self {
+        Self {
+            config,
+            resources,
+            gateway,
+        }
     }
 
     pub fn resources(&self) -> Arc<ResourceRegistry> {
         self.resources.clone()
+    }
+
+    pub fn gateway(&self) -> Arc<Gateway> {
+        self.gateway.clone()
     }
 }
 

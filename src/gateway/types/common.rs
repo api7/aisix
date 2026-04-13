@@ -44,16 +44,33 @@ pub struct Usage {
 }
 
 impl Usage {
+    fn derive_total_tokens(input_tokens: Option<u32>, output_tokens: Option<u32>) -> Option<u32> {
+        input_tokens
+            .zip(output_tokens)
+            .map(|(input_tokens, output_tokens)| input_tokens + output_tokens)
+    }
+
+    /// Returns the reported total tokens, or derives it from input/output tokens.
+    pub fn resolved_total_tokens(&self) -> Option<u32> {
+        self.total_tokens
+            .or_else(|| Self::derive_total_tokens(self.input_tokens, self.output_tokens))
+    }
+
+    /// Fills `total_tokens` from input/output token counts when it is missing.
+    pub fn with_derived_total(mut self) -> Self {
+        if self.total_tokens.is_none() {
+            self.total_tokens = Self::derive_total_tokens(self.input_tokens, self.output_tokens);
+        }
+        self
+    }
+
     /// Merge partial usage from another source (e.g., a streaming update).
     ///
     /// Non-None fields in `other` overwrite the corresponding fields in `self`.
     /// If `total_tokens` was previously auto-derived, it is recomputed after
     /// input or output token updates to avoid stale totals.
     pub fn merge(&mut self, other: &Usage) {
-        let previous_auto_total = match (self.input_tokens, self.output_tokens) {
-            (Some(input_tokens), Some(output_tokens)) => Some(input_tokens + output_tokens),
-            _ => None,
-        };
+        let previous_auto_total = Self::derive_total_tokens(self.input_tokens, self.output_tokens);
         let had_explicit_total =
             self.total_tokens.is_some() && self.total_tokens != previous_auto_total;
         let token_counts_updated = other.input_tokens.is_some() || other.output_tokens.is_some();
@@ -87,11 +104,8 @@ impl Usage {
             return;
         }
 
-        if (self.total_tokens.is_none() || (token_counts_updated && !had_explicit_total))
-            && let (Some(input_tokens), Some(output_tokens)) =
-                (self.input_tokens, self.output_tokens)
-        {
-            self.total_tokens = Some(input_tokens + output_tokens);
+        if self.total_tokens.is_none() || (token_counts_updated && !had_explicit_total) {
+            self.total_tokens = Self::derive_total_tokens(self.input_tokens, self.output_tokens);
         }
     }
 }
@@ -221,6 +235,29 @@ mod tests {
 
         base.merge(&update);
         assert_eq!(base.total_tokens, Some(60));
+    }
+
+    #[test]
+    fn usage_resolved_total_tokens_falls_back_to_derived_total() {
+        let usage = Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            ..Default::default()
+        };
+
+        assert_eq!(usage.resolved_total_tokens(), Some(30));
+    }
+
+    #[test]
+    fn usage_with_derived_total_fills_missing_total() {
+        let usage = Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            ..Default::default()
+        }
+        .with_derived_total();
+
+        assert_eq!(usage.total_tokens, Some(30));
     }
 
     #[test]

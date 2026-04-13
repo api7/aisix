@@ -16,10 +16,8 @@ use thiserror::Error;
 
 use crate::{
     config::entities::{ApiKey, Model, ResourceEntry},
-    proxy::hooks::{
-        RequestContext, ResponseData, TokenUsage,
-        rate_limit::ratelimit::RateLimitError as RRateLimitError,
-    },
+    gateway::types::common::Usage,
+    proxy::hooks::{RequestContext, rate_limit::ratelimit::RateLimitError as RRateLimitError},
 };
 
 #[derive(Debug, Error)]
@@ -167,23 +165,23 @@ pub async fn pre_check(ctx: &mut RequestContext) -> Result<(), RateLimitError> {
 /// Performs post-checks for rate limiting after the response is generated.
 /// It will record the total token usage and update the rate limit state accordingly.
 /// This should be called for non-streaming responses.
-pub async fn post_check(ctx: &mut RequestContext, response: &ResponseData) -> Result<()> {
-    let usage = response.token_usage();
-    run_post_check(ctx, usage.total_tokens).await;
+pub async fn post_check(ctx: &mut RequestContext, usage: &Usage) -> Result<()> {
+    let total_tokens = usage
+        .resolved_total_tokens()
+        .map(u64::from)
+        .ok_or_else(|| anyhow::anyhow!("usage.total_tokens is missing for post-check"))?;
+    run_post_check(ctx, total_tokens).await;
     Ok(())
 }
 
 /// Performs post-checks for streaming responses after the stream is completed.
 /// It will record the total token usage and update the rate limit state accordingly.
 /// This should be called after the streaming usage is received.
-pub async fn post_check_streaming(ctx: &mut RequestContext) -> Result<()> {
-    let total_tokens = {
-        match ctx.extensions().await.get::<TokenUsage>() {
-            Some(usage) => usage.total_tokens,
-            None => 0,
-        }
-    };
-
+pub async fn post_check_streaming(ctx: &mut RequestContext, usage: &Usage) -> Result<()> {
+    let total_tokens = usage
+        .resolved_total_tokens()
+        .map(u64::from)
+        .ok_or_else(|| anyhow::anyhow!("usage.total_tokens is missing for post-check"))?;
     run_post_check(ctx, total_tokens).await;
     Ok(())
 }

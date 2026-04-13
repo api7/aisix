@@ -32,11 +32,38 @@ pub trait ProviderMeta: Send + Sync + 'static {
 
     /// Build the final request URL for the chat endpoint.
     fn build_url(&self, base_url: &str, model: &str) -> String {
-        format!(
-            "{}{}",
-            base_url.trim_end_matches('/'),
-            self.chat_endpoint_path(model)
-        )
+        let endpoint_path = self.chat_endpoint_path(model);
+
+        let Ok(mut parsed) = reqwest::Url::parse(base_url) else {
+            return format!("{}{}", base_url.trim_end_matches('/'), endpoint_path);
+        };
+
+        let base_segments = parsed
+            .path_segments()
+            .map(|segments| {
+                segments
+                    .filter(|segment| !segment.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let endpoint_segments = endpoint_path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+
+        let max_overlap = base_segments.len().min(endpoint_segments.len());
+        let overlap = (1..=max_overlap)
+            .rev()
+            .find(|count| {
+                base_segments[base_segments.len() - count..] == endpoint_segments[..*count]
+            })
+            .unwrap_or(0);
+
+        let mut joined_segments = base_segments;
+        joined_segments.extend_from_slice(&endpoint_segments[overlap..]);
+
+        parsed.set_path(&format!("/{}", joined_segments.join("/")));
+        parsed.to_string()
     }
 }
 
@@ -292,6 +319,16 @@ mod tests {
         quirks.apply_to_request(&mut body);
 
         assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn build_url_avoids_duplicate_version_prefixes() {
+        let provider = DummyProvider;
+
+        assert_eq!(
+            provider.build_url("https://example.com/v1", "ignored"),
+            "https://example.com/v1/chat/completions"
+        );
     }
 
     #[test]

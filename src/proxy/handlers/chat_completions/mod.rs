@@ -11,23 +11,31 @@ use axum::{
     },
 };
 use fastrace::prelude::{Event as TraceEvent, *};
-use futures::stream::BoxStream;
 use log::error;
-pub use types::*;
+use tokio::sync::oneshot;
+pub use types::ChatCompletionError;
 
 use crate::{
     config::entities::{Model, ResourceEntry},
-    providers::{Provider, ProviderError, create_provider},
+    gateway::{
+        formats::OpenAIChatFormat,
+        types::{
+            common::Usage,
+            openai::{ChatCompletionRequest, ChatCompletionResponse},
+            response::{ChatResponse, ChatResponseStream},
+        },
+    },
     proxy::{
         AppState,
-        hooks::{self, RequestContext, ResponseData, TokenUsage},
+        hooks::{self, RequestContext},
+        provider::create_provider_instance,
     },
     utils::future::maybe_timeout,
 };
 
 #[fastrace::trace]
 pub async fn chat_completions(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(span_ctx): Extension<SpanContext>,
     mut request_ctx: RequestContext,
     Json(mut request_data): Json<ChatCompletionRequest>,
@@ -41,152 +49,136 @@ pub async fn chat_completions(
         .await
         .get::<ResourceEntry<Model>>()
         .cloned()
-        .unwrap(); //TODO: safe unwrap
-
-    let provider = create_provider(&model.provider_config);
-    let timeout = model.timeout.map(Duration::from_millis);
+        .ok_or(ChatCompletionError::MissingModelInContext)?;
 
     // Replace request model name with real model name
     request_data.model = model.model.name.clone();
+    let timeout = model.timeout.map(Duration::from_millis);
 
-    // Check if it's a streaming request
-    let is_stream = request_data.stream.unwrap_or(false);
+    let gateway = state.gateway();
+    let provider_instance = create_provider_instance(gateway.as_ref(), &model)?;
 
-    let response = if is_stream {
-        handle_stream_request(provider, request_data, &mut request_ctx, span_ctx, timeout).await?
-    } else {
-        handle_regular_request(provider, request_data, &mut request_ctx, timeout).await?
-    };
-
-    Ok(response)
-}
-
-async fn finalize_stream_request(request_ctx: &mut RequestContext) {
-    if let Err(err) = hooks::rate_limit::post_check_streaming(request_ctx).await {
-        error!("Rate limit post_check_streaming error: {}", err);
+    match maybe_timeout(
+        timeout,
+        gateway.chat::<OpenAIChatFormat>(&request_data, &provider_instance),
+    )
+    .await
+    {
+        Ok(response) => match response? {
+            ChatResponse::Complete { response, usage } => {
+                handle_regular_request(response, usage, &mut request_ctx).await
+            }
+            ChatResponse::Stream { stream, usage_rx } => {
+                handle_stream_request(stream, usage_rx, &mut request_ctx, span_ctx).await
+            }
+        },
+        Err(err) => Err(ChatCompletionError::Timeout(err)),
     }
-    hooks::observability::record_streaming_usage(request_ctx).await;
 }
 
 #[fastrace::trace]
 async fn handle_regular_request(
-    provider: Box<dyn Provider>,
-    request: ChatCompletionRequest,
+    response: ChatCompletionResponse,
+    usage: Usage,
     request_ctx: &mut RequestContext,
-    timeout: Option<Duration>,
 ) -> Result<Response, ChatCompletionError> {
-    match maybe_timeout(timeout, provider.chat_completion(request)).await? {
-        Ok(response) => {
-            let response_data = ResponseData::ChatCompletion(response.clone());
-
-            if let Err(err) = hooks::rate_limit::post_check(
-                request_ctx,
-                &response_data,
-            )
-            .await
-            {
-                error!("Rate limit post_check error: {}", err);
-            }
-
-            let mut resp = Json(response).into_response();
-            hooks::rate_limit::inject_response_headers(request_ctx, resp.headers_mut()).await;
-            hooks::observability::record_usage(request_ctx, &response_data).await;
-
-            Ok(resp)
-        }
-        Err(err) => {
-            error!("Provider request failed: {}", err);
-            Err(ChatCompletionError::ProviderError(err))
-        }
+    if let Err(err) = hooks::rate_limit::post_check(request_ctx, &usage).await {
+        error!("Rate limit post_check error: {}", err);
     }
+
+    let mut resp = Json(response).into_response();
+    hooks::rate_limit::inject_response_headers(request_ctx, resp.headers_mut()).await;
+    hooks::observability::record_usage(request_ctx, &usage).await;
+
+    Ok(resp)
+}
+
+fn spawn_stream_usage_observer(request_ctx: RequestContext, usage_rx: oneshot::Receiver<Usage>) {
+    tokio::spawn(async move {
+        let mut request_ctx = request_ctx;
+
+        match usage_rx.await {
+            Ok(usage) => {
+                if let Err(err) =
+                    hooks::rate_limit::post_check_streaming(&mut request_ctx, &usage).await
+                {
+                    error!("Rate limit post_check_streaming error: {}", err);
+                }
+                hooks::observability::record_streaming_usage(&mut request_ctx, &usage).await;
+            }
+            Err(err) => {
+                error!("Failed to receive streaming usage from gateway: {}", err);
+            }
+        }
+    });
 }
 
 #[fastrace::trace]
 async fn handle_stream_request(
-    provider: Box<dyn Provider>,
-    request: ChatCompletionRequest,
+    stream: ChatResponseStream<OpenAIChatFormat>,
+    usage_rx: oneshot::Receiver<Usage>,
     request_ctx: &mut RequestContext,
     span_ctx: SpanContext,
-    timeout: Option<Duration>,
 ) -> Result<Response, ChatCompletionError> {
     use futures::stream::StreamExt;
 
-    let res: Result<BoxStream<'static, Result<ChatCompletionChunk, ProviderError>>, ProviderError> =
-        match maybe_timeout(timeout, provider.chat_completion_stream(request)).await {
-            Ok(res) => res,
-            Err(err) => Err(ChatCompletionError::Timeout(err))?,
-        };
+    spawn_stream_usage_observer(request_ctx.clone(), usage_rx);
 
-    match res {
-        Ok(stream) => {
-            let stream_request_ctx = request_ctx.clone(); //TODO
-            let stream_span = Span::root("sse_connection", span_ctx);
+    let stream_request_ctx = request_ctx.clone();
+    let stream_span = Span::root("sse_connection", span_ctx);
+    let sse_stream = futures::stream::unfold(
+        (
+            stream,
+            stream_span,
+            0usize,
+            stream_request_ctx,
+            false,
+            false,
+        ),
+        |(mut stream, span, idx, mut request_ctx, done, saw_chunk)| async move {
+            if done {
+                drop(span);
+                return None;
+            }
 
-            let sse_stream = futures::stream::unfold(
-                (stream, stream_span, 0, stream_request_ctx, false, false),
-                |(mut stream, span, idx, mut request_ctx, done, saw_chunk)| async move {
-                    if done {
-                        finalize_stream_request(&mut request_ctx).await;
+            match stream.next().await {
+                Some(Ok(chunk)) => {
+                    if idx == 0 {
+                        hooks::observability::record_first_token_latency(&mut request_ctx).await;
+                        span.add_event(TraceEvent::new("first token arrived"));
+                    }
 
+                    let event = match serde_json::to_string(&chunk) {
+                        Ok(json) => Ok::<SseEvent, Infallible>(SseEvent::default().data(json)),
+                        Err(err) => {
+                            error!("Failed to serialize chunk: {}", err);
+                            Ok(SseEvent::default().data(""))
+                        }
+                    };
+
+                    Some((event, (stream, span, idx + 1, request_ctx, false, true)))
+                }
+                Some(Err(err)) => {
+                    error!("Gateway stream error: {}", err);
+                    drop(span);
+                    None
+                }
+                None => {
+                    if saw_chunk {
+                        Some((
+                            Ok(SseEvent::default().data("[DONE]")),
+                            (stream, span, idx + 1, request_ctx, true, saw_chunk),
+                        ))
+                    } else {
                         drop(span);
-                        return None;
+                        None
                     }
-                    match stream.next().await {
-                        Some(Ok(chunk)) => {
-                            // Record first-token event
-                            if idx == 0 {
-                                hooks::observability::record_first_token_latency(&mut request_ctx)
-                                    .await;
-                                span.add_event(TraceEvent::new("first token arrived"));
-                            }
+                }
+            }
+        },
+    );
 
-                            // Record token usage
-                            if let Some(usage) = &chunk.usage {
-                                request_ctx
-                                    .extensions_mut()
-                                    .await
-                                    .insert(TokenUsage::from_chat_completion(usage));
-                            }
-
-                            let event = match serde_json::to_string(&chunk) {
-                                Ok(json) => {
-                                    Ok::<SseEvent, Infallible>(SseEvent::default().data(json))
-                                }
-                                Err(err) => {
-                                    error!("Failed to serialize chunk: {}", err);
-                                    Ok(SseEvent::default().data(""))
-                                }
-                            };
-                            Some((event, (stream, span, idx + 1, request_ctx, false, true)))
-                        }
-                        Some(Err(err)) => {
-                            error!("Stream error: {}", err);
-                            finalize_stream_request(&mut request_ctx).await;
-                            drop(span);
-                            None
-                        }
-                        None => {
-                            if saw_chunk {
-                                Some((
-                                    Ok(SseEvent::default().data("[DONE]")),
-                                    (stream, span, idx + 1, request_ctx, true, saw_chunk),
-                                ))
-                            } else {
-                                // TODO: check why
-                                finalize_stream_request(&mut request_ctx).await;
-
-                                drop(span);
-                                None
-                            }
-                        }
-                    }
-                },
-            );
-            Ok(Sse::new(sse_stream).into_response())
-        }
-        Err(err) => {
-            error!("Provider stream request failed: {}", err);
-            Err(ChatCompletionError::ProviderError(err))
-        }
-    }
+    let mut response = Sse::new(sse_stream).into_response();
+    hooks::rate_limit::inject_response_headers(request_ctx, response.headers_mut()).await;
+    Ok(response)
 }

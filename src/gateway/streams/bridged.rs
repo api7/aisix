@@ -58,14 +58,11 @@ impl<F: ChatFormat> BridgedStream<F> {
         Usage {
             input_tokens: state.input_tokens,
             output_tokens: state.output_tokens,
-            total_tokens: match (state.input_tokens, state.output_tokens) {
-                (Some(input_tokens), Some(output_tokens)) => Some(input_tokens + output_tokens),
-                _ => None,
-            },
             cache_creation_input_tokens: state.cache_creation_input_tokens,
             cache_read_input_tokens: state.cache_read_input_tokens,
             ..Default::default()
         }
+        .with_derived_total()
     }
 
     fn send_usage(usage_tx: &mut Option<oneshot::Sender<Usage>>, usage: Usage) {
