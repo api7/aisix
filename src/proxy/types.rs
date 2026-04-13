@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::proxy::handlers::embeddings::{EmbeddingRequest, EmbeddingResponse, EmbeddingUsage};
 
+/// Represents a chat message with role, content, and optional display name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub content: String,
@@ -12,6 +13,7 @@ pub struct ChatMessage {
     pub name: Option<String>,
 }
 
+/// Describes the requested response formatting for a chat completion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionResponseFormat {
     pub r#type: String,
@@ -19,6 +21,7 @@ pub struct ChatCompletionResponseFormat {
     pub json_schema: Option<serde_json::Value>,
 }
 
+/// Represents the legacy proxy chat completion request payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
@@ -49,6 +52,7 @@ pub struct ChatCompletionRequest {
     pub user: Option<String>,
 }
 
+/// Represents a single choice in a non-streaming chat completion response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionChoice {
     pub index: u32,
@@ -56,6 +60,7 @@ pub struct ChatCompletionChoice {
     pub finish_reason: Option<String>,
 }
 
+/// Carries token usage counters for a chat completion response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionUsage {
     pub prompt_tokens: u32,
@@ -63,6 +68,7 @@ pub struct ChatCompletionUsage {
     pub total_tokens: u32,
 }
 
+/// Represents the legacy proxy chat completion response payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionResponse {
     pub id: String,
@@ -73,6 +79,7 @@ pub struct ChatCompletionResponse {
     pub usage: ChatCompletionUsage,
 }
 
+/// Contains the incremental delta payload emitted by a streaming chunk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionChunkDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,6 +90,7 @@ pub struct ChatCompletionChunkDelta {
     pub tool_calls: Option<Vec<ChatCompletionChunkToolCall>>,
 }
 
+/// Represents an incremental tool call update inside a streaming chunk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionChunkToolCall {
     pub index: usize,
@@ -94,6 +102,7 @@ pub struct ChatCompletionChunkToolCall {
     pub function: Option<ChatCompletionChunkToolCallFunction>,
 }
 
+/// Carries the incremental function call name and arguments for a tool delta.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionChunkToolCallFunction {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -102,6 +111,7 @@ pub struct ChatCompletionChunkToolCallFunction {
     pub arguments: Option<String>,
 }
 
+/// Represents a single choice entry within a streaming chat completion chunk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionChunkChoice {
     pub index: u32,
@@ -110,6 +120,7 @@ pub struct ChatCompletionChunkChoice {
     pub finish_reason: Option<String>,
 }
 
+/// Represents one streamed chat completion chunk in the legacy proxy format.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatCompletionChunk {
     pub id: String,

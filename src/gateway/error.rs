@@ -28,6 +28,10 @@ pub enum GatewayError {
     #[error("format not natively supported by provider {provider}")]
     NativeNotSupported { provider: String },
 
+    /// Internal gateway or server-side configuration error.
+    #[error("internal: {0}")]
+    Internal(String),
+
     // ── Provider errors (may be retryable) ──
     /// The upstream provider returned an error response.
     #[error("provider {provider} returned {status}: {body}")]
@@ -64,6 +68,7 @@ impl GatewayError {
         match self {
             Self::Validation(_) | Self::Bridge(_) => StatusCode::BAD_REQUEST,
             Self::Transform(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Provider { status, .. } => *status,
             Self::Http(_) | Self::Stream(_) => StatusCode::BAD_GATEWAY,
             Self::NativeNotSupported { .. } => StatusCode::NOT_IMPLEMENTED,
@@ -160,5 +165,16 @@ mod tests {
         };
         assert!(provider_err.to_string().contains("openai"));
         assert!(provider_err.to_string().contains("500"));
+        assert_eq!(
+            GatewayError::Internal("boom".into()).to_string(),
+            "internal: boom"
+        );
+    }
+
+    #[test]
+    fn internal_error_is_not_retryable_and_maps_to_500() {
+        let e = GatewayError::Internal("misconfigured provider registry".into());
+        assert!(!e.is_retryable());
+        assert_eq!(e.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

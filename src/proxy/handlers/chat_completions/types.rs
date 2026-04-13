@@ -30,17 +30,40 @@ impl IntoResponse for ChatCompletionError {
         match self {
             ChatCompletionError::AuthorizationError(err) => err.into_response(),
             ChatCompletionError::RateLimitError(RateLimitError::Raw(resp)) => resp,
-            ChatCompletionError::GatewayError(err) => (
-                err.status_code(),
-                Json(serde_json::json!({
-                    "error": {
-                        "message": err.to_string(),
-                        "type": if err.status_code().is_client_error() { "invalid_request_error" } else { "server_error" },
-                        "code": "gateway_error"
-                    }
-                })),
-            )
-                .into_response(),
+            ChatCompletionError::GatewayError(err) => {
+                let status = err.status_code();
+                let (message, error_type, code) = match err {
+                    GatewayError::Provider { .. }
+                    | GatewayError::Http(_)
+                    | GatewayError::Stream(_)
+                    | GatewayError::Internal(_) => (
+                        "Provider error".to_string(),
+                        "server_error",
+                        "provider_error",
+                    ),
+                    _ => (
+                        err.to_string(),
+                        if status.is_client_error() {
+                            "invalid_request_error"
+                        } else {
+                            "server_error"
+                        },
+                        "gateway_error",
+                    ),
+                };
+
+                (
+                    status,
+                    Json(serde_json::json!({
+                        "error": {
+                            "message": message,
+                            "type": error_type,
+                            "code": code
+                        }
+                    })),
+                )
+                    .into_response()
+            }
             ChatCompletionError::Timeout(_) => (
                 StatusCode::GATEWAY_TIMEOUT,
                 Json(serde_json::json!({
