@@ -643,11 +643,11 @@ fn anthropic_usage_to_common_usage(usage: &AnthropicUsage) -> Usage {
     Usage {
         input_tokens: Some(input_tokens),
         output_tokens: Some(usage.output_tokens),
-        total_tokens: Some(input_tokens + usage.output_tokens),
         cache_creation_input_tokens: Some(usage.cache_creation_input_tokens),
         cache_read_input_tokens: Some(usage.cache_read_input_tokens),
         ..Default::default()
     }
+    .with_derived_total()
 }
 
 fn anthropic_delta_usage_to_common_usage(usage: &DeltaUsage, previous: &Usage) -> Usage {
@@ -666,13 +666,11 @@ fn anthropic_delta_usage_to_common_usage(usage: &DeltaUsage, previous: &Usage) -
     Usage {
         input_tokens,
         output_tokens: usage.output_tokens,
-        total_tokens: input_tokens
-            .zip(usage.output_tokens)
-            .map(|(input_tokens, output_tokens)| input_tokens + output_tokens),
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
         cache_read_input_tokens: usage.cache_read_input_tokens,
         ..Default::default()
     }
+    .with_derived_total()
 }
 
 fn update_native_usage_from_event(
@@ -735,13 +733,11 @@ fn anthropic_message_start_usage_to_common_usage(usage: &MessageStartUsage) -> U
     Usage {
         input_tokens,
         output_tokens: usage.output_tokens,
-        total_tokens: input_tokens
-            .zip(usage.output_tokens)
-            .map(|(input_tokens, output_tokens)| input_tokens + output_tokens),
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
         cache_read_input_tokens: usage.cache_read_input_tokens,
         ..Default::default()
     }
+    .with_derived_total()
 }
 
 fn openai_finish_reason_to_anthropic(finish_reason: Option<&str>) -> Option<String> {
@@ -1011,10 +1007,43 @@ mod tests {
         error::GatewayError,
         traits::ChatFormat,
         types::{
-            anthropic::AnthropicMessagesRequest, common::BridgeContext,
+            anthropic::{AnthropicMessagesRequest, AnthropicUsage, MessageStartUsage},
+            common::BridgeContext,
             openai::ChatCompletionResponse,
         },
     };
+
+    #[test]
+    fn anthropic_usage_to_common_usage_counts_cached_tokens_in_total() {
+        let usage = AnthropicUsage {
+            input_tokens: 3,
+            output_tokens: 4,
+            cache_creation_input_tokens: 5,
+            cache_read_input_tokens: 2,
+            cache_creation: None,
+        };
+
+        let common = super::anthropic_usage_to_common_usage(&usage);
+
+        assert_eq!(common.input_tokens, Some(10));
+        assert_eq!(common.total_tokens, Some(14));
+    }
+
+    #[test]
+    fn anthropic_message_start_usage_to_common_usage_counts_cached_tokens_in_total() {
+        let usage = MessageStartUsage {
+            input_tokens: Some(3),
+            output_tokens: Some(4),
+            cache_creation_input_tokens: Some(5),
+            cache_read_input_tokens: Some(2),
+            cache_creation: None,
+        };
+
+        let common = super::anthropic_message_start_usage_to_common_usage(&usage);
+
+        assert_eq!(common.input_tokens, Some(10));
+        assert_eq!(common.total_tokens, Some(14));
+    }
 
     #[test]
     fn request_to_hub_maps_system_metadata_tools_and_tool_results() {

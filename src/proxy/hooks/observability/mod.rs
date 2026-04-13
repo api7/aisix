@@ -1,9 +1,11 @@
 use std::time::Instant;
 
-use log::error;
 use metrics::{counter, histogram};
 
-use crate::proxy::hooks::{RequestContext, ResponseData, TokenUsage, authorization::RequestModel};
+use crate::{
+    gateway::types::common::Usage,
+    proxy::hooks::{RequestContext, authorization::RequestModel},
+};
 
 #[derive(Clone)]
 struct StartTime(Instant);
@@ -33,27 +35,27 @@ async fn record_llm_latency(ctx: &RequestContext, model_name: String) {
     .record(get_start_time(ctx).await.elapsed().as_millis() as f64);
 }
 
-fn record_token_usage(model_name: String, usage: &TokenUsage) {
+fn record_token_usage(model_name: String, usage: &Usage) {
     counter!(
         crate::utils::metrics::TOKEN_COUNT_KEY,
         "type" => "prompt",
         "model" => model_name.clone(),
     )
-    .increment(usage.prompt_tokens.unwrap_or(0));
+    .increment(usage.input_tokens.unwrap_or(0) as u64);
 
     counter!(
         crate::utils::metrics::TOKEN_COUNT_KEY,
         "type" => "completion",
         "model" => model_name.clone(),
     )
-    .increment(usage.completion_tokens.unwrap_or(0));
+    .increment(usage.output_tokens.unwrap_or(0) as u64);
 
     counter!(
         crate::utils::metrics::TOKEN_COUNT_KEY,
         "type" => "total",
         "model" => model_name,
     )
-    .increment(usage.total_tokens);
+    .increment(usage.resolved_total_tokens().map(u64::from).unwrap_or(0));
 }
 
 /// Records the request start timestamp in the request context.
@@ -62,10 +64,10 @@ pub async fn record_start_time(ctx: &mut RequestContext) {
 }
 
 /// Records latency and token metrics for a non-streaming response.
-pub async fn record_usage(ctx: &mut RequestContext, response: &ResponseData) {
+pub async fn record_usage(ctx: &mut RequestContext, usage: &Usage) {
     let model_name = get_request_model_name(ctx).await;
     record_llm_latency(ctx, model_name.clone()).await;
-    record_token_usage(model_name, &response.token_usage());
+    record_token_usage(model_name, usage);
 }
 
 /// Records first-token latency for a streaming response.
@@ -80,20 +82,9 @@ pub async fn record_first_token_latency(ctx: &mut RequestContext) {
 }
 
 /// Records final latency and token metrics for a completed streaming response.
-pub async fn record_streaming_usage(ctx: &mut RequestContext) {
+pub async fn record_streaming_usage(ctx: &mut RequestContext, usage: &Usage) {
     let model_name = get_request_model_name(ctx).await;
 
     record_llm_latency(ctx, model_name.clone()).await;
-
-    // Note, to avoid holdind the guard and then across to await boundary
-    let guard = ctx.extensions().await;
-    let usage = match guard.get::<TokenUsage>() {
-        Some(usage) => usage,
-        None => {
-            error!("Token usage not found in context for model {}", model_name);
-            return;
-        }
-    };
-
     record_token_usage(model_name, usage);
 }

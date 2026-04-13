@@ -12,13 +12,25 @@ pub use types::*;
 
 use crate::{
     config::entities::{Model, ResourceEntry},
-    providers::create_provider,
+    gateway::types::common::Usage,
     proxy::{
         AppState,
-        hooks::{self, RequestContext, ResponseData},
+        hooks::{self, RequestContext},
+        provider::create_legacy_provider,
     },
     utils::future::maybe_timeout,
 };
+
+fn embedding_usage(response: &EmbeddingResponse) -> Usage {
+    match &response.usage {
+        Some(usage) => Usage {
+            input_tokens: Some(usage.prompt_tokens),
+            total_tokens: Some(usage.total_tokens),
+            ..Default::default()
+        },
+        None => Usage::default(),
+    }
+}
 
 #[fastrace::trace]
 pub async fn embeddings(
@@ -38,7 +50,7 @@ pub async fn embeddings(
         .cloned()
         .unwrap();
 
-    let provider = create_provider(&model.provider_config);
+    let provider = create_legacy_provider(&model);
     let timeout = model.timeout.map(Duration::from_millis);
 
     // Replace request model name with real model name
@@ -46,13 +58,12 @@ pub async fn embeddings(
 
     match maybe_timeout(timeout, provider.embedding(request_data)).await {
         Ok(Ok(response)) => {
-            let response_data = ResponseData::Embedding(response.clone());
+            let usage = embedding_usage(&response);
             let mut resp = Json(response).into_response();
-            if let Err(err) = hooks::rate_limit::post_check(&mut request_ctx, &response_data).await
-            {
+            if let Err(err) = hooks::rate_limit::post_check(&mut request_ctx, &usage).await {
                 error!("Rate limit post_check error: {}", err);
             }
-            hooks::observability::record_usage(&mut request_ctx, &response_data).await;
+            hooks::observability::record_usage(&mut request_ctx, &usage).await;
             hooks::rate_limit::inject_response_headers(&mut request_ctx, resp.headers_mut()).await;
 
             Ok(resp)

@@ -32,11 +32,38 @@ pub trait ProviderMeta: Send + Sync + 'static {
 
     /// Build the final request URL for the chat endpoint.
     fn build_url(&self, base_url: &str, model: &str) -> String {
-        format!(
-            "{}{}",
-            base_url.trim_end_matches('/'),
-            self.chat_endpoint_path(model)
-        )
+        let endpoint_path = self.chat_endpoint_path(model);
+
+        let Ok(mut parsed) = reqwest::Url::parse(base_url) else {
+            return format!("{}{}", base_url.trim_end_matches('/'), endpoint_path);
+        };
+
+        let base_segments = parsed
+            .path_segments()
+            .map(|segments| {
+                segments
+                    .filter(|segment| !segment.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let endpoint_segments = endpoint_path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+
+        let max_overlap = base_segments.len().min(endpoint_segments.len());
+        let overlap = (1..=max_overlap)
+            .rev()
+            .find(|count| {
+                base_segments[base_segments.len() - count..] == endpoint_segments[..*count]
+            })
+            .unwrap_or(0);
+
+        let mut joined_segments = base_segments;
+        joined_segments.extend_from_slice(&endpoint_segments[overlap..]);
+
+        parsed.set_path(&format!("/{}", joined_segments.join("/")));
+        parsed.to_string()
     }
 }
 
@@ -196,6 +223,8 @@ pub trait ImageGenTransform: Send + Sync + 'static {}
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use http::HeaderMap;
     use serde_json::json;
 
@@ -204,9 +233,38 @@ mod tests {
 
     struct DummyProvider;
 
+    struct VersionedDummyProvider;
+
     impl ProviderMeta for DummyProvider {
         fn name(&self) -> &'static str {
             "dummy"
+        }
+
+        fn default_base_url(&self) -> &'static str {
+            "https://example.com"
+        }
+
+        fn chat_endpoint_path(&self, _model: &str) -> Cow<'static, str> {
+            Cow::Borrowed("/chat/completions")
+        }
+
+        fn stream_reader_kind(&self) -> StreamReaderKind {
+            StreamReaderKind::Sse
+        }
+
+        fn build_auth_headers(
+            &self,
+            _auth: &ProviderAuth,
+        ) -> crate::gateway::error::Result<HeaderMap> {
+            Ok(HeaderMap::new())
+        }
+    }
+
+    impl ChatTransform for DummyProvider {}
+
+    impl ProviderMeta for VersionedDummyProvider {
+        fn name(&self) -> &'static str {
+            "versioned-dummy"
         }
 
         fn default_base_url(&self) -> &'static str {
@@ -225,7 +283,7 @@ mod tests {
         }
     }
 
-    impl ChatTransform for DummyProvider {}
+    impl ChatTransform for VersionedDummyProvider {}
 
     #[test]
     fn apply_to_request_removes_and_renames_fields() {
@@ -292,6 +350,46 @@ mod tests {
         quirks.apply_to_request(&mut body);
 
         assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn build_url_avoids_duplicate_version_prefixes() {
+        let provider = VersionedDummyProvider;
+
+        assert_eq!(
+            provider.build_url("https://example.com/v1", "ignored"),
+            "https://example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn build_url_appends_chat_path_without_overlap() {
+        let provider = DummyProvider;
+
+        assert_eq!(
+            provider.build_url("https://example.com", "ignored"),
+            "https://example.com/chat/completions"
+        );
+    }
+
+    #[test]
+    fn build_url_handles_trailing_slash_in_base_url() {
+        let provider = DummyProvider;
+
+        assert_eq!(
+            provider.build_url("https://example.com/v1/", "ignored"),
+            "https://example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn build_url_falls_back_for_invalid_urls() {
+        let provider = DummyProvider;
+
+        assert_eq!(
+            provider.build_url("not-a-valid-url", "ignored"),
+            "not-a-valid-url/chat/completions"
+        );
     }
 
     #[test]
