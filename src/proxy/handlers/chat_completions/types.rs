@@ -35,11 +35,15 @@ impl IntoResponse for ChatCompletionError {
                 let (message, error_type, code) = match err {
                     GatewayError::Provider { .. }
                     | GatewayError::Http(_)
-                    | GatewayError::Stream(_)
-                    | GatewayError::Internal(_) => (
+                    | GatewayError::Stream(_) => (
                         "Provider error".to_string(),
                         "server_error",
                         "provider_error",
+                    ),
+                    GatewayError::Internal(_) => (
+                        "Gateway internal error".to_string(),
+                        "server_error",
+                        "internal_error",
                     ),
                     _ => (
                         err.to_string(),

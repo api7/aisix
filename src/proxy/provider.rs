@@ -50,9 +50,21 @@ fn provider_auth_and_base_url(config: &ProviderConfig) -> Result<(ProviderAuth, 
     };
 
     let base_url_override = match api_base {
-        Some(api_base) => Some(Url::parse(api_base).map_err(|error| {
-            GatewayError::Internal(format!("invalid provider api_base {}: {}", api_base, error))
-        })?),
+        Some(api_base) => {
+            let parsed = Url::parse(api_base).map_err(|error| {
+                GatewayError::Internal(format!("invalid provider api_base {}: {}", api_base, error))
+            })?;
+
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(GatewayError::Internal(format!(
+                    "invalid provider api_base {}: unsupported scheme {}",
+                    api_base,
+                    parsed.scheme()
+                )));
+            }
+
+            Some(parsed)
+        }
         None => None,
     };
 
