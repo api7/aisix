@@ -38,3 +38,6 @@ pnpm-debug.log*
 # Database files
 *.sqlite
 *.db
+
+# AI ENV
+.opencode
