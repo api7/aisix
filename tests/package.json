@@ -9,6 +9,7 @@
   },
   "packageManager": "pnpm@10.32.1",
   "devDependencies": {
+    "@anthropic-ai/sdk": "^0.88.0",
     "@eslint/js": "^10.0.1",
     "@fastify/deepmerge": "^3.2.1",
     "@trivago/prettier-plugin-sort-imports": "^6.0.2",

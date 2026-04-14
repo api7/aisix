@@ -57,6 +57,7 @@ pub fn create_router(state: AppState) -> Router {
             "/v1/chat/completions",
             post(handlers::chat_completions::chat_completions),
         )
+        .route("/v1/messages", post(handlers::messages::messages))
         .route("/v1/embeddings", post(handlers::embeddings::embeddings))
         .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
         .layer(from_fn_with_state(state.clone(), middlewares::auth))

@@ -53,19 +53,18 @@ pub async fn auth(
     mut req: Request,
     next: Next,
 ) -> Result<Response, AuthError> {
-    let api_key = match req.headers().get(http::header::AUTHORIZATION) {
-        Some(value) => {
-            let header = value.to_str().unwrap_or("");
-            let (prefix, rest) = header.split_at(7.min(header.len()));
-            if prefix.eq_ignore_ascii_case("bearer ") {
-                rest
-            } else {
-                header
-            }
+    let api_key = if let Some(value) = req.headers().get(http::header::AUTHORIZATION) {
+        let header = value.to_str().unwrap_or("");
+        let (prefix, rest) = header.split_at(7.min(header.len()));
+        if prefix.eq_ignore_ascii_case("bearer ") {
+            rest
+        } else {
+            header
         }
-        None => {
-            return Err(AuthError::MissingApiKey);
-        }
+    } else if let Some(value) = req.headers().get("x-api-key") {
+        value.to_str().unwrap_or("")
+    } else {
+        return Err(AuthError::MissingApiKey);
     };
 
     let api_key = match state.resources().apikeys.get_by_key(api_key) {
