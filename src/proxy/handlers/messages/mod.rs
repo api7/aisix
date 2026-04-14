@@ -186,7 +186,7 @@ fn anthropic_error_event_payload(message: String) -> String {
     serde_json::json!({
         "type": "error",
         "error": {
-            "type": "gateway_error",
+            "type": "api_error",
             "message": message,
         }
     })

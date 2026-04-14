@@ -3,6 +3,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use http::{HeaderMap, StatusCode};
+use log::error;
 use thiserror::Error;
 use tokio::time::error::Elapsed;
 use uuid::Uuid;
@@ -37,7 +38,7 @@ impl IntoResponse for MessagesError {
         match self {
             MessagesError::AuthorizationError(err) => match err {
                 AuthorizationError::ModelNotFound(message) => anthropic_error_response(
-                    StatusCode::BAD_REQUEST,
+                    StatusCode::NOT_FOUND,
                     "not_found_error",
                     format!("Model '{message}' not found"),
                     None,
@@ -58,10 +59,11 @@ impl IntoResponse for MessagesError {
             MessagesError::RateLimitError(RateLimitError::Raw(resp)) => {
                 let (parts, _) = resp.into_parts();
                 let message = if parts.status == StatusCode::TOO_MANY_REQUESTS {
-                    "Rate limit exceeded".to_string()
+                    "Rate limit exceeded"
                 } else {
-                    "Internal server error".to_string()
+                    "Internal server error"
                 };
+
                 anthropic_error_response(
                     parts.status,
                     if parts.status == StatusCode::TOO_MANY_REQUESTS {
@@ -69,25 +71,21 @@ impl IntoResponse for MessagesError {
                     } else {
                         "api_error"
                     },
-                    message,
+                    message.to_string(),
                     Some(parts.headers),
                 )
             }
             MessagesError::GatewayError(err) => {
                 let status = err.status_code();
-                let (message, error_type) = match &err {
-                    GatewayError::Provider { .. }
-                    | GatewayError::Http(_)
-                    | GatewayError::Stream(_) => {
-                        ("Provider error".to_string(), gateway_error_type(&err))
-                    }
-                    GatewayError::Internal(_) => {
-                        ("Gateway internal error".to_string(), "api_error")
-                    }
-                    _ => (err.to_string(), gateway_error_type(&err)),
-                };
+                let error_type = gateway_error_type(&err);
+                error!("Messages gateway error: {}", err);
 
-                anthropic_error_response(status, error_type, message, None)
+                anthropic_error_response(
+                    status,
+                    error_type,
+                    gateway_error_message(&err, error_type).to_string(),
+                    None,
+                )
             }
             MessagesError::Timeout(_) => anthropic_error_response(
                 StatusCode::GATEWAY_TIMEOUT,
@@ -105,6 +103,26 @@ impl IntoResponse for MessagesError {
     }
 }
 
+fn gateway_error_message(error: &GatewayError, error_type: &'static str) -> &'static str {
+    match error {
+        GatewayError::Validation(_)
+        | GatewayError::Bridge(_)
+        | GatewayError::Transform(_)
+        | GatewayError::NativeNotSupported { .. } => "Invalid request",
+        GatewayError::Internal(_) => "Internal server error",
+        GatewayError::Provider { .. } => match error_type {
+            "authentication_error" => "Authentication failed",
+            "permission_error" => "Permission denied",
+            "not_found_error" => "Requested resource not found",
+            "rate_limit_error" => "Rate limit exceeded",
+            "timeout_error" => "Upstream request timed out",
+            "overloaded_error" => "Upstream service unavailable",
+            _ => "Provider error",
+        },
+        GatewayError::Http(_) | GatewayError::Stream(_) => "Upstream service unavailable",
+    }
+}
+
 fn anthropic_error_response(
     status: StatusCode,
     error_type: &'static str,
@@ -119,7 +137,7 @@ fn anthropic_error_response(
                 "type": error_type,
                 "message": message,
             },
-            //TODO: A normalized request ID, which may reuse the trace ID.
+            // TODO: Reuse a normalized request ID once proxy/request tracing exposes one here.
             "request_id": format!("req_{}", Uuid::new_v4()),
         })),
     )
