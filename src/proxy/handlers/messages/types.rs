@@ -108,7 +108,7 @@ fn gateway_error_message(error: &GatewayError, error_type: &'static str) -> &'st
         GatewayError::Validation(_) | GatewayError::Bridge(_) => "Invalid request",
         GatewayError::Transform(_) | GatewayError::NativeNotSupported { .. } => "Server error",
         GatewayError::Internal(_) => "Internal server error",
-        GatewayError::Provider { .. } => match error_type {
+        GatewayError::Provider { status, .. } => match error_type {
             "authentication_error" => "Authentication failed",
             "billing_error" => "Payment required",
             "permission_error" => "Permission denied",
@@ -117,6 +117,7 @@ fn gateway_error_message(error: &GatewayError, error_type: &'static str) -> &'st
             "request_too_large" => "Request payload too large",
             "timeout_error" => "Upstream request timed out",
             "overloaded_error" => "Upstream service unavailable",
+            _ if status.as_u16() == 529 => "overloaded_error", // provider-specific overload status code
             _ => "Provider error",
         },
         GatewayError::Http(_) | GatewayError::Stream(_) => "Upstream service unavailable",
