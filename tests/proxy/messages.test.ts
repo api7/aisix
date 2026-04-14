@@ -180,7 +180,10 @@ describe('proxy /v1/messages', () => {
     );
 
     expect(resp.status).toBe(403);
-    expect(resp.data.error.code).toBe('model_access_forbidden');
+    expect(resp.data.type).toBe('error');
+    expect(resp.data.error.type).toBe('permission_error');
+    expect(resp.data.error.message).toContain(restrictedModelName);
+    expect(typeof resp.data.request_id).toBe('string');
   });
 
   test('authorized model with invalid json body returns extractor error', async () => {
