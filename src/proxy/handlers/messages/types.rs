@@ -110,9 +110,11 @@ fn gateway_error_message(error: &GatewayError, error_type: &'static str) -> &'st
         GatewayError::Internal(_) => "Internal server error",
         GatewayError::Provider { .. } => match error_type {
             "authentication_error" => "Authentication failed",
+            "billing_error" => "Payment required",
             "permission_error" => "Permission denied",
             "not_found_error" => "Requested resource not found",
             "rate_limit_error" => "Rate limit exceeded",
+            "request_too_large" => "Request payload too large",
             "timeout_error" => "Upstream request timed out",
             "overloaded_error" => "Upstream service unavailable",
             _ => "Provider error",
@@ -162,9 +164,11 @@ fn gateway_error_type(error: &GatewayError) -> &'static str {
         GatewayError::Internal(_) => "api_error",
         GatewayError::Provider { status, .. } => match *status {
             StatusCode::UNAUTHORIZED => "authentication_error",
+            StatusCode::PAYMENT_REQUIRED => "billing_error",
             StatusCode::FORBIDDEN => "permission_error",
             StatusCode::NOT_FOUND => "not_found_error",
             StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+            StatusCode::PAYLOAD_TOO_LARGE => "request_too_large",
             StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => "timeout_error",
             StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE => "overloaded_error",
             _ if status.is_server_error() => "api_error",
@@ -176,6 +180,9 @@ fn gateway_error_type(error: &GatewayError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use http::StatusCode;
+    use serde_json::json;
+
     use super::{gateway_error_message, gateway_error_type};
     use crate::gateway::error::GatewayError;
 
@@ -197,5 +204,39 @@ mod tests {
         let error_type = gateway_error_type(&error);
         assert_eq!(error_type, "api_error");
         assert_eq!(gateway_error_message(&error, error_type), "Server error");
+    }
+
+    #[test]
+    fn provider_billing_errors_are_reported_with_billing_type() {
+        let error = GatewayError::Provider {
+            status: StatusCode::PAYMENT_REQUIRED,
+            body: json!({"error": "payment required"}),
+            provider: "anthropic".into(),
+            retryable: false,
+        };
+
+        let error_type = gateway_error_type(&error);
+        assert_eq!(error_type, "billing_error");
+        assert_eq!(
+            gateway_error_message(&error, error_type),
+            "Payment required"
+        );
+    }
+
+    #[test]
+    fn provider_large_payload_errors_are_reported_with_payload_type() {
+        let error = GatewayError::Provider {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            body: json!({"error": "payload too large"}),
+            provider: "anthropic".into(),
+            retryable: false,
+        };
+
+        let error_type = gateway_error_type(&error);
+        assert_eq!(error_type, "request_too_large");
+        assert_eq!(
+            gateway_error_message(&error, error_type),
+            "Request payload too large"
+        );
     }
 }
