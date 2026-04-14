@@ -18,8 +18,6 @@ use crate::{
     gateway::Gateway,
 };
 
-const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
-
 #[derive(Clone)]
 pub struct AppState {
     #[allow(dead_code)]
@@ -57,8 +55,12 @@ pub fn create_router(state: AppState) -> Router {
             "/v1/chat/completions",
             post(handlers::chat_completions::chat_completions),
         )
+        .route(
+            "/v1/messages",
+            post(handlers::messages::messages).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .route("/v1/embeddings", post(handlers::embeddings::embeddings))
-        .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(from_fn_with_state(state.clone(), middlewares::auth))
         .layer(from_fn(middlewares::trace))
         .with_state(state)
