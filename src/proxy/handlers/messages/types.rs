@@ -105,10 +105,8 @@ impl IntoResponse for MessagesError {
 
 fn gateway_error_message(error: &GatewayError, error_type: &'static str) -> &'static str {
     match error {
-        GatewayError::Validation(_)
-        | GatewayError::Bridge(_)
-        | GatewayError::Transform(_)
-        | GatewayError::NativeNotSupported { .. } => "Invalid request",
+        GatewayError::Validation(_) | GatewayError::Bridge(_) => "Invalid request",
+        GatewayError::Transform(_) | GatewayError::NativeNotSupported { .. } => "Server error",
         GatewayError::Internal(_) => "Internal server error",
         GatewayError::Provider { .. } => match error_type {
             "authentication_error" => "Authentication failed",
@@ -159,10 +157,8 @@ fn anthropic_error_response(
 
 fn gateway_error_type(error: &GatewayError) -> &'static str {
     match error {
-        GatewayError::Validation(_)
-        | GatewayError::Bridge(_)
-        | GatewayError::Transform(_)
-        | GatewayError::NativeNotSupported { .. } => "invalid_request_error",
+        GatewayError::Validation(_) | GatewayError::Bridge(_) => "invalid_request_error",
+        GatewayError::Transform(_) | GatewayError::NativeNotSupported { .. } => "api_error",
         GatewayError::Internal(_) => "api_error",
         GatewayError::Provider { status, .. } => match *status {
             StatusCode::UNAUTHORIZED => "authentication_error",
@@ -175,5 +171,31 @@ fn gateway_error_type(error: &GatewayError) -> &'static str {
             _ => "invalid_request_error",
         },
         GatewayError::Http(_) | GatewayError::Stream(_) => "overloaded_error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{gateway_error_message, gateway_error_type};
+    use crate::gateway::error::GatewayError;
+
+    #[test]
+    fn transform_errors_are_reported_as_api_errors() {
+        let error = GatewayError::Transform("bad provider payload".into());
+
+        let error_type = gateway_error_type(&error);
+        assert_eq!(error_type, "api_error");
+        assert_eq!(gateway_error_message(&error, error_type), "Server error");
+    }
+
+    #[test]
+    fn native_not_supported_is_reported_as_api_error() {
+        let error = GatewayError::NativeNotSupported {
+            provider: "gemini".into(),
+        };
+
+        let error_type = gateway_error_type(&error);
+        assert_eq!(error_type, "api_error");
+        assert_eq!(gateway_error_message(&error, error_type), "Server error");
     }
 }
