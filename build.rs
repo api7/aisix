@@ -19,27 +19,18 @@ fn build_ui() -> Result<()> {
     if env::var("CARGO_FEATURE_BUILD_UI").is_ok() {
         println!("cargo:rerun-if-changed=ui");
 
-        let output = process::Command::new("pnpm")
+        let status = process::Command::new("pnpm")
             .args(["run", "build"])
             .current_dir("ui")
-            .output()?;
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()?;
 
-        println!(
-            "build ui stdout:\n{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-
-        // stderr
-        eprintln!(
-            "build ui stderr:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        if !output.status.success() {
-            return Err(anyhow!("UI build failed with status: {}", output.status));
+        if !status.success() {
+            return Err(anyhow!("failed to build ui with status: {}", status));
         }
     } else {
-        fs::create_dir_all(path::PathBuf::from(env::var("OUT_DIR")?).join("ui/dist"))?;
+        fs::create_dir_all("ui/dist")?;
     }
     Ok(())
 }
