@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::proxy::handlers::embeddings::{EmbeddingRequest, EmbeddingResponse, EmbeddingUsage};
+pub use crate::gateway::types::embed::{EmbeddingRequest, EmbeddingResponse, EmbeddingUsage};
 
 /// Represents a chat message with role, content, and optional display name.
 #[derive(Debug, Clone, Serialize, Deserialize)]

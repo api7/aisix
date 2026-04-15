@@ -10,7 +10,10 @@ use crate::gateway::{
         chat_format::ChatStreamState,
         native::{NativeAnthropicMessagesSupport, NativeOpenAIResponsesSupport},
     },
-    types::openai::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
+    types::{
+        embed::{EmbedRequestBody, EmbedResponseBody, EmbeddingRequest, EmbeddingResponse},
+        openai::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
+    },
 };
 
 /// Provider metadata with no data transformation logic.
@@ -30,10 +33,8 @@ pub trait ProviderMeta: Send + Sync + 'static {
 
     fn build_auth_headers(&self, auth: &ProviderAuth) -> Result<HeaderMap>;
 
-    /// Build the final request URL for the chat endpoint.
-    fn build_url(&self, base_url: &str, model: &str) -> String {
-        let endpoint_path = self.chat_endpoint_path(model);
-
+    /// Build the final request URL for an arbitrary provider endpoint.
+    fn build_url_for_endpoint(&self, base_url: &str, endpoint_path: &str) -> String {
         let Ok(mut parsed) = reqwest::Url::parse(base_url) else {
             return format!("{}{}", base_url.trim_end_matches('/'), endpoint_path);
         };
@@ -64,6 +65,12 @@ pub trait ProviderMeta: Send + Sync + 'static {
 
         parsed.set_path(&format!("/{}", joined_segments.join("/")));
         parsed.to_string()
+    }
+
+    /// Build the final request URL for the chat endpoint.
+    fn build_url(&self, base_url: &str, model: &str) -> String {
+        let endpoint_path = self.chat_endpoint_path(model);
+        self.build_url_for_endpoint(base_url, endpoint_path.as_ref())
     }
 }
 
@@ -209,8 +216,28 @@ impl CompatQuirks {
     }
 }
 
-/// Placeholder trait for embeddings until multimodal traits arrive.
-pub trait EmbedTransform: Send + Sync + 'static {}
+/// Provider-specific embeddings request and response conversion.
+pub trait EmbedTransform: Send + Sync + 'static {
+    fn embeddings_endpoint_path(&self, _model: &str) -> Cow<'static, str> {
+        Cow::Borrowed("/v1/embeddings")
+    }
+
+    fn transform_embeddings_request(&self, request: &EmbeddingRequest) -> Result<EmbedRequestBody> {
+        let body = serde_json::to_value(request)
+            .map_err(|error| GatewayError::Transform(error.to_string()))?;
+        Ok(EmbedRequestBody::Json(body))
+    }
+
+    fn transform_embeddings_response(&self, body: EmbedResponseBody) -> Result<EmbeddingResponse> {
+        match body {
+            EmbedResponseBody::Json(body) => serde_json::from_value(body)
+                .map_err(|error| GatewayError::Transform(error.to_string())),
+            EmbedResponseBody::Binary(_) => Err(GatewayError::Transform(
+                "embedding response must be JSON".into(),
+            )),
+        }
+    }
+}
 
 /// Placeholder trait for text-to-speech until multimodal traits arrive.
 pub trait TtsTransform: Send + Sync + 'static {}
@@ -228,8 +255,12 @@ mod tests {
     use http::HeaderMap;
     use serde_json::json;
 
-    use super::{ChatTransform, CompatQuirks, ProviderMeta, StreamReaderKind};
-    use crate::gateway::{provider_instance::ProviderAuth, traits::chat_format::ChatStreamState};
+    use super::{ChatTransform, CompatQuirks, EmbedTransform, ProviderMeta, StreamReaderKind};
+    use crate::gateway::{
+        provider_instance::ProviderAuth,
+        traits::chat_format::ChatStreamState,
+        types::embed::{EmbedRequestBody, EmbedResponseBody, EmbeddingRequest},
+    };
 
     struct DummyProvider;
 
@@ -261,6 +292,8 @@ mod tests {
     }
 
     impl ChatTransform for DummyProvider {}
+
+    impl EmbedTransform for DummyProvider {}
 
     impl ProviderMeta for VersionedDummyProvider {
         fn name(&self) -> &'static str {
@@ -350,6 +383,47 @@ mod tests {
         quirks.apply_to_request(&mut body);
 
         assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn embed_transform_defaults_to_json_round_trip() {
+        let provider = DummyProvider;
+        let request: EmbeddingRequest = serde_json::from_value(json!({
+            "model": "text-embedding-3-large",
+            "input": "hello"
+        }))
+        .unwrap();
+
+        let body = provider.transform_embeddings_request(&request).unwrap();
+        match body {
+            EmbedRequestBody::Json(value) => {
+                pretty_assertions::assert_eq!(value["model"], "text-embedding-3-large");
+                pretty_assertions::assert_eq!(value["input"], "hello");
+            }
+            EmbedRequestBody::Binary(_) => panic!("expected json body"),
+        }
+
+        let response = provider
+            .transform_embeddings_response(EmbedResponseBody::Json(json!({
+                "object": "list",
+                "data": [{
+                    "object": "embedding",
+                    "embedding": [0.1, 0.2],
+                    "index": 0
+                }],
+                "model": "text-embedding-3-large",
+                "usage": {"prompt_tokens": 2, "total_tokens": 2}
+            })))
+            .unwrap();
+
+        pretty_assertions::assert_eq!(response.data.len(), 1);
+
+        let usage = match response.usage {
+            Some(usage) => usage,
+            None => panic!("expected usage in embedding response"),
+        };
+
+        pretty_assertions::assert_eq!(usage.total_tokens, 2);
     }
 
     #[test]

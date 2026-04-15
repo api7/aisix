@@ -8,14 +8,7 @@ use crate::{
         error::{GatewayError, Result},
         provider_instance::{ProviderAuth, ProviderInstance},
     },
-    providers::{Provider, create_provider},
 };
-
-/// Creates a legacy boxed provider from the model's stored provider configuration.
-#[fastrace::trace]
-pub fn create_legacy_provider(model: &ResourceEntry<Model>) -> Box<dyn Provider> {
-    create_provider(&model.provider_config)
-}
 
 /// Creates a gateway provider instance for the given model using the gateway registry.
 #[fastrace::trace]

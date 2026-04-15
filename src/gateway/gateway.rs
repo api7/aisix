@@ -1,7 +1,8 @@
 use std::{pin::Pin, time::Duration};
 
+use bytes::Bytes;
 use futures::Stream;
-use http::StatusCode;
+use http::{StatusCode, header::CONTENT_TYPE};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
@@ -14,10 +15,16 @@ use crate::gateway::{
     types::{
         anthropic::AnthropicMessagesRequest,
         common::Usage,
+        embed::{EmbedRequestBody, EmbedResponseBody, EmbeddingRequest, EmbeddingResponse},
         openai::{ChatCompletionRequest, ChatCompletionResponse},
         response::ChatResponse,
     },
 };
+
+enum HttpResponseBody {
+    Json(Value),
+    Binary(Bytes),
+}
 
 /// Typed Layer-3 gateway entry point.
 pub struct Gateway {
@@ -103,7 +110,59 @@ impl Gateway {
             .await
     }
 
-    async fn send_chat_request(
+    /// Typed embeddings entry point.
+    #[fastrace::trace]
+    pub async fn embed(
+        &self,
+        request: &EmbeddingRequest,
+        instance: &ProviderInstance,
+    ) -> Result<EmbeddingResponse> {
+        let transform = instance.def.as_embed_transform().ok_or_else(|| {
+            GatewayError::Validation(format!(
+                "provider {} does not support embeddings",
+                instance.def.name()
+            ))
+        })?;
+
+        let endpoint_path = transform.embeddings_endpoint_path(&request.model);
+        let base_url = instance.effective_base_url()?;
+        let url = instance
+            .def
+            .build_url_for_endpoint(base_url.as_str(), endpoint_path.as_ref());
+        let headers = instance.build_headers()?;
+        let request = match transform.transform_embeddings_request(request)? {
+            EmbedRequestBody::Json(value) => {
+                self.http_client.post(url).headers(headers).json(&value)
+            }
+            EmbedRequestBody::Binary(bytes) => {
+                self.http_client.post(url).headers(headers).body(bytes)
+            }
+        };
+
+        let response = self.send_request(request, false).await?;
+
+        if !response.status().is_success() {
+            return Err(provider_error(response, instance.def.name()).await);
+        }
+
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let bytes = response.bytes().await.map_err(GatewayError::Http)?;
+
+        let body = parse_http_response_body(content_type.as_deref(), bytes)?;
+
+        let response_body = match body {
+            HttpResponseBody::Json(value) => EmbedResponseBody::Json(value),
+            HttpResponseBody::Binary(bytes) => EmbedResponseBody::Binary(bytes),
+        };
+
+        transform.transform_embeddings_response(response_body)
+    }
+
+    async fn send_request(
         &self,
         request: reqwest::RequestBuilder,
         stream: bool,
@@ -134,7 +193,7 @@ impl Gateway {
         let headers = instance.build_headers()?;
 
         let request = self.http_client.post(url).headers(headers).json(&body);
-        let response = self.send_chat_request(request, stream).await?;
+        let response = self.send_request(request, stream).await?;
 
         if !response.status().is_success() {
             return Err(provider_error(response, instance.def.name()).await);
@@ -173,7 +232,7 @@ impl Gateway {
             .post(url)
             .headers(headers)
             .json(&provider_body);
-        let response = self.send_chat_request(request, false).await?;
+        let response = self.send_request(request, false).await?;
 
         if !response.status().is_success() {
             return Err(provider_error(response, instance.def.name()).await);
@@ -199,7 +258,7 @@ impl Gateway {
             .post(url)
             .headers(headers)
             .json(&provider_body);
-        let response = self.send_chat_request(request, true).await?;
+        let response = self.send_request(request, true).await?;
 
         if !response.status().is_success() {
             return Err(provider_error(response, instance.def.name()).await);
@@ -242,6 +301,23 @@ fn join_url(base_url: &str, endpoint_path: &str) -> String {
         format!("{base_url}{endpoint_path}")
     } else {
         format!("{base_url}/{endpoint_path}")
+    }
+}
+
+fn parse_http_response_body(content_type: Option<&str>, bytes: Bytes) -> Result<HttpResponseBody> {
+    let expects_json = content_type
+        .map(|value| value.contains("json"))
+        .unwrap_or(false);
+
+    if expects_json {
+        let value = serde_json::from_slice(&bytes)
+            .map_err(|error| GatewayError::Transform(error.to_string()))?;
+        return Ok(HttpResponseBody::Json(value));
+    }
+
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => Ok(HttpResponseBody::Json(value)),
+        Err(_) => Ok(HttpResponseBody::Binary(bytes)),
     }
 }
 
@@ -311,12 +387,13 @@ mod tests {
         provider_instance::{ProviderAuth, ProviderInstance, ProviderRegistry},
         providers::AnthropicDef,
         traits::{
-            ChatFormat, ChatTransform, NativeHandler, NativeOpenAIResponsesSupport,
+            ChatFormat, ChatTransform, EmbedTransform, NativeHandler, NativeOpenAIResponsesSupport,
             OpenAIResponsesNativeStreamState, ProviderCapabilities, ProviderMeta, StreamReaderKind,
         },
         types::{
             anthropic::{AnthropicContentBlock, AnthropicMessagesRequest},
             common::{BridgeContext, Usage},
+            embed::EmbeddingRequest,
             openai::{
                 ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
                 responses::{ResponsesApiRequest, ResponsesApiResponse, ResponsesApiStreamEvent},
@@ -368,7 +445,13 @@ mod tests {
 
     impl ChatTransform for HubTestProvider {}
 
-    impl ProviderCapabilities for HubTestProvider {}
+    impl EmbedTransform for HubTestProvider {}
+
+    impl ProviderCapabilities for HubTestProvider {
+        fn as_embed_transform(&self) -> Option<&dyn EmbedTransform> {
+            Some(self)
+        }
+    }
 
     impl ProviderMeta for NativeTestProvider {
         fn name(&self) -> &'static str {
@@ -758,6 +841,90 @@ mod tests {
         assert_eq!(observed.1["messages"][0]["content"], "hello");
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn embed_uses_provider_transform_and_parses_response() {
+        let observed: Arc<Mutex<ObservedRequest>> = Arc::new(Mutex::new(None));
+        let observed_clone = Arc::clone(&observed);
+        let router = Router::new().route(
+            "/v1/embeddings",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let observed = Arc::clone(&observed_clone);
+                async move {
+                    let auth = headers
+                        .get(AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    *observed.lock().await = Some((auth, body));
+
+                    Json(json!({
+                        "object": "list",
+                        "data": [{
+                            "object": "embedding",
+                            "embedding": [0.1, 0.2],
+                            "index": 0
+                        }],
+                        "model": "text-embedding-3-large",
+                        "usage": {
+                            "prompt_tokens": 2,
+                            "total_tokens": 2
+                        }
+                    }))
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(HubTestProvider),
+            auth: ProviderAuth::ApiKey("hub-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: EmbeddingRequest = serde_json::from_value(json!({
+            "model": "text-embedding-3-large",
+            "input": ["hello"]
+        }))
+        .unwrap();
+
+        let response = gateway.embed(&request, &instance).await.unwrap();
+
+        assert_eq!(response.model, "text-embedding-3-large");
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.usage.as_ref().unwrap().total_tokens, 2);
+
+        let observed = observed.lock().await.take().unwrap();
+        assert_eq!(observed.0.as_deref(), Some("Bearer hub-secret"));
+        assert_eq!(observed.1["model"], "text-embedding-3-large");
+        assert_eq!(observed.1["input"][0], "hello");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn embed_rejects_provider_without_embed_transform() {
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(NativeTestProvider),
+            auth: ProviderAuth::ApiKey("native-secret".into()),
+            base_url_override: Some(Url::parse("https://example.invalid").unwrap()),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: EmbeddingRequest = serde_json::from_value(json!({
+            "model": "text-embedding-3-large",
+            "input": "hello"
+        }))
+        .unwrap();
+
+        let error = gateway.embed(&request, &instance).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            GatewayError::Validation(message)
+                if message.contains("native-test") && message.contains("embeddings")
+        ));
     }
 
     #[tokio::test]
