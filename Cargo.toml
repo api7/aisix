@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 
+[features]
+build-ui = []
+
 [dependencies]
 log = { version = "0.4.29", features = ["kv", "kv_serde"] }
 tokio = { version = "1.52.0", features = ["full", "test-util"] }
