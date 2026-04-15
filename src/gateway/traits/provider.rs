@@ -33,10 +33,8 @@ pub trait ProviderMeta: Send + Sync + 'static {
 
     fn build_auth_headers(&self, auth: &ProviderAuth) -> Result<HeaderMap>;
 
-    /// Build the final request URL for the chat endpoint.
-    fn build_url(&self, base_url: &str, model: &str) -> String {
-        let endpoint_path = self.chat_endpoint_path(model);
-
+    /// Build the final request URL for an arbitrary provider endpoint.
+    fn build_url_for_endpoint(&self, base_url: &str, endpoint_path: &str) -> String {
         let Ok(mut parsed) = reqwest::Url::parse(base_url) else {
             return format!("{}{}", base_url.trim_end_matches('/'), endpoint_path);
         };
@@ -67,6 +65,12 @@ pub trait ProviderMeta: Send + Sync + 'static {
 
         parsed.set_path(&format!("/{}", joined_segments.join("/")));
         parsed.to_string()
+    }
+
+    /// Build the final request URL for the chat endpoint.
+    fn build_url(&self, base_url: &str, model: &str) -> String {
+        let endpoint_path = self.chat_endpoint_path(model);
+        self.build_url_for_endpoint(base_url, endpoint_path.as_ref())
     }
 }
 

@@ -8,15 +8,18 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use log::error;
-pub use types::*;
+pub use types::EmbeddingError;
 
 use crate::{
     config::entities::{Model, ResourceEntry},
-    gateway::types::common::Usage,
+    gateway::types::{
+        common::Usage,
+        embed::{EmbeddingRequest, EmbeddingResponse},
+    },
     proxy::{
         AppState,
         hooks::{self, RequestContext},
-        provider::create_legacy_provider,
+        provider::create_provider_instance,
     },
     utils::future::maybe_timeout,
 };
@@ -34,7 +37,7 @@ fn embedding_usage(response: &EmbeddingResponse) -> Usage {
 
 #[fastrace::trace]
 pub async fn embeddings(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     mut request_ctx: RequestContext,
     Json(mut request_data): Json<EmbeddingRequest>,
 ) -> Result<Response, EmbeddingError> {
@@ -42,21 +45,21 @@ pub async fn embeddings(
     hooks::authorization::check(&mut request_ctx, request_data.model.clone()).await?;
     hooks::rate_limit::pre_check(&mut request_ctx).await?;
 
-    //TODO: safe unwrap
     let model = request_ctx
         .extensions()
         .await
         .get::<ResourceEntry<Model>>()
         .cloned()
-        .unwrap();
+        .ok_or(EmbeddingError::MissingModelInContext)?;
 
-    let provider = create_legacy_provider(&model);
+    let gateway = state.gateway();
+    let provider_instance = create_provider_instance(gateway.as_ref(), &model)?;
     let timeout = model.timeout.map(Duration::from_millis);
 
     // Replace request model name with real model name
     request_data.model = model.model.name.clone();
 
-    match maybe_timeout(timeout, provider.embedding(request_data)).await {
+    match maybe_timeout(timeout, gateway.embed(&request_data, &provider_instance)).await {
         Ok(Ok(response)) => {
             let usage = embedding_usage(&response);
             let mut resp = Json(response).into_response();
@@ -70,7 +73,7 @@ pub async fn embeddings(
         }
         Ok(Err(err)) => {
             error!("Error generating embeddings: {}", err);
-            Err(EmbeddingError::ProviderError(err))
+            Err(EmbeddingError::GatewayError(err))
         }
         Err(err) => Err(EmbeddingError::Timeout(err)),
     }
