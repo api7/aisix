@@ -20,6 +20,20 @@ fn build_ui() -> Result<()> {
         println!("cargo:rerun-if-changed=ui");
 
         let status = process::Command::new("pnpm")
+            .args(["install", "--frozen-lockfile"])
+            .current_dir("ui")
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()?;
+
+        if !status.success() {
+            return Err(anyhow!(
+                "failed to install ui dependencies with status: {}",
+                status
+            ));
+        }
+
+        let status = process::Command::new("pnpm")
             .args(["run", "build"])
             .current_dir("ui")
             .stdout(std::process::Stdio::inherit())
