@@ -2,7 +2,6 @@ mod handlers;
 mod hooks;
 mod middlewares;
 mod provider;
-pub mod types;
 
 use std::sync::Arc;
 
