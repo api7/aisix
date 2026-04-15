@@ -120,7 +120,7 @@ fn gateway_error_message(error: &GatewayError, error_type: &'static str) -> &'st
             _ if status.as_u16() == 529 => "overloaded_error", // provider-specific overload status code
             _ => "Provider error",
         },
-        GatewayError::Http(_) | GatewayError::Stream(_) => "Upstream service unavailable",
+        _ => "Upstream service unavailable",
     }
 }
 
@@ -175,7 +175,7 @@ fn gateway_error_type(error: &GatewayError) -> &'static str {
             _ if status.is_server_error() => "api_error",
             _ => "invalid_request_error",
         },
-        GatewayError::Http(_) | GatewayError::Stream(_) => "overloaded_error",
+        _ => "overloaded_error",
     }
 }
 

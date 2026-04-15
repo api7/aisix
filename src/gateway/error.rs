@@ -28,6 +28,10 @@ pub enum GatewayError {
     #[error("format not natively supported by provider {provider}")]
     NativeNotSupported { provider: String },
 
+    /// The provider does not implement embeddings.
+    #[error("embeddings not supported by provider {provider}")]
+    EmbeddingsNotSupported { provider: String },
+
     /// Internal gateway or server-side configuration error.
     #[error("internal: {0}")]
     Internal(String),
@@ -71,7 +75,9 @@ impl GatewayError {
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Provider { status, .. } => *status,
             Self::Http(_) | Self::Stream(_) => StatusCode::BAD_GATEWAY,
-            Self::NativeNotSupported { .. } => StatusCode::NOT_IMPLEMENTED,
+            Self::NativeNotSupported { .. } | Self::EmbeddingsNotSupported { .. } => {
+                StatusCode::NOT_IMPLEMENTED
+            }
         }
     }
 }
@@ -114,6 +120,16 @@ mod tests {
         assert!(!e.is_retryable());
         assert_eq!(e.status_code(), StatusCode::NOT_IMPLEMENTED);
         assert!(e.to_string().contains("gemini"));
+    }
+
+    #[test]
+    fn embeddings_not_supported() {
+        let e = GatewayError::EmbeddingsNotSupported {
+            provider: "anthropic".into(),
+        };
+        assert!(!e.is_retryable());
+        assert_eq!(e.status_code(), StatusCode::NOT_IMPLEMENTED);
+        assert!(e.to_string().contains("anthropic"));
     }
 
     #[test]

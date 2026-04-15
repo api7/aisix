@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use http::{HeaderMap, HeaderValue};
+use serde::{Deserialize, Serialize};
 
 use crate::gateway::{
     error::{GatewayError, Result},
@@ -8,11 +9,21 @@ use crate::gateway::{
     traits::{ChatTransform, EmbedTransform, ProviderCapabilities, ProviderMeta},
 };
 
+pub const IDENTIFIER: &str = "gemini";
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct GeminiProviderConfig {
+    pub api_key: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_base: Option<String>,
+}
+
 pub struct GoogleDef;
 
 impl ProviderMeta for GoogleDef {
     fn name(&self) -> &'static str {
-        "gemini"
+        IDENTIFIER
     }
 
     fn default_base_url(&self) -> &'static str {
@@ -51,6 +62,8 @@ impl ProviderCapabilities for GoogleDef {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use super::GoogleDef;
     use crate::gateway::{
         provider_instance::ProviderAuth,

@@ -118,10 +118,9 @@ impl Gateway {
         instance: &ProviderInstance,
     ) -> Result<EmbeddingResponse> {
         let transform = instance.def.as_embed_transform().ok_or_else(|| {
-            GatewayError::Validation(format!(
-                "provider {} does not support embeddings",
-                instance.def.name()
-            ))
+            GatewayError::EmbeddingsNotSupported {
+                provider: instance.def.name().to_string(),
+            }
         })?;
 
         let endpoint_path = transform.embeddings_endpoint_path(&request.model);
@@ -922,8 +921,8 @@ mod tests {
 
         assert!(matches!(
             error,
-            GatewayError::Validation(message)
-                if message.contains("native-test") && message.contains("embeddings")
+            GatewayError::EmbeddingsNotSupported { provider }
+                if provider == "native-test"
         ));
     }
 

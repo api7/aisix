@@ -32,11 +32,7 @@ impl IntoResponse for EmbeddingError {
                     GatewayError::Provider { .. }
                     | GatewayError::Http(_)
                     | GatewayError::Stream(_) => StatusCode::BAD_GATEWAY,
-                    GatewayError::Validation(message)
-                        if message.contains("does not support embeddings") =>
-                    {
-                        StatusCode::BAD_GATEWAY
-                    }
+                    GatewayError::EmbeddingsNotSupported { .. } => StatusCode::BAD_GATEWAY,
                     _ => err.status_code(),
                 };
                 let (message, error_type, code) = match err {
@@ -47,15 +43,11 @@ impl IntoResponse for EmbeddingError {
                         "server_error",
                         "provider_error",
                     ),
-                    GatewayError::Validation(message)
-                        if message.contains("does not support embeddings") =>
-                    {
-                        (
-                            "Provider error".to_string(),
-                            "server_error",
-                            "provider_error",
-                        )
-                    }
+                    GatewayError::EmbeddingsNotSupported { .. } => (
+                        "Provider error".to_string(),
+                        "server_error",
+                        "provider_error",
+                    ),
                     GatewayError::Internal(_) => (
                         "Gateway internal error".to_string(),
                         "server_error",
