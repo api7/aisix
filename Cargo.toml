@@ -6,7 +6,7 @@ rust-version = "1.85"
 
 [dependencies]
 log = { version = "0.4.29", features = ["kv", "kv_serde"] }
-tokio = { version = "1", features = ["full", "test-util"] }
+tokio = { version = "1.52.0", features = ["full", "test-util"] }
 reqwest = { version = "0.13", default-features = false, features = [
   "charset",
   "system-proxy",
@@ -14,14 +14,14 @@ reqwest = { version = "0.13", default-features = false, features = [
   "stream",
   "native-tls",
 ] }
-openssl = { version = "0.10.76" }
+openssl = { version = "0.10.77" }
 tokio-openssl = "0.6"
 clap = { version = "4.6.0", features = ["derive"] }
 config = "0.15"
 http = "1.4.0"
 http-body = "1.0.1"
 http-body-util = "0.1.3"
-axum = { version = "0.8.8", features = [
+axum = { version = "0.8.9", features = [
   "http1",
   "json",
   "matched-path",
@@ -35,7 +35,7 @@ async-trait = "0.1"
 futures = "0.3"
 bytes = "1.0"
 arc-swap = "1"
-anyhow = "1.0.100"
+anyhow = "1"
 fastrace = { version = "0.7.16", features = ["enable"] }
 fastrace-axum = "0.2.0"
 fastrace-opentelemetry = "0.16.0"
@@ -58,8 +58,8 @@ thiserror = "2"
 skp-ratelimit = { git = "https://github.com/bzp2010/skp-ratelimit.git", branch = "bzp/feat-custom-cost", default-features = false, features = [
   "memory",
 ] }
-rand = "0.10.0"
-jsonschema = { version = "0.45", default-features = false }
+rand = "0.10.1"
+jsonschema = { version = "0.46.0", default-features = false }
 uuid = { version = "1.22.0", features = ["v4"] }
 utoipa = "5.4.0"
 utoipa-scalar = { version = "0.3", features = ["axum"] }
@@ -84,6 +84,10 @@ assert_matches = "1.5"
 pretty_assertions = "1.4"
 rstest = "0.26"
 tempfile = "3"
+
+[build-dependencies]
+anyhow = "1"
+vergen-git2 = { version = "9.1.0" }
 
 [patch.crates-io]
 opentelemetry = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "965078315b58ae14725721735f1c8e2bc2d3b445" }
