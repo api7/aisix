@@ -19,6 +19,7 @@ pub struct AnthropicMessagesNativeStreamState {
 }
 
 /// Stateful data for native OpenAI Responses streaming transforms.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct OpenAIResponsesNativeStreamState;
 
@@ -39,6 +40,7 @@ pub trait NativeAnthropicMessagesSupport: ChatTransform {
 }
 
 /// Native OpenAI Responses support for providers that can bypass the hub format.
+#[allow(dead_code)]
 pub trait NativeOpenAIResponsesSupport: ChatTransform {
     fn native_openai_responses_endpoint(&self, model: &str) -> Cow<'static, str>;
     fn transform_openai_responses_request(&self, req: &ResponsesApiRequest) -> Result<Value>;
@@ -53,6 +55,7 @@ pub trait NativeOpenAIResponsesSupport: ChatTransform {
 /// Type-erased native handler returned by format implementations.
 pub enum NativeHandler<'a> {
     AnthropicMessages(&'a dyn NativeAnthropicMessagesSupport),
+    #[allow(dead_code)]
     OpenAIResponses(&'a dyn NativeOpenAIResponsesSupport),
 }
 

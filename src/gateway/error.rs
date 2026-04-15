@@ -58,6 +58,7 @@ pub enum GatewayError {
 
 impl GatewayError {
     /// Whether this error is safe to retry.
+    #[allow(dead_code)]
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Provider { retryable, .. } => *retryable,

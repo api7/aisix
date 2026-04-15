@@ -152,9 +152,10 @@ mod tests {
     use super::{ChatFormat, ChatStreamState, ToolCallAccumulator};
     use crate::gateway::{
         error::GatewayError,
+        provider_instance::ProviderAuth,
         traits::{
-            NativeHandler, NativeOpenAIResponsesSupport, ProviderAuth, ProviderMeta,
-            StreamReaderKind, provider::ChatTransform,
+            NativeHandler, NativeOpenAIResponsesSupport, ProviderMeta, StreamReaderKind,
+            provider::ChatTransform,
         },
         types::{
             common::BridgeContext,

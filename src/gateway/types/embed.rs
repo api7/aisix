@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -6,14 +5,12 @@ use serde_json::Value;
 #[derive(Debug, Clone)]
 pub enum EmbedRequestBody {
     Json(Value),
-    Binary(Bytes),
 }
 
 /// Parsed response body abstractions for embedding gateway calls.
 #[derive(Debug, Clone)]
 pub enum EmbedResponseBody {
     Json(Value),
-    Binary(Bytes),
 }
 
 /// Embedding input that may be either one string or multiple strings.

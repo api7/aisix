@@ -136,6 +136,7 @@ pub trait ProviderCapabilities: ChatTransform {
         None
     }
 
+    #[allow(dead_code)]
     fn as_native_openai_responses(&self) -> Option<&dyn NativeOpenAIResponsesSupport> {
         None
     }
@@ -144,14 +145,17 @@ pub trait ProviderCapabilities: ChatTransform {
         None
     }
 
+    #[allow(dead_code)]
     fn as_tts_transform(&self) -> Option<&dyn TtsTransform> {
         None
     }
 
+    #[allow(dead_code)]
     fn as_stt_transform(&self) -> Option<&dyn SttTransform> {
         None
     }
 
+    #[allow(dead_code)]
     fn as_image_gen_transform(&self) -> Option<&dyn ImageGenTransform> {
         None
     }
@@ -161,7 +165,9 @@ pub trait ProviderCapabilities: ChatTransform {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamReaderKind {
     Sse,
+    #[allow(dead_code)]
     AwsEventStream,
+    #[allow(dead_code)]
     JsonArrayStream,
 }
 
@@ -170,6 +176,7 @@ pub enum StreamReaderKind {
 pub struct CompatQuirks {
     pub unsupported_params: &'static [&'static str],
     pub param_renames: &'static [(&'static str, &'static str)],
+    #[allow(dead_code)]
     pub tool_args_may_be_object: bool,
     pub inject_stream_usage: bool,
     pub stream_done_signal: &'static str,
@@ -229,23 +236,22 @@ pub trait EmbedTransform: Send + Sync + 'static {
     }
 
     fn transform_embeddings_response(&self, body: EmbedResponseBody) -> Result<EmbeddingResponse> {
-        match body {
-            EmbedResponseBody::Json(body) => serde_json::from_value(body)
-                .map_err(|error| GatewayError::Transform(error.to_string())),
-            EmbedResponseBody::Binary(_) => Err(GatewayError::Transform(
-                "embedding response must be JSON".into(),
-            )),
-        }
+        let EmbedResponseBody::Json(body) = body;
+
+        serde_json::from_value(body).map_err(|error| GatewayError::Transform(error.to_string()))
     }
 }
 
 /// Placeholder trait for text-to-speech until multimodal traits arrive.
+#[allow(dead_code)]
 pub trait TtsTransform: Send + Sync + 'static {}
 
 /// Placeholder trait for speech-to-text until multimodal traits arrive.
+#[allow(dead_code)]
 pub trait SttTransform: Send + Sync + 'static {}
 
 /// Placeholder trait for image generation until multimodal traits arrive.
+#[allow(dead_code)]
 pub trait ImageGenTransform: Send + Sync + 'static {}
 
 #[cfg(test)]
@@ -400,7 +406,6 @@ mod tests {
                 pretty_assertions::assert_eq!(value["model"], "text-embedding-3-large");
                 pretty_assertions::assert_eq!(value["input"], "hello");
             }
-            EmbedRequestBody::Binary(_) => panic!("expected json body"),
         }
 
         let response = provider

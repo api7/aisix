@@ -9,6 +9,8 @@
 //! `NativeOpenAIResponsesSupport` providing a bypass for providers that
 //! natively support the Responses API (e.g., OpenAI).
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

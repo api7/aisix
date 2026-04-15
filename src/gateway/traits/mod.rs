@@ -5,11 +5,12 @@ pub mod provider;
 pub use chat_format::{ChatFormat, ChatStreamState, ToolCallAccumulator};
 pub use native::{
     AnthropicMessagesNativeStreamState, NativeAnthropicMessagesSupport, NativeHandler,
-    NativeOpenAIResponsesSupport, OpenAIResponsesNativeStreamState,
 };
+#[allow(unused_imports)]
+pub use native::{NativeOpenAIResponsesSupport, OpenAIResponsesNativeStreamState};
 pub use provider::{
-    ChatTransform, CompatQuirks, EmbedTransform, ImageGenTransform, ProviderCapabilities,
-    ProviderMeta, StreamReaderKind, SttTransform, TtsTransform,
+    ChatTransform, CompatQuirks, EmbedTransform, ProviderCapabilities, ProviderMeta,
+    StreamReaderKind,
 };
-
-pub use crate::gateway::provider_instance::ProviderAuth;
+#[allow(unused_imports)]
+pub use provider::{ImageGenTransform, SttTransform, TtsTransform};
