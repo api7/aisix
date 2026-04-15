@@ -37,6 +37,7 @@ pub struct ResourceEntry<T> {
 }
 
 impl<T> ResourceEntry<T> {
+    /// Returns the source config revision associated with this entry.
     #[allow(dead_code)]
     pub fn revision(&self) -> i64 {
         self.revision

@@ -6,7 +6,7 @@ mod utils;
 
 use std::{process::exit, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use axum::Router;
 use clap::Parser;
 use log::{error, info};
@@ -166,7 +166,7 @@ fn init_observability() -> Result<(oneshot::Sender<()>, tokio::task::JoinHandle<
     Ok((tx, shutdown_handle))
 }
 
-async fn serve_proxy(config: Arc<config::Config>, router: Router) -> Result<(), std::io::Error> {
+async fn serve_proxy(config: Arc<config::Config>, router: Router) -> Result<()> {
     serve(
         "Proxy",
         config.server.proxy.listen,
@@ -176,10 +176,7 @@ async fn serve_proxy(config: Arc<config::Config>, router: Router) -> Result<(), 
     .await
 }
 
-async fn serve_admin(
-    config: Arc<config::Config>,
-    state: admin::AppState,
-) -> Result<(), std::io::Error> {
+async fn serve_admin(config: Arc<config::Config>, state: admin::AppState) -> Result<()> {
     serve(
         "Admin",
         config.server.admin.listen,
@@ -194,26 +191,28 @@ async fn serve(
     addr: std::net::SocketAddr,
     tls: &config::ServerCommonTls,
     router: Router,
-) -> Result<(), std::io::Error> {
+) -> Result<()> {
     if tls.enabled {
         let Some(cert) = tls.cert_file.as_deref() else {
-            error!("{} TLS cert_file is required when TLS is enabled", name);
-            exit(1);
+            return Err(anyhow!(
+                "{} TLS cert_file is required when TLS is enabled",
+                name
+            ));
         };
 
         if !std::path::Path::new(cert).exists() {
-            error!("{} TLS cert_file '{}' does not exist", name, cert);
-            exit(1);
+            return Err(anyhow!("{} TLS cert_file '{}' does not exist", name, cert));
         }
 
         let Some(key) = tls.key_file.as_deref() else {
-            error!("{} TLS key_file is required when TLS is enabled", name);
-            exit(1);
+            return Err(anyhow!(
+                "{} TLS key_file is required when TLS is enabled",
+                name
+            ));
         };
 
         if !std::path::Path::new(key).exists() {
-            error!("{} TLS key_file '{}' does not exist", name, key);
-            exit(1);
+            return Err(anyhow!("{} TLS key_file '{}' does not exist", name, key));
         }
 
         info!("{} API listening on https://{}", name, addr);
@@ -221,7 +220,7 @@ async fn serve(
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         axum_server::bind_openssl(addr, tls_config)
             .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .await
+            .await?;
     } else {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         info!("{} API listening on http://{}", name, addr);
@@ -229,6 +228,8 @@ async fn serve(
             listener,
             router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-        .await
+        .await?;
     }
+
+    Ok(())
 }
