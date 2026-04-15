@@ -1,4 +1,4 @@
-use std::{env, fs, path, process};
+use std::{env, fs, process};
 
 use anyhow::{Result, anyhow};
 use vergen_git2::{Emitter, Git2Builder};
