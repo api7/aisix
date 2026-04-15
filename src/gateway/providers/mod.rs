@@ -9,6 +9,22 @@ pub use deepseek::DeepSeek;
 pub use gemini::GoogleDef;
 pub use openai::OpenAIDef;
 
+pub mod identifiers {
+    use super::{anthropic, deepseek, gemini, openai};
+
+    pub const ANTHROPIC: &str = anthropic::IDENTIFIER;
+    pub const DEEPSEEK: &str = deepseek::IDENTIFIER;
+    pub const GEMINI: &str = gemini::IDENTIFIER;
+    pub const OPENAI: &str = openai::IDENTIFIER;
+}
+
+pub mod configs {
+    pub use super::{
+        anthropic::AnthropicProviderConfig, deepseek::DeepSeekProviderConfig,
+        gemini::GeminiProviderConfig, openai::OpenAIProviderConfig,
+    };
+}
+
 use crate::gateway::{error::Result, provider_instance::ProviderRegistry};
 
 pub fn default_provider_registry() -> Result<ProviderRegistry> {

@@ -32,11 +32,7 @@ impl IntoResponse for EmbeddingError {
                     GatewayError::Provider { .. }
                     | GatewayError::Http(_)
                     | GatewayError::Stream(_) => StatusCode::BAD_GATEWAY,
-                    GatewayError::Validation(message)
-                        if message.contains("does not support embeddings") =>
-                    {
-                        StatusCode::BAD_GATEWAY
-                    }
+                    GatewayError::EmbeddingsNotSupported { .. } => StatusCode::NOT_IMPLEMENTED,
                     _ => err.status_code(),
                 };
                 let (message, error_type, code) = match err {
@@ -47,15 +43,11 @@ impl IntoResponse for EmbeddingError {
                         "server_error",
                         "provider_error",
                     ),
-                    GatewayError::Validation(message)
-                        if message.contains("does not support embeddings") =>
-                    {
-                        (
-                            "Provider error".to_string(),
-                            "server_error",
-                            "provider_error",
-                        )
-                    }
+                    GatewayError::EmbeddingsNotSupported { .. } => (
+                        "Provider error".to_string(),
+                        "server_error",
+                        "provider_error",
+                    ),
                     GatewayError::Internal(_) => (
                         "Gateway internal error".to_string(),
                         "server_error",
@@ -107,5 +99,41 @@ impl IntoResponse for EmbeddingError {
             )
                 .into_response(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::response::IntoResponse;
+    use http::StatusCode;
+    use http_body_util::BodyExt;
+    use pretty_assertions::assert_eq;
+    use serde_json::{Value, json};
+
+    use super::EmbeddingError;
+    use crate::gateway::error::GatewayError;
+
+    #[tokio::test]
+    async fn embeddings_not_supported_returns_not_implemented() {
+        let response = EmbeddingError::GatewayError(GatewayError::EmbeddingsNotSupported {
+            provider: "anthropic".into(),
+        })
+        .into_response();
+
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            payload,
+            json!({
+                "error": {
+                    "message": "Provider error",
+                    "type": "server_error",
+                    "code": "provider_error"
+                }
+            })
+        );
     }
 }

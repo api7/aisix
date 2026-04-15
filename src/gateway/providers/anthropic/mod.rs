@@ -3,6 +3,7 @@ pub mod transform;
 use std::borrow::Cow;
 
 use http::{HeaderMap, HeaderValue};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use self::transform::{
@@ -24,9 +25,19 @@ use crate::gateway::{
 
 pub struct AnthropicDef;
 
+pub const IDENTIFIER: &str = "anthropic";
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct AnthropicProviderConfig {
+    pub api_key: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_base: Option<String>,
+}
+
 impl ProviderMeta for AnthropicDef {
     fn name(&self) -> &'static str {
-        "anthropic"
+        IDENTIFIER
     }
 
     fn default_base_url(&self) -> &'static str {

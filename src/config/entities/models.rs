@@ -13,7 +13,7 @@ use crate::{
         ResourceEntry,
         types::{HasRateLimit, RateLimit, RateLimitMetric},
     },
-    providers::{configs, identifiers},
+    gateway::providers::{configs, identifiers},
     utils::jsonschema::format_evaluation_error,
 };
 

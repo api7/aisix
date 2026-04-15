@@ -30,8 +30,6 @@ async fn main() -> Result<()> {
     let resources =
         Arc::new(config::entities::ResourceRegistry::new(config_provider.clone()).await);
 
-    providers::init_client();
-
     let gateway = Arc::new(gateway::Gateway::new(
         gateway::providers::default_provider_registry()
             .context("failed to build default gateway provider registry")?,

@@ -1,4 +1,5 @@
 use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+use serde::{Deserialize, Serialize};
 
 use crate::gateway::{
     error::{GatewayError, Result},
@@ -6,11 +7,21 @@ use crate::gateway::{
     traits::{ChatTransform, CompatQuirks, EmbedTransform, ProviderCapabilities, ProviderMeta},
 };
 
+pub const IDENTIFIER: &str = "openai";
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct OpenAIProviderConfig {
+    pub api_key: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_base: Option<String>,
+}
+
 pub struct OpenAIDef;
 
 impl ProviderMeta for OpenAIDef {
     fn name(&self) -> &'static str {
-        "openai"
+        IDENTIFIER
     }
 
     fn default_base_url(&self) -> &'static str {
