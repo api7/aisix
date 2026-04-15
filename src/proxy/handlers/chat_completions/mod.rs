@@ -19,6 +19,7 @@ use crate::{
     config::entities::{Model, ResourceEntry},
     gateway::{
         formats::OpenAIChatFormat,
+        traits::ChatFormat,
         types::{
             common::Usage,
             openai::{ChatCompletionRequest, ChatCompletionResponse},
@@ -41,7 +42,11 @@ pub async fn chat_completions(
     Json(mut request_data): Json<ChatCompletionRequest>,
 ) -> Result<Response, ChatCompletionError> {
     hooks::observability::record_start_time(&mut request_ctx).await;
-    hooks::authorization::check(&mut request_ctx, request_data.model.clone()).await?;
+    hooks::authorization::check(
+        &mut request_ctx,
+        OpenAIChatFormat::extract_model(&request_data).to_owned(),
+    )
+    .await?;
     hooks::rate_limit::pre_check(&mut request_ctx).await?;
 
     let model = request_ctx
@@ -60,7 +65,7 @@ pub async fn chat_completions(
 
     match maybe_timeout(
         timeout,
-        gateway.chat::<OpenAIChatFormat>(&request_data, &provider_instance),
+        gateway.chat_completion(&request_data, &provider_instance),
     )
     .await
     {
@@ -145,16 +150,18 @@ async fn handle_stream_request(
                 Some(Ok(chunk)) => {
                     if idx == 0 {
                         hooks::observability::record_first_token_latency(&mut request_ctx).await;
-                        span.add_event(TraceEvent::new("first token arrived"));
+                        span.add_event(TraceEvent::new(format!(
+                            "{} first token arrived",
+                            OpenAIChatFormat::name()
+                        )));
                     }
 
-                    let event = match serde_json::to_string(&chunk) {
-                        Ok(json) => Ok::<SseEvent, Infallible>(SseEvent::default().data(json)),
-                        Err(err) => {
-                            error!("Failed to serialize chunk: {}", err);
-                            Ok(SseEvent::default().data(""))
-                        }
-                    };
+                    let mut event =
+                        SseEvent::default().data(OpenAIChatFormat::serialize_chunk_payload(&chunk));
+                    if let Some(event_type) = OpenAIChatFormat::sse_event_type(&chunk) {
+                        event = event.event(event_type);
+                    }
+                    let event = Ok::<SseEvent, Infallible>(event);
 
                     Some((event, (stream, span, idx + 1, request_ctx, false, true)))
                 }

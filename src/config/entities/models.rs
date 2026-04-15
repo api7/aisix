@@ -233,16 +233,8 @@ impl ModelsStore {
         self.store.list()
     }
 
-    pub fn get(&self, key: &str) -> Option<ResourceEntry<Model>> {
-        self.store.get(key)
-    }
-
     pub fn get_by_name(&self, name: &str) -> Option<ResourceEntry<Model>> {
         self.store.get_by_secondary("by_name", name)
-    }
-
-    pub fn latest_mod_revision(&self) -> i64 {
-        self.store.latest_mod_revision()
     }
 }
 

@@ -19,6 +19,7 @@ use crate::{
     config::entities::{Model, ResourceEntry},
     gateway::{
         formats::AnthropicMessagesFormat,
+        traits::ChatFormat,
         types::{
             anthropic::{
                 AnthropicMessagesRequest, AnthropicMessagesResponse, AnthropicStreamEvent,
@@ -49,7 +50,11 @@ pub async fn messages(
     Json(mut request_data): Json<AnthropicMessagesRequest>,
 ) -> Result<Response, MessagesError> {
     hooks::observability::record_start_time(&mut request_ctx).await;
-    hooks::authorization::check(&mut request_ctx, request_data.model.clone()).await?;
+    hooks::authorization::check(
+        &mut request_ctx,
+        AnthropicMessagesFormat::extract_model(&request_data).to_owned(),
+    )
+    .await?;
     hooks::rate_limit::pre_check(&mut request_ctx).await?;
 
     let model = request_ctx
@@ -140,21 +145,15 @@ async fn handle_stream_request(
                 Some(Ok(event)) => {
                     if idx == 0 {
                         hooks::observability::record_first_token_latency(&mut request_ctx).await;
-                        span.add_event(TraceEvent::new("first token arrived"));
+                        span.add_event(TraceEvent::new(format!(
+                            "{} first token arrived",
+                            AnthropicMessagesFormat::name()
+                        )));
                     }
 
-                    let (sse_event, should_terminate) = match serialize_stream_event(&event) {
-                        Ok(event) => (Ok::<SseEvent, Infallible>(event), false),
-                        Err(err) => {
-                            error!("Failed to serialize anthropic stream event: {}", err);
-                            (Ok(anthropic_error_sse_event(err.to_string())), true)
-                        }
-                    };
+                    let sse_event = Ok::<SseEvent, Infallible>(serialize_stream_event(&event));
 
-                    Some((
-                        sse_event,
-                        (stream, span, idx + 1, request_ctx, should_terminate),
-                    ))
+                    Some((sse_event, (stream, span, idx + 1, request_ctx, false)))
                 }
                 Some(Err(err)) => {
                     error!("Gateway stream error: {}", err);
@@ -193,8 +192,13 @@ fn anthropic_error_event_payload(message: String) -> String {
     .to_string()
 }
 
-fn serialize_stream_event(event: &AnthropicStreamEvent) -> Result<SseEvent, serde_json::Error> {
-    Ok(SseEvent::default()
-        .event(event.event_type())
-        .data(serde_json::to_string(event)?))
+fn serialize_stream_event(event: &AnthropicStreamEvent) -> SseEvent {
+    let mut sse_event =
+        SseEvent::default().data(AnthropicMessagesFormat::serialize_chunk_payload(event));
+
+    if let Some(event_type) = AnthropicMessagesFormat::sse_event_type(event) {
+        sse_event = sse_event.event(event_type);
+    }
+
+    sse_event
 }

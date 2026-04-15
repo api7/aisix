@@ -17,10 +17,6 @@ pub mod defaults {
     pub fn admin_listen() -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], 3001))
     }
-
-    pub fn server() -> Server {
-        Server::default()
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

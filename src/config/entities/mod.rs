@@ -32,10 +32,13 @@ impl ResourceRegistry {
 pub struct ResourceEntry<T> {
     pub id: String,
     value: T,
+    #[allow(dead_code)]
     revision: i64,
 }
 
 impl<T> ResourceEntry<T> {
+    /// Returns the source config revision associated with this entry.
+    #[allow(dead_code)]
     pub fn revision(&self) -> i64 {
         self.revision
     }
@@ -154,6 +157,7 @@ impl<T: Clone + 'static> ResourceStore<T> {
         deleted
     }
 
+    #[cfg(test)]
     fn get(&self, key: &str) -> Option<ResourceEntry<T>> {
         self.data.load().primary.get(key).cloned()
     }
@@ -170,6 +174,7 @@ impl<T: Clone + 'static> ResourceStore<T> {
         Arc::clone(&self.data.load().primary)
     }
 
+    #[cfg(test)]
     fn latest_mod_revision(&self) -> i64 {
         self.data.load().mod_revision
     }
@@ -283,6 +288,7 @@ impl<T: DeserializeOwned + Clone + Send + Sync + 'static> EntityStore<T> {
     }
 
     /// Get the value of the specified key
+    #[cfg(test)]
     pub fn get(&self, key: &str) -> Option<ResourceEntry<T>> {
         self.store.get(key)
     }
@@ -297,6 +303,7 @@ impl<T: DeserializeOwned + Clone + Send + Sync + 'static> EntityStore<T> {
     }
 
     /// Get the latest mod_revision of this resource type
+    #[cfg(test)]
     pub fn latest_mod_revision(&self) -> i64 {
         self.store.latest_mod_revision()
     }

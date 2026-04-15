@@ -23,7 +23,7 @@ use crate::gateway::{
 
 enum HttpResponseBody {
     Json(Value),
-    Binary(Bytes),
+    Binary,
 }
 
 /// Typed Layer-3 gateway entry point.
@@ -129,14 +129,8 @@ impl Gateway {
             .def
             .build_url_for_endpoint(base_url.as_str(), endpoint_path.as_ref());
         let headers = instance.build_headers()?;
-        let request = match transform.transform_embeddings_request(request)? {
-            EmbedRequestBody::Json(value) => {
-                self.http_client.post(url).headers(headers).json(&value)
-            }
-            EmbedRequestBody::Binary(bytes) => {
-                self.http_client.post(url).headers(headers).body(bytes)
-            }
-        };
+        let EmbedRequestBody::Json(body) = transform.transform_embeddings_request(request)?;
+        let request = self.http_client.post(url).headers(headers).json(&body);
 
         let response = self.send_request(request, false).await?;
 
@@ -155,7 +149,11 @@ impl Gateway {
 
         let response_body = match body {
             HttpResponseBody::Json(value) => EmbedResponseBody::Json(value),
-            HttpResponseBody::Binary(bytes) => EmbedResponseBody::Binary(bytes),
+            HttpResponseBody::Binary => {
+                return Err(GatewayError::Transform(
+                    "embedding response must be JSON".into(),
+                ));
+            }
         };
 
         transform.transform_embeddings_response(response_body)
@@ -316,7 +314,7 @@ fn parse_http_response_body(content_type: Option<&str>, bytes: Bytes) -> Result<
 
     match serde_json::from_slice(&bytes) {
         Ok(value) => Ok(HttpResponseBody::Json(value)),
-        Err(_) => Ok(HttpResponseBody::Binary(bytes)),
+        Err(_) => Ok(HttpResponseBody::Binary),
     }
 }
 

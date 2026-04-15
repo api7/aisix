@@ -126,7 +126,6 @@ mod tests {
                 assert_eq!(value["model"], "text-embedding-3-large");
                 assert_eq!(value["input"][0], "hello");
             }
-            EmbedRequestBody::Binary(_) => panic!("expected json body"),
         }
 
         let response = transform

@@ -114,6 +114,7 @@ impl Usage {
 /// format (OpenAI Chat) cannot represent.
 ///
 /// Populated during `ChatFormat::to_hub()`, consumed during `ChatFormat::from_hub()`.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct BridgeContext {
     pub anthropic_messages_extras: Option<AnthropicMessagesExtras>,
@@ -123,6 +124,7 @@ pub struct BridgeContext {
 }
 
 /// Anthropic Messages-specific fields preserved across hub bridging.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct AnthropicMessagesExtras {
     pub metadata: Option<Value>,
@@ -130,6 +132,7 @@ pub struct AnthropicMessagesExtras {
 }
 
 /// OpenAI Responses-specific fields preserved across hub bridging.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct OpenAIResponsesExtras {
     pub previous_response_id: Option<String>,

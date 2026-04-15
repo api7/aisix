@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, LazyLock},
-};
+use std::sync::{Arc, LazyLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -84,29 +81,8 @@ impl ApiKeysStore {
         }
     }
 
-    pub fn list(&self) -> Arc<HashMap<String, ResourceEntry<ApiKey>>> {
-        self.store.list()
-    }
-
-    pub fn get(&self, username: &str) -> Option<ResourceEntry<ApiKey>> {
-        self.store.get(username)
-    }
-
     pub fn get_by_key(&self, api_key: &str) -> Option<ResourceEntry<ApiKey>> {
         self.store.get_by_secondary("by_key", api_key)
-    }
-
-    #[fastrace::trace]
-    pub fn is_model_allowed(&self, username: &str, model: &str) -> bool {
-        if let Some(consumer) = self.get(username) {
-            consumer.allowed_models.contains(&model.to_string())
-        } else {
-            false
-        }
-    }
-
-    pub fn latest_mod_revision(&self) -> i64 {
-        self.store.latest_mod_revision()
     }
 }
 
