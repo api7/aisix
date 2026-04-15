@@ -39,7 +39,7 @@ fn build_ui() -> Result<()> {
             return Err(anyhow!("UI build failed with status: {}", output.status));
         }
     } else {
-        fs::create_dir_all(&path::PathBuf::from(env::var("OUT_DIR")?).join("ui/dist"))?;
+        fs::create_dir_all(path::PathBuf::from(env::var("OUT_DIR")?).join("ui/dist"))?;
     }
     Ok(())
 }
