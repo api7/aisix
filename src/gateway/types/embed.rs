@@ -3,12 +3,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Transport body abstractions for embedding gateway calls.
+#[derive(Debug, Clone)]
 pub enum EmbedRequestBody {
     Json(Value),
     Binary(Bytes),
 }
 
 /// Parsed response body abstractions for embedding gateway calls.
+#[derive(Debug, Clone)]
 pub enum EmbedResponseBody {
     Json(Value),
     Binary(Bytes),
@@ -82,6 +84,20 @@ mod tests {
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["dimensions"], 256);
         assert_eq!(value["encoding_format"], "float");
+    }
+
+    #[test]
+    fn embedding_request_single_input_round_trips() {
+        let request: EmbeddingRequest = serde_json::from_value(json!({
+            "model": "text-embedding-3-large",
+            "input": "hello"
+        }))
+        .unwrap();
+
+        assert!(matches!(request.input, OneOrMany::One(_)));
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["input"], "hello");
     }
 
     #[test]

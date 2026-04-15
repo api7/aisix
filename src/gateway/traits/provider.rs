@@ -393,8 +393,8 @@ mod tests {
         let body = provider.transform_embeddings_request(&request).unwrap();
         match body {
             EmbedRequestBody::Json(value) => {
-                assert_eq!(value["model"], "text-embedding-3-large");
-                assert_eq!(value["input"], "hello");
+                pretty_assertions::assert_eq!(value["model"], "text-embedding-3-large");
+                pretty_assertions::assert_eq!(value["input"], "hello");
             }
             EmbedRequestBody::Binary(_) => panic!("expected json body"),
         }
@@ -412,8 +412,14 @@ mod tests {
             })))
             .unwrap();
 
-        assert_eq!(response.data.len(), 1);
-        assert_eq!(response.usage.unwrap().total_tokens, 2);
+        pretty_assertions::assert_eq!(response.data.len(), 1);
+
+        let usage = match response.usage {
+            Some(usage) => usage,
+            None => panic!("expected usage in embedding response"),
+        };
+
+        pretty_assertions::assert_eq!(usage.total_tokens, 2);
     }
 
     #[test]
