@@ -99,61 +99,21 @@ impl EtcdConfigProvider {
         }
 
         // Enable TLS when any host uses the https:// scheme.
-        //
-        // Use the openssl-tls backend (not rustls) to support certificates with
-        // misconfigured SANs (e.g. an empty DNS name instead of the server IP).
-        // With OpenSSL we can skip hostname verification while still validating
-        // the certificate chain against the supplied CA, equivalent to
-        // `curl --cacert` without `-k`.
         let use_tls = config.host.iter().any(|h| h.starts_with("https://"));
         if use_tls {
-            use openssl::ssl::SslVerifyMode;
-
-            let mut ssl_cfg = etcd_client::OpenSslClientConfig::default();
+            let mut tls = etcd_client::TlsOptions::new();
 
             if let Some(tls_cfg) = &config.tls {
                 if let Some(ca_pem) = &tls_cfg.ca_pem {
-                    // ca_cert_pem() only loads the first certificate in a PEM
-                    // bundle.  Use stack_from_pem so that multi-cert bundles
-                    // (e.g. intermediate + root) are all added to the store.
-                    let ca_bytes = ca_pem.as_bytes().to_vec();
-                    ssl_cfg = ssl_cfg.manually(move |b| {
-                        for cert in openssl::x509::X509::stack_from_pem(&ca_bytes)? {
-                            b.cert_store_mut().add_cert(cert)?;
-                        }
-                        Ok(())
-                    });
+                    tls = tls.ca_certificate(etcd_client::Certificate::from_pem(ca_pem));
                 }
 
-                if let (Some(cert_pem), Some(key_pem)) =
-                    (&tls_cfg.cert_pem, &tls_cfg.key_pem)
-                {
-                    ssl_cfg =
-                        ssl_cfg.client_cert_pem_and_key(cert_pem.as_bytes(), key_pem.as_bytes());
+                if let (Some(cert_pem), Some(key_pem)) = (&tls_cfg.cert_pem, &tls_cfg.key_pem) {
+                    tls = tls.identity(etcd_client::Identity::from_pem(cert_pem, key_pem));
                 }
             }
 
-            // Skip hostname/IP verification: the CP certificate SAN may not match
-            // the endpoint IP/hostname.  We still validate the certificate chain
-            // (preverify_ok covers chain errors).  Error code 64 is
-            // X509_V_ERR_IP_ADDRESS_MISMATCH; we allow it explicitly so that
-            // IP-addressed endpoints with a non-matching SAN still connect.
-            ssl_cfg = ssl_cfg.manually(|b| {
-                b.set_verify_callback(SslVerifyMode::PEER, |preverify_ok, ctx| {
-                    if preverify_ok {
-                        return true;
-                    }
-                    // Allow IP address mismatch and hostname mismatch errors.
-                    matches!(
-                        ctx.error().as_raw(),
-                        64 // X509_V_ERR_IP_ADDRESS_MISMATCH
-                        | 62 // X509_V_ERR_HOSTNAME_MISMATCH
-                    )
-                });
-                Ok(())
-            });
-
-            opts = opts.with_openssl_tls(ssl_cfg);
+            opts = opts.with_tls(tls);
         }
 
         let mut client = etcd_client::Client::connect(

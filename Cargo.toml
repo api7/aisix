@@ -33,7 +33,7 @@ axum = { version = "0.8.9", features = [
 ], default-features = false }
 serde = "1.0.228"
 serde_json = "1.0"
-etcd-client = { version = "0.18.0", features = ["tls-openssl"] }
+etcd-client = { version = "0.18.0", features = ["tls"] }
 async-trait = "0.1"
 futures = "0.3"
 bytes = "1.0"
