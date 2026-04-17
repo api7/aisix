@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aisix_admin::AdminState;
+use aisix_admin::{AdminState, ConfigStore, InMemoryStore};
 use aisix_core::models::Provider;
 use aisix_core::Config;
 use aisix_etcd::{EtcdConfigProvider, Supervisor};
@@ -73,8 +73,14 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         hub.clone(),
         &cfg.proxy,
     ));
-    let admin_router =
-        aisix_admin::build_router(AdminState::new(snapshot_handle.clone(), &cfg.admin));
+    // Admin CRUD uses an in-memory store for now; an etcd-backed store
+    // lands in a follow-up PR.
+    let admin_store: Arc<dyn ConfigStore> = InMemoryStore::new();
+    let admin_router = aisix_admin::build_router(AdminState::new(
+        snapshot_handle.clone(),
+        admin_store,
+        &cfg.admin,
+    ));
 
     // Step 9: bind + serve.
     let proxy_addr: std::net::SocketAddr = cfg.proxy.addr.parse()?;

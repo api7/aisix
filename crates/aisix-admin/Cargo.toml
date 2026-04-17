@@ -27,6 +27,8 @@ utoipa-axum.workspace = true
 utoipa-scalar.workspace = true
 rust-embed.workspace = true
 mime_guess.workspace = true
+async-trait.workspace = true
+dashmap.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
