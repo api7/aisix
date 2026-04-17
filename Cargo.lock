@@ -202,7 +202,10 @@ dependencies = [
  "aisix-gateway",
  "aisix-provider-openai",
  "async-trait",
+ "serde_json",
+ "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -213,7 +216,10 @@ dependencies = [
  "aisix-gateway",
  "aisix-provider-openai",
  "async-trait",
+ "serde_json",
+ "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

@@ -14,3 +14,8 @@ aisix-gateway = { path = "../aisix-gateway" }
 aisix-provider-openai = { path = "../aisix-provider-openai" }
 async-trait.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock.workspace = true
+serde_json.workspace = true
