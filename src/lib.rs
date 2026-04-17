@@ -35,7 +35,14 @@ pub struct Args {
 pub async fn run(config_file: Option<String>) -> Result<()> {
     let (ob_shutdown_signal, ob_shutdown_task) =
         init_observability().context("failed to initialize observability")?;
-    let config = Arc::new(config::load(config_file).context("failed to load configuration")?);
+    let config = match config::load(config_file).context("failed to load configuration") {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            let _ = ob_shutdown_signal.send(());
+            let _ = ob_shutdown_task.await;
+            return Err(e);
+        }
+    };
     run_with_config(config, ob_shutdown_signal, ob_shutdown_task).await
 }
 
@@ -79,31 +86,35 @@ pub async fn run_with_provider(
         gateway,
     ));
 
-    let mut exception = false;
+    let mut run_error: Option<anyhow::Error> = None;
     select! {
         res = tokio::signal::ctrl_c() => {
             if let Err(e) = res {
-                error!("Failed to listen for shutdown signal: {}", e);
-                exception = true;
+                let err = anyhow::Error::new(e).context("failed to listen for shutdown signal");
+                error!("{err:#}");
+                run_error = Some(err);
             }
         }
         res = serve_proxy(config.clone(), proxy_router.clone()) => {
             if let Err(e) = res {
-                error!("Proxy server error: {}", e);
-                exception = true;
+                let err = e.context("proxy server error");
+                error!("{err:#}");
+                run_error = Some(err);
             }
         }
         res = serve_admin(config.clone(), admin::AppState::new(config, config_provider.clone(), resources, Some(proxy_router))) => {
             if let Err(e) = res {
-                error!("Admin server error: {}", e);
-                exception = true;
+                let err = e.context("admin server error");
+                error!("{err:#}");
+                run_error = Some(err);
             }
         }
     }
 
     if let Err(e) = config_provider.shutdown().await {
-        error!("Config provider shutdown error: {}", e);
-        exception = true;
+        let err = e.context("config provider shutdown error");
+        error!("{err:#}");
+        run_error.get_or_insert(err);
     }
 
     info!("Stopping, see you next time!");
@@ -112,8 +123,8 @@ pub async fn run_with_provider(
         .await
         .context("failed to shutdown observability")?;
 
-    if exception {
-        Err(anyhow!("one or more servers exited with an error"))
+    if let Some(err) = run_error {
+        Err(err)
     } else {
         Ok(())
     }

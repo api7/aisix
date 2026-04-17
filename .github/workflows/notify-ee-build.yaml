@@ -8,6 +8,8 @@ on:
     branches: ["main"]
     tags: ["v*"]
 
+permissions: {}
+
 jobs:
   notify:
     runs-on: ubuntu-latest

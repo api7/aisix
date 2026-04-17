@@ -36,7 +36,6 @@ dependencies = [
  "axum",
  "axum-server",
  "backon",
- "base64",
  "bytes",
  "clap",
  "config",

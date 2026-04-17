@@ -13,8 +13,11 @@ fn main() -> Result<()> {
         .add_instructions(&Git2Builder::default().sha(true).build()?)?
         .emit();
 
-    if result.is_err() {
+    if let Err(e) = result {
         // Emit a placeholder so that code referencing VERGEN_GIT_SHA compiles.
+        println!(
+            "cargo:warning=vergen_git2 could not read git SHA ({e}); falling back to \"unknown\""
+        );
         println!("cargo:rustc-env=VERGEN_GIT_SHA=unknown");
     }
 
