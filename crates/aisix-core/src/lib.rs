@@ -1,8 +1,32 @@
-//! aisix-core — shared primitives used across the gateway.
+//! aisix-core — primitives shared across every other aisix crate.
 //!
-//! This crate only contains types and errors. It must not depend on any
-//! I/O framework (no tokio, no axum, no reqwest) so that it can be reused
-//! by every other crate in the workspace.
+//! Four responsibilities:
+//! 1. **Config** ([`config::Config`]) — bootstrap YAML/TOML/JSON loader.
+//! 2. **Resources** ([`resource::Resource`], [`resource::ResourceEntry`]) — trait
+//!    and wrapper for every entity stored in etcd.
+//! 3. **Snapshot** ([`snapshot::ResourceTable`], [`snapshot::SnapshotHandle`]) —
+//!    lock-free read path via `ArcSwap`, O(1) lookup by id or name.
+//! 4. **Errors** ([`error::ProxyError`], [`error::AdminError`],
+//!    [`error::BootstrapError`]) — the three error envelopes that show up at
+//!    the two HTTP surfaces plus startup.
+//!
+//! This crate is intentionally framework-agnostic — no axum, no reqwest.
+//! `IntoResponse` impls live in `aisix-proxy` / `aisix-admin`.
 
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
+
+pub mod config;
+pub mod error;
+pub mod resource;
+pub mod snapshot;
+
+pub use config::{
+    AdminConfig, CacheBackend, CacheConfig, Config, EtcdConfig, ObservabilityConfig, ProxyConfig,
+    TlsConfig,
+};
+pub use error::{
+    AdminError, AdminErrorEnvelope, BootstrapError, ProxyError, ProxyErrorEnvelope, RateLimitScope,
+};
+pub use resource::{Resource, ResourceEntry};
+pub use snapshot::{ResourceTable, SnapshotHandle};

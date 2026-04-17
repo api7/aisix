@@ -18,7 +18,11 @@ anyhow.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+config.workspace = true
+humantime-serde.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
 rstest.workspace = true
+serde_yaml.workspace = true
+tempfile.workspace = true

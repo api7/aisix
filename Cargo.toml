@@ -113,11 +113,16 @@ redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "clu
 # Tokenization / counting (optional hard-mode TPM)
 tiktoken-rs = "0.5"
 
+# Duration / humanised types
+humantime = "2.1"
+humantime-serde = "1.1"
+
 # Test-only
 wiremock = "0.6"
 rstest = "0.23"
 insta = { version = "1", features = ["json", "yaml"] }
 testcontainers = "0.23"
+tempfile = "3.13"
 
 [profile.release]
 lto = "thin"
