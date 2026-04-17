@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aisix_admin::{AdminState, ConfigStore, InMemoryStore};
+use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore};
 use aisix_core::models::Provider;
 use aisix_core::Config;
 use aisix_etcd::{EtcdConfigProvider, Supervisor};
@@ -60,6 +60,13 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("etcd connect failed: {e}"))?,
     );
+    // Separate client for the admin write path. We could share a single
+    // underlying connection via `Client::clone()` but keeping two is
+    // cleaner — writes and the watch stream don't contend on the same
+    // mutex.
+    let admin_client = etcd_client::Client::connect(&cfg.etcd.endpoints, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("etcd admin client connect failed: {e}"))?;
     let supervisor = Arc::new(Supervisor::new(provider, cfg.etcd.prefix.clone()));
     let snapshot_handle = supervisor.handle();
 
@@ -73,9 +80,11 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         hub.clone(),
         &cfg.proxy,
     ));
-    // Admin CRUD uses an in-memory store for now; an etcd-backed store
-    // lands in a follow-up PR.
-    let admin_store: Arc<dyn ConfigStore> = InMemoryStore::new();
+    // Admin CRUD writes through etcd. The watch supervisor's read path
+    // is on a separate client (see above) so a long range scan during a
+    // list doesn't stall the watch stream.
+    let admin_store: Arc<dyn ConfigStore> =
+        Arc::new(EtcdConfigStore::new(admin_client, cfg.etcd.prefix.clone()));
     let admin_router = aisix_admin::build_router(AdminState::new(
         snapshot_handle.clone(),
         admin_store,

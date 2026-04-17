@@ -29,6 +29,8 @@ rust-embed.workspace = true
 mime_guess.workspace = true
 async-trait.workspace = true
 dashmap.workspace = true
+etcd-client.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+testcontainers.workspace = true

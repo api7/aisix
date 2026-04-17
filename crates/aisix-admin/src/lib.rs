@@ -21,12 +21,14 @@
 mod apikeys_handlers;
 mod auth;
 mod error;
+pub mod etcd_store;
 mod models_handlers;
 mod state;
 pub mod store;
 
 pub use auth::AdminAuth;
 pub use error::{AdminError, ErrorBody};
+pub use etcd_store::EtcdConfigStore;
 pub use state::AdminState;
 pub use store::{ConfigStore, InMemoryStore, StoreError};
 
