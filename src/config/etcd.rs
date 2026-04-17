@@ -169,7 +169,7 @@ impl EtcdConfigProvider {
         // Use a KV.Get as the connectivity probe instead of Maintenance.Status.
         // The API7 dp-manager only implements KV/Watch/Lease; calling Status
         // returns HTTP 404 which tonic misparses as a gRPC framing error.
-        client.get("__probe__", None).await.map(|_| Ok(client))?
+        client.status().await.map(|_| Ok(client))?
     }
 
     /// Spawn the long-running supervisor task that manages the watch stream

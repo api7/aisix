@@ -35,20 +35,6 @@ pub struct Args {
 pub async fn run(config_file: Option<String>) -> Result<()> {
     let (ob_shutdown_signal, ob_shutdown_task) =
         init_observability().context("failed to initialize observability")?;
-    run_with_observability(config_file, ob_shutdown_signal, ob_shutdown_task).await
-}
-
-/// Run the full aisix gateway using already-initialised observability handles.
-///
-/// This variant is intended for embedders (e.g. `aisix-ee`) that call
-/// [`init_observability`] themselves before starting the gateway, so that
-/// logging is available for pre-gateway setup code without triggering a
-/// double-initialisation panic.
-pub async fn run_with_observability(
-    config_file: Option<String>,
-    ob_shutdown_signal: oneshot::Sender<()>,
-    ob_shutdown_task: tokio::task::JoinHandle<()>,
-) -> Result<()> {
     let config = Arc::new(config::load(config_file).context("failed to load configuration")?);
     run_with_config(config, ob_shutdown_signal, ob_shutdown_task).await
 }
