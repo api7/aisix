@@ -114,9 +114,20 @@ impl<T: Resource> ResourceTable<T> {
 /// `SnapshotHandle<S>` is the type actually stored in axum state — consumers
 /// call [`SnapshotHandle::load`] on every request to get the current `Arc<S>`
 /// without any locking.
-#[derive(Debug, Clone)]
+///
+/// The manual `Clone` impl deliberately does *not* require `S: Clone` — the
+/// handle only clones its inner `Arc`, the `S` is never duplicated.
+#[derive(Debug)]
 pub struct SnapshotHandle<S> {
     inner: Arc<ArcSwap<S>>,
+}
+
+impl<S> Clone for SnapshotHandle<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 impl<S> SnapshotHandle<S> {
