@@ -16,9 +16,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aisix_admin::AdminState;
+use aisix_core::models::Provider;
 use aisix_core::Config;
 use aisix_etcd::{EtcdConfigProvider, Supervisor};
+use aisix_gateway::Hub;
 use aisix_obs::init_tracing;
+use aisix_provider_anthropic::AnthropicBridge;
+use aisix_provider_deepseek::deepseek_bridge;
+use aisix_provider_gemini::gemini_bridge;
+use aisix_provider_openai::OpenAiBridge;
 use aisix_proxy::ProxyState;
 use clap::Parser;
 use tokio::sync::watch;
@@ -60,9 +66,13 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let watch_task = tokio::spawn(supervisor.clone().run(cancel_rx.clone()));
 
-    // Steps 7-8: routers.
-    let proxy_router =
-        aisix_proxy::build_router(ProxyState::new(snapshot_handle.clone(), &cfg.proxy));
+    // Steps 7-8: build Hub, then routers.
+    let hub = Arc::new(build_hub());
+    let proxy_router = aisix_proxy::build_router(ProxyState::new(
+        snapshot_handle.clone(),
+        hub.clone(),
+        &cfg.proxy,
+    ));
     let admin_router =
         aisix_admin::build_router(AdminState::new(snapshot_handle.clone(), &cfg.admin));
 
@@ -92,6 +102,18 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let _ = watch_task.await;
     tracing::info!("aisix shut down cleanly");
     Ok(())
+}
+
+/// Register all four provider bridges on a fresh Hub. The Hub is
+/// created once at startup; future dynamic reload lands behind the
+/// same `register()` call.
+fn build_hub() -> Hub {
+    let hub = Hub::new();
+    hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+    hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
+    hub.register(Provider::Gemini, Arc::new(gemini_bridge()));
+    hub.register(Provider::Deepseek, Arc::new(deepseek_bridge()));
+    hub
 }
 
 /// Completes when the process receives SIGINT or SIGTERM (best-effort on

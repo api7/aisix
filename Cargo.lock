@@ -250,7 +250,9 @@ dependencies = [
  "aisix-gateway",
  "aisix-guardrails",
  "aisix-obs",
+ "aisix-provider-openai",
  "aisix-ratelimit",
+ "async-stream",
  "async-trait",
  "axum",
  "bytes",
@@ -267,6 +269,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -294,6 +297,10 @@ dependencies = [
  "aisix-etcd",
  "aisix-gateway",
  "aisix-obs",
+ "aisix-provider-anthropic",
+ "aisix-provider-deepseek",
+ "aisix-provider-gemini",
+ "aisix-provider-openai",
  "aisix-proxy",
  "anyhow",
  "axum",

@@ -19,6 +19,10 @@ aisix-gateway = { path = "../aisix-gateway" }
 aisix-obs = { path = "../aisix-obs" }
 aisix-proxy = { path = "../aisix-proxy" }
 aisix-admin = { path = "../aisix-admin" }
+aisix-provider-openai = { path = "../aisix-provider-openai" }
+aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
+aisix-provider-gemini = { path = "../aisix-provider-gemini" }
+aisix-provider-deepseek = { path = "../aisix-provider-deepseek" }
 tokio.workspace = true
 axum.workspace = true
 axum-server.workspace = true
