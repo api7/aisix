@@ -180,13 +180,18 @@ version = "0.1.0"
 dependencies = [
  "aisix-core",
  "aisix-gateway",
+ "async-stream",
  "async-trait",
  "base64",
+ "bytes",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

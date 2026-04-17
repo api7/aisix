@@ -18,3 +18,11 @@ async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 base64.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-stream = "0.3"
+bytes.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+wiremock.workspace = true
