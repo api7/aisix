@@ -18,6 +18,7 @@
 
 pub mod config;
 pub mod error;
+pub mod models;
 pub mod resource;
 pub mod snapshot;
 
@@ -27,6 +28,10 @@ pub use config::{
 };
 pub use error::{
     AdminError, AdminErrorEnvelope, BootstrapError, ProxyError, ProxyErrorEnvelope, RateLimitScope,
+};
+pub use models::{
+    validate_apikey, validate_model, AisixSnapshot, ApiKey, Model, Provider, ProviderConfig,
+    RateLimit, SchemaError,
 };
 pub use resource::{Resource, ResourceEntry};
 pub use snapshot::{ResourceTable, SnapshotHandle};

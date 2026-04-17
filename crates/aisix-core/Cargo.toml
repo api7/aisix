@@ -20,6 +20,9 @@ chrono.workspace = true
 tracing.workspace = true
 config.workspace = true
 humantime-serde.workspace = true
+jsonschema.workspace = true
+once_cell.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
