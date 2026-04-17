@@ -100,11 +100,11 @@ impl EtcdConfigProvider {
 
         // Enable TLS when any host uses the https:// scheme.
         //
-        // We use the openssl-tls backend (not rustls) because the control-plane
-        // etcd certificate may have a misconfigured SAN (e.g. only an empty DNS
-        // name instead of the server IP).  With OpenSSL we can skip hostname
-        // verification while still validating the certificate chain against the
-        // supplied CA, which is equivalent to `curl --cacert` without `-k`.
+        // Use the openssl-tls backend (not rustls) to support certificates with
+        // misconfigured SANs (e.g. an empty DNS name instead of the server IP).
+        // With OpenSSL we can skip hostname verification while still validating
+        // the certificate chain against the supplied CA, equivalent to
+        // `curl --cacert` without `-k`.
         let use_tls = config.host.iter().any(|h| h.starts_with("https://"));
         if use_tls {
             use openssl::ssl::SslVerifyMode;
@@ -166,9 +166,6 @@ impl EtcdConfigProvider {
         )
         .await?;
 
-        // Use a KV.Get as the connectivity probe instead of Maintenance.Status.
-        // The API7 dp-manager only implements KV/Watch/Lease; calling Status
-        // returns HTTP 404 which tonic misparses as a gRPC framing error.
         client.status().await.map(|_| Ok(client))?
     }
 

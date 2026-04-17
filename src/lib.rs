@@ -57,10 +57,8 @@ pub async fn run_with_config(
 
 /// Run the full aisix gateway with an already-constructed [`config::ConfigProvider`].
 ///
-/// This variant is intended for embedders (e.g. `aisix-ee`) that need to supply
-/// a custom config provider — for example, the HTTP REST provider that talks to
-/// the API7 control-plane etcd proxy instead of a native gRPC etcd.
-/// Observability must already be initialised by the caller.
+/// This variant is intended for embedders that need to supply a custom config
+/// provider.  Observability must already be initialised by the caller.
 pub async fn run_with_provider(
     config: Arc<config::Config>,
     config_provider: Arc<dyn config::ConfigProvider>,
