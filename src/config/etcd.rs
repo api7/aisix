@@ -20,6 +20,13 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Initial backoff delay.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct EtcdTlsConfig {
+    pub ca_pem: Option<String>,
+    pub cert_pem: Option<String>,
+    pub key_pem: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     pub host: Vec<String>,
@@ -27,6 +34,7 @@ pub struct Config {
     pub timeout: u32,
     pub user: Option<String>,
     pub password: Option<String>,
+    pub tls: Option<EtcdTlsConfig>,
 }
 
 impl Default for Config {
@@ -37,6 +45,7 @@ impl Default for Config {
             timeout: 5,
             user: None,
             password: None,
+            tls: None,
         }
     }
 }
@@ -87,6 +96,24 @@ impl EtcdConfigProvider {
 
         if let (Some(user), Some(password)) = (config.user.clone(), config.password.clone()) {
             opts = opts.with_user(user, password);
+        }
+
+        // Enable TLS when any host uses the https:// scheme.
+        let use_tls = config.host.iter().any(|h| h.starts_with("https://"));
+        if use_tls {
+            let mut tls = etcd_client::TlsOptions::new();
+
+            if let Some(tls_cfg) = &config.tls {
+                if let Some(ca_pem) = &tls_cfg.ca_pem {
+                    tls = tls.ca_certificate(etcd_client::Certificate::from_pem(ca_pem));
+                }
+
+                if let (Some(cert_pem), Some(key_pem)) = (&tls_cfg.cert_pem, &tls_cfg.key_pem) {
+                    tls = tls.identity(etcd_client::Identity::from_pem(cert_pem, key_pem));
+                }
+            }
+
+            opts = opts.with_tls(tls);
         }
 
         let mut client = etcd_client::Client::connect(
