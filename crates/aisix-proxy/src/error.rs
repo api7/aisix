@@ -18,7 +18,8 @@
 //! JSON shape boilerplate.
 
 use aisix_gateway::BridgeError;
-use axum::http::StatusCode;
+use aisix_ratelimit::RateLimitError;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
@@ -72,6 +73,8 @@ pub enum ProxyError {
     #[error("no bridge registered for provider")]
     ProviderUnavailable,
     #[error(transparent)]
+    RateLimit(#[from] RateLimitError),
+    #[error(transparent)]
     Bridge(#[from] BridgeError),
 }
 
@@ -83,6 +86,7 @@ impl ProxyError {
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ProxyError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::Bridge(b) => {
                 StatusCode::from_u16(b.http_status()).unwrap_or(StatusCode::BAD_GATEWAY)
             }
@@ -96,7 +100,18 @@ impl ProxyError {
             ProxyError::ModelNotFound(_) => "model_not_found",
             ProxyError::InvalidRequest(_) => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
+            ProxyError::RateLimit(_) => "rate_limit_exceeded",
             ProxyError::Bridge(b) => b.error_type(),
+        }
+    }
+
+    /// Seconds the client should wait before retrying. Only present for
+    /// rate-limit-style rejections so the proxy can emit a `Retry-After`
+    /// header.
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            ProxyError::RateLimit(e) => e.retry_after_secs(),
+            _ => None,
         }
     }
 
@@ -108,8 +123,15 @@ impl ProxyError {
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
         let status = self.status();
+        let retry_after = self.retry_after_secs();
         let body = self.envelope();
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if let Some(secs) = retry_after {
+            if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+                response.headers_mut().insert("retry-after", value);
+            }
+        }
+        response
     }
 }
 

@@ -105,8 +105,20 @@ mod tests {
     }
 
     fn apikey_entry(key: &str, allowed: &[&str]) -> ResourceEntry<ApiKey> {
+        apikey_entry_with_limits(key, allowed, None)
+    }
+
+    fn apikey_entry_with_limits(
+        key: &str,
+        allowed: &[&str],
+        rate_limit: Option<serde_json::Value>,
+    ) -> ResourceEntry<ApiKey> {
         let allowed_json = serde_json::to_string(&allowed).unwrap();
-        let cfg = format!(r#"{{"key": "{key}", "allowed_models": {allowed_json}}}"#);
+        let rl_tail = match rate_limit {
+            Some(v) => format!(", \"rate_limit\": {v}"),
+            None => String::new(),
+        };
+        let cfg = format!(r#"{{"key": "{key}", "allowed_models": {allowed_json}{rl_tail}}}"#);
         let apikey: ApiKey = serde_json::from_str(&cfg).unwrap();
         ResourceEntry::new("key-id-1", apikey, 1)
     }
@@ -115,6 +127,22 @@ mod tests {
         let snap = AisixSnapshot::new();
         snap.models.insert(model_entry(model, api_base));
         snap.apikeys.insert(apikey_entry("sk-caller", allowed));
+        snap
+    }
+
+    fn seed_snapshot_with_limits(
+        model: &str,
+        allowed: &[&str],
+        api_base: &str,
+        rate_limit: serde_json::Value,
+    ) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.models.insert(model_entry(model, api_base));
+        snap.apikeys.insert(apikey_entry_with_limits(
+            "sk-caller",
+            allowed,
+            Some(rate_limit),
+        ));
         snap
     }
 
@@ -378,5 +406,121 @@ data: [DONE]\n\n";
             data_count >= 2,
             "expected at least two chat chunks, got {data_count}"
         );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_rpm_returns_429_with_retry_after_header() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot_with_limits(
+            "my-gpt4",
+            &["my-gpt4"],
+            &upstream.uri(),
+            serde_json::json!({"rpm": 1}),
+        );
+        let state = build_state(snap, hub);
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // First request succeeds.
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Second request within the same minute trips rpm=1 → 429.
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .expect("missing or malformed retry-after header");
+        assert!(retry >= 1);
+        let body_bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(v["error"]["type"], "rate_limit_exceeded");
+    }
+
+    #[tokio::test]
+    async fn rate_limit_tpm_blocks_after_token_commit_exhausts_window() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hi"},
+                    "finish_reason": "stop"
+                }],
+                // Deliberately overshoot the TPM cap so the next
+                // pre_commit observes an exhausted window.
+                "usage": {"prompt_tokens": 10_000, "completion_tokens": 10_000, "total_tokens": 20_000}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot_with_limits(
+            "my-gpt4",
+            &["my-gpt4"],
+            &upstream.uri(),
+            serde_json::json!({"tpm": 1_000}),
+        );
+        let state = build_state(snap, hub);
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // First request goes through (pre-commit TPM is unchecked for an
+        // empty bucket); usage counted at post-deduct overshoots the cap.
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Second request sees TPM > 1000 and rejects.
+        let resp = run(build_router(state), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body_bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(v["error"]["type"], "rate_limit_exceeded");
     }
 }

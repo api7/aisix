@@ -60,6 +60,12 @@ pub async fn chat_completions(
         .get(provider)
         .ok_or(ProxyError::ProviderUnavailable)?;
 
+    // Rate-limit pre-commit. Key on ApiKey id so two different keys get
+    // independent buckets even if they alias the same upstream credential.
+    let rl_key = auth.entry.id.clone();
+    let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
+    let reservation = state.limiter.pre_commit(&rl_key, &rl_limits)?;
+
     let request_id = format!("req-{}", Uuid::new_v4());
     let model_arc = std::sync::Arc::new(model_entry.value.clone());
     let ctx = BridgeContext::new(&request_id, model_arc);
@@ -67,7 +73,12 @@ pub async fn chat_completions(
     let now = created_ts();
 
     if req.is_streaming() {
+        // Streaming: we can't measure tokens before the stream ends, so
+        // commit zero up front to keep the reservation's drop-guard from
+        // silently counting nothing. A later PR will tally tokens as the
+        // stream runs; for now release the permit when the handler returns.
         let upstream = bridge.chat_stream(&req, &ctx).await?;
+        reservation.commit_tokens(0);
         let model_name = req.model.clone();
         let sse_stream = build_sse_stream(upstream, model_name, now);
         let response =
@@ -76,6 +87,8 @@ pub async fn chat_completions(
     }
 
     let upstream = bridge.chat(&req, &ctx).await?;
+    let tokens = upstream.usage.total_tokens as u64;
+    reservation.commit_tokens(tokens);
     let rendered = render_response(now, upstream);
     Ok(Json(rendered).into_response())
 }
