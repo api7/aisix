@@ -1,0 +1,33 @@
+[package]
+name = "aisix-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix: /v1/* proxy router (OpenAI-compatible) + middleware + hooks"
+
+[dependencies]
+aisix-core = { path = "../aisix-core" }
+aisix-gateway = { path = "../aisix-gateway" }
+aisix-obs = { path = "../aisix-obs" }
+aisix-ratelimit = { path = "../aisix-ratelimit" }
+aisix-cache = { path = "../aisix-cache" }
+aisix-guardrails = { path = "../aisix-guardrails" }
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true

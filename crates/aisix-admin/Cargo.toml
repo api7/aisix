@@ -1,0 +1,29 @@
+[package]
+name = "aisix-admin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix: Admin API + Playground + embedded UI + OpenAPI"
+
+[dependencies]
+aisix-core = { path = "../aisix-core" }
+aisix-etcd = { path = "../aisix-etcd" }
+aisix-proxy = { path = "../aisix-proxy" }
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+utoipa.workspace = true
+utoipa-axum.workspace = true
+utoipa-scalar.workspace = true
+rust-embed.workspace = true
+mime_guess.workspace = true

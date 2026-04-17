@@ -1,0 +1,131 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aisix-core",
+    "crates/aisix-etcd",
+    "crates/aisix-gateway",
+    "crates/aisix-provider-openai",
+    "crates/aisix-provider-anthropic",
+    "crates/aisix-provider-gemini",
+    "crates/aisix-provider-deepseek",
+    "crates/aisix-proxy",
+    "crates/aisix-admin",
+    "crates/aisix-obs",
+    "crates/aisix-ratelimit",
+    "crates/aisix-cache",
+    "crates/aisix-guardrails",
+    "crates/aisix-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+license = "MIT"
+repository = "https://github.com/moonming/ai-gateway"
+authors = ["moonming"]
+
+[workspace.dependencies]
+# Runtime
+tokio = { version = "1.41", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
+futures = "0.3"
+futures-util = "0.3"
+async-trait = "0.1"
+
+# HTTP server
+axum = { version = "0.7", features = ["macros", "ws", "tracing"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "limit", "compression-gzip"] }
+hyper = "1.5"
+hyper-util = "0.1"
+http = "1.2"
+http-body-util = "0.1"
+mime = "0.3"
+mime_guess = "2.0"
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip"] }
+eventsource-stream = "0.2"
+
+# TLS
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+
+# Serialization / validation
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+jsonschema = "0.28"
+schemars = "0.8"
+
+# Concurrency primitives
+arc-swap = "1.7"
+dashmap = "6.1"
+once_cell = "1.20"
+parking_lot = "0.12"
+
+# etcd
+etcd-client = { version = "0.14", features = ["tls"] }
+
+# Config
+config = { version = "0.14", default-features = false, features = ["yaml", "toml", "json"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Time / IDs
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "registry"] }
+tracing-opentelemetry = "0.28"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "metrics", "trace"] }
+opentelemetry-semantic-conventions = "0.27"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# Errors / utilities
+anyhow = "1"
+thiserror = "1"
+bytes = "1"
+rand = "0.8"
+regex = "1"
+base64 = "0.22"
+
+# OpenAPI
+utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
+utoipa-axum = "0.1"
+utoipa-scalar = { version = "0.2", features = ["axum"] }
+
+# Static embed
+rust-embed = { version = "8", features = ["compression"] }
+
+# Caching / storage backends
+moka = { version = "0.12", features = ["future"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "cluster-async"] }
+
+# Tokenization / counting (optional hard-mode TPM)
+tiktoken-rs = "0.5"
+
+# Test-only
+wiremock = "0.6"
+rstest = "0.23"
+insta = { version = "1", features = ["json", "yaml"] }
+testcontainers = "0.23"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.coverage]
+inherits = "dev"
+opt-level = 0
+debug = 2
+incremental = false

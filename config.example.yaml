@@ -1,0 +1,63 @@
+# aisix — example configuration
+# Reference: ai-gateway spec §1–§2.
+
+etcd:
+  endpoints:
+    - "http://127.0.0.1:2379"
+  prefix: "/aisix"
+  # user: "aisix"
+  # password_env: "AISIX_ETCD_PASSWORD"
+  dial_timeout_ms: 5000
+  request_timeout_ms: 5000
+
+proxy:
+  addr: "0.0.0.0:3000"
+  request_body_limit_bytes: 10485760   # 10 MiB
+  # tls:
+  #   cert_file: "/etc/aisix/tls/proxy.crt"
+  #   key_file:  "/etc/aisix/tls/proxy.key"
+
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys:
+    # Provide via env to avoid committing secrets.
+    # - "${AISIX_ADMIN_KEY}"
+    - "admin-local-only-change-me"
+  # tls:
+  #   cert_file: "/etc/aisix/tls/admin.crt"
+  #   key_file:  "/etc/aisix/tls/admin.key"
+
+observability:
+  service_name: "aisix"
+  log_level: "info"
+  access_log: true
+  metrics:
+    prometheus:
+      enabled: true
+      path: "/metrics"
+    otlp:
+      enabled: false
+      endpoint: "http://127.0.0.1:4317"
+  tracing:
+    otlp:
+      enabled: false
+      endpoint: "http://127.0.0.1:4317"
+      sample_ratio: 1.0
+  langfuse:
+    enabled: false
+    # public_key_env: "LANGFUSE_PUBLIC_KEY"
+    # secret_key_env: "LANGFUSE_SECRET_KEY"
+    # host: "https://cloud.langfuse.com"
+
+cache:
+  backend: "memory"   # memory | redis | qdrant
+  # redis:
+  #   url: "redis://127.0.0.1:6379"
+  #   mode: "single"   # single | cluster | sentinel
+  # qdrant:
+  #   url: "http://127.0.0.1:6333"
+  #   collection: "aisix-semantic-cache"
+
+# Models, API keys, teams, budgets, credentials, guardrails, fallback policies
+# are NOT defined in this file. They are stored in etcd and managed via the
+# Admin API (see spec §10). This file only bootstraps the gateway.

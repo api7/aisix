@@ -1,0 +1,16 @@
+[package]
+name = "aisix-provider-gemini"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix: Google Gemini via OpenAI-compatible endpoint"
+
+[dependencies]
+aisix-core = { path = "../aisix-core" }
+aisix-gateway = { path = "../aisix-gateway" }
+aisix-provider-openai = { path = "../aisix-provider-openai" }
+async-trait.workspace = true
+tracing.workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "aisix-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix: core types (Config, ResourceEntry, Snapshot, errors)"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+arc-swap.workspace = true
+dashmap.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+rstest.workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "aisix-cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix: response cache (in-memory / Redis / semantic)"
+
+[dependencies]
+aisix-core = { path = "../aisix-core" }
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+moka.workspace = true
+redis = { workspace = true, optional = true }
+
+[features]
+default = ["memory"]
+memory = []
+redis = ["dep:redis"]

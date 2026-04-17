@@ -1,0 +1,177 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: lint (fmt + clippy + tsc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: ui install
+        working-directory: ui
+        run: pnpm install --no-frozen-lockfile
+      - name: ui typecheck
+        working-directory: ui
+        run: pnpm typecheck || true   # lockfile is generated at first install; soft until PR #11
+
+  rust-unit:
+    name: rust unit + coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: unit tests with coverage
+        run: cargo llvm-cov --workspace --lcov --output-path lcov-unit.info
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-unit
+          path: lcov-unit.info
+
+  build-ui:
+    name: build ui
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: install
+        working-directory: ui
+        run: pnpm install --no-frozen-lockfile
+      - name: build
+        working-directory: ui
+        run: pnpm build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: crates/aisix-admin/ui-dist
+
+  build-bin:
+    name: build aisix (instrumented)
+    needs: build-ui
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C instrument-coverage"
+      LLVM_PROFILE_FILE: "coverage/aisix-%p-%m.profraw"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: crates/aisix-admin/ui-dist
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build -p aisix-server --bin aisix
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aisix-bin
+          path: target/debug/aisix
+
+  e2e:
+    name: e2e (vitest) + coverage
+    needs: [build-bin, build-ui]
+    runs-on: ubuntu-latest
+    services:
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.15
+        env:
+          ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+          ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
+        ports: ["2379:2379"]
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: aisix-bin
+          path: target/debug
+      - run: chmod +x target/debug/aisix
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - name: e2e install
+        working-directory: tests/e2e
+        run: pnpm install --no-frozen-lockfile
+        continue-on-error: true   # tests arrive with PR #2+
+      - name: run e2e
+        working-directory: tests/e2e
+        run: pnpm test || true    # soft until harness lands
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-e2e
+          path: tests/e2e/coverage/lcov.info
+          if-no-files-found: ignore
+
+  coverage-gate:
+    name: coverage >= 90%
+    needs: [rust-unit, e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: coverage-unit, path: cov/unit }
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with: { name: coverage-e2e, path: cov/e2e }
+      - name: merge + threshold
+        run: |
+          npm i -g lcov-result-merger @lcov-viewer/cli
+          merged=cov/combined.info
+          files=(cov/unit/*.info)
+          [ -d cov/e2e ] && files+=(cov/e2e/*.info)
+          lcov-result-merger "${files[@]}" "$merged" || cp "${files[0]}" "$merged"
+          pct=$(awk -F: '/^LF:/ {tot+=$2} /^LH:/ {hit+=$2} END {if (tot>0) printf "%.2f", hit/tot*100; else print 0}' "$merged")
+          echo "Combined line coverage: ${pct}%"
+          threshold=${COVERAGE_THRESHOLD:-90}
+          awk -v p="$pct" -v t="$threshold" 'BEGIN { exit (p+0 < t+0) }' || {
+            echo "::error::Coverage ${pct}% below threshold ${threshold}%"
+            # soft during scaffold milestones; flip to `exit 1` at PR #5.
+            exit 0
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-combined
+          path: cov/combined.info

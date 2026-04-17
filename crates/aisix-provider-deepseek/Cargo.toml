@@ -1,0 +1,16 @@
+[package]
+name = "aisix-provider-deepseek"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix: DeepSeek (OpenAI-compatible, chat + streaming only)"
+
+[dependencies]
+aisix-core = { path = "../aisix-core" }
+aisix-gateway = { path = "../aisix-gateway" }
+aisix-provider-openai = { path = "../aisix-provider-openai" }
+async-trait.workspace = true
+tracing.workspace = true

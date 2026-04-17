@@ -1,0 +1,26 @@
+[package]
+name = "aisix-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix: Hub-and-Bridge gateway core (ChatFormat, BridgeContext, SSE parser)"
+
+[dependencies]
+aisix-core = { path = "../aisix-core" }
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+eventsource-stream.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+http.workspace = true

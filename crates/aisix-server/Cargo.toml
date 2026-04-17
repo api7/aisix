@@ -1,0 +1,38 @@
+[package]
+name = "aisix-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix — the single binary"
+
+[[bin]]
+name = "aisix"
+path = "src/main.rs"
+
+[dependencies]
+aisix-core = { path = "../aisix-core" }
+aisix-etcd = { path = "../aisix-etcd" }
+aisix-gateway = { path = "../aisix-gateway" }
+aisix-obs = { path = "../aisix-obs" }
+aisix-proxy = { path = "../aisix-proxy" }
+aisix-admin = { path = "../aisix-admin" }
+tokio.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+hyper.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+http.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+clap.workspace = true
+config.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
