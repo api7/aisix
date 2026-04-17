@@ -115,6 +115,9 @@ jobs:
     name: e2e (vitest) + coverage
     needs: [build-bin, build-ui]
     runs-on: ubuntu-latest
+    # Scaffold-phase soft gate: the harness lands with PR #2+.
+    # Flip `continue-on-error` to false at PR #5 per plan §5.2 ratchet.
+    continue-on-error: true
     services:
       etcd:
         image: quay.io/coreos/etcd:v3.5.15
@@ -138,13 +141,23 @@ jobs:
       - uses: pnpm/action-setup@v4
         with:
           version: 9
+      - name: check harness exists
+        id: harness
+        run: |
+          if [ -f tests/e2e/package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::tests/e2e harness not present yet — skipping"
+          fi
       - name: e2e install
+        if: steps.harness.outputs.present == 'true'
         working-directory: tests/e2e
         run: pnpm install --no-frozen-lockfile
-        continue-on-error: true   # tests arrive with PR #2+
       - name: run e2e
+        if: steps.harness.outputs.present == 'true'
         working-directory: tests/e2e
-        run: pnpm test || true    # soft until harness lands
+        run: pnpm test
       - uses: actions/upload-artifact@v4
         if: always()
         with:
