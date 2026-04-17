@@ -127,6 +127,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "dashmap",
  "eventsource-stream",
  "futures",
  "futures-util",

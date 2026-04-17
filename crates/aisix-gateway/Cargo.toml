@@ -24,3 +24,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 http.workspace = true
+dashmap.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

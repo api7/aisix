@@ -19,7 +19,7 @@ static MODEL_ID_RE: Lazy<Regex> =
 
 /// Supported provider prefixes. The `model` field must start with one of these
 /// followed by `/<upstream-model-id>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     Openai,
