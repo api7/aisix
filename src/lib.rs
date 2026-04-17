@@ -1,10 +1,10 @@
-mod admin;
-mod config;
-mod gateway;
-mod proxy;
-mod utils;
+pub mod admin;
+pub mod config;
+pub mod gateway;
+pub mod proxy;
+pub mod utils;
 
-use std::{process::exit, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use axum::Router;
@@ -12,32 +12,75 @@ use clap::Parser;
 use log::{error, info};
 use tokio::{select, sync::oneshot};
 
+/// Git hash of the aisix core at build time.
 pub const GIT_HASH: &str = env!("VERGEN_GIT_SHA");
 
 fn long_version() -> &'static str {
     concat!(env!("CARGO_PKG_VERSION"), " (", env!("VERGEN_GIT_SHA"), ")",)
 }
 
-/// Simple program to greet a person
+/// Command-line arguments for the aisix core binary.
 #[derive(Parser, Debug)]
 #[command(version = env!("CARGO_PKG_VERSION"), long_version = long_version())]
 pub struct Args {
     /// Path to the configuration file
     #[arg(short, long)]
-    config: Option<String>,
+    pub config: Option<String>,
 }
 
-pub async fn run() -> Result<()> {
-    let args = Args::parse();
-
+/// Run the full aisix gateway with the given config file path.
+///
+/// Initialises observability, loads config, starts proxy and admin servers,
+/// and blocks until a signal is received or a server error occurs.
+pub async fn run(config_file: Option<String>) -> Result<()> {
     let (ob_shutdown_signal, ob_shutdown_task) =
         init_observability().context("failed to initialize observability")?;
+    run_with_observability(config_file, ob_shutdown_signal, ob_shutdown_task).await
+}
 
-    let config = Arc::new(config::load(args.config).context("failed to load configuration")?);
+/// Run the full aisix gateway using already-initialised observability handles.
+///
+/// This variant is intended for embedders (e.g. `aisix-ee`) that call
+/// [`init_observability`] themselves before starting the gateway, so that
+/// logging is available for pre-gateway setup code without triggering a
+/// double-initialisation panic.
+pub async fn run_with_observability(
+    config_file: Option<String>,
+    ob_shutdown_signal: oneshot::Sender<()>,
+    ob_shutdown_task: tokio::task::JoinHandle<()>,
+) -> Result<()> {
+    let config = Arc::new(config::load(config_file).context("failed to load configuration")?);
+    run_with_config(config, ob_shutdown_signal, ob_shutdown_task).await
+}
 
+/// Run the full aisix gateway with a pre-built [`config::Config`].
+///
+/// This variant is intended for embedders that need to modify the configuration
+/// (e.g. override etcd hosts from environment variables) before starting the
+/// gateway.  Observability must already be initialised by the caller.
+pub async fn run_with_config(
+    config: Arc<config::Config>,
+    ob_shutdown_signal: oneshot::Sender<()>,
+    ob_shutdown_task: tokio::task::JoinHandle<()>,
+) -> Result<()> {
     let config_provider = config::create_provider(&config)
         .await
         .context("failed to create config provider")?;
+    run_with_provider(config, config_provider, ob_shutdown_signal, ob_shutdown_task).await
+}
+
+/// Run the full aisix gateway with an already-constructed [`config::ConfigProvider`].
+///
+/// This variant is intended for embedders (e.g. `aisix-ee`) that need to supply
+/// a custom config provider — for example, the HTTP REST provider that talks to
+/// the API7 control-plane etcd proxy instead of a native gRPC etcd.
+/// Observability must already be initialised by the caller.
+pub async fn run_with_provider(
+    config: Arc<config::Config>,
+    config_provider: Arc<dyn config::ConfigProvider>,
+    ob_shutdown_signal: oneshot::Sender<()>,
+    ob_shutdown_task: tokio::task::JoinHandle<()>,
+) -> Result<()> {
     let resources =
         Arc::new(config::entities::ResourceRegistry::new(config_provider.clone()).await);
 
@@ -85,10 +128,18 @@ pub async fn run() -> Result<()> {
         .await
         .context("failed to shutdown observability")?;
 
-    exit(if exception { 1 } else { 0 });
+    if exception {
+        Err(anyhow!("one or more servers exited with an error"))
+    } else {
+        Ok(())
+    }
 }
 
-fn init_observability() -> Result<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)> {
+/// Initialize observability (logging, tracing, metrics).
+///
+/// Returns `(shutdown_sender, shutdown_task_handle)`.
+/// Call `shutdown_sender.send(())` to flush and shut down observability.
+pub fn init_observability() -> Result<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)> {
     use std::{borrow::Cow, time::Duration};
 
     use fastrace::collector::Config;

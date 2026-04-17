@@ -33,7 +33,7 @@ axum = { version = "0.8.9", features = [
 ], default-features = false }
 serde = "1.0.228"
 serde_json = "1.0"
-etcd-client = "0.18.0"
+etcd-client = { version = "0.18.0", features = ["tls-openssl"] }
 async-trait = "0.1"
 futures = "0.3"
 bytes = "1.0"
@@ -80,6 +80,11 @@ axum-server = { version = "0.8.0", default-features = false, features = [
 backon = { version = "1.6.0", default-features = false, features = [
   "tokio-sleep",
 ] }
+base64 = "0.22"
+
+[build-dependencies]
+vergen-git2 = { version = "9.1.0" }
+anyhow = "1"
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -87,10 +92,6 @@ assert_matches = "1.5"
 pretty_assertions = "1.4"
 rstest = "0.26"
 tempfile = "3"
-
-[build-dependencies]
-anyhow = "1"
-vergen-git2 = { version = "9.1.0" }
 
 [patch.crates-io]
 opentelemetry = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "965078315b58ae14725721735f1c8e2bc2d3b445" }

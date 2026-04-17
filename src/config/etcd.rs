@@ -20,6 +20,13 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Initial backoff delay.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct EtcdTlsConfig {
+    pub ca_pem: Option<String>,
+    pub cert_pem: Option<String>,
+    pub key_pem: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     pub host: Vec<String>,
@@ -27,6 +34,7 @@ pub struct Config {
     pub timeout: u32,
     pub user: Option<String>,
     pub password: Option<String>,
+    pub tls: Option<EtcdTlsConfig>,
 }
 
 impl Default for Config {
@@ -37,6 +45,7 @@ impl Default for Config {
             timeout: 5,
             user: None,
             password: None,
+            tls: None,
         }
     }
 }
@@ -89,6 +98,64 @@ impl EtcdConfigProvider {
             opts = opts.with_user(user, password);
         }
 
+        // Enable TLS when any host uses the https:// scheme.
+        //
+        // We use the openssl-tls backend (not rustls) because the control-plane
+        // etcd certificate may have a misconfigured SAN (e.g. only an empty DNS
+        // name instead of the server IP).  With OpenSSL we can skip hostname
+        // verification while still validating the certificate chain against the
+        // supplied CA, which is equivalent to `curl --cacert` without `-k`.
+        let use_tls = config.host.iter().any(|h| h.starts_with("https://"));
+        if use_tls {
+            use openssl::ssl::SslVerifyMode;
+
+            let mut ssl_cfg = etcd_client::OpenSslClientConfig::default();
+
+            if let Some(tls_cfg) = &config.tls {
+                if let Some(ca_pem) = &tls_cfg.ca_pem {
+                    // ca_cert_pem() only loads the first certificate in a PEM
+                    // bundle.  Use stack_from_pem so that multi-cert bundles
+                    // (e.g. intermediate + root) are all added to the store.
+                    let ca_bytes = ca_pem.as_bytes().to_vec();
+                    ssl_cfg = ssl_cfg.manually(move |b| {
+                        for cert in openssl::x509::X509::stack_from_pem(&ca_bytes)? {
+                            b.cert_store_mut().add_cert(cert)?;
+                        }
+                        Ok(())
+                    });
+                }
+
+                if let (Some(cert_pem), Some(key_pem)) =
+                    (&tls_cfg.cert_pem, &tls_cfg.key_pem)
+                {
+                    ssl_cfg =
+                        ssl_cfg.client_cert_pem_and_key(cert_pem.as_bytes(), key_pem.as_bytes());
+                }
+            }
+
+            // Skip hostname/IP verification: the CP certificate SAN may not match
+            // the endpoint IP/hostname.  We still validate the certificate chain
+            // (preverify_ok covers chain errors).  Error code 64 is
+            // X509_V_ERR_IP_ADDRESS_MISMATCH; we allow it explicitly so that
+            // IP-addressed endpoints with a non-matching SAN still connect.
+            ssl_cfg = ssl_cfg.manually(|b| {
+                b.set_verify_callback(SslVerifyMode::PEER, |preverify_ok, ctx| {
+                    if preverify_ok {
+                        return true;
+                    }
+                    // Allow IP address mismatch and hostname mismatch errors.
+                    matches!(
+                        ctx.error().as_raw(),
+                        64 // X509_V_ERR_IP_ADDRESS_MISMATCH
+                        | 62 // X509_V_ERR_HOSTNAME_MISMATCH
+                    )
+                });
+                Ok(())
+            });
+
+            opts = opts.with_openssl_tls(ssl_cfg);
+        }
+
         let mut client = etcd_client::Client::connect(
             config
                 .host
@@ -99,7 +166,10 @@ impl EtcdConfigProvider {
         )
         .await?;
 
-        client.status().await.map(|_| Ok(client))?
+        // Use a KV.Get as the connectivity probe instead of Maintenance.Status.
+        // The API7 dp-manager only implements KV/Watch/Lease; calling Status
+        // returns HTTP 404 which tonic misparses as a gRPC framing error.
+        client.get("__probe__", None).await.map(|_| Ok(client))?
     }
 
     /// Spawn the long-running supervisor task that manages the watch stream
