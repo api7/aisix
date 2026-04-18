@@ -1,0 +1,1 @@
+Reserved for the Vite-built admin UI. Populated by `pnpm --filter aisix-ui build` (or the CI build-ui job) and embedded into the binary at compile time via rust-embed (see crates/aisix-admin/src/embedded_ui.rs).

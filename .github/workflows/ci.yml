@@ -76,6 +76,9 @@ jobs:
       - name: install
         working-directory: ui
         run: pnpm install --no-frozen-lockfile
+      - name: ui unit tests
+        working-directory: ui
+        run: pnpm test
       - name: build
         working-directory: ui
         run: pnpm build

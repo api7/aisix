@@ -1,21 +1,65 @@
-// aisix — Admin UI entrypoint. Scaffold for PR #1.
-// Real layout, routing, theme, i18n arrive in PR #11 (see plan §4.11).
+import { useState } from "react";
+import { ApiKeysView } from "./components/ApiKeysView";
+import { ConnectionForm } from "./components/ConnectionForm";
+import { ModelsView } from "./components/ModelsView";
+import { isConfigured, loadConnection } from "./storage";
+
+type Tab = "models" | "apikeys" | "connection";
 
 export default function App() {
+  const [connection, setConnection] = useState(loadConnection());
+  const [tab, setTab] = useState<Tab>(
+    isConfigured(loadConnection()) ? "models" : "connection",
+  );
+
   return (
-    <main className="min-h-dvh flex items-center justify-center bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
-      <section className="max-w-xl px-8 py-12">
-        <h1 className="text-5xl font-semibold tracking-tight">aisix</h1>
-        <p className="mt-4 text-lg text-zinc-600 dark:text-zinc-400">
-          AI Gateway scaffold. Admin console is arriving in PR #11 — models, API
-          keys, playground, observability, and the full bento dashboard.
-        </p>
-        <pre className="mt-8 rounded-md bg-zinc-900 text-zinc-100 px-4 py-3 text-xs overflow-x-auto">
-{`GET  /aisix/admin/health
-POST /aisix/admin/models
-POST /playground/chat/completions`}
-        </pre>
-      </section>
-    </main>
+    <div className="min-h-dvh bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
+      <header className="border-b border-zinc-200 bg-white px-6 py-4 dark:border-zinc-800 dark:bg-zinc-900">
+        <div className="mx-auto flex max-w-5xl items-center justify-between">
+          <h1 className="text-xl font-semibold tracking-tight">aisix admin</h1>
+          <nav className="flex gap-2">
+            <NavButton label="Models" active={tab === "models"} onClick={() => setTab("models")} />
+            <NavButton label="API keys" active={tab === "apikeys"} onClick={() => setTab("apikeys")} />
+            <NavButton label="Connection" active={tab === "connection"} onClick={() => setTab("connection")} />
+          </nav>
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-5xl px-6 py-8">
+        {tab === "connection" && (
+          <ConnectionForm
+            initial={connection}
+            onSaved={(c) => {
+              setConnection(c);
+              setTab("models");
+            }}
+          />
+        )}
+        {tab === "models" && <ModelsView connection={connection} />}
+        {tab === "apikeys" && <ApiKeysView connection={connection} />}
+      </main>
+    </div>
+  );
+}
+
+interface NavButtonProps {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}
+
+function NavButton({ label, active, onClick }: NavButtonProps) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={
+        active
+          ? "rounded-md bg-zinc-900 px-3 py-1.5 text-sm font-medium text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900"
+          : "rounded-md px-3 py-1.5 text-sm font-medium hover:bg-zinc-100 dark:hover:bg-zinc-800"
+      }
+    >
+      {label}
+    </button>
   );
 }
