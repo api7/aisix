@@ -87,7 +87,16 @@ mod tests {
         }
     }
 
+    /// State used by the *existing* tests — cache disabled so the
+    /// rate-limit / wiremock cases still see every request reach the
+    /// upstream. Cache-specific tests build state with the default
+    /// constructor (which keeps caching on) instead.
     fn build_state(snapshot: AisixSnapshot, hub: Arc<Hub>) -> ProxyState {
+        let handle = SnapshotHandle::new(snapshot);
+        ProxyState::new(handle, hub, &cfg()).without_cache()
+    }
+
+    fn build_state_with_cache(snapshot: AisixSnapshot, hub: Arc<Hub>) -> ProxyState {
         let handle = SnapshotHandle::new(snapshot);
         ProxyState::new(handle, hub, &cfg())
     }
@@ -628,5 +637,125 @@ data: [DONE]\n\n";
         let rendered = metrics.render();
         assert!(rendered.contains("aisix_ratelimit_rejections_total"));
         assert!(rendered.contains("scope=\"requests\""));
+    }
+
+    #[tokio::test]
+    async fn cache_hit_short_circuits_upstream_and_sets_header() {
+        // Wiremock that *only* satisfies one upstream call. If the cache
+        // ever lets a second request through, the test fails with a 500.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "cached"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1) // hard expectation: exactly one upstream hit
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        // Cache enabled — uses the default constructor.
+        let state = build_state_with_cache(snap, hub);
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // First request — miss.
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-aisix-cache")
+                .and_then(|v| v.to_str().ok()),
+            Some("miss"),
+        );
+
+        // Second identical request — hit.
+        let resp = run(build_router(state), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-aisix-cache")
+                .and_then(|v| v.to_str().ok()),
+            Some("hit"),
+        );
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "cached");
+    }
+
+    #[tokio::test]
+    async fn cache_miss_when_request_payload_differs() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            // Two distinct payloads → expect exactly two upstream calls.
+            .expect(2)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state_with_cache(snap, hub);
+
+        let body_a = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "first"}]
+        });
+        let body_b = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "second"}]
+        });
+        let mk = |body: &serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let r1 = run(build_router(state.clone()), mk(&body_a)).await;
+        let r2 = run(build_router(state), mk(&body_b)).await;
+        for r in [r1, r2] {
+            assert_eq!(r.status(), StatusCode::OK);
+            assert_eq!(
+                r.headers()
+                    .get("x-aisix-cache")
+                    .and_then(|v| v.to_str().ok()),
+                Some("miss"),
+            );
+        }
     }
 }

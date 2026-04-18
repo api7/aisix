@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore};
+use aisix_cache::{Cache, MemoryCache};
 use aisix_core::models::Provider;
 use aisix_core::Config;
 use aisix_etcd::{EtcdConfigProvider, Supervisor};
@@ -80,12 +81,16 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let hub = Arc::new(build_hub());
     let limiter = Arc::new(Limiter::new());
     let metrics = Arc::new(Metrics::new(true));
+    // In-memory cache by default. Redis/semantic backends drop in here
+    // behind the same trait object once their PRs land.
+    let cache: Option<Arc<dyn Cache>> = Some(Arc::new(MemoryCache::with_defaults()));
 
     let proxy_router = aisix_proxy::build_router(ProxyState::with_components(
         snapshot_handle.clone(),
         hub.clone(),
         limiter.clone(),
         metrics.clone(),
+        cache.clone(),
         &cfg.proxy,
     ));
 

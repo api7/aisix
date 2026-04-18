@@ -6,10 +6,15 @@
 //! - the `Hub` for resolving a `Provider` to the Bridge that serves it
 //! - the per-key [`Limiter`] — queried before each upstream call and
 //!   finalised after the response completes
+//! - an `Arc<Metrics>` shared with the admin `/metrics` endpoint
+//! - an `Arc<dyn Cache>` consulted before bridge dispatch (None disables
+//!   caching for that ProxyState; tests use this to keep the cache off
+//!   the hot path when they don't care about it)
 //! - the configured request-body size limit
 //!
 //! Cheap to clone: every field is either an `Arc` or a small Copy scalar.
 
+use aisix_cache::{Cache, MemoryCache};
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ProxyConfig};
 use aisix_gateway::Hub;
@@ -23,6 +28,7 @@ pub struct ProxyState {
     pub hub: Arc<Hub>,
     pub limiter: Arc<Limiter>,
     pub metrics: Arc<Metrics>,
+    pub cache: Option<Arc<dyn Cache>>,
     pub request_body_limit_bytes: usize,
 }
 
@@ -33,6 +39,7 @@ impl ProxyState {
             hub,
             limiter: Arc::new(Limiter::new()),
             metrics: Arc::new(Metrics::new(false)),
+            cache: Some(Arc::new(MemoryCache::with_defaults())),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }
@@ -50,17 +57,20 @@ impl ProxyState {
             hub,
             limiter,
             metrics: Arc::new(Metrics::new(false)),
+            cache: Some(Arc::new(MemoryCache::with_defaults())),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }
 
     /// Full constructor used by the server bootstrap — lets the same
-    /// Metrics handle be shared with the admin `/metrics` endpoint.
+    /// Metrics handle be shared with the admin `/metrics` endpoint and
+    /// lets the caller supply a configured Cache backend.
     pub fn with_components(
         snapshot: SnapshotHandle<AisixSnapshot>,
         hub: Arc<Hub>,
         limiter: Arc<Limiter>,
         metrics: Arc<Metrics>,
+        cache: Option<Arc<dyn Cache>>,
         cfg: &ProxyConfig,
     ) -> Self {
         Self {
@@ -68,7 +78,15 @@ impl ProxyState {
             hub,
             limiter,
             metrics,
+            cache,
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
+    }
+
+    /// Disable caching on an existing state. Used by tests that need
+    /// every request to reach wiremock.
+    pub fn without_cache(mut self) -> Self {
+        self.cache = None;
+        self
     }
 }
