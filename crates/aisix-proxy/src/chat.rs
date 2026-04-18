@@ -16,9 +16,11 @@
 //!    line. Errors surface via [`ProxyError`] which carries the right
 //!    status, error type, and (for rate-limits) Retry-After.
 
+use aisix_cache::CacheKey;
 use aisix_gateway::{BridgeContext, ChatFormat};
 use aisix_obs::{AccessLog, Metrics, RequestOutcome};
 use axum::extract::State;
+use axum::http::HeaderValue;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -32,6 +34,10 @@ use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
 use crate::render::{render_chunk, render_response};
 use crate::state::ProxyState;
+
+/// Header set on every non-streaming response indicating whether the
+/// response came from the cache (`hit`) or the upstream (`miss`).
+pub const CACHE_HEADER: &str = "x-aisix-cache";
 
 pub async fn chat_completions(
     State(state): State<ProxyState>,
@@ -163,15 +169,64 @@ async fn dispatch(
         });
     }
 
+    // Cache lookup runs before the upstream call. Streaming requests
+    // never hit this branch — `req.is_streaming()` short-circuits above.
+    let cache_key = state
+        .cache
+        .as_ref()
+        .map(|_| CacheKey::from_request(req).fingerprint());
+
+    if let (Some(cache), Some(key)) = (state.cache.as_ref(), cache_key.as_ref()) {
+        match cache.get(key).await {
+            Ok(Some(cached)) => {
+                // Release the reservation we took up front — the cached
+                // request shouldn't count against TPM.
+                reservation.commit_tokens(0);
+                let prompt = cached.usage.prompt_tokens as u64;
+                let completion = cached.usage.completion_tokens as u64;
+                let total = cached.usage.total_tokens as u64;
+                let mut response = Json(render_response(now, cached)).into_response();
+                response
+                    .headers_mut()
+                    .insert(CACHE_HEADER, HeaderValue::from_static("hit"));
+                return Ok(Success {
+                    response,
+                    provider: provider_name,
+                    prompt_tokens: Some(prompt),
+                    completion_tokens: Some(completion),
+                    total_tokens: Some(total),
+                });
+            }
+            Ok(None) => {} // miss → fall through to upstream call
+            Err(err) => {
+                // Cache failures are non-fatal — the upstream call still
+                // runs. Just log and move on.
+                tracing::warn!(error = %err, key = %key, "cache lookup failed");
+            }
+        }
+    }
+
     let upstream = bridge.chat(req, &ctx).await?;
     let prompt = upstream.usage.prompt_tokens as u64;
     let completion = upstream.usage.completion_tokens as u64;
     let total = upstream.usage.total_tokens as u64;
     reservation.commit_tokens(total);
-    let rendered = render_response(now, upstream);
+
+    if let (Some(cache), Some(key)) = (state.cache.as_ref(), cache_key.as_ref()) {
+        if let Err(err) = cache.put(key, upstream.clone()).await {
+            tracing::warn!(error = %err, key = %key, "cache write failed");
+        }
+    }
+
+    let mut response = Json(render_response(now, upstream)).into_response();
+    if cache_key.is_some() {
+        response
+            .headers_mut()
+            .insert(CACHE_HEADER, HeaderValue::from_static("miss"));
+    }
 
     Ok(Success {
-        response: Json(rendered).into_response(),
+        response,
         provider: provider_name,
         prompt_tokens: Some(prompt),
         completion_tokens: Some(completion),
