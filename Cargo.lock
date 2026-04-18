@@ -152,6 +152,7 @@ name = "aisix-guardrails"
 version = "0.1.0"
 dependencies = [
  "aisix-core",
+ "aisix-gateway",
  "async-trait",
  "regex",
  "serde",

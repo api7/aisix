@@ -944,4 +944,100 @@ data: [DONE]\n\n";
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn input_guardrail_block_returns_422_and_skips_upstream() {
+        use aisix_guardrails::{GuardrailChain, KeywordBlocklist, KeywordRule};
+
+        // wiremock that fails the test if it's hit at all.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0) // hard expectation — guardrail must short-circuit
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+
+        let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(KeywordBlocklist::new(
+            vec![KeywordRule::literal("forbidden-token")],
+        ))]));
+        let state = build_state(snap, hub).with_guardrails(guardrails);
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "say the forbidden-token please"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("forbidden-token"));
+    }
+
+    #[tokio::test]
+    async fn output_guardrail_block_returns_422_after_upstream_runs() {
+        use aisix_guardrails::{GuardrailChain, KeywordBlocklist, KeywordRule};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "here is your secret-string"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1) // upstream IS called; guardrail blocks the response
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+
+        let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(
+            KeywordBlocklist::output_only(vec![KeywordRule::literal("secret-string")]),
+        )]));
+        let state = build_state(snap, hub).with_guardrails(guardrails);
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "anything"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+    }
 }

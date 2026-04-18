@@ -18,6 +18,7 @@
 
 use aisix_cache::CacheKey;
 use aisix_gateway::{BridgeContext, BridgeError, ChatFormat};
+use aisix_guardrails::GuardrailVerdict;
 use aisix_obs::{AccessLog, Metrics, RequestOutcome};
 use axum::extract::State;
 use axum::http::HeaderValue;
@@ -134,6 +135,13 @@ async fn dispatch(
 
     if !auth.key().can_access(&req.model) {
         return Err(ProxyError::ModelForbidden(req.model.clone()));
+    }
+
+    // Input guardrails. Run before reservation so a blocked prompt
+    // doesn't burn an RPM slot — content-policy refusals shouldn't
+    // count against quota.
+    if let GuardrailVerdict::Block { reason } = state.guardrails.check_input(req).await {
+        return Err(ProxyError::ContentFiltered(reason));
     }
 
     // Resolve the attempt-list of underlying Model entries. For a
@@ -301,10 +309,17 @@ async fn dispatch(
     };
     let provider_name = chosen_provider.unwrap_or_else(|| "unknown".into());
 
+    // Output guardrail. Tokens still count against quota — the upstream
+    // already burned them — so commit before the check, and refuse the
+    // refusal-write to the cache so a re-request gets a fresh chance.
     let prompt = upstream.usage.prompt_tokens as u64;
     let completion = upstream.usage.completion_tokens as u64;
     let total = upstream.usage.total_tokens as u64;
     reservation.commit_tokens(total);
+
+    if let GuardrailVerdict::Block { reason } = state.guardrails.check_output(&upstream).await {
+        return Err(ProxyError::ContentFiltered(reason));
+    }
 
     if let (Some(cache), Some(key)) = (state.cache.as_ref(), cache_key.as_ref()) {
         if let Err(err) = cache.put(key, upstream.clone()).await {

@@ -72,6 +72,8 @@ pub enum ProxyError {
     InvalidRequest(String),
     #[error("no bridge registered for provider")]
     ProviderUnavailable,
+    #[error("content blocked by policy: {0}")]
+    ContentFiltered(String),
     #[error(transparent)]
     RateLimit(#[from] RateLimitError),
     #[error(transparent)]
@@ -86,6 +88,7 @@ impl ProxyError {
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ProxyError::ContentFiltered(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ProxyError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::Bridge(b) => {
                 StatusCode::from_u16(b.http_status()).unwrap_or(StatusCode::BAD_GATEWAY)
@@ -100,6 +103,7 @@ impl ProxyError {
             ProxyError::ModelNotFound(_) => "model_not_found",
             ProxyError::InvalidRequest(_) => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
+            ProxyError::ContentFiltered(_) => "content_filter",
             ProxyError::RateLimit(_) => "rate_limit_exceeded",
             ProxyError::Bridge(b) => b.error_type(),
         }

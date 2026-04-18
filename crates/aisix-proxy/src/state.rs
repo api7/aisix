@@ -18,6 +18,7 @@ use aisix_cache::{Cache, MemoryCache};
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ProxyConfig};
 use aisix_gateway::Hub;
+use aisix_guardrails::{Guardrail, GuardrailChain};
 use aisix_obs::Metrics;
 use aisix_ratelimit::Limiter;
 use std::sync::Arc;
@@ -32,6 +33,9 @@ pub struct ProxyState {
     pub metrics: Arc<Metrics>,
     pub cache: Option<Arc<dyn Cache>>,
     pub routing: Arc<RoutingRegistry>,
+    /// Content-policy hooks. Default is an empty chain (no-op); the
+    /// server bootstrap loads a real chain from config.
+    pub guardrails: Arc<dyn Guardrail>,
     pub request_body_limit_bytes: usize,
 }
 
@@ -44,6 +48,7 @@ impl ProxyState {
             metrics: Arc::new(Metrics::new(false)),
             cache: Some(Arc::new(MemoryCache::with_defaults())),
             routing: Arc::new(RoutingRegistry::new()),
+            guardrails: Arc::new(GuardrailChain::empty()),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }
@@ -63,6 +68,7 @@ impl ProxyState {
             metrics: Arc::new(Metrics::new(false)),
             cache: Some(Arc::new(MemoryCache::with_defaults())),
             routing: Arc::new(RoutingRegistry::new()),
+            guardrails: Arc::new(GuardrailChain::empty()),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }
@@ -85,6 +91,7 @@ impl ProxyState {
             metrics,
             cache,
             routing: Arc::new(RoutingRegistry::new()),
+            guardrails: Arc::new(GuardrailChain::empty()),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }
@@ -93,6 +100,13 @@ impl ProxyState {
     /// every request to reach wiremock.
     pub fn without_cache(mut self) -> Self {
         self.cache = None;
+        self
+    }
+
+    /// Replace the guardrail chain. Used by both the server bootstrap
+    /// and tests that want a deterministic policy.
+    pub fn with_guardrails(mut self, guardrails: Arc<dyn Guardrail>) -> Self {
+        self.guardrails = guardrails;
         self
     }
 }
