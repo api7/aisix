@@ -20,12 +20,13 @@ use aisix_core::models::Provider;
 use aisix_core::Config;
 use aisix_etcd::{EtcdConfigProvider, Supervisor};
 use aisix_gateway::Hub;
-use aisix_obs::init_tracing;
+use aisix_obs::{init_tracing, install_otlp_tracer, Metrics};
 use aisix_provider_anthropic::AnthropicBridge;
 use aisix_provider_deepseek::deepseek_bridge;
 use aisix_provider_gemini::gemini_bridge;
 use aisix_provider_openai::OpenAiBridge;
 use aisix_proxy::ProxyState;
+use aisix_ratelimit::Limiter;
 use clap::Parser;
 use tokio::sync::watch;
 
@@ -45,8 +46,10 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::load_from_path(Some(&cli.config))
         .map_err(|e| anyhow::anyhow!("config load failed: {e}"))?;
 
-    // Step 3: tracing.
+    // Step 3: tracing + optional OTLP export.
     init_tracing(&cfg.observability).map_err(|e| anyhow::anyhow!("tracing init failed: {e}"))?;
+    let _otlp = install_otlp_tracer(&cfg.observability)
+        .map_err(|e| anyhow::anyhow!("otlp init failed: {e}"))?;
 
     run(cfg).await
 }
@@ -73,23 +76,29 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let watch_task = tokio::spawn(supervisor.clone().run(cancel_rx.clone()));
 
-    // Steps 7-8: build Hub, then routers.
+    // Steps 7-8: build Hub, shared components, then routers.
     let hub = Arc::new(build_hub());
-    let proxy_router = aisix_proxy::build_router(ProxyState::new(
+    let limiter = Arc::new(Limiter::new());
+    let metrics = Arc::new(Metrics::new(true));
+
+    let proxy_router = aisix_proxy::build_router(ProxyState::with_components(
         snapshot_handle.clone(),
         hub.clone(),
+        limiter.clone(),
+        metrics.clone(),
         &cfg.proxy,
     ));
+
     // Admin CRUD writes through etcd. The watch supervisor's read path
     // is on a separate client (see above) so a long range scan during a
-    // list doesn't stall the watch stream.
+    // list doesn't stall the watch stream. The admin listener also owns
+    // the `/metrics` endpoint — sharing the same `Metrics` handle means
+    // a scrape reflects counters written by the proxy surface.
     let admin_store: Arc<dyn ConfigStore> =
         Arc::new(EtcdConfigStore::new(admin_client, cfg.etcd.prefix.clone()));
-    let admin_router = aisix_admin::build_router(AdminState::new(
-        snapshot_handle.clone(),
-        admin_store,
-        &cfg.admin,
-    ));
+    let admin_state = AdminState::new(snapshot_handle.clone(), admin_store, &cfg.admin)
+        .with_metrics(metrics.clone());
+    let admin_router = aisix_admin::build_router(admin_state);
 
     // Step 9: bind + serve.
     let proxy_addr: std::net::SocketAddr = cfg.proxy.addr.parse()?;

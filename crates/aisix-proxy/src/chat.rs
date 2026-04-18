@@ -9,20 +9,23 @@
 //! 4. Check the ApiKey's `allowed_models` whitelist → 403 if disallowed.
 //! 5. Look up the matching `Bridge` on the Hub by `Model::provider()` →
 //!    503 if no bridge registered.
-//! 6. Build a [`BridgeContext`] and dispatch:
+//! 6. Rate-limit pre-commit; build [`BridgeContext`] and dispatch:
 //!    - `stream == true`  → `chat_stream` + Sse response
 //!    - otherwise          → `chat` + JSON response rendered as OpenAI
-//! 7. Any `BridgeError` surfaces through [`ProxyError::Bridge`] which
-//!    supplies the right HTTP status and OpenAI-style error type.
+//! 7. On completion: record metrics + emit one structured access log
+//!    line. Errors surface via [`ProxyError`] which carries the right
+//!    status, error type, and (for rate-limits) Retry-After.
 
 use aisix_gateway::{BridgeContext, ChatFormat};
+use aisix_obs::{AccessLog, Metrics, RequestOutcome};
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::{Stream, StreamExt};
 use std::convert::Infallible;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::auth::AuthenticatedKey;
@@ -34,7 +37,82 @@ pub async fn chat_completions(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
     Json(req): Json<ChatFormat>,
-) -> Result<Response, ProxyError> {
+) -> Response {
+    let started = Instant::now();
+    let method = "POST";
+    let path = "/v1/chat/completions";
+    let request_id = format!("req-{}", Uuid::new_v4());
+    let api_key_id = auth.entry.id.clone();
+    let model_name = req.model.clone();
+
+    let outcome = dispatch(&state, &auth, &req, &request_id).await;
+
+    match outcome {
+        Ok(success) => {
+            let status = 200;
+            let elapsed = started.elapsed();
+            record_success(
+                &state.metrics,
+                &success.provider,
+                &model_name,
+                status,
+                &success,
+                elapsed,
+            );
+            emit_access_log(
+                method,
+                path,
+                status,
+                elapsed,
+                Some(success.provider.as_str()),
+                Some(&model_name),
+                Some(&api_key_id),
+                success.prompt_tokens,
+                success.completion_tokens,
+                success.total_tokens,
+                &request_id,
+            );
+            success.response
+        }
+        Err(err) => {
+            let status = err.status().as_u16();
+            let elapsed = started.elapsed();
+            record_error(&state.metrics, &err, &model_name, status, elapsed);
+            emit_access_log(
+                method,
+                path,
+                status,
+                elapsed,
+                None,
+                Some(&model_name),
+                Some(&api_key_id),
+                None,
+                None,
+                None,
+                &request_id,
+            );
+            err.into_response()
+        }
+    }
+}
+
+/// Everything needed to populate post-call telemetry for a successful
+/// request. For streaming we don't yet have token totals, so those are
+/// `None` and `total_tokens` stays at 0.
+struct Success {
+    response: Response,
+    provider: String,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+}
+
+async fn dispatch(
+    state: &ProxyState,
+    auth: &AuthenticatedKey,
+    req: &ChatFormat,
+    request_id: &str,
+) -> Result<Success, ProxyError> {
     if req.messages.is_empty() {
         return Err(ProxyError::InvalidRequest(
             "messages array must not be empty".into(),
@@ -60,37 +138,99 @@ pub async fn chat_completions(
         .get(provider)
         .ok_or(ProxyError::ProviderUnavailable)?;
 
-    // Rate-limit pre-commit. Key on ApiKey id so two different keys get
-    // independent buckets even if they alias the same upstream credential.
     let rl_key = auth.entry.id.clone();
     let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
     let reservation = state.limiter.pre_commit(&rl_key, &rl_limits)?;
 
-    let request_id = format!("req-{}", Uuid::new_v4());
-    let model_arc = std::sync::Arc::new(model_entry.value.clone());
-    let ctx = BridgeContext::new(&request_id, model_arc);
+    let model_arc = Arc::new(model_entry.value.clone());
+    let ctx = BridgeContext::new(request_id, model_arc);
+    let provider_name = format!("{provider:?}").to_lowercase();
 
     let now = created_ts();
 
     if req.is_streaming() {
-        // Streaming: we can't measure tokens before the stream ends, so
-        // commit zero up front to keep the reservation's drop-guard from
-        // silently counting nothing. A later PR will tally tokens as the
-        // stream runs; for now release the permit when the handler returns.
-        let upstream = bridge.chat_stream(&req, &ctx).await?;
+        let upstream = bridge.chat_stream(req, &ctx).await?;
         reservation.commit_tokens(0);
-        let model_name = req.model.clone();
-        let sse_stream = build_sse_stream(upstream, model_name, now);
+        let sse_stream = build_sse_stream(upstream, now);
         let response =
             Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
-        return Ok(response.into_response());
+        return Ok(Success {
+            response: response.into_response(),
+            provider: provider_name,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+        });
     }
 
-    let upstream = bridge.chat(&req, &ctx).await?;
-    let tokens = upstream.usage.total_tokens as u64;
-    reservation.commit_tokens(tokens);
+    let upstream = bridge.chat(req, &ctx).await?;
+    let prompt = upstream.usage.prompt_tokens as u64;
+    let completion = upstream.usage.completion_tokens as u64;
+    let total = upstream.usage.total_tokens as u64;
+    reservation.commit_tokens(total);
     let rendered = render_response(now, upstream);
-    Ok(Json(rendered).into_response())
+
+    Ok(Success {
+        response: Json(rendered).into_response(),
+        provider: provider_name,
+        prompt_tokens: Some(prompt),
+        completion_tokens: Some(completion),
+        total_tokens: Some(total),
+    })
+}
+
+fn record_success(
+    metrics: &Metrics,
+    provider: &str,
+    model: &str,
+    status: u16,
+    s: &Success,
+    elapsed: Duration,
+) {
+    let outcome = RequestOutcome::from_status(status);
+    metrics.record_request(provider, model, status, outcome, elapsed);
+    if let Some(total) = s.total_tokens {
+        metrics.record_tokens(provider, model, total);
+    }
+}
+
+fn record_error(metrics: &Metrics, err: &ProxyError, model: &str, status: u16, elapsed: Duration) {
+    let outcome = RequestOutcome::from_status(status);
+    // Provider is unknown for pre-dispatch errors (auth, 404, etc.).
+    metrics.record_request("unknown", model, status, outcome, elapsed);
+    if let ProxyError::RateLimit(rl) = err {
+        metrics.record_ratelimit_rejection(&rl.scope().to_string());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_access_log(
+    method: &str,
+    path: &str,
+    status: u16,
+    latency: Duration,
+    provider: Option<&str>,
+    model: Option<&str>,
+    api_key_id: Option<&str>,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    request_id: &str,
+) {
+    AccessLog {
+        method,
+        path,
+        status,
+        latency,
+        provider,
+        model,
+        api_key_id,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        request_id,
+    }
+    .emit();
 }
 
 fn created_ts() -> i64 {
@@ -102,7 +242,6 @@ fn created_ts() -> i64 {
 
 fn build_sse_stream(
     upstream: aisix_gateway::ChatChunkStream,
-    _model: String,
     created: i64,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
@@ -124,8 +263,6 @@ fn build_sse_stream(
             };
             yield Ok::<_, Infallible>(ev);
         }
-        // Emit the OpenAI-style [DONE] sentinel so clients that terminate
-        // on it behave correctly.
         yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
     }
 }

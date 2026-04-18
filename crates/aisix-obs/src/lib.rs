@@ -1,17 +1,27 @@
-//! aisix-obs — observability bootstrap.
+//! aisix-obs — observability primitives shared by the proxy and admin
+//! crates.
 //!
-//! This crate will hold the OpenTelemetry + Prometheus wiring and the
-//! access-log middleware. For PR #5 we expose just [`init_tracing`], the
-//! startup-sequence call that turns the config's `log_level` into an
-//! `EnvFilter` and installs a formatted subscriber.
-//!
-//! OTLP export, Langfuse, and Prometheus registration arrive in their own
-//! PRs so this crate stays focused.
+//! Scope for PR #14:
+//! - [`init_tracing`] installs the process-wide tracing subscriber.
+//! - [`access_log::AccessLog`] — one-line structured request log, called
+//!   by the proxy handler at end-of-request.
+//! - [`metrics::Metrics`] — Prometheus counters + histogram for
+//!   requests/duration/rate-limits/tokens.
+//! - [`otlp::install_otlp_tracer`] — optional OTLP export handshake
+//!   (concrete pipeline wired in a follow-up PR).
 
 #![deny(rust_2018_idioms)]
 
+pub mod access_log;
+pub mod metrics;
+pub mod otlp;
+
 use aisix_core::ObservabilityConfig;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+pub use access_log::AccessLog;
+pub use metrics::{Metrics, RequestOutcome};
+pub use otlp::{install_otlp_tracer, shutdown_otlp, OtlpError, OtlpHandle};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ObsError {
@@ -26,14 +36,6 @@ pub enum ObsError {
 }
 
 /// Install a process-wide tracing subscriber.
-///
-/// - Log level comes from `cfg.log_level` (a `tracing_subscriber::EnvFilter`
-///   directive string, e.g. `"info"`, `"aisix=debug,tower=warn"`).
-/// - The `RUST_LOG` env var, if set, overrides the config's directive —
-///   standard Rust convention so operators can debug without a restart
-///   of the rollout pipeline.
-/// - Output format is plain text to stderr for now; structured JSON will
-///   be a config knob in a later PR.
 pub fn init_tracing(cfg: &ObservabilityConfig) -> Result<(), ObsError> {
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&cfg.log_level))
@@ -70,10 +72,6 @@ mod tests {
 
     #[test]
     fn filter_error_carries_the_bad_directive() {
-        // Directly exercise the EnvFilter parse error path — fabricating
-        // the error avoids touching the global tracing subscriber, which
-        // is a process-wide singleton that can't be re-initialised safely
-        // across tests.
         let bad = "BAD=@notalevel";
         let err = tracing_subscriber::EnvFilter::try_new(bad).unwrap_err();
         let wrapped = ObsError::Filter {

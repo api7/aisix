@@ -39,6 +39,7 @@ use serde_json::json;
 pub fn build_router(state: AdminState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics_handler))
         .route(
             "/admin/v1/models",
             get(models_handlers::list_models).post(models_handlers::create_model),
@@ -74,6 +75,33 @@ async fn health(
             "apikeys": snap.apikeys.len(),
         })),
     )
+}
+
+/// Prometheus `/metrics` endpoint. Unauthenticated by design — the admin
+/// listener is bound to a private address in production, and scrapers
+/// don't carry bearer tokens. Emits `text/plain; version=0.0.4`.
+async fn metrics_handler(
+    axum::extract::State(state): axum::extract::State<AdminState>,
+) -> axum::response::Response {
+    use axum::http::header::CONTENT_TYPE;
+    use axum::response::IntoResponse;
+
+    match state.metrics.as_ref() {
+        Some(m) => {
+            let body = m.render();
+            (
+                StatusCode::OK,
+                [(CONTENT_TYPE, "text/plain; version=0.0.4")],
+                body,
+            )
+                .into_response()
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "metrics recorder not configured",
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -134,6 +162,61 @@ mod tests {
     async fn body_json(resp: axum::http::Response<Body>) -> Value {
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_prometheus_text_when_configured() {
+        use aisix_obs::{Metrics, RequestOutcome};
+        use std::time::Duration;
+
+        let handle = SnapshotHandle::new(AisixSnapshot::new());
+        let store = InMemoryStore::new() as Arc<dyn ConfigStore>;
+        let metrics = Arc::new(Metrics::new(false));
+        // Pre-populate so the assertion doesn't depend on a separate
+        // proxy call landing samples.
+        metrics.record_request(
+            "openai",
+            "my-gpt4",
+            200,
+            RequestOutcome::Success,
+            Duration::from_millis(10),
+        );
+
+        let state = AdminState::new(handle, store, &cfg()).with_metrics(metrics);
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("text/plain"),
+            "unexpected content-type: {ct}"
+        );
+
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("aisix_requests_total"));
+        assert!(body.contains("provider=\"openai\""));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_503_when_recorder_not_wired() {
+        let state = build_state(); // no with_metrics
+        let app = build_router(state);
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

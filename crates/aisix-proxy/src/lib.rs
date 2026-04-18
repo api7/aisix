@@ -523,4 +523,110 @@ data: [DONE]\n\n";
         let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(v["error"]["type"], "rate_limit_exceeded");
     }
+
+    #[tokio::test]
+    async fn request_lifecycle_increments_metrics_counters() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+
+        let state = build_state(snap, hub);
+        let metrics = state.metrics.clone();
+        let app = build_router(state);
+
+        // Pre-flight: counter family is absent until something writes.
+        assert!(!metrics.render().contains("aisix_requests_total"));
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let rendered = metrics.render();
+        assert!(rendered.contains("aisix_requests_total"));
+        assert!(rendered.contains("provider=\"openai\""));
+        assert!(rendered.contains("outcome=\"success\""));
+        assert!(rendered.contains("aisix_tokens_consumed_total"));
+        // 7 tokens were committed.
+        assert!(
+            rendered.contains("7"),
+            "expected tokens counter at 7:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ratelimit_rejection_increments_ratelimit_counter() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot_with_limits(
+            "my-gpt4",
+            &["my-gpt4"],
+            &upstream.uri(),
+            serde_json::json!({"rpm": 1}),
+        );
+        let state = build_state(snap, hub);
+        let metrics = state.metrics.clone();
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let _ = run(build_router(state.clone()), make_req()).await;
+        let resp = run(build_router(state), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let rendered = metrics.render();
+        assert!(rendered.contains("aisix_ratelimit_rejections_total"));
+        assert!(rendered.contains("scope=\"requests\""));
+    }
 }
