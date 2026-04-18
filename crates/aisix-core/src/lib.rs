@@ -31,7 +31,7 @@ pub use error::{
 };
 pub use models::{
     validate_apikey, validate_model, AisixSnapshot, ApiKey, Model, Provider, ProviderConfig,
-    RateLimit, SchemaError,
+    RateLimit, Routing, RoutingStrategy, RoutingTarget, SchemaError,
 };
 pub use resource::{Resource, ResourceEntry};
 pub use snapshot::{ResourceTable, SnapshotHandle};

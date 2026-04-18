@@ -17,7 +17,7 @@
 //!    status, error type, and (for rate-limits) Retry-After.
 
 use aisix_cache::CacheKey;
-use aisix_gateway::{BridgeContext, ChatFormat};
+use aisix_gateway::{BridgeContext, BridgeError, ChatFormat};
 use aisix_obs::{AccessLog, Metrics, RequestOutcome};
 use axum::extract::State;
 use axum::http::HeaderValue;
@@ -33,6 +33,7 @@ use uuid::Uuid;
 use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
 use crate::render::{render_chunk, render_response};
+use crate::routing::is_retryable;
 use crate::state::ProxyState;
 
 /// Header set on every non-streaming response indicating whether the
@@ -126,7 +127,7 @@ async fn dispatch(
     }
 
     let snapshot = state.snapshot.load();
-    let model_entry = snapshot
+    let virtual_entry = snapshot
         .models
         .get_by_name(&req.model)
         .ok_or_else(|| ProxyError::ModelNotFound(req.model.clone()))?;
@@ -135,26 +136,65 @@ async fn dispatch(
         return Err(ProxyError::ModelForbidden(req.model.clone()));
     }
 
-    let provider = model_entry
-        .value
-        .provider()
-        .ok_or_else(|| ProxyError::InvalidRequest("model has no provider prefix".into()))?;
-    let bridge = state
-        .hub
-        .get(provider)
-        .ok_or(ProxyError::ProviderUnavailable)?;
+    // Resolve the attempt-list of underlying Model entries. For a
+    // routing model we walk targets per the configured strategy; for a
+    // single-provider Model we just dispatch to it directly.
+    let attempt_models: Vec<aisix_core::Model> =
+        if let Some(routing) = virtual_entry.value.routing.as_ref() {
+            let names = state.routing.pick_order(&req.model, routing);
+            if names.is_empty() {
+                return Err(ProxyError::InvalidRequest(
+                    "routing model has no targets".into(),
+                ));
+            }
+            let mut resolved = Vec::with_capacity(names.len());
+            for name in &names {
+                let target_entry = snapshot.models.get_by_name(name).ok_or_else(|| {
+                    ProxyError::InvalidRequest(format!(
+                        "routing target {name:?} does not resolve to a Model"
+                    ))
+                })?;
+                resolved.push(target_entry.value.clone());
+            }
+            resolved
+        } else {
+            vec![virtual_entry.value.clone()]
+        };
+
+    // For non-routing requests, surface a misconfigured bridge as a
+    // proper 503 rather than burying it inside a generic Bridge error.
+    // Routing requests rely on the loop's `is_retryable` path so a
+    // single bad provider doesn't take down the whole request.
+    if attempt_models.len() == 1 {
+        let only = &attempt_models[0];
+        let provider = only
+            .provider()
+            .ok_or_else(|| ProxyError::InvalidRequest("model has no provider prefix".into()))?;
+        if state.hub.get(provider).is_none() {
+            return Err(ProxyError::ProviderUnavailable);
+        }
+    }
 
     let rl_key = auth.entry.id.clone();
     let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
     let reservation = state.limiter.pre_commit(&rl_key, &rl_limits)?;
 
-    let model_arc = Arc::new(model_entry.value.clone());
-    let ctx = BridgeContext::new(request_id, model_arc);
-    let provider_name = format!("{provider:?}").to_lowercase();
-
     let now = created_ts();
 
+    // Streaming path: only attempt the first target. Streaming fallback
+    // is genuinely hard (we'd have to buffer the stream to detect
+    // failure mid-flight) and not worth the complexity for V1.
     if req.is_streaming() {
+        let model = &attempt_models[0];
+        let provider = model
+            .provider()
+            .ok_or_else(|| ProxyError::InvalidRequest("model has no provider prefix".into()))?;
+        let bridge = state
+            .hub
+            .get(provider)
+            .ok_or(ProxyError::ProviderUnavailable)?;
+        let model_arc = Arc::new(model.clone());
+        let ctx = BridgeContext::new(request_id, model_arc);
         let upstream = bridge.chat_stream(req, &ctx).await?;
         reservation.commit_tokens(0);
         let sse_stream = build_sse_stream(upstream, now);
@@ -162,15 +202,15 @@ async fn dispatch(
             Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
         return Ok(Success {
             response: response.into_response(),
-            provider: provider_name,
+            provider: format!("{provider:?}").to_lowercase(),
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
         });
     }
 
-    // Cache lookup runs before the upstream call. Streaming requests
-    // never hit this branch — `req.is_streaming()` short-circuits above.
+    // Cache lookup keyed on the *virtual* model name so a re-request
+    // hits the cache regardless of which target served the original.
     let cache_key = state
         .cache
         .as_ref()
@@ -179,34 +219,88 @@ async fn dispatch(
     if let (Some(cache), Some(key)) = (state.cache.as_ref(), cache_key.as_ref()) {
         match cache.get(key).await {
             Ok(Some(cached)) => {
-                // Release the reservation we took up front — the cached
-                // request shouldn't count against TPM.
                 reservation.commit_tokens(0);
                 let prompt = cached.usage.prompt_tokens as u64;
                 let completion = cached.usage.completion_tokens as u64;
                 let total = cached.usage.total_tokens as u64;
+                // The provider label points at the first attempt — for a
+                // cache hit we don't know (or care) which target ran the
+                // original call; the fingerprint identified the answer.
+                let provider_label = attempt_models[0]
+                    .provider()
+                    .map(|p| format!("{p:?}").to_lowercase())
+                    .unwrap_or_else(|| "unknown".into());
                 let mut response = Json(render_response(now, cached)).into_response();
                 response
                     .headers_mut()
                     .insert(CACHE_HEADER, HeaderValue::from_static("hit"));
                 return Ok(Success {
                     response,
-                    provider: provider_name,
+                    provider: provider_label,
                     prompt_tokens: Some(prompt),
                     completion_tokens: Some(completion),
                     total_tokens: Some(total),
                 });
             }
-            Ok(None) => {} // miss → fall through to upstream call
+            Ok(None) => {}
             Err(err) => {
-                // Cache failures are non-fatal — the upstream call still
-                // runs. Just log and move on.
                 tracing::warn!(error = %err, key = %key, "cache lookup failed");
             }
         }
     }
 
-    let upstream = bridge.chat(req, &ctx).await?;
+    // Walk the attempt-list. First retryable failure → next target.
+    // Non-retryable (4xx) or exhausted budget → propagate the last error.
+    let mut last_err: Option<BridgeError> = None;
+    let mut chosen_provider: Option<String> = None;
+    let mut upstream: Option<aisix_gateway::ChatResponse> = None;
+
+    for model in &attempt_models {
+        let Some(provider) = model.provider() else {
+            last_err = Some(BridgeError::Config("model has no provider prefix".into()));
+            continue;
+        };
+        let Some(bridge) = state.hub.get(provider) else {
+            last_err = Some(BridgeError::Config(
+                "no bridge registered for provider".into(),
+            ));
+            continue;
+        };
+        let model_arc = Arc::new(model.clone());
+        let ctx = BridgeContext::new(request_id, model_arc);
+
+        match bridge.chat(req, &ctx).await {
+            Ok(resp) => {
+                chosen_provider = Some(format!("{provider:?}").to_lowercase());
+                upstream = Some(resp);
+                break;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target_model = %model.name,
+                    error = %err,
+                    retryable = is_retryable(&err),
+                    "routing target attempt failed",
+                );
+                if !is_retryable(&err) {
+                    last_err = Some(err);
+                    break;
+                }
+                last_err = Some(err);
+                continue;
+            }
+        }
+    }
+
+    let Some(upstream) = upstream else {
+        // Bubble the most recent BridgeError through ProxyError::Bridge.
+        let err = last_err.unwrap_or_else(|| {
+            BridgeError::Config("routing exhausted with no targets attempted".into())
+        });
+        return Err(ProxyError::Bridge(err));
+    };
+    let provider_name = chosen_provider.unwrap_or_else(|| "unknown".into());
+
     let prompt = upstream.usage.prompt_tokens as u64;
     let completion = upstream.usage.completion_tokens as u64;
     let total = upstream.usage.total_tokens as u64;

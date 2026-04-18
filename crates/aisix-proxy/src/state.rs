@@ -22,6 +22,8 @@ use aisix_obs::Metrics;
 use aisix_ratelimit::Limiter;
 use std::sync::Arc;
 
+use crate::routing::RoutingRegistry;
+
 #[derive(Clone)]
 pub struct ProxyState {
     pub snapshot: SnapshotHandle<AisixSnapshot>,
@@ -29,6 +31,7 @@ pub struct ProxyState {
     pub limiter: Arc<Limiter>,
     pub metrics: Arc<Metrics>,
     pub cache: Option<Arc<dyn Cache>>,
+    pub routing: Arc<RoutingRegistry>,
     pub request_body_limit_bytes: usize,
 }
 
@@ -40,6 +43,7 @@ impl ProxyState {
             limiter: Arc::new(Limiter::new()),
             metrics: Arc::new(Metrics::new(false)),
             cache: Some(Arc::new(MemoryCache::with_defaults())),
+            routing: Arc::new(RoutingRegistry::new()),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }
@@ -58,6 +62,7 @@ impl ProxyState {
             limiter,
             metrics: Arc::new(Metrics::new(false)),
             cache: Some(Arc::new(MemoryCache::with_defaults())),
+            routing: Arc::new(RoutingRegistry::new()),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }
@@ -79,6 +84,7 @@ impl ProxyState {
             limiter,
             metrics,
             cache,
+            routing: Arc::new(RoutingRegistry::new()),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }

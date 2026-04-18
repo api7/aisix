@@ -12,10 +12,11 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use super::rate_limit::RateLimit;
+use super::routing::Routing;
 use crate::resource::Resource;
 
 static MODEL_ID_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^(anthropic|deepseek|gemini|openai)/.+$").unwrap());
+    Lazy::new(|| Regex::new(r"^(anthropic|deepseek|gemini|openai|router)/.+$").unwrap());
 
 /// Supported provider prefixes. The `model` field must start with one of these
 /// followed by `/<upstream-model-id>`.
@@ -74,6 +75,15 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
 
+    /// Optional routing config. When present, the proxy treats this Model
+    /// as a *virtual* router: it picks one of the listed targets per the
+    /// strategy and dispatches through that target's bridge instead of
+    /// using `model` / `provider_config` on this entity. The base `model`
+    /// field is still required (use the `router/<name>` prefix to make
+    /// the intent obvious to operators).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<Routing>,
+
     /// Non-schema runtime id. Not part of the JSON payload — filled in by
     /// the snapshot loader from the etcd key path. Kept here so `Resource`
     /// can return a `&str` id.
@@ -82,9 +92,9 @@ pub struct Model {
 }
 
 impl Model {
-    /// Parse the `<provider>/<model_name>` prefix. Returns `None` if the
-    /// `model` field doesn't match the spec regex — callers should have
-    /// already run schema validation.
+    /// Parse the `<provider>/<model_name>` prefix. Returns `None` for
+    /// the `router/...` virtual-routing form (which intentionally has
+    /// no upstream provider) and for malformed values.
     pub fn provider(&self) -> Option<Provider> {
         let (prefix, _) = self.model.split_once('/')?;
         match prefix {
@@ -94,6 +104,12 @@ impl Model {
             "deepseek" => Some(Provider::Deepseek),
             _ => None,
         }
+    }
+
+    /// Whether this Model is a virtual router (proxy walks `routing.targets`
+    /// instead of dispatching its own provider config).
+    pub fn is_routing(&self) -> bool {
+        self.routing.is_some()
     }
 
     /// Returns the upstream-facing model id (everything after the first `/`).
@@ -195,6 +211,7 @@ mod tests {
             },
             timeout: None,
             rate_limit: None,
+            routing: None,
             runtime_id: String::new(),
         };
 

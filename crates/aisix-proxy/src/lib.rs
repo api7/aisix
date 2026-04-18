@@ -28,6 +28,7 @@ mod auth;
 mod chat;
 mod error;
 mod render;
+mod routing;
 mod state;
 
 pub use auth::AuthenticatedKey;
@@ -757,5 +758,190 @@ data: [DONE]\n\n";
                 Some("miss"),
             );
         }
+    }
+
+    /// Build a `ResourceEntry<Model>` with a non-default id so the test
+    /// can mount multiple Models in one snapshot.
+    fn model_entry_with_id(id: &str, name: &str, api_base: &str) -> ResourceEntry<Model> {
+        let cfg = format!(
+            r#"{{
+                "name": "{name}",
+                "model": "openai/gpt-4o",
+                "provider_config": {{"api_key": "sk-upstream", "api_base": "{api_base}"}}
+            }}"#
+        );
+        let model: Model = serde_json::from_str(&cfg).unwrap();
+        ResourceEntry::new(id, model, 1)
+    }
+
+    /// Build a virtual routing Model that points at `targets` (other
+    /// Model.name values) using the given strategy.
+    fn routing_entry(name: &str, strategy: &str, targets: &[&str]) -> ResourceEntry<Model> {
+        let target_objs: Vec<serde_json::Value> = targets
+            .iter()
+            .map(|t| serde_json::json!({"model": t}))
+            .collect();
+        let cfg = serde_json::json!({
+            "name": name,
+            "model": format!("router/{name}"),
+            // The provider_config is required by the schema but unused
+            // by the proxy because routing.is_some() short-circuits.
+            "provider_config": {"api_key": "ignored"},
+            "routing": {
+                "strategy": strategy,
+                "targets": target_objs,
+            }
+        });
+        let model: Model = serde_json::from_value(cfg).unwrap();
+        ResourceEntry::new(format!("router-{name}"), model, 1)
+    }
+
+    #[tokio::test]
+    async fn routing_failover_retries_to_second_target_when_first_5xxs() {
+        let bad_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
+            .mount(&bad_upstream)
+            .await;
+
+        let good_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-good",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "fallback worked"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&good_upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+
+        let snap = AisixSnapshot::new();
+        snap.models
+            .insert(model_entry_with_id("m-bad", "primary", &bad_upstream.uri()));
+        snap.models.insert(model_entry_with_id(
+            "m-good",
+            "secondary",
+            &good_upstream.uri(),
+        ));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary", "secondary"],
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let app = build_router(build_state(snap, hub));
+        let body = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "fallback worked");
+    }
+
+    #[tokio::test]
+    async fn routing_propagates_4xx_without_attempting_fallback() {
+        // First target returns 400 — caller mistake, no point trying
+        // the second target. We assert the request fails 400 *and* the
+        // second wiremock never sees a request.
+        let bad_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("invalid_request"))
+            .expect(1)
+            .mount(&bad_upstream)
+            .await;
+
+        let standby_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            // Should never be hit; expect(0) enforces it on Drop.
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&standby_upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+
+        let snap = AisixSnapshot::new();
+        snap.models
+            .insert(model_entry_with_id("m-bad", "primary", &bad_upstream.uri()));
+        snap.models.insert(model_entry_with_id(
+            "m-standby",
+            "secondary",
+            &standby_upstream.uri(),
+        ));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary", "secondary"],
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let app = build_router(build_state(snap, hub));
+        let body = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn routing_to_missing_target_returns_400() {
+        // Routing references a Model that isn't in the snapshot — this
+        // is a misconfiguration and should surface as a clean 400.
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+
+        let snap = AisixSnapshot::new();
+        snap.models
+            .insert(routing_entry("smart", "failover", &["nonexistent"]));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let app = build_router(build_state(snap, hub));
+        let body = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

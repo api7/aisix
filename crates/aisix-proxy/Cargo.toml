@@ -29,6 +29,7 @@ futures.workspace = true
 futures-util.workspace = true
 async-trait.workspace = true
 async-stream = "0.3"
+dashmap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true

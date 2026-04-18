@@ -79,7 +79,7 @@ fn model_schema() -> Value {
             "name": { "type": "string", "minLength": 1 },
             "model": {
                 "type": "string",
-                "pattern": "^(anthropic|deepseek|gemini|openai)/.+$"
+                "pattern": "^(anthropic|deepseek|gemini|openai|router)/.+$"
             },
             "provider_config": {
                 "type": "object",
@@ -91,7 +91,32 @@ fn model_schema() -> Value {
                 }
             },
             "timeout": { "type": "integer", "minimum": 0 },
-            "rate_limit": { "$ref": "#/$defs/rate_limit" }
+            "rate_limit": { "$ref": "#/$defs/rate_limit" },
+            "routing": {
+                "type": "object",
+                "required": ["targets"],
+                "additionalProperties": false,
+                "properties": {
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["round_robin", "weighted", "failover"]
+                    },
+                    "targets": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "required": ["model"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "model":  { "type": "string", "minLength": 1 },
+                                "weight": { "type": "integer", "minimum": 0 }
+                            }
+                        }
+                    },
+                    "retry_budget": { "type": "integer", "minimum": 0 }
+                }
+            }
         },
         "$defs": {
             "rate_limit": {
