@@ -1,3 +1,4 @@
+/// <reference types="vitest" />
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -14,9 +15,15 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/aisix/admin": "http://127.0.0.1:3001",
-      "/playground": "http://127.0.0.1:3001",
-      "/openapi": "http://127.0.0.1:3001",
+      "/admin": "http://127.0.0.1:3001",
+      "/health": "http://127.0.0.1:3001",
+      "/metrics": "http://127.0.0.1:3001",
     },
+  },
+  test: {
+    environment: "jsdom",
+    globals: true,
+    setupFiles: ["./src/test-setup.ts"],
+    css: false,
   },
 });
