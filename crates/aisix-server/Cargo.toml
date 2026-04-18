@@ -23,6 +23,7 @@ aisix-provider-openai = { path = "../aisix-provider-openai" }
 aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
 aisix-provider-gemini = { path = "../aisix-provider-gemini" }
 aisix-provider-deepseek = { path = "../aisix-provider-deepseek" }
+aisix-ratelimit = { path = "../aisix-ratelimit" }
 tokio.workspace = true
 axum.workspace = true
 axum-server.workspace = true

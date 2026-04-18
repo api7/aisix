@@ -43,6 +43,7 @@ version = "0.1.0"
 dependencies = [
  "aisix-core",
  "aisix-etcd",
+ "aisix-obs",
  "aisix-proxy",
  "async-trait",
  "axum",
@@ -306,6 +307,7 @@ dependencies = [
  "aisix-provider-gemini",
  "aisix-provider-openai",
  "aisix-proxy",
+ "aisix-ratelimit",
  "anyhow",
  "axum",
  "axum-server",
