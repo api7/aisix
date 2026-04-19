@@ -48,7 +48,14 @@ pub async fn responses(
         Ok((resp, provider)) => {
             let elapsed = started.elapsed();
             let status = resp.status().as_u16();
-            emit_access_log(&model_name, &provider, &api_key_id, status, elapsed, &request_id);
+            emit_access_log(
+                &model_name,
+                &provider,
+                &api_key_id,
+                status,
+                elapsed,
+                &request_id,
+            );
             state.metrics.record_request(
                 &provider,
                 &model_name,
@@ -61,7 +68,14 @@ pub async fn responses(
         Err(err) => {
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
-            emit_access_log(&model_name, "unknown", &api_key_id, status, elapsed, &request_id);
+            emit_access_log(
+                &model_name,
+                "unknown",
+                &api_key_id,
+                status,
+                elapsed,
+                &request_id,
+            );
             state.metrics.record_request(
                 "unknown",
                 &model_name,
@@ -151,10 +165,12 @@ async fn dispatch(
     if !status.is_success() {
         let status_u16 = status.as_u16();
         let message = upstream_resp.text().await.unwrap_or_default();
-        return Err(ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamStatus {
-            status: status_u16,
-            message: message.chars().take(1024).collect(),
-        }));
+        return Err(ProxyError::Bridge(
+            aisix_gateway::BridgeError::UpstreamStatus {
+                status: status_u16,
+                message: message.chars().take(1024).collect(),
+            },
+        ));
     }
 
     state.health.record_success(&model_name);
@@ -165,24 +181,21 @@ async fn dispatch(
         let headers = upstream_resp.headers().clone();
         let body_stream = upstream_resp.bytes_stream();
 
-        let mut response = axum::response::Response::new(
-            axum::body::Body::from_stream(body_stream),
-        );
+        let mut response =
+            axum::response::Response::new(axum::body::Body::from_stream(body_stream));
 
         if let Some(ct) = headers.get("content-type") {
             if let Ok(hv) = HeaderValue::from_bytes(ct.as_bytes()) {
-                response.headers_mut().insert(
-                    axum::http::header::CONTENT_TYPE,
-                    hv,
-                );
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, hv);
             }
         }
 
         if let Ok(hv) = HeaderValue::from_str(request_id) {
-            response.headers_mut().insert(
-                HeaderName::from_static("x-aisix-request-id"),
-                hv,
-            );
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static("x-aisix-request-id"), hv);
         }
 
         Ok((response, provider_label))
@@ -223,12 +236,12 @@ fn emit_access_log(
 
 #[cfg(test)]
 mod tests {
+    use aisix_core::models::Provider;
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ApiKey, Model, ProxyConfig};
     use aisix_gateway::Hub;
     use aisix_provider_openai::OpenAiBridge;
-    use aisix_core::models::Provider;
     use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
     use std::sync::Arc;
@@ -308,10 +321,13 @@ mod tests {
         snap.apikeys.insert(apikey_entry(&["*"]));
         let app = build_app(snap);
 
-        let resp = app.oneshot(make_req(serde_json::json!({
-            "model": "no-such-model",
-            "input": "hello"
-        }))).await.unwrap();
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "no-such-model",
+                "input": "hello"
+            })))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -322,10 +338,13 @@ mod tests {
         snap.apikeys.insert(apikey_entry(&["*"]));
         let app = build_app(snap);
 
-        let resp = app.oneshot(make_req(serde_json::json!({
-            "model": "claude-haiku",
-            "input": "hello"
-        }))).await.unwrap();
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "claude-haiku",
+                "input": "hello"
+            })))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -344,14 +363,18 @@ mod tests {
             .await;
 
         let snap = AisixSnapshot::new();
-        snap.models.insert(openai_model("gpt-4o-resp", &upstream.uri()));
+        snap.models
+            .insert(openai_model("gpt-4o-resp", &upstream.uri()));
         snap.apikeys.insert(apikey_entry(&["*"]));
         let app = build_app(snap);
 
-        let resp = app.oneshot(make_req(serde_json::json!({
-            "model": "gpt-4o-resp",
-            "input": "Hello"
-        }))).await.unwrap();
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "Hello"
+            })))
+            .await
+            .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
@@ -369,14 +392,18 @@ mod tests {
             .await;
 
         let snap = AisixSnapshot::new();
-        snap.models.insert(openai_model("gpt-4o-resp", &upstream.uri()));
+        snap.models
+            .insert(openai_model("gpt-4o-resp", &upstream.uri()));
         snap.apikeys.insert(apikey_entry(&["*"]));
         let app = build_app(snap);
 
-        let resp = app.oneshot(make_req(serde_json::json!({
-            "model": "gpt-4o-resp",
-            "input": "Hello"
-        }))).await.unwrap();
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "Hello"
+            })))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 }

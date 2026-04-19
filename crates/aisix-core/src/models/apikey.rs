@@ -123,16 +123,14 @@ mod tests {
 
     #[test]
     fn wildcard_grants_access_to_any_model() {
-        let k: ApiKey =
-            serde_json::from_str(r#"{"key":"sk-x","allowed_models":["*"]}"#).unwrap();
+        let k: ApiKey = serde_json::from_str(r#"{"key":"sk-x","allowed_models":["*"]}"#).unwrap();
         assert!(k.can_access("my-gpt4"));
         assert!(k.can_access("literally-anything"));
     }
 
     #[test]
     fn accessible_models_expands_wildcard_to_full_universe() {
-        let k: ApiKey =
-            serde_json::from_str(r#"{"key":"sk-x","allowed_models":["*"]}"#).unwrap();
+        let k: ApiKey = serde_json::from_str(r#"{"key":"sk-x","allowed_models":["*"]}"#).unwrap();
         let universe = ["a", "b", "c"];
         let accessible = k.accessible_models(universe.iter().copied());
         assert_eq!(accessible, vec!["a", "b", "c"]);
@@ -149,8 +147,7 @@ mod tests {
 
     #[test]
     fn accessible_models_empty_list_returns_nothing() {
-        let k: ApiKey =
-            serde_json::from_str(r#"{"key":"sk-x","allowed_models":[]}"#).unwrap();
+        let k: ApiKey = serde_json::from_str(r#"{"key":"sk-x","allowed_models":[]}"#).unwrap();
         let universe = ["a", "b"];
         assert!(k.accessible_models(universe.iter().copied()).is_empty());
     }

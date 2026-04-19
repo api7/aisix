@@ -24,10 +24,10 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+mod audio;
 mod auth;
 pub mod budget;
 mod chat;
-mod audio;
 mod completions;
 mod embeddings;
 mod error;
@@ -37,8 +37,8 @@ mod images;
 mod messages;
 mod models;
 mod passthrough;
-mod rerank;
 mod render;
+mod rerank;
 mod responses;
 mod routing;
 mod state;
@@ -65,14 +65,8 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/v1/messages", post(messages::messages))
         .route("/v1/rerank", post(rerank::rerank))
         .route("/v1/responses", post(responses::responses))
-        .route(
-            "/v1/audio/transcriptions",
-            post(audio::transcriptions),
-        )
-        .route(
-            "/v1/audio/translations",
-            post(audio::translations),
-        )
+        .route("/v1/audio/transcriptions", post(audio::transcriptions))
+        .route("/v1/audio/translations", post(audio::translations))
         .route("/v1/audio/speech", post(audio::speech))
         .route(
             "/passthrough/:provider/*rest",
@@ -1027,7 +1021,9 @@ data: [DONE]\n\n";
             "missing x-ratelimit-limit-requests"
         );
         assert_eq!(
-            headers.get("x-ratelimit-limit-requests").and_then(|v| v.to_str().ok()),
+            headers
+                .get("x-ratelimit-limit-requests")
+                .and_then(|v| v.to_str().ok()),
             Some("100"),
         );
         assert!(
@@ -1035,13 +1031,16 @@ data: [DONE]\n\n";
             "missing x-ratelimit-limit-tokens"
         );
         assert_eq!(
-            headers.get("x-ratelimit-limit-tokens").and_then(|v| v.to_str().ok()),
+            headers
+                .get("x-ratelimit-limit-tokens")
+                .and_then(|v| v.to_str().ok()),
             Some("50000"),
         );
         // Remaining should be limit - 1 (one request consumed).
         assert_eq!(
-            headers.get("x-ratelimit-remaining-requests")
-                   .and_then(|v| v.to_str().ok()),
+            headers
+                .get("x-ratelimit-remaining-requests")
+                .and_then(|v| v.to_str().ok()),
             Some("99"),
         );
     }
@@ -1159,12 +1158,15 @@ data: [DONE]\n\n";
         hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
 
         // Budget entity caps "key-id-1" at $1 / month.
-        let budget: Budget = serde_json::from_str(r#"{
+        let budget: Budget = serde_json::from_str(
+            r#"{
             "name": "test-budget",
             "api_key_id": "key-id-1",
             "monthly_usd_cap": 1.0,
             "usd_per_1k_tokens": 0.005
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let budget_entry = ResourceEntry::new("b-1", budget, 1);
 
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
@@ -1218,12 +1220,15 @@ data: [DONE]\n\n";
         hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
 
         // Budget at $100 cap — won't be exceeded.
-        let budget: Budget = serde_json::from_str(r#"{
+        let budget: Budget = serde_json::from_str(
+            r#"{
             "name": "test-budget",
             "api_key_id": "key-id-1",
             "monthly_usd_cap": 100.0,
             "usd_per_1k_tokens": 0.005
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         let budget_entry = ResourceEntry::new("b-1", budget, 1);
 
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());

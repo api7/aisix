@@ -24,14 +24,14 @@ mod budgets_handlers;
 mod credentials_handlers;
 mod embedded_ui;
 mod error;
-mod health_handler;
 pub mod etcd_store;
+mod health_handler;
 mod models_handlers;
 mod openapi;
 mod playground_handler;
+mod spend_handler;
 mod state;
 pub mod store;
-mod spend_handler;
 mod teams_handlers;
 
 pub use auth::AdminAuth;
@@ -616,11 +616,7 @@ mod tests {
         let app = build_router(state.clone());
         let resp = run(
             app,
-            auth_req(
-                "POST",
-                &format!("/admin/v1/apikeys/{id}/rotate"),
-                None,
-            ),
+            auth_req("POST", &format!("/admin/v1/apikeys/{id}/rotate"), None),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -738,11 +734,7 @@ mod tests {
 
         // Get.
         let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("GET", &format!("/admin/v1/teams/{id}"), None),
-        )
-        .await;
+        let resp = run(app, auth_req("GET", &format!("/admin/v1/teams/{id}"), None)).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let got = body_json(resp).await;
         assert_eq!(got["value"]["name"], "eng-team");
@@ -773,11 +765,7 @@ mod tests {
 
         // Subsequent GET returns 404.
         let app = build_router(state);
-        let resp = run(
-            app,
-            auth_req("GET", &format!("/admin/v1/teams/{id}"), None),
-        )
-        .await;
+        let resp = run(app, auth_req("GET", &format!("/admin/v1/teams/{id}"), None)).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -787,11 +775,7 @@ mod tests {
         // Missing required `name` field.
         let resp = run(
             app,
-            auth_req(
-                "POST",
-                "/admin/v1/teams",
-                Some(json!({"members": ["k-1"]})),
-            ),
+            auth_req("POST", "/admin/v1/teams", Some(json!({"members": ["k-1"]}))),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -800,11 +784,7 @@ mod tests {
     #[tokio::test]
     async fn team_get_missing_is_404() {
         let app = build_router(build_state());
-        let resp = run(
-            app,
-            auth_req("GET", "/admin/v1/teams/nonexistent", None),
-        )
-        .await;
+        let resp = run(app, auth_req("GET", "/admin/v1/teams/nonexistent", None)).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -868,7 +848,8 @@ mod tests {
 
         let handle = SnapshotHandle::new(AisixSnapshot::new());
         let store = InMemoryStore::new() as Arc<dyn ConfigStore>;
-        let state = AdminState::new(handle.clone(), store.clone(), &cfg()).with_health_tracker(health);
+        let state =
+            AdminState::new(handle.clone(), store.clone(), &cfg()).with_health_tracker(health);
 
         // Insert a model into the store (to appear in snapshot via store.
         // Since InMemoryStore doesn't auto-push to snapshot in tests, we

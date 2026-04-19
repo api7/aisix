@@ -67,12 +67,10 @@ pub struct RateLimitStatus {
 
 impl RateLimitStatus {
     pub fn rpm_remaining(&self) -> Option<u64> {
-        self.rpm_limit
-            .map(|lim| lim.saturating_sub(self.rpm_used))
+        self.rpm_limit.map(|lim| lim.saturating_sub(self.rpm_used))
     }
     pub fn tpm_remaining(&self) -> Option<u64> {
-        self.tpm_limit
-            .map(|lim| lim.saturating_sub(self.tpm_used))
+        self.tpm_limit.map(|lim| lim.saturating_sub(self.tpm_used))
     }
 }
 

@@ -38,9 +38,7 @@ pub async fn playground_chat_completions(
     // match it — the client POSTed to `/playground/chat/completions` but
     // the proxy listens on `/v1/chat/completions`.
     let (mut parts, body) = req.into_parts();
-    parts.uri = "/v1/chat/completions"
-        .parse()
-        .unwrap_or(parts.uri.clone());
+    parts.uri = "/v1/chat/completions".parse().unwrap_or(parts.uri.clone());
     let forwarded = Request::from_parts(parts, body);
 
     match proxy.oneshot(forwarded).await {
@@ -109,13 +107,12 @@ mod tests {
         let snapshot = SnapshotHandle::new(snap);
         let hub = Arc::new(Hub::new());
         hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
-        let proxy_state =
-            ProxyState::new(snapshot.clone(), hub, &proxy_cfg()).without_cache();
+        let proxy_state = ProxyState::new(snapshot.clone(), hub, &proxy_cfg()).without_cache();
         let proxy_router = aisix_proxy::build_router(proxy_state);
 
         let store = InMemoryStore::new() as Arc<dyn crate::ConfigStore>;
-        let admin_state = AdminState::new(snapshot, store, &admin_cfg())
-            .with_proxy_router(proxy_router);
+        let admin_state =
+            AdminState::new(snapshot, store, &admin_cfg()).with_proxy_router(proxy_router);
 
         build_router(admin_state)
     }

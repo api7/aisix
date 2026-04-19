@@ -187,7 +187,10 @@ async fn dispatch(
     // Forward safe incoming headers (drop hop-by-hop and auth).
     for (name, value) in &incoming_headers {
         let n = name.as_str().to_lowercase();
-        if matches!(n.as_str(), "authorization" | "x-api-key" | "host" | "content-length") {
+        if matches!(
+            n.as_str(),
+            "authorization" | "x-api-key" | "host" | "content-length"
+        ) {
             continue;
         }
         builder = builder.header(name, value);
@@ -222,9 +225,10 @@ async fn dispatch(
     copy_safe_headers(&resp_headers, response.headers_mut());
 
     if let Ok(hv) = HeaderValue::from_str(request_id) {
-        response
-            .headers_mut()
-            .insert(axum::http::header::HeaderName::from_static("x-aisix-request-id"), hv);
+        response.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("x-aisix-request-id"),
+            hv,
+        );
     }
 
     Ok((response, provider_lower))
@@ -237,8 +241,14 @@ fn copy_safe_headers(src: &HeaderMap, dst: &mut HeaderMap) {
         // Skip hop-by-hop headers.
         if matches!(
             n.as_str(),
-            "transfer-encoding" | "connection" | "keep-alive" | "proxy-authenticate"
-                | "proxy-authorization" | "te" | "trailers" | "upgrade"
+            "transfer-encoding"
+                | "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailers"
+                | "upgrade"
         ) {
             continue;
         }
@@ -400,7 +410,9 @@ mod tests {
             .uri("/passthrough/openai/v1/fine_tuning/jobs")
             .header("authorization", "Bearer sk-caller")
             .header("content-type", "application/json")
-            .body(axum::body::Body::from(r#"{"training_file":"file-xyz","model":"gpt-4o"}"#))
+            .body(axum::body::Body::from(
+                r#"{"training_file":"file-xyz","model":"gpt-4o"}"#,
+            ))
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();

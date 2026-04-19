@@ -163,10 +163,14 @@ mod tests {
     }
 
     fn jan(day: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 1, day, 12, 0, 0).single().unwrap()
+        Utc.with_ymd_and_hms(2026, 1, day, 12, 0, 0)
+            .single()
+            .unwrap()
     }
     fn feb(day: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 2, day, 12, 0, 0).single().unwrap()
+        Utc.with_ymd_and_hms(2026, 2, day, 12, 0, 0)
+            .single()
+            .unwrap()
     }
 
     #[test]

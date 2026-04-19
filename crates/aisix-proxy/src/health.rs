@@ -162,11 +162,7 @@ mod tests {
             } else {
                 HealthLevel::Down
             };
-            assert_eq!(
-                t.level("m"),
-                expected,
-                "wrong level after {i} failures"
-            );
+            assert_eq!(t.level("m"), expected, "wrong level after {i} failures");
         }
     }
 

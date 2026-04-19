@@ -240,7 +240,10 @@ impl Bridge for OpenAiBridge {
         // Replace the `model` field with the upstream provider id.
         let mut outbound = body.clone();
         if let Some(obj) = outbound.as_object_mut() {
-            obj.insert("model".to_string(), serde_json::Value::String(upstream.to_string()));
+            obj.insert(
+                "model".to_string(),
+                serde_json::Value::String(upstream.to_string()),
+            );
         }
 
         let url = format!("{base}/completions");

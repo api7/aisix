@@ -45,18 +45,56 @@ pub async fn transcriptions(
     let request_id = format!("atr-{}", Uuid::new_v4());
     let api_key_id = auth.entry.id.clone();
 
-    match multipart_dispatch(&state, &auth, multipart, "/v1/audio/transcriptions", &request_id).await {
+    match multipart_dispatch(
+        &state,
+        &auth,
+        multipart,
+        "/v1/audio/transcriptions",
+        &request_id,
+    )
+    .await
+    {
         Ok((resp, model_name, provider)) => {
             let elapsed = started.elapsed();
-            emit_access_log("POST", "/v1/audio/transcriptions", &model_name, &provider, &api_key_id, 200, elapsed, &request_id);
-            state.metrics.record_request(&provider, &model_name, 200, RequestOutcome::Success, elapsed);
+            emit_access_log(
+                "POST",
+                "/v1/audio/transcriptions",
+                &model_name,
+                &provider,
+                &api_key_id,
+                200,
+                elapsed,
+                &request_id,
+            );
+            state.metrics.record_request(
+                &provider,
+                &model_name,
+                200,
+                RequestOutcome::Success,
+                elapsed,
+            );
             resp
         }
         Err(err) => {
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
-            emit_access_log("POST", "/v1/audio/transcriptions", "unknown", "unknown", &api_key_id, status, elapsed, &request_id);
-            state.metrics.record_request("unknown", "unknown", status, RequestOutcome::from_status(status), elapsed);
+            emit_access_log(
+                "POST",
+                "/v1/audio/transcriptions",
+                "unknown",
+                "unknown",
+                &api_key_id,
+                status,
+                elapsed,
+                &request_id,
+            );
+            state.metrics.record_request(
+                "unknown",
+                "unknown",
+                status,
+                RequestOutcome::from_status(status),
+                elapsed,
+            );
             err.into_response()
         }
     }
@@ -75,18 +113,56 @@ pub async fn translations(
     let request_id = format!("atr-{}", Uuid::new_v4());
     let api_key_id = auth.entry.id.clone();
 
-    match multipart_dispatch(&state, &auth, multipart, "/v1/audio/translations", &request_id).await {
+    match multipart_dispatch(
+        &state,
+        &auth,
+        multipart,
+        "/v1/audio/translations",
+        &request_id,
+    )
+    .await
+    {
         Ok((resp, model_name, provider)) => {
             let elapsed = started.elapsed();
-            emit_access_log("POST", "/v1/audio/translations", &model_name, &provider, &api_key_id, 200, elapsed, &request_id);
-            state.metrics.record_request(&provider, &model_name, 200, RequestOutcome::Success, elapsed);
+            emit_access_log(
+                "POST",
+                "/v1/audio/translations",
+                &model_name,
+                &provider,
+                &api_key_id,
+                200,
+                elapsed,
+                &request_id,
+            );
+            state.metrics.record_request(
+                &provider,
+                &model_name,
+                200,
+                RequestOutcome::Success,
+                elapsed,
+            );
             resp
         }
         Err(err) => {
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
-            emit_access_log("POST", "/v1/audio/translations", "unknown", "unknown", &api_key_id, status, elapsed, &request_id);
-            state.metrics.record_request("unknown", "unknown", status, RequestOutcome::from_status(status), elapsed);
+            emit_access_log(
+                "POST",
+                "/v1/audio/translations",
+                "unknown",
+                "unknown",
+                &api_key_id,
+                status,
+                elapsed,
+                &request_id,
+            );
+            state.metrics.record_request(
+                "unknown",
+                "unknown",
+                status,
+                RequestOutcome::from_status(status),
+                elapsed,
+            );
             err.into_response()
         }
     }
@@ -113,15 +189,45 @@ pub async fn speech(
     match speech_dispatch(&state, &auth, body, &request_id).await {
         Ok((resp, provider)) => {
             let elapsed = started.elapsed();
-            emit_access_log("POST", "/v1/audio/speech", &model_name, &provider, &api_key_id, 200, elapsed, &request_id);
-            state.metrics.record_request(&provider, &model_name, 200, RequestOutcome::Success, elapsed);
+            emit_access_log(
+                "POST",
+                "/v1/audio/speech",
+                &model_name,
+                &provider,
+                &api_key_id,
+                200,
+                elapsed,
+                &request_id,
+            );
+            state.metrics.record_request(
+                &provider,
+                &model_name,
+                200,
+                RequestOutcome::Success,
+                elapsed,
+            );
             resp
         }
         Err(err) => {
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
-            emit_access_log("POST", "/v1/audio/speech", &model_name, "unknown", &api_key_id, status, elapsed, &request_id);
-            state.metrics.record_request("unknown", &model_name, status, RequestOutcome::from_status(status), elapsed);
+            emit_access_log(
+                "POST",
+                "/v1/audio/speech",
+                &model_name,
+                "unknown",
+                &api_key_id,
+                status,
+                elapsed,
+                &request_id,
+            );
+            state.metrics.record_request(
+                "unknown",
+                &model_name,
+                status,
+                RequestOutcome::from_status(status),
+                elapsed,
+            );
             err.into_response()
         }
     }
@@ -144,15 +250,18 @@ async fn multipart_dispatch(
     // outgoing reqwest multipart.
     let mut fields: Vec<(String, Option<String>, Option<String>, Bytes)> = Vec::new();
 
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
-        ProxyError::InvalidRequest(format!("multipart read error: {e}"))
-    })? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| ProxyError::InvalidRequest(format!("multipart read error: {e}")))?
+    {
         let name = field.name().unwrap_or("").to_string();
         let file_name = field.file_name().map(|s| s.to_string());
         let content_type = field.content_type().map(|s| s.to_string());
-        let data = field.bytes().await.map_err(|e| {
-            ProxyError::InvalidRequest(format!("multipart field read error: {e}"))
-        })?;
+        let data = field
+            .bytes()
+            .await
+            .map_err(|e| ProxyError::InvalidRequest(format!("multipart field read error: {e}")))?;
         fields.push((name, file_name, content_type, data));
     }
 
@@ -235,19 +344,23 @@ async fn multipart_dispatch(
     if !status.is_success() {
         let s = status.as_u16();
         let msg = resp.text().await.unwrap_or_default();
-        return Err(ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamStatus {
-            status: s,
-            message: msg.chars().take(1024).collect(),
-        }));
+        return Err(ProxyError::Bridge(
+            aisix_gateway::BridgeError::UpstreamStatus {
+                status: s,
+                message: msg.chars().take(1024).collect(),
+            },
+        ));
     }
 
     state.health.record_success(&model_name);
 
     // Relay response headers that matter for the client.
     let upstream_headers = resp.headers().clone();
-    let body_bytes = resp.bytes().await.map_err(|e| {
-        aisix_gateway::BridgeError::UpstreamDecode(e.to_string())
-    }).map_err(ProxyError::Bridge)?;
+    let body_bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| aisix_gateway::BridgeError::UpstreamDecode(e.to_string()))
+        .map_err(ProxyError::Bridge)?;
 
     let mut out = axum::response::Response::new(axum::body::Body::from(body_bytes));
     copy_response_header(&upstream_headers, &mut out, header::CONTENT_TYPE);
@@ -306,7 +419,7 @@ async fn speech_dispatch(
 
     let client = crate::http_client::client();
     let resp = client
-        .post(&format!("{base}/v1/audio/speech"))
+        .post(format!("{base}/v1/audio/speech"))
         .header(header::AUTHORIZATION, format!("Bearer {api_key}"))
         .header(header::CONTENT_TYPE, "application/json")
         .header("x-aisix-request-id", request_id)
@@ -320,34 +433,35 @@ async fn speech_dispatch(
     if !status.is_success() {
         let s = status.as_u16();
         let msg = resp.text().await.unwrap_or_default();
-        return Err(ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamStatus {
-            status: s,
-            message: msg.chars().take(1024).collect(),
-        }));
+        return Err(ProxyError::Bridge(
+            aisix_gateway::BridgeError::UpstreamStatus {
+                status: s,
+                message: msg.chars().take(1024).collect(),
+            },
+        ));
     }
 
     state.health.record_success(&model_name);
 
     let upstream_headers = resp.headers().clone();
-    let body_bytes = resp.bytes().await.map_err(|e| {
-        aisix_gateway::BridgeError::UpstreamDecode(e.to_string())
-    }).map_err(ProxyError::Bridge)?;
+    let body_bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| aisix_gateway::BridgeError::UpstreamDecode(e.to_string()))
+        .map_err(ProxyError::Bridge)?;
 
     let mut out = axum::response::Response::new(axum::body::Body::from(body_bytes));
     copy_response_header(&upstream_headers, &mut out, header::CONTENT_TYPE);
     Ok((out, provider_label))
 }
 
-fn copy_response_header(
-    src: &HeaderMap,
-    dst: &mut Response,
-    name: header::HeaderName,
-) {
+fn copy_response_header(src: &HeaderMap, dst: &mut Response, name: header::HeaderName) {
     if let Some(val) = src.get(&name) {
         dst.headers_mut().insert(name, val.clone());
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_access_log(
     method: &'static str,
     path: &'static str,
@@ -512,7 +626,10 @@ mod tests {
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        assert!(ct.contains("audio"), "expected audio content-type, got {ct}");
+        assert!(
+            ct.contains("audio"),
+            "expected audio content-type, got {ct}"
+        );
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         assert_eq!(&bytes[..3], b"ID3");
     }

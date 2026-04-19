@@ -83,16 +83,33 @@ pub async fn embeddings(
                 elapsed,
                 &request_id,
             );
-            state.metrics.record_request(&provider, &model_name, status, RequestOutcome::Success, elapsed);
+            state.metrics.record_request(
+                &provider,
+                &model_name,
+                status,
+                RequestOutcome::Success,
+                elapsed,
+            );
             resp
         }
         Err(err) => {
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
-            emit_access_log(&model_name, "unknown", &api_key_id, status, elapsed, &request_id);
-            state
-                .metrics
-                .record_request("unknown", &model_name, status, RequestOutcome::from_status(status), elapsed);
+            emit_access_log(
+                &model_name,
+                "unknown",
+                &api_key_id,
+                status,
+                elapsed,
+                &request_id,
+            );
+            state.metrics.record_request(
+                "unknown",
+                &model_name,
+                status,
+                RequestOutcome::from_status(status),
+                elapsed,
+            );
             err.into_response()
         }
     }
@@ -274,7 +291,9 @@ mod tests {
 
         let app = build_app(snap);
         let body = serde_json::json!({"model": "my-embed", "input": "hello world"});
-        let resp = tower::ServiceExt::oneshot(app, make_req(body)).await.unwrap();
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
@@ -300,7 +319,9 @@ mod tests {
 
         let app = build_app(snap);
         let body = serde_json::json!({"model": "my-embed", "input": ["a", "b"]});
-        let resp = tower::ServiceExt::oneshot(app, make_req(body)).await.unwrap();
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -331,7 +352,9 @@ mod tests {
 
         let app = build_app(snap);
         let body = serde_json::json!({"model": "my-embed", "input": "hi"});
-        let resp = tower::ServiceExt::oneshot(app, make_req(body)).await.unwrap();
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
@@ -342,7 +365,9 @@ mod tests {
 
         let app = build_app(snap);
         let body = serde_json::json!({"model": "nonexistent", "input": "hi"});
-        let resp = tower::ServiceExt::oneshot(app, make_req(body)).await.unwrap();
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -361,7 +386,9 @@ mod tests {
 
         let app = build_app(snap);
         let body = serde_json::json!({"model": "my-embed", "input": "hi"});
-        let resp = tower::ServiceExt::oneshot(app, make_req(body)).await.unwrap();
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

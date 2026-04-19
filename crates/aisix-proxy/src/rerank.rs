@@ -135,8 +135,7 @@ async fn dispatch(
             // Derive a sensible default base from the provider.
             model
                 .provider()
-                .map(|p| default_base_for_provider(p))
-                .flatten()
+                .and_then(default_base_for_provider)
                 .unwrap_or_else(|| "https://api.cohere.ai".to_string())
         }
     };
@@ -159,10 +158,12 @@ async fn dispatch(
     if !status.is_success() {
         let status_u16 = status.as_u16();
         let message = upstream_resp.text().await.unwrap_or_default();
-        return Err(ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamStatus {
-            status: status_u16,
-            message: message.chars().take(1024).collect(),
-        }));
+        return Err(ProxyError::Bridge(
+            aisix_gateway::BridgeError::UpstreamStatus {
+                status: status_u16,
+                message: message.chars().take(1024).collect(),
+            },
+        ));
     }
 
     state.health.record_success(&model_name);
@@ -302,26 +303,33 @@ mod tests {
         snap.apikeys.insert(apikey_entry(&["*"]));
         let app = build_app(snap);
 
-        let resp = app.oneshot(make_req(serde_json::json!({
-            "model": "no-such/model",
-            "query": "search",
-            "documents": ["doc1"]
-        }))).await.unwrap();
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "no-such/model",
+                "query": "search",
+                "documents": ["doc1"]
+            })))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn forbidden_model_returns_403() {
         let snap = AisixSnapshot::new();
-        snap.models.insert(openai_model("rerank-model", "https://api.openai.com"));
+        snap.models
+            .insert(openai_model("rerank-model", "https://api.openai.com"));
         snap.apikeys.insert(apikey_entry(&["other-model"]));
         let app = build_app(snap);
 
-        let resp = app.oneshot(make_req(serde_json::json!({
-            "model": "rerank-model",
-            "query": "search",
-            "documents": ["doc1"]
-        }))).await.unwrap();
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "rerank-model",
+                "query": "search",
+                "documents": ["doc1"]
+            })))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
@@ -337,15 +345,19 @@ mod tests {
             .await;
 
         let snap = AisixSnapshot::new();
-        snap.models.insert(openai_model("my-reranker", &upstream.uri()));
+        snap.models
+            .insert(openai_model("my-reranker", &upstream.uri()));
         snap.apikeys.insert(apikey_entry(&["*"]));
         let app = build_app(snap);
 
-        let resp = app.oneshot(make_req(serde_json::json!({
-            "model": "my-reranker",
-            "query": "search query",
-            "documents": ["doc1", "doc2"]
-        }))).await.unwrap();
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "my-reranker",
+                "query": "search query",
+                "documents": ["doc1", "doc2"]
+            })))
+            .await
+            .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         upstream.verify().await;

@@ -47,10 +47,8 @@ mod tests {
 
     #[test]
     fn deserialises_minimal_credential() {
-        let c: Credential = serde_json::from_str(
-            r#"{"name":"openai-prod","api_key":"sk-prod-xxxx"}"#,
-        )
-        .unwrap();
+        let c: Credential =
+            serde_json::from_str(r#"{"name":"openai-prod","api_key":"sk-prod-xxxx"}"#).unwrap();
         assert_eq!(c.name, "openai-prod");
         assert_eq!(c.api_key, "sk-prod-xxxx");
         assert!(c.api_base.is_none());

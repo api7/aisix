@@ -46,7 +46,14 @@ pub async fn completions(
     match dispatch(&state, &auth, body, &request_id).await {
         Ok((resp, provider)) => {
             let elapsed = started.elapsed();
-            emit_access_log(&model_name, &provider, &api_key_id, 200, elapsed, &request_id);
+            emit_access_log(
+                &model_name,
+                &provider,
+                &api_key_id,
+                200,
+                elapsed,
+                &request_id,
+            );
             state.metrics.record_request(
                 &provider,
                 &model_name,
@@ -59,7 +66,14 @@ pub async fn completions(
         Err(err) => {
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
-            emit_access_log(&model_name, "unknown", &api_key_id, status, elapsed, &request_id);
+            emit_access_log(
+                &model_name,
+                "unknown",
+                &api_key_id,
+                status,
+                elapsed,
+                &request_id,
+            );
             state.metrics.record_request(
                 "unknown",
                 &model_name,
@@ -237,7 +251,9 @@ mod tests {
 
         let app = build_app(snap);
         let body = serde_json::json!({"model": "instruct", "prompt": "Say this"});
-        let resp = tower::ServiceExt::oneshot(app, make_req(body)).await.unwrap();
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
@@ -273,7 +289,9 @@ mod tests {
 
         let app = build_app(snap);
         let body = serde_json::json!({"model": "instruct", "prompt": "hi"});
-        let resp = tower::ServiceExt::oneshot(app, make_req(body)).await.unwrap();
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
@@ -284,7 +302,9 @@ mod tests {
 
         let app = build_app(snap);
         let body = serde_json::json!({"model": "nonexistent", "prompt": "hi"});
-        let resp = tower::ServiceExt::oneshot(app, make_req(body)).await.unwrap();
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -303,7 +323,9 @@ mod tests {
 
         let app = build_app(snap);
         let body = serde_json::json!({"model": "instruct", "prompt": "hi"});
-        let resp = tower::ServiceExt::oneshot(app, make_req(body)).await.unwrap();
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 }

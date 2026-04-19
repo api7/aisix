@@ -90,9 +90,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_top_level_fields() {
-        let r: Result<Team, _> = serde_json::from_str(
-            r#"{"name":"x","members":[],"rogue": true}"#,
-        );
+        let r: Result<Team, _> = serde_json::from_str(r#"{"name":"x","members":[],"rogue": true}"#);
         assert!(r.is_err(), "should reject unknown fields");
     }
 

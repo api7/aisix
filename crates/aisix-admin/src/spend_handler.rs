@@ -41,10 +41,7 @@ pub struct SpendResponse {
     pub entries: Vec<SpendEntry>,
 }
 
-pub async fn get_spend(
-    _auth: AdminAuth,
-    State(state): State<AdminState>,
-) -> Json<SpendResponse> {
+pub async fn get_spend(_auth: AdminAuth, State(state): State<AdminState>) -> Json<SpendResponse> {
     let period = Utc::now().format("%Y-%m").to_string();
 
     let tracker = match &state.budget_tracker {

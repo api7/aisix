@@ -27,8 +27,8 @@ pub mod sse;
 
 pub use bridge::{Bridge, BridgeContext, BridgeError, ChatChunkStream};
 pub use chat::{
-    ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject,
-    EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, FinishReason, Role, UsageStats,
+    ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest,
+    EmbeddingResponse, EmbeddingUsage, FinishReason, Role, UsageStats,
 };
 pub use hub::Hub;
 pub use sse::{SseDecoder, SseEvent};

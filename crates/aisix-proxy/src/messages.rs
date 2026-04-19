@@ -40,7 +40,6 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Default Anthropic base URL used when `api_base` is not set on the Model.
 const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
 
-
 pub async fn messages(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
@@ -133,10 +132,7 @@ async fn dispatch(
         )));
     }
 
-    let api_key = model
-        .provider_config
-        .api_key
-        .as_str();
+    let api_key = model.provider_config.api_key.as_str();
 
     if api_key.is_empty() {
         return Err(ProxyError::Bridge(aisix_gateway::BridgeError::Config(
@@ -177,23 +173,27 @@ async fn dispatch(
         .header("x-aisix-request-id", request_id)
         .json(body);
 
-    let upstream_resp = req_builder.send().await.map_err(|e| {
-        aisix_gateway::BridgeError::Transport(e.to_string())
-    }).map_err(ProxyError::Bridge)?;
+    let upstream_resp = req_builder
+        .send()
+        .await
+        .map_err(|e| aisix_gateway::BridgeError::Transport(e.to_string()))
+        .map_err(ProxyError::Bridge)?;
 
     let status = upstream_resp.status();
 
     if !status.is_success() {
         let status_u16 = status.as_u16();
         let message = upstream_resp.text().await.unwrap_or_default();
-        return Err(ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamStatus {
-            status: status_u16,
-            message: if message.len() > 1024 {
-                format!("{}…", &message[..1024])
-            } else {
-                message
+        return Err(ProxyError::Bridge(
+            aisix_gateway::BridgeError::UpstreamStatus {
+                status: status_u16,
+                message: if message.len() > 1024 {
+                    format!("{}…", &message[..1024])
+                } else {
+                    message
+                },
             },
-        }));
+        ));
     }
 
     // Update health tracker on success.
@@ -207,17 +207,15 @@ async fn dispatch(
         let headers = upstream_resp.headers().clone();
         let body_stream = upstream_resp.bytes_stream();
 
-        let mut response = axum::response::Response::new(
-            axum::body::Body::from_stream(body_stream),
-        );
+        let mut response =
+            axum::response::Response::new(axum::body::Body::from_stream(body_stream));
 
         // Copy content-type from upstream (should be text/event-stream).
         if let Some(ct) = headers.get("content-type") {
             if let Ok(hv) = HeaderValue::from_bytes(ct.as_bytes()) {
-                response.headers_mut().insert(
-                    axum::http::header::CONTENT_TYPE,
-                    hv,
-                );
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, hv);
             }
         }
         // Set cache-control to no-cache for SSE.
@@ -227,10 +225,9 @@ async fn dispatch(
         );
         // Expose the request-id header.
         if let Ok(hv) = HeaderValue::from_str(request_id) {
-            response.headers_mut().insert(
-                HeaderName::from_static("x-aisix-request-id"),
-                hv,
-            );
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static("x-aisix-request-id"), hv);
         }
 
         Ok((response, provider_label))
@@ -239,9 +236,7 @@ async fn dispatch(
         let json_body: Value = upstream_resp
             .json()
             .await
-            .map_err(|e| {
-                aisix_gateway::BridgeError::UpstreamDecode(e.to_string())
-            })
+            .map_err(|e| aisix_gateway::BridgeError::UpstreamDecode(e.to_string()))
             .map_err(ProxyError::Bridge)?;
 
         // Restore the gateway-facing model name so callers see what they asked for.
@@ -377,9 +372,7 @@ mod tests {
             .and(path("/v1/messages"))
             .and(header("x-api-key", "sk-ant-test"))
             .and(header("anthropic-version", "2023-06-01"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(anthropic_response()),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
             .mount(&upstream)
             .await;
 
@@ -409,9 +402,7 @@ mod tests {
         // Expect upstream receives "claude-3-5-haiku-20241022" (no prefix).
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(anthropic_response()),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
             .mount(&upstream)
             .await;
 
@@ -489,8 +480,7 @@ mod tests {
     #[tokio::test]
     async fn non_anthropic_model_returns_400() {
         let snap = AisixSnapshot::new();
-        snap.models
-            .insert(openai_model("gpt-4o", "http://unused"));
+        snap.models.insert(openai_model("gpt-4o", "http://unused"));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);
