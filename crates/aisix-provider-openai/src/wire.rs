@@ -11,7 +11,8 @@
 //!    from upstream but don't invent params.
 
 use aisix_gateway::{
-    ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, FinishReason, Role, UsageStats,
+    ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest,
+    EmbeddingResponse, EmbeddingUsage, FinishReason, Role, UsageStats,
 };
 use serde::{Deserialize, Serialize};
 
@@ -210,6 +211,77 @@ pub(crate) fn stream_chunk_into_chat_chunk(mut raw: OpenAiStreamChunk) -> ChatCh
         delta,
         finish_reason: finish,
         usage: raw.usage.map(into_usage),
+    }
+}
+
+// ─── Embeddings wire types ────────────────────────────────────────────────────
+
+/// Request body forwarded to OpenAI `/v1/embeddings`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct OpenAiEmbedRequest<'a> {
+    pub model: &'a str,
+    pub input: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding_format: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<u32>,
+}
+
+/// One embedding object from OpenAI's response.
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenAiEmbeddingObject {
+    pub index: u32,
+    pub object: String,
+    pub embedding: Vec<f32>,
+}
+
+/// Usage block from OpenAI's embeddings response.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct OpenAiEmbedUsage {
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
+}
+
+/// Full response body from OpenAI `/v1/embeddings`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct OpenAiEmbedResponse {
+    pub object: String,
+    pub model: String,
+    pub data: Vec<OpenAiEmbeddingObject>,
+    #[serde(default)]
+    pub usage: Option<OpenAiEmbedUsage>,
+}
+
+pub(crate) fn embed_request_body<'a>(
+    req: &'a EmbeddingRequest,
+    upstream_model: &'a str,
+) -> OpenAiEmbedRequest<'a> {
+    OpenAiEmbedRequest {
+        model: upstream_model,
+        input: &req.input,
+        encoding_format: req.encoding_format.as_deref(),
+        dimensions: req.dimensions,
+    }
+}
+
+pub(crate) fn embed_response_into(raw: OpenAiEmbedResponse) -> EmbeddingResponse {
+    let usage = raw.usage.unwrap_or_default();
+    EmbeddingResponse {
+        object: raw.object,
+        model: raw.model,
+        data: raw
+            .data
+            .into_iter()
+            .map(|e| EmbeddingObject {
+                index: e.index,
+                object: e.object,
+                embedding: e.embedding,
+            })
+            .collect(),
+        usage: EmbeddingUsage {
+            prompt_tokens: usage.prompt_tokens,
+            total_tokens: usage.total_tokens,
+        },
     }
 }
 

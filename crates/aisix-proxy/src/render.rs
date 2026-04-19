@@ -113,6 +113,61 @@ pub fn render_chunk(created_unix_ts: i64, chunk: ChatChunk) -> ChatCompletionChu
     }
 }
 
+/// Inject the `x-ratelimit-*` response headers that OpenAI SDK clients
+/// read for back-pressure / progress reporting.
+///
+/// Only headers with a configured limit (non-`None`) are injected;
+/// endpoints or keys that have no limit set don't emit anything — the
+/// client should not assume absence means unlimited when it sees nothing.
+pub fn inject_ratelimit_headers(
+    response: &mut axum::response::Response,
+    status: &aisix_ratelimit::RateLimitStatus,
+) {
+    use axum::http::HeaderValue;
+
+    let headers = response.headers_mut();
+
+    macro_rules! set_header {
+        ($name:expr, $value:expr) => {
+            if let Ok(v) = HeaderValue::try_from($value.to_string()) {
+                headers.insert($name, v);
+            }
+        };
+    }
+
+    if let Some(lim) = status.rpm_limit {
+        set_header!("x-ratelimit-limit-requests", lim);
+        set_header!(
+            "x-ratelimit-remaining-requests",
+            status.rpm_remaining().unwrap_or(0)
+        );
+        set_header!(
+            "x-ratelimit-reset-requests",
+            format!("{}s", status.rpm_reset_secs)
+        );
+    }
+
+    if let Some(lim) = status.tpm_limit {
+        set_header!("x-ratelimit-limit-tokens", lim);
+        set_header!(
+            "x-ratelimit-remaining-tokens",
+            status.tpm_remaining().unwrap_or(0)
+        );
+        set_header!(
+            "x-ratelimit-reset-tokens",
+            format!("{}s", status.tpm_reset_secs)
+        );
+    }
+
+    if let Some(lim) = status.concurrency_limit {
+        set_header!("x-ratelimit-limit-concurrent", lim);
+        set_header!(
+            "x-ratelimit-remaining-concurrent",
+            lim.saturating_sub(status.in_flight)
+        );
+    }
+}
+
 fn role_to_str(role: Role) -> &'static str {
     match role {
         Role::System => "system",

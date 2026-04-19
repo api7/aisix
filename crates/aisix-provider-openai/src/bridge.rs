@@ -21,7 +21,7 @@
 
 use aisix_gateway::{
     Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatFormat, ChatResponse,
-    SseDecoder, SseEvent,
+    EmbeddingRequest, EmbeddingResponse, SseDecoder, SseEvent,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -29,8 +29,9 @@ use reqwest::{header, Client, StatusCode};
 use std::time::{Duration, Instant};
 
 use crate::wire::{
-    build_request, messages_from, response_into_chat_response, stream_chunk_into_chat_chunk,
-    OpenAiResponse, OpenAiStreamChunk,
+    build_request, embed_request_body, embed_response_into, messages_from,
+    response_into_chat_response, stream_chunk_into_chat_chunk, OpenAiEmbedResponse, OpenAiResponse,
+    OpenAiStreamChunk,
 };
 
 /// Fallback OpenAI host used when the Model doesn't set `api_base` and
@@ -181,6 +182,138 @@ impl Bridge for OpenAiBridge {
                 .await
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
             Ok(response_into_chat_response(parsed))
+        })
+        .await
+    }
+
+    async fn embed(
+        &self,
+        req: &EmbeddingRequest,
+        ctx: &BridgeContext,
+    ) -> Result<EmbeddingResponse, BridgeError> {
+        let model = ctx.model.as_ref();
+        let base = resolve_base(model);
+        let key = api_key(model)?;
+        let upstream = upstream_model(model)?;
+
+        let body = embed_request_body(req, upstream);
+        let url = format!("{base}/embeddings");
+        let client = self.client.clone();
+        let started = Instant::now();
+        let request_id = ctx.request_id.clone();
+
+        with_deadline(ctx.deadline, started, async move {
+            let resp = client
+                .post(&url)
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-aisix-request-id", &request_id)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(map_http_error(status, resp).await);
+            }
+
+            let parsed: OpenAiEmbedResponse = resp
+                .json()
+                .await
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            Ok(embed_response_into(parsed))
+        })
+        .await
+    }
+
+    async fn complete(
+        &self,
+        body: &serde_json::Value,
+        ctx: &BridgeContext,
+    ) -> Result<serde_json::Value, BridgeError> {
+        let model = ctx.model.as_ref();
+        let base = resolve_base(model);
+        let key = api_key(model)?;
+        let upstream = upstream_model(model)?;
+
+        // Replace the `model` field with the upstream provider id.
+        let mut outbound = body.clone();
+        if let Some(obj) = outbound.as_object_mut() {
+            obj.insert("model".to_string(), serde_json::Value::String(upstream.to_string()));
+        }
+
+        let url = format!("{base}/completions");
+        let client = self.client.clone();
+        let started = Instant::now();
+        let request_id = ctx.request_id.clone();
+
+        with_deadline(ctx.deadline, started, async move {
+            let resp = client
+                .post(&url)
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-aisix-request-id", &request_id)
+                .json(&outbound)
+                .send()
+                .await
+                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(map_http_error(status, resp).await);
+            }
+
+            resp.json::<serde_json::Value>()
+                .await
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
+        })
+        .await
+    }
+
+    async fn generate_image(
+        &self,
+        body: &serde_json::Value,
+        ctx: &BridgeContext,
+    ) -> Result<serde_json::Value, BridgeError> {
+        let model = ctx.model.as_ref();
+        let base = resolve_base(model);
+        let key = api_key(model)?;
+        let upstream = upstream_model(model)?;
+
+        // Replace the `model` field with the upstream provider id.
+        let mut outbound = body.clone();
+        if let Some(obj) = outbound.as_object_mut() {
+            obj.insert(
+                "model".to_string(),
+                serde_json::Value::String(upstream.to_string()),
+            );
+        }
+
+        let url = format!("{base}/images/generations");
+        let client = self.client.clone();
+        let started = Instant::now();
+        let request_id = ctx.request_id.clone();
+
+        with_deadline(ctx.deadline, started, async move {
+            let resp = client
+                .post(&url)
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-aisix-request-id", &request_id)
+                .json(&outbound)
+                .send()
+                .await
+                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(map_http_error(status, resp).await);
+            }
+
+            resp.json::<serde_json::Value>()
+                .await
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
         })
         .await
     }

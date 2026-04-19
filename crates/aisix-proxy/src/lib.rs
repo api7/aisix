@@ -25,26 +25,59 @@
 #![deny(rust_2018_idioms)]
 
 mod auth;
+pub mod budget;
 mod chat;
+mod audio;
+mod completions;
+mod embeddings;
 mod error;
+pub mod health;
+mod http_client;
+mod images;
+mod messages;
+mod models;
+mod passthrough;
+mod rerank;
 mod render;
+mod responses;
 mod routing;
 mod state;
 
 pub use auth::AuthenticatedKey;
 pub use error::{ErrorEnvelope, ProxyError};
+pub use health::HealthTracker;
 pub use state::ProxyState;
 
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{http::StatusCode, Json, Router};
 use serde_json::json;
 
 /// Build the proxy router. Mounts `/health` plus the
-/// OpenAI-compatible chat-completions surface.
+/// OpenAI-compatible proxy surface.
 pub fn build_router(state: ProxyState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/v1/models", get(models::list_models))
         .route("/v1/chat/completions", post(chat::chat_completions))
+        .route("/v1/completions", post(completions::completions))
+        .route("/v1/embeddings", post(embeddings::embeddings))
+        .route("/v1/images/generations", post(images::image_generations))
+        .route("/v1/messages", post(messages::messages))
+        .route("/v1/rerank", post(rerank::rerank))
+        .route("/v1/responses", post(responses::responses))
+        .route(
+            "/v1/audio/transcriptions",
+            post(audio::transcriptions),
+        )
+        .route(
+            "/v1/audio/translations",
+            post(audio::translations),
+        )
+        .route("/v1/audio/speech", post(audio::speech))
+        .route(
+            "/passthrough/:provider/*rest",
+            any(passthrough::passthrough),
+        )
         .with_state(state)
 }
 
@@ -946,6 +979,74 @@ data: [DONE]\n\n";
     }
 
     #[tokio::test]
+    async fn ratelimit_response_headers_are_injected_on_success() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot_with_limits(
+            "my-gpt4",
+            &["my-gpt4"],
+            &upstream.uri(),
+            serde_json::json!({"rpm": 100, "tpm": 50000}),
+        );
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let headers = resp.headers();
+        assert!(
+            headers.contains_key("x-ratelimit-limit-requests"),
+            "missing x-ratelimit-limit-requests"
+        );
+        assert_eq!(
+            headers.get("x-ratelimit-limit-requests").and_then(|v| v.to_str().ok()),
+            Some("100"),
+        );
+        assert!(
+            headers.contains_key("x-ratelimit-limit-tokens"),
+            "missing x-ratelimit-limit-tokens"
+        );
+        assert_eq!(
+            headers.get("x-ratelimit-limit-tokens").and_then(|v| v.to_str().ok()),
+            Some("50000"),
+        );
+        // Remaining should be limit - 1 (one request consumed).
+        assert_eq!(
+            headers.get("x-ratelimit-remaining-requests")
+                   .and_then(|v| v.to_str().ok()),
+            Some("99"),
+        );
+    }
+
+    #[tokio::test]
     async fn input_guardrail_block_returns_422_and_skips_upstream() {
         use aisix_guardrails::{GuardrailChain, KeywordBlocklist, KeywordRule};
 
@@ -1039,5 +1140,121 @@ data: [DONE]\n\n";
         let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "content_filter");
+    }
+
+    #[tokio::test]
+    async fn budget_exceeded_returns_429() {
+        use aisix_core::Budget;
+
+        // Wiremock should NOT be hit — the budget check fires before dispatch.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0) // hard expectation: budget blocks before upstream
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+
+        // Budget entity caps "key-id-1" at $1 / month.
+        let budget: Budget = serde_json::from_str(r#"{
+            "name": "test-budget",
+            "api_key_id": "key-id-1",
+            "monthly_usd_cap": 1.0,
+            "usd_per_1k_tokens": 0.005
+        }"#).unwrap();
+        let budget_entry = ResourceEntry::new("b-1", budget, 1);
+
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        snap.budgets.insert(budget_entry);
+
+        let state = build_state(snap, hub);
+        // Simulate previous spend that already hit the cap.
+        state.budgets.add("key-id-1", 1.5); // $1.50 > $1.00 cap
+
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "budget_exceeded");
+    }
+
+    #[tokio::test]
+    async fn budget_accumulates_cost_on_success() {
+        use aisix_core::Budget;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+
+        // Budget at $100 cap — won't be exceeded.
+        let budget: Budget = serde_json::from_str(r#"{
+            "name": "test-budget",
+            "api_key_id": "key-id-1",
+            "monthly_usd_cap": 100.0,
+            "usd_per_1k_tokens": 0.005
+        }"#).unwrap();
+        let budget_entry = ResourceEntry::new("b-1", budget, 1);
+
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        snap.budgets.insert(budget_entry);
+
+        let state = build_state(snap, hub);
+        let budgets = state.budgets.clone();
+        assert_eq!(budgets.spend("key-id-1"), 0.0); // starts at zero
+
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 15 tokens × $0.005 / 1k = $0.000075
+        let expected = 15.0 * 0.005 / 1000.0;
+        let spend = budgets.spend("key-id-1");
+        assert!(
+            (spend - expected).abs() < 1e-9,
+            "expected {expected} USD spend, got {spend}"
+        );
     }
 }

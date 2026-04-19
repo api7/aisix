@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use std::time::Duration;
 
-use crate::chat::{ChatChunk, ChatFormat, ChatResponse};
+use crate::chat::{ChatChunk, ChatFormat, ChatResponse, EmbeddingRequest, EmbeddingResponse};
 
 /// Context carried through the whole request lifecycle.
 ///
@@ -135,6 +135,56 @@ pub trait Bridge: Send + Sync + 'static {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError>;
+
+    /// Embedding call: text(s) → float vectors. Providers that do not
+    /// support embeddings return [`BridgeError::Config`] with a clear
+    /// message so the proxy can surface a 501 rather than a 502.
+    async fn embed(
+        &self,
+        _req: &EmbeddingRequest,
+        _ctx: &BridgeContext,
+    ) -> Result<EmbeddingResponse, BridgeError> {
+        Err(BridgeError::Config(
+            "this provider does not support embeddings".into(),
+        ))
+    }
+
+    /// Legacy text completions passthrough (`/v1/completions`).
+    ///
+    /// The request body JSON is forwarded verbatim after replacing the
+    /// `model` field with the upstream provider model id. The response
+    /// body JSON is returned as-is from the upstream so format differences
+    /// between providers are the caller's responsibility.
+    ///
+    /// Providers that do not expose a `/completions` endpoint should keep
+    /// the default, which returns a 501-mapped [`BridgeError::Config`].
+    async fn complete(
+        &self,
+        _body: &serde_json::Value,
+        _ctx: &BridgeContext,
+    ) -> Result<serde_json::Value, BridgeError> {
+        Err(BridgeError::Config(
+            "this provider does not support text completions".into(),
+        ))
+    }
+
+    /// Image generation passthrough (`/v1/images/generations`).
+    ///
+    /// The request body JSON is forwarded verbatim after replacing the
+    /// `model` field with the upstream provider model id. The response
+    /// body JSON is returned as-is from the upstream.
+    ///
+    /// Providers that do not expose an image generation endpoint should keep
+    /// the default, which returns a 501-mapped [`BridgeError::Config`].
+    async fn generate_image(
+        &self,
+        _body: &serde_json::Value,
+        _ctx: &BridgeContext,
+    ) -> Result<serde_json::Value, BridgeError> {
+        Err(BridgeError::Config(
+            "this provider does not support image generation".into(),
+        ))
+    }
 }
 
 #[cfg(test)]

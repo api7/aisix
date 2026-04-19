@@ -85,14 +85,18 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // behind the same trait object once their PRs land.
     let cache: Option<Arc<dyn Cache>> = Some(Arc::new(MemoryCache::with_defaults()));
 
-    let proxy_router = aisix_proxy::build_router(ProxyState::with_components(
+    let proxy_state = ProxyState::with_components(
         snapshot_handle.clone(),
         hub.clone(),
         limiter.clone(),
         metrics.clone(),
         cache.clone(),
         &cfg.proxy,
-    ));
+    );
+    // Clone shared trackers before consuming proxy_state in build_router.
+    let budget_tracker = proxy_state.budgets.clone();
+    let health_tracker = proxy_state.health.clone();
+    let proxy_router = aisix_proxy::build_router(proxy_state);
 
     // Admin CRUD writes through etcd. The watch supervisor's read path
     // is on a separate client (see above) so a long range scan during a
@@ -102,7 +106,16 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let admin_store: Arc<dyn ConfigStore> =
         Arc::new(EtcdConfigStore::new(admin_client, cfg.etcd.prefix.clone()));
     let admin_state = AdminState::new(snapshot_handle.clone(), admin_store, &cfg.admin)
-        .with_metrics(metrics.clone());
+        .with_metrics(metrics.clone())
+        // Share the in-process budget tracker so /admin/v1/spend reports
+        // live current-month spend without a database round-trip.
+        .with_budget_tracker(budget_tracker)
+        // Share the health tracker so /admin/v1/health reflects live
+        // per-model upstream failure counts.
+        .with_health_tracker(health_tracker)
+        // Share the proxy router so the playground endpoint can forward
+        // requests in-process without an extra network hop.
+        .with_proxy_router(proxy_router.clone());
     let admin_router = aisix_admin::build_router(admin_state);
 
     // Step 9: bind + serve.

@@ -31,7 +31,12 @@ async-trait.workspace = true
 dashmap.workspace = true
 etcd-client.workspace = true
 aisix-obs = { path = "../aisix-obs" }
+chrono.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
 testcontainers.workspace = true
+aisix-gateway = { path = "../aisix-gateway" }
+aisix-provider-openai = { path = "../aisix-provider-openai" }
+aisix-core = { path = "../aisix-core" }
+wiremock.workspace = true

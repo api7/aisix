@@ -177,6 +177,52 @@ pub struct ChatDelta {
     pub content: Option<String>,
 }
 
+// ─── Embeddings ──────────────────────────────────────────────────────────────
+
+/// Single embedding object as returned by a provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingObject {
+    pub index: u32,
+    pub object: String,
+    pub embedding: Vec<f32>,
+}
+
+/// Normalised embedding request.
+///
+/// The `input` is either a single string or a list of strings. We
+/// represent both as `Vec<String>` — single-string inputs are wrapped in
+/// a one-element vec by the proxy handler before passing to a Bridge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingRequest {
+    /// The public-facing model name (resolved to an upstream model by the
+    /// proxy before the Bridge sees it).
+    pub model: String,
+    /// Texts to embed. A single-string input is normalised to
+    /// `vec![text]` by the proxy handler.
+    pub input: Vec<String>,
+    /// Optional encoding hint forwarded verbatim (`float` / `base64`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding_format: Option<String>,
+    /// Optional dimensions hint forwarded verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<u32>,
+}
+
+/// Normalised embedding response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingResponse {
+    pub object: String,
+    pub model: String,
+    pub data: Vec<EmbeddingObject>,
+    pub usage: EmbeddingUsage,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EmbeddingUsage {
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

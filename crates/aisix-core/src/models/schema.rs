@@ -24,6 +24,9 @@ use thiserror::Error;
 pub struct Schemas {
     pub model: Validator,
     pub apikey: Validator,
+    pub credential: Validator,
+    pub budget: Validator,
+    pub team: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile()));
@@ -37,6 +40,15 @@ impl Schemas {
             apikey: jsonschema::options()
                 .build(&apikey_schema())
                 .expect("apikey schema is well-formed"),
+            credential: jsonschema::options()
+                .build(&credential_schema())
+                .expect("credential schema is well-formed"),
+            budget: jsonschema::options()
+                .build(&budget_schema())
+                .expect("budget schema is well-formed"),
+            team: jsonschema::options()
+                .build(&team_schema())
+                .expect("team schema is well-formed"),
         }
     }
 }
@@ -67,6 +79,18 @@ pub fn validate_model(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_apikey(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.apikey, value)
+}
+
+pub fn validate_credential(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.credential, value)
+}
+
+pub fn validate_budget(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.budget, value)
+}
+
+pub fn validate_team(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.team, value)
 }
 
 fn model_schema() -> Value {
@@ -146,6 +170,66 @@ fn apikey_schema() -> Value {
                 "type": "array",
                 "items": { "type": "string" }
             },
+            "rate_limit": { "$ref": "#/$defs/rate_limit" }
+        },
+        "$defs": {
+            "rate_limit": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "tpm":         { "type": "integer", "minimum": 0 },
+                    "tpd":         { "type": "integer", "minimum": 0 },
+                    "rpm":         { "type": "integer", "minimum": 0 },
+                    "rpd":         { "type": "integer", "minimum": 0 },
+                    "concurrency": { "type": "integer", "minimum": 0 }
+                }
+            }
+        }
+    })
+}
+
+fn credential_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["name", "api_key"],
+        "additionalProperties": false,
+        "properties": {
+            "name":     { "type": "string", "minLength": 1 },
+            "api_key":  { "type": "string", "minLength": 1 },
+            "api_base": { "type": "string" }
+        }
+    })
+}
+
+fn budget_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["name", "api_key_id", "monthly_usd_cap", "usd_per_1k_tokens"],
+        "additionalProperties": false,
+        "properties": {
+            "name":              { "type": "string", "minLength": 1 },
+            "api_key_id":        { "type": "string", "minLength": 1 },
+            "monthly_usd_cap":   { "type": "number", "exclusiveMinimum": 0 },
+            "usd_per_1k_tokens": { "type": "number", "minimum": 0 }
+        }
+    })
+}
+
+fn team_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["name"],
+        "additionalProperties": false,
+        "properties": {
+            "name":      { "type": "string", "minLength": 1 },
+            "members":   {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 }
+            },
+            "budget_id": { "type": "string", "minLength": 1 },
             "rate_limit": { "$ref": "#/$defs/rate_limit" }
         },
         "$defs": {
