@@ -74,6 +74,8 @@ pub enum ProxyError {
     ProviderUnavailable,
     #[error("content blocked by policy: {0}")]
     ContentFiltered(String),
+    #[error("budget exceeded for ApiKey {0:?}")]
+    BudgetExceeded(String),
     #[error(transparent)]
     RateLimit(#[from] RateLimitError),
     #[error(transparent)]
@@ -89,6 +91,7 @@ impl ProxyError {
             ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::ContentFiltered(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::Bridge(b) => {
                 StatusCode::from_u16(b.http_status()).unwrap_or(StatusCode::BAD_GATEWAY)
@@ -104,6 +107,7 @@ impl ProxyError {
             ProxyError::InvalidRequest(_) => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
             ProxyError::ContentFiltered(_) => "content_filter",
+            ProxyError::BudgetExceeded(_) => "budget_exceeded",
             ProxyError::RateLimit(_) => "rate_limit_exceeded",
             ProxyError::Bridge(b) => b.error_type(),
         }

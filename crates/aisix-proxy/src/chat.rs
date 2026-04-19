@@ -56,7 +56,7 @@ pub async fn chat_completions(
     let outcome = dispatch(&state, &auth, &req, &request_id).await;
 
     match outcome {
-        Ok(success) => {
+        Ok(mut success) => {
             let status = 200;
             let elapsed = started.elapsed();
             record_success(
@@ -80,6 +80,17 @@ pub async fn chat_completions(
                 success.total_tokens,
                 &request_id,
             );
+            // Inject x-ratelimit-* headers so OpenAI SDK clients see the
+            // current window state. We peek *after* the commit so
+            // remaining-requests reflects the post-dispatch tally.
+            let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
+            if let Some(rl_status) = state.limiter.peek(&api_key_id, &rl_limits) {
+                crate::render::inject_ratelimit_headers(&mut success.response, &rl_status);
+            }
+            // Correlation / routing headers.
+            if let Ok(v) = axum::http::HeaderValue::try_from(request_id.as_str()) {
+                success.response.headers_mut().insert("x-aisix-call-id", v);
+            }
             success.response
         }
         Err(err) => {
@@ -142,6 +153,24 @@ async fn dispatch(
     // count against quota.
     if let GuardrailVerdict::Block { reason } = state.guardrails.check_input(req).await {
         return Err(ProxyError::ContentFiltered(reason));
+    }
+
+    // Budget pre-check. Refuse if the previous request already pushed
+    // monthly spend past the cap. Mid-request overshoot is bounded by
+    // one request worth of tokens — acceptable for V1; a future
+    // pre-debit-by-prompt-tokens-only mode can tighten it.
+    let budget_for_key = snapshot
+        .budgets
+        .entries()
+        .into_iter()
+        .find(|b| b.value.api_key_id == auth.entry.id);
+    if let Some(b) = budget_for_key.as_ref() {
+        if state
+            .budgets
+            .would_exceed(&auth.entry.id, b.value.monthly_usd_cap)
+        {
+            return Err(ProxyError::BudgetExceeded(auth.entry.id.clone()));
+        }
     }
 
     // Resolve the attempt-list of underlying Model entries. For a
@@ -279,6 +308,7 @@ async fn dispatch(
 
         match bridge.chat(req, &ctx).await {
             Ok(resp) => {
+                state.health.record_success(&model.name);
                 chosen_provider = Some(format!("{provider:?}").to_lowercase());
                 upstream = Some(resp);
                 break;
@@ -290,6 +320,11 @@ async fn dispatch(
                     retryable = is_retryable(&err),
                     "routing target attempt failed",
                 );
+                // Only retryable (server-side) errors indicate deployment
+                // health deterioration; 4xx are caller mistakes.
+                if is_retryable(&err) {
+                    state.health.record_failure(&model.name);
+                }
                 if !is_retryable(&err) {
                     last_err = Some(err);
                     break;
@@ -316,6 +351,14 @@ async fn dispatch(
     let completion = upstream.usage.completion_tokens as u64;
     let total = upstream.usage.total_tokens as u64;
     reservation.commit_tokens(total);
+
+    // Budget post-deduct. Add the actual cost; doesn't gate the
+    // current response (we already paid for it) but shapes future
+    // pre-checks within the same calendar month.
+    if let Some(b) = budget_for_key.as_ref() {
+        let cost = b.value.cost_for(total);
+        state.budgets.add(&auth.entry.id, cost);
+    }
 
     if let GuardrailVerdict::Block { reason } = state.guardrails.check_output(&upstream).await {
         return Err(ProxyError::ContentFiltered(reason));

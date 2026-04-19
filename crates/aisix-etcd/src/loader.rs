@@ -11,7 +11,10 @@
 //! this matches spec §2: "the gateway does not abort on a single bad
 //! entry; it serves the rest."
 
-use aisix_core::models::{validate_apikey, validate_model, ApiKey, Model, SchemaError};
+use aisix_core::models::{
+    validate_apikey, validate_budget, validate_credential, validate_model, ApiKey, Budget,
+    Credential, Model, SchemaError,
+};
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
 use serde::de::DeserializeOwned;
@@ -79,6 +82,30 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     &mut stats,
                 ) {
                     snapshot.apikeys.insert(entry);
+                }
+            }
+            "credentials" => {
+                if let Some(entry) = validate_and_parse::<Credential>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_credential,
+                    &mut stats,
+                ) {
+                    snapshot.credentials.insert(entry);
+                }
+            }
+            "budgets" => {
+                if let Some(entry) = validate_and_parse::<Budget>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_budget,
+                    &mut stats,
+                ) {
+                    snapshot.budgets.insert(entry);
                 }
             }
             other => {

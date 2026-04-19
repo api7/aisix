@@ -4,11 +4,14 @@
 //! coherent rebuild (compaction, initial load) and atomically swaps it into
 //! a [`SnapshotHandle<AisixSnapshot>`]. The data plane only sees the handle.
 //!
-//! Later entities (`Team`, `Budget`, `Guardrail`, …) will be added here as
-//! their feature PRs land.
+//! Tables grow as feature PRs add entities: Model + ApiKey landed first;
+//! Credential + Budget arrived with PR #19; Team / Guardrail will follow.
 
 use super::apikey::ApiKey;
+use super::budget::Budget;
+use super::credential::Credential;
 use super::model::Model;
+use super::team::Team;
 use crate::snapshot::ResourceTable;
 
 /// Composite of every typed [`ResourceTable`] the gateway reads on the hot
@@ -17,6 +20,9 @@ use crate::snapshot::ResourceTable;
 pub struct AisixSnapshot {
     pub models: ResourceTable<Model>,
     pub apikeys: ResourceTable<ApiKey>,
+    pub credentials: ResourceTable<Credential>,
+    pub budgets: ResourceTable<Budget>,
+    pub teams: ResourceTable<Team>,
 }
 
 impl AisixSnapshot {
@@ -27,7 +33,11 @@ impl AisixSnapshot {
     /// Convenience: total entry count across all tables. Handy for debug /
     /// readiness checks.
     pub fn total_entries(&self) -> usize {
-        self.models.len() + self.apikeys.len()
+        self.models.len()
+            + self.apikeys.len()
+            + self.credentials.len()
+            + self.budgets.len()
+            + self.teams.len()
     }
 }
 
@@ -52,30 +62,46 @@ mod tests {
             .unwrap()
     }
 
+    fn sample_credential() -> Credential {
+        serde_json::from_str(r#"{"name":"openai-prod","api_key":"sk-prod"}"#).unwrap()
+    }
+
+    fn sample_budget() -> Budget {
+        serde_json::from_str(
+            r#"{"name":"team-a","api_key_id":"k-1","monthly_usd_cap":50.0,"usd_per_1k_tokens":0.005}"#,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn empty_snapshot_has_no_entries() {
         let s = AisixSnapshot::new();
         assert_eq!(s.total_entries(), 0);
         assert!(s.models.is_empty());
         assert!(s.apikeys.is_empty());
+        assert!(s.credentials.is_empty());
+        assert!(s.budgets.is_empty());
     }
 
     #[test]
-    fn tables_are_independent() {
+    fn all_four_tables_are_independent() {
         let s = AisixSnapshot::new();
         s.models
             .insert(ResourceEntry::new("m-1", sample_model(), 1));
         s.apikeys
             .insert(ResourceEntry::new("k-1", sample_apikey(), 1));
+        s.credentials
+            .insert(ResourceEntry::new("c-1", sample_credential(), 1));
+        s.budgets
+            .insert(ResourceEntry::new("b-1", sample_budget(), 1));
 
-        assert_eq!(s.total_entries(), 2);
-        // Note: `.id` is the wrapper field (etcd key uuid); the inner
-        // `Resource::id()` would read the private `runtime_id` which the
-        // loader fills in separately.
+        assert_eq!(s.total_entries(), 4);
         assert_eq!(s.models.get_by_name("my-gpt4").unwrap().id, "m-1");
         assert_eq!(
             s.apikeys.get_by_name("sk-my-api-key-123").unwrap().id,
-            "k-1"
+            "k-1",
         );
+        assert_eq!(s.credentials.get_by_name("openai-prod").unwrap().id, "c-1");
+        assert_eq!(s.budgets.get_by_name("team-a").unwrap().id, "b-1");
     }
 }

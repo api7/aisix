@@ -35,7 +35,7 @@ futures-util = "0.3"
 async-trait = "0.1"
 
 # HTTP server
-axum = { version = "0.7", features = ["macros", "ws", "tracing"] }
+axum = { version = "0.7", features = ["macros", "ws", "tracing", "multipart"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "limit", "compression-gzip"] }
@@ -47,7 +47,7 @@ mime = "0.3"
 mime_guess = "2.0"
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "multipart"] }
 eventsource-stream = "0.2"
 
 # TLS

@@ -23,6 +23,8 @@ use aisix_obs::Metrics;
 use aisix_ratelimit::Limiter;
 use std::sync::Arc;
 
+use crate::budget::BudgetTracker;
+use crate::health::HealthTracker;
 use crate::routing::RoutingRegistry;
 
 #[derive(Clone)]
@@ -36,6 +38,12 @@ pub struct ProxyState {
     /// Content-policy hooks. Default is an empty chain (no-op); the
     /// server bootstrap loads a real chain from config.
     pub guardrails: Arc<dyn Guardrail>,
+    /// Per-ApiKey monthly USD spend tracker. Process-local for V1;
+    /// future PR can swap behind a trait for Redis-backed durability.
+    pub budgets: Arc<BudgetTracker>,
+    /// Per-model health tracker. Updated on every upstream call outcome;
+    /// read by `GET /admin/v1/health`.
+    pub health: Arc<HealthTracker>,
     pub request_body_limit_bytes: usize,
 }
 
@@ -49,6 +57,8 @@ impl ProxyState {
             cache: Some(Arc::new(MemoryCache::with_defaults())),
             routing: Arc::new(RoutingRegistry::new()),
             guardrails: Arc::new(GuardrailChain::empty()),
+            budgets: Arc::new(BudgetTracker::new()),
+            health: Arc::new(HealthTracker::new()),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }
@@ -69,6 +79,8 @@ impl ProxyState {
             cache: Some(Arc::new(MemoryCache::with_defaults())),
             routing: Arc::new(RoutingRegistry::new()),
             guardrails: Arc::new(GuardrailChain::empty()),
+            budgets: Arc::new(BudgetTracker::new()),
+            health: Arc::new(HealthTracker::new()),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }
@@ -92,6 +104,8 @@ impl ProxyState {
             cache,
             routing: Arc::new(RoutingRegistry::new()),
             guardrails: Arc::new(GuardrailChain::empty()),
+            budgets: Arc::new(BudgetTracker::new()),
+            health: Arc::new(HealthTracker::new()),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }

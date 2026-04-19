@@ -20,5 +20,5 @@ mod window;
 
 pub use clock::{Clock, SystemClock, TestClock};
 pub use error::RateLimitError;
-pub use limiter::{Limiter, Reservation};
+pub use limiter::{Limiter, RateLimitStatus, Reservation};
 pub use window::{FixedWindowCounter, WindowCheck};

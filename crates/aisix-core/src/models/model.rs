@@ -61,6 +61,25 @@ pub struct ProviderConfig {
     pub api_base: Option<String>,
 }
 
+/// Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCost {
+    /// Input (prompt) token cost in USD per 1,000 tokens.
+    pub input_per_1k: f64,
+    /// Output (completion) token cost in USD per 1,000 tokens.
+    pub output_per_1k: f64,
+}
+
+impl ModelCost {
+    /// Calculate USD cost for the given token counts.
+    pub fn calculate(&self, input_tokens: u64, output_tokens: u64) -> f64 {
+        let input_cost = self.input_per_1k * (input_tokens as f64) / 1000.0;
+        let output_cost = self.output_per_1k * (output_tokens as f64) / 1000.0;
+        input_cost + output_cost
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Model {
@@ -83,6 +102,10 @@ pub struct Model {
     /// the intent obvious to operators).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<Routing>,
+
+    /// Per-token cost for budget tracking. Absent = no cost tracked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<ModelCost>,
 
     /// Non-schema runtime id. Not part of the JSON payload — filled in by
     /// the snapshot loader from the etcd key path. Kept here so `Resource`
@@ -212,6 +235,7 @@ mod tests {
             timeout: None,
             rate_limit: None,
             routing: None,
+            cost: None,
             runtime_id: String::new(),
         };
 

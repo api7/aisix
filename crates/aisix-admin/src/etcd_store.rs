@@ -19,7 +19,7 @@
 //! deterministic behaviour continue to use [`crate::InMemoryStore`].
 
 use aisix_core::resource::ResourceEntry;
-use aisix_core::{ApiKey, Model};
+use aisix_core::{ApiKey, Budget, Credential, Model, Team};
 use etcd_client::{Client, DeleteOptions, GetOptions};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -31,6 +31,9 @@ use crate::store::{ConfigStore, StoreError};
 /// `aisix-etcd`'s loader so the two paths agree at the byte level.
 pub const MODELS_SUBKEY: &str = "models";
 pub const APIKEYS_SUBKEY: &str = "apikeys";
+pub const CREDENTIALS_SUBKEY: &str = "credentials";
+pub const BUDGETS_SUBKEY: &str = "budgets";
+pub const TEAMS_SUBKEY: &str = "teams";
 
 pub struct EtcdConfigStore {
     client: Mutex<Client>,
@@ -204,6 +207,87 @@ impl ConfigStore for EtcdConfigStore {
 
     async fn delete_apikey(&self, id: &str) -> Result<bool, StoreError> {
         self.delete_one(&self.key_for(APIKEYS_SUBKEY, id)).await
+    }
+
+    async fn put_credential(&self, entry: ResourceEntry<Credential>) -> Result<(), StoreError> {
+        let key = self.key_for(CREDENTIALS_SUBKEY, &entry.id);
+        self.put_json(&key, &entry.value).await
+    }
+
+    async fn get_credential(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<Credential>>, StoreError> {
+        let key = self.key_for(CREDENTIALS_SUBKEY, id);
+        Ok(self
+            .get_one::<Credential>(&key)
+            .await?
+            .map(|(v, rev)| ResourceEntry::new(id, v, rev)))
+    }
+
+    async fn list_credentials(&self) -> Result<Vec<ResourceEntry<Credential>>, StoreError> {
+        Ok(self
+            .list_range::<Credential>(CREDENTIALS_SUBKEY)
+            .await?
+            .into_iter()
+            .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
+            .collect())
+    }
+
+    async fn delete_credential(&self, id: &str) -> Result<bool, StoreError> {
+        self.delete_one(&self.key_for(CREDENTIALS_SUBKEY, id)).await
+    }
+
+    async fn put_budget(&self, entry: ResourceEntry<Budget>) -> Result<(), StoreError> {
+        let key = self.key_for(BUDGETS_SUBKEY, &entry.id);
+        self.put_json(&key, &entry.value).await
+    }
+
+    async fn get_budget(&self, id: &str) -> Result<Option<ResourceEntry<Budget>>, StoreError> {
+        let key = self.key_for(BUDGETS_SUBKEY, id);
+        Ok(self
+            .get_one::<Budget>(&key)
+            .await?
+            .map(|(v, rev)| ResourceEntry::new(id, v, rev)))
+    }
+
+    async fn list_budgets(&self) -> Result<Vec<ResourceEntry<Budget>>, StoreError> {
+        Ok(self
+            .list_range::<Budget>(BUDGETS_SUBKEY)
+            .await?
+            .into_iter()
+            .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
+            .collect())
+    }
+
+    async fn delete_budget(&self, id: &str) -> Result<bool, StoreError> {
+        self.delete_one(&self.key_for(BUDGETS_SUBKEY, id)).await
+    }
+
+    async fn put_team(&self, entry: ResourceEntry<Team>) -> Result<(), StoreError> {
+        let key = self.key_for(TEAMS_SUBKEY, &entry.id);
+        self.put_json(&key, &entry.value).await
+    }
+
+    async fn get_team(&self, id: &str) -> Result<Option<ResourceEntry<Team>>, StoreError> {
+        let key = self.key_for(TEAMS_SUBKEY, id);
+        Ok(self
+            .get_one::<Team>(&key)
+            .await?
+            .map(|(v, rev)| ResourceEntry::new(id, v, rev)))
+    }
+
+    async fn list_teams(&self) -> Result<Vec<ResourceEntry<Team>>, StoreError> {
+        Ok(self
+            .list_range::<Team>(TEAMS_SUBKEY)
+            .await?
+            .into_iter()
+            .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
+            .collect())
+    }
+
+    async fn delete_team(&self, id: &str) -> Result<bool, StoreError> {
+        self.delete_one(&self.key_for(TEAMS_SUBKEY, id)).await
     }
 }
 

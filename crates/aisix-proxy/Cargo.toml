@@ -17,6 +17,7 @@ aisix-cache = { path = "../aisix-cache" }
 aisix-guardrails = { path = "../aisix-guardrails" }
 tokio.workspace = true
 axum.workspace = true
+reqwest.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 hyper.workspace = true
@@ -30,6 +31,7 @@ futures-util.workspace = true
 async-trait.workspace = true
 async-stream = "0.3"
 dashmap.workspace = true
+chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
@@ -37,4 +39,5 @@ uuid.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
 aisix-provider-openai = { path = "../aisix-provider-openai" }
+aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
 wiremock.workspace = true

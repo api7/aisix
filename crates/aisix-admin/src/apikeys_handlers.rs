@@ -4,6 +4,10 @@
 //! resources. Duplicate-name detection uses `ApiKey::key` (which is the
 //! ApiKey's unique human-readable name from [`aisix_core::Resource`]),
 //! matching the proxy auth lookup by `by_name` index.
+//!
+//! Also provides key rotation: `POST /admin/v1/apikeys/:id/rotate`
+//! replaces the `key` field with a freshly-generated `sk-*` value and
+//! bumps the revision, invalidating the old credential.
 
 use aisix_core::models::validate_apikey;
 use aisix_core::resource::ResourceEntry;
@@ -86,6 +90,34 @@ pub async fn delete_apikey(
         return Err(AdminError::NotFound);
     }
     Ok(Json(serde_json::json!({"deleted": true, "id": id})))
+}
+
+/// `POST /admin/v1/apikeys/:id/rotate`
+///
+/// Replaces the `key` field with a new `sk-<uuid>` value, bumps the
+/// revision, and returns the updated entry. The old key stops working as
+/// soon as the etcd watch propagates the new snapshot (≤ 500 ms).
+pub async fn rotate_apikey(
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+    State(state): State<AdminState>,
+) -> Result<Json<ResourceEntry<ApiKey>>, AdminError> {
+    let existing = state
+        .store
+        .get_apikey(&id)
+        .await?
+        .ok_or(AdminError::NotFound)?;
+
+    // Generate a new key: `sk-` prefix + first segment of a UUID v4 gives
+    // a 12-hex-char suffix that's unguessable yet short.
+    let new_key = format!("sk-{}", Uuid::new_v4().as_simple());
+
+    let mut updated = existing.value.clone();
+    updated.key = new_key;
+
+    let entry = ResourceEntry::new(&id, updated, existing.revision + 1);
+    state.store.put_apikey(entry.clone()).await?;
+    Ok(Json(entry))
 }
 
 fn decode_apikey(raw: &Value) -> Result<ApiKey, AdminError> {

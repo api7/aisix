@@ -50,6 +50,30 @@ impl KeyState {
     }
 }
 
+/// Current window state for a single key, returned by [`Limiter::peek`].
+/// Used by the proxy handlers to inject the `x-ratelimit-*` response
+/// headers that OpenAI SDK clients expect.
+#[derive(Debug, Clone)]
+pub struct RateLimitStatus {
+    pub rpm_limit: Option<u64>,
+    pub rpm_used: u64,
+    pub rpm_reset_secs: u64,
+    pub tpm_limit: Option<u64>,
+    pub tpm_used: u64,
+    pub tpm_reset_secs: u64,
+    pub concurrency_limit: Option<u32>,
+    pub in_flight: u32,
+}
+
+impl RateLimitStatus {
+    pub fn rpm_remaining(&self) -> Option<u64> {
+        self.rpm_limit.map(|lim| lim.saturating_sub(self.rpm_used))
+    }
+    pub fn tpm_remaining(&self) -> Option<u64> {
+        self.tpm_limit.map(|lim| lim.saturating_sub(self.tpm_used))
+    }
+}
+
 pub struct Limiter<C: Clock = SystemClock> {
     states: DashMap<String, Arc<Mutex<KeyState>>>,
     clock: C,
@@ -73,6 +97,37 @@ impl<C: Clock> Limiter<C> {
             states: DashMap::new(),
             clock,
         }
+    }
+
+    /// Snapshot of the current rate-limit state for a key, used to inject
+    /// `x-ratelimit-*` response headers. Returns `None` if the key has
+    /// never been seen (i.e. no counters yet — headers are meaningless).
+    ///
+    /// This is a **read-only** operation; it does not affect any counters.
+    pub fn peek(&self, key: &str, limits: &aisix_core::RateLimit) -> Option<RateLimitStatus> {
+        let now = self.clock.unix_secs();
+        let state = self.states.get(key)?;
+        let mut s = state.lock();
+
+        // Roll counters so we're looking at the current window.
+        let rpm_used = s.rpm.current(now);
+        let tpm_used = s.tpm.current(now);
+        let in_flight = s.in_flight;
+
+        // Seconds remaining in the current minute-window. Zero if the
+        // window just started or has already rolled.
+        let minute_reset = MINUTE_SECS - (now % MINUTE_SECS);
+
+        Some(RateLimitStatus {
+            rpm_limit: limits.rpm,
+            rpm_used,
+            rpm_reset_secs: minute_reset,
+            tpm_limit: limits.tpm,
+            tpm_used,
+            tpm_reset_secs: minute_reset,
+            concurrency_limit: limits.concurrency,
+            in_flight,
+        })
     }
 
     fn state_for(&self, key: &str) -> Arc<Mutex<KeyState>> {
@@ -324,6 +379,45 @@ mod tests {
             let _r = limiter.pre_commit("k1", &l).unwrap();
         } // dropped
         let _r2 = limiter.pre_commit("k1", &l).unwrap();
+    }
+
+    #[test]
+    fn peek_returns_none_for_unknown_key() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::with_clock(clock);
+        assert!(limiter.peek("unknown", &RateLimit::default()).is_none());
+    }
+
+    #[test]
+    fn peek_reports_current_window_counts() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::with_clock(clock.clone());
+        let l = limits(Some(60), Some(100_000), Some(10));
+
+        let r = limiter.pre_commit("k1", &l).unwrap();
+        r.commit_tokens(500);
+
+        let status = limiter.peek("k1", &l).unwrap();
+        assert_eq!(status.rpm_limit, Some(60));
+        assert_eq!(status.rpm_used, 1);
+        assert_eq!(status.rpm_remaining(), Some(59));
+        assert_eq!(status.tpm_limit, Some(100_000));
+        assert_eq!(status.tpm_used, 500);
+        assert_eq!(status.tpm_remaining(), Some(99_500));
+        assert_eq!(status.in_flight, 0); // committed → released
+    }
+
+    #[test]
+    fn peek_reflects_in_flight_count_during_dispatch() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::with_clock(clock);
+        let l = limits(None, None, Some(5));
+
+        let _r1 = limiter.pre_commit("k1", &l).unwrap();
+        let _r2 = limiter.pre_commit("k1", &l).unwrap();
+        let status = limiter.peek("k1", &l).unwrap();
+        assert_eq!(status.in_flight, 2);
+        assert_eq!(status.concurrency_limit, Some(5));
     }
 
     #[test]
