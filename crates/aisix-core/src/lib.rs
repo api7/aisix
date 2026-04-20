@@ -23,8 +23,8 @@ pub mod resource;
 pub mod snapshot;
 
 pub use config::{
-    AdminConfig, CacheBackend, CacheConfig, Config, EtcdConfig, ObservabilityConfig, ProxyConfig,
-    TlsConfig,
+    AdminConfig, CacheBackend, CacheConfig, Config, EtcdConfig, LangfuseConfig,
+    ObservabilityConfig, ProxyConfig, TlsConfig,
 };
 pub use error::{
     AdminError, AdminErrorEnvelope, BootstrapError, ProxyError, ProxyErrorEnvelope, RateLimitScope,

@@ -13,6 +13,7 @@
 #![deny(rust_2018_idioms)]
 
 pub mod access_log;
+pub mod langfuse;
 pub mod metrics;
 pub mod otlp;
 
@@ -20,6 +21,7 @@ use aisix_core::ObservabilityConfig;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 pub use access_log::AccessLog;
+pub use langfuse::{LangfuseError, LangfuseEvent, LangfuseHandle, LangfuseSender};
 pub use metrics::{Metrics, RequestOutcome};
 pub use otlp::{install_otlp_tracer, shutdown_otlp, OtlpError, OtlpHandle};
 

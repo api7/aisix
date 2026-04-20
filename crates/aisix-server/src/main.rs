@@ -21,7 +21,7 @@ use aisix_core::models::Provider;
 use aisix_core::Config;
 use aisix_etcd::{EtcdConfigProvider, Supervisor};
 use aisix_gateway::Hub;
-use aisix_obs::{init_tracing, install_otlp_tracer, Metrics};
+use aisix_obs::{init_tracing, install_otlp_tracer, langfuse, Metrics};
 use aisix_provider_anthropic::AnthropicBridge;
 use aisix_provider_deepseek::deepseek_bridge;
 use aisix_provider_gemini::gemini_bridge;
@@ -85,7 +85,21 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     // behind the same trait object once their PRs land.
     let cache: Option<Arc<dyn Cache>> = Some(Arc::new(MemoryCache::with_defaults()));
 
-    let proxy_state = ProxyState::with_components(
+    // Optional Langfuse exporter — disabled in config by default.
+    // When enabled, the proxy gets an Arc<LangfuseSender> through
+    // ProxyState and emits one event per chat completion at
+    // end-of-request. We keep the handle alive for the lifetime of
+    // the process so the background flush task continues running.
+    let langfuse_handle = match langfuse::spawn(&cfg.observability) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "langfuse exporter disabled");
+            None
+        }
+    };
+    let langfuse_sender = langfuse_handle.as_ref().map(|h| h.sender());
+
+    let mut proxy_state = ProxyState::with_components(
         snapshot_handle.clone(),
         hub.clone(),
         limiter.clone(),
@@ -93,6 +107,9 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
         cache.clone(),
         &cfg.proxy,
     );
+    if let Some(sender) = langfuse_sender {
+        proxy_state = proxy_state.with_langfuse(sender);
+    }
     // Clone shared trackers before consuming proxy_state in build_router.
     let budget_tracker = proxy_state.budgets.clone();
     let health_tracker = proxy_state.health.clone();

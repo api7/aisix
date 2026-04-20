@@ -172,17 +172,23 @@ version = "0.1.0"
 dependencies = [
  "aisix-core",
  "anyhow",
+ "base64 0.22.1",
  "metrics",
  "metrics-exporter-prometheus",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
+ "reqwest",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uuid",
+ "wiremock",
 ]
 
 [[package]]

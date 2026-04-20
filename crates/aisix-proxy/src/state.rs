@@ -19,7 +19,7 @@ use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ProxyConfig};
 use aisix_gateway::Hub;
 use aisix_guardrails::{Guardrail, GuardrailChain};
-use aisix_obs::Metrics;
+use aisix_obs::{LangfuseSender, Metrics};
 use aisix_ratelimit::Limiter;
 use std::sync::Arc;
 
@@ -44,6 +44,9 @@ pub struct ProxyState {
     /// Per-model health tracker. Updated on every upstream call outcome;
     /// read by `GET /admin/v1/health`.
     pub health: Arc<HealthTracker>,
+    /// Optional Langfuse exporter. When `Some`, chat handlers emit one
+    /// generation event at end-of-request. `None` disables emission.
+    pub langfuse: Option<Arc<LangfuseSender>>,
     pub request_body_limit_bytes: usize,
 }
 
@@ -59,6 +62,7 @@ impl ProxyState {
             guardrails: Arc::new(GuardrailChain::empty()),
             budgets: Arc::new(BudgetTracker::new()),
             health: Arc::new(HealthTracker::new()),
+            langfuse: None,
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }
@@ -81,6 +85,7 @@ impl ProxyState {
             guardrails: Arc::new(GuardrailChain::empty()),
             budgets: Arc::new(BudgetTracker::new()),
             health: Arc::new(HealthTracker::new()),
+            langfuse: None,
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }
@@ -106,6 +111,7 @@ impl ProxyState {
             guardrails: Arc::new(GuardrailChain::empty()),
             budgets: Arc::new(BudgetTracker::new()),
             health: Arc::new(HealthTracker::new()),
+            langfuse: None,
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }
@@ -121,6 +127,13 @@ impl ProxyState {
     /// and tests that want a deterministic policy.
     pub fn with_guardrails(mut self, guardrails: Arc<dyn Guardrail>) -> Self {
         self.guardrails = guardrails;
+        self
+    }
+
+    /// Attach a Langfuse sender. The exporter is opt-in; when absent
+    /// no events are emitted regardless of request volume.
+    pub fn with_langfuse(mut self, sender: Arc<LangfuseSender>) -> Self {
+        self.langfuse = Some(sender);
         self
     }
 }
