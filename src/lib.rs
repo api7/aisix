@@ -95,6 +95,10 @@ pub async fn run_with_provider(
             res.context("admin server error"),
     };
 
+    if let Err(ref e) = res {
+        error!("{e:#}");
+    }
+
     if let Err(e) = config_provider.shutdown().await {
         let err = e.context("config provider shutdown error");
         error!("{err:#}");
