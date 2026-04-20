@@ -118,8 +118,9 @@ jobs:
     name: e2e (vitest) + coverage
     needs: [build-bin, build-ui]
     runs-on: ubuntu-latest
-    # Scaffold-phase soft gate: the harness lands with PR #2+.
-    # Flip `continue-on-error` to false at PR #5 per plan §5.2 ratchet.
+    # Soft gate while the harness stabilises across CI runners (etcd
+    # service startup, port detection, undici quirks). Flip to `false`
+    # once we have ~5 consecutive green runs on main.
     continue-on-error: true
     services:
       etcd:
