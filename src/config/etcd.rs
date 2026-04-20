@@ -238,7 +238,7 @@ pub enum EtcdConfigError {
 /// Returns `Ok(has_https)` where `has_https` indicates whether the host list
 /// uses HTTPS, or an [`EtcdConfigError`] describing the first validation
 /// failure.
-fn validate_connect_config(config: &Config) -> std::result::Result<bool, EtcdConfigError> {
+fn validate_connect_config(config: &Config) -> Result<bool, EtcdConfigError> {
     let has_https = config.host.iter().any(|h| h.starts_with("https://"));
     let has_http = config.host.iter().any(|h| h.starts_with("http://"));
 
