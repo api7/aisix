@@ -78,6 +78,14 @@ pub async fn run_with_provider(
     let gateway = Arc::new(gateway::Gateway::new(
         gateway::providers::default_provider_registry()
             .context("failed to build default gateway provider registry")?,
+    ));
+
+    let proxy_router = proxy::create_router(proxy::AppState::new(
+        config.clone(),
+        resources.clone(),
+        gateway,
+    ));
+
     let res = select! {
         res = tokio::signal::ctrl_c() => match res {
             Ok(_) => Ok(()),
