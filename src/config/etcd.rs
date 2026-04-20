@@ -20,10 +20,16 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Initial backoff delay.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
+/// TLS material for connecting to etcd over HTTPS.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct EtcdTlsConfig {
+    /// PEM-encoded CA certificate used to validate the etcd server certificate.
     pub ca_pem: Option<String>,
+    /// PEM-encoded client certificate for mTLS authentication.
+    /// Must be provided together with `key_pem`.
     pub cert_pem: Option<String>,
+    /// PEM-encoded private key matching `cert_pem`.
+    /// Must be provided together with `cert_pem`.
     pub key_pem: Option<String>,
 }
 
@@ -34,6 +40,7 @@ pub struct Config {
     pub timeout: u32,
     pub user: Option<String>,
     pub password: Option<String>,
+    /// Optional TLS settings used when etcd endpoints use `https://`.
     pub tls: Option<EtcdTlsConfig>,
 }
 
@@ -90,7 +97,7 @@ impl EtcdConfigProvider {
         })
     }
 
-    async fn connect_client(config: &Config) -> Result<etcd_client::Client, etcd_client::Error> {
+    async fn connect_client(config: &Config) -> Result<etcd_client::Client> {
         let mut opts = etcd_client::ConnectOptions::default()
             .with_connect_timeout(Duration::from_secs(config.timeout as u64));
 
@@ -98,15 +105,31 @@ impl EtcdConfigProvider {
             opts = opts.with_user(user, password);
         }
 
-        let use_tls = config.host.iter().any(|h| h.starts_with("https://"));
-        if use_tls {
+        let has_https = config.host.iter().any(|h| h.starts_with("https://"));
+        let has_http = config.host.iter().any(|h| h.starts_with("http://"));
+        if has_http && has_https {
+            return Err(anyhow!(
+                "etcd hosts must use a single scheme (all http:// or all https://)"
+            ));
+        }
+
+        if has_https {
             let mut tls_cfg = etcd_client::OpenSslClientConfig::default();
             if let Some(t) = &config.tls {
                 if let Some(ca_pem) = &t.ca_pem {
                     tls_cfg = tls_cfg.ca_cert_pem(ca_pem.as_bytes());
                 }
-                if let (Some(cert_pem), Some(key_pem)) = (&t.cert_pem, &t.key_pem) {
-                    tls_cfg = tls_cfg.client_cert_pem_and_key(cert_pem.as_bytes(), key_pem.as_bytes());
+                match (&t.cert_pem, &t.key_pem) {
+                    (Some(cert_pem), Some(key_pem)) => {
+                        tls_cfg =
+                            tls_cfg.client_cert_pem_and_key(cert_pem.as_bytes(), key_pem.as_bytes());
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(anyhow!(
+                            "both tls.cert_pem and tls.key_pem must be set together"
+                        ))
+                    }
                 }
             }
             opts = opts.with_openssl_tls(tls_cfg);
@@ -122,7 +145,8 @@ impl EtcdConfigProvider {
         )
         .await?;
 
-        client.status().await.map(|_| Ok(client))?
+        client.status().await?;
+        Ok(client)
     }
 
     /// Spawn the long-running supervisor task that manages the watch stream
@@ -440,24 +464,26 @@ mod tests {
     }
 
     #[test]
-    fn test_use_tls_detected_from_https_host() {
+    fn test_tls_detected_from_https_host() {
         let cfg = Config {
             host: vec!["https://etcd.example.com:2379".to_string()],
             ..Config::default()
         };
-        let use_tls = cfg.host.iter().any(|h| h.starts_with("https://"));
-        assert!(use_tls);
+        let has_https = cfg.host.iter().any(|h| h.starts_with("https://"));
+        let has_http = cfg.host.iter().any(|h| h.starts_with("http://"));
+        assert!(has_https);
+        assert!(!has_http);
     }
 
     #[test]
-    fn test_use_tls_not_detected_for_http_host() {
+    fn test_tls_not_detected_for_http_host() {
         let cfg = Config::default();
-        let use_tls = cfg.host.iter().any(|h| h.starts_with("https://"));
-        assert!(!use_tls);
+        let has_https = cfg.host.iter().any(|h| h.starts_with("https://"));
+        assert!(!has_https);
     }
 
     #[test]
-    fn test_use_tls_mixed_hosts_any_https_triggers_tls() {
+    fn test_mixed_http_https_hosts_detected() {
         let cfg = Config {
             host: vec![
                 "http://etcd1.example.com:2379".to_string(),
@@ -465,8 +491,68 @@ mod tests {
             ],
             ..Config::default()
         };
-        let use_tls = cfg.host.iter().any(|h| h.starts_with("https://"));
-        assert!(use_tls);
+        let has_https = cfg.host.iter().any(|h| h.starts_with("https://"));
+        let has_http = cfg.host.iter().any(|h| h.starts_with("http://"));
+        // Both detected: this should be rejected by connect_client
+        assert!(has_https && has_http);
+    }
+
+    #[tokio::test]
+    async fn test_connect_client_rejects_mixed_schemes() {
+        let cfg = Config {
+            host: vec![
+                "http://127.0.0.1:2379".to_string(),
+                "https://127.0.0.1:2379".to_string(),
+            ],
+            ..Config::default()
+        };
+        match EtcdConfigProvider::connect_client(&cfg).await {
+            Ok(_) => panic!("expected error for mixed schemes"),
+            Err(e) => assert!(
+                e.to_string().contains("single scheme"),
+                "unexpected error: {e}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_client_rejects_partial_mtls_cert_only() {
+        let cfg = Config {
+            host: vec!["https://127.0.0.1:2379".to_string()],
+            tls: Some(EtcdTlsConfig {
+                ca_pem: None,
+                cert_pem: Some("cert".to_string()),
+                key_pem: None,
+            }),
+            ..Config::default()
+        };
+        match EtcdConfigProvider::connect_client(&cfg).await {
+            Ok(_) => panic!("expected error for cert without key"),
+            Err(e) => assert!(
+                e.to_string().contains("cert_pem and tls.key_pem must be set together"),
+                "unexpected error: {e}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_client_rejects_partial_mtls_key_only() {
+        let cfg = Config {
+            host: vec!["https://127.0.0.1:2379".to_string()],
+            tls: Some(EtcdTlsConfig {
+                ca_pem: None,
+                cert_pem: None,
+                key_pem: Some("key".to_string()),
+            }),
+            ..Config::default()
+        };
+        match EtcdConfigProvider::connect_client(&cfg).await {
+            Ok(_) => panic!("expected error for key without cert"),
+            Err(e) => assert!(
+                e.to_string().contains("cert_pem and tls.key_pem must be set together"),
+                "unexpected error: {e}"
+            ),
+        }
     }
 
     #[test]
