@@ -91,6 +91,5 @@ fn uuid_like() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    format!("{nanos:x}-{:?}", std::thread::current().id())
-        .replace(['(', ')', ' '], "")
+    format!("{nanos:x}-{:?}", std::thread::current().id()).replace(['(', ')', ' '], "")
 }
