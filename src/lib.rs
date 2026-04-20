@@ -78,43 +78,24 @@ pub async fn run_with_provider(
     let gateway = Arc::new(gateway::Gateway::new(
         gateway::providers::default_provider_registry()
             .context("failed to build default gateway provider registry")?,
-    ));
-
-    let proxy_router = proxy::create_router(proxy::AppState::new(
-        config.clone(),
-        resources.clone(),
-        gateway,
-    ));
-
-    let mut run_error: Option<anyhow::Error> = None;
-    select! {
-        res = tokio::signal::ctrl_c() => {
-            if let Err(e) = res {
-                let err = anyhow::Error::new(e).context("failed to listen for shutdown signal");
-                error!("{err:#}");
-                run_error = Some(err);
-            }
+    let res = select! {
+        res = tokio::signal::ctrl_c() => match res {
+            Ok(_) => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e).context("failed to listen for shutdown signal")),
+        },
+        res = serve_proxy(config.clone(), proxy_router.clone()) => match res {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.context("proxy server error")),
+        },
+        res = serve_admin(config.clone(), admin::AppState::new(config, config_provider.clone(), resources, Some(proxy_router))) => match res {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.context("admin server error")),
         }
-        res = serve_proxy(config.clone(), proxy_router.clone()) => {
-            if let Err(e) = res {
-                let err = e.context("proxy server error");
-                error!("{err:#}");
-                run_error = Some(err);
-            }
-        }
-        res = serve_admin(config.clone(), admin::AppState::new(config, config_provider.clone(), resources, Some(proxy_router))) => {
-            if let Err(e) = res {
-                let err = e.context("admin server error");
-                error!("{err:#}");
-                run_error = Some(err);
-            }
-        }
-    }
+    };
 
     if let Err(e) = config_provider.shutdown().await {
         let err = e.context("config provider shutdown error");
         error!("{err:#}");
-        run_error.get_or_insert(err);
     }
 
     info!("Stopping, see you next time!");
@@ -123,11 +104,7 @@ pub async fn run_with_provider(
         .await
         .context("failed to shutdown observability")?;
 
-    if let Some(err) = run_error {
-        Err(err)
-    } else {
-        Ok(())
-    }
+    res
 }
 
 /// Initialize observability (logging, tracing, metrics).
