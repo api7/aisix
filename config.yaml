@@ -1,14 +1,14 @@
 deployment:
   etcd:
     host:
-      - "https://127.0.0.1:7943"
+      - "http://127.0.0.1:2379"
     prefix: /aisix
     timeout: 30
     tls:
       ca_file: ca.pem
       cert_file: cert.pem
       key_file: key.pem
-      insecure_skip_verify: true
+      insecure_skip_verify: false
   admin:
     admin_key:
       - key: admin
