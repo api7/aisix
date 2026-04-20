@@ -6,20 +6,9 @@ use vergen_git2::{Emitter, Git2Builder};
 fn main() -> Result<()> {
     build_ui()?;
 
-    // When built as a git dependency (no .git directory present), vergen_git2
-    // cannot read the SHA. We emit a fallback value and continue rather than
-    // failing the build.
-    let result = Emitter::default()
+    Emitter::default()
         .add_instructions(&Git2Builder::default().sha(true).build()?)?
-        .emit();
-
-    if let Err(e) = result {
-        // Emit a placeholder so that code referencing VERGEN_GIT_SHA compiles.
-        println!(
-            "cargo:warning=vergen_git2 could not read git SHA ({e}); falling back to \"unknown\""
-        );
-        println!("cargo:rustc-env=VERGEN_GIT_SHA=unknown");
-    }
+        .emit()?;
 
     println!("cargo:rerun-if-changed=build.rs");
 
