@@ -1,5 +1,3 @@
-use std::process::exit;
-
 use aisix::{Args, run};
 use anyhow::Result;
 use clap::Parser;

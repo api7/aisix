@@ -87,18 +87,12 @@ pub async fn run_with_provider(
     ));
 
     let res = select! {
-        res = tokio::signal::ctrl_c() => match res {
-            Ok(_) => Ok(()),
-            Err(e) => Err(anyhow::Error::new(e).context("failed to listen for shutdown signal")),
-        },
-        res = serve_proxy(config.clone(), proxy_router.clone()) => match res {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e.context("proxy server error")),
-        },
-        res = serve_admin(config.clone(), admin::AppState::new(config, config_provider.clone(), resources, Some(proxy_router))) => match res {
-            Ok(_) => Ok(()),
-            Err(e) => Err(e.context("admin server error")),
-        }
+        res = tokio::signal::ctrl_c() =>
+            res.context("failed to listen for shutdown signal"),
+        res = serve_proxy(config.clone(), proxy_router.clone()) =>
+            res.context("proxy server error"),
+        res = serve_admin(config.clone(), admin::AppState::new(config, config_provider.clone(), resources, Some(proxy_router))) =>
+            res.context("admin server error"),
     };
 
     if let Err(e) = config_provider.shutdown().await {
