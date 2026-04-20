@@ -1,13 +1,13 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
-use thiserror::Error;
 use async_trait::async_trait;
 use backon::{ConstantBuilder, Retryable};
 use dashmap::{DashMap, Entry};
 use etcd_client::{GetOptions, PutOptions, WatchOptions};
 use log::{debug, error, warn};
 use serde::Deserialize;
+use thiserror::Error;
 use tokio::{
     sync::{Mutex, Notify, mpsc},
     task::JoinHandle,
@@ -16,17 +16,201 @@ use tokio::{
 
 use crate::config::{ConfigEvent, ConfigEventReceiver, ConfigProvider, GetEntry, PutEntry};
 
-/// Read PEM bytes from a file path. Returns `Ok(None)` when `path` is `None`.
-fn read_pem(label: &str, path: &Option<String>) -> Result<Option<Vec<u8>>> {
-    match path {
-        None => Ok(None),
-        Some(p) => {
-            let bytes = std::fs::read(p)
-                .with_context(|| format!("etcd TLS: failed to read {label}_file '{p}'"))?;
-            Ok(Some(bytes))
+// ── TLS certificate material ──────────────────────────────────────────────────
+
+/// Certificate material for connecting to etcd over HTTPS.
+///
+/// Supports two exclusive sources:
+/// - [`EtcdTlsCertConfig::Strings`] – inline PEM-encoded content (e.g. from
+///   environment variables or secrets managers).
+/// - [`EtcdTlsCertConfig::Files`] – paths to PEM files on disk.
+///
+/// All fields within each variant are optional; omit a field to disable the
+/// corresponding TLS feature.
+#[derive(Clone)]
+pub enum EtcdTlsCertConfig {
+    /// Inline PEM-encoded certificate material.
+    Strings {
+        /// PEM-encoded CA certificate used to validate the etcd server.
+        ca: Option<String>,
+        /// PEM-encoded client certificate for mTLS.  Must be paired with `key`.
+        cert: Option<String>,
+        /// PEM-encoded private key for mTLS.  Must be paired with `cert`.
+        key: Option<String>,
+    },
+    /// File paths to PEM-encoded certificate material.
+    Files {
+        /// Path to a PEM-encoded CA certificate file.
+        ca_file: Option<String>,
+        /// Path to a PEM-encoded client certificate file for mTLS.
+        /// Must be paired with `key_file`.
+        cert_file: Option<String>,
+        /// Path to a PEM-encoded private key file for mTLS.
+        /// Must be paired with `cert_file`.
+        key_file: Option<String>,
+    },
+}
+
+impl EtcdTlsCertConfig {
+    fn read_file(label: &str, path: &Option<String>) -> Result<Option<Vec<u8>>> {
+        match path {
+            None => Ok(None),
+            Some(p) => {
+                let bytes = std::fs::read(p)
+                    .with_context(|| format!("etcd TLS: failed to read {label}_file '{p}'"))?;
+                Ok(Some(bytes))
+            }
+        }
+    }
+
+    /// Return the CA certificate as PEM bytes, or `None` if not configured.
+    pub fn ca_pem(&self) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::Strings { ca, .. } => Ok(ca.as_deref().map(|s| s.as_bytes().to_vec())),
+            Self::Files { ca_file, .. } => Self::read_file("ca", ca_file),
+        }
+    }
+
+    /// Return the client certificate as PEM bytes, or `None` if not configured.
+    pub fn cert_pem(&self) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::Strings { cert, .. } => Ok(cert.as_deref().map(|s| s.as_bytes().to_vec())),
+            Self::Files { cert_file, .. } => Self::read_file("cert", cert_file),
+        }
+    }
+
+    /// Return the private key as PEM bytes, or `None` if not configured.
+    pub fn key_pem(&self) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::Strings { key, .. } => Ok(key.as_deref().map(|s| s.as_bytes().to_vec())),
+            Self::Files { key_file, .. } => Self::read_file("key", key_file),
+        }
+    }
+
+    fn has_cert(&self) -> bool {
+        match self {
+            Self::Strings { cert, .. } => cert.is_some(),
+            Self::Files { cert_file, .. } => cert_file.is_some(),
+        }
+    }
+
+    fn has_key(&self) -> bool {
+        match self {
+            Self::Strings { key, .. } => key.is_some(),
+            Self::Files { key_file, .. } => key_file.is_some(),
         }
     }
 }
+
+impl std::fmt::Debug for EtcdTlsCertConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Strings { ca, cert, key } => f
+                .debug_struct("EtcdTlsCertConfig::Strings")
+                .field("ca", &ca.as_deref().map(|_| "***redacted***"))
+                .field("cert", &cert.as_deref().map(|_| "***redacted***"))
+                .field("key", &key.as_deref().map(|_| "***redacted***"))
+                .finish(),
+            Self::Files { ca_file, cert_file, key_file } => f
+                .debug_struct("EtcdTlsCertConfig::Files")
+                .field("ca_file", ca_file)
+                .field("cert_file", cert_file)
+                .field("key_file", key_file)
+                .finish(),
+        }
+    }
+}
+
+/// TLS settings for connecting to etcd over HTTPS.
+///
+/// Certificate material (`ca`, `cert`, `key` inline strings, or `ca_file`,
+/// `cert_file`, `key_file` file paths) is deserialized from a flat structure;
+/// mixing the two forms in the same config block is rejected at parse time.
+#[derive(Clone, Debug, Default)]
+pub struct EtcdTlsConfig {
+    /// Certificate material.  `None` when no cert fields are configured.
+    pub cert: Option<EtcdTlsCertConfig>,
+    /// Skip TLS certificate verification entirely.
+    ///
+    /// **WARNING**: This disables all certificate validation including hostname
+    /// and CA checks. Use only in development or testing environments.
+    pub insecure_skip_verify: bool,
+}
+
+impl EtcdTlsConfig {
+    /// Return the CA certificate as PEM bytes, or `None` if not configured.
+    pub fn ca_pem(&self) -> Result<Option<Vec<u8>>> {
+        self.cert.as_ref().map(|c| c.ca_pem()).transpose().map(Option::flatten)
+    }
+
+    /// Return the client certificate as PEM bytes, or `None` if not configured.
+    pub fn cert_pem(&self) -> Result<Option<Vec<u8>>> {
+        self.cert.as_ref().map(|c| c.cert_pem()).transpose().map(Option::flatten)
+    }
+
+    /// Return the private key as PEM bytes, or `None` if not configured.
+    pub fn key_pem(&self) -> Result<Option<Vec<u8>>> {
+        self.cert.as_ref().map(|c| c.key_pem()).transpose().map(Option::flatten)
+    }
+}
+
+impl std::ops::Deref for EtcdTlsConfig {
+    type Target = Option<EtcdTlsCertConfig>;
+    fn deref(&self) -> &Self::Target {
+        &self.cert
+    }
+}
+
+/// Flat intermediate used only for serde deserialization of [`EtcdTlsConfig`].
+///
+/// After deserialization the fields are validated and converted into the typed
+/// [`EtcdTlsConfig`].  This sidesteps the known serde limitation that
+/// `#[serde(deny_unknown_fields)]` does not compose with `#[serde(flatten)]`.
+#[derive(Deserialize)]
+struct EtcdTlsConfigRaw {
+    ca: Option<String>,
+    cert: Option<String>,
+    key: Option<String>,
+    ca_file: Option<String>,
+    cert_file: Option<String>,
+    key_file: Option<String>,
+    #[serde(default)]
+    insecure_skip_verify: bool,
+}
+
+impl<'de> Deserialize<'de> for EtcdTlsConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let raw = EtcdTlsConfigRaw::deserialize(d)?;
+
+        let has_strings = raw.ca.is_some() || raw.cert.is_some() || raw.key.is_some();
+        let has_files =
+            raw.ca_file.is_some() || raw.cert_file.is_some() || raw.key_file.is_some();
+
+        let cert = match (has_strings, has_files) {
+            (true, true) => {
+                return Err(serde::de::Error::custom(
+                    "cannot mix inline PEM strings (ca/cert/key) and \
+                     file paths (ca_file/cert_file/key_file) in the same tls block",
+                ));
+            }
+            (true, false) => Some(EtcdTlsCertConfig::Strings {
+                ca: raw.ca,
+                cert: raw.cert,
+                key: raw.key,
+            }),
+            (false, true) => Some(EtcdTlsCertConfig::Files {
+                ca_file: raw.ca_file,
+                cert_file: raw.cert_file,
+                key_file: raw.key_file,
+            }),
+            (false, false) => None,
+        };
+
+        Ok(EtcdTlsConfig { cert, insecure_skip_verify: raw.insecure_skip_verify })
+    }
+}
+
+// ── Config validation errors ─────────────────────────────────────────────────
 
 /// Errors produced during etcd connection-configuration validation.
 #[derive(Debug, Error)]
@@ -41,10 +225,10 @@ pub enum EtcdConfigError {
     #[error("etcd host '{0}' is missing a scheme; use http:// or https://")]
     MissingScheme(String),
 
-    /// Only one of `cert_file`/`key_file` was provided; both are required for mTLS.
+    /// Only one of `cert`/`key` was provided; both are required for mTLS.
     #[error(
         "both tls cert and key must be set together \
-         (via cert_file and key_file)"
+         (cert/key for inline PEM, or cert_file/key_file for file paths)"
     )]
     PartialMtlsKeypair,
 }
@@ -71,10 +255,10 @@ fn validate_connect_config(config: &Config) -> std::result::Result<bool, EtcdCon
 
     if has_https {
         if let Some(t) = &config.tls {
-            let has_cert = t.cert_file.is_some();
-            let has_key = t.key_file.is_some();
-            if has_cert != has_key {
-                return Err(EtcdConfigError::PartialMtlsKeypair);
+            if let Some(cert) = &t.cert {
+                if cert.has_cert() != cert.has_key() {
+                    return Err(EtcdConfigError::PartialMtlsKeypair);
+                }
             }
         }
     }
@@ -82,46 +266,6 @@ fn validate_connect_config(config: &Config) -> std::result::Result<bool, EtcdCon
     Ok(has_https)
 }
 
-
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
-/// Initial backoff delay.
-const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-
-/// TLS settings for connecting to etcd over HTTPS.
-///
-/// All certificate material is supplied via file paths pointing to PEM-encoded
-/// files on disk.  All fields are optional; omit a field to disable the
-/// corresponding TLS feature.
-#[derive(Clone, Default, Deserialize)]
-pub struct EtcdTlsConfig {
-    /// Path to a PEM-encoded CA certificate file used to validate the etcd
-    /// server certificate.
-    pub ca_file: Option<String>,
-    /// Path to a PEM-encoded client certificate file for mTLS authentication.
-    /// Must be provided together with `key_file`.
-    pub cert_file: Option<String>,
-    /// Path to a PEM-encoded private key file matching `cert_file`.
-    /// Must be provided together with `cert_file`.
-    pub key_file: Option<String>,
-
-    /// Skip TLS certificate verification entirely.
-    ///
-    /// **WARNING**: This disables all certificate validation including hostname
-    /// and CA checks. Use only in development or testing environments.
-    #[serde(default)]
-    pub insecure_skip_verify: bool,
-}
-
-impl std::fmt::Debug for EtcdTlsConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EtcdTlsConfig")
-            .field("ca_file", &self.ca_file)
-            .field("cert_file", &self.cert_file)
-            .field("key_file", &self.key_file)
-            .field("insecure_skip_verify", &self.insecure_skip_verify)
-            .finish()
-    }
-}
 
 #[derive(Clone, Deserialize)]
 pub struct Config {
@@ -173,6 +317,11 @@ pub struct EtcdConfigProvider {
     supervisor_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Maximum backoff delay between reconnect attempts.
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Initial backoff delay.
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+
 impl EtcdConfigProvider {
     pub async fn new(config: Config) -> Result<Self> {
         let client = (|| Self::connect_client(&config))
@@ -223,16 +372,11 @@ impl EtcdConfigProvider {
                     });
                 }
 
-                // CA certificate from file.
-                if let Some(ca) = read_pem("ca", &t.ca_file)? {
+                if let Some(ca) = t.ca_pem()? {
                     tls_cfg = tls_cfg.ca_cert_pem(ca.as_slice());
                 }
-
-                // mTLS: cert and key files (pair completeness already validated).
-                if let (Some(cert), Some(key)) = (
-                    read_pem("cert", &t.cert_file)?,
-                    read_pem("key", &t.key_file)?,
-                ) {
+                // mTLS: cert and key pair completeness already validated.
+                if let (Some(cert), Some(key)) = (t.cert_pem()?, t.key_pem()?) {
                     tls_cfg = tls_cfg.client_cert_pem_and_key(cert.as_slice(), key.as_slice());
                 }
             }
@@ -555,17 +699,34 @@ mod tests {
 
     use super::*;
 
-    // ── helpers ──────────────────────────────────────────────────────────────
+    // ── helpers ───────────────────────────────────────────────────────────────
 
-    fn tls_with(
+    fn tls_files(
         ca_file: Option<&str>,
         cert_file: Option<&str>,
         key_file: Option<&str>,
     ) -> EtcdTlsConfig {
         EtcdTlsConfig {
-            ca_file: ca_file.map(str::to_owned),
-            cert_file: cert_file.map(str::to_owned),
-            key_file: key_file.map(str::to_owned),
+            cert: Some(EtcdTlsCertConfig::Files {
+                ca_file: ca_file.map(str::to_owned),
+                cert_file: cert_file.map(str::to_owned),
+                key_file: key_file.map(str::to_owned),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn tls_strings(
+        ca: Option<&str>,
+        cert: Option<&str>,
+        key: Option<&str>,
+    ) -> EtcdTlsConfig {
+        EtcdTlsConfig {
+            cert: Some(EtcdTlsCertConfig::Strings {
+                ca: ca.map(str::to_owned),
+                cert: cert.map(str::to_owned),
+                key: key.map(str::to_owned),
+            }),
             ..Default::default()
         }
     }
@@ -575,9 +736,7 @@ mod tests {
     #[test]
     fn test_etcd_tls_config_default() {
         let tls = EtcdTlsConfig::default();
-        assert!(tls.ca_file.is_none());
-        assert!(tls.cert_file.is_none());
-        assert!(tls.key_file.is_none());
+        assert!(tls.cert.is_none());
         assert!(!tls.insecure_skip_verify);
     }
 
@@ -586,6 +745,64 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.tls.is_none());
         assert_eq!(cfg.host, vec!["http://127.0.0.1:2379"]);
+    }
+
+    // ── EtcdTlsCertConfig pem accessors ──────────────────────────────────────
+
+    #[test]
+    fn test_cert_config_strings_ca_pem() {
+        let cfg = EtcdTlsCertConfig::Strings {
+            ca: Some("ca-content".to_owned()),
+            cert: None,
+            key: None,
+        };
+        assert_eq!(cfg.ca_pem().unwrap(), Some(b"ca-content".to_vec()));
+        assert_eq!(cfg.cert_pem().unwrap(), None);
+        assert_eq!(cfg.key_pem().unwrap(), None);
+    }
+
+    #[test]
+    fn test_cert_config_files_reads_from_disk() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, b"file-pem-content").unwrap();
+        let path = tmp.path().to_str().unwrap().to_owned();
+
+        let cfg = EtcdTlsCertConfig::Files {
+            ca_file: Some(path),
+            cert_file: None,
+            key_file: None,
+        };
+        assert_eq!(cfg.ca_pem().unwrap(), Some(b"file-pem-content".to_vec()));
+        assert_eq!(cfg.cert_pem().unwrap(), None);
+    }
+
+    #[test]
+    fn test_cert_config_files_missing_returns_error() {
+        let cfg = EtcdTlsCertConfig::Files {
+            ca_file: Some("/nonexistent/ca.pem".to_owned()),
+            cert_file: None,
+            key_file: None,
+        };
+        assert_matches!(
+            cfg.ca_pem(),
+            Err(e) if e.to_string().contains("failed to read ca_file")
+        );
+    }
+
+    #[test]
+    fn test_tls_config_delegates_pem_methods() {
+        let tls = tls_strings(Some("ca-content"), None, None);
+        assert_eq!(tls.ca_pem().unwrap(), Some(b"ca-content".to_vec()));
+        assert_eq!(tls.cert_pem().unwrap(), None);
+        assert_eq!(tls.key_pem().unwrap(), None);
+    }
+
+    #[test]
+    fn test_tls_config_no_cert_returns_none() {
+        let tls = EtcdTlsConfig::default();
+        assert_eq!(tls.ca_pem().unwrap(), None);
+        assert_eq!(tls.cert_pem().unwrap(), None);
+        assert_eq!(tls.key_pem().unwrap(), None);
     }
 
     // ── TLS scheme detection ──────────────────────────────────────────────────
@@ -623,7 +840,7 @@ mod tests {
         assert!(has_https && has_http);
     }
 
-    // ── connect_client validation ─────────────────────────────────────────────
+    // ── connect_client validation (via connect_client) ────────────────────────
 
     #[tokio::test]
     async fn test_connect_client_rejects_mixed_schemes() {
@@ -652,7 +869,7 @@ mod tests {
     async fn test_connect_client_rejects_partial_mtls_cert_only() {
         let cfg = Config {
             host: vec!["https://127.0.0.1:2379".to_string()],
-            tls: Some(tls_with(None, Some("cert.pem"), None)),
+            tls: Some(tls_files(None, Some("cert.pem"), None)),
             ..Config::default()
         };
         let result = EtcdConfigProvider::connect_client(&cfg).await.map(|_| ());
@@ -663,7 +880,7 @@ mod tests {
     async fn test_connect_client_rejects_partial_mtls_key_only() {
         let cfg = Config {
             host: vec!["https://127.0.0.1:2379".to_string()],
-            tls: Some(tls_with(None, None, Some("key.pem"))),
+            tls: Some(tls_files(None, None, Some("key.pem"))),
             ..Config::default()
         };
         let result = EtcdConfigProvider::connect_client(&cfg).await.map(|_| ());
@@ -701,15 +918,26 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_partial_mtls() {
+        // Both file-based and string-based partial mTLS should fail.
         for cfg in [
             Config {
                 host: vec!["https://etcd:2379".to_string()],
-                tls: Some(tls_with(None, Some("cert.pem"), None)),
+                tls: Some(tls_files(None, Some("cert.pem"), None)),
                 ..Config::default()
             },
             Config {
                 host: vec!["https://etcd:2379".to_string()],
-                tls: Some(tls_with(None, None, Some("key.pem"))),
+                tls: Some(tls_files(None, None, Some("key.pem"))),
+                ..Config::default()
+            },
+            Config {
+                host: vec!["https://etcd:2379".to_string()],
+                tls: Some(tls_strings(None, Some("cert"), None)),
+                ..Config::default()
+            },
+            Config {
+                host: vec!["https://etcd:2379".to_string()],
+                tls: Some(tls_strings(None, None, Some("key"))),
                 ..Config::default()
             },
         ] {
@@ -735,59 +963,61 @@ mod tests {
         assert_matches!(validate_connect_config(&cfg), Ok(true));
     }
 
-    // ── read_pem unit tests ───────────────────────────────────────────────────
-
-    #[test]
-    fn test_read_pem_none_returns_none() {
-        let result = read_pem("ca", &None).unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_read_pem_file_reads_and_returns_bytes() {
-        let mut tmp = NamedTempFile::new().unwrap();
-        std::io::Write::write_all(&mut tmp, b"file-pem-content").unwrap();
-        let path = tmp.path().to_str().unwrap().to_owned();
-
-        let result = read_pem("ca", &Some(path)).unwrap();
-        assert_eq!(result, Some(b"file-pem-content".to_vec()));
-    }
-
-    #[test]
-    fn test_read_pem_file_not_found_returns_error() {
-        let result = read_pem("ca", &Some("/nonexistent/ca.pem".to_owned()));
-        assert_matches!(result, Err(e) if e.to_string().contains("failed to read ca_file"));
-    }
-
     // ── deserialization ───────────────────────────────────────────────────────
 
     #[test]
-    fn test_etcd_tls_config_deserialization_files() {
+    fn test_tls_deserialize_files() {
         let json = r#"{"ca_file":"ca.pem","cert_file":"cert.pem","key_file":"key.pem"}"#;
         let tls: EtcdTlsConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(tls.ca_file.as_deref(), Some("ca.pem"));
-        assert_eq!(tls.cert_file.as_deref(), Some("cert.pem"));
-        assert_eq!(tls.key_file.as_deref(), Some("key.pem"));
+        assert_matches!(
+            &tls.cert,
+            Some(EtcdTlsCertConfig::Files { ca_file, cert_file, key_file })
+                if ca_file.as_deref() == Some("ca.pem")
+                && cert_file.as_deref() == Some("cert.pem")
+                && key_file.as_deref() == Some("key.pem")
+        );
         assert!(!tls.insecure_skip_verify);
     }
 
     #[test]
-    fn test_etcd_tls_config_deserialization_insecure() {
+    fn test_tls_deserialize_strings() {
+        let json = r#"{"ca":"ca-content","cert":"cert-content","key":"key-content"}"#;
+        let tls: EtcdTlsConfig = serde_json::from_str(json).unwrap();
+        assert_matches!(
+            &tls.cert,
+            Some(EtcdTlsCertConfig::Strings { ca, cert, key })
+                if ca.as_deref() == Some("ca-content")
+                && cert.as_deref() == Some("cert-content")
+                && key.as_deref() == Some("key-content")
+        );
+    }
+
+    #[test]
+    fn test_tls_deserialize_mixed_rejects() {
+        let json = r#"{"ca_file":"ca.pem","cert":"cert-content"}"#;
+        let result = serde_json::from_str::<EtcdTlsConfig>(json);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot mix"));
+    }
+
+    #[test]
+    fn test_tls_deserialize_insecure_only() {
         let json = r#"{"insecure_skip_verify":true}"#;
         let tls: EtcdTlsConfig = serde_json::from_str(json).unwrap();
+        assert!(tls.cert.is_none());
         assert!(tls.insecure_skip_verify);
-        assert!(tls.ca_file.is_none());
     }
 
     #[test]
-    fn test_etcd_tls_config_insecure_defaults_false() {
+    fn test_tls_deserialize_empty() {
         let json = r#"{}"#;
         let tls: EtcdTlsConfig = serde_json::from_str(json).unwrap();
+        assert!(tls.cert.is_none());
         assert!(!tls.insecure_skip_verify);
     }
 
     #[test]
-    fn test_config_deserialization_with_tls() {
+    fn test_config_deserialize_with_tls_files() {
         let json = r#"{
             "host": ["https://etcd.example.com:2379"],
             "prefix": "/aisix",
@@ -797,12 +1027,33 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.host, vec!["https://etcd.example.com:2379"]);
         let tls = cfg.tls.unwrap();
-        assert_eq!(tls.ca_file.as_deref(), Some("ca.pem"));
+        assert_matches!(
+            &tls.cert,
+            Some(EtcdTlsCertConfig::Files { ca_file, .. })
+                if ca_file.as_deref() == Some("ca.pem")
+        );
         assert!(!tls.insecure_skip_verify);
     }
 
     #[test]
-    fn test_config_deserialization_without_tls() {
+    fn test_config_deserialize_with_tls_strings() {
+        let json = r#"{
+            "host": ["https://etcd.example.com:2379"],
+            "prefix": "/aisix",
+            "timeout": 30,
+            "tls": {"ca": "ca-content", "cert": "cert-content", "key": "key-content"}
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let tls = cfg.tls.unwrap();
+        assert_matches!(
+            &tls.cert,
+            Some(EtcdTlsCertConfig::Strings { ca, .. })
+                if ca.as_deref() == Some("ca-content")
+        );
+    }
+
+    #[test]
+    fn test_config_deserialize_without_tls() {
         let json = r#"{
             "host": ["http://127.0.0.1:2379"],
             "prefix": "/aisix",
