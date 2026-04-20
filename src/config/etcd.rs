@@ -326,7 +326,7 @@ impl EtcdConfigProvider {
             opts = opts.with_openssl_tls(tls_cfg);
         }
 
-        let client = etcd_client::Client::connect(
+        let mut client = etcd_client::Client::connect(
             config
                 .host
                 .iter()
