@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
+use thiserror::Error;
 use async_trait::async_trait;
 use backon::{ConstantBuilder, Retryable};
 use dashmap::{DashMap, Entry};
@@ -27,7 +28,61 @@ fn read_pem(label: &str, path: &Option<String>) -> Result<Option<Vec<u8>>> {
     }
 }
 
-/// Maximum backoff delay between reconnect attempts.
+/// Errors produced during etcd connection-configuration validation.
+#[derive(Debug, Error)]
+pub enum EtcdConfigError {
+    /// The host list contains a mix of `http://` and `https://` endpoints,
+    /// which is unsupported.
+    #[error("etcd hosts must use a single scheme (all http:// or all https://)")]
+    MixedSchemes,
+
+    /// One of the host strings is missing the `http://` or `https://` scheme
+    /// prefix.
+    #[error("etcd host '{0}' is missing a scheme; use http:// or https://")]
+    MissingScheme(String),
+
+    /// Only one of `cert`/`key` was provided; both are required for mTLS.
+    #[error(
+        "both tls cert and key must be set together \
+         (via cert_file/cert_pem and key_file/key_pem)"
+    )]
+    PartialMtlsKeypair,
+}
+
+/// Validate the connection configuration before attempting any I/O.
+///
+/// Returns `Ok(has_https)` where `has_https` indicates whether the host list
+/// uses HTTPS, or an [`EtcdConfigError`] describing the first validation
+/// failure.
+fn validate_connect_config(config: &Config) -> std::result::Result<bool, EtcdConfigError> {
+    let has_https = config.host.iter().any(|h| h.starts_with("https://"));
+    let has_http = config.host.iter().any(|h| h.starts_with("http://"));
+
+    if has_http && has_https {
+        return Err(EtcdConfigError::MixedSchemes);
+    }
+    if let Some(invalid) = config
+        .host
+        .iter()
+        .find(|h| !h.starts_with("http://") && !h.starts_with("https://"))
+    {
+        return Err(EtcdConfigError::MissingScheme(invalid.clone()));
+    }
+
+    if has_https {
+        if let Some(t) = &config.tls {
+            let has_cert = t.cert_file.is_some() || t.cert_pem.is_some();
+            let has_key = t.key_file.is_some() || t.key_pem.is_some();
+            if has_cert != has_key {
+                return Err(EtcdConfigError::PartialMtlsKeypair);
+            }
+        }
+    }
+
+    Ok(has_https)
+}
+
+
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Initial backoff delay.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -77,7 +132,7 @@ impl std::fmt::Debug for EtcdTlsConfig {
         f.debug_struct("EtcdTlsConfig")
             .field("ca_file", &self.ca_file)
             .field("cert_file", &self.cert_file)
-            .field("key_file", &self.key_file.as_deref().map(|_| "***redacted***"))
+            .field("key_file", &self.key_file)
             .field("ca_pem", &self.ca_pem.as_deref().map(|_| "***redacted***"))
             .field("cert_pem", &self.cert_pem.as_deref().map(|_| "***redacted***"))
             .field("key_pem", &self.key_pem.as_deref().map(|_| "***redacted***"))
@@ -174,22 +229,7 @@ impl EtcdConfigProvider {
             opts = opts.with_user(user, password);
         }
 
-        let has_https = config.host.iter().any(|h| h.starts_with("https://"));
-        let has_http = config.host.iter().any(|h| h.starts_with("http://"));
-        if has_http && has_https {
-            return Err(anyhow!(
-                "etcd hosts must use a single scheme (all http:// or all https://)"
-            ));
-        }
-        if let Some(invalid) = config
-            .host
-            .iter()
-            .find(|h| !h.starts_with("http://") && !h.starts_with("https://"))
-        {
-            return Err(anyhow!(
-                "etcd host '{invalid}' is missing a scheme; use http:// or https://"
-            ));
-        }
+        let has_https = validate_connect_config(config)?;
 
         if has_https {
             let mut tls_cfg = etcd_client::OpenSslClientConfig::default();
@@ -223,17 +263,6 @@ impl EtcdConfigProvider {
                 } else {
                     t.key_pem.as_deref().map(|s| s.as_bytes().to_vec())
                 };
-
-                // Validate that cert and key are provided together.
-                match (&cert_bytes, &key_bytes) {
-                    (Some(_), None) | (None, Some(_)) => {
-                        return Err(anyhow!(
-                            "both tls cert and key must be set together \
-                             (via cert_file/cert_pem and key_file/key_pem)"
-                        ))
-                    }
-                    _ => {}
-                }
 
                 if let (Some(cert), Some(key)) = (&cert_bytes, &key_bytes) {
                     tls_cfg = tls_cfg.client_cert_pem_and_key(cert.as_slice(), key.as_slice());
@@ -705,6 +734,81 @@ mod tests {
         };
         let result = EtcdConfigProvider::connect_client(&cfg).await.map(|_| ());
         assert_matches!(result, Err(e) if e.to_string().contains("cert and key must be set together"));
+    }
+
+    // ── validate_connect_config unit tests ───────────────────────────────────
+
+    #[test]
+    fn test_validate_rejects_mixed_schemes() {
+        let cfg = Config {
+            host: vec![
+                "http://etcd1:2379".to_string(),
+                "https://etcd2:2379".to_string(),
+            ],
+            ..Config::default()
+        };
+        assert_matches!(
+            validate_connect_config(&cfg),
+            Err(EtcdConfigError::MixedSchemes)
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_missing_scheme() {
+        let cfg = Config {
+            host: vec!["127.0.0.1:2379".to_string()],
+            ..Config::default()
+        };
+        assert_matches!(
+            validate_connect_config(&cfg),
+            Err(EtcdConfigError::MissingScheme(h)) if h == "127.0.0.1:2379"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_partial_mtls() {
+        for cfg in [
+            Config {
+                host: vec!["https://etcd:2379".to_string()],
+                tls: Some(tls_with(None, Some("cert.pem"), None)),
+                ..Config::default()
+            },
+            Config {
+                host: vec!["https://etcd:2379".to_string()],
+                tls: Some(tls_with(None, None, Some("key.pem"))),
+                ..Config::default()
+            },
+            Config {
+                host: vec!["https://etcd:2379".to_string()],
+                tls: Some(tls_with_pem(None, Some("cert"), None)),
+                ..Config::default()
+            },
+            Config {
+                host: vec!["https://etcd:2379".to_string()],
+                tls: Some(tls_with_pem(None, None, Some("key"))),
+                ..Config::default()
+            },
+        ] {
+            assert_matches!(
+                validate_connect_config(&cfg),
+                Err(EtcdConfigError::PartialMtlsKeypair)
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_http_ok() {
+        let cfg = Config::default();
+        assert_matches!(validate_connect_config(&cfg), Ok(false));
+    }
+
+    #[test]
+    fn test_validate_https_ok() {
+        let cfg = Config {
+            host: vec!["https://etcd:2379".to_string()],
+            ..Config::default()
+        };
+        assert_matches!(validate_connect_config(&cfg), Ok(true));
     }
 
     // ── read_pem unit tests ───────────────────────────────────────────────────
