@@ -1,7 +1,9 @@
-use aisix::run;
+use aisix::{Args, run};
 use anyhow::Result;
+use clap::Parser;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    run().await
+    let args = Args::parse();
+    run(args.config).await
 }
