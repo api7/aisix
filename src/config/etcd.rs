@@ -398,6 +398,7 @@ impl ConfigProvider for EtcdConfigProvider {
     }
 
     async fn shutdown(&self) -> Result<()> {
+
         // Signal the supervisor to stop.
         self.shutdown.notify_one();
 
@@ -416,5 +417,102 @@ impl ConfigProvider for EtcdConfigProvider {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_etcd_tls_config_default() {
+        let tls = EtcdTlsConfig::default();
+        assert!(tls.ca_pem.is_none());
+        assert!(tls.cert_pem.is_none());
+        assert!(tls.key_pem.is_none());
+    }
+
+    #[test]
+    fn test_config_default_no_tls() {
+        let cfg = Config::default();
+        assert!(cfg.tls.is_none());
+        assert_eq!(cfg.host, vec!["http://127.0.0.1:2379"]);
+    }
+
+    #[test]
+    fn test_use_tls_detected_from_https_host() {
+        let cfg = Config {
+            host: vec!["https://etcd.example.com:2379".to_string()],
+            ..Config::default()
+        };
+        let use_tls = cfg.host.iter().any(|h| h.starts_with("https://"));
+        assert!(use_tls);
+    }
+
+    #[test]
+    fn test_use_tls_not_detected_for_http_host() {
+        let cfg = Config::default();
+        let use_tls = cfg.host.iter().any(|h| h.starts_with("https://"));
+        assert!(!use_tls);
+    }
+
+    #[test]
+    fn test_use_tls_mixed_hosts_any_https_triggers_tls() {
+        let cfg = Config {
+            host: vec![
+                "http://etcd1.example.com:2379".to_string(),
+                "https://etcd2.example.com:2379".to_string(),
+            ],
+            ..Config::default()
+        };
+        let use_tls = cfg.host.iter().any(|h| h.starts_with("https://"));
+        assert!(use_tls);
+    }
+
+    #[test]
+    fn test_etcd_tls_config_deserialization() {
+        let json = r#"{"ca_pem":"ca-cert","cert_pem":"client-cert","key_pem":"client-key"}"#;
+        let tls: EtcdTlsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(tls.ca_pem.as_deref(), Some("ca-cert"));
+        assert_eq!(tls.cert_pem.as_deref(), Some("client-cert"));
+        assert_eq!(tls.key_pem.as_deref(), Some("client-key"));
+    }
+
+    #[test]
+    fn test_etcd_tls_config_partial_deserialization() {
+        let json = r#"{"ca_pem":"ca-cert"}"#;
+        let tls: EtcdTlsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(tls.ca_pem.as_deref(), Some("ca-cert"));
+        assert!(tls.cert_pem.is_none());
+        assert!(tls.key_pem.is_none());
+    }
+
+    #[test]
+    fn test_config_deserialization_with_tls() {
+        let json = r#"{
+            "host": ["https://etcd.example.com:2379"],
+            "prefix": "/aisix",
+            "timeout": 30,
+            "tls": {"ca_pem": "ca-cert"}
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.host, vec!["https://etcd.example.com:2379"]);
+        let tls = cfg.tls.unwrap();
+        assert_eq!(tls.ca_pem.as_deref(), Some("ca-cert"));
+        assert!(tls.cert_pem.is_none());
+        assert!(tls.key_pem.is_none());
+    }
+
+    #[test]
+    fn test_config_deserialization_without_tls() {
+        let json = r#"{
+            "host": ["http://127.0.0.1:2379"],
+            "prefix": "/aisix",
+            "timeout": 5
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.tls.is_none());
+        assert!(cfg.user.is_none());
+        assert!(cfg.password.is_none());
     }
 }
