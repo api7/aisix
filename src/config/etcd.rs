@@ -336,7 +336,7 @@ impl EtcdConfigProvider {
         )
         .await?;
 
-        client.status().await?
+        client.status().await?;
         Ok(client)
     }
 
