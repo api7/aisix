@@ -1,7 +1,7 @@
 deployment:
   etcd:
     host:
-      - "https://test.com:7943"
+      - "http://127.0.0.1:2379"
     prefix: /aisix
     timeout: 30
     tls:
