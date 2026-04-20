@@ -222,7 +222,7 @@ pub enum EtcdConfigError {
 
     /// One of the host strings is missing the `http://` or `https://` scheme
     /// prefix.
-    #[error("etcd host '{0}' is missing a scheme; use http:// or https://")]
+    #[error("etcd host '{0}' is missing a scheme; use the prefix http:// or https://")]
     MissingScheme(String),
 
     /// Only one of `cert`/`key` was provided; both are required for mTLS.
