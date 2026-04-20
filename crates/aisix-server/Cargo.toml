@@ -24,7 +24,7 @@ aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
 aisix-provider-gemini = { path = "../aisix-provider-gemini" }
 aisix-provider-deepseek = { path = "../aisix-provider-deepseek" }
 aisix-ratelimit = { path = "../aisix-ratelimit" }
-aisix-cache = { path = "../aisix-cache" }
+aisix-cache = { path = "../aisix-cache", features = ["redis"] }
 tokio.workspace = true
 axum.workspace = true
 axum-server.workspace = true

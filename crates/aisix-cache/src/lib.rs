@@ -20,7 +20,13 @@
 mod cache;
 mod key;
 mod memory;
+#[cfg(feature = "redis")]
+mod redis;
 
 pub use cache::{Cache, CacheError, CacheOutcome};
 pub use key::CacheKey;
 pub use memory::{MemoryCache, DEFAULT_CAPACITY, DEFAULT_TTL};
+#[cfg(feature = "redis")]
+pub use redis::{
+    RedisCache, DEFAULT_PREFIX as REDIS_DEFAULT_PREFIX, DEFAULT_TTL as REDIS_DEFAULT_TTL,
+};

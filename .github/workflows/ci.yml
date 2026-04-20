@@ -44,6 +44,14 @@ jobs:
   rust-unit:
     name: rust unit + coverage
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+    env:
+      # Picked up by crates/aisix-cache/tests/redis_integration.rs.
+      # The tests no-op when this is unset (local dev), so absence is safe.
+      AISIX_REDIS_URL: redis://127.0.0.1:6379
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -56,7 +64,7 @@ jobs:
       - name: install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: unit tests with coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov-unit.info
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov-unit.info
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-unit

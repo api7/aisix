@@ -16,9 +16,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore};
-use aisix_cache::{Cache, MemoryCache};
+use aisix_cache::{Cache, MemoryCache, RedisCache};
 use aisix_core::models::Provider;
-use aisix_core::Config;
+use aisix_core::{CacheBackend, Config};
 use aisix_etcd::{EtcdConfigProvider, Supervisor};
 use aisix_gateway::Hub;
 use aisix_obs::{init_tracing, install_otlp_tracer, langfuse, Metrics};
@@ -81,9 +81,28 @@ async fn run(cfg: Config) -> anyhow::Result<()> {
     let hub = Arc::new(build_hub());
     let limiter = Arc::new(Limiter::new());
     let metrics = Arc::new(Metrics::new(true));
-    // In-memory cache by default. Redis/semantic backends drop in here
-    // behind the same trait object once their PRs land.
-    let cache: Option<Arc<dyn Cache>> = Some(Arc::new(MemoryCache::with_defaults()));
+    // Cache backend selection. Memory by default; Redis when configured.
+    // Qdrant / semantic backends drop in here in a follow-up PR.
+    let cache: Option<Arc<dyn Cache>> = match cfg.cache.backend {
+        CacheBackend::Memory => Some(Arc::new(MemoryCache::with_defaults())),
+        CacheBackend::Redis => {
+            let url = cfg
+                .cache
+                .redis
+                .as_ref()
+                .map(|r| r.url.clone())
+                .ok_or_else(|| anyhow::anyhow!("cache.backend = redis but cache.redis missing"))?;
+            tracing::info!(target: "aisix::cache", backend = "redis", "connecting cache backend");
+            let redis = RedisCache::connect(&url)
+                .await
+                .map_err(|e| anyhow::anyhow!("redis cache connect failed (url={url}): {e}"))?;
+            Some(Arc::new(redis) as Arc<dyn Cache>)
+        }
+        CacheBackend::Qdrant => {
+            tracing::warn!(target: "aisix::cache", "qdrant cache not yet implemented — falling back to in-memory");
+            Some(Arc::new(MemoryCache::with_defaults()))
+        }
+    };
 
     // Optional Langfuse exporter — disabled in config by default.
     // When enabled, the proxy gets an Arc<LangfuseSender> through
