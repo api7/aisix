@@ -446,6 +446,9 @@ impl ConfigProvider for EtcdConfigProvider {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
+    use pretty_assertions::assert_eq;
+
     use super::*;
 
     #[test]
@@ -506,13 +509,8 @@ mod tests {
             ],
             ..Config::default()
         };
-        match EtcdConfigProvider::connect_client(&cfg).await {
-            Ok(_) => panic!("expected error for mixed schemes"),
-            Err(e) => assert!(
-                e.to_string().contains("single scheme"),
-                "unexpected error: {e}"
-            ),
-        }
+        let result = EtcdConfigProvider::connect_client(&cfg).await.map(|_| ());
+        assert_matches!(result, Err(e) if e.to_string().contains("single scheme"));
     }
 
     #[tokio::test]
@@ -526,13 +524,8 @@ mod tests {
             }),
             ..Config::default()
         };
-        match EtcdConfigProvider::connect_client(&cfg).await {
-            Ok(_) => panic!("expected error for cert without key"),
-            Err(e) => assert!(
-                e.to_string().contains("cert_pem and tls.key_pem must be set together"),
-                "unexpected error: {e}"
-            ),
-        }
+        let result = EtcdConfigProvider::connect_client(&cfg).await.map(|_| ());
+        assert_matches!(result, Err(e) if e.to_string().contains("cert_pem and tls.key_pem must be set together"));
     }
 
     #[tokio::test]
@@ -546,13 +539,8 @@ mod tests {
             }),
             ..Config::default()
         };
-        match EtcdConfigProvider::connect_client(&cfg).await {
-            Ok(_) => panic!("expected error for key without cert"),
-            Err(e) => assert!(
-                e.to_string().contains("cert_pem and tls.key_pem must be set together"),
-                "unexpected error: {e}"
-            ),
-        }
+        let result = EtcdConfigProvider::connect_client(&cfg).await.map(|_| ());
+        assert_matches!(result, Err(e) if e.to_string().contains("cert_pem and tls.key_pem must be set together"));
     }
 
     #[test]
