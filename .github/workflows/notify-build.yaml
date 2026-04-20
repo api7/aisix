@@ -28,4 +28,3 @@ jobs:
           repository: ${{ secrets.BUILD_REPOSITORY }}
           event-type: release-build
           client-payload: '{"tag": "${{ github.ref_name }}"}'
-  
