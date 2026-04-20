@@ -36,7 +36,7 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 ///
 /// Certificate material is loaded from PEM files on disk. All file fields are
 /// optional; omit a field to disable the corresponding TLS feature.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct EtcdTlsConfig {
     /// Path to a PEM-encoded CA certificate file used to validate the etcd
     /// server certificate.
@@ -55,7 +55,18 @@ pub struct EtcdTlsConfig {
     pub insecure_skip_verify: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+impl std::fmt::Debug for EtcdTlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EtcdTlsConfig")
+            .field("ca_file", &self.ca_file)
+            .field("cert_file", &self.cert_file)
+            .field("key_file", &"***redacted***")
+            .field("insecure_skip_verify", &self.insecure_skip_verify)
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize)]
 pub struct Config {
     pub host: Vec<String>,
     pub prefix: String,
@@ -64,6 +75,22 @@ pub struct Config {
     pub password: Option<String>,
     /// Optional TLS settings used when etcd endpoints use `https://`.
     pub tls: Option<EtcdTlsConfig>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("host", &self.host)
+            .field("prefix", &self.prefix)
+            .field("timeout", &self.timeout)
+            .field("user", &self.user)
+            .field(
+                "password",
+                &self.password.as_deref().map(|_| "***redacted***"),
+            )
+            .field("tls", &self.tls)
+            .finish()
+    }
 }
 
 impl Default for Config {
@@ -134,6 +161,15 @@ impl EtcdConfigProvider {
                 "etcd hosts must use a single scheme (all http:// or all https://)"
             ));
         }
+        if let Some(invalid) = config
+            .host
+            .iter()
+            .find(|h| !h.starts_with("http://") && !h.starts_with("https://"))
+        {
+            return Err(anyhow!(
+                "etcd host '{invalid}' is missing a scheme; use http:// or https://"
+            ));
+        }
 
         if has_https {
             let mut tls_cfg = etcd_client::OpenSslClientConfig::default();
@@ -149,20 +185,21 @@ impl EtcdConfigProvider {
                     tls_cfg = tls_cfg.ca_cert_pem(ca.as_slice());
                 }
 
-                let cert_bytes = read_pem("cert", &t.cert_file)?;
-                let key_bytes = read_pem("key", &t.key_file)?;
-                match (&cert_bytes, &key_bytes) {
-                    (Some(cert), Some(key)) => {
-                        tls_cfg =
-                            tls_cfg.client_cert_pem_and_key(cert.as_slice(), key.as_slice());
-                    }
-                    (None, None) => {}
-                    _ => {
+                // Validate cert/key pair presence before reading files.
+                match (t.cert_file.is_some(), t.key_file.is_some()) {
+                    (true, false) | (false, true) => {
                         return Err(anyhow!(
                             "both tls cert and key must be set together \
                              (via cert_file and key_file)"
                         ))
                     }
+                    _ => {}
+                }
+
+                let cert_bytes = read_pem("cert", &t.cert_file)?;
+                let key_bytes = read_pem("key", &t.key_file)?;
+                if let (Some(cert), Some(key)) = (&cert_bytes, &key_bytes) {
+                    tls_cfg = tls_cfg.client_cert_pem_and_key(cert.as_slice(), key.as_slice());
                 }
             }
             opts = opts.with_openssl_tls(tls_cfg);
@@ -565,6 +602,16 @@ mod tests {
         };
         let result = EtcdConfigProvider::connect_client(&cfg).await.map(|_| ());
         assert_matches!(result, Err(e) if e.to_string().contains("single scheme"));
+    }
+
+    #[tokio::test]
+    async fn test_connect_client_rejects_missing_scheme() {
+        let cfg = Config {
+            host: vec!["127.0.0.1:2379".to_string()],
+            ..Config::default()
+        };
+        let result = EtcdConfigProvider::connect_client(&cfg).await.map(|_| ());
+        assert_matches!(result, Err(e) if e.to_string().contains("missing a scheme"));
     }
 
     #[tokio::test]
