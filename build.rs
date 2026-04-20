@@ -1,6 +1,6 @@
 use std::{env, fs, process};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use vergen_git2::{Emitter, Git2Builder};
 
 fn main() -> Result<()> {
@@ -16,12 +16,14 @@ fn main() -> Result<()> {
 }
 
 fn build_ui() -> Result<()> {
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+
     if env::var("CARGO_FEATURE_BUILD_UI").is_ok() {
         println!("cargo:rerun-if-changed=ui");
 
         let status = process::Command::new("pnpm")
             .args(["install", "--frozen-lockfile"])
-            .current_dir("ui")
+            .current_dir(format!("{manifest_dir}/ui"))
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .status()?;
@@ -35,7 +37,7 @@ fn build_ui() -> Result<()> {
 
         let status = process::Command::new("pnpm")
             .args(["run", "build"])
-            .current_dir("ui")
+            .current_dir(format!("{manifest_dir}/ui"))
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .status()?;
@@ -44,7 +46,7 @@ fn build_ui() -> Result<()> {
             return Err(anyhow!("failed to build ui with status: {}", status));
         }
     } else {
-        fs::create_dir_all("ui/dist")?;
+        fs::create_dir_all(format!("{manifest_dir}/ui/dist"))?;
     }
     Ok(())
 }
