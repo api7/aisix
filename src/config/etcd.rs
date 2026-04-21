@@ -127,13 +127,14 @@ impl EtcdTlsConfig {
     fn extract_pem(label: &str, value: &serde_json::Value) -> Option<Result<String>> {
         if let Some(s) = value.get(label).and_then(|v| v.as_str()) {
             Some(Ok(s.to_string()))
-        } else if let Some(path) = value.get(format!("{label}_file")).and_then(|v| v.as_str()) {
-            Some(
-                std::fs::read_to_string(path)
-                    .with_context(|| format!("failed to read {label} file \"{path}\"")),
-            )
         } else {
-            None
+            value
+                .get(format!("{label}_file"))
+                .and_then(|v| v.as_str())
+                .map(|path| {
+                    std::fs::read_to_string(path)
+                        .with_context(|| format!("failed to read {label} file \"{path}\""))
+                })
         }
     }
 }
