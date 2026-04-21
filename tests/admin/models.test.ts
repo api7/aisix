@@ -127,4 +127,67 @@ describe('admin models', () => {
     expect(duplicateResp.status).toBe(400);
     expect(duplicateResp.data.error_msg).toBe('Model name already exists');
   });
+
+  test('test_rename_propagates_to_apikeys_allowed_models', async () => {
+    const auth = bearerAuthHeader(ADMIN_KEY);
+
+    const createModel = await adminPost(
+      '/models',
+      {
+        name: 'old-model-name',
+        model: TEST_PROVIDER_MODEL,
+        provider_config: TEST_PROVIDER_CONFIG,
+      },
+      auth,
+    );
+    expect(createModel.status).toBe(201);
+    const modelId = extractIdFromStorageKey(createModel.data.key);
+
+    const createKeyBound = await adminPost(
+      '/apikeys',
+      {
+        key: 'sk-rename-bound',
+        allowed_models: ['old-model-name', 'untouched-model'],
+      },
+      auth,
+    );
+    expect(createKeyBound.status).toBe(201);
+    const boundKeyId = extractIdFromStorageKey(createKeyBound.data.key);
+
+    const createKeyUnrelated = await adminPost(
+      '/apikeys',
+      {
+        key: 'sk-rename-unrelated',
+        allowed_models: ['some-other-model'],
+      },
+      auth,
+    );
+    expect(createKeyUnrelated.status).toBe(201);
+    const unrelatedKeyId = extractIdFromStorageKey(createKeyUnrelated.data.key);
+
+    const renameResp = await adminPut(
+      `/models/${modelId}`,
+      {
+        name: 'new-model-name',
+        model: TEST_PROVIDER_MODEL,
+        provider_config: TEST_PROVIDER_CONFIG,
+      },
+      auth,
+    );
+    expect(renameResp.status).toBe(200);
+    expect(renameResp.data.value.name).toBe('new-model-name');
+
+    const boundAfter = await adminGet(`/apikeys/${boundKeyId}`, auth);
+    expect(boundAfter.status).toBe(200);
+    expect(boundAfter.data.value.allowed_models).toStrictEqual([
+      'new-model-name',
+      'untouched-model',
+    ]);
+
+    const unrelatedAfter = await adminGet(`/apikeys/${unrelatedKeyId}`, auth);
+    expect(unrelatedAfter.status).toBe(200);
+    expect(unrelatedAfter.data.value.allowed_models).toStrictEqual([
+      'some-other-model',
+    ]);
+  });
 });

@@ -13,7 +13,7 @@ use crate::{
     },
     config::{
         PutEntry,
-        entities::{Model, models::SCHEMA_VALIDATOR},
+        entities::{ApiKey, Model, models::SCHEMA_VALIDATOR},
     },
     utils::jsonschema::format_evaluation_error,
 };
@@ -215,17 +215,49 @@ async fn update(state: AppState, id: &str, body: Bytes) -> Response {
                 },
             )
                 .into_response(),
-            PutEntry::Updated(_prev) => (
-                StatusCode::OK,
-                ItemResponse {
-                    key: key.to_string(),
-                    value: model,
-                    created_index: None,
-                    modified_index: None,
-                },
-            )
-                .into_response(),
+            PutEntry::Updated(prev) => {
+                if prev.value.name != model.name
+                    && let Err(err) =
+                        propagate_model_rename(&state, &prev.value.name, &model.name).await
+                {
+                    return APIError::InternalError(err).into_response();
+                }
+                (
+                    StatusCode::OK,
+                    ItemResponse {
+                        key: key.to_string(),
+                        value: model,
+                        created_index: None,
+                        modified_index: None,
+                    },
+                )
+                    .into_response()
+            }
         },
         Err(err) => APIError::InternalError(err).into_response(),
     }
+}
+
+/// Rewrite every API key's `allowed_models` list so that references to
+/// `old_name` become `new_name`. Called when a model is renamed via PUT,
+/// since API keys reference models by name.
+async fn propagate_model_rename(
+    state: &AppState,
+    old_name: &str,
+    new_name: &str,
+) -> Result<(), String> {
+    let apikeys = state.config_provider.get_all::<ApiKey>("/apikeys").await?;
+    for entry in apikeys {
+        if !entry.value.allowed_models.iter().any(|m| m == old_name) {
+            continue;
+        }
+        let mut updated = entry.value.clone();
+        for m in updated.allowed_models.iter_mut() {
+            if m == old_name {
+                *m = new_name.to_string();
+            }
+        }
+        state.config_provider.put(&entry.key, &updated).await?;
+    }
+    Ok(())
 }
