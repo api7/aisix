@@ -233,8 +233,6 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 impl EtcdConfigProvider {
     pub async fn new(config: Config) -> Result<Self> {
-        println!("etcd config provider: connecting with config: {config:#?}");
-
         validate_connect_config(&config)?;
 
         let client = (|| Self::connect_client(&config))
