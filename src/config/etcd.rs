@@ -155,6 +155,9 @@ impl EtcdTlsConfig {
 /// Errors produced during etcd connection-configuration validation.
 #[derive(Debug, Error)]
 pub enum EtcdConfigError {
+    #[error("etcd host list is empty")]
+    MissingHost,
+
     /// The host list contains a mix of `http://` and `https://` endpoints,
     /// which is unsupported.
     #[error("etcd hosts must use a single scheme (all http:// or all https://)")]
@@ -171,6 +174,10 @@ pub enum EtcdConfigError {
 /// Returns `Ok(())` if the configuration is valid, or an [`EtcdConfigError`]
 /// describing the first validation failure.
 fn validate_connect_config(config: &Config) -> Result<(), EtcdConfigError> {
+    if config.host.is_empty() {
+        return Err(EtcdConfigError::MissingHost);
+    }
+
     let has_https = config.host.iter().any(|h| h.starts_with("https://"));
     let has_http = config.host.iter().any(|h| h.starts_with("http://"));
 
