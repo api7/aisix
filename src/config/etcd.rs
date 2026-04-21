@@ -129,15 +129,16 @@ impl EtcdTlsConfig {
         pem: &Option<String>,
         pem_file: &Option<String>,
     ) -> Result<Option<String>> {
-        pem.clone()
-            .map(Ok)
-            .or_else(|| {
-                pem_file.as_ref().map(|path| {
-                    std::fs::read_to_string(path)
-                        .with_context(|| format!("failed to read {label} file \"{path}\""))
-                })
-            })
-            .transpose()
+        match (pem, pem_file) {
+            (Some(_), Some(_)) => Err(anyhow!(
+                "both {label} and {label}_file are set; only one must be provided"
+            )),
+            (Some(pem), None) => Ok(Some(pem.clone())),
+            (None, Some(path)) => std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read {label} file from \"{path}\"",))
+                .map(Some),
+            _ => Ok(None),
+        }
     }
 
     fn parse_x509_chain(label: &str, pem: &str) -> Result<Vec<X509>> {
