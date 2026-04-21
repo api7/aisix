@@ -77,32 +77,31 @@ impl<'de> Deserialize<'de> for EtcdTlsConfig {
     where
         D: Deserializer<'de>,
     {
-        let mut config = EtcdTlsConfig::default();
-        let value = serde_json::Value::deserialize(deserializer)?;
+        #[derive(Deserialize)]
+        struct RawEtcdTlsConfig {
+            insecure_skip_verify: Option<bool>,
+            ca: Option<String>,
+            ca_file: Option<String>,
+            cert: Option<String>,
+            cert_file: Option<String>,
+            key: Option<String>,
+            key_file: Option<String>,
+        }
 
-        config.insecure_skip_verify = value
-            .get("insecure_skip_verify")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let value = RawEtcdTlsConfig::deserialize(deserializer)?;
 
-        config.ca_cert = Self::extract_pem("ca", &value)
-            .transpose()
-            .map_err(de::Error::custom)?
-            .map(|pem| Self::parse_x509_chain("ca", &pem))
-            .transpose()
-            .map_err(de::Error::custom)?;
+        let ca_cert = match Self::map_err(Self::extract_pem("ca", &value.ca, &value.ca_file))? {
+            Some(pem) => Some(Self::map_err(Self::parse_x509_chain("ca", &pem))?),
+            _ => None,
+        };
 
-        config.client_cert = match (
-            Self::extract_pem("cert", &value)
-                .transpose()
-                .map_err(de::Error::custom)?,
-            Self::extract_pem("key", &value)
-                .transpose()
-                .map_err(de::Error::custom)?,
+        let client_cert = match (
+            Self::map_err(Self::extract_pem("cert", &value.cert, &value.cert_file))?,
+            Self::map_err(Self::extract_pem("key", &value.key, &value.key_file))?,
         ) {
             (Some(cert_pem), Some(key_pem)) => Some(EtcdTlsCertConfig {
-                certs: Self::parse_x509_chain("cert", &cert_pem).map_err(de::Error::custom)?,
-                key: PKey::private_key_from_pem(key_pem.as_bytes()).map_err(de::Error::custom)?,
+                certs: Self::map_err(Self::parse_x509_chain("cert", &cert_pem))?,
+                key: Self::map_err(PKey::private_key_from_pem(key_pem.as_bytes()))?,
             }),
             (None, None) => None,
             _ => {
@@ -110,11 +109,37 @@ impl<'de> Deserialize<'de> for EtcdTlsConfig {
             }
         };
 
-        Ok(config)
+        Ok(Self {
+            ca_cert,
+            client_cert,
+            insecure_skip_verify: value.insecure_skip_verify.unwrap_or(false),
+        })
     }
 }
 
 impl EtcdTlsConfig {
+    fn map_err<T, E: std::fmt::Display, D: de::Error>(
+        result: std::result::Result<T, E>,
+    ) -> std::result::Result<T, D> {
+        result.map_err(D::custom)
+    }
+
+    fn extract_pem(
+        label: &str,
+        pem: &Option<String>,
+        pem_file: &Option<String>,
+    ) -> Result<Option<String>> {
+        pem.clone()
+            .map(Ok)
+            .or_else(|| {
+                pem_file.as_ref().map(|path| {
+                    std::fs::read_to_string(path)
+                        .with_context(|| format!("failed to read {label} file \"{path}\""))
+                })
+            })
+            .transpose()
+    }
+
     fn parse_x509_chain(label: &str, pem: &str) -> Result<Vec<X509>> {
         let certs = X509::stack_from_pem(pem.as_bytes())
             .with_context(|| format!("etcd TLS: failed to parse {label} PEM"))?;
@@ -122,20 +147,6 @@ impl EtcdTlsConfig {
             return Err(anyhow!("etcd TLS: failed to parse {label} PEM"));
         }
         Ok(certs)
-    }
-
-    fn extract_pem(label: &str, value: &serde_json::Value) -> Option<Result<String>> {
-        if let Some(s) = value.get(label).and_then(|v| v.as_str()) {
-            Some(Ok(s.to_string()))
-        } else {
-            value
-                .get(format!("{label}_file"))
-                .and_then(|v| v.as_str())
-                .map(|path| {
-                    std::fs::read_to_string(path)
-                        .with_context(|| format!("failed to read {label} file \"{path}\""))
-                })
-        }
     }
 }
 
@@ -702,7 +713,7 @@ mod tests {
 
     #[test]
     fn test_cert_config_files_reads_from_disk() {
-        let pem = EtcdTlsConfig::extract_pem("ca", &json!({ "ca_file": CA_CERT_PATH }))
+        let pem = EtcdTlsConfig::extract_pem("ca", &None, &Some(CA_CERT_PATH.to_owned()))
             .expect("ca_file should be present")
             .unwrap();
         assert_eq!(pem, CA_CERT_PEM);
