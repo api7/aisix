@@ -26,24 +26,24 @@ use crate::config::{ConfigEvent, ConfigEventReceiver, ConfigProvider, GetEntry, 
 ///
 /// Stores the eagerly parsed client certificate chain and private key.
 #[derive(Clone)]
-pub struct EtcdTlsCertConfig {
+pub struct EtcdMtlsConfig {
     certs: Vec<X509>,
     key: PKey<pkey::Private>,
 }
 
-impl EtcdTlsCertConfig {
+impl EtcdMtlsConfig {
     /// Return the parsed client certificate chain.
-    pub fn certs(&self) -> Vec<X509> {
-        self.certs.clone()
+    pub fn certs(&self) -> &[X509] {
+        &self.certs
     }
 
     /// Return the parsed client private key.
-    pub fn key(&self) -> PKey<pkey::Private> {
-        self.key.clone()
+    pub fn key(&self) -> &PKey<pkey::Private> {
+        &self.key
     }
 }
 
-impl Debug for EtcdTlsCertConfig {
+impl Debug for EtcdMtlsConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EtcdTlsCertConfig")
             .field("certs", &self.certs)
@@ -63,7 +63,7 @@ pub struct EtcdTlsConfig {
     pub ca_cert: Option<Vec<X509>>,
 
     /// Optional client certificate material.
-    pub client_cert: Option<EtcdTlsCertConfig>,
+    pub client_cert: Option<EtcdMtlsConfig>,
 
     /// Skip TLS certificate verification entirely.
     ///
@@ -99,7 +99,7 @@ impl<'de> Deserialize<'de> for EtcdTlsConfig {
             Self::map_err(Self::extract_pem("cert", &value.cert, &value.cert_file))?,
             Self::map_err(Self::extract_pem("key", &value.key, &value.key_file))?,
         ) {
-            (Some(cert_pem), Some(key_pem)) => Some(EtcdTlsCertConfig {
+            (Some(cert_pem), Some(key_pem)) => Some(EtcdMtlsConfig {
                 certs: Self::map_err(Self::parse_x509_chain("cert", &cert_pem))?,
                 key: Self::map_err(PKey::private_key_from_pem(key_pem.as_bytes()))?,
             }),
@@ -321,7 +321,7 @@ impl EtcdConfigProvider {
                                 cb.add_extra_chain_cert(cert.to_owned())?;
                             }
                         }
-                        cb.set_private_key(&key)?;
+                        cb.set_private_key(key)?;
 
                         Ok(())
                     });
@@ -686,7 +686,7 @@ mod tests {
         assert_eq!(cert.is_some(), key.is_some());
         EtcdTlsConfig {
             ca_cert: ca.map(|ca| EtcdTlsConfig::parse_x509_chain("ca", ca).unwrap()),
-            client_cert: cert.zip(key).map(|(cert, key)| EtcdTlsCertConfig {
+            client_cert: cert.zip(key).map(|(cert, key)| EtcdMtlsConfig {
                 certs: EtcdTlsConfig::parse_x509_chain("cert", cert).unwrap(),
                 key: PKey::private_key_from_pem(key.as_bytes()).unwrap(),
             }),
@@ -750,9 +750,9 @@ mod tests {
             Some(CLIENT_KEY_PEM),
         );
         assert_cert_chain_matches(tls.ca_cert.as_deref().unwrap(), CA_CERT_PEM);
-        assert_cert_chain_matches(&tls.client_cert.as_ref().unwrap().certs(), CLIENT_CERT_PEM);
+        assert_cert_chain_matches(tls.client_cert.as_ref().unwrap().certs(), CLIENT_CERT_PEM);
         let key = tls.client_cert.as_ref().unwrap().key();
-        assert_key_matches(&key, CLIENT_KEY_PEM);
+        assert_key_matches(key, CLIENT_KEY_PEM);
     }
 
     // ── TLS scheme detection ──────────────────────────────────────────────────
@@ -848,9 +848,9 @@ mod tests {
         .unwrap();
         assert_cert_chain_matches(tls.ca_cert.as_deref().unwrap(), CA_CERT_PEM);
         let client_cert = tls.client_cert.as_ref().unwrap();
-        assert_cert_chain_matches(&client_cert.certs(), CLIENT_CERT_PEM);
+        assert_cert_chain_matches(client_cert.certs(), CLIENT_CERT_PEM);
         let key = client_cert.key();
-        assert_key_matches(&key, CLIENT_KEY_PEM);
+        assert_key_matches(key, CLIENT_KEY_PEM);
         assert!(!tls.insecure_skip_verify);
     }
 
@@ -864,9 +864,9 @@ mod tests {
         .unwrap();
         assert_cert_chain_matches(tls.ca_cert.as_deref().unwrap(), CA_CERT_PEM);
         let client_cert = tls.client_cert.as_ref().unwrap();
-        assert_cert_chain_matches(&client_cert.certs(), CLIENT_CERT_PEM);
+        assert_cert_chain_matches(client_cert.certs(), CLIENT_CERT_PEM);
         let key = client_cert.key();
-        assert_key_matches(&key, CLIENT_KEY_PEM);
+        assert_key_matches(key, CLIENT_KEY_PEM);
     }
 
     #[test]
@@ -878,7 +878,7 @@ mod tests {
         }))
         .unwrap();
         assert_cert_chain_matches(tls.ca_cert.as_deref().unwrap(), CA_CERT_PEM);
-        assert_cert_chain_matches(&tls.client_cert.as_ref().unwrap().certs(), CLIENT_CERT_PEM);
+        assert_cert_chain_matches(tls.client_cert.as_ref().unwrap().certs(), CLIENT_CERT_PEM);
         assert!(!tls.insecure_skip_verify);
     }
 
@@ -979,8 +979,8 @@ mod tests {
         let tls = cfg.tls.unwrap();
         assert_cert_chain_matches(tls.ca_cert.as_deref().unwrap(), CA_CERT_PEM);
         let client_cert = tls.client_cert.as_ref().unwrap();
-        assert_cert_chain_matches(&client_cert.certs(), CLIENT_CERT_PEM);
+        assert_cert_chain_matches(client_cert.certs(), CLIENT_CERT_PEM);
         let key = client_cert.key();
-        assert_key_matches(&key, CLIENT_KEY_PEM);
+        assert_key_matches(key, CLIENT_KEY_PEM);
     }
 }
