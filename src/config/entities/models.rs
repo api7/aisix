@@ -40,7 +40,10 @@ static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
             {
                 "if": {
                     "properties": {
-                        "model": { "pattern": "^(anthropic|deepseek|gemini|openai)/.+$" }
+                        "model": {
+                            "type": "string",
+                            "pattern": "^(anthropic|deepseek|gemini|openai)/.+$"
+                        }
                     },
                     "required": ["model"]
                 },
@@ -53,7 +56,10 @@ static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
             {
                 "if": {
                     "properties": {
-                        "model": { "pattern": "^bedrock/.+$" }
+                        "model": {
+                            "type": "string",
+                            "pattern": "^bedrock/.+$"
+                        }
                     },
                     "required": ["model"]
                 },
@@ -322,8 +328,7 @@ mod tests {
         "name": "test",
         "model": 123,
         "provider_config": {},
-    }), false, Some(r#"property "/model" validation failed: 123 is not of type "string"
-property "/provider_config" validation failed: "api_key" is a required property"#.to_string()))]
+    }), false, Some(r#"property "/model" validation failed: 123 is not of type "string""#.to_string()))]
     #[case::invalid_model_pattern(json!({
         "name": "test",
         "model": "invalid",
