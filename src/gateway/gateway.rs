@@ -269,16 +269,16 @@ impl Gateway {
         let url = instance.build_url(&request.model)?;
         let headers = instance.build_headers()?;
 
-        let request =
+        let prepared_request =
             self.prepare_json_request(instance, Method::POST, url, headers, &provider_body, false)?;
-        let response = self.send_request(request).await?;
+        let response = self.send_request(prepared_request).await?;
 
         if !response.status().is_success() {
             return Err(provider_error(response, instance.def.name()).await);
         }
 
         let body: Value = response.json().await.map_err(GatewayError::Http)?;
-        instance.def.transform_response(body)
+        instance.def.transform_response_with_request(request, body)
     }
 
     async fn call_chat_hub_stream(
@@ -407,7 +407,7 @@ mod tests {
         },
     };
 
-    use axum::{Json, Router, routing::post};
+    use axum::{Json, Router, extract::OriginalUri, routing::post};
     use futures::StreamExt;
     use http::{
         HeaderMap, HeaderValue, StatusCode,
@@ -420,8 +420,10 @@ mod tests {
     use super::Gateway;
     use crate::gateway::{
         error::{GatewayError, Result},
-        provider_instance::{ProviderAuth, ProviderInstance, ProviderRegistry},
-        providers::AnthropicDef,
+        provider_instance::{
+            AwsStaticCredentials, ProviderAuth, ProviderInstance, ProviderRegistry,
+        },
+        providers::{AnthropicDef, BedrockDef},
         traits::{
             ChatFormat, ChatTransform, EmbedTransform, NativeHandler, NativeOpenAIResponsesSupport,
             OpenAIResponsesNativeStreamState, PreparedRequest, ProviderCapabilities, ProviderMeta,
@@ -441,6 +443,7 @@ mod tests {
 
     type ObservedRequest = Option<(Option<String>, Value)>;
     type PreparedObservedRequest = Option<(Option<String>, Option<String>, Value)>;
+    type BedrockObservedRequest = Option<(String, Option<String>, Option<String>, Value)>;
 
     struct HubTestProvider;
 
@@ -979,6 +982,102 @@ mod tests {
         assert_eq!(observed.0.as_deref(), Some("Bearer hub-secret"));
         assert_eq!(observed.1.as_deref(), Some("yes"));
         assert_eq!(observed.2["model"], "gpt-test");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_completion_uses_bedrock_complete_path_and_signs_request() {
+        let observed: Arc<Mutex<BedrockObservedRequest>> = Arc::new(Mutex::new(None));
+        let observed_clone = Arc::clone(&observed);
+        let router = Router::new().route(
+            "/{*path}",
+            post(
+                move |OriginalUri(uri): OriginalUri,
+                      headers: HeaderMap,
+                      Json(body): Json<Value>| {
+                    let observed = Arc::clone(&observed_clone);
+                    async move {
+                        let authorization = headers
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        let session_token = headers
+                            .get("x-amz-security-token")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        *observed.lock().await =
+                            Some((uri.path().to_string(), authorization, session_token, body));
+
+                        Json(json!({
+                            "output": {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": [{"text": "hello from bedrock"}]
+                                }
+                            },
+                            "stopReason": "end_turn",
+                            "usage": {
+                                "inputTokens": 7,
+                                "outputTokens": 9,
+                                "totalTokens": 16
+                            }
+                        }))
+                    }
+                },
+            ),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(BedrockDef),
+            auth: ProviderAuth::AwsStatic(AwsStaticCredentials {
+                access_key_id: "AKIA123".into(),
+                secret_access_key: "secret".into(),
+                session_token: Some("token".into()),
+                region: "us-east-1".into(),
+            }),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let response = gateway.chat_completion(&request, &instance).await.unwrap();
+        let ChatResponse::Complete { response, usage } = response else {
+            panic!("expected complete response")
+        };
+
+        assert_eq!(
+            response.model,
+            "inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+        );
+        assert!(response.id.starts_with("bedrock-"));
+        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert!(matches!(
+            response.choices[0].message.content.as_ref(),
+            Some(crate::gateway::types::openai::MessageContent::Text(text))
+                if text == "hello from bedrock"
+        ));
+        assert_eq!(usage.total_tokens, Some(16));
+
+        let observed = observed.lock().await.take().unwrap();
+        assert_eq!(
+            observed.0,
+            "/model/inference-profile%2Fus.anthropic.claude-3-7-sonnet-20250219-v1:0/converse"
+        );
+        assert!(
+            observed
+                .1
+                .as_deref()
+                .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256"))
+        );
+        assert_eq!(observed.2.as_deref(), Some("token"));
+        assert_eq!(observed.3["messages"][0]["content"][0]["text"], "hello");
 
         server.abort();
     }

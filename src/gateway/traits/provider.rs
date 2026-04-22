@@ -110,6 +110,14 @@ pub trait ChatTransform: ProviderMeta {
         serde_json::from_value(body).map_err(|error| GatewayError::Transform(error.to_string()))
     }
 
+    fn transform_response_with_request(
+        &self,
+        _request: &ChatCompletionRequest,
+        body: Value,
+    ) -> Result<ChatCompletionResponse> {
+        self.transform_response(body)
+    }
+
     fn transform_stream_chunk(
         &self,
         raw: &str,

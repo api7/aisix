@@ -14,6 +14,7 @@ pub struct AwsStaticCredentials {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub session_token: Option<String>,
+    pub region: String,
 }
 
 /// Authentication material bound to a provider instance at runtime.
@@ -57,7 +58,6 @@ impl ProviderAuth {
         })
     }
 
-    #[cfg(test)]
     pub fn aws_static_credentials(&self) -> Result<&AwsStaticCredentials> {
         match self {
             Self::AwsStatic(credentials) => Ok(credentials),
@@ -67,7 +67,6 @@ impl ProviderAuth {
         }
     }
 
-    #[cfg(test)]
     pub fn aws_static_credentials_for(&self, provider: &str) -> Result<&AwsStaticCredentials> {
         self.aws_static_credentials().map_err(|error| match error {
             GatewayError::Validation(message) => {
@@ -268,6 +267,7 @@ mod tests {
                     access_key_id: "AKIA...".into(),
                     secret_access_key: "secret".into(),
                     session_token: Some("token".into()),
+                    region: "us-east-1".into(),
                 })
             ),
             "AwsStatic(REDACTED)"
@@ -308,6 +308,7 @@ mod tests {
             access_key_id: "AKIA123".into(),
             secret_access_key: "secret".into(),
             session_token: Some("token".into()),
+            region: "us-east-1".into(),
         };
         let auth = ProviderAuth::AwsStatic(credentials.clone());
 
