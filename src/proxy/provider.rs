@@ -6,7 +6,7 @@ use crate::{
     gateway::{
         Gateway,
         error::{GatewayError, Result},
-        provider_instance::{ProviderAuth, ProviderInstance},
+        provider_instance::{AwsStaticCredentials, ProviderAuth, ProviderInstance},
     },
 };
 
@@ -35,14 +35,38 @@ pub fn create_provider_instance(
 }
 
 fn provider_auth_and_base_url(config: &ProviderConfig) -> Result<(ProviderAuth, Option<Url>)> {
-    let (api_key, api_base) = match config {
-        ProviderConfig::Anthropic(config) => (&config.api_key, config.api_base.as_deref()),
-        ProviderConfig::DeepSeek(config) => (&config.api_key, config.api_base.as_deref()),
-        ProviderConfig::Gemini(config) => (&config.api_key, config.api_base.as_deref()),
-        ProviderConfig::OpenAI(config) => (&config.api_key, config.api_base.as_deref()),
+    let (auth, base_url_override) = match config {
+        ProviderConfig::Anthropic(config) => (
+            ProviderAuth::ApiKey(config.api_key.clone()),
+            parse_base_url(config.api_base.as_deref())?,
+        ),
+        ProviderConfig::Bedrock(config) => (
+            ProviderAuth::AwsStatic(AwsStaticCredentials {
+                access_key_id: config.access_key_id.clone(),
+                secret_access_key: config.secret_access_key.clone(),
+                session_token: config.session_token.clone(),
+            }),
+            parse_base_url(config.endpoint.as_deref())?,
+        ),
+        ProviderConfig::DeepSeek(config) => (
+            ProviderAuth::ApiKey(config.api_key.clone()),
+            parse_base_url(config.api_base.as_deref())?,
+        ),
+        ProviderConfig::Gemini(config) => (
+            ProviderAuth::ApiKey(config.api_key.clone()),
+            parse_base_url(config.api_base.as_deref())?,
+        ),
+        ProviderConfig::OpenAI(config) => (
+            ProviderAuth::ApiKey(config.api_key.clone()),
+            parse_base_url(config.api_base.as_deref())?,
+        ),
     };
 
-    let base_url_override = match api_base {
+    Ok((auth, base_url_override))
+}
+
+fn parse_base_url(api_base: Option<&str>) -> Result<Option<Url>> {
+    match api_base {
         Some(api_base) => {
             let parsed = Url::parse(api_base).map_err(|error| {
                 GatewayError::Internal(format!("invalid provider api_base {}: {}", api_base, error))
@@ -56,10 +80,60 @@ fn provider_auth_and_base_url(config: &ProviderConfig) -> Result<(ProviderAuth, 
                 )));
             }
 
-            Some(parsed)
+            Ok(Some(parsed))
         }
-        None => None,
+        None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use reqwest::Url;
+
+    use super::provider_auth_and_base_url;
+    use crate::{
+        config::entities::models::ProviderConfig,
+        gateway::providers::configs::BedrockProviderConfig,
     };
 
-    Ok((ProviderAuth::ApiKey(api_key.clone()), base_url_override))
+    #[test]
+    fn provider_auth_and_base_url_returns_bedrock_static_credentials() {
+        let config = ProviderConfig::Bedrock(BedrockProviderConfig {
+            region: "us-east-1".into(),
+            access_key_id: "AKIA123".into(),
+            secret_access_key: "secret".into(),
+            session_token: Some("token".into()),
+            endpoint: Some("https://bedrock-runtime.us-east-1.amazonaws.com".into()),
+        });
+
+        let (auth, base_url_override) = provider_auth_and_base_url(&config).unwrap();
+        let credentials = auth.aws_static_credentials_for("bedrock").unwrap();
+
+        assert_eq!(credentials.access_key_id, "AKIA123");
+        assert_eq!(credentials.secret_access_key, "secret");
+        assert_eq!(credentials.session_token.as_deref(), Some("token"));
+        assert_eq!(
+            base_url_override.as_ref().map(Url::as_str),
+            Some("https://bedrock-runtime.us-east-1.amazonaws.com/")
+        );
+    }
+
+    #[test]
+    fn provider_auth_and_base_url_rejects_invalid_bedrock_endpoint_scheme() {
+        let config = ProviderConfig::Bedrock(BedrockProviderConfig {
+            region: "us-east-1".into(),
+            access_key_id: "AKIA123".into(),
+            secret_access_key: "secret".into(),
+            session_token: None,
+            endpoint: Some("ftp://bedrock-runtime.us-east-1.amazonaws.com".into()),
+        });
+
+        let error = provider_auth_and_base_url(&config).unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::gateway::error::GatewayError::Internal(message)
+                if message.contains("unsupported scheme")
+        ));
+    }
 }

@@ -59,7 +59,13 @@ pub async fn run_with_config(
     let config_provider = config::create_provider(&config)
         .await
         .context("failed to create config provider")?;
-    run_with_provider(config, config_provider, ob_shutdown_signal, ob_shutdown_task).await
+    run_with_provider(
+        config,
+        config_provider,
+        ob_shutdown_signal,
+        ob_shutdown_task,
+    )
+    .await
 }
 
 /// Run the full aisix gateway with an already-constructed [`config::ConfigProvider`].

@@ -1,6 +1,6 @@
 use std::{env, fs, process};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use vergen_git2::{Emitter, Git2Builder};
 
 fn main() -> Result<()> {

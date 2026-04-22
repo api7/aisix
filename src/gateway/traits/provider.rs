@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
-use http::HeaderMap;
+use bytes::Bytes;
+use http::{HeaderMap, Method};
 use serde_json::{Map, Value};
 
 use crate::gateway::{
@@ -16,6 +17,16 @@ use crate::gateway::{
     },
 };
 
+/// Prepared outbound request that can be adjusted by the provider before send.
+#[derive(Debug, Clone)]
+pub struct PreparedRequest {
+    pub method: Method,
+    pub url: reqwest::Url,
+    pub headers: HeaderMap,
+    pub body: Bytes,
+    pub stream: bool,
+}
+
 /// Provider metadata with no data transformation logic.
 pub trait ProviderMeta: Send + Sync + 'static {
     fn name(&self) -> &'static str;
@@ -29,6 +40,14 @@ pub trait ProviderMeta: Send + Sync + 'static {
 
     fn stream_reader_kind(&self) -> StreamReaderKind {
         StreamReaderKind::Sse
+    }
+
+    fn prepare_request(
+        &self,
+        request: PreparedRequest,
+        _auth: &ProviderAuth,
+    ) -> Result<PreparedRequest> {
+        Ok(request)
     }
 
     fn build_auth_headers(&self, auth: &ProviderAuth) -> Result<HeaderMap>;

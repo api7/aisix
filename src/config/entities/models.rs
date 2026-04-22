@@ -49,6 +49,19 @@ static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
                         "provider_config": { "$ref": "#/$defs/openai_compatible" }
                     }
                 }
+            },
+            {
+                "if": {
+                    "properties": {
+                        "model": { "pattern": "^bedrock/.+$" }
+                    },
+                    "required": ["model"]
+                },
+                "then": {
+                    "properties": {
+                        "provider_config": { "$ref": "#/$defs/bedrock" }
+                    }
+                }
             }
         ],
         "$defs": {
@@ -58,6 +71,18 @@ static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
                 "properties": {
                     "api_key": {"type": "string"},
                     "api_base": {"type": "string"}
+                },
+                "additionalProperties": false
+            },
+            "bedrock": {
+                "type": "object",
+                "required": ["region", "access_key_id", "secret_access_key"],
+                "properties": {
+                    "region": {"type": "string"},
+                    "access_key_id": {"type": "string"},
+                    "secret_access_key": {"type": "string"},
+                    "session_token": {"type": "string"},
+                    "endpoint": {"type": "string"}
                 },
                 "additionalProperties": false
             }
@@ -71,6 +96,7 @@ pub static SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> =
 #[serde(untagged)]
 pub enum ProviderConfig {
     Anthropic(configs::AnthropicProviderConfig),
+    Bedrock(configs::BedrockProviderConfig),
     DeepSeek(configs::DeepSeekProviderConfig),
     Gemini(configs::GeminiProviderConfig),
     OpenAI(configs::OpenAIProviderConfig),
@@ -86,6 +112,11 @@ impl ProviderConfig {
                 let config =
                     serde_json::from_value::<configs::AnthropicProviderConfig>(json_value.clone())?;
                 Ok(ProviderConfig::Anthropic(config))
+            }
+            identifiers::BEDROCK => {
+                let config =
+                    serde_json::from_value::<configs::BedrockProviderConfig>(json_value.clone())?;
+                Ok(ProviderConfig::Bedrock(config))
             }
             identifiers::DEEPSEEK => {
                 let config =
@@ -110,7 +141,7 @@ impl ProviderConfig {
     }
 }
 
-pub static MODELS_PATTERN: &str = "^(anthropic|deepseek|gemini|openai)/.+$";
+pub static MODELS_PATTERN: &str = "^(anthropic|bedrock|deepseek|gemini|openai)/.+$";
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ProviderModel {
     #[serde(skip)]
@@ -119,7 +150,7 @@ pub struct ProviderModel {
     pub name: String,
 
     #[serde(rename = "model")]
-    #[schema(pattern = "^(anthropic|deepseek|gemini|openai)/.+$")]
+    #[schema(pattern = "^(anthropic|bedrock|deepseek|gemini|openai)/.+$")]
     pub original_model: String,
 }
 
@@ -155,9 +186,14 @@ impl<'de> Deserialize<'de> for Model {
 
         let raw = ModelRaw::deserialize(deserializer)?;
 
-        let mut model_parts = raw.model.split('/');
-        let provider = model_parts.next().unwrap_or("").to_lowercase();
-        let provider_model = model_parts.next().unwrap_or("").to_string();
+        let Some((provider, provider_model)) = raw.model.split_once('/') else {
+            return Err(D::Error::custom(format!(
+                "Invalid model format for {}: {}",
+                raw.name, raw.model
+            )));
+        };
+        let provider = provider.to_lowercase();
+        let provider_model = provider_model.to_string();
         if provider.is_empty() || provider_model.is_empty() {
             return Err(D::Error::custom(format!(
                 "Invalid model format for {}: {}",
@@ -256,6 +292,15 @@ mod tests {
         "model": "openai/gpt-5",
         "provider_config": { "api_key": "test_key" },
     }), true, None)]
+    #[case::bedrock_ok(json!({
+        "name": "test",
+        "model": "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
+        "provider_config": {
+            "region": "us-east-1",
+            "access_key_id": "AKIA123",
+            "secret_access_key": "secret"
+        },
+    }), true, None)]
     #[case::missing_name(json!({
         "model": "openai/gpt-5",
         "provider_config": { "api_key": "test_key" },
@@ -295,6 +340,14 @@ property "/provider_config" validation failed: 123 is not of type "object""#.to_
         "model": "deepseek/deepseek-chat",
         "provider_config": {},
     }), false, Some(r#"property "/provider_config" validation failed: "api_key" is a required property"#.to_string()))]
+    #[case::invalid_bedrock_provider_config_missing_region(json!({
+        "name": "test",
+        "model": "bedrock/meta.llama3-70b-instruct-v1:0",
+        "provider_config": {
+            "access_key_id": "AKIA123",
+            "secret_access_key": "secret"
+        },
+    }), false, Some(r#"property "/provider_config" validation failed: "region" is a required property"#.to_string()))]
     #[case::invalid_provider_config_additional_property(json!({
         "name": "test",
         "model": "deepseek/deepseek-chat",
@@ -336,5 +389,34 @@ property "/provider_config" validation failed: 123 is not of type "object""#.to_
                 "unexpected error message"
             );
         }
+    }
+
+    #[test]
+    fn deserialize_bedrock_model_preserves_full_identifier() {
+        let model: super::Model = serde_json::from_value(json!({
+            "name": "test",
+            "model": "bedrock/arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "provider_config": {
+                "region": "us-east-1",
+                "access_key_id": "AKIA123",
+                "secret_access_key": "secret",
+                "session_token": "token"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(model.model.provider, "bedrock");
+        assert_eq!(
+            model.model.name,
+            "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-3-5-sonnet-20240620-v1:0"
+        );
+        assert_eq!(
+            model.model.original_model,
+            "bedrock/arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-3-5-sonnet-20240620-v1:0"
+        );
+        assert!(matches!(
+            model.provider_config,
+            super::ProviderConfig::Bedrock(_)
+        ));
     }
 }

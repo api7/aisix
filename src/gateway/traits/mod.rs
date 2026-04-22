@@ -9,8 +9,8 @@ pub use native::{
 #[allow(unused_imports)]
 pub use native::{NativeOpenAIResponsesSupport, OpenAIResponsesNativeStreamState};
 pub use provider::{
-    ChatTransform, CompatQuirks, EmbedTransform, ProviderCapabilities, ProviderMeta,
-    StreamReaderKind,
+    ChatTransform, CompatQuirks, EmbedTransform, PreparedRequest, ProviderCapabilities,
+    ProviderMeta, StreamReaderKind,
 };
 #[allow(unused_imports)]
 pub use provider::{ImageGenTransform, SttTransform, TtsTransform};

@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod bedrock;
 pub mod deepseek;
 pub mod gemini;
 pub mod macros;
@@ -10,9 +11,10 @@ pub use gemini::GoogleDef;
 pub use openai::OpenAIDef;
 
 pub mod identifiers {
-    use super::{anthropic, deepseek, gemini, openai};
+    use super::{anthropic, bedrock, deepseek, gemini, openai};
 
     pub const ANTHROPIC: &str = anthropic::IDENTIFIER;
+    pub const BEDROCK: &str = bedrock::IDENTIFIER;
     pub const DEEPSEEK: &str = deepseek::IDENTIFIER;
     pub const GEMINI: &str = gemini::IDENTIFIER;
     pub const OPENAI: &str = openai::IDENTIFIER;
@@ -20,8 +22,9 @@ pub mod identifiers {
 
 pub mod configs {
     pub use super::{
-        anthropic::AnthropicProviderConfig, deepseek::DeepSeekProviderConfig,
-        gemini::GeminiProviderConfig, openai::OpenAIProviderConfig,
+        anthropic::AnthropicProviderConfig, bedrock::BedrockProviderConfig,
+        deepseek::DeepSeekProviderConfig, gemini::GeminiProviderConfig,
+        openai::OpenAIProviderConfig,
     };
 }
 

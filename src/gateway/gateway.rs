@@ -2,7 +2,7 @@ use std::{pin::Pin, time::Duration};
 
 use bytes::Bytes;
 use futures::Stream;
-use http::{StatusCode, header::CONTENT_TYPE};
+use http::{Method, StatusCode, header::CONTENT_TYPE};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
@@ -11,7 +11,7 @@ use crate::gateway::{
     formats::{AnthropicMessagesFormat, OpenAIChatFormat},
     provider_instance::{ProviderInstance, ProviderRegistry},
     streams::{BridgedStream, HubChunkStream, NativeStream, sse_reader},
-    traits::{ChatFormat, NativeHandler, StreamReaderKind},
+    traits::{ChatFormat, NativeHandler, PreparedRequest, StreamReaderKind},
     types::{
         anthropic::AnthropicMessagesRequest,
         common::Usage,
@@ -130,9 +130,10 @@ impl Gateway {
             .build_url_for_endpoint(base_url.as_str(), endpoint_path.as_ref());
         let headers = instance.build_headers()?;
         let EmbedRequestBody::Json(body) = transform.transform_embeddings_request(request)?;
-        let request = self.http_client.post(url).headers(headers).json(&body);
+        let request =
+            self.prepare_json_request(instance, Method::POST, url, headers, &body, false)?;
 
-        let response = self.send_request(request, false).await?;
+        let response = self.send_request(request).await?;
 
         if !response.status().is_success() {
             return Err(provider_error(response, instance.def.name()).await);
@@ -159,11 +160,54 @@ impl Gateway {
         transform.transform_embeddings_response(response_body)
     }
 
-    async fn send_request(
+    fn prepare_json_request(
         &self,
-        request: reqwest::RequestBuilder,
+        instance: &ProviderInstance,
+        method: Method,
+        url: String,
+        mut headers: http::HeaderMap,
+        body: &Value,
         stream: bool,
-    ) -> Result<reqwest::Response> {
+    ) -> Result<PreparedRequest> {
+        let url = reqwest::Url::parse(&url).map_err(|error| {
+            GatewayError::Validation(format!(
+                "provider {} produced invalid request url {}: {}",
+                instance.def.name(),
+                url,
+                error
+            ))
+        })?;
+        let body = serde_json::to_vec(body)
+            .map(Bytes::from)
+            .map_err(|error| GatewayError::Transform(error.to_string()))?;
+
+        headers
+            .entry(CONTENT_TYPE)
+            .or_insert(http::HeaderValue::from_static("application/json"));
+
+        instance.prepare_request(PreparedRequest {
+            method,
+            url,
+            headers,
+            body,
+            stream,
+        })
+    }
+
+    async fn send_request(&self, request: PreparedRequest) -> Result<reqwest::Response> {
+        let PreparedRequest {
+            method,
+            url,
+            headers,
+            body,
+            stream,
+        } = request;
+
+        let request = self
+            .http_client
+            .request(method, url)
+            .headers(headers)
+            .body(body);
         let request = if stream {
             request
         } else {
@@ -189,8 +233,9 @@ impl Gateway {
         let url = join_url(base_url.as_str(), &endpoint_path);
         let headers = instance.build_headers()?;
 
-        let request = self.http_client.post(url).headers(headers).json(&body);
-        let response = self.send_request(request, stream).await?;
+        let request =
+            self.prepare_json_request(instance, Method::POST, url, headers, &body, stream)?;
+        let response = self.send_request(request).await?;
 
         if !response.status().is_success() {
             return Err(provider_error(response, instance.def.name()).await);
@@ -224,12 +269,9 @@ impl Gateway {
         let url = instance.build_url(&request.model)?;
         let headers = instance.build_headers()?;
 
-        let request = self
-            .http_client
-            .post(url)
-            .headers(headers)
-            .json(&provider_body);
-        let response = self.send_request(request, false).await?;
+        let request =
+            self.prepare_json_request(instance, Method::POST, url, headers, &provider_body, false)?;
+        let response = self.send_request(request).await?;
 
         if !response.status().is_success() {
             return Err(provider_error(response, instance.def.name()).await);
@@ -250,12 +292,9 @@ impl Gateway {
         let url = instance.build_url(&request.model)?;
         let headers = instance.build_headers()?;
 
-        let request = self
-            .http_client
-            .post(url)
-            .headers(headers)
-            .json(&provider_body);
-        let response = self.send_request(request, true).await?;
+        let request =
+            self.prepare_json_request(instance, Method::POST, url, headers, &provider_body, true)?;
+        let response = self.send_request(request).await?;
 
         if !response.status().is_success() {
             return Err(provider_error(response, instance.def.name()).await);
@@ -385,7 +424,8 @@ mod tests {
         providers::AnthropicDef,
         traits::{
             ChatFormat, ChatTransform, EmbedTransform, NativeHandler, NativeOpenAIResponsesSupport,
-            OpenAIResponsesNativeStreamState, ProviderCapabilities, ProviderMeta, StreamReaderKind,
+            OpenAIResponsesNativeStreamState, PreparedRequest, ProviderCapabilities, ProviderMeta,
+            StreamReaderKind,
         },
         types::{
             anthropic::{AnthropicContentBlock, AnthropicMessagesRequest},
@@ -400,8 +440,11 @@ mod tests {
     };
 
     type ObservedRequest = Option<(Option<String>, Value)>;
+    type PreparedObservedRequest = Option<(Option<String>, Option<String>, Value)>;
 
     struct HubTestProvider;
+
+    struct PreparedHubTestProvider;
 
     struct NativeTestProvider;
 
@@ -449,6 +492,40 @@ mod tests {
             Some(self)
         }
     }
+
+    impl ProviderMeta for PreparedHubTestProvider {
+        fn name(&self) -> &'static str {
+            "prepared-hub-test"
+        }
+
+        fn default_base_url(&self) -> &'static str {
+            "https://example.invalid"
+        }
+
+        fn chat_endpoint_path(&self, _model: &str) -> Cow<'static, str> {
+            Cow::Borrowed("/v1/chat/completions")
+        }
+
+        fn prepare_request(
+            &self,
+            mut request: PreparedRequest,
+            _auth: &ProviderAuth,
+        ) -> Result<PreparedRequest> {
+            request.headers.insert(
+                HeaderName::from_static("x-prepared"),
+                HeaderValue::from_static("yes"),
+            );
+            Ok(request)
+        }
+
+        fn build_auth_headers(&self, auth: &ProviderAuth) -> Result<HeaderMap> {
+            bearer_headers(self.name(), auth)
+        }
+    }
+
+    impl ChatTransform for PreparedHubTestProvider {}
+
+    impl ProviderCapabilities for PreparedHubTestProvider {}
 
     impl ProviderMeta for NativeTestProvider {
         fn name(&self) -> &'static str {
@@ -836,6 +913,72 @@ mod tests {
         assert_eq!(observed.0.as_deref(), Some("Bearer hub-secret"));
         assert_eq!(observed.1["model"], "gpt-test");
         assert_eq!(observed.1["messages"][0]["content"], "hello");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_completion_applies_provider_prepare_request() {
+        let observed: Arc<Mutex<PreparedObservedRequest>> = Arc::new(Mutex::new(None));
+        let observed_clone = Arc::clone(&observed);
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let observed = Arc::clone(&observed_clone);
+                async move {
+                    let auth = headers
+                        .get(AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    let prepared = headers
+                        .get("x-prepared")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    *observed.lock().await = Some((auth, prepared, body));
+
+                    Json(json!({
+                        "id": "chatcmpl-123",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": "gpt-test",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "prepared"
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(PreparedHubTestProvider),
+            auth: ProviderAuth::ApiKey("hub-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let response = gateway.chat_completion(&request, &instance).await.unwrap();
+        let ChatResponse::Complete { response, .. } = response else {
+            panic!("expected complete response")
+        };
+
+        assert_eq!(response.model, "gpt-test");
+
+        let observed = observed.lock().await.take().unwrap();
+        assert_eq!(observed.0.as_deref(), Some("Bearer hub-secret"));
+        assert_eq!(observed.1.as_deref(), Some("yes"));
+        assert_eq!(observed.2["model"], "gpt-test");
 
         server.abort();
     }

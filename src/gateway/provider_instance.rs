@@ -5,13 +5,22 @@ use reqwest::Url;
 
 use crate::gateway::{
     error::{GatewayError, Result},
-    traits::ProviderCapabilities,
+    traits::{PreparedRequest, ProviderCapabilities},
 };
+
+/// Authentication material bound to a provider instance at runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AwsStaticCredentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+}
 
 /// Authentication material bound to a provider instance at runtime.
 #[derive(Clone, Default)]
 pub enum ProviderAuth {
     ApiKey(String),
+    AwsStatic(AwsStaticCredentials),
     #[default]
     None,
 }
@@ -20,6 +29,10 @@ impl fmt::Debug for ProviderAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ApiKey(_) => f.write_str("ApiKey(REDACTED)"),
+            Self::AwsStatic(credentials) => {
+                let _has_session_token = credentials.session_token.is_some();
+                f.write_str("AwsStatic(REDACTED)")
+            }
             Self::None => f.write_str("None"),
         }
     }
@@ -29,7 +42,7 @@ impl ProviderAuth {
     pub fn api_key(&self) -> Result<&str> {
         match self {
             Self::ApiKey(api_key) => Ok(api_key),
-            Self::None => Err(GatewayError::Validation(
+            Self::AwsStatic(_) | Self::None => Err(GatewayError::Validation(
                 "missing ProviderAuth::ApiKey value".into(),
             )),
         }
@@ -37,6 +50,26 @@ impl ProviderAuth {
 
     pub fn api_key_for(&self, provider: &str) -> Result<&str> {
         self.api_key().map_err(|error| match error {
+            GatewayError::Validation(message) => {
+                GatewayError::Validation(format!("provider {}: {}", provider, message))
+            }
+            other => other,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn aws_static_credentials(&self) -> Result<&AwsStaticCredentials> {
+        match self {
+            Self::AwsStatic(credentials) => Ok(credentials),
+            Self::ApiKey(_) | Self::None => Err(GatewayError::Validation(
+                "missing ProviderAuth::AwsStatic value".into(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn aws_static_credentials_for(&self, provider: &str) -> Result<&AwsStaticCredentials> {
+        self.aws_static_credentials().map_err(|error| match error {
             GatewayError::Validation(message) => {
                 GatewayError::Validation(format!("provider {}: {}", provider, message))
             }
@@ -79,6 +112,10 @@ impl ProviderInstance {
         let mut headers = self.def.build_auth_headers(&self.auth)?;
         headers.extend(self.custom_headers.clone());
         Ok(headers)
+    }
+
+    pub fn prepare_request(&self, request: PreparedRequest) -> Result<PreparedRequest> {
+        self.def.prepare_request(request, &self.auth)
     }
 }
 
@@ -130,7 +167,7 @@ mod tests {
         header::{AUTHORIZATION, HeaderName},
     };
 
-    use super::{ProviderAuth, ProviderInstance, ProviderRegistry};
+    use super::{AwsStaticCredentials, ProviderAuth, ProviderInstance, ProviderRegistry};
     use crate::gateway::{
         error::{GatewayError, Result},
         traits::{ChatTransform, ProviderCapabilities, ProviderMeta, StreamReaderKind},
@@ -224,6 +261,17 @@ mod tests {
             format!("{:?}", ProviderAuth::ApiKey("sk-secret".into())),
             "ApiKey(REDACTED)"
         );
+        assert_eq!(
+            format!(
+                "{:?}",
+                ProviderAuth::AwsStatic(AwsStaticCredentials {
+                    access_key_id: "AKIA...".into(),
+                    secret_access_key: "secret".into(),
+                    session_token: Some("token".into()),
+                })
+            ),
+            "AwsStatic(REDACTED)"
+        );
         assert_eq!(format!("{:?}", ProviderAuth::None), "None");
     }
 
@@ -251,6 +299,28 @@ mod tests {
             GatewayError::Validation(message)
                 if message.contains("deepseek")
                     && message.contains("ProviderAuth::ApiKey")
+        ));
+    }
+
+    #[test]
+    fn provider_auth_bedrock_static_credentials_accessor_returns_credentials() {
+        let credentials = AwsStaticCredentials {
+            access_key_id: "AKIA123".into(),
+            secret_access_key: "secret".into(),
+            session_token: Some("token".into()),
+        };
+        let auth = ProviderAuth::AwsStatic(credentials.clone());
+
+        assert_eq!(auth.aws_static_credentials().unwrap(), &credentials);
+
+        let error = ProviderAuth::None
+            .aws_static_credentials_for("bedrock")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            GatewayError::Validation(message)
+                if message.contains("bedrock")
+                    && message.contains("ProviderAuth::AwsStatic")
         ));
     }
 
