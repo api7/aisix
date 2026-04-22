@@ -1,22 +1,28 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use uuid::Uuid;
 
 use crate::gateway::{
     error::{GatewayError, Result},
+    traits::{ChatStreamState, ToolCallAccumulator},
     types::{
         bedrock::{
-            BedrockContentBlock, BedrockConverseRequest, BedrockConverseResponse,
-            BedrockEmptyObject, BedrockInferenceConfig, BedrockMessage, BedrockRole,
-            BedrockSpecificToolChoice, BedrockSystemContentBlock, BedrockTool, BedrockToolChoice,
-            BedrockToolConfig, BedrockToolInputSchema, BedrockToolResultBlock,
-            BedrockToolResultContentBlock, BedrockToolSpecification, BedrockToolUseBlock,
+            BedrockContentBlock, BedrockContentBlockDeltaEvent, BedrockContentBlockStartEvent,
+            BedrockContentBlockStopEvent, BedrockConverseRequest, BedrockConverseResponse,
+            BedrockConverseStreamFrame, BedrockConverseStreamMetadataEvent, BedrockEmptyObject,
+            BedrockInferenceConfig, BedrockMessage, BedrockMessageStartEvent,
+            BedrockMessageStopEvent, BedrockRole, BedrockSpecificToolChoice,
+            BedrockSystemContentBlock, BedrockTool, BedrockToolChoice, BedrockToolConfig,
+            BedrockToolInputSchema, BedrockToolResultBlock, BedrockToolResultContentBlock,
+            BedrockToolSpecification, BedrockToolUseBlock, BedrockUsage,
         },
         openai::{
-            ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
-            ChatCompletionUsage, ChatMessage, ContentPart, FunctionCall, MessageContent,
-            StopCondition, Tool, ToolCall, ToolChoice,
+            ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice,
+            ChatCompletionChunkDelta, ChatCompletionRequest, ChatCompletionResponse,
+            ChatCompletionUsage, ChatMessage, ChunkFunctionCall, ChunkToolCall, ContentPart,
+            FunctionCall, MessageContent, StopCondition, Tool, ToolCall, ToolChoice,
         },
     },
 };
@@ -101,6 +107,166 @@ pub(super) fn bedrock_to_openai_response(
         usage,
         system_fingerprint: None,
     })
+}
+
+pub(super) fn parse_bedrock_stream_to_openai(
+    raw: &str,
+    state: &mut ChatStreamState,
+) -> Result<Vec<ChatCompletionChunk>> {
+    let frame: BedrockConverseStreamFrame =
+        serde_json::from_str(raw).map_err(|error| GatewayError::Transform(error.to_string()))?;
+
+    match frame.event_type.as_str() {
+        "messageStart" => {
+            let event: BedrockMessageStartEvent =
+                deserialize_bedrock_stream_payload(frame.payload)?;
+            state
+                .response_id
+                .get_or_insert_with(|| format!("bedrock-{}", Uuid::new_v4()));
+            if state.response_created.is_none() {
+                state.response_created = Some(current_unix_timestamp()?);
+            }
+
+            Ok(vec![build_bedrock_stream_chunk(
+                state,
+                ChatCompletionChunkDelta {
+                    role: Some(
+                        match event.role {
+                            BedrockRole::Assistant => "assistant",
+                            BedrockRole::User => "user",
+                        }
+                        .to_string(),
+                    ),
+                    content: None,
+                    tool_calls: None,
+                },
+                None,
+                None,
+            )?])
+        }
+        "contentBlockStart" => {
+            let event: BedrockContentBlockStartEvent =
+                deserialize_bedrock_stream_payload(frame.payload)?;
+            let Some(tool_use) = event.start.and_then(|start| start.tool_use) else {
+                return Ok(vec![]);
+            };
+
+            let accumulator = state
+                .tool_call_accumulators
+                .entry((0, event.content_block_index))
+                .or_insert_with(|| ToolCallAccumulator {
+                    id: Some(tool_use.tool_use_id.clone()),
+                    kind: Some("function".into()),
+                    name: Some(tool_use.name.clone()),
+                    arguments: String::new(),
+                });
+            accumulator.id = Some(tool_use.tool_use_id.clone());
+            accumulator.kind = Some("function".into());
+            accumulator.name = Some(tool_use.name.clone());
+
+            Ok(vec![build_bedrock_stream_chunk(
+                state,
+                ChatCompletionChunkDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: Some(vec![ChunkToolCall {
+                        index: event.content_block_index,
+                        id: Some(tool_use.tool_use_id),
+                        r#type: Some("function".into()),
+                        function: Some(ChunkFunctionCall {
+                            name: Some(tool_use.name),
+                            arguments: None,
+                        }),
+                    }]),
+                },
+                None,
+                None,
+            )?])
+        }
+        "contentBlockDelta" => {
+            let event: BedrockContentBlockDeltaEvent =
+                deserialize_bedrock_stream_payload(frame.payload)?;
+
+            if let Some(text) = event.delta.text {
+                return Ok(vec![build_bedrock_stream_chunk(
+                    state,
+                    ChatCompletionChunkDelta {
+                        role: None,
+                        content: Some(text),
+                        tool_calls: None,
+                    },
+                    None,
+                    None,
+                )?]);
+            }
+
+            let Some(tool_use) = event.delta.tool_use else {
+                return Ok(vec![]);
+            };
+
+            let accumulator = state
+                .tool_call_accumulators
+                .entry((0, event.content_block_index))
+                .or_default();
+            accumulator.arguments.push_str(&tool_use.input);
+
+            Ok(vec![build_bedrock_stream_chunk(
+                state,
+                ChatCompletionChunkDelta {
+                    role: None,
+                    content: None,
+                    tool_calls: Some(vec![ChunkToolCall {
+                        index: event.content_block_index,
+                        id: None,
+                        r#type: None,
+                        function: Some(ChunkFunctionCall {
+                            name: None,
+                            arguments: Some(tool_use.input),
+                        }),
+                    }]),
+                },
+                None,
+                None,
+            )?])
+        }
+        "contentBlockStop" => {
+            let _: BedrockContentBlockStopEvent =
+                deserialize_bedrock_stream_payload(frame.payload)?;
+            Ok(vec![])
+        }
+        "messageStop" => {
+            let event: BedrockMessageStopEvent = deserialize_bedrock_stream_payload(frame.payload)?;
+            let finish_reason = event.stop_reason.as_deref().map(map_finish_reason);
+            if finish_reason.is_none() {
+                return Ok(vec![]);
+            }
+
+            Ok(vec![build_bedrock_stream_chunk(
+                state,
+                ChatCompletionChunkDelta::default(),
+                finish_reason,
+                None,
+            )?])
+        }
+        "metadata" => {
+            let event: BedrockConverseStreamMetadataEvent =
+                deserialize_bedrock_stream_payload(frame.payload)?;
+            let Some(usage) = event.usage else {
+                return Ok(vec![]);
+            };
+
+            state.input_tokens = Some(usage.input_tokens);
+            state.output_tokens = Some(usage.output_tokens);
+
+            Ok(vec![build_bedrock_stream_chunk(
+                state,
+                ChatCompletionChunkDelta::default(),
+                None,
+                Some(bedrock_usage_to_openai_usage(&usage)),
+            )?])
+        }
+        _ => Ok(vec![]),
+    }
 }
 
 fn build_inference_config(request: &ChatCompletionRequest) -> Option<BedrockInferenceConfig> {
@@ -383,6 +549,49 @@ fn map_finish_reason(reason: &str) -> String {
     .to_string()
 }
 
+fn deserialize_bedrock_stream_payload<T: DeserializeOwned>(
+    payload: serde_json::Value,
+) -> Result<T> {
+    serde_json::from_value(payload).map_err(|error| GatewayError::Transform(error.to_string()))
+}
+
+fn build_bedrock_stream_chunk(
+    state: &ChatStreamState,
+    delta: ChatCompletionChunkDelta,
+    finish_reason: Option<String>,
+    usage: Option<ChatCompletionUsage>,
+) -> Result<ChatCompletionChunk> {
+    Ok(ChatCompletionChunk {
+        id: state.response_id.clone().ok_or_else(|| {
+            GatewayError::Stream("bedrock stream emitted a delta before messageStart".into())
+        })?,
+        object: "chat.completion.chunk".into(),
+        created: state.response_created.ok_or_else(|| {
+            GatewayError::Stream("bedrock stream missing response_created metadata".into())
+        })?,
+        model: state.response_model.clone().ok_or_else(|| {
+            GatewayError::Stream("bedrock stream missing response_model metadata".into())
+        })?,
+        choices: vec![ChatCompletionChunkChoice {
+            index: 0,
+            delta,
+            finish_reason,
+        }],
+        usage,
+        system_fingerprint: None,
+    })
+}
+
+fn bedrock_usage_to_openai_usage(usage: &BedrockUsage) -> ChatCompletionUsage {
+    ChatCompletionUsage {
+        prompt_tokens: usage.input_tokens,
+        completion_tokens: usage.output_tokens,
+        total_tokens: usage.total_tokens,
+        prompt_tokens_details: None,
+        completion_tokens_details: None,
+    }
+}
+
 fn current_unix_timestamp() -> Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -394,7 +603,9 @@ fn current_unix_timestamp() -> Result<u64> {
 mod tests {
     use serde_json::json;
 
-    use super::{bedrock_to_openai_response, openai_to_bedrock_request};
+    use super::{
+        bedrock_to_openai_response, openai_to_bedrock_request, parse_bedrock_stream_to_openai,
+    };
     use crate::gateway::types::{
         bedrock::{BedrockEmptyObject, BedrockToolChoice},
         openai::{ChatCompletionRequest, MessageContent},
@@ -498,5 +709,101 @@ mod tests {
             "{\"city\":\"Shanghai\"}"
         );
         assert_eq!(mapped.usage.as_ref().unwrap().total_tokens, 8);
+    }
+
+    #[test]
+    fn parse_bedrock_stream_to_openai_emits_role_text_finish_and_usage() {
+        let mut state = crate::gateway::traits::ChatStreamState {
+            response_model: Some("bedrock/test-model".into()),
+            ..Default::default()
+        };
+
+        let message_start = parse_bedrock_stream_to_openai(
+            r#"{"type":"messageStart","payload":{"role":"assistant"}}"#,
+            &mut state,
+        )
+        .unwrap();
+        let text_delta = parse_bedrock_stream_to_openai(
+            r#"{"type":"contentBlockDelta","payload":{"contentBlockIndex":0,"delta":{"text":"hello from stream"}}}"#,
+            &mut state,
+        )
+        .unwrap();
+        let message_stop = parse_bedrock_stream_to_openai(
+            r#"{"type":"messageStop","payload":{"stopReason":"end_turn"}}"#,
+            &mut state,
+        )
+        .unwrap();
+        let metadata = parse_bedrock_stream_to_openai(
+            r#"{"type":"metadata","payload":{"usage":{"inputTokens":7,"outputTokens":9,"totalTokens":16}}}"#,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            message_start[0].choices[0].delta.role.as_deref(),
+            Some("assistant")
+        );
+        assert!(message_start[0].id.starts_with("bedrock-"));
+        assert_eq!(
+            text_delta[0].choices[0].delta.content.as_deref(),
+            Some("hello from stream")
+        );
+        assert_eq!(
+            message_stop[0].choices[0].finish_reason.as_deref(),
+            Some("stop")
+        );
+        assert_eq!(metadata[0].usage.as_ref().unwrap().total_tokens, 16);
+        assert_eq!(state.input_tokens, Some(7));
+        assert_eq!(state.output_tokens, Some(9));
+    }
+
+    #[test]
+    fn parse_bedrock_stream_to_openai_emits_tool_call_start_and_delta() {
+        let mut state = crate::gateway::traits::ChatStreamState {
+            response_model: Some("bedrock/test-model".into()),
+            ..Default::default()
+        };
+
+        parse_bedrock_stream_to_openai(
+            r#"{"type":"messageStart","payload":{"role":"assistant"}}"#,
+            &mut state,
+        )
+        .unwrap();
+        let tool_start = parse_bedrock_stream_to_openai(
+            r#"{"type":"contentBlockStart","payload":{"contentBlockIndex":0,"start":{"toolUse":{"toolUseId":"toolu_123","name":"get_weather"}}}}"#,
+            &mut state,
+        )
+        .unwrap();
+        let tool_delta = parse_bedrock_stream_to_openai(
+            r#"{"type":"contentBlockDelta","payload":{"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\"city\":\"Shanghai\"}"}}}}"#,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            tool_start[0].choices[0].delta.tool_calls.as_ref().unwrap()[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("get_weather")
+        );
+        assert_eq!(
+            tool_delta[0].choices[0].delta.tool_calls.as_ref().unwrap()[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .arguments
+                .as_deref(),
+            Some("{\"city\":\"Shanghai\"}")
+        );
+        assert_eq!(
+            state
+                .tool_call_accumulators
+                .get(&(0, 0))
+                .map(|accumulator| accumulator.arguments.as_str()),
+            Some("{\"city\":\"Shanghai\"}")
+        );
     }
 }

@@ -162,3 +162,82 @@ pub struct BedrockUsage {
     #[serde(rename = "totalTokens")]
     pub total_tokens: u32,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BedrockConverseStreamFrame {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BedrockMessageStartEvent {
+    pub role: BedrockRole,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BedrockContentBlockStartEvent {
+    #[serde(rename = "contentBlockIndex")]
+    pub content_block_index: usize,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<BedrockContentBlockStart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct BedrockContentBlockStart {
+    #[serde(rename = "toolUse", skip_serializing_if = "Option::is_none")]
+    pub tool_use: Option<BedrockToolUseBlockStart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BedrockToolUseBlockStart {
+    #[serde(rename = "toolUseId")]
+    pub tool_use_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BedrockContentBlockDeltaEvent {
+    #[serde(rename = "contentBlockIndex")]
+    pub content_block_index: usize,
+    pub delta: BedrockContentBlockDelta,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct BedrockContentBlockDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+
+    #[serde(rename = "toolUse", skip_serializing_if = "Option::is_none")]
+    pub tool_use: Option<BedrockToolUseBlockDelta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BedrockToolUseBlockDelta {
+    pub input: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BedrockContentBlockStopEvent {
+    #[serde(rename = "contentBlockIndex")]
+    pub content_block_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BedrockMessageStopEvent {
+    #[serde(rename = "stopReason", skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+
+    #[serde(
+        rename = "additionalModelResponseFields",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub additional_model_response_fields: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct BedrockConverseStreamMetadataEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<BedrockUsage>,
+}

@@ -16,9 +16,10 @@ use crate::gateway::{
     error::{GatewayError, Result},
     provider_instance::ProviderAuth,
     traits::{
-        ChatTransform, PreparedRequest, ProviderCapabilities, ProviderMeta, StreamReaderKind,
+        ChatStreamState, ChatTransform, PreparedRequest, ProviderCapabilities, ProviderMeta,
+        StreamReaderKind,
     },
-    types::openai::{ChatCompletionRequest, ChatCompletionResponse},
+    types::openai::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
 };
 
 pub const IDENTIFIER: &str = "bedrock";
@@ -62,6 +63,19 @@ impl ProviderMeta for BedrockDef {
         mut request: PreparedRequest,
         auth: &ProviderAuth,
     ) -> Result<PreparedRequest> {
+        if request.stream {
+            let mut path = request.url.path().to_string();
+            let Some(prefix) = path.strip_suffix("/converse") else {
+                return Err(GatewayError::Validation(format!(
+                    "provider {} expected a converse path before stream signing, got {}",
+                    self.name(),
+                    path
+                )));
+            };
+            path = format!("{prefix}/converse-stream");
+            request.url.set_path(&path);
+        }
+
         let aws = auth.aws_static_credentials_for(self.name())?;
         let header_pairs = request
             .headers
@@ -172,6 +186,14 @@ impl ChatTransform for BedrockDef {
             .map_err(|error| GatewayError::Transform(error.to_string()))?;
         transform::bedrock_to_openai_response(request, response)
     }
+
+    fn transform_stream_chunk(
+        &self,
+        raw: &str,
+        state: &mut ChatStreamState,
+    ) -> Result<Vec<ChatCompletionChunk>> {
+        transform::parse_bedrock_stream_to_openai(raw, state)
+    }
 }
 
 impl ProviderCapabilities for BedrockDef {}
@@ -251,5 +273,45 @@ mod tests {
             crate::gateway::error::GatewayError::Validation(message)
                 if message.contains("ProviderAuth::AwsStatic")
         ));
+    }
+
+    #[test]
+    fn prepare_request_rewrites_stream_url_before_signing() {
+        let provider = BedrockDef;
+        let request = PreparedRequest {
+            method: Method::POST,
+            url: reqwest::Url::parse(
+                "https://bedrock-runtime.us-east-1.amazonaws.com/model/test/converse",
+            )
+            .unwrap(),
+            headers: {
+                let mut headers = HeaderMap::new();
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                headers
+            },
+            body: Bytes::from_static(b"{}"),
+            stream: true,
+        };
+
+        let prepared = provider
+            .prepare_request(
+                request,
+                &ProviderAuth::AwsStatic(crate::gateway::provider_instance::AwsStaticCredentials {
+                    access_key_id: "AKIA123".into(),
+                    secret_access_key: "secret".into(),
+                    session_token: None,
+                    region: "us-east-1".into(),
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(prepared.url.path(), "/model/test/converse-stream");
+        assert!(
+            prepared
+                .headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256"))
+        );
     }
 }

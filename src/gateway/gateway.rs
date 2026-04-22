@@ -10,7 +10,7 @@ use crate::gateway::{
     error::{GatewayError, Result},
     formats::{AnthropicMessagesFormat, OpenAIChatFormat},
     provider_instance::{ProviderInstance, ProviderRegistry},
-    streams::{BridgedStream, HubChunkStream, NativeStream, sse_reader},
+    streams::{BridgedStream, HubChunkStream, NativeStream, aws_event_stream_reader, sse_reader},
     traits::{ChatFormat, NativeHandler, PreparedRequest, StreamReaderKind},
     types::{
         anthropic::AnthropicMessagesRequest,
@@ -292,22 +292,24 @@ impl Gateway {
         let url = instance.build_url(&request.model)?;
         let headers = instance.build_headers()?;
 
-        let request =
+        let prepared_request =
             self.prepare_json_request(instance, Method::POST, url, headers, &provider_body, true)?;
-        let response = self.send_request(request).await?;
+        let response = self.send_request(prepared_request).await?;
 
         if !response.status().is_success() {
             return Err(provider_error(response, instance.def.name()).await);
         }
 
         let raw_chunks = select_chat_stream_reader(instance.def.stream_reader_kind(), response)?;
-        Ok(HubChunkStream::new(raw_chunks, instance.def.clone()))
+        let mut stream = HubChunkStream::new(raw_chunks, instance.def.clone());
+        stream.state.response_model = Some(request.model.clone());
+        Ok(stream)
     }
 }
 
 fn ensure_chat_stream_reader_supported(kind: StreamReaderKind) -> Result<()> {
     match kind {
-        StreamReaderKind::Sse => Ok(()),
+        StreamReaderKind::Sse | StreamReaderKind::AwsEventStream => Ok(()),
         other => Err(GatewayError::Validation(format!(
             "stream reader kind {:?} is not implemented yet",
             other
@@ -323,7 +325,8 @@ fn select_chat_stream_reader(
 
     match kind {
         StreamReaderKind::Sse => Ok(sse_reader(response.bytes_stream())),
-        StreamReaderKind::AwsEventStream | StreamReaderKind::JsonArrayStream => {
+        StreamReaderKind::AwsEventStream => Ok(aws_event_stream_reader(response.bytes_stream())),
+        StreamReaderKind::JsonArrayStream => {
             unreachable!(
                 "unsupported stream reader kind should be rejected before response wrapping"
             )
@@ -407,7 +410,10 @@ mod tests {
         },
     };
 
+    use aws_smithy_eventstream::frame::write_message_to;
+    use aws_smithy_types::event_stream::{Header, HeaderValue as EventStreamHeaderValue, Message};
     use axum::{Json, Router, extract::OriginalUri, routing::post};
+    use bytes::Bytes;
     use futures::StreamExt;
     use http::{
         HeaderMap, HeaderValue, StatusCode,
@@ -617,7 +623,7 @@ mod tests {
         }
 
         fn stream_reader_kind(&self) -> StreamReaderKind {
-            StreamReaderKind::AwsEventStream
+            StreamReaderKind::JsonArrayStream
         }
 
         fn build_auth_headers(&self, auth: &ProviderAuth) -> Result<HeaderMap> {
@@ -1704,6 +1710,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_completion_streams_bedrock_chunks_and_reports_usage() {
+        let observed: Arc<Mutex<BedrockObservedRequest>> = Arc::new(Mutex::new(None));
+        let observed_clone = Arc::clone(&observed);
+        let body = encode_event_stream_body(vec![
+            (
+                "messageStart",
+                json!({
+                    "role": "assistant"
+                }),
+            ),
+            (
+                "contentBlockDelta",
+                json!({
+                    "contentBlockIndex": 0,
+                    "delta": {"text": "hello from bedrock stream"}
+                }),
+            ),
+            (
+                "messageStop",
+                json!({
+                    "stopReason": "end_turn"
+                }),
+            ),
+            (
+                "metadata",
+                json!({
+                    "usage": {
+                        "inputTokens": 7,
+                        "outputTokens": 9,
+                        "totalTokens": 16
+                    }
+                }),
+            ),
+        ]);
+        let router = Router::new().route(
+            "/{*path}",
+            post(
+                move |OriginalUri(uri): OriginalUri,
+                      headers: HeaderMap,
+                      Json(body_json): Json<Value>| {
+                    let observed = Arc::clone(&observed_clone);
+                    let body = body.clone();
+                    async move {
+                        let authorization = headers
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        let session_token = headers
+                            .get("x-amz-security-token")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        *observed.lock().await = Some((
+                            uri.path().to_string(),
+                            authorization,
+                            session_token,
+                            body_json,
+                        ));
+
+                        http::Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/vnd.amazon.eventstream")
+                            .body(axum::body::Body::from(body))
+                            .unwrap()
+                    }
+                },
+            ),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(BedrockDef),
+            auth: ProviderAuth::AwsStatic(AwsStaticCredentials {
+                access_key_id: "AKIA123".into(),
+                secret_access_key: "secret".into(),
+                session_token: Some("token".into()),
+                region: "us-east-1".into(),
+            }),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .unwrap();
+
+        let response = gateway.chat_completion(&request, &instance).await.unwrap();
+        let ChatResponse::Stream {
+            mut stream,
+            usage_rx,
+        } = response
+        else {
+            panic!("expected streaming response")
+        };
+
+        let role_chunk = stream.next().await.unwrap().unwrap();
+        let text_chunk = stream.next().await.unwrap().unwrap();
+        let stop_chunk = stream.next().await.unwrap().unwrap();
+        let usage_chunk = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+
+        assert!(role_chunk.id.starts_with("bedrock-"));
+        assert_eq!(
+            role_chunk.choices[0].delta.role.as_deref(),
+            Some("assistant")
+        );
+        assert_eq!(
+            text_chunk.choices[0].delta.content.as_deref(),
+            Some("hello from bedrock stream")
+        );
+        assert_eq!(stop_chunk.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(usage_chunk.usage.as_ref().unwrap().total_tokens, 16);
+
+        let usage = usage_rx.await.unwrap();
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(9));
+        assert_eq!(usage.total_tokens, Some(16));
+
+        let observed = observed.lock().await.take().unwrap();
+        assert_eq!(
+            observed.0,
+            "/model/inference-profile%2Fus.anthropic.claude-3-7-sonnet-20250219-v1:0/converse-stream"
+        );
+        assert!(
+            observed
+                .1
+                .as_deref()
+                .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256"))
+        );
+        assert_eq!(observed.2.as_deref(), Some("token"));
+        assert_eq!(observed.3["messages"][0]["content"][0]["text"], "hello");
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn chat_streams_native_chunks_and_reports_usage() {
         let router = Router::new().route(
             "/v1/native-stream",
@@ -1842,7 +1986,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(GatewayError::Validation(message))
-                if message.contains("AwsEventStream")
+                if message.contains("JsonArrayStream")
         ));
         assert_eq!(request_count.load(Ordering::SeqCst), 0);
 
@@ -1901,6 +2045,27 @@ mod tests {
                 .map_err(|error| GatewayError::Validation(error.to_string()))?,
         );
         Ok(headers)
+    }
+
+    fn encode_event_stream_body(events: Vec<(&str, Value)>) -> Bytes {
+        let mut buffer = Vec::new();
+        for (event_type, payload) in events {
+            let message = Message::new(serde_json::to_vec(&payload).unwrap())
+                .add_header(Header::new(
+                    ":message-type",
+                    EventStreamHeaderValue::String("event".into()),
+                ))
+                .add_header(Header::new(
+                    ":event-type",
+                    EventStreamHeaderValue::String(event_type.to_string().into()),
+                ))
+                .add_header(Header::new(
+                    ":content-type",
+                    EventStreamHeaderValue::String("application/json".into()),
+                ));
+            write_message_to(&message, &mut buffer).unwrap();
+        }
+        Bytes::from(buffer)
     }
 
     async fn spawn_server(router: Router) -> (Url, JoinHandle<()>) {
