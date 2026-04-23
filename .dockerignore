@@ -1,0 +1,10 @@
+.git
+.github
+target
+ui/node_modules
+ui/.next
+ui/dist
+docs
+tests/fixtures/tmp
+**/.DS_Store
+**/*.log
