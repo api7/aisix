@@ -34,11 +34,21 @@ use crate::error::BootstrapError;
 pub struct Config {
     pub etcd: EtcdConfig,
     pub proxy: ProxyConfig,
+    /// Admin surface. Defaulted so managed-mode configs can omit this
+    /// block entirely; the default values are NOT bound at runtime —
+    /// [`ManagedConfig::is_managed`] gates the listener.
+    #[serde(default)]
     pub admin: AdminConfig,
     #[serde(default)]
     pub observability: ObservabilityConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    /// Optional managed-mode configuration. When `managed.enabled = true`
+    /// the admin API, admin UI, and Playground endpoints are **not**
+    /// bound — the DP is a pure etcd reader driven by the aisix.cloud
+    /// control plane. Missing or `enabled = false` runs standalone.
+    #[serde(default)]
+    pub managed: ManagedConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +67,58 @@ pub struct EtcdConfig {
     pub dial_timeout_ms: u64,
     #[serde(default = "EtcdConfig::default_request_timeout")]
     pub request_timeout_ms: u64,
+    /// Optional TLS / mTLS bundle used to authenticate to the etcd
+    /// endpoint. Required when talking to an aisix.cloud DP Manager
+    /// (see prd-09 §9.3.3 — the CP issues a 10-year client cert via
+    /// `IssueAIDataplaneCertificate`). Leave unset for plain-HTTP
+    /// etcd (local dev, integration tests).
+    #[serde(default)]
+    pub tls: Option<EtcdTlsConfig>,
+}
+
+/// Paths to the mTLS bundle used for etcd client auth. Files are read
+/// lazily at connect time — absent files surface as a BootstrapError.
+///
+/// When `domain_name` is unset, callers typically derive it from the
+/// first endpoint's hostname so the tonic TLS layer knows what SNI /
+/// cert-subject-alt-name to match against.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EtcdTlsConfig {
+    /// PEM-encoded CA bundle used to verify the etcd server cert.
+    pub ca_cert_file: String,
+    /// PEM-encoded client certificate (from `IssueAIDataplaneCertificate`).
+    pub client_cert_file: String,
+    /// PEM-encoded client private key. Paired with `client_cert_file`.
+    pub client_key_file: String,
+    /// Expected server name for TLS verification. Usually the hostname
+    /// portion of `etcd.endpoints[0]`. Only required when the CA issues
+    /// certs under a different SNI than the endpoint DNS name.
+    #[serde(default)]
+    pub domain_name: Option<String>,
+}
+
+/// Optional managed-mode configuration (prd-09 §9.2.2).
+///
+/// When `enabled = true`, aisix runs as a tenant of aisix.cloud:
+///
+/// - The admin API listener is **not** bound.
+/// - The admin UI is **not** served.
+/// - The Playground endpoint is **not** exposed.
+///
+/// All configuration is read from etcd via the TLS channel (see
+/// [`EtcdTlsConfig`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ManagedConfig {
+    pub enabled: bool,
+}
+
+impl ManagedConfig {
+    /// True if the DP should behave as an aisix.cloud tenant.
+    pub const fn is_managed(&self) -> bool {
+        self.enabled
+    }
 }
 
 impl EtcdConfig {
@@ -98,12 +160,33 @@ impl ProxyConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminConfig {
+    #[serde(default = "AdminConfig::default_addr")]
     pub addr: String,
     /// Statically-provisioned admin keys. A request is authorised if it
     /// presents any of these via `Authorization: Bearer <k>` or `x-api-key`.
+    #[serde(default)]
     pub admin_keys: Vec<String>,
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+}
+
+impl AdminConfig {
+    fn default_addr() -> String {
+        // Intentionally non-routable. Managed-mode configs never bind
+        // this; standalone configs are rejected by `Config::validate`
+        // if they leave it at the default without overriding.
+        "127.0.0.1:0".into()
+    }
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            addr: Self::default_addr(),
+            admin_keys: Vec::new(),
+            tls: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,21 +374,29 @@ impl Config {
                 "etcd.endpoints must contain at least one endpoint".into(),
             ));
         }
-        if self.admin.admin_keys.is_empty() {
-            return Err(BootstrapError::Config(
-                "admin.admin_keys must contain at least one key".into(),
-            ));
+        // In managed mode the admin listener is not bound, so requiring
+        // admin_keys or a valid admin.addr would be punishing the user
+        // for fields that aren't going to be used. In standalone mode
+        // we keep the original invariants.
+        if !self.managed.is_managed() {
+            if self.admin.admin_keys.is_empty() {
+                return Err(BootstrapError::Config(
+                    "admin.admin_keys must contain at least one key \
+                     (required when managed.enabled is false)"
+                        .into(),
+                ));
+            }
+            if self.admin.addr.parse::<std::net::SocketAddr>().is_err() {
+                return Err(BootstrapError::Config(format!(
+                    "admin.addr invalid socket address: {}",
+                    self.admin.addr
+                )));
+            }
         }
         if self.proxy.addr.parse::<std::net::SocketAddr>().is_err() {
             return Err(BootstrapError::Config(format!(
                 "proxy.addr invalid socket address: {}",
                 self.proxy.addr
-            )));
-        }
-        if self.admin.addr.parse::<std::net::SocketAddr>().is_err() {
-            return Err(BootstrapError::Config(format!(
-                "admin.addr invalid socket address: {}",
-                self.admin.addr
             )));
         }
         Ok(())
@@ -411,5 +502,84 @@ bogus_field: 1
         );
         let err = Config::load_from_path(Some(f.path())).unwrap_err();
         assert!(err.to_string().contains("bogus_field"));
+    }
+
+    #[test]
+    fn managed_mode_lets_admin_fields_be_omitted() {
+        // A managed-mode config is the minimum aisix.cloud tenant
+        // shape: etcd + tls + proxy + managed.enabled = true. Admin
+        // keys / addr are fine to leave out entirely because the
+        // admin surface is never bound.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["https://etcd.aisix.cloud:2379"]
+  prefix: "/aisix"
+  tls:
+    ca_cert_file: "/etc/aisix/mtls/ca.crt"
+    client_cert_file: "/etc/aisix/mtls/client.crt"
+    client_key_file: "/etc/aisix/mtls/client.key"
+proxy:
+  addr: "0.0.0.0:3000"
+managed:
+  enabled: true
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(cfg.managed.is_managed());
+        assert_eq!(
+            cfg.etcd.tls.as_ref().unwrap().client_cert_file,
+            "/etc/aisix/mtls/client.crt"
+        );
+        assert!(cfg.admin.admin_keys.is_empty());
+    }
+
+    #[test]
+    fn standalone_still_requires_admin_keys_even_with_managed_false() {
+        // managed.enabled = false (or missing) must keep the original
+        // "admin_keys must be non-empty" invariant. Otherwise a user
+        // accidentally dropping admin_keys would silently lose auth
+        // on their admin listener.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: []
+managed:
+  enabled: false
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(err.to_string().contains("admin.admin_keys"));
+    }
+
+    #[test]
+    fn parses_etcd_tls_block() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["https://etcd.aisix.cloud:2379"]
+  tls:
+    ca_cert_file: "/a.crt"
+    client_cert_file: "/c.crt"
+    client_key_file: "/c.key"
+    domain_name: "etcd.aisix.cloud"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        let tls = cfg.etcd.tls.expect("tls parsed");
+        assert_eq!(tls.ca_cert_file, "/a.crt");
+        assert_eq!(tls.client_cert_file, "/c.crt");
+        assert_eq!(tls.client_key_file, "/c.key");
+        assert_eq!(tls.domain_name.as_deref(), Some("etcd.aisix.cloud"));
     }
 }

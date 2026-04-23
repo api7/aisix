@@ -9,6 +9,17 @@ etcd:
   # password_env: "AISIX_ETCD_PASSWORD"
   dial_timeout_ms: 5000
   request_timeout_ms: 5000
+  # Optional TLS / mTLS bundle. Required when connecting to an
+  # aisix.cloud DP Manager (endpoint is https:// and the CP issues
+  # a client cert via IssueAIDataplaneCertificate). Uncomment and
+  # point to your mTLS bundle.
+  # tls:
+  #   ca_cert_file:     "/etc/aisix/mtls/ca.crt"
+  #   client_cert_file: "/etc/aisix/mtls/client.crt"
+  #   client_key_file:  "/etc/aisix/mtls/client.key"
+  #   # Optional: override the TLS SNI / cert-subject-alt-name.
+  #   # Defaults to the hostname portion of endpoints[0].
+  #   # domain_name: "etcd.aisix.cloud"
 
 proxy:
   addr: "0.0.0.0:3000"
@@ -48,6 +59,13 @@ observability:
     # public_key_env: "LANGFUSE_PUBLIC_KEY"
     # secret_key_env: "LANGFUSE_SECRET_KEY"
     # host: "https://cloud.langfuse.com"
+
+# Managed-mode switch. Uncomment when running as an aisix.cloud
+# tenant: the admin API, admin UI, and Playground will NOT be
+# bound — all configuration flows from etcd via the mTLS channel
+# above, driven by the aisix.cloud control plane.
+# managed:
+#   enabled: true
 
 cache:
   backend: "memory"   # memory | redis | qdrant
