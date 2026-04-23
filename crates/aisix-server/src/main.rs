@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod heartbeat;
 mod register;
 
 use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore};
@@ -61,38 +62,57 @@ async fn main() -> anyhow::Result<()> {
 /// Factored out of `main` so the integration tests can drive the full
 /// startup with a real config struct and still use `#[tokio::test]`.
 async fn run(mut cfg: Config) -> anyhow::Result<()> {
-    // If this is a managed tenant and the mTLS bundle isn't on disk
-    // yet, perform the one-shot `POST /dp/register` exchange against
-    // the aisix.cloud control plane. The response fills in
-    // `cfg.etcd.endpoints` + `cfg.etcd.tls` so the regular etcd
-    // connect path below is oblivious to whether certs came from an
-    // out-of-band install or just-now registration.
-    if cfg.managed.is_managed()
-        && !register::bundle_exists(&cfg.managed.mtls_dir)
-        && cfg.managed.registration_enabled()
-    {
-        tracing::info!("managed mode: registering with aisix.cloud CP");
-        let r = register::register_and_persist(&cfg.managed)
-            .await
-            .map_err(|e| anyhow::anyhow!("DP registration failed: {e:#}"))?;
-        tracing::info!(
-            dp_id = %r.dp_id,
-            gateway_id = %r.gateway_id,
-            etcd = %r.etcd_endpoint,
-            "registered with control plane",
-        );
-        // Override the static config with what the CP handed back.
-        // Endpoints get the https:// scheme re-attached (the CP sends
-        // a bare host:port, but tonic-based etcd-client expects a
-        // full URL for TLS endpoints).
-        cfg.etcd.endpoints = vec![format!("https://{}", r.etcd_endpoint)];
-        cfg.etcd.tls = Some(EtcdTlsConfig {
-            ca_cert_file: r.ca_cert_path.to_string_lossy().into_owned(),
-            client_cert_file: r.client_cert_path.to_string_lossy().into_owned(),
-            client_key_file: r.client_key_path.to_string_lossy().into_owned(),
-            domain_name: None, // derive from endpoint host
-        });
-    }
+    // Managed-mode bootstrap. If we have to register (first boot),
+    // we also capture the heartbeat config the CP sent back so the
+    // worker can be spawned a few lines below. If the bundle is
+    // already on disk (subsequent boot), we synthesise the same
+    // values from config + dp_id_file.
+    let heartbeat_cfg: Option<heartbeat::HeartbeatConfig> = if cfg.managed.is_managed() {
+        if !register::bundle_exists(&cfg.managed.mtls_dir) && cfg.managed.registration_enabled() {
+            tracing::info!("managed mode: registering with aisix.cloud CP");
+            let r = register::register_and_persist(&cfg.managed)
+                .await
+                .map_err(|e| anyhow::anyhow!("DP registration failed: {e:#}"))?;
+            tracing::info!(
+                dp_id = %r.dp_id,
+                gateway_id = %r.gateway_id,
+                etcd = %r.etcd_endpoint,
+                "registered with control plane",
+            );
+            // Override the static config with what the CP handed back.
+            // Endpoints get the https:// scheme re-attached (the CP
+            // sends a bare host:port, but tonic-based etcd-client
+            // expects a full URL for TLS endpoints).
+            cfg.etcd.endpoints = vec![format!("https://{}", r.etcd_endpoint)];
+            cfg.etcd.tls = Some(EtcdTlsConfig {
+                ca_cert_file: r.ca_cert_path.to_string_lossy().into_owned(),
+                client_cert_file: r.client_cert_path.to_string_lossy().into_owned(),
+                client_key_file: r.client_key_path.to_string_lossy().into_owned(),
+                domain_name: None, // derive from endpoint host
+            });
+            Some(heartbeat::HeartbeatConfig::sanitised(
+                r.heartbeat_url,
+                r.dp_id,
+                r.heartbeat_interval,
+            ))
+        } else if register::bundle_exists(&cfg.managed.mtls_dir) {
+            // Bundle persisted from a previous boot; load the dp_id
+            // and synthesise heartbeat config from the configured
+            // cp_base_url. Registration doesn't re-run.
+            match load_heartbeat_config_from_disk(&cfg.managed) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    tracing::warn!(error = %e,
+                        "managed mode: heartbeat worker disabled (dp_id unreadable)");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Steps 4-6: etcd + supervisor.
     let connect_options = build_etcd_connect_options(&cfg.etcd)?;
@@ -124,6 +144,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
 
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let watch_task = tokio::spawn(supervisor.clone().run(cancel_rx.clone()));
+    // Spawn heartbeat worker if we have a config for it. The
+    // JoinHandle is awaited after graceful shutdown below so the
+    // final in-flight beat drains cleanly.
+    let heartbeat_task = heartbeat_cfg.map(|h| heartbeat::spawn(h, cancel_rx.clone()));
 
     // Steps 7-8: build Hub, shared components, then routers.
     let hub = Arc::new(build_hub());
@@ -243,6 +267,9 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     let _ = cancel_tx.send(true);
     let _ = signal_task.await;
     let _ = watch_task.await;
+    if let Some(task) = heartbeat_task {
+        let _ = task.await;
+    }
     tracing::info!("aisix shut down cleanly");
     Ok(())
 }
@@ -321,6 +348,39 @@ fn default_domain_from_endpoint(endpoint: &str) -> anyhow::Result<String> {
         anyhow::bail!("cannot derive TLS domain_name from endpoint {endpoint:?}");
     }
     Ok(host.to_string())
+}
+
+/// Synthesise a HeartbeatConfig when the mTLS bundle is already on
+/// disk from a previous boot. Reads `managed.dp_id_file` and
+/// combines with `managed.cp_base_url` — the register response is
+/// not available on this code path.
+///
+/// Returns an error (not None) when the user has configured managed
+/// mode AND the bundle exists BUT the dp_id is unreadable — that's
+/// an inconsistent on-disk state an operator should know about.
+fn load_heartbeat_config_from_disk(
+    managed: &aisix_core::ManagedConfig,
+) -> anyhow::Result<heartbeat::HeartbeatConfig> {
+    let base = managed
+        .cp_base_url
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("managed.cp_base_url must be set for heartbeat on subsequent boots")
+        })?;
+    let dp_id = std::fs::read_to_string(&managed.dp_id_file)
+        .map_err(|e| anyhow::anyhow!("read dp_id from {}: {e}", managed.dp_id_file))?
+        .trim()
+        .to_string();
+    if dp_id.is_empty() {
+        anyhow::bail!("dp_id file {} is empty", managed.dp_id_file);
+    }
+    let url = format!("{}/dp/heartbeat", base.trim_end_matches('/'));
+    Ok(heartbeat::HeartbeatConfig::sanitised(
+        url,
+        dp_id,
+        std::time::Duration::from_secs(15),
+    ))
 }
 
 /// Register all four provider bridges on a fresh Hub. The Hub is
