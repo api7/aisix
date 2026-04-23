@@ -1,0 +1,72 @@
+# aisix — managed-mode bootstrap config (aisix.cloud tenant).
+#
+# Used by the official Docker image as `/etc/aisix/config.yaml`.
+# Only the bare minimum is set here:
+#
+#   - `managed.enabled: true`           always on for this image
+#   - `etcd.endpoints: [placeholder]`   overridden at first boot by the
+#                                       `/dp/register` response
+#   - `admin.admin_keys: [placeholder]` validation requires the slot,
+#                                       but the admin listener is never
+#                                       bound in managed mode
+#
+# Operators inject these env vars at `docker run` time:
+#
+#   AISIX_MANAGED__REGISTRATION_TOKEN=aisix_dp_us_east_1_AbCd…
+#   AISIX_MANAGED__CP_BASE_URL=https://api.us.aisix.cloud
+#
+# Plus optionally `AISIX_PROXY__ADDR`, `AISIX_OBSERVABILITY__LOG_LEVEL`,
+# `AISIX_CACHE__BACKEND`, etc. — every config field is reachable via
+# `AISIX_<UPPER>__<UPPER>` (see crates/aisix-core/src/config.rs).
+#
+# Subsequent boots re-use the mTLS bundle written under
+# `managed.mtls_dir` and skip the register round-trip entirely.
+
+etcd:
+  # Placeholder — overwritten at first boot. The Rust bootstrap copies
+  # the etcd endpoint + mTLS paths from the /dp/register response into
+  # this field before opening the gRPC channel.
+  endpoints:
+    - "https://placeholder-overridden-at-register:2379"
+  prefix: "/aisix"
+  dial_timeout_ms: 5000
+  request_timeout_ms: 5000
+
+proxy:
+  addr: "0.0.0.0:3000"
+  request_body_limit_bytes: 10485760
+
+admin:
+  # Bind to an unbindable port so even if managed mode somehow
+  # toggled off, the admin surface wouldn't accidentally come up
+  # without an operator-supplied key.
+  addr: "127.0.0.1:0"
+  admin_keys:
+    - "managed-mode-admin-disabled"
+
+observability:
+  service_name: "aisix"
+  log_level: "info"
+  access_log: true
+  metrics:
+    prometheus:
+      enabled: true
+      path: "/metrics"
+    otlp:
+      enabled: false
+  tracing:
+    otlp:
+      enabled: false
+      sample_ratio: 1.0
+  langfuse:
+    enabled: false
+
+managed:
+  enabled: true
+  # registration_token + cp_base_url come from env vars — never bake
+  # secrets into the image.
+  mtls_dir: "/var/lib/aisix/mtls"
+  dp_id_file: "/var/lib/aisix/dp_id"
+
+cache:
+  backend: "memory"

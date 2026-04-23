@@ -602,6 +602,37 @@ managed:
     }
 
     #[test]
+    fn parses_managed_block_with_register_fields() {
+        // Mirrors the shape of the baked-in config.managed.yaml so the
+        // image's bootstrap template stays a valid Config; if anyone
+        // adds a required ManagedConfig field they have to update both
+        // the YAML and this test.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["https://placeholder:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:0"
+  admin_keys: ["disabled"]
+managed:
+  enabled: true
+  mtls_dir: "/var/lib/aisix/mtls"
+  dp_id_file: "/var/lib/aisix/dp_id"
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(cfg.managed.is_managed());
+        assert_eq!(cfg.managed.mtls_dir, "/var/lib/aisix/mtls");
+        assert_eq!(cfg.managed.dp_id_file, "/var/lib/aisix/dp_id");
+        // Token / CP URL come from env at runtime — empty here is fine.
+        assert!(cfg.managed.registration_token.is_none());
+        assert!(cfg.managed.cp_base_url.is_none());
+        assert!(!cfg.managed.registration_enabled());
+    }
+
+    #[test]
     fn parses_etcd_tls_block() {
         let f = write_yaml(
             r#"

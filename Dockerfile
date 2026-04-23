@@ -13,8 +13,16 @@
 # Build:
 #   docker build -t aisix:dev .
 #
-# Run:
+# Run, standalone (mount your own config):
 #   docker run --rm -v $(pwd)/config.example.yaml:/etc/aisix/config.yaml \
+#     aisix:dev
+#
+# Run, managed (aisix.cloud tenant — bake config + env-var overrides):
+#   docker run --rm \
+#     -e AISIX_CONFIG_PATH=/etc/aisix/config.managed.yaml \
+#     -e AISIX_MANAGED__REGISTRATION_TOKEN=$DEPLOYMENT_TOKEN \
+#     -e AISIX_MANAGED__CP_BASE_URL=https://api.us.aisix.cloud \
+#     -v aisix-mtls:/var/lib/aisix \
 #     aisix:dev
 
 # --- Stage 1: build ----------------------------------------------------------
@@ -55,11 +63,22 @@ RUN apt-get update \
 
 COPY --from=builder /usr/local/bin/aisix /usr/local/bin/aisix
 
+# Bake the managed-mode bootstrap config so aisix.cloud tenants can
+# `docker run` without mounting anything — env vars carry the per-DP
+# secret bits (registration token + CP base URL).
+COPY config.managed.yaml /etc/aisix/config.managed.yaml
+
+# Entrypoint script picks the config file via AISIX_CONFIG_PATH so the
+# same image serves both standalone (mount your config at the default
+# path) and managed (point AISIX_CONFIG_PATH at the baked file).
+COPY docker/entrypoint.sh /usr/local/bin/aisix-entrypoint
+RUN chmod 0755 /usr/local/bin/aisix-entrypoint
+
 # Proxy + admin listeners from config.example.yaml.
 EXPOSE 3000 3001
 
 USER aisix
 
-# tini forwards signals cleanly to the aisix process.
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/aisix"]
-CMD ["--config", "/etc/aisix/config.yaml"]
+# tini forwards signals cleanly to the aisix process; entrypoint script
+# resolves the config path from env, then execs the binary.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/aisix-entrypoint"]
