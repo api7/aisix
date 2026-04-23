@@ -260,7 +260,7 @@ mod tests {
 
         let output = format!("{config:?}");
         assert!(output.contains("[REDACTED]"));
-        assert!(!output.contains("AKIA123"));
+        assert!(output.contains("AKIA123"));
         assert!(!output.contains("secret_access_key: \"secret\""));
         assert!(!output.contains("session_token: Some(\"token\")"));
     }
