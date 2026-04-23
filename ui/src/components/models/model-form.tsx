@@ -1,9 +1,17 @@
 import { useForm } from '@tanstack/react-form';
+import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import type { Model } from '@/lib/api/types';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -16,6 +24,25 @@ export interface ModelFormProps {
   error?: string;
   submitLabel: string;
   extraActions?: React.ReactNode;
+}
+
+type ProviderId = 'anthropic' | 'bedrock' | 'deepseek' | 'gemini' | 'openai';
+type ProviderSelection = ProviderId | '';
+
+type ProviderConfigValues = Record<string, string>;
+
+interface ProviderConfigFieldSchema {
+  type: 'string';
+  titleKey: string;
+  descriptionKey?: string;
+  placeholder?: string;
+  placeholderKey?: string;
+  inputType?: React.HTMLInputTypeAttribute;
+}
+
+interface ProviderConfigSchema {
+  required: string[];
+  properties: Record<string, ProviderConfigFieldSchema>;
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -48,6 +75,135 @@ const RATE_LIMIT_FIELDS = [
   },
 ];
 
+const PROVIDER_OPTIONS: Array<{ value: ProviderId; labelKey: string }> = [
+  { value: 'openai', labelKey: 'models.form.providers.openai' },
+  { value: 'anthropic', labelKey: 'models.form.providers.anthropic' },
+  { value: 'gemini', labelKey: 'models.form.providers.gemini' },
+  { value: 'deepseek', labelKey: 'models.form.providers.deepseek' },
+  { value: 'bedrock', labelKey: 'models.form.providers.bedrock' },
+];
+
+const OPENAI_COMPATIBLE_CONFIG_SCHEMA: ProviderConfigSchema = {
+  required: ['api_key'],
+  properties: {
+    api_key: {
+      type: 'string',
+      titleKey: 'models.form.apiKeyLabel',
+      placeholder: 'sk-…',
+      inputType: 'password',
+    },
+    api_base: {
+      type: 'string',
+      titleKey: 'models.form.apiBase',
+      descriptionKey: 'models.form.apiBaseHint',
+      placeholderKey: 'models.form.apiBasePlaceholder',
+      inputType: 'url',
+    },
+  },
+};
+
+const BEDROCK_CONFIG_SCHEMA: ProviderConfigSchema = {
+  required: ['region', 'access_key_id', 'secret_access_key'],
+  properties: {
+    region: {
+      type: 'string',
+      titleKey: 'models.form.regionLabel',
+      descriptionKey: 'models.form.regionHint',
+      placeholder: 'us-east-1',
+    },
+    access_key_id: {
+      type: 'string',
+      titleKey: 'models.form.accessKeyIdLabel',
+      placeholder: 'AKIA...',
+    },
+    secret_access_key: {
+      type: 'string',
+      titleKey: 'models.form.secretAccessKeyLabel',
+      inputType: 'password',
+      placeholderKey: 'models.form.secretAccessKeyPlaceholder',
+    },
+    session_token: {
+      type: 'string',
+      titleKey: 'models.form.sessionTokenLabel',
+      descriptionKey: 'models.form.sessionTokenHint',
+      inputType: 'password',
+      placeholderKey: 'models.form.sessionTokenPlaceholder',
+    },
+    endpoint: {
+      type: 'string',
+      titleKey: 'models.form.endpointLabel',
+      descriptionKey: 'models.form.endpointHint',
+      inputType: 'url',
+      placeholder: 'https://bedrock-runtime.us-east-1.amazonaws.com',
+    },
+  },
+};
+
+const PROVIDER_CONFIG_SCHEMAS: Record<ProviderId, ProviderConfigSchema> = {
+  anthropic: OPENAI_COMPATIBLE_CONFIG_SCHEMA,
+  bedrock: BEDROCK_CONFIG_SCHEMA,
+  deepseek: OPENAI_COMPATIBLE_CONFIG_SCHEMA,
+  gemini: OPENAI_COMPATIBLE_CONFIG_SCHEMA,
+  openai: OPENAI_COMPATIBLE_CONFIG_SCHEMA,
+};
+
+function isProviderId(value: string): value is ProviderId {
+  return PROVIDER_OPTIONS.some((option) => option.value === value);
+}
+
+function splitModelIdentifier(model: string | undefined): {
+  provider: ProviderSelection;
+  providerModel: string;
+} {
+  if (!model) {
+    return { provider: '', providerModel: '' };
+  }
+
+  const separatorIndex = model.indexOf('/');
+  if (separatorIndex === -1) {
+    return { provider: '', providerModel: model };
+  }
+
+  const provider = model.slice(0, separatorIndex).toLowerCase();
+  const providerModel = model.slice(separatorIndex + 1);
+  if (!isProviderId(provider) || !providerModel) {
+    return { provider: '', providerModel: model };
+  }
+
+  return { provider, providerModel };
+}
+
+function normalizeProviderConfigValues(
+  provider: ProviderId,
+  source: Model['provider_config'] | ProviderConfigValues | undefined,
+): ProviderConfigValues {
+  const schema = PROVIDER_CONFIG_SCHEMAS[provider];
+  const objectSource =
+    source && typeof source === 'object'
+      ? (source as Record<string, unknown>)
+      : undefined;
+
+  return Object.fromEntries(
+    Object.keys(schema.properties).map((fieldName) => {
+      const rawValue = objectSource?.[fieldName];
+      return [fieldName, typeof rawValue === 'string' ? rawValue : ''];
+    }),
+  );
+}
+
+function serializeProviderConfig(
+  provider: ProviderId,
+  values: ProviderConfigValues,
+): Model['provider_config'] {
+  const schema = PROVIDER_CONFIG_SCHEMAS[provider];
+
+  return Object.fromEntries(
+    Object.keys(schema.properties)
+      .map((fieldName) => [fieldName, values[fieldName]?.trim() ?? ''])
+      .filter(([, value]) => value.length > 0),
+  );
+}
+
 function parseOptionalNonNegativeInteger(raw: string): number | undefined {
   const trimmed = raw.trim();
   if (!trimmed) {
@@ -74,12 +230,31 @@ export function ModelForm({
   extraActions,
 }: ModelFormProps) {
   const { t } = useTranslation();
+  const initialModel = splitModelIdentifier(initial?.model);
+  const initialProviderConfigValues = initialModel.provider
+    ? normalizeProviderConfigValues(
+        initialModel.provider,
+        initial?.provider_config,
+      )
+    : {};
+  const [provider, setProvider] = useState<ProviderSelection>(
+    initialModel.provider,
+  );
+  const [providerConfigDrafts, setProviderConfigDrafts] = useState<
+    Partial<Record<ProviderId, ProviderConfigValues>>
+  >(() =>
+    initialModel.provider
+      ? { [initialModel.provider]: initialProviderConfigValues }
+      : {},
+  );
+  const [providerConfigValues, setProviderConfigValues] =
+    useState<ProviderConfigValues>(initialProviderConfigValues);
+  const [clientError, setClientError] = useState<string>();
+
   const form = useForm({
     defaultValues: {
       name: initial?.name ?? '',
-      model: initial?.model ?? '',
-      api_key: initial?.provider_config.api_key ?? '',
-      api_base: initial?.provider_config.api_base ?? '',
+      model: initialModel.providerModel,
       timeout: initial?.timeout != null ? String(initial.timeout) : '',
       tpm:
         initial?.rate_limit?.tpm != null ? String(initial.rate_limit.tpm) : '',
@@ -95,6 +270,19 @@ export function ModelForm({
           : '',
     },
     onSubmit: async ({ value }) => {
+      if (!provider) {
+        setClientError(t('models.form.providerRequired'));
+        return;
+      }
+
+      const trimmedModel = value.model.trim();
+      if (!trimmedModel) {
+        setClientError(t('models.form.modelRequired'));
+        return;
+      }
+
+      setClientError(undefined);
+
       const tpm = parseOptionalNonNegativeInteger(value.tpm);
       const tpd = parseOptionalNonNegativeInteger(value.tpd);
       const rpm = parseOptionalNonNegativeInteger(value.rpm);
@@ -111,17 +299,63 @@ export function ModelForm({
       };
       const payload: Model = {
         name: value.name.trim(),
-        model: value.model.trim(),
-        provider_config: {
-          ...(value.api_key ? { api_key: value.api_key.trim() } : {}),
-          ...(value.api_base ? { api_base: value.api_base.trim() } : {}),
-        },
+        model: `${provider}/${trimmedModel}`,
+        provider_config: serializeProviderConfig(
+          provider,
+          providerConfigValues,
+        ),
         ...(timeout != null ? { timeout } : {}),
         ...(Object.keys(rateLimit).length > 0 ? { rate_limit: rateLimit } : {}),
       };
       await onSubmit(payload);
     },
   });
+
+  const providerConfigSchema = provider
+    ? PROVIDER_CONFIG_SCHEMAS[provider]
+    : undefined;
+
+  function handleProviderChange(nextProvider: string) {
+    if (!isProviderId(nextProvider)) {
+      return;
+    }
+
+    const nextDrafts = provider
+      ? {
+          ...providerConfigDrafts,
+          [provider]: { ...providerConfigValues },
+        }
+      : providerConfigDrafts;
+    const nextProviderDraft = nextDrafts[nextProvider];
+
+    setProviderConfigDrafts(nextDrafts);
+    setProvider(nextProvider);
+    setProviderConfigValues(
+      normalizeProviderConfigValues(nextProvider, nextProviderDraft),
+    );
+    setClientError(undefined);
+  }
+
+  function handleProviderConfigFieldChange(
+    fieldName: string,
+    nextValue: string,
+  ) {
+    setProviderConfigValues((current) => {
+      const nextValues = {
+        ...current,
+        [fieldName]: nextValue,
+      };
+
+      if (provider) {
+        setProviderConfigDrafts((currentDrafts) => ({
+          ...currentDrafts,
+          [provider]: nextValues,
+        }));
+      }
+
+      return nextValues;
+    });
+  }
 
   return (
     <form
@@ -136,7 +370,7 @@ export function ModelForm({
       <section className="space-y-4 rounded-xl border bg-card p-5">
         <h3 className="text-sm font-semibold">{t('models.form.basicInfo')}</h3>
 
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid gap-4 md:grid-cols-3">
           <form.Field name="name">
             {(field) => (
               <Field label={t('models.form.nameLabel')}>
@@ -151,16 +385,36 @@ export function ModelForm({
             )}
           </form.Field>
 
+          <Field label={t('models.form.providerLabel')}>
+            <Select
+              value={provider || undefined}
+              onValueChange={handleProviderChange}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue
+                  placeholder={t('models.form.providerPlaceholder')}
+                />
+              </SelectTrigger>
+              <SelectContent>
+                {PROVIDER_OPTIONS.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {t(option.labelKey)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
+
           <form.Field name="model">
             {(field) => (
-              <Field
-                label={t('models.form.modelLabel')}
-                hint={t('models.form.modelHint')}
-              >
+              <Field label={t('models.form.modelLabel')}>
                 <Input
                   required
                   value={field.state.value}
-                  onChange={(e) => field.handleChange(e.target.value)}
+                  onChange={(e) => {
+                    setClientError(undefined);
+                    field.handleChange(e.target.value);
+                  }}
                   onBlur={field.handleBlur}
                   placeholder={t('models.form.modelPlaceholder')}
                 />
@@ -176,38 +430,42 @@ export function ModelForm({
           {t('models.form.providerConfig')}
         </h3>
 
-        <div className="grid grid-cols-2 gap-4">
-          <form.Field name="api_key">
-            {(field) => (
-              <Field label={t('models.form.apiKeyLabel')}>
-                <Input
-                  type="password"
-                  value={field.state.value}
-                  onChange={(e) => field.handleChange(e.target.value)}
-                  onBlur={field.handleBlur}
-                  placeholder="sk-…"
-                  autoComplete="off"
-                />
-              </Field>
+        {providerConfigSchema ? (
+          <div className="grid gap-4 md:grid-cols-2">
+            {Object.entries(providerConfigSchema.properties).map(
+              ([fieldName, fieldSchema]) => (
+                <Field
+                  key={fieldName}
+                  label={t(fieldSchema.titleKey)}
+                  hint={
+                    fieldSchema.descriptionKey
+                      ? t(fieldSchema.descriptionKey)
+                      : undefined
+                  }
+                >
+                  <Input
+                    required={providerConfigSchema.required.includes(fieldName)}
+                    type={fieldSchema.inputType ?? 'text'}
+                    value={providerConfigValues[fieldName] ?? ''}
+                    onChange={(e) =>
+                      handleProviderConfigFieldChange(fieldName, e.target.value)
+                    }
+                    placeholder={
+                      fieldSchema.placeholderKey
+                        ? t(fieldSchema.placeholderKey)
+                        : fieldSchema.placeholder
+                    }
+                    autoComplete="off"
+                  />
+                </Field>
+              ),
             )}
-          </form.Field>
-
-          <form.Field name="api_base">
-            {(field) => (
-              <Field
-                label={t('models.form.apiBase')}
-                hint={t('models.form.apiBaseHint')}
-              >
-                <Input
-                  value={field.state.value}
-                  onChange={(e) => field.handleChange(e.target.value)}
-                  onBlur={field.handleBlur}
-                  placeholder={t('models.form.apiBasePlaceholder')}
-                />
-              </Field>
-            )}
-          </form.Field>
-        </div>
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            {t('models.form.providerConfigSelectHint')}
+          </p>
+        )}
       </section>
 
       {/* Advanced */}
@@ -235,7 +493,7 @@ export function ModelForm({
           <p className="mb-3 text-xs font-medium tracking-wide text-muted-foreground uppercase">
             {t('models.form.rateLimits')}
           </p>
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid gap-3 md:grid-cols-3">
             {RATE_LIMIT_FIELDS.map(({ name, labelKey, hintKey }) => (
               <form.Field key={name} name={name}>
                 {(field) => (
@@ -259,9 +517,9 @@ export function ModelForm({
         </div>
       </section>
 
-      {error && (
+      {(clientError ?? error) && (
         <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {error}
+          {clientError ?? error}
         </p>
       )}
 
