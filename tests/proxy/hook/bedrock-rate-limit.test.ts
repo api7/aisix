@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto';
 
-import { bearerAuthHeader, startIsolatedAdminApp } from '../../utils/admin.js';
+import {
+  adminPost,
+  bearerAuthHeader,
+  startIsolatedAdminApp,
+} from '../../utils/admin.js';
 import {
   BedrockMockUpstream,
   type BedrockStreamEvent,
@@ -8,8 +12,8 @@ import {
   buildBedrockProviderModel,
   startBedrockMockUpstream,
 } from '../../utils/bedrock-mock-upstream.js';
-import { client } from '../../utils/http.js';
-import { App, randomPort } from '../../utils/setup.js';
+import { proxyPost } from '../../utils/proxy.js';
+import { App } from '../../utils/setup.js';
 import {
   expectStreamHasDoneMarker,
   expectStreamHasUsageChunk,
@@ -19,32 +23,6 @@ const ADMIN_KEY = 'test_admin_key_proxy_hook_bedrock_rate_limit';
 const PROXY_KEY = 'sk-proxy-hook-bedrock-rate-limit';
 const BEDROCK_RUNTIME_MODEL =
   'inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0';
-
-const proxyPort = randomPort();
-const adminPort = randomPort();
-
-const proxyBaseUrl = () => `http://127.0.0.1:${proxyPort}`;
-const adminBaseUrl = () => `http://127.0.0.1:${adminPort}/aisix/admin`;
-
-const adminPostAt = async (
-  path: string,
-  body: unknown,
-  headers: Record<string, string> = {},
-) => client.post(`${adminBaseUrl()}${path}`, body, { headers });
-
-const proxyPostAt = async (
-  path: string,
-  body: unknown,
-  apiKey: string,
-  config: Record<string, unknown> = {},
-) =>
-  client.post(`${proxyBaseUrl()}${path}`, body, {
-    ...config,
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      ...((config.headers as Record<string, string> | undefined) ?? {}),
-    },
-  });
 
 const waitConfigPropagation = async () => {
   await new Promise((resolve) => setTimeout(resolve, 500));
@@ -86,17 +64,14 @@ describe('proxy hook consumes bedrock stream usage metadata', () => {
   let modelName = '';
 
   beforeEach(async () => {
-    server = await startIsolatedAdminApp(ADMIN_KEY, {
-      proxyPort,
-      adminPort,
-    });
+    server = await startIsolatedAdminApp(ADMIN_KEY);
     upstream = await startBedrockMockUpstream({
       streamEvents: usageLimitedStreamEvents,
     });
 
     modelName = `rate-limit-bedrock-model-${randomUUID()}`;
 
-    const modelResp = await adminPostAt(
+    const modelResp = await adminPost(
       '/models',
       {
         name: modelName,
@@ -110,7 +85,7 @@ describe('proxy hook consumes bedrock stream usage metadata', () => {
     );
     expect(modelResp.status, JSON.stringify(modelResp.data)).toBe(201);
 
-    const apiKeyResp = await adminPostAt(
+    const apiKeyResp = await adminPost(
       '/apikeys',
       {
         key: PROXY_KEY,
@@ -129,7 +104,7 @@ describe('proxy hook consumes bedrock stream usage metadata', () => {
   });
 
   test('charges tpm after bedrock stream metadata is surfaced as usage', async () => {
-    const firstResp = await proxyPostAt(
+    const firstResp = await proxyPost(
       '/v1/chat/completions',
       {
         model: modelName,
@@ -146,7 +121,7 @@ describe('proxy hook consumes bedrock stream usage metadata', () => {
 
     await new Promise((resolve) => setTimeout(resolve, 100));
 
-    const secondResp = await proxyPostAt(
+    const secondResp = await proxyPost(
       '/v1/chat/completions',
       {
         model: modelName,

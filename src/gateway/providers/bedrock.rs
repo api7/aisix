@@ -1,6 +1,6 @@
 mod transform;
 
-use std::{borrow::Cow, time::SystemTime};
+use std::{borrow::Cow, fmt, time::SystemTime};
 
 use aws_credential_types::Credentials;
 use aws_sigv4::{
@@ -28,7 +28,7 @@ const DEFAULT_BASE_URL: &str = "https://bedrock-runtime.us-east-1.amazonaws.com"
 
 pub struct BedrockDef;
 
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BedrockProviderConfig {
     pub region: String,
     pub access_key_id: String,
@@ -39,6 +39,23 @@ pub struct BedrockProviderConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+}
+
+impl fmt::Debug for BedrockProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const REDACTED: &str = "[REDACTED]";
+
+        f.debug_struct("BedrockProviderConfig")
+            .field("region", &self.region)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &REDACTED)
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| REDACTED),
+            )
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
 }
 
 impl ProviderMeta for BedrockDef {
@@ -229,6 +246,23 @@ mod tests {
             config.endpoint.as_deref(),
             Some("https://bedrock-runtime.us-east-1.amazonaws.com")
         );
+    }
+
+    #[test]
+    fn bedrock_provider_config_debug_redacts_credentials() {
+        let config = BedrockProviderConfig {
+            region: "us-east-1".into(),
+            access_key_id: "AKIA123".into(),
+            secret_access_key: "secret".into(),
+            session_token: Some("token".into()),
+            endpoint: Some("https://bedrock-runtime.us-east-1.amazonaws.com".into()),
+        };
+
+        let output = format!("{config:?}");
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("AKIA123"));
+        assert!(!output.contains("secret_access_key: \"secret\""));
+        assert!(!output.contains("session_token: Some(\"token\")"));
     }
 
     #[test]

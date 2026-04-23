@@ -1,15 +1,18 @@
 import { randomUUID } from 'node:crypto';
 
-import { bearerAuthHeader, startIsolatedAdminApp } from '../utils/admin.js';
+import {
+  adminPost,
+  bearerAuthHeader,
+  startIsolatedAdminApp,
+} from '../utils/admin.js';
 import {
   BedrockMockUpstream,
   buildBedrockProviderConfig,
   buildBedrockProviderModel,
   startBedrockMockUpstream,
 } from '../utils/bedrock-mock-upstream.js';
-import { client } from '../utils/http.js';
-import { parseSseDataEvents } from '../utils/proxy.js';
-import { App, randomPort } from '../utils/setup.js';
+import { parseSseDataEvents, proxyPost } from '../utils/proxy.js';
+import { App } from '../utils/setup.js';
 import {
   expectParseableChatCompletionChunks,
   expectStreamHasDoneMarker,
@@ -23,32 +26,6 @@ const BEDROCK_RUNTIME_MODEL =
 const EXPECTED_ENCODED_PATH =
   '/model/inference-profile%2Fus.anthropic.claude-3-7-sonnet-20250219-v1:0';
 
-const proxyPort = randomPort();
-const adminPort = randomPort();
-
-const proxyBaseUrl = () => `http://127.0.0.1:${proxyPort}`;
-const adminBaseUrl = () => `http://127.0.0.1:${adminPort}/aisix/admin`;
-
-const adminPostAt = async (
-  path: string,
-  body: unknown,
-  headers: Record<string, string> = {},
-) => client.post(`${adminBaseUrl()}${path}`, body, { headers });
-
-const proxyPostAt = async (
-  path: string,
-  body: unknown,
-  apiKey: string,
-  config: Record<string, unknown> = {},
-) =>
-  client.post(`${proxyBaseUrl()}${path}`, body, {
-    ...config,
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      ...((config.headers as Record<string, string> | undefined) ?? {}),
-    },
-  });
-
 const waitConfigPropagation = async () => {
   await new Promise((resolve) => setTimeout(resolve, 500));
 };
@@ -59,15 +36,12 @@ describe('proxy /v1/chat/completions with bedrock-backed model', () => {
   let modelName = '';
 
   beforeEach(async () => {
-    server = await startIsolatedAdminApp(ADMIN_KEY, {
-      proxyPort,
-      adminPort,
-    });
+    server = await startIsolatedAdminApp(ADMIN_KEY);
     upstream = await startBedrockMockUpstream();
 
     modelName = `mock-bedrock-chat-${randomUUID()}`;
 
-    const modelResp = await adminPostAt(
+    const modelResp = await adminPost(
       '/models',
       {
         name: modelName,
@@ -78,7 +52,7 @@ describe('proxy /v1/chat/completions with bedrock-backed model', () => {
     );
     expect(modelResp.status, JSON.stringify(modelResp.data)).toBe(201);
 
-    const apiKeyResp = await adminPostAt(
+    const apiKeyResp = await adminPost(
       '/apikeys',
       {
         key: AUTHORIZED_KEY,
@@ -97,7 +71,7 @@ describe('proxy /v1/chat/completions with bedrock-backed model', () => {
   });
 
   test('bedrock-backed model returns normal response and signs request', async () => {
-    const resp = await proxyPostAt(
+    const resp = await proxyPost(
       '/v1/chat/completions',
       {
         model: modelName,
@@ -130,7 +104,7 @@ describe('proxy /v1/chat/completions with bedrock-backed model', () => {
   });
 
   test('bedrock-backed stream emits chunks usage and done marker', async () => {
-    const resp = await proxyPostAt(
+    const resp = await proxyPost(
       '/v1/chat/completions',
       {
         model: modelName,

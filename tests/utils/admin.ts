@@ -6,11 +6,6 @@ import { App, defaultConfig } from './setup.js';
 export const ADMIN_BASE_URL = 'http://127.0.0.1:3001';
 export const ADMIN_PREFIX = '/aisix/admin';
 
-export interface TestAppPorts {
-  proxyPort: number;
-  adminPort: number;
-}
-
 export const adminUrl = (path: string) =>
   `${ADMIN_BASE_URL}${ADMIN_PREFIX}${path}`;
 
@@ -28,10 +23,7 @@ export const extractIdFromStorageKey = (storageKey: string) => {
   return id;
 };
 
-export const startIsolatedAdminApp = async (
-  adminKey: string,
-  ports: TestAppPorts = { proxyPort: 3000, adminPort: 3001 },
-) => {
+export const startIsolatedAdminApp = async (adminKey: string) => {
   return (await (
     await App.spawn(
       defaultConfig({
@@ -42,14 +34,14 @@ export const startIsolatedAdminApp = async (
           admin: { admin_key: [{ key: adminKey }] },
         },
         server: {
-          proxy: { listen: `127.0.0.1:${ports.proxyPort}` },
-          admin: { listen: `127.0.0.1:${ports.adminPort}` },
+          proxy: { listen: '127.0.0.1:3000' },
+          admin: { listen: '127.0.0.1:3001' },
         },
       }),
     )
   )
-    .waitForReady(ports.proxyPort)
-    .then((app) => app.waitForReady(ports.adminPort))) as App;
+    .waitForReady(3000)
+    .then((app) => app.waitForReady(3001))) as App;
 };
 
 export const adminGet = async (
