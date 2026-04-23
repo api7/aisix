@@ -2,11 +2,13 @@ name: docker-image
 
 # Build and publish the aisix container image to GHCR.
 #
-# Tag strategy:
+# Tag strategy. Every push always carries a :sha-<shortsha> tag for
+# traceability; the other tags layer on top based on the trigger:
 #   - push to main              → :main + :sha-<shortsha>
 #   - push tag vX.Y.Z           → :X.Y.Z + :X.Y + :X + :latest
+#                                 + :sha-<shortsha>
 #   - pull request              → build-only (no push), sanity check
-#   - workflow_dispatch         → manual trigger, respects 'tag' input
+#   - workflow_dispatch         → :sha-<shortsha> + optional tag input
 
 on:
   push:

@@ -1,9 +1,11 @@
 .git
 .github
 target
-ui/node_modules
-ui/.next
-ui/dist
+
+# The Dockerfile only copies Cargo.* + crates/. Excluding the UI
+# tree entirely avoids shipping ~50 MB of node_modules (on dev
+# machines) and ~2 MB of checked-in sources into the build context.
+ui
 docs
 tests/fixtures/tmp
 **/.DS_Store
