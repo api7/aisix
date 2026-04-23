@@ -141,6 +141,7 @@ describe('proxy /v1/chat/completions with bedrock-backed model', () => {
     expect(recorded).toHaveLength(1);
     expect(recorded[0]?.url).toBe(`${EXPECTED_ENCODED_PATH}/converse-stream`);
     expect(recorded[0]?.headers.authorization).toMatch(/^AWS4-HMAC-SHA256 /);
+    expect(recorded[0]?.headers['x-amz-security-token']).toBe('session-token');
 
     const bodyJson = recorded[0]?.bodyJson as {
       messages: Array<{ content: Array<{ text: string }> }>;
