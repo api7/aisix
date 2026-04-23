@@ -27,6 +27,7 @@ export interface ModelFormProps {
 }
 
 type ProviderId = 'anthropic' | 'bedrock' | 'deepseek' | 'gemini' | 'openai';
+type ProviderSelection = ProviderId | '';
 
 type ProviderConfigValues = Record<string, string>;
 
@@ -119,14 +120,14 @@ const BEDROCK_CONFIG_SCHEMA: ProviderConfigSchema = {
       type: 'string',
       titleKey: 'models.form.secretAccessKeyLabel',
       inputType: 'password',
-      placeholder: 'AWS secret access key',
+      placeholderKey: 'models.form.secretAccessKeyPlaceholder',
     },
     session_token: {
       type: 'string',
       titleKey: 'models.form.sessionTokenLabel',
       descriptionKey: 'models.form.sessionTokenHint',
       inputType: 'password',
-      placeholder: 'Optional temporary credential',
+      placeholderKey: 'models.form.sessionTokenPlaceholder',
     },
     endpoint: {
       type: 'string',
@@ -151,22 +152,22 @@ function isProviderId(value: string): value is ProviderId {
 }
 
 function splitModelIdentifier(model: string | undefined): {
-  provider: ProviderId;
+  provider: ProviderSelection;
   providerModel: string;
 } {
   if (!model) {
-    return { provider: 'openai', providerModel: '' };
+    return { provider: '', providerModel: '' };
   }
 
   const separatorIndex = model.indexOf('/');
   if (separatorIndex === -1) {
-    return { provider: 'openai', providerModel: model };
+    return { provider: '', providerModel: model };
   }
 
   const provider = model.slice(0, separatorIndex).toLowerCase();
   const providerModel = model.slice(separatorIndex + 1);
   if (!isProviderId(provider) || !providerModel) {
-    return { provider: 'openai', providerModel: model };
+    return { provider: '', providerModel: model };
   }
 
   return { provider, providerModel };
@@ -230,14 +231,25 @@ export function ModelForm({
 }: ModelFormProps) {
   const { t } = useTranslation();
   const initialModel = splitModelIdentifier(initial?.model);
-  const [provider, setProvider] = useState<ProviderId>(initialModel.provider);
-  const [providerConfigValues, setProviderConfigValues] =
-    useState<ProviderConfigValues>(() =>
-      normalizeProviderConfigValues(
+  const initialProviderConfigValues = initialModel.provider
+    ? normalizeProviderConfigValues(
         initialModel.provider,
         initial?.provider_config,
-      ),
-    );
+      )
+    : {};
+  const [provider, setProvider] = useState<ProviderSelection>(
+    initialModel.provider,
+  );
+  const [providerConfigDrafts, setProviderConfigDrafts] = useState<
+    Partial<Record<ProviderId, ProviderConfigValues>>
+  >(() =>
+    initialModel.provider
+      ? { [initialModel.provider]: initialProviderConfigValues }
+      : {},
+  );
+  const [providerConfigValues, setProviderConfigValues] =
+    useState<ProviderConfigValues>(initialProviderConfigValues);
+  const [clientError, setClientError] = useState<string>();
 
   const form = useForm({
     defaultValues: {
@@ -258,6 +270,19 @@ export function ModelForm({
           : '',
     },
     onSubmit: async ({ value }) => {
+      if (!provider) {
+        setClientError(t('models.form.providerRequired'));
+        return;
+      }
+
+      const trimmedModel = value.model.trim();
+      if (!trimmedModel) {
+        setClientError(t('models.form.modelRequired'));
+        return;
+      }
+
+      setClientError(undefined);
+
       const tpm = parseOptionalNonNegativeInteger(value.tpm);
       const tpd = parseOptionalNonNegativeInteger(value.tpd);
       const rpm = parseOptionalNonNegativeInteger(value.rpm);
@@ -274,7 +299,7 @@ export function ModelForm({
       };
       const payload: Model = {
         name: value.name.trim(),
-        model: `${provider}/${value.model.trim()}`,
+        model: `${provider}/${trimmedModel}`,
         provider_config: serializeProviderConfig(
           provider,
           providerConfigValues,
@@ -286,27 +311,50 @@ export function ModelForm({
     },
   });
 
-  const providerConfigSchema = PROVIDER_CONFIG_SCHEMAS[provider];
+  const providerConfigSchema = provider
+    ? PROVIDER_CONFIG_SCHEMAS[provider]
+    : undefined;
 
   function handleProviderChange(nextProvider: string) {
     if (!isProviderId(nextProvider)) {
       return;
     }
 
+    const nextDrafts = provider
+      ? {
+          ...providerConfigDrafts,
+          [provider]: { ...providerConfigValues },
+        }
+      : providerConfigDrafts;
+    const nextProviderDraft = nextDrafts[nextProvider];
+
+    setProviderConfigDrafts(nextDrafts);
     setProvider(nextProvider);
-    setProviderConfigValues((current) =>
-      normalizeProviderConfigValues(nextProvider, current),
+    setProviderConfigValues(
+      normalizeProviderConfigValues(nextProvider, nextProviderDraft),
     );
+    setClientError(undefined);
   }
 
   function handleProviderConfigFieldChange(
     fieldName: string,
     nextValue: string,
   ) {
-    setProviderConfigValues((current) => ({
-      ...current,
-      [fieldName]: nextValue,
-    }));
+    setProviderConfigValues((current) => {
+      const nextValues = {
+        ...current,
+        [fieldName]: nextValue,
+      };
+
+      if (provider) {
+        setProviderConfigDrafts((currentDrafts) => ({
+          ...currentDrafts,
+          [provider]: nextValues,
+        }));
+      }
+
+      return nextValues;
+    });
   }
 
   return (
@@ -337,11 +385,11 @@ export function ModelForm({
             )}
           </form.Field>
 
-          <Field
-            label={t('models.form.providerLabel')}
-            hint={t('models.form.providerHint')}
-          >
-            <Select value={provider} onValueChange={handleProviderChange}>
+          <Field label={t('models.form.providerLabel')}>
+            <Select
+              value={provider || undefined}
+              onValueChange={handleProviderChange}
+            >
               <SelectTrigger className="w-full">
                 <SelectValue
                   placeholder={t('models.form.providerPlaceholder')}
@@ -359,14 +407,14 @@ export function ModelForm({
 
           <form.Field name="model">
             {(field) => (
-              <Field
-                label={t('models.form.modelLabel')}
-                hint={t('models.form.modelHint')}
-              >
+              <Field label={t('models.form.modelLabel')}>
                 <Input
                   required
                   value={field.state.value}
-                  onChange={(e) => field.handleChange(e.target.value)}
+                  onChange={(e) => {
+                    setClientError(undefined);
+                    field.handleChange(e.target.value);
+                  }}
                   onBlur={field.handleBlur}
                   placeholder={t('models.form.modelPlaceholder')}
                 />
@@ -382,36 +430,42 @@ export function ModelForm({
           {t('models.form.providerConfig')}
         </h3>
 
-        <div className="grid gap-4 md:grid-cols-2">
-          {Object.entries(providerConfigSchema.properties).map(
-            ([fieldName, fieldSchema]) => (
-              <Field
-                key={fieldName}
-                label={t(fieldSchema.titleKey)}
-                hint={
-                  fieldSchema.descriptionKey
-                    ? t(fieldSchema.descriptionKey)
-                    : undefined
-                }
-              >
-                <Input
-                  required={providerConfigSchema.required.includes(fieldName)}
-                  type={fieldSchema.inputType ?? 'text'}
-                  value={providerConfigValues[fieldName] ?? ''}
-                  onChange={(e) =>
-                    handleProviderConfigFieldChange(fieldName, e.target.value)
+        {providerConfigSchema ? (
+          <div className="grid gap-4 md:grid-cols-2">
+            {Object.entries(providerConfigSchema.properties).map(
+              ([fieldName, fieldSchema]) => (
+                <Field
+                  key={fieldName}
+                  label={t(fieldSchema.titleKey)}
+                  hint={
+                    fieldSchema.descriptionKey
+                      ? t(fieldSchema.descriptionKey)
+                      : undefined
                   }
-                  placeholder={
-                    fieldSchema.placeholderKey
-                      ? t(fieldSchema.placeholderKey)
-                      : fieldSchema.placeholder
-                  }
-                  autoComplete="off"
-                />
-              </Field>
-            ),
-          )}
-        </div>
+                >
+                  <Input
+                    required={providerConfigSchema.required.includes(fieldName)}
+                    type={fieldSchema.inputType ?? 'text'}
+                    value={providerConfigValues[fieldName] ?? ''}
+                    onChange={(e) =>
+                      handleProviderConfigFieldChange(fieldName, e.target.value)
+                    }
+                    placeholder={
+                      fieldSchema.placeholderKey
+                        ? t(fieldSchema.placeholderKey)
+                        : fieldSchema.placeholder
+                    }
+                    autoComplete="off"
+                  />
+                </Field>
+              ),
+            )}
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            {t('models.form.providerConfigSelectHint')}
+          </p>
+        )}
       </section>
 
       {/* Advanced */}
@@ -463,9 +517,9 @@ export function ModelForm({
         </div>
       </section>
 
-      {error && (
+      {(clientError ?? error) && (
         <p className="rounded-md bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {error}
+          {clientError ?? error}
         </p>
       )}
 
