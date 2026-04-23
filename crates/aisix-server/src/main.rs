@@ -22,7 +22,7 @@ use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore};
 use aisix_cache::{Cache, MemoryCache, RedisCache};
 use aisix_core::models::Provider;
 use aisix_core::{CacheBackend, Config, EtcdConfig, EtcdTlsConfig};
-use aisix_etcd::{EtcdConfigProvider, Supervisor};
+use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor};
 use aisix_gateway::Hub;
 use aisix_obs::{init_tracing, install_otlp_tracer, langfuse, Metrics};
 use aisix_provider_anthropic::AnthropicBridge;
@@ -139,7 +139,26 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("etcd admin client connect failed: {e}"))?,
         )
     };
-    let supervisor = Arc::new(Supervisor::new(provider, cfg.etcd.prefix.clone()));
+    // Snapshot cache: in managed mode persist to disk (default
+    // /var/lib/aisix/config_cache.json) so the DP can serve traffic
+    // from the last-known config across CP outages and restarts.
+    // Disabled outside managed mode and when the operator clears the
+    // path explicitly.
+    let snapshot_cache = if cfg.managed.is_managed() && !cfg.managed.snapshot_cache_path.is_empty()
+    {
+        SnapshotCache::new(&cfg.managed.snapshot_cache_path)
+    } else {
+        SnapshotCache::disabled()
+    };
+    let supervisor = Arc::new(Supervisor::with_cache(
+        provider,
+        cfg.etcd.prefix.clone(),
+        snapshot_cache,
+    ));
+    // Seed the snapshot from disk before the etcd cycle starts so the
+    // proxy is ready to serve from cached config the moment the watch
+    // task takes its first iteration.
+    supervisor.restore_from_cache();
     let snapshot_handle = supervisor.handle();
 
     let (cancel_tx, cancel_rx) = watch::channel(false);

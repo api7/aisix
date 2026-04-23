@@ -140,6 +140,18 @@ pub struct ManagedConfig {
     /// the mTLS files.
     #[serde(default = "ManagedConfig::default_dp_id_file")]
     pub dp_id_file: String,
+
+    /// Optional path to the on-disk snapshot cache the DP keeps as a
+    /// fallback when etcd is unreachable (prd-09 §9.7.2). When set, the
+    /// supervisor flushes every applied resync / put / delete to this
+    /// file and re-loads it at boot before opening the etcd connection,
+    /// so the proxy can serve traffic from cached config across CP
+    /// outages and full container restarts.
+    ///
+    /// Empty string disables persistence — useful for ephemeral test
+    /// runs where you don't want a stale cache to mask a real failure.
+    #[serde(default = "ManagedConfig::default_snapshot_cache_path")]
+    pub snapshot_cache_path: String,
 }
 
 impl ManagedConfig {
@@ -162,6 +174,9 @@ impl ManagedConfig {
     }
     fn default_dp_id_file() -> String {
         "/var/lib/aisix/dp_id".into()
+    }
+    fn default_snapshot_cache_path() -> String {
+        "/var/lib/aisix/config_cache.json".into()
     }
 }
 
@@ -626,6 +641,12 @@ managed:
         assert!(cfg.managed.is_managed());
         assert_eq!(cfg.managed.mtls_dir, "/var/lib/aisix/mtls");
         assert_eq!(cfg.managed.dp_id_file, "/var/lib/aisix/dp_id");
+        // Default snapshot cache path keeps offline-resilience on by
+        // default; operators opt out by setting the field to "".
+        assert_eq!(
+            cfg.managed.snapshot_cache_path,
+            "/var/lib/aisix/config_cache.json",
+        );
         // Token / CP URL come from env at runtime — empty here is fine.
         assert!(cfg.managed.registration_token.is_none());
         assert!(cfg.managed.cp_base_url.is_none());

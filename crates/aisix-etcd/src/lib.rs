@@ -24,6 +24,7 @@ pub mod etcd_provider;
 pub mod key;
 pub mod loader;
 pub mod provider;
+pub mod snapshot_cache;
 pub mod supervisor;
 
 pub use backoff::{ExpBackoff, BASE_MS, MAX_MS};
@@ -34,4 +35,5 @@ pub use etcd_provider::{
 pub use key::{parse as parse_key, KeyError, ResourceKey};
 pub use loader::{build_snapshot, BuildStats};
 pub use provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
+pub use snapshot_cache::SnapshotCache;
 pub use supervisor::Supervisor;

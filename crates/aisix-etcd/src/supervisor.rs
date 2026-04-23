@@ -18,13 +18,16 @@
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::AisixSnapshot;
 use futures::StreamExt;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::backoff::ExpBackoff;
 use crate::key;
 use crate::loader::{self, BuildStats};
 use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
+use crate::snapshot_cache::SnapshotCache;
 
 /// One supervisor instance. Consumers call [`Supervisor::run`] once and
 /// drop the returned handle on shutdown.
@@ -32,15 +35,58 @@ pub struct Supervisor<P: ConfigProvider> {
     provider: Arc<P>,
     prefix: String,
     handle: SnapshotHandle<AisixSnapshot>,
+
+    // Last-known etcd state, kept in `key → RawEntry` form so deltas
+    // (Put/Delete) can update it incrementally and the whole map can
+    // be flushed to disk via `cache.store`.
+    state: Mutex<HashMap<String, RawEntry>>,
+    revision: Mutex<i64>,
+    cache: SnapshotCache,
 }
 
 impl<P: ConfigProvider> Supervisor<P> {
+    /// Construct without on-disk persistence. Equivalent to
+    /// [`Self::with_cache(provider, prefix, SnapshotCache::disabled())`].
     pub fn new(provider: Arc<P>, prefix: impl Into<String>) -> Self {
+        Self::with_cache(provider, prefix, SnapshotCache::disabled())
+    }
+
+    /// Construct with a snapshot cache. After every successful
+    /// resync / put / delete the supervisor flushes the current entry
+    /// set to the cache so a restart that can't reach etcd still has
+    /// configuration to serve from.
+    pub fn with_cache(provider: Arc<P>, prefix: impl Into<String>, cache: SnapshotCache) -> Self {
         Self {
             provider,
             prefix: prefix.into(),
             handle: SnapshotHandle::new(AisixSnapshot::new()),
+            state: Mutex::new(HashMap::new()),
+            revision: Mutex::new(0),
+            cache,
         }
+    }
+
+    /// Try to seed the snapshot from the on-disk cache. Called once at
+    /// boot before the etcd cycle starts so the proxy can serve traffic
+    /// from cached config even if etcd is briefly unreachable.
+    /// No-op when the cache is disabled or the file is missing /
+    /// unparseable.
+    pub fn restore_from_cache(&self) {
+        let Some((entries, revision)) = self.cache.load() else {
+            return;
+        };
+        let stats = self.apply_resync(&entries);
+        // Track the last cached revision so the first live cycle's
+        // resync reflects the right "from where" in logs. We don't
+        // try to use it as the watch start revision — the etcd server
+        // may have compacted past it; load_all + watch from latest is
+        // always safer.
+        *self.revision.lock().unwrap() = revision;
+        tracing::info!(
+            accepted = stats.accepted,
+            revision,
+            "snapshot restored from on-disk cache (offline-resilient boot)",
+        );
     }
 
     /// Clone of the public snapshot handle. Axum state / request handlers
@@ -55,15 +101,29 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// decides whether to backoff and retry.
     pub async fn load_once(&self) -> Result<BuildStats, ProviderError> {
         let (entries, revision) = self.provider.load_all().await?;
-        let (snapshot, stats) = loader::build_snapshot(&self.prefix, &entries);
+        let stats = self.apply_resync(&entries);
+        // apply_resync uses max(entry revisions); bump to the etcd
+        // load_all revision so the cache file records the true "as
+        // of" point, not just the max entry write.
+        self.set_revision_floor(revision);
         tracing::info!(
             accepted = stats.accepted,
             rejected = stats.schema_rejected + stats.parse_rejected,
             revision,
             "initial snapshot built",
         );
-        self.handle.store(snapshot);
         Ok(stats)
+    }
+
+    /// Bump the recorded revision floor. Used by the cycle path to
+    /// stamp the cache with the etcd `load_all` revision even when the
+    /// resulting entry set is empty (so the file still reflects when
+    /// the DP last successfully reached the CP).
+    fn set_revision_floor(&self, revision: i64) {
+        let mut rev = self.revision.lock().unwrap();
+        if revision > *rev {
+            *rev = revision;
+        }
     }
 
     /// Apply a single Put event on top of the current snapshot.
@@ -86,6 +146,21 @@ impl<P: ConfigProvider> Supervisor<P> {
         }
 
         self.handle.store(new);
+
+        // Mirror the put into the cache-tracking map and flush.
+        // Track the highest revision we've observed so the cache file
+        // records something monotonic.
+        {
+            let mut state = self.state.lock().unwrap();
+            state.insert(entry.key.clone(), entry.clone());
+        }
+        {
+            let mut rev = self.revision.lock().unwrap();
+            if entry.revision > *rev {
+                *rev = entry.revision;
+            }
+        }
+        self.flush_cache();
         true
     }
 
@@ -108,6 +183,8 @@ impl<P: ConfigProvider> Supervisor<P> {
         };
         if removed {
             self.handle.store(new);
+            self.state.lock().unwrap().remove(key_str);
+            self.flush_cache();
         }
         removed
     }
@@ -116,7 +193,46 @@ impl<P: ConfigProvider> Supervisor<P> {
     pub fn apply_resync(&self, entries: &[RawEntry]) -> BuildStats {
         let (snap, stats) = loader::build_snapshot(&self.prefix, entries);
         self.handle.store(snap);
+
+        // Replace the cache-tracking map wholesale and flush.
+        {
+            let mut state = self.state.lock().unwrap();
+            state.clear();
+            for e in entries {
+                state.insert(e.key.clone(), e.clone());
+            }
+        }
+        // Resync revision is the max of any entry; if the caller has a
+        // separate "load_all revision" they pass it via the cycle path
+        // (see `cycle`), this branch just covers the watch Resync event.
+        if let Some(max_rev) = entries.iter().map(|e| e.revision).max() {
+            let mut rev = self.revision.lock().unwrap();
+            if max_rev > *rev {
+                *rev = max_rev;
+            }
+        }
+        self.flush_cache();
         stats
+    }
+
+    /// Snapshot the current cache-tracking map and write it to disk.
+    /// Called from the apply paths; safe to invoke from sync code
+    /// because the cache writer lives behind a tokio runtime detected
+    /// via `tokio::spawn` — when called outside a runtime (tests that
+    /// don't drive the cache), the write is silently dropped which is
+    /// the desired no-op.
+    fn flush_cache(&self) {
+        let entries: Vec<RawEntry> = {
+            let state = self.state.lock().unwrap();
+            state.values().cloned().collect()
+        };
+        let revision = *self.revision.lock().unwrap();
+        let cache = self.cache.clone();
+        // Spawn the actual write so the apply path stays sync. If we
+        // aren't inside a runtime (cache::disabled() tests), just skip.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { cache.store(&entries, revision).await });
+        }
     }
 
     /// Long-running loop. Handles exp-backoff reconnects and resync on
@@ -173,6 +289,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             .map_err(SupervisorError::Provider)?;
 
         self.apply_resync(&entries);
+        self.set_revision_floor(revision);
 
         let mut stream = self
             .provider
@@ -391,5 +508,67 @@ mod tests {
 
         tx.send(true).unwrap();
         join.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resync_writes_to_disk_cache_then_restore_replays_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("snap.json");
+
+        // First lifecycle: load with one entry, supervisor flushes to
+        // disk on the resync.
+        {
+            let provider = Arc::new(FakeProvider::new(
+                vec![entry("/aisix/models/m-1", VALID_MODEL, 7)],
+                7,
+            ));
+            let sup = Supervisor::with_cache(provider, "/aisix", SnapshotCache::new(&cache_path));
+            sup.load_once().await.unwrap();
+            // Yield so the spawned cache write has a chance to complete
+            // before we drop the supervisor.
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Second lifecycle: provider returns nothing, but restore_from_cache
+        // populates the snapshot from disk so the proxy is ready.
+        {
+            let provider = Arc::new(FakeProvider::new(vec![], 0));
+            let sup = Supervisor::with_cache(provider, "/aisix", SnapshotCache::new(&cache_path));
+            // Snapshot is empty before restore.
+            assert_eq!(sup.handle().load().models.len(), 0);
+            sup.restore_from_cache();
+            assert_eq!(
+                sup.handle().load().models.len(),
+                1,
+                "restore_from_cache should re-publish the cached entry",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn put_and_delete_keep_cache_in_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_path = dir.path().join("snap.json");
+
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::with_cache(provider, "/aisix", SnapshotCache::new(&cache_path));
+        sup.load_once().await.unwrap();
+
+        sup.apply_put(&entry("/aisix/models/m-1", VALID_MODEL, 5));
+        sup.apply_put(&entry("/aisix/models/m-2", VALID_MODEL, 6));
+        // Yield so the spawned cache writes have a chance to complete.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let cache = SnapshotCache::new(&cache_path);
+        let (entries, _) = cache.load().expect("cache file present");
+        assert_eq!(entries.len(), 2);
+
+        sup.apply_delete("/aisix/models/m-1");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (entries, _) = cache.load().expect("cache file present");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "/aisix/models/m-2");
     }
 }

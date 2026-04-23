@@ -67,6 +67,12 @@ managed:
   # secrets into the image.
   mtls_dir: "/var/lib/aisix/mtls"
   dp_id_file: "/var/lib/aisix/dp_id"
+  # On-disk snapshot cache (prd-09 §9.7.2). The supervisor writes the
+  # last-known etcd contents here on every successful resync / put /
+  # delete, and re-loads it at boot before opening the etcd connection
+  # — so the proxy stays up across CP outages and full restarts.
+  # Set to "" to disable.
+  snapshot_cache_path: "/var/lib/aisix/config_cache.json"
 
 cache:
   backend: "memory"
