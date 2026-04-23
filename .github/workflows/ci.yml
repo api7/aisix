@@ -69,6 +69,7 @@ jobs:
         with:
           name: coverage-unit
           path: lcov-unit.info
+          retention-days: 7
 
   build-ui:
     name: build ui
@@ -94,6 +95,7 @@ jobs:
         with:
           name: ui-dist
           path: crates/aisix-admin/ui-dist
+          retention-days: 7
 
   build-bin:
     name: build aisix (instrumented)
@@ -121,6 +123,9 @@ jobs:
         with:
           name: aisix-bin
           path: target/debug/aisix
+          # 72 MB binary × many runs will refill the quota quickly;
+          # keep only as long as the downstream e2e job needs it.
+          retention-days: 1
 
   e2e:
     name: e2e (vitest) + coverage
@@ -176,6 +181,7 @@ jobs:
           name: coverage-e2e
           path: tests/e2e/coverage/lcov.info
           if-no-files-found: ignore
+          retention-days: 7
 
   coverage-gate:
     name: coverage >= 90%
@@ -207,3 +213,4 @@ jobs:
         with:
           name: coverage-combined
           path: cov/combined.info
+          retention-days: 7
