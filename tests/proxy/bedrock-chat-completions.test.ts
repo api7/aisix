@@ -50,7 +50,7 @@ describe('proxy /v1/chat/completions with bedrock-backed model', () => {
       },
       bearerAuthHeader(ADMIN_KEY),
     );
-    expect(modelResp.status, JSON.stringify(modelResp.data)).toBe(201);
+    expect(modelResp.status).toBe(201);
 
     const apiKeyResp = await adminPost(
       '/apikeys',
@@ -60,7 +60,7 @@ describe('proxy /v1/chat/completions with bedrock-backed model', () => {
       },
       bearerAuthHeader(ADMIN_KEY),
     );
-    expect(apiKeyResp.status, JSON.stringify(apiKeyResp.data)).toBe(201);
+    expect(apiKeyResp.status).toBe(201);
 
     await waitConfigPropagation();
   }, 30_000);

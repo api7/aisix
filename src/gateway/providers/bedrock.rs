@@ -22,22 +22,32 @@ use crate::gateway::{
     types::openai::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
 };
 
+/// Provider registry identifier for AWS Bedrock-compatible models.
 pub const IDENTIFIER: &str = "bedrock";
 
 const DEFAULT_BASE_URL: &str = "https://bedrock-runtime.us-east-1.amazonaws.com";
 
+/// Provider metadata and request preparation for AWS Bedrock chat models.
 pub struct BedrockDef;
 
 #[derive(Clone, Serialize, Deserialize, utoipa::ToSchema)]
+/// Static AWS credentials and endpoint settings used to access Bedrock.
 pub struct BedrockProviderConfig {
+    /// AWS region used for SigV4 signing and the default runtime endpoint.
     pub region: String,
+
+    /// AWS access key ID used for Bedrock request signing.
     pub access_key_id: String,
+
+    /// AWS secret access key used for Bedrock request signing.
     pub secret_access_key: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional AWS session token for temporary credentials.
     pub session_token: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional Bedrock runtime endpoint override.
     pub endpoint: Option<String>,
 }
 
@@ -47,7 +57,7 @@ impl fmt::Debug for BedrockProviderConfig {
 
         f.debug_struct("BedrockProviderConfig")
             .field("region", &self.region)
-            .field("access_key_id", &self.access_key_id)
+            .field("access_key_id", &REDACTED)
             .field("secret_access_key", &REDACTED)
             .field(
                 "session_token",
@@ -67,8 +77,8 @@ impl ProviderMeta for BedrockDef {
         DEFAULT_BASE_URL
     }
 
-    fn chat_endpoint_path(&self, _model: &str) -> Cow<'static, str> {
-        Cow::Borrowed("/model")
+    fn chat_endpoint_path(&self, model: &str) -> Cow<'static, str> {
+        Cow::Owned(format!("/model/{}/converse", model.replace('/', "%2F")))
     }
 
     fn stream_reader_kind(&self) -> StreamReaderKind {
@@ -161,25 +171,6 @@ impl ProviderMeta for BedrockDef {
     fn build_auth_headers(&self, _auth: &ProviderAuth) -> Result<HeaderMap> {
         Ok(HeaderMap::new())
     }
-
-    fn build_url(&self, base_url: &str, model: &str) -> String {
-        let Ok(mut url) = reqwest::Url::parse(base_url) else {
-            return format!(
-                "{}/model/{}/converse",
-                base_url.trim_end_matches('/'),
-                model.replace('/', "%2F")
-            );
-        };
-
-        if let Ok(mut segments) = url.path_segments_mut() {
-            segments.pop_if_empty();
-            segments.push("model");
-            segments.push(model);
-            segments.push("converse");
-        }
-
-        url.to_string()
-    }
 }
 
 impl ChatTransform for BedrockDef {
@@ -217,8 +208,10 @@ impl ProviderCapabilities for BedrockDef {}
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
     use bytes::Bytes;
     use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     use super::{BedrockDef, BedrockProviderConfig};
@@ -260,17 +253,17 @@ mod tests {
 
         let output = format!("{config:?}");
         assert!(output.contains("[REDACTED]"));
-        assert!(output.contains("AKIA123"));
+        assert!(!output.contains("AKIA123"));
         assert!(!output.contains("secret_access_key: \"secret\""));
         assert!(!output.contains("session_token: Some(\"token\")"));
     }
 
     #[test]
-    fn build_url_encodes_model_ids_with_slashes() {
+    fn build_url_uses_overlap_handling_and_encodes_model_ids_with_slashes() {
         let provider = BedrockDef;
 
         let url = provider.build_url(
-            "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model",
             "inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0",
         );
 
@@ -302,11 +295,11 @@ mod tests {
             .prepare_request(request, &ProviderAuth::ApiKey("secret".into()))
             .unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             error,
             crate::gateway::error::GatewayError::Validation(message)
                 if message.contains("ProviderAuth::AwsStatic")
-        ));
+        );
     }
 
     #[test]
