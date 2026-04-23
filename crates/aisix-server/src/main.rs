@@ -15,10 +15,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod register;
+
 use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore};
 use aisix_cache::{Cache, MemoryCache, RedisCache};
 use aisix_core::models::Provider;
-use aisix_core::{CacheBackend, Config, EtcdConfig};
+use aisix_core::{CacheBackend, Config, EtcdConfig, EtcdTlsConfig};
 use aisix_etcd::{EtcdConfigProvider, Supervisor};
 use aisix_gateway::Hub;
 use aisix_obs::{init_tracing, install_otlp_tracer, langfuse, Metrics};
@@ -58,7 +60,40 @@ async fn main() -> anyhow::Result<()> {
 
 /// Factored out of `main` so the integration tests can drive the full
 /// startup with a real config struct and still use `#[tokio::test]`.
-async fn run(cfg: Config) -> anyhow::Result<()> {
+async fn run(mut cfg: Config) -> anyhow::Result<()> {
+    // If this is a managed tenant and the mTLS bundle isn't on disk
+    // yet, perform the one-shot `POST /dp/register` exchange against
+    // the aisix.cloud control plane. The response fills in
+    // `cfg.etcd.endpoints` + `cfg.etcd.tls` so the regular etcd
+    // connect path below is oblivious to whether certs came from an
+    // out-of-band install or just-now registration.
+    if cfg.managed.is_managed()
+        && !register::bundle_exists(&cfg.managed.mtls_dir)
+        && cfg.managed.registration_enabled()
+    {
+        tracing::info!("managed mode: registering with aisix.cloud CP");
+        let r = register::register_and_persist(&cfg.managed)
+            .await
+            .map_err(|e| anyhow::anyhow!("DP registration failed: {e:#}"))?;
+        tracing::info!(
+            dp_id = %r.dp_id,
+            gateway_id = %r.gateway_id,
+            etcd = %r.etcd_endpoint,
+            "registered with control plane",
+        );
+        // Override the static config with what the CP handed back.
+        // Endpoints get the https:// scheme re-attached (the CP sends
+        // a bare host:port, but tonic-based etcd-client expects a
+        // full URL for TLS endpoints).
+        cfg.etcd.endpoints = vec![format!("https://{}", r.etcd_endpoint)];
+        cfg.etcd.tls = Some(EtcdTlsConfig {
+            ca_cert_file: r.ca_cert_path.to_string_lossy().into_owned(),
+            client_cert_file: r.client_cert_path.to_string_lossy().into_owned(),
+            client_key_file: r.client_key_path.to_string_lossy().into_owned(),
+            domain_name: None, // derive from endpoint host
+        });
+    }
+
     // Steps 4-6: etcd + supervisor.
     let connect_options = build_etcd_connect_options(&cfg.etcd)?;
     let provider = Arc::new(

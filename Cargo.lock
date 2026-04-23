@@ -333,16 +333,19 @@ dependencies = [
  "etcd-client",
  "http",
  "hyper",
+ "reqwest",
  "rustls",
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
  "tower 0.5.3",
  "tower-http",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

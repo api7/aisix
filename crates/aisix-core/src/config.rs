@@ -112,12 +112,56 @@ pub struct EtcdTlsConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct ManagedConfig {
     pub enabled: bool,
+
+    /// When set, aisix performs a one-shot `POST /dp/register` against
+    /// `cp_base_url` at boot to exchange this token for an mTLS bundle
+    /// and a dp_id. Subsequent boots detect the existing bundle at
+    /// `mtls_dir` and skip re-registration (the token is single-use).
+    ///
+    /// Leave empty if the mTLS bundle is already on disk — typical for
+    /// configs installed via an out-of-band "download bundle" flow.
+    #[serde(default)]
+    pub registration_token: Option<String>,
+
+    /// aisix.cloud CP base URL, e.g. "https://api.us.aisix.cloud".
+    /// Required whenever `registration_token` is set.
+    #[serde(default)]
+    pub cp_base_url: Option<String>,
+
+    /// Directory where the DP persists `ca.crt`, `client.crt`,
+    /// `client.key` received from the register response. Files are
+    /// written `0600`. Parent directory must already exist and be
+    /// writable by the aisix process user.
+    #[serde(default = "ManagedConfig::default_mtls_dir")]
+    pub mtls_dir: String,
+
+    /// File where the DP persists its `dp_id`. Read back on restart
+    /// for heartbeat / telemetry payloads. Same permission rules as
+    /// the mTLS files.
+    #[serde(default = "ManagedConfig::default_dp_id_file")]
+    pub dp_id_file: String,
 }
 
 impl ManagedConfig {
     /// True if the DP should behave as an aisix.cloud tenant.
     pub const fn is_managed(&self) -> bool {
         self.enabled
+    }
+
+    /// True when both the token and CP URL are set — i.e. the DP
+    /// should attempt `/dp/register` at boot.
+    pub fn registration_enabled(&self) -> bool {
+        self.registration_token
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+            && self.cp_base_url.as_deref().is_some_and(|s| !s.is_empty())
+    }
+
+    fn default_mtls_dir() -> String {
+        "/var/lib/aisix/mtls".into()
+    }
+    fn default_dp_id_file() -> String {
+        "/var/lib/aisix/dp_id".into()
     }
 }
 
