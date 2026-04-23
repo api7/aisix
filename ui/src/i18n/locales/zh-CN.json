@@ -81,7 +81,7 @@
     "addModel": "添加模型",
     "deleteModel": "删除模型",
     "createTitle": "创建模型资源",
-    "createDesc": "必填：name、model、provider config API key。可选：timeout、rate limits。",
+    "createDesc": "必填：name、provider、provider model、provider 专属配置。可选：timeout 和 rate limits。",
     "editTitle": "编辑模型资源",
     "createModel": "创建模型",
     "columns": {
@@ -102,14 +102,25 @@
       "basicInfo": "基础信息",
       "nameLabel": "名称 *",
       "namePlaceholder": "例如：@my-llm/chat",
-      "modelLabel": "Model *",
-      "modelHint": "格式：provider/model-name",
-      "modelPlaceholder": "例如：deepseek/deepseek-chat",
+      "providerLabel": "Provider *",
+      "providerHint": "先选择上游 provider，再填写 provider 侧模型标识。",
+      "providerPlaceholder": "选择 provider",
+      "modelLabel": "Provider Model *",
+      "modelHint": "填写 provider 前缀后面的模型标识，不要再包含 provider/。",
+      "modelPlaceholder": "例如：gpt-4.1、deepseek-chat 或 anthropic.claude-3-5-sonnet-20240620-v1:0",
       "providerConfig": "Provider 配置",
       "apiKeyLabel": "API Key",
       "apiBase": "API Base",
       "apiBaseHint": "留空则使用 provider 默认值",
       "apiBasePlaceholder": "https://api.example.com/v1",
+      "regionLabel": "AWS Region",
+      "regionHint": "用于选择默认的 Bedrock 运行时地址。",
+      "accessKeyIdLabel": "AWS Access Key ID",
+      "secretAccessKeyLabel": "AWS Secret Access Key",
+      "sessionTokenLabel": "AWS Session Token",
+      "sessionTokenHint": "使用 STS 或 AssumeRole 临时凭证时可选。",
+      "endpointLabel": "Bedrock Endpoint Override",
+      "endpointHint": "留空则根据所选 Region 使用标准运行时地址。",
       "advanced": "高级（可选）",
       "timeout": "超时（毫秒）",
       "rateLimits": "限流",
@@ -121,7 +132,14 @@
       "rpmHint": "每分钟请求数",
       "rpd": "RPD",
       "rpdHint": "每天请求数",
-      "concurrency": "并发"
+      "concurrency": "并发",
+      "providers": {
+        "openai": "OpenAI",
+        "anthropic": "Anthropic",
+        "gemini": "Gemini",
+        "deepseek": "DeepSeek",
+        "bedrock": "AWS Bedrock"
+      }
     }
   },
   "apiKeys": {

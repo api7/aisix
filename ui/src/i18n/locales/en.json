@@ -81,7 +81,7 @@
     "addModel": "Add Model",
     "deleteModel": "Delete Model",
     "createTitle": "Create model resource",
-    "createDesc": "Required: name, model, provider config API key. Optional: timeout, rate limits.",
+    "createDesc": "Required: name, provider, provider model, provider-specific config. Optional: timeout and rate limits.",
     "editTitle": "Edit model resource",
     "createModel": "Create Model",
     "columns": {
@@ -102,14 +102,25 @@
       "basicInfo": "Basic Information",
       "nameLabel": "Name *",
       "namePlaceholder": "e.g. @my-llm/chat",
-      "modelLabel": "Model *",
-      "modelHint": "Format: provider/model-name",
-      "modelPlaceholder": "e.g. deepseek/deepseek-chat",
+      "providerLabel": "Provider *",
+      "providerHint": "Choose the upstream provider before entering the provider model identifier.",
+      "providerPlaceholder": "Select provider",
+      "modelLabel": "Provider Model *",
+      "modelHint": "Enter the provider-side model identifier without the provider prefix.",
+      "modelPlaceholder": "e.g. gpt-4.1, deepseek-chat, or anthropic.claude-3-5-sonnet-20240620-v1:0",
       "providerConfig": "Provider Config",
       "apiKeyLabel": "API Key",
       "apiBase": "API Base",
       "apiBaseHint": "Leave blank to use provider default",
       "apiBasePlaceholder": "https://api.example.com/v1",
+      "regionLabel": "AWS Region",
+      "regionHint": "Used to choose the default Bedrock runtime endpoint.",
+      "accessKeyIdLabel": "AWS Access Key ID",
+      "secretAccessKeyLabel": "AWS Secret Access Key",
+      "sessionTokenLabel": "AWS Session Token",
+      "sessionTokenHint": "Optional temporary credential when using STS or assumed roles.",
+      "endpointLabel": "Bedrock Endpoint Override",
+      "endpointHint": "Leave blank to use the standard runtime endpoint for the selected region.",
       "advanced": "Advanced (Optional)",
       "timeout": "Timeout (ms)",
       "rateLimits": "Rate Limits",
@@ -121,7 +132,14 @@
       "rpmHint": "Requests / minute",
       "rpd": "RPD",
       "rpdHint": "Requests / day",
-      "concurrency": "Concurrency"
+      "concurrency": "Concurrency",
+      "providers": {
+        "openai": "OpenAI",
+        "anthropic": "Anthropic",
+        "gemini": "Gemini",
+        "deepseek": "DeepSeek",
+        "bedrock": "AWS Bedrock"
+      }
     }
   },
   "apiKeys": {
