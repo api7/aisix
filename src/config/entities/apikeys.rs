@@ -1,7 +1,6 @@
 use std::sync::{Arc, LazyLock};
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use utoipa::ToSchema;
 
 use super::{EntityStore, IndexFn, ResourceEntry};
@@ -13,8 +12,10 @@ use crate::{
     utils::jsonschema::format_evaluation_error,
 };
 
-static SCHEMA: LazyLock<serde_json::Value> =
-    LazyLock::new(|| json!(include_str!("apikeys-schema.json")));
+static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("apikeys-schema.json"))
+        .expect("Invalid JSON document for API Key schema")
+});
 pub static SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> =
     LazyLock::new(|| jsonschema::validator_for(&SCHEMA).expect("Invalid JSON schema for API Key"));
 

@@ -4,7 +4,6 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize, de::Error};
-use serde_json::json;
 use utoipa::ToSchema;
 
 use super::{ConfigProvider, EntityStore, IndexFn};
@@ -17,8 +16,10 @@ use crate::{
     utils::jsonschema::format_evaluation_error,
 };
 
-static SCHEMA: LazyLock<serde_json::Value> =
-    LazyLock::new(|| json!(include_str!("models-schema.json")));
+static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("models-schema.json"))
+        .expect("Invalid JSON document for Model schema")
+});
 pub static SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> =
     LazyLock::new(|| jsonschema::validator_for(&SCHEMA).expect("Invalid JSON schema for Model"));
 
