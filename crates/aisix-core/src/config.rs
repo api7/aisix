@@ -421,7 +421,17 @@ impl Config {
             Environment::with_prefix("AISIX")
                 .prefix_separator("_")
                 .separator("__")
+                // Per-key list parsing. Setting `list_separator`
+                // without explicit `with_list_parse_key` would force
+                // EVERY string env override through comma-splitting —
+                // which blows up secrets that happen to contain a
+                // comma (AISIX_MANAGED__REGISTRATION_TOKEN has been
+                // the visible victim) with a serde "invalid type:
+                // sequence, expected a string" error. Opt in only for
+                // fields that are actually Vec<String>.
                 .list_separator(",")
+                .with_list_parse_key("etcd.endpoints")
+                .with_list_parse_key("admin.admin_keys")
                 .try_parsing(true),
         );
 
