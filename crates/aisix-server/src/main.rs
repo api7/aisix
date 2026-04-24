@@ -45,6 +45,18 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Install the process-level rustls CryptoProvider before anything
+    // else touches TLS. rustls 0.23 dropped implicit provider selection
+    // and panics at first use when both `aws-lc-rs` and `ring` features
+    // are reachable (or neither is) — which is the case here through
+    // transitive deps on reqwest + etcd-client + tokio-rustls.
+    //
+    // We pick aws-lc-rs because it's the upstream default as of
+    // rustls 0.23, FIPS-capable, and what every compiled-in crate
+    // already depends on transitively. Falls back to ring only if
+    // the process somehow has a provider installed already (idempotent).
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let cli = Cli::parse();
 
     // Steps 1-2: config.
