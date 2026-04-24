@@ -12,6 +12,7 @@
 //!  9. Bind + serve both ports (tokio::select! with shutdown signal)
 //! 10. On SIGINT/SIGTERM: cancel supervisor, stop accepting, join
 
+use std::error::Error as StdError;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -127,6 +128,18 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     };
 
     // Steps 4-6: etcd + supervisor.
+    //
+    // Before handing endpoints to tonic, probe each one via the
+    // stdlib resolver. tonic's HTTP connector collapses any DNS
+    // failure into an opaque "dns error" Status (see
+    // hyper-util/src/client/legacy/connect/http.rs) — even after the
+    // cause-chain logging in aisix-etcd, the deepest cause we see is
+    // still whatever getaddrinfo returned. The probe either logs the
+    // resolved addresses (DNS works; the failure is higher in the
+    // tonic / TLS stack) or logs the raw io::Error (DNS actually
+    // fails). Both outcomes narrow triage substantially.
+    probe_etcd_dns(&cfg.etcd.endpoints).await;
+
     let connect_options = build_etcd_connect_options(&cfg.etcd)?;
     let provider = Arc::new(
         EtcdConfigProvider::connect(
@@ -365,6 +378,79 @@ fn build_etcd_connect_options(etcd: &EtcdConfig) -> anyhow::Result<Option<Connec
 
 /// Extract the host portion of a URL-like endpoint (`http://host:2379`,
 /// `https://host:2379`, or bare `host:2379`) for use as the TLS SNI.
+/// Per-endpoint DNS probe logged at info / warn. Not part of the
+/// connect path — purely diagnostic. See the call site in [`run`]
+/// for why this exists.
+async fn probe_etcd_dns(endpoints: &[String]) {
+    for raw in endpoints {
+        let (host, port) = match parse_host_port(raw) {
+            Ok(hp) => hp,
+            Err(err) => {
+                tracing::warn!(
+                    endpoint = %raw,
+                    error = %err,
+                    "etcd endpoint parse failed; skipping DNS probe",
+                );
+                continue;
+            }
+        };
+        match tokio::net::lookup_host((host.clone(), port)).await {
+            Ok(iter) => {
+                let addrs: Vec<String> = iter.map(|a| a.to_string()).collect();
+                tracing::info!(
+                    endpoint = %raw,
+                    host = %host,
+                    port,
+                    addrs = ?addrs,
+                    "etcd endpoint DNS probe resolved",
+                );
+            }
+            Err(err) => {
+                // Walk the io::Error chain so the OS-level detail
+                // ("Name or service not known", "Temporary failure
+                // in name resolution", …) makes it into the log.
+                let mut chain = err.to_string();
+                let mut cur: Option<&(dyn StdError + 'static)> = StdError::source(&err);
+                while let Some(src) = cur {
+                    chain.push_str(": ");
+                    chain.push_str(&src.to_string());
+                    cur = src.source();
+                }
+                tracing::warn!(
+                    endpoint = %raw,
+                    host = %host,
+                    port,
+                    error = %chain,
+                    kind = ?err.kind(),
+                    "etcd endpoint DNS probe failed",
+                );
+            }
+        }
+    }
+}
+
+/// Shared endpoint → (host, port) splitter. Mirrors the logic in
+/// [`default_domain_from_endpoint`] plus a port parse.
+fn parse_host_port(endpoint: &str) -> anyhow::Result<(String, u16)> {
+    let without_scheme = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
+    let (host, port) = match without_scheme.rsplit_once(':') {
+        Some((h, p)) => (
+            h.trim_matches(|c| c == '[' || c == ']'),
+            p.parse::<u16>()
+                .map_err(|e| anyhow::anyhow!("invalid port {p:?} in {endpoint:?}: {e}"))?,
+        ),
+        // No explicit port — default to the etcd v3 port.
+        None => (without_scheme.trim_matches(|c| c == '[' || c == ']'), 2379),
+    };
+    if host.is_empty() {
+        anyhow::bail!("endpoint {endpoint:?} has no host");
+    }
+    Ok((host.to_string(), port))
+}
+
 fn default_domain_from_endpoint(endpoint: &str) -> anyhow::Result<String> {
     let without_scheme = endpoint
         .split_once("://")
@@ -554,6 +640,44 @@ mod tests {
         assert!(
             err.to_string().contains("ca_cert_file"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_host_port_strips_scheme_and_keeps_port() {
+        let (h, p) = parse_host_port("https://dp-manager:7943").unwrap();
+        assert_eq!(h, "dp-manager");
+        assert_eq!(p, 7943);
+    }
+
+    #[test]
+    fn parse_host_port_defaults_to_2379_when_port_is_omitted() {
+        let (h, p) = parse_host_port("http://etcd.aisix.cloud").unwrap();
+        assert_eq!(h, "etcd.aisix.cloud");
+        assert_eq!(p, 2379);
+    }
+
+    #[test]
+    fn parse_host_port_accepts_bare_host_port() {
+        let (h, p) = parse_host_port("etcd.aisix.cloud:2379").unwrap();
+        assert_eq!(h, "etcd.aisix.cloud");
+        assert_eq!(p, 2379);
+    }
+
+    #[test]
+    fn parse_host_port_rejects_empty_host() {
+        // Host portion before the port colon is empty — real-world
+        // shape: a stripped prefix that left just ":<port>".
+        let err = parse_host_port(":7943").unwrap_err();
+        assert!(err.to_string().contains("no host"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn parse_host_port_rejects_non_numeric_port() {
+        let err = parse_host_port("host:abc").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid port"),
+            "unexpected: {err}"
         );
     }
 }
