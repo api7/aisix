@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Smoke tests for the AISIX Docker image.
-# Starts aisix + etcd via quickstart/docker-compose.yaml, runs 6 checks,
+# Starts aisix + etcd via quickstart/docker-compose.yaml, runs 7 checks,
 # and tears down on exit. Must be run from the repo root.
 #
 # Usage:
@@ -80,17 +80,26 @@ info "Test 2: GET /ui/"
 status=$(curl -s -o /dev/null -w '%{http_code}' "${ADMIN_URL}/ui/")
 assert_status "GET /ui/" 200 "$status"
 
-# --- Test 3: Create a model via Admin API ---
-info "Test 3: POST /aisix/admin/models (create model)"
+# --- Test 3: Create a provider via Admin API ---
+info "Test 3: PUT /aisix/admin/providers/smoke-test-provider (create provider)"
+status=$(curl -s -o /dev/null -w '%{http_code}' \
+    -X PUT "${ADMIN_URL}/aisix/admin/providers/smoke-test-provider" \
+    -H "Content-Type: application/json" \
+    -H "X-API-KEY: ${ADMIN_KEY}" \
+    -d '{"name":"smoke-test-provider","type":"openai","config":{"api_key":"unused-smoke-key"}}')
+assert_status "PUT /aisix/admin/providers/smoke-test-provider" 201 "$status"
+
+# --- Test 4: Create a model via Admin API ---
+info "Test 4: POST /aisix/admin/models (create model)"
 status=$(curl -s -o /dev/null -w '%{http_code}' \
     -X POST "${ADMIN_URL}/aisix/admin/models" \
     -H "Content-Type: application/json" \
     -H "X-API-KEY: ${ADMIN_KEY}" \
-    -d '{"name":"smoke-test-model","model":"openai/smoke-test-upstream","provider_config":{"api_key":"unused-smoke-key"}}')
+    -d '{"name":"smoke-test-model","model":"smoke-test-upstream","provider_id":"smoke-test-provider"}')
 assert_status "POST /aisix/admin/models" 201 "$status"
 
-# --- Test 4: List models — verify model exists ---
-info "Test 4: GET /aisix/admin/models (list models)"
+# --- Test 5: List models — verify model exists ---
+info "Test 5: GET /aisix/admin/models (list models)"
 response=$(curl -s -w '\n%{http_code}' \
     "${ADMIN_URL}/aisix/admin/models" \
     -H "X-API-KEY: ${ADMIN_KEY}")
@@ -107,8 +116,8 @@ else
     exit 1
 fi
 
-# --- Test 5: Create an API key via Admin API ---
-info "Test 5: POST /aisix/admin/apikeys (create API key)"
+# --- Test 6: Create an API key via Admin API ---
+info "Test 6: POST /aisix/admin/apikeys (create API key)"
 status=$(curl -s -o /dev/null -w '%{http_code}' \
     -X POST "${ADMIN_URL}/aisix/admin/apikeys" \
     -H "Content-Type: application/json" \
@@ -116,8 +125,8 @@ status=$(curl -s -o /dev/null -w '%{http_code}' \
     -d '{"key":"sk-smoke-test","allowed_models":["smoke-test-model"]}')
 assert_status "POST /aisix/admin/apikeys" 201 "$status"
 
-# --- Test 6: Proxy port responds with API key ---
-info "Test 6: GET /v1/models via proxy (port 3000)"
+# --- Test 7: Proxy port responds with API key ---
+info "Test 7: GET /v1/models via proxy (port 3000)"
 status=$(curl -s -o /dev/null -w '%{http_code}' \
     "${PROXY_URL}/v1/models" \
     -H "Authorization: Bearer sk-smoke-test")
