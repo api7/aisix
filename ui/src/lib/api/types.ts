@@ -29,21 +29,60 @@ export interface RateLimit {
   concurrency?: number;
 }
 
-// ── Model ─────────────────────────────────────────────────────────────────────
-export interface ProviderConfig {
-  api_key?: string;
-  api_base?: string;
-  [key: string]: unknown;
-}
-
 export interface Model {
   name: string;
-  /** Format: provider/model-name */
+  provider_id: string;
   model: string;
-  provider_config: ProviderConfig;
   timeout?: number;
   rate_limit?: RateLimit;
 }
+
+export type ProviderType =
+  | 'anthropic'
+  | 'bedrock'
+  | 'deepseek'
+  | 'gemini'
+  | 'openai';
+
+export interface ApiBaseProviderConfig {
+  api_key: string;
+  api_base?: string;
+}
+
+export interface BedrockProviderConfig {
+  region: string;
+  access_key_id: string;
+  secret_access_key: string;
+  session_token?: string;
+  endpoint?: string;
+}
+
+export type Provider =
+  | {
+      name: string;
+      type: 'anthropic';
+      config: ApiBaseProviderConfig;
+    }
+  | {
+      name: string;
+      type: 'deepseek';
+      config: ApiBaseProviderConfig;
+    }
+  | {
+      name: string;
+      type: 'gemini';
+      config: ApiBaseProviderConfig;
+    }
+  | {
+      name: string;
+      type: 'openai';
+      config: ApiBaseProviderConfig;
+    }
+  | {
+      name: string;
+      type: 'bedrock';
+      config: BedrockProviderConfig;
+    };
 
 // ── ApiKey ────────────────────────────────────────────────────────────────────
 export interface ApiKey {

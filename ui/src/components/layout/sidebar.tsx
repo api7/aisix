@@ -8,6 +8,7 @@ import {
   Monitor,
   Moon,
   Settings,
+  Server,
   Sun,
   Zap,
 } from 'lucide-react';
@@ -23,6 +24,7 @@ const NAV_GROUPS = [
     labelKey: 'nav.platform',
     items: [
       { to: '/playground', labelKey: 'nav.playground', icon: LayoutDashboard },
+      { to: '/providers', labelKey: 'nav.providers', icon: Server },
       { to: '/models', labelKey: 'nav.models', icon: Boxes },
       { to: '/apikeys', labelKey: 'nav.apiKeys', icon: KeyRound },
     ],

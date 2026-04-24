@@ -5,6 +5,7 @@ import type {
   ItemResponse,
   ListResponse,
   Model,
+  Provider,
 } from './types';
 
 /** Admin API base URL — proxied via Vite dev-server to avoid CORS */
@@ -67,6 +68,24 @@ export const modelsApi = {
 
   delete: (adminKey: string, id: string) =>
     request<DeleteResponse>('DELETE', `/models/${id}`, adminKey),
+};
+
+// ── Providers ────────────────────────────────────────────────────────────────
+export const providersApi = {
+  list: (adminKey: string) =>
+    request<ListResponse<Provider>>('GET', '/providers', adminKey),
+
+  get: (adminKey: string, id: string) =>
+    request<ItemResponse<Provider>>('GET', `/providers/${id}`, adminKey),
+
+  create: (adminKey: string, data: Provider) =>
+    request<ItemResponse<Provider>>('POST', '/providers', adminKey, data),
+
+  update: (adminKey: string, id: string, data: Provider) =>
+    request<ItemResponse<Provider>>('PUT', `/providers/${id}`, adminKey, data),
+
+  delete: (adminKey: string, id: string) =>
+    request<DeleteResponse>('DELETE', `/providers/${id}`, adminKey),
 };
 
 // ── ApiKeys ───────────────────────────────────────────────────────────────────

@@ -12,9 +12,12 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as LayoutRouteImport } from './routes/_layout'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as LayoutSettingsRouteImport } from './routes/_layout/settings'
+import { Route as LayoutProvidersIndexRouteImport } from './routes/_layout/providers/index'
 import { Route as LayoutPlaygroundIndexRouteImport } from './routes/_layout/playground/index'
 import { Route as LayoutModelsIndexRouteImport } from './routes/_layout/models/index'
 import { Route as LayoutApikeysIndexRouteImport } from './routes/_layout/apikeys/index'
+import { Route as LayoutProvidersCreateRouteImport } from './routes/_layout/providers/create'
+import { Route as LayoutProvidersIdRouteImport } from './routes/_layout/providers/$id'
 import { Route as LayoutModelsCreateRouteImport } from './routes/_layout/models/create'
 import { Route as LayoutModelsIdRouteImport } from './routes/_layout/models/$id'
 import { Route as LayoutApikeysCreateRouteImport } from './routes/_layout/apikeys/create'
@@ -34,6 +37,11 @@ const LayoutSettingsRoute = LayoutSettingsRouteImport.update({
   path: '/settings',
   getParentRoute: () => LayoutRoute,
 } as any)
+const LayoutProvidersIndexRoute = LayoutProvidersIndexRouteImport.update({
+  id: '/providers/',
+  path: '/providers/',
+  getParentRoute: () => LayoutRoute,
+} as any)
 const LayoutPlaygroundIndexRoute = LayoutPlaygroundIndexRouteImport.update({
   id: '/playground/',
   path: '/playground/',
@@ -47,6 +55,16 @@ const LayoutModelsIndexRoute = LayoutModelsIndexRouteImport.update({
 const LayoutApikeysIndexRoute = LayoutApikeysIndexRouteImport.update({
   id: '/apikeys/',
   path: '/apikeys/',
+  getParentRoute: () => LayoutRoute,
+} as any)
+const LayoutProvidersCreateRoute = LayoutProvidersCreateRouteImport.update({
+  id: '/providers/create',
+  path: '/providers/create',
+  getParentRoute: () => LayoutRoute,
+} as any)
+const LayoutProvidersIdRoute = LayoutProvidersIdRouteImport.update({
+  id: '/providers/$id',
+  path: '/providers/$id',
   getParentRoute: () => LayoutRoute,
 } as any)
 const LayoutModelsCreateRoute = LayoutModelsCreateRouteImport.update({
@@ -77,9 +95,12 @@ export interface FileRoutesByFullPath {
   '/apikeys/create': typeof LayoutApikeysCreateRoute
   '/models/$id': typeof LayoutModelsIdRoute
   '/models/create': typeof LayoutModelsCreateRoute
+  '/providers/$id': typeof LayoutProvidersIdRoute
+  '/providers/create': typeof LayoutProvidersCreateRoute
   '/apikeys/': typeof LayoutApikeysIndexRoute
   '/models/': typeof LayoutModelsIndexRoute
   '/playground/': typeof LayoutPlaygroundIndexRoute
+  '/providers/': typeof LayoutProvidersIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -88,9 +109,12 @@ export interface FileRoutesByTo {
   '/apikeys/create': typeof LayoutApikeysCreateRoute
   '/models/$id': typeof LayoutModelsIdRoute
   '/models/create': typeof LayoutModelsCreateRoute
+  '/providers/$id': typeof LayoutProvidersIdRoute
+  '/providers/create': typeof LayoutProvidersCreateRoute
   '/apikeys': typeof LayoutApikeysIndexRoute
   '/models': typeof LayoutModelsIndexRoute
   '/playground': typeof LayoutPlaygroundIndexRoute
+  '/providers': typeof LayoutProvidersIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -101,9 +125,12 @@ export interface FileRoutesById {
   '/_layout/apikeys/create': typeof LayoutApikeysCreateRoute
   '/_layout/models/$id': typeof LayoutModelsIdRoute
   '/_layout/models/create': typeof LayoutModelsCreateRoute
+  '/_layout/providers/$id': typeof LayoutProvidersIdRoute
+  '/_layout/providers/create': typeof LayoutProvidersCreateRoute
   '/_layout/apikeys/': typeof LayoutApikeysIndexRoute
   '/_layout/models/': typeof LayoutModelsIndexRoute
   '/_layout/playground/': typeof LayoutPlaygroundIndexRoute
+  '/_layout/providers/': typeof LayoutProvidersIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -114,9 +141,12 @@ export interface FileRouteTypes {
     | '/apikeys/create'
     | '/models/$id'
     | '/models/create'
+    | '/providers/$id'
+    | '/providers/create'
     | '/apikeys/'
     | '/models/'
     | '/playground/'
+    | '/providers/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -125,9 +155,12 @@ export interface FileRouteTypes {
     | '/apikeys/create'
     | '/models/$id'
     | '/models/create'
+    | '/providers/$id'
+    | '/providers/create'
     | '/apikeys'
     | '/models'
     | '/playground'
+    | '/providers'
   id:
     | '__root__'
     | '/'
@@ -137,9 +170,12 @@ export interface FileRouteTypes {
     | '/_layout/apikeys/create'
     | '/_layout/models/$id'
     | '/_layout/models/create'
+    | '/_layout/providers/$id'
+    | '/_layout/providers/create'
     | '/_layout/apikeys/'
     | '/_layout/models/'
     | '/_layout/playground/'
+    | '/_layout/providers/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -170,6 +206,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LayoutSettingsRouteImport
       parentRoute: typeof LayoutRoute
     }
+    '/_layout/providers/': {
+      id: '/_layout/providers/'
+      path: '/providers'
+      fullPath: '/providers/'
+      preLoaderRoute: typeof LayoutProvidersIndexRouteImport
+      parentRoute: typeof LayoutRoute
+    }
     '/_layout/playground/': {
       id: '/_layout/playground/'
       path: '/playground'
@@ -189,6 +232,20 @@ declare module '@tanstack/react-router' {
       path: '/apikeys'
       fullPath: '/apikeys/'
       preLoaderRoute: typeof LayoutApikeysIndexRouteImport
+      parentRoute: typeof LayoutRoute
+    }
+    '/_layout/providers/create': {
+      id: '/_layout/providers/create'
+      path: '/providers/create'
+      fullPath: '/providers/create'
+      preLoaderRoute: typeof LayoutProvidersCreateRouteImport
+      parentRoute: typeof LayoutRoute
+    }
+    '/_layout/providers/$id': {
+      id: '/_layout/providers/$id'
+      path: '/providers/$id'
+      fullPath: '/providers/$id'
+      preLoaderRoute: typeof LayoutProvidersIdRouteImport
       parentRoute: typeof LayoutRoute
     }
     '/_layout/models/create': {
@@ -228,9 +285,12 @@ interface LayoutRouteChildren {
   LayoutApikeysCreateRoute: typeof LayoutApikeysCreateRoute
   LayoutModelsIdRoute: typeof LayoutModelsIdRoute
   LayoutModelsCreateRoute: typeof LayoutModelsCreateRoute
+  LayoutProvidersIdRoute: typeof LayoutProvidersIdRoute
+  LayoutProvidersCreateRoute: typeof LayoutProvidersCreateRoute
   LayoutApikeysIndexRoute: typeof LayoutApikeysIndexRoute
   LayoutModelsIndexRoute: typeof LayoutModelsIndexRoute
   LayoutPlaygroundIndexRoute: typeof LayoutPlaygroundIndexRoute
+  LayoutProvidersIndexRoute: typeof LayoutProvidersIndexRoute
 }
 
 const LayoutRouteChildren: LayoutRouteChildren = {
@@ -239,9 +299,12 @@ const LayoutRouteChildren: LayoutRouteChildren = {
   LayoutApikeysCreateRoute: LayoutApikeysCreateRoute,
   LayoutModelsIdRoute: LayoutModelsIdRoute,
   LayoutModelsCreateRoute: LayoutModelsCreateRoute,
+  LayoutProvidersIdRoute: LayoutProvidersIdRoute,
+  LayoutProvidersCreateRoute: LayoutProvidersCreateRoute,
   LayoutApikeysIndexRoute: LayoutApikeysIndexRoute,
   LayoutModelsIndexRoute: LayoutModelsIndexRoute,
   LayoutPlaygroundIndexRoute: LayoutPlaygroundIndexRoute,
+  LayoutProvidersIndexRoute: LayoutProvidersIndexRoute,
 }
 
 const LayoutRouteWithChildren =
