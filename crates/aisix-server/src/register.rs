@@ -94,6 +94,21 @@ pub fn bundle_exists(mtls_dir: impl AsRef<Path>) -> bool {
         .all(|name| dir.join(name).is_file())
 }
 
+/// Well-known filename within `mtls_dir` for the issuer's CA cert.
+pub fn ca_cert_path(mtls_dir: impl AsRef<Path>) -> std::path::PathBuf {
+    mtls_dir.as_ref().join("ca.crt")
+}
+
+/// Well-known filename within `mtls_dir` for the DP's client cert.
+pub fn client_cert_path(mtls_dir: impl AsRef<Path>) -> std::path::PathBuf {
+    mtls_dir.as_ref().join("client.crt")
+}
+
+/// Well-known filename within `mtls_dir` for the DP's client key.
+pub fn client_key_path(mtls_dir: impl AsRef<Path>) -> std::path::PathBuf {
+    mtls_dir.as_ref().join("client.key")
+}
+
 // ---------------------------------------------------------------------
 // HTTP client
 // ---------------------------------------------------------------------

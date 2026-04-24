@@ -81,7 +81,36 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // already on disk (subsequent boot), we synthesise the same
     // values from config + dp_id_file.
     let heartbeat_cfg: Option<heartbeat::HeartbeatConfig> = if cfg.managed.is_managed() {
-        if !register::bundle_exists(&cfg.managed.mtls_dir) && cfg.managed.registration_enabled() {
+        let bundle_on_disk = register::bundle_exists(&cfg.managed.mtls_dir);
+        let can_register = cfg.managed.registration_enabled();
+        // Log the branch inputs so operators don't have to guess why
+        // their DP didn't register (or why it tried to).
+        tracing::info!(
+            bundle_exists = bundle_on_disk,
+            registration_enabled = can_register,
+            mtls_dir = %cfg.managed.mtls_dir,
+            "managed-mode bootstrap branch inputs",
+        );
+        if !bundle_on_disk && !can_register {
+            // In managed mode we MUST have either a persisted bundle or
+            // enough config to go get one. Silently proceeding with the
+            // placeholder etcd endpoint from config.managed.yaml turns
+            // into an opaque gRPC "dns error" minutes later — instead,
+            // fail the boot loudly with exactly what's missing.
+            anyhow::bail!(
+                "managed mode is enabled but registration is not possible: \
+                 registration_token={}, cp_base_url={}; set both \
+                 AISIX_MANAGED__REGISTRATION_TOKEN and AISIX_MANAGED__CP_BASE_URL, \
+                 or persist an mTLS bundle at {:?}",
+                cfg.managed
+                    .registration_token
+                    .as_deref()
+                    .unwrap_or("<unset>"),
+                cfg.managed.cp_base_url.as_deref().unwrap_or("<unset>"),
+                cfg.managed.mtls_dir,
+            );
+        }
+        if !bundle_on_disk && can_register {
             tracing::info!("managed mode: registering with aisix.cloud CP");
             let r = register::register_and_persist(&cfg.managed)
                 .await
@@ -108,10 +137,27 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 r.dp_id,
                 r.heartbeat_interval,
             ))
-        } else if register::bundle_exists(&cfg.managed.mtls_dir) {
+        } else if bundle_on_disk {
             // Bundle persisted from a previous boot; load the dp_id
             // and synthesise heartbeat config from the configured
-            // cp_base_url. Registration doesn't re-run.
+            // cp_base_url. Registration doesn't re-run — but we still
+            // have to carry over the etcd bundle paths, otherwise the
+            // etcd client falls back to the unencrypted placeholder
+            // from config.managed.yaml and the gRPC connect blows up
+            // with an opaque "dns error".
+            tracing::info!("managed mode: reusing persisted mTLS bundle");
+            cfg.etcd.tls = Some(EtcdTlsConfig {
+                ca_cert_file: register::ca_cert_path(&cfg.managed.mtls_dir)
+                    .to_string_lossy()
+                    .into_owned(),
+                client_cert_file: register::client_cert_path(&cfg.managed.mtls_dir)
+                    .to_string_lossy()
+                    .into_owned(),
+                client_key_file: register::client_key_path(&cfg.managed.mtls_dir)
+                    .to_string_lossy()
+                    .into_owned(),
+                domain_name: None,
+            });
             match load_heartbeat_config_from_disk(&cfg.managed) {
                 Ok(h) => Some(h),
                 Err(e) => {
@@ -121,7 +167,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 }
             }
         } else {
-            None
+            // can_register branch above caught the "neither bundle nor
+            // registration possible" case and bailed. This arm is
+            // unreachable in managed mode; kept for exhaustiveness.
+            unreachable!("managed-mode branch check is exhaustive")
         }
     } else {
         None
