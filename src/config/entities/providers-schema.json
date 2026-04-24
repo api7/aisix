@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
+  "type": "object",
+  "properties": {
+    "name": { "type": "string" },
+    "type": {
+      "type": "string",
+      "enum": ["anthropic", "bedrock", "deepseek", "gemini", "openai"]
+    },
+    "config": { "type": "object" }
+  },
+  "required": ["name", "type", "config"],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": { "type": { "const": "bedrock" } },
+        "required": ["type"]
+      },
+      "then": {
+        "properties": {
+          "config": { "$ref": "#/$defs/bedrock" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": { "enum": ["anthropic", "deepseek", "gemini", "openai"] }
+        },
+        "required": ["type"]
+      },
+      "then": {
+        "properties": {
+          "config": { "$ref": "#/$defs/openai_compatible" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "openai_compatible": {
+      "type": "object",
+      "required": ["api_key"],
+      "properties": {
+        "api_key": { "type": "string" },
+        "api_base": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "bedrock": {
+      "type": "object",
+      "required": ["region", "access_key_id", "secret_access_key"],
+      "properties": {
+        "region": { "type": "string" },
+        "access_key_id": { "type": "string" },
+        "secret_access_key": { "type": "string" },
+        "session_token": { "type": "string" },
+        "endpoint": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

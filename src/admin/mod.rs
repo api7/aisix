@@ -1,6 +1,7 @@
 mod apikeys;
 mod models;
 mod playground;
+mod providers;
 mod types;
 mod ui;
 
@@ -35,7 +36,8 @@ pub const PATH_PREFIX: &str = "/aisix/admin";
     modifiers(&SecurityAddon),
     tags(
         (name = models::OPENAPI_TAG, description = "Admin API for managing AI models"),
-        (name = apikeys::OPENAPI_TAG, description = "Admin API for managing API keys")
+        (name = apikeys::OPENAPI_TAG, description = "Admin API for managing API keys"),
+        (name = providers::OPENAPI_TAG, description = "Admin API for managing AI providers")
     ),
     security(
         ("bearer" = []),
@@ -47,6 +49,11 @@ pub const PATH_PREFIX: &str = "/aisix/admin";
         models::post,
         models::put,
         models::delete,
+        providers::list,
+        providers::get,
+        providers::post,
+        providers::put,
+        providers::delete,
         apikeys::list,
         apikeys::get,
         apikeys::post,
@@ -112,6 +119,16 @@ pub fn create_router(state: AppState) -> Router {
                         .route(
                             "/models/{id}",
                             get(models::get).put(models::put).delete(models::delete),
+                        ),
+                )
+                .merge(
+                    Router::new()
+                        .route("/providers", get(providers::list).post(providers::post))
+                        .route(
+                            "/providers/{id}",
+                            get(providers::get)
+                                .put(providers::put)
+                                .delete(providers::delete),
                         ),
                 )
                 .merge(
