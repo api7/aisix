@@ -12,10 +12,30 @@ use etcd_client::{
     Client, ConnectOptions, Error as EtcdError, EventType, GetOptions, WatchOptions,
 };
 use futures::{Stream, StreamExt};
+use std::error::Error as StdError;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::Mutex;
+
+/// Flatten an error and its source chain into a single readable line.
+/// Without this, tonic surfaces opaque strings like "dns error" while
+/// the real cause (`getaddrinfo: Name or service not known`, TLS
+/// handshake reason, …) hides in `.source()`. The supervisor logs
+/// the returned string, so CI triage gets the full picture.
+fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut cur = err.source();
+    while let Some(next) = cur {
+        let s = next.to_string();
+        if !s.is_empty() && !out.ends_with(&s) {
+            out.push_str(": ");
+            out.push_str(&s);
+        }
+        cur = next.source();
+    }
+    out
+}
 
 use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 
@@ -89,7 +109,7 @@ impl EtcdConfigProvider {
                     tracing::warn!(
                         attempt,
                         max = policy.attempts,
-                        error = %err,
+                        error = %format_error_chain(&err),
                         "etcd connect failed — retrying",
                     );
                     last_err = Some(err);
@@ -101,7 +121,8 @@ impl EtcdConfigProvider {
         }
         Err(ProviderError::Connect(
             last_err
-                .map(|e| e.to_string())
+                .as_ref()
+                .map(|e| format_error_chain(e))
                 .unwrap_or_else(|| "exhausted retries".to_string()),
         ))
     }
@@ -121,7 +142,7 @@ impl ConfigProvider for EtcdConfigProvider {
                 Some(GetOptions::new().with_prefix()),
             )
             .await
-            .map_err(|e| ProviderError::Range(e.to_string()))?;
+            .map_err(|e| ProviderError::Range(format_error_chain(&e)))?;
 
         let revision = resp.header().map(|h| h.revision()).unwrap_or(0);
 
@@ -152,7 +173,7 @@ impl ConfigProvider for EtcdConfigProvider {
         let (_watcher, stream) = client
             .watch(self.prefix.as_bytes(), Some(opts))
             .await
-            .map_err(|e| ProviderError::Watch(e.to_string()))?;
+            .map_err(|e| ProviderError::Watch(format_error_chain(&e)))?;
 
         Ok(Box::new(EtcdWatchStream { inner: stream }))
     }
@@ -181,13 +202,13 @@ impl Stream for EtcdWatchStream {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Ready(Some(Err(err))) => {
-                let msg = err.to_string();
-                if msg.contains("required revision has been compacted")
-                    || msg.contains("mvcc: required revision")
+                let shallow = err.to_string();
+                if shallow.contains("required revision has been compacted")
+                    || shallow.contains("mvcc: required revision")
                 {
                     Poll::Ready(Some(Err(ProviderError::Compacted)))
                 } else {
-                    Poll::Ready(Some(Err(ProviderError::Watch(msg))))
+                    Poll::Ready(Some(Err(ProviderError::Watch(format_error_chain(&err)))))
                 }
             }
             Poll::Ready(Some(Ok(resp))) => {
@@ -258,5 +279,41 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ProviderError::Connect(_)));
+    }
+
+    #[test]
+    fn format_error_chain_joins_sources_without_duplicating() {
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("Name or service not known")
+            }
+        }
+        impl StdError for Inner {}
+
+        #[derive(Debug)]
+        struct Outer {
+            inner: Inner,
+        }
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("dns error")
+            }
+        }
+        impl StdError for Outer {
+            fn source(&self) -> Option<&(dyn StdError + 'static)> {
+                Some(&self.inner)
+            }
+        }
+
+        let joined = format_error_chain(&Outer { inner: Inner });
+        assert_eq!(joined, "dns error: Name or service not known");
+    }
+
+    #[test]
+    fn format_error_chain_handles_empty_source() {
+        let err = std::io::Error::other("bare");
+        assert_eq!(format_error_chain(&err), "bare");
     }
 }
