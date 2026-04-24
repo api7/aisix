@@ -13,22 +13,8 @@ use crate::{
     utils::jsonschema::format_evaluation_error,
 };
 
-static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema#",
-        "type": "object",
-        "properties": {
-            "key": {"type": "string"},
-            "allowed_models": {
-                "type": "array",
-                "items": { "type": "string" }
-            },
-            "rate_limit": {"type": "object"}
-        },
-        "required": ["key", "allowed_models"],
-        "additionalProperties": false
-    })
-});
+static SCHEMA: LazyLock<serde_json::Value> =
+    LazyLock::new(|| json!(include_str!("apikeys-schema.json")));
 pub static SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> =
     LazyLock::new(|| jsonschema::validator_for(&SCHEMA).expect("Invalid JSON schema for API Key"));
 
