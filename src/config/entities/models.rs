@@ -4,7 +4,6 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize, de::Error};
-use serde_json::json;
 use utoipa::ToSchema;
 
 use super::{ConfigProvider, EntityStore, IndexFn};
@@ -18,82 +17,8 @@ use crate::{
 };
 
 static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema#",
-        "type": "object",
-        "properties": {
-            "name": {"type": "string"},
-            "model": {
-                "type": "string",
-                "pattern": MODELS_PATTERN
-            },
-            "provider_config": {"type": "object"},
-            "timeout": {
-                "type": "integer",
-                "minimum": 0
-            },
-            "rate_limit": {"type": "object"}
-        },
-        "required": ["name", "model", "provider_config"],
-        "additionalProperties": false,
-        "allOf": [
-            {
-                "if": {
-                    "properties": {
-                        "model": {
-                            "type": "string",
-                            "pattern": "^(anthropic|deepseek|gemini|openai)/.+$"
-                        }
-                    },
-                    "required": ["model"]
-                },
-                "then": {
-                    "properties": {
-                        "provider_config": { "$ref": "#/$defs/openai_compatible" }
-                    }
-                }
-            },
-            {
-                "if": {
-                    "properties": {
-                        "model": {
-                            "type": "string",
-                            "pattern": "^bedrock/.+$"
-                        }
-                    },
-                    "required": ["model"]
-                },
-                "then": {
-                    "properties": {
-                        "provider_config": { "$ref": "#/$defs/bedrock" }
-                    }
-                }
-            }
-        ],
-        "$defs": {
-            "openai_compatible": {
-                "type": "object",
-                "required": ["api_key"],
-                "properties": {
-                    "api_key": {"type": "string"},
-                    "api_base": {"type": "string"}
-                },
-                "additionalProperties": false
-            },
-            "bedrock": {
-                "type": "object",
-                "required": ["region", "access_key_id", "secret_access_key"],
-                "properties": {
-                    "region": {"type": "string"},
-                    "access_key_id": {"type": "string"},
-                    "secret_access_key": {"type": "string"},
-                    "session_token": {"type": "string"},
-                    "endpoint": {"type": "string"}
-                },
-                "additionalProperties": false
-            }
-        }
-    })
+    serde_json::from_str(include_str!("models-schema.json"))
+        .expect("Invalid JSON document for Model schema")
 });
 pub static SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> =
     LazyLock::new(|| jsonschema::validator_for(&SCHEMA).expect("Invalid JSON schema for Model"));
