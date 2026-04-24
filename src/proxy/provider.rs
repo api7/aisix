@@ -42,11 +42,10 @@ fn resolve_provider(
     resources: &ResourceRegistry,
     provider_id: &str,
 ) -> Result<ResourceEntry<Provider>> {
-    let key = format!("/providers/{provider_id}");
     resources
         .providers
         .list()
-        .get(&key)
+        .get(provider_id)
         .cloned()
         .ok_or_else(|| GatewayError::Internal(format!("provider {} not found", provider_id)))
 }

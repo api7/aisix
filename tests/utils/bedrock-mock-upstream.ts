@@ -13,7 +13,7 @@ interface BedrockProviderConfigOverrides {
   session_token?: string;
 }
 
-export const buildBedrockProviderModel = (model: string) => `bedrock/${model}`;
+export const buildBedrockProviderModel = (model: string) => model;
 
 export const buildBedrockProviderConfig = (
   endpoint: string,

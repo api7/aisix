@@ -1,9 +1,15 @@
 import { randomUUID } from 'node:crypto';
 
+import {
+  MODELS_URL,
+  PROVIDERS_URL,
+  adminPost,
+  adminPut,
+  bearerAuthHeader,
+} from '../utils/admin.js';
 import { client } from '../utils/http.js';
 import {
   OpenAiMockUpstream,
-  buildOpenAiProviderConfig,
   buildOpenAiProviderModel,
   startOpenAiMockUpstream,
 } from '../utils/mock-upstream.js';
@@ -11,9 +17,8 @@ import { App, defaultConfig } from '../utils/setup.js';
 
 const ADMIN_KEY = 'test-admin-key-timeout';
 const PROXY_KEY = 'sk-proxy-timeout';
-const ADMIN_URL = 'http://127.0.0.1:3001';
+const APIKEYS_URL = '/apikeys';
 const PROXY_URL = 'http://127.0.0.1:3000';
-const ADMIN_PREFIX = '/aisix/admin';
 
 describe('proxy timeout', () => {
   let server: App | undefined;
@@ -35,33 +40,47 @@ describe('proxy timeout', () => {
       .waitForReady()
       .then((app) => app.waitForReady(3001));
 
-    const modelRes = await client.post(
-      `${ADMIN_URL}${ADMIN_PREFIX}/models`,
+    const auth = bearerAuthHeader(ADMIN_KEY);
+    const providerId = 'timeout-model-provider';
+
+    const providerRes = await adminPut(
+      `${PROVIDERS_URL}/${providerId}`,
+      {
+        name: providerId,
+        type: 'openai',
+        config: {
+          api_key: 'upstream-key-timeout',
+          api_base: upstream.apiBase,
+        },
+      },
+      auth,
+    );
+    expect(providerRes.status).toBe(201);
+
+    const modelRes = await adminPost(
+      MODELS_URL,
       {
         name: 'timeout-model',
         model: buildOpenAiProviderModel('timeout-model'),
-        provider_config: buildOpenAiProviderConfig(
-          upstream.apiBase,
-          'upstream-key-timeout',
-        ),
+        provider_id: providerId,
         timeout: 50,
       },
-      { headers: { Authorization: `Bearer ${ADMIN_KEY}` } },
+      auth,
     );
     expect(modelRes.status).toBe(201);
 
-    const apikeyRes = await client.post(
-      `${ADMIN_URL}${ADMIN_PREFIX}/apikeys`,
+    const apikeyRes = await adminPost(
+      APIKEYS_URL,
       {
         key: PROXY_KEY,
         allowed_models: ['timeout-model'],
       },
-      { headers: { Authorization: `Bearer ${ADMIN_KEY}` } },
+      auth,
     );
     expect(apikeyRes.status).toBe(201);
 
     // Wait for config to propagate from etcd to the proxy
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise((resolve) => setTimeout(resolve, 1000));
   });
 
   afterEach(async () => {

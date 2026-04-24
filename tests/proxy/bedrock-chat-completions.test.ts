@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
 
 import {
+  MODELS_URL,
+  PROVIDERS_URL,
   adminPost,
+  adminPut,
   bearerAuthHeader,
   startIsolatedAdminApp,
 } from '../utils/admin.js';
@@ -27,7 +30,7 @@ const EXPECTED_ENCODED_PATH =
   '/model/inference-profile%2Fus.anthropic.claude-3-7-sonnet-20250219-v1:0';
 
 const waitConfigPropagation = async () => {
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await new Promise((resolve) => setTimeout(resolve, 1000));
 };
 
 describe('proxy /v1/chat/completions with bedrock-backed model', () => {
@@ -38,17 +41,30 @@ describe('proxy /v1/chat/completions with bedrock-backed model', () => {
   beforeEach(async () => {
     server = await startIsolatedAdminApp(ADMIN_KEY);
     upstream = await startBedrockMockUpstream();
+    const auth = bearerAuthHeader(ADMIN_KEY);
 
     modelName = `mock-bedrock-chat-${randomUUID()}`;
+    const providerId = `mock-bedrock-provider-${randomUUID()}`;
+
+    const providerResp = await adminPut(
+      `${PROVIDERS_URL}/${providerId}`,
+      {
+        name: providerId,
+        type: 'bedrock',
+        config: buildBedrockProviderConfig(upstream.baseUrl),
+      },
+      auth,
+    );
+    expect(providerResp.status).toBe(201);
 
     const modelResp = await adminPost(
-      '/models',
+      MODELS_URL,
       {
         name: modelName,
         model: buildBedrockProviderModel(BEDROCK_RUNTIME_MODEL),
-        provider_config: buildBedrockProviderConfig(upstream.baseUrl),
+        provider_id: providerId,
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
     );
     expect(modelResp.status).toBe(201);
 
@@ -58,7 +74,7 @@ describe('proxy /v1/chat/completions with bedrock-backed model', () => {
         key: AUTHORIZED_KEY,
         allowed_models: [modelName],
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
     );
     expect(apiKeyResp.status).toBe(201);
 

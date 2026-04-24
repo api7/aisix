@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
 
 import {
+  MODELS_URL,
+  PROVIDERS_URL,
   adminPost,
+  adminPut,
   bearerAuthHeader,
   startIsolatedAdminApp,
 } from '../utils/admin.js';
@@ -10,22 +13,36 @@ import { App } from '../utils/setup.js';
 
 const ADMIN_KEY = 'test_admin_key_models_proxy';
 const PROXY_KEY = 'sk-proxy-models';
-const TEST_PROVIDER_MODEL = 'openai/test-proxy-model';
+const TEST_PROVIDER_MODEL = 'test-proxy-model';
 const TEST_PROVIDER_CONFIG = { api_key: 'unused-proxy-model-key' };
 
 const waitConfigPropagation = async () => {
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await new Promise((resolve) => setTimeout(resolve, 1000));
 };
 
 const createModel = async (name: string) => {
+  const auth = bearerAuthHeader(ADMIN_KEY);
+  const providerId = `${name}-provider`;
+
+  const providerResp = await adminPut(
+    `${PROVIDERS_URL}/${providerId}`,
+    {
+      name: providerId,
+      type: 'openai',
+      config: TEST_PROVIDER_CONFIG,
+    },
+    auth,
+  );
+  expect(providerResp.status).toBe(201);
+
   const resp = await adminPost(
-    '/models',
+    MODELS_URL,
     {
       name,
       model: TEST_PROVIDER_MODEL,
-      provider_config: TEST_PROVIDER_CONFIG,
+      provider_id: providerId,
     },
-    bearerAuthHeader(ADMIN_KEY),
+    auth,
   );
 
   expect(resp.status).toBe(201);

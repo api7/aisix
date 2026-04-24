@@ -1,4 +1,6 @@
 import {
+  MODELS_URL,
+  PROVIDERS_URL,
   adminDelete,
   adminGet,
   adminPost,
@@ -10,8 +12,14 @@ import {
 import { App } from '../utils/setup.js';
 
 const ADMIN_KEY = 'test_admin_key';
-const TEST_PROVIDER_MODEL = 'openai/test-admin-model';
+const TEST_PROVIDER_MODEL = 'test-admin-model';
 const TEST_PROVIDER_CONFIG = { api_key: 'unused-admin-model-key' };
+
+const buildModelBody = (name: string, providerId: string) => ({
+  name,
+  model: TEST_PROVIDER_MODEL,
+  provider_id: providerId,
+});
 
 describe('admin models', () => {
   let server: App | undefined;
@@ -24,18 +32,26 @@ describe('admin models', () => {
 
   test('test_crud', async () => {
     const auth = bearerAuthHeader(ADMIN_KEY);
+    const providerId = 'test-model-provider';
 
     const listBefore = await adminGet('/models', auth);
     expect(listBefore.status).toBe(200);
     expect(listBefore.data.total).toBe(0);
 
-    const createResp = await adminPost(
-      '/models',
+    const providerResp = await adminPut(
+      `${PROVIDERS_URL}/${providerId}`,
       {
-        name: 'test_model',
-        model: TEST_PROVIDER_MODEL,
-        provider_config: TEST_PROVIDER_CONFIG,
+        name: providerId,
+        type: 'openai',
+        config: TEST_PROVIDER_CONFIG,
       },
+      auth,
+    );
+    expect(providerResp.status).toBe(201);
+
+    const createResp = await adminPost(
+      MODELS_URL,
+      buildModelBody('test_model', providerId),
       auth,
     );
     expect(createResp.status).toBe(201);
@@ -46,12 +62,8 @@ describe('admin models', () => {
     expect(listAfterCreate.data.total).toBe(1);
 
     const updateResp = await adminPut(
-      `/models/${id}`,
-      {
-        name: 'updated_model',
-        model: TEST_PROVIDER_MODEL,
-        provider_config: TEST_PROVIDER_CONFIG,
-      },
+      `${MODELS_URL}/${id}`,
+      buildModelBody('updated_model', providerId),
       auth,
     );
     expect(updateResp.status).toBe(200);
@@ -72,58 +84,95 @@ describe('admin models', () => {
 
   test('test_put_status_codes', async () => {
     const auth = bearerAuthHeader(ADMIN_KEY);
-    const body = {
-      name: 'put_model',
-      model: TEST_PROVIDER_MODEL,
-      provider_config: TEST_PROVIDER_CONFIG,
-    };
+    const providerId = 'put-model-provider';
+    const providerResp = await adminPut(
+      `${PROVIDERS_URL}/${providerId}`,
+      {
+        name: providerId,
+        type: 'openai',
+        config: TEST_PROVIDER_CONFIG,
+      },
+      auth,
+    );
+    expect(providerResp.status).toBe(201);
+    const body = buildModelBody('put_model', providerId);
 
-    const firstPut = await adminPut('/models/put-test-fixed-id', body, auth);
+    const firstPut = await adminPut(
+      `${MODELS_URL}/put-test-fixed-id`,
+      body,
+      auth,
+    );
     expect(firstPut.status).toBe(201);
 
-    const secondPut = await adminPut('/models/put-test-fixed-id', body, auth);
+    const secondPut = await adminPut(
+      `${MODELS_URL}/put-test-fixed-id`,
+      body,
+      auth,
+    );
     expect(secondPut.status).toBe(200);
   });
 
   test('test_put_duplicate_name_rejected', async () => {
     const auth = bearerAuthHeader(ADMIN_KEY);
+    const providerId = 'put-dup-provider';
+    const providerResp = await adminPut(
+      `${PROVIDERS_URL}/${providerId}`,
+      {
+        name: providerId,
+        type: 'openai',
+        config: TEST_PROVIDER_CONFIG,
+      },
+      auth,
+    );
+    expect(providerResp.status).toBe(201);
 
-    const firstModel = {
-      name: 'put-dup-name-a',
-      model: TEST_PROVIDER_MODEL,
-      provider_config: TEST_PROVIDER_CONFIG,
-    };
+    const firstModel = buildModelBody('put-dup-name-a', providerId);
 
-    const secondModel = {
-      name: 'put-dup-name-b',
-      model: TEST_PROVIDER_MODEL,
-      provider_config: TEST_PROVIDER_CONFIG,
-    };
+    const secondModel = buildModelBody('put-dup-name-b', providerId);
 
-    const putA = await adminPut('/models/put-dup-model-a', firstModel, auth);
+    const putA = await adminPut(
+      `${MODELS_URL}/put-dup-model-a`,
+      firstModel,
+      auth,
+    );
     expect(putA.status).toBe(201);
 
-    const putB = await adminPut('/models/put-dup-model-b', secondModel, auth);
+    const putB = await adminPut(
+      `${MODELS_URL}/put-dup-model-b`,
+      secondModel,
+      auth,
+    );
     expect(putB.status).toBe(201);
 
-    const putDup = await adminPut('/models/put-dup-model-b', firstModel, auth);
+    const putDup = await adminPut(
+      `${MODELS_URL}/put-dup-model-b`,
+      firstModel,
+      auth,
+    );
     expect(putDup.status).toBe(400);
     expect(putDup.data.error_msg).toBe('Model name already exists');
   });
 
   test('test_duplicate_name_rejected', async () => {
     const auth = bearerAuthHeader(ADMIN_KEY);
-    const body = {
-      name: 'duplicate_model_name',
-      model: TEST_PROVIDER_MODEL,
-      provider_config: TEST_PROVIDER_CONFIG,
-    };
+    const providerId = 'duplicate-model-provider';
+    const providerResp = await adminPut(
+      `${PROVIDERS_URL}/${providerId}`,
+      {
+        name: providerId,
+        type: 'openai',
+        config: TEST_PROVIDER_CONFIG,
+      },
+      auth,
+    );
+    expect(providerResp.status).toBe(201);
+    const body = buildModelBody('duplicate_model_name', providerId);
 
-    const createResp = await adminPost('/models', body, auth);
+    const createResp = await adminPost(MODELS_URL, body, auth);
     expect(createResp.status).toBe(201);
     expect(typeof createResp.data.key).toBe('string');
 
-    const duplicateResp = await adminPost('/models', body, auth);
+    const duplicateResp = await adminPost(MODELS_URL, body, auth);
     expect(duplicateResp.status).toBe(400);
     expect(duplicateResp.data.error_msg).toBe('Model name already exists');
   });

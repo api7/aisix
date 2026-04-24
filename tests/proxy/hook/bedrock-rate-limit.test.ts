@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
 
 import {
+  MODELS_URL,
+  PROVIDERS_URL,
   adminPost,
+  adminPut,
   bearerAuthHeader,
   startIsolatedAdminApp,
 } from '../../utils/admin.js';
@@ -25,7 +28,7 @@ const BEDROCK_RUNTIME_MODEL =
   'inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0';
 
 const waitConfigPropagation = async () => {
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await new Promise((resolve) => setTimeout(resolve, 1000));
 };
 
 // This regression is Bedrock-specific: the generic limiter only sees token
@@ -68,20 +71,33 @@ describe('proxy hook consumes bedrock stream usage metadata', () => {
     upstream = await startBedrockMockUpstream({
       streamEvents: usageLimitedStreamEvents,
     });
+    const auth = bearerAuthHeader(ADMIN_KEY);
 
     modelName = `rate-limit-bedrock-model-${randomUUID()}`;
+    const providerId = `rate-limit-bedrock-provider-${randomUUID()}`;
+
+    const providerResp = await adminPut(
+      `${PROVIDERS_URL}/${providerId}`,
+      {
+        name: providerId,
+        type: 'bedrock',
+        config: buildBedrockProviderConfig(upstream.baseUrl),
+      },
+      auth,
+    );
+    expect(providerResp.status).toBe(201);
 
     const modelResp = await adminPost(
-      '/models',
+      MODELS_URL,
       {
         name: modelName,
         model: buildBedrockProviderModel(BEDROCK_RUNTIME_MODEL),
-        provider_config: buildBedrockProviderConfig(upstream.baseUrl),
+        provider_id: providerId,
         rate_limit: {
           tpm: 20,
         },
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
     );
     expect(modelResp.status, JSON.stringify(modelResp.data)).toBe(201);
 
@@ -91,7 +107,7 @@ describe('proxy hook consumes bedrock stream usage metadata', () => {
         key: PROXY_KEY,
         allowed_models: [modelName],
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
     );
     expect(apiKeyResp.status, JSON.stringify(apiKeyResp.data)).toBe(201);
 

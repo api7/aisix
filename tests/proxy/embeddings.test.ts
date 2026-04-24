@@ -3,7 +3,10 @@ import { randomUUID } from 'node:crypto';
 import OpenAI from 'openai';
 
 import {
+  MODELS_URL,
+  PROVIDERS_URL,
   adminPost,
+  adminPut,
   bearerAuthHeader,
   startIsolatedAdminApp,
 } from '../utils/admin.js';
@@ -26,7 +29,7 @@ const FAILING_UPSTREAM_API_KEY = 'upstream-key-embeddings-failing';
 const PROXY_EMBEDDINGS_URL = 'http://127.0.0.1:3000/v1/embeddings';
 
 const waitConfigPropagation = async () => {
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await new Promise((resolve) => setTimeout(resolve, 1000));
 };
 
 const sdkClient = (apiKey: string) =>
@@ -47,6 +50,7 @@ describe('proxy /v1/embeddings', () => {
   beforeEach(async () => {
     server = await startIsolatedAdminApp(ADMIN_KEY);
     upstream = await startOpenAiMockUpstream();
+    const auth = bearerAuthHeader(ADMIN_KEY);
     failingUpstream = await startOpenAiMockUpstream({
       embeddings: {
         status: 500,
@@ -62,46 +66,76 @@ describe('proxy /v1/embeddings', () => {
     embeddingModelName = `embedding-${randomUUID()}`;
     forbiddenModelName = `embedding-forbidden-${randomUUID()}`;
     failingUpstreamModelName = `embedding-failing-${randomUUID()}`;
+    const embeddingProviderId = `embedding-provider-${randomUUID()}`;
+    const forbiddenProviderId = `embedding-forbidden-provider-${randomUUID()}`;
+    const failingProviderId = `embedding-failing-provider-${randomUUID()}`;
+
+    const embeddingProviderResp = await adminPut(
+      `${PROVIDERS_URL}/${embeddingProviderId}`,
+      {
+        name: embeddingProviderId,
+        type: 'openai',
+        config: buildOpenAiProviderConfig(upstream.apiBase, UPSTREAM_API_KEY),
+      },
+      auth,
+    );
+    expect(embeddingProviderResp.status).toBe(201);
 
     const createEmbeddingModelResp = await adminPost(
-      '/models',
+      MODELS_URL,
       {
         name: embeddingModelName,
         model: buildOpenAiProviderModel(embeddingModelName),
-        provider_config: buildOpenAiProviderConfig(
-          upstream.apiBase,
-          UPSTREAM_API_KEY,
-        ),
+        provider_id: embeddingProviderId,
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
     );
     expect(createEmbeddingModelResp.status).toBe(201);
 
+    const forbiddenProviderResp = await adminPut(
+      `${PROVIDERS_URL}/${forbiddenProviderId}`,
+      {
+        name: forbiddenProviderId,
+        type: 'openai',
+        config: buildOpenAiProviderConfig(upstream.apiBase, UPSTREAM_API_KEY),
+      },
+      auth,
+    );
+    expect(forbiddenProviderResp.status).toBe(201);
+
     const createForbiddenModelResp = await adminPost(
-      '/models',
+      MODELS_URL,
       {
         name: forbiddenModelName,
         model: buildOpenAiProviderModel(forbiddenModelName),
-        provider_config: buildOpenAiProviderConfig(
-          upstream.apiBase,
-          UPSTREAM_API_KEY,
-        ),
+        provider_id: forbiddenProviderId,
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
     );
     expect(createForbiddenModelResp.status).toBe(201);
 
-    const createFailingModelResp = await adminPost(
-      '/models',
+    const failingProviderResp = await adminPut(
+      `${PROVIDERS_URL}/${failingProviderId}`,
       {
-        name: failingUpstreamModelName,
-        model: buildOpenAiProviderModel(failingUpstreamModelName),
-        provider_config: buildOpenAiProviderConfig(
+        name: failingProviderId,
+        type: 'openai',
+        config: buildOpenAiProviderConfig(
           failingUpstream.apiBase,
           FAILING_UPSTREAM_API_KEY,
         ),
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
+    );
+    expect(failingProviderResp.status).toBe(201);
+
+    const createFailingModelResp = await adminPost(
+      MODELS_URL,
+      {
+        name: failingUpstreamModelName,
+        model: buildOpenAiProviderModel(failingUpstreamModelName),
+        provider_id: failingProviderId,
+      },
+      auth,
     );
     expect(createFailingModelResp.status).toBe(201);
 
@@ -111,7 +145,7 @@ describe('proxy /v1/embeddings', () => {
         key: AUTHORIZED_KEY,
         allowed_models: [embeddingModelName, failingUpstreamModelName],
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
     );
     expect(authorizedResp.status).toBe(201);
 
@@ -121,7 +155,7 @@ describe('proxy /v1/embeddings', () => {
         key: LIMITED_KEY,
         allowed_models: [embeddingModelName],
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
     );
     expect(limitedResp.status).toBe(201);
 

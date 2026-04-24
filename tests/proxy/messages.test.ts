@@ -3,7 +3,10 @@ import { randomUUID } from 'node:crypto';
 import Anthropic from '@anthropic-ai/sdk';
 
 import {
+  MODELS_URL,
+  PROVIDERS_URL,
   adminPost,
+  adminPut,
   bearerAuthHeader,
   startIsolatedAdminApp,
 } from '../utils/admin.js';
@@ -26,7 +29,7 @@ const UPSTREAM_MODEL = 'test-model';
 const PROXY_MESSAGES_URL = 'http://127.0.0.1:3000/v1/messages';
 
 const waitConfigPropagation = async () => {
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await new Promise((resolve) => setTimeout(resolve, 1000));
 };
 
 const sdkClient = (apiKey: string) =>
@@ -66,35 +69,54 @@ describe('proxy /v1/messages', () => {
   beforeEach(async () => {
     server = await startIsolatedAdminApp(ADMIN_KEY);
     upstream = await startOpenAiMockUpstream();
+    const auth = bearerAuthHeader(ADMIN_KEY);
 
     mockModelName = `mock-messages-${randomUUID()}`;
     restrictedModelName = `mock-messages-restricted-${randomUUID()}`;
+    const mockProviderId = `mock-messages-provider-${randomUUID()}`;
+    const restrictedProviderId = `mock-messages-restricted-provider-${randomUUID()}`;
+
+    const mockProviderResp = await adminPut(
+      `${PROVIDERS_URL}/${mockProviderId}`,
+      {
+        name: mockProviderId,
+        type: 'openai',
+        config: buildOpenAiProviderConfig(upstream.apiBase, UPSTREAM_API_KEY),
+      },
+      auth,
+    );
+    expect(mockProviderResp.status).toBe(201);
 
     const mockModelResp = await adminPost(
-      '/models',
+      MODELS_URL,
       {
         name: mockModelName,
         model: buildOpenAiProviderModel(UPSTREAM_MODEL),
-        provider_config: buildOpenAiProviderConfig(
-          upstream.apiBase,
-          UPSTREAM_API_KEY,
-        ),
+        provider_id: mockProviderId,
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
     );
     expect(mockModelResp.status).toBe(201);
 
+    const restrictedProviderResp = await adminPut(
+      `${PROVIDERS_URL}/${restrictedProviderId}`,
+      {
+        name: restrictedProviderId,
+        type: 'openai',
+        config: buildOpenAiProviderConfig(upstream.apiBase, UPSTREAM_API_KEY),
+      },
+      auth,
+    );
+    expect(restrictedProviderResp.status).toBe(201);
+
     const restrictedModelResp = await adminPost(
-      '/models',
+      MODELS_URL,
       {
         name: restrictedModelName,
         model: buildOpenAiProviderModel(UPSTREAM_MODEL),
-        provider_config: buildOpenAiProviderConfig(
-          upstream.apiBase,
-          UPSTREAM_API_KEY,
-        ),
+        provider_id: restrictedProviderId,
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
     );
     expect(restrictedModelResp.status).toBe(201);
 
@@ -104,7 +126,7 @@ describe('proxy /v1/messages', () => {
         key: AUTHORIZED_KEY,
         allowed_models: [mockModelName, restrictedModelName],
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
     );
     expect(authorizedResp.status).toBe(201);
 
@@ -114,7 +136,7 @@ describe('proxy /v1/messages', () => {
         key: LIMITED_KEY,
         allowed_models: [mockModelName],
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
     );
     expect(limitedResp.status).toBe(201);
 

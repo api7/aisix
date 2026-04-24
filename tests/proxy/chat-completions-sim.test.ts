@@ -3,7 +3,10 @@ import { randomUUID } from 'node:crypto';
 import OpenAI from 'openai';
 
 import {
+  MODELS_URL,
+  PROVIDERS_URL,
   adminPost,
+  adminPut,
   bearerAuthHeader,
   startIsolatedAdminApp,
 } from '../utils/admin.js';
@@ -26,7 +29,7 @@ const SIM_API_BASE = 'http://127.0.0.1:18000/v1';
 const SIM_MODEL = 'sim-model';
 
 const waitConfigPropagation = async () => {
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await new Promise((resolve) => setTimeout(resolve, 1000));
 };
 
 const sdkClient = (apiKey: string) =>
@@ -42,35 +45,60 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
 
   beforeEach(async () => {
     server = await startIsolatedAdminApp(ADMIN_KEY);
+    const auth = bearerAuthHeader(ADMIN_KEY);
 
     simModelName = `sim-chat-${randomUUID()}`;
     restrictedModelName = `sim-chat-restricted-${randomUUID()}`;
+    const simProviderId = `sim-provider-${randomUUID()}`;
+    const restrictedProviderId = `sim-restricted-provider-${randomUUID()}`;
 
-    const simModelResp = await adminPost(
-      '/models',
+    const simProviderResp = await adminPut(
+      `${PROVIDERS_URL}/${simProviderId}`,
       {
-        name: simModelName,
-        model: `openai/${SIM_MODEL}`,
-        provider_config: {
+        name: simProviderId,
+        type: 'openai',
+        config: {
           api_key: 'unused',
           api_base: SIM_API_BASE,
         },
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
+    );
+    expect(simProviderResp.status).toBe(201);
+
+    const simModelResp = await adminPost(
+      MODELS_URL,
+      {
+        name: simModelName,
+        model: SIM_MODEL,
+        provider_id: simProviderId,
+      },
+      auth,
     );
     expect(simModelResp.status).toBe(201);
 
-    const restrictedModelResp = await adminPost(
-      '/models',
+    const restrictedProviderResp = await adminPut(
+      `${PROVIDERS_URL}/${restrictedProviderId}`,
       {
-        name: restrictedModelName,
-        model: `openai/${SIM_MODEL}`,
-        provider_config: {
+        name: restrictedProviderId,
+        type: 'openai',
+        config: {
           api_key: 'unused',
           api_base: SIM_API_BASE,
         },
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
+    );
+    expect(restrictedProviderResp.status).toBe(201);
+
+    const restrictedModelResp = await adminPost(
+      MODELS_URL,
+      {
+        name: restrictedModelName,
+        model: SIM_MODEL,
+        provider_id: restrictedProviderId,
+      },
+      auth,
     );
     expect(restrictedModelResp.status).toBe(201);
 
@@ -80,7 +108,7 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
         key: AUTHORIZED_KEY,
         allowed_models: [simModelName, restrictedModelName],
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
     );
     expect(authorizedResp.status).toBe(201);
 
@@ -90,7 +118,7 @@ describe('proxy /v1/chat/completions (llm-d sim)', () => {
         key: LIMITED_KEY,
         allowed_models: [simModelName],
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
     );
     expect(limitedResp.status).toBe(201);
 

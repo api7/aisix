@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
 
 import {
+  MODELS_URL,
+  PROVIDERS_URL,
   adminPost,
+  adminPut,
   bearerAuthHeader,
   startIsolatedAdminApp,
 } from '../../utils/admin.js';
@@ -20,7 +23,7 @@ const UPSTREAM_API_KEY = 'upstream-key-rate-limit';
 const UPSTREAM_MODEL = 'rate-limit-upstream-model';
 
 const waitConfigPropagation = async () => {
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await new Promise((resolve) => setTimeout(resolve, 1000));
 };
 
 describe('proxy hooks rate limit', () => {
@@ -31,23 +34,33 @@ describe('proxy hooks rate limit', () => {
   beforeEach(async () => {
     server = await startIsolatedAdminApp(ADMIN_KEY);
     upstream = await startOpenAiMockUpstream();
+    const auth = bearerAuthHeader(ADMIN_KEY);
 
     modelName = `rate-limit-model-${randomUUID()}`;
+    const providerId = `rate-limit-provider-${randomUUID()}`;
+
+    const providerResp = await adminPut(
+      `${PROVIDERS_URL}/${providerId}`,
+      {
+        name: providerId,
+        type: 'openai',
+        config: buildOpenAiProviderConfig(upstream.apiBase, UPSTREAM_API_KEY),
+      },
+      auth,
+    );
+    expect(providerResp.status).toBe(201);
 
     const modelResp = await adminPost(
-      '/models',
+      MODELS_URL,
       {
         name: modelName,
         model: buildOpenAiProviderModel(UPSTREAM_MODEL),
-        provider_config: buildOpenAiProviderConfig(
-          upstream.apiBase,
-          UPSTREAM_API_KEY,
-        ),
+        provider_id: providerId,
         rate_limit: {
           tpm: 1000,
         },
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
     );
     expect(modelResp.status).toBe(201);
 
@@ -60,7 +73,7 @@ describe('proxy hooks rate limit', () => {
           rpm: 2,
         },
       },
-      bearerAuthHeader(ADMIN_KEY),
+      auth,
     );
     expect(apiKeyResp.status).toBe(201);
 

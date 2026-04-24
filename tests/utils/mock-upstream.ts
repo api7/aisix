@@ -7,7 +7,7 @@ export {
   type RecordedRequest,
 } from '../fixtures/mock-upstream.js';
 
-export const buildOpenAiProviderModel = (model: string) => `openai/${model}`;
+export const buildOpenAiProviderModel = (model: string) => model;
 
 export const buildOpenAiProviderConfig = (
   apiBase: string,
