@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::{ConfigProvider, EntityStore, ResourceEntry};
-use crate::{gateway::providers::configs, utils::jsonschema::format_evaluation_error};
+use crate::{
+    gateway::providers::{configs, identifiers},
+    utils::jsonschema::format_evaluation_error,
+};
 
 static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
     serde_json::from_str(include_str!("providers-schema.json"))
@@ -34,11 +37,11 @@ pub enum ProviderConfig {
 impl ProviderConfig {
     pub fn provider_type(&self) -> &'static str {
         match self {
-            Self::Anthropic(_) => "anthropic",
-            Self::Bedrock(_) => "bedrock",
-            Self::DeepSeek(_) => "deepseek",
-            Self::Gemini(_) => "gemini",
-            Self::OpenAI(_) => "openai",
+            Self::Anthropic(_) => identifiers::ANTHROPIC,
+            Self::Bedrock(_) => identifiers::BEDROCK,
+            Self::DeepSeek(_) => identifiers::DEEPSEEK,
+            Self::Gemini(_) => identifiers::GEMINI,
+            Self::OpenAI(_) => identifiers::OPENAI,
         }
     }
 }

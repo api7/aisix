@@ -57,11 +57,12 @@ pub async fn chat_completions(
         .ok_or(ChatCompletionError::MissingModelInContext)?;
 
     // Replace request model name with real model name
-    request_data.model = model.model.name.clone();
+    request_data.model = model.model.clone();
     let timeout = model.timeout.map(Duration::from_millis);
 
     let gateway = state.gateway();
-    let provider_instance = create_provider_instance(gateway.as_ref(), &model)?;
+    let resources = state.resources();
+    let provider_instance = create_provider_instance(gateway.as_ref(), resources.as_ref(), &model)?;
 
     match maybe_timeout(
         timeout,

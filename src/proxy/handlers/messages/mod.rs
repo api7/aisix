@@ -64,11 +64,12 @@ pub async fn messages(
         .cloned()
         .ok_or(MessagesError::MissingModelInContext)?;
 
-    request_data.model = model.model.name.clone();
+    request_data.model = model.model.clone();
     let timeout = model.timeout.map(Duration::from_millis);
 
     let gateway = state.gateway();
-    let provider_instance = create_provider_instance(gateway.as_ref(), &model)?;
+    let resources = state.resources();
+    let provider_instance = create_provider_instance(gateway.as_ref(), resources.as_ref(), &model)?;
 
     match maybe_timeout(timeout, gateway.messages(&request_data, &provider_instance)).await {
         Ok(response) => match response? {

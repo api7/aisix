@@ -2,7 +2,9 @@ use http::HeaderMap;
 use reqwest::Url;
 
 use crate::{
-    config::entities::{Model, ResourceEntry, models::ProviderConfig},
+    config::entities::{
+        Model, Provider, ResourceEntry, ResourceRegistry, providers::ProviderConfig,
+    },
     gateway::{
         Gateway,
         error::{GatewayError, Result},
@@ -14,9 +16,11 @@ use crate::{
 #[fastrace::trace]
 pub fn create_provider_instance(
     gateway: &Gateway,
+    resources: &ResourceRegistry,
     model: &ResourceEntry<Model>,
 ) -> Result<ProviderInstance> {
-    let provider_name = model.model.provider.as_str();
+    let provider = resolve_provider(resources, &model.provider_id)?;
+    let provider_name = provider.provider_type();
     let def = gateway.registry().get(provider_name).ok_or_else(|| {
         GatewayError::Internal(format!(
             "provider {} is not registered in gateway registry",
@@ -24,7 +28,7 @@ pub fn create_provider_instance(
         ))
     })?;
 
-    let (auth, base_url_override) = provider_auth_and_base_url(&model.provider_config)?;
+    let (auth, base_url_override) = provider_auth_and_base_url(&provider.provider)?;
 
     Ok(ProviderInstance {
         def,
@@ -32,6 +36,19 @@ pub fn create_provider_instance(
         base_url_override,
         custom_headers: HeaderMap::new(),
     })
+}
+
+fn resolve_provider(
+    resources: &ResourceRegistry,
+    provider_id: &str,
+) -> Result<ResourceEntry<Provider>> {
+    let key = format!("/providers/{provider_id}");
+    resources
+        .providers
+        .list()
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| GatewayError::Internal(format!("provider {} not found", provider_id)))
 }
 
 fn provider_auth_and_base_url(config: &ProviderConfig) -> Result<(ProviderAuth, Option<Url>)> {
@@ -106,7 +123,7 @@ mod tests {
 
     use super::provider_auth_and_base_url;
     use crate::{
-        config::entities::models::ProviderConfig,
+        config::entities::providers::ProviderConfig,
         gateway::providers::configs::BedrockProviderConfig,
     };
 

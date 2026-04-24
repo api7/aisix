@@ -13,7 +13,7 @@ use crate::{
     },
     config::{
         PutEntry,
-        entities::{Model, models::SCHEMA_VALIDATOR},
+        entities::{Model, Provider, models::SCHEMA_VALIDATOR},
     },
     utils::jsonschema::format_evaluation_error,
 };
@@ -179,6 +179,21 @@ async fn update(state: AppState, id: &str, body: Bytes) -> Response {
             return APIError::BadRequest(format!("Invalid model data: {}", err)).into_response();
         }
     };
+
+    let provider_key = format!("/providers/{}", model.provider_id);
+    match state.config_provider.get::<Provider>(&provider_key).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return APIError::BadRequest(format!(
+                "Provider with ID {} not found",
+                model.provider_id
+            ))
+            .into_response();
+        }
+        Err(err) => {
+            return APIError::InternalError(err).into_response();
+        }
+    }
 
     // Check if the model name already exists: fast path
     if let Some(found) = state.resources.models.get_by_name(&model.name)

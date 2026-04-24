@@ -3,16 +3,12 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use serde::{Deserialize, Serialize, de::Error};
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use super::{ConfigProvider, EntityStore, IndexFn};
+use super::{ConfigProvider, EntityStore, IndexFn, ResourceEntry};
 use crate::{
-    config::entities::{
-        ResourceEntry,
-        types::{HasRateLimit, RateLimit, RateLimitMetric},
-    },
-    gateway::providers::{configs, identifiers},
+    config::entities::types::{HasRateLimit, RateLimit, RateLimitMetric},
     utils::jsonschema::format_evaluation_error,
 };
 
@@ -23,137 +19,17 @@ static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
 pub static SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> =
     LazyLock::new(|| jsonschema::validator_for(&SCHEMA).expect("Invalid JSON schema for Model"));
 
-#[derive(Debug, Clone, Serialize, ToSchema)]
-#[serde(untagged)]
-pub enum ProviderConfig {
-    Anthropic(configs::AnthropicProviderConfig),
-    Bedrock(configs::BedrockProviderConfig),
-    DeepSeek(configs::DeepSeekProviderConfig),
-    Gemini(configs::GeminiProviderConfig),
-    OpenAI(configs::OpenAIProviderConfig),
-}
-
-impl ProviderConfig {
-    pub fn from_json(
-        provider: &str,
-        json_value: &serde_json::Value,
-    ) -> Result<Self, serde_json::Error> {
-        match provider {
-            identifiers::ANTHROPIC => {
-                let config =
-                    serde_json::from_value::<configs::AnthropicProviderConfig>(json_value.clone())?;
-                Ok(ProviderConfig::Anthropic(config))
-            }
-            identifiers::BEDROCK => {
-                let config =
-                    serde_json::from_value::<configs::BedrockProviderConfig>(json_value.clone())?;
-                Ok(ProviderConfig::Bedrock(config))
-            }
-            identifiers::DEEPSEEK => {
-                let config =
-                    serde_json::from_value::<configs::DeepSeekProviderConfig>(json_value.clone())?;
-                Ok(ProviderConfig::DeepSeek(config))
-            }
-            identifiers::GEMINI => {
-                let config =
-                    serde_json::from_value::<configs::GeminiProviderConfig>(json_value.clone())?;
-                Ok(ProviderConfig::Gemini(config))
-            }
-            identifiers::OPENAI => {
-                let config =
-                    serde_json::from_value::<configs::OpenAIProviderConfig>(json_value.clone())?;
-                Ok(ProviderConfig::OpenAI(config))
-            }
-            _ => Err(serde_json::Error::custom(format!(
-                "Unknown provider type: {}",
-                provider
-            ))),
-        }
-    }
-}
-
-pub static MODELS_PATTERN: &str = "^(anthropic|bedrock|deepseek|gemini|openai)/.+$";
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct ProviderModel {
-    #[serde(skip)]
-    pub provider: String,
-    #[serde(skip)]
-    pub name: String,
-
-    #[serde(rename = "model")]
-    #[schema(pattern = "^(anthropic|bedrock|deepseek|gemini|openai)/.+$")]
-    pub original_model: String,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Model {
     pub name: String,
-
-    #[serde(flatten)]
-    #[schema(inline)]
-    pub model: ProviderModel,
-    pub provider_config: ProviderConfig,
+    pub provider_id: String,
+    pub model: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
-}
-
-impl<'de> Deserialize<'de> for Model {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct ModelRaw {
-            name: String,
-            model: String,
-            provider_config: serde_json::Value,
-            timeout: Option<u64>,
-            rate_limit: Option<RateLimit>,
-        }
-
-        let raw = ModelRaw::deserialize(deserializer)?;
-
-        let Some((provider, provider_model)) = raw.model.split_once('/') else {
-            return Err(D::Error::custom(format!(
-                "Invalid model format for {}: {}",
-                raw.name, raw.model
-            )));
-        };
-        let provider = provider.to_lowercase();
-        let provider_model = provider_model.to_string();
-        if provider.is_empty() || provider_model.is_empty() {
-            return Err(D::Error::custom(format!(
-                "Invalid model format for {}: {}",
-                raw.name, raw.model
-            )));
-        }
-
-        let provider_config = match ProviderConfig::from_json(&provider, &raw.provider_config) {
-            Ok(config) => config,
-            Err(err) => {
-                return Err(D::Error::custom(format!(
-                    "Failed to parse provider_config for model {}: {}",
-                    raw.name, err
-                )));
-            }
-        };
-
-        Ok(Model {
-            name: raw.name,
-            model: ProviderModel {
-                provider,
-                name: provider_model,
-                original_model: raw.model,
-            },
-            provider_config,
-            timeout: raw.timeout,
-            rate_limit: raw.rate_limit,
-        })
-    }
 }
 
 impl HasRateLimit for ResourceEntry<Model> {
@@ -210,7 +86,6 @@ mod tests {
     use serde_json::json;
 
     use super::{SCHEMA, SCHEMA_VALIDATOR, format_evaluation_error};
-    use crate::config::entities::models::MODELS_PATTERN;
 
     #[test]
     fn test_valid_jsonschema() {
@@ -220,90 +95,48 @@ mod tests {
     #[rstest::rstest]
     #[case::ok(json!({
         "name": "test",
-        "model": "openai/gpt-5",
-        "provider_config": { "api_key": "test_key" },
+        "provider_id": "openai-primary",
+        "model": "gpt-5"
     }), true, None)]
-    #[case::bedrock_ok(json!({
-        "name": "test",
-        "model": "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
-        "provider_config": {
-            "region": "us-east-1",
-            "access_key_id": "AKIA123",
-            "secret_access_key": "secret"
-        },
-    }), true, None)]
-    #[case::missing_name(json!({
-        "model": "openai/gpt-5",
-        "provider_config": { "api_key": "test_key" },
-    }), false, Some(r#"property "/" validation failed: "name" is a required property"#.to_string()))]
-    #[case::missing_model(json!({
-        "name": "test",
-        "provider_config": {},
-    }), false, Some(r#"property "/" validation failed: "model" is a required property"#.to_string()))]
-    #[case::missing_provider_config(json!({
-        "name": "test",
-        "model": "deepseek/deepseek-chat",
-    }), false, Some(r#"property "/" validation failed: "provider_config" is a required property"#.to_string()))]
-    #[case::invalid_name_type(json!({
-        "name": 123,
-        "model": "openai/gpt-5",
-        "provider_config": { "api_key": "test_key" },
-    }), false, Some(r#"property "/name" validation failed: 123 is not of type "string""#.to_string()))]
-    #[case::invalid_model_type(json!({
-        "name": "test",
-        "model": 123,
-        "provider_config": {},
-    }), false, Some(r#"property "/model" validation failed: 123 is not of type "string""#.to_string()))]
-    #[case::invalid_model_pattern(json!({
-        "name": "test",
-        "model": "invalid",
-        "provider_config": {},
-    }), false, Some(format!(r#"property "/model" validation failed: "invalid" does not match "{}""#, MODELS_PATTERN)))]
-    #[case::invalid_provider_config_type(json!({
-        "name": "test",
-        "model": "openai/gpt-5",
-        "provider_config": 123,
-    }), false, Some(r#"property "/provider_config" validation failed: 123 is not of type "object"
-property "/provider_config" validation failed: 123 is not of type "object""#.to_string()))]
-    #[case::invalid_provider_config_for_specific_vendor(json!({
-        "name": "test",
-        "model": "deepseek/deepseek-chat",
-        "provider_config": {},
-    }), false, Some(r#"property "/provider_config" validation failed: "api_key" is a required property"#.to_string()))]
-    #[case::invalid_bedrock_provider_config_missing_region(json!({
-        "name": "test",
-        "model": "bedrock/meta.llama3-70b-instruct-v1:0",
-        "provider_config": {
-            "access_key_id": "AKIA123",
-            "secret_access_key": "secret"
-        },
-    }), false, Some(r#"property "/provider_config" validation failed: "region" is a required property"#.to_string()))]
-    #[case::invalid_provider_config_additional_property(json!({
-        "name": "test",
-        "model": "deepseek/deepseek-chat",
-        "provider_config": {
-            "api_key": "test_key",
-            "additional": "not allowed"
-        },
-    }), false, Some(r#"property "/provider_config" validation failed: Additional properties are not allowed ('additional' was unexpected)"#.to_string()))]
-    #[case::invalid_root_additional_property(json!({
-        "name": "test",
-        "model": "deepseek/deepseek-chat",
-        "provider_config": { "api_key": "test_key" },
-        "extra": "not allowed"
-    }), false, Some(r#"property "/" validation failed: Additional properties are not allowed ('extra' was unexpected)"#.to_string()))]
     #[case::ok_with_rate_limit(json!({
         "name": "test",
-        "model": "openai/gpt-5",
-        "provider_config": { "api_key": "test_key" },
-        "rate_limit": {},
+        "provider_id": "bedrock-primary",
+        "model": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        "rate_limit": {}
     }), true, None)]
-    #[case::invalid_rate_limit_type(json!({
+    #[case::missing_name(json!({
+        "provider_id": "openai-primary",
+        "model": "gpt-5"
+    }), false, Some(r#"property "/" validation failed: "name" is a required property"#.to_string()))]
+    #[case::missing_provider_id(json!({
         "name": "test",
-        "model": "openai/gpt-5",
-        "provider_config": { "api_key": "test_key" },
-        "rate_limit": 123,
-    }), false, Some(r#"property "/rate_limit" validation failed: 123 is not of type "object""#.to_string()))]
+        "model": "gpt-5"
+    }), false, Some(r#"property "/" validation failed: "provider_id" is a required property"#.to_string()))]
+    #[case::missing_model(json!({
+        "name": "test",
+        "provider_id": "openai-primary"
+    }), false, Some(r#"property "/" validation failed: "model" is a required property"#.to_string()))]
+    #[case::invalid_name_type(json!({
+        "name": 123,
+        "provider_id": "openai-primary",
+        "model": "gpt-5"
+    }), false, Some(r#"property "/name" validation failed: 123 is not of type "string""#.to_string()))]
+    #[case::invalid_provider_id_type(json!({
+        "name": "test",
+        "provider_id": 123,
+        "model": "gpt-5"
+    }), false, Some(r#"property "/provider_id" validation failed: 123 is not of type "string""#.to_string()))]
+    #[case::invalid_model_type(json!({
+        "name": "test",
+        "provider_id": "openai-primary",
+        "model": 123
+    }), false, Some(r#"property "/model" validation failed: 123 is not of type "string""#.to_string()))]
+    #[case::invalid_root_additional_property(json!({
+        "name": "test",
+        "provider_id": "openai-primary",
+        "model": "gpt-5",
+        "extra": "not allowed"
+    }), false, Some(r#"property "/" validation failed: Additional properties are not allowed ('extra' was unexpected)"#.to_string()))]
     fn schemas(
         #[case] input: serde_json::Value,
         #[case] ok: bool,
@@ -322,31 +155,21 @@ property "/provider_config" validation failed: 123 is not of type "object""#.to_
     }
 
     #[test]
-    fn deserialize_bedrock_model_preserves_full_identifier() {
+    fn deserialize_model_preserves_provider_reference_and_model_name() {
         let model: super::Model = serde_json::from_value(json!({
             "name": "test",
-            "model": "bedrock/arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-3-5-sonnet-20240620-v1:0",
-            "provider_config": {
-                "region": "us-east-1",
-                "access_key_id": "AKIA123",
-                "secret_access_key": "secret",
-                "session_token": "token"
-            }
+            "provider_id": "bedrock-primary",
+            "model": "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "timeout": 30000
         }))
         .unwrap();
 
-        assert_eq!(model.model.provider, "bedrock");
+        assert_eq!(model.name, "test");
+        assert_eq!(model.provider_id, "bedrock-primary");
         assert_eq!(
-            model.model.name,
+            model.model,
             "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-3-5-sonnet-20240620-v1:0"
         );
-        assert_eq!(
-            model.model.original_model,
-            "bedrock/arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-3-5-sonnet-20240620-v1:0"
-        );
-        assert!(matches!(
-            model.provider_config,
-            super::ProviderConfig::Bedrock(_)
-        ));
+        assert_eq!(model.timeout, Some(30000));
     }
 }

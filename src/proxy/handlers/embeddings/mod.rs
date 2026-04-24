@@ -53,11 +53,12 @@ pub async fn embeddings(
         .ok_or(EmbeddingError::MissingModelInContext)?;
 
     let gateway = state.gateway();
-    let provider_instance = create_provider_instance(gateway.as_ref(), &model)?;
+    let resources = state.resources();
+    let provider_instance = create_provider_instance(gateway.as_ref(), resources.as_ref(), &model)?;
     let timeout = model.timeout.map(Duration::from_millis);
 
     // Replace request model name with real model name
-    request_data.model = model.model.name.clone();
+    request_data.model = model.model.clone();
 
     match maybe_timeout(timeout, gateway.embed(&request_data, &provider_instance)).await {
         Ok(Ok(response)) => {

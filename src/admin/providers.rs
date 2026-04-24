@@ -13,7 +13,7 @@ use crate::{
     },
     config::{
         PutEntry,
-        entities::{Provider, providers::SCHEMA_VALIDATOR},
+        entities::{Model, Provider, providers::SCHEMA_VALIDATOR},
     },
     utils::jsonschema::format_evaluation_error,
 };
@@ -140,6 +140,7 @@ pub async fn put(State(state): State<AppState>, Path(id): Path<String>, body: By
         ("id" = String, Path, description = "The ID of the provider"),
     ),
     responses(
+        (status = StatusCode::BAD_REQUEST, description = "Provider is still referenced by models", body = APIError),
         (status = StatusCode::OK, description = "Provider deleted successfully", body = DeleteResponse),
         (status = StatusCode::NOT_FOUND, description = "Provider not found", body = APIError),
         (status = StatusCode::INTERNAL_SERVER_ERROR, description = "Internal server error", body = APIError)
@@ -147,6 +148,30 @@ pub async fn put(State(state): State<AppState>, Path(id): Path<String>, body: By
 )]
 pub async fn delete(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let key = format!("/providers/{id}");
+
+    match state.config_provider.get::<serde_json::Value>(&key).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return APIError::NotFound(format!("Provider with ID {} not found", id))
+                .into_response();
+        }
+        Err(err) => {
+            return APIError::InternalError(err).into_response();
+        }
+    }
+
+    match state.config_provider.get_all::<Model>("/models").await {
+        Ok(models) => {
+            if models.iter().any(|item| item.value.provider_id == id) {
+                return APIError::BadRequest("provider is still referenced by models".to_string())
+                    .into_response();
+            }
+        }
+        Err(err) => {
+            return APIError::InternalError(err).into_response();
+        }
+    }
+
     match state.config_provider.delete(&key).await {
         Ok(deleted) if deleted > 0 => DeleteResponse { deleted, key }.into_response(),
         Ok(_) => APIError::NotFound(format!("Provider with ID {} not found", id)).into_response(),
