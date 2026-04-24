@@ -408,8 +408,18 @@ impl Config {
             builder = builder.add_source(source);
         }
 
+        // config-rs default: when `separator` is set, the prefix
+        // separator inherits from it — so `separator("__")` alone
+        // would demand `AISIX__FOO__BAR` env vars. That's at odds
+        // with every other aisix.cloud service (and the existing
+        // docs / Dockerfile / e2e harness), which all use
+        // `AISIX_FOO__BAR` (single underscore between prefix and
+        // first key segment, double underscore for nested keys).
+        // Pin prefix_separator explicitly so the two shapes are
+        // distinct: `AISIX_` strips the prefix, `__` splits keys.
         builder = builder.add_source(
             Environment::with_prefix("AISIX")
+                .prefix_separator("_")
                 .separator("__")
                 .list_separator(",")
                 .try_parsing(true),
@@ -652,6 +662,17 @@ managed:
         assert!(cfg.managed.cp_base_url.is_none());
         assert!(!cfg.managed.registration_enabled());
     }
+
+    // NOTE: the env-prefix regression (config-rs default
+    // prefix_separator inheriting from separator, silently dropping
+    // `AISIX_FOO__BAR` shaped vars) is covered end-to-end by
+    // aisix.cloud's Go e2e suite, which runs the DP docker image
+    // with `AISIX_MANAGED__REGISTRATION_TOKEN` + `AISIX_MANAGED__CP_BASE_URL`
+    // and asserts on registration_enabled=true via the structured
+    // boot log added in the same release. A unit test here would
+    // need std::env::set_var (forbidden by the crate-level
+    // #![forbid(unsafe_code)]) or an extra dev-dep for a guarded
+    // env helper; the downstream integration coverage is enough.
 
     #[test]
     fn parses_etcd_tls_block() {
