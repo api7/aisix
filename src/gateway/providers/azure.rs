@@ -18,6 +18,10 @@ pub const IDENTIFIER: &str = "azure";
 pub const DEFAULT_API_VERSION: &str = "2024-10-21";
 const DEFAULT_BASE_URL: &str = "https://example.openai.azure.com";
 
+/// Configuration for an Azure OpenAI provider deployment.
+///
+/// `api_key` authenticates requests, `api_base` identifies the Azure resource,
+/// and `api_version` optionally overrides the default REST API version.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AzureProviderConfig {
     pub api_key: String,
@@ -27,6 +31,7 @@ pub struct AzureProviderConfig {
     pub api_version: Option<String>,
 }
 
+/// Provider definition for Azure OpenAI compatible deployments.
 pub struct AzureDef;
 
 impl ProviderMeta for AzureDef {
@@ -104,6 +109,7 @@ fn remove_model_field(body: &mut Value) {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -187,11 +193,9 @@ mod tests {
 
         let body = provider.transform_embeddings_request(&request).unwrap();
 
-        match body {
-            EmbedRequestBody::Json(value) => {
-                assert_eq!(value["input"][0], "hello");
-                assert_eq!(value.get("model"), None);
-            }
-        }
+        assert_matches!(body, EmbedRequestBody::Json(value) => {
+            assert_eq!(value["input"][0], "hello");
+            assert_eq!(value.get("model"), None);
+        });
     }
 }
