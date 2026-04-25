@@ -171,7 +171,7 @@ mod tests {
         assert_eq!(auth.api_key_for("azure").unwrap(), "azure-key");
         assert_eq!(
             base_url_override.as_ref().map(Url::as_str),
-            Some("https://example-resource.openai.azure.com/?api-version=2024-10-21")
+            Some("https://example-resource.openai.azure.com/?api-version=v1")
         );
     }
 

@@ -164,12 +164,12 @@ mod tests {
             chat_url.path(),
             "/openai/deployments/gpt-4o-prod/chat/completions"
         );
-        assert_eq!(chat_url.query(), Some("api-version=2024-10-21"));
+        assert_eq!(chat_url.query(), Some("api-version=v1"));
         assert_eq!(
             embed_url.path(),
             "/openai/deployments/text-embedding-3-large/embeddings"
         );
-        assert_eq!(embed_url.query(), Some("api-version=2024-10-21"));
+        assert_eq!(embed_url.query(), Some("api-version=v1"));
         assert!(provider.as_embed_transform().is_some());
     }
 
