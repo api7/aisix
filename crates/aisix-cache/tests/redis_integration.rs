@@ -1,6 +1,6 @@
 //! End-to-end Redis tests against a live Redis instance.
 //!
-//! Runs only when `AISIX_REDIS_URL` is set (e.g. on CI which spins
+//! Runs only when `CACHE_TEST_REDIS_URL` is set (e.g. on CI which spins
 //! `redis:7-alpine` as a service). The unit test module in
 //! `src/redis.rs` handles hermetic checks; this file proves the
 //! request → upstream → cache round-trip actually round-trips.
@@ -13,7 +13,7 @@ use aisix_cache::{Cache, RedisCache};
 use aisix_gateway::{ChatMessage, ChatResponse, FinishReason, UsageStats};
 
 fn redis_url() -> Option<String> {
-    std::env::var("AISIX_REDIS_URL").ok()
+    std::env::var("CACHE_TEST_REDIS_URL").ok()
 }
 
 fn sample(content: &str) -> ChatResponse {
@@ -29,7 +29,7 @@ fn sample(content: &str) -> ChatResponse {
 #[tokio::test]
 async fn put_then_get_round_trips_against_real_redis() {
     let Some(url) = redis_url() else {
-        eprintln!("skipping: AISIX_REDIS_URL not set");
+        eprintln!("skipping: CACHE_TEST_REDIS_URL not set");
         return;
     };
 
@@ -48,7 +48,7 @@ async fn put_then_get_round_trips_against_real_redis() {
 #[tokio::test]
 async fn ttl_eviction_drops_entry_after_window() {
     let Some(url) = redis_url() else {
-        eprintln!("skipping: AISIX_REDIS_URL not set");
+        eprintln!("skipping: CACHE_TEST_REDIS_URL not set");
         return;
     };
 
@@ -70,7 +70,7 @@ async fn ttl_eviction_drops_entry_after_window() {
 #[tokio::test]
 async fn missing_key_returns_none() {
     let Some(url) = redis_url() else {
-        eprintln!("skipping: AISIX_REDIS_URL not set");
+        eprintln!("skipping: CACHE_TEST_REDIS_URL not set");
         return;
     };
 

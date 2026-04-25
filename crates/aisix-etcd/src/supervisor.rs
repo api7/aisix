@@ -266,8 +266,7 @@ impl<P: ConfigProvider> Supervisor<P> {
         // raced the spawn (~50ms wasn't enough on heavily loaded
         // GitHub Actions runners).
         if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
-            let join =
-                rt_handle.spawn(async move { cache.store(&entries, revision).await });
+            let join = rt_handle.spawn(async move { cache.store(&entries, revision).await });
             self.pending_writes.lock().unwrap().push(join);
         }
     }

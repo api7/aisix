@@ -51,7 +51,14 @@ jobs:
     env:
       # Picked up by crates/aisix-cache/tests/redis_integration.rs.
       # The tests no-op when this is unset (local dev), so absence is safe.
-      AISIX_REDIS_URL: redis://127.0.0.1:6379
+      #
+      # MUST NOT start with the `AISIX_` prefix — Config::load_from_path
+      # merges every AISIX_* env var into the root Config (via
+      # config-rs Environment::with_prefix("AISIX")), and Config has
+      # `#[serde(deny_unknown_fields)]`. An AISIX_REDIS_URL leaks into
+      # every Config::load_from_path test as `redis_url` and breaks
+      # the entire `aisix-core::config::tests` module.
+      CACHE_TEST_REDIS_URL: redis://127.0.0.1:6379
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

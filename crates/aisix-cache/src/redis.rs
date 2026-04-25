@@ -148,7 +148,7 @@ mod tests {
     }
 
     // The full integration path (real Redis round-trip) lives in
-    // `tests/redis_integration.rs` and is opt-in via the `AISIX_REDIS_URL`
+    // `tests/redis_integration.rs` and is opt-in via the `CACHE_TEST_REDIS_URL`
     // env var so the unit-test job stays hermetic. CI runs Redis as a
     // service so the integration test exercises the happy path.
 }
