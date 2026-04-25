@@ -7,7 +7,10 @@ use serde_json::Value;
 use crate::gateway::{
     error::{GatewayError, Result},
     provider_instance::ProviderAuth,
-    traits::{ChatTransform, CompatQuirks, EmbedTransform, ProviderCapabilities, ProviderMeta},
+    traits::{
+        ChatTransform, CompatQuirks, EmbedTransform, ProviderCapabilities, ProviderMeta,
+        provider::encode_path_segment,
+    },
     types::{
         embed::{EmbedRequestBody, EmbeddingRequest},
         openai::ChatCompletionRequest,
@@ -46,7 +49,7 @@ impl ProviderMeta for AzureDef {
     fn chat_endpoint_path(&self, model: &str) -> Cow<'static, str> {
         Cow::Owned(format!(
             "/openai/deployments/{}/chat/completions",
-            model.replace('/', "%2F")
+            encode_path_segment(model)
         ))
     }
 
@@ -83,7 +86,7 @@ impl EmbedTransform for AzureDef {
     fn embeddings_endpoint_path(&self, model: &str) -> Cow<'static, str> {
         Cow::Owned(format!(
             "/openai/deployments/{}/embeddings",
-            model.replace('/', "%2F")
+            encode_path_segment(model)
         ))
     }
 
@@ -163,6 +166,39 @@ mod tests {
         );
         assert_eq!(embed_url.query(), Some("api-version=2024-10-21"));
         assert!(provider.as_embed_transform().is_some());
+    }
+
+    #[test]
+    fn azure_def_percent_encodes_reserved_deployment_characters() {
+        let provider = AzureDef;
+        let deployment = "prod slot/50%?blue#canary";
+
+        let chat_url = provider.build_url(
+            &format!(
+                "https://example-resource.openai.azure.com/?api-version={}",
+                DEFAULT_API_VERSION
+            ),
+            deployment,
+        );
+        let embed_url = provider.build_url_for_endpoint(
+            &format!(
+                "https://example-resource.openai.azure.com/?api-version={}",
+                DEFAULT_API_VERSION
+            ),
+            provider.embeddings_endpoint_path(deployment).as_ref(),
+        );
+
+        let chat_url = reqwest::Url::parse(&chat_url).unwrap();
+        let embed_url = reqwest::Url::parse(&embed_url).unwrap();
+
+        assert_eq!(
+            chat_url.path(),
+            "/openai/deployments/prod%20slot%2F50%25%3Fblue%23canary/chat/completions"
+        );
+        assert_eq!(
+            embed_url.path(),
+            "/openai/deployments/prod%20slot%2F50%25%3Fblue%23canary/embeddings"
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use bytes::Bytes;
 use http::{HeaderMap, Method};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde_json::{Map, Value};
 
 use crate::gateway::{
@@ -25,6 +26,23 @@ pub struct PreparedRequest {
     pub headers: HeaderMap,
     pub body: Bytes,
     pub stream: bool,
+}
+
+const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/');
+
+pub(crate) fn encode_path_segment(segment: &str) -> String {
+    utf8_percent_encode(segment, PATH_SEGMENT_ENCODE_SET).to_string()
 }
 
 /// Provider metadata with no data transformation logic.

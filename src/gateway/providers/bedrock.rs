@@ -17,7 +17,7 @@ use crate::gateway::{
     provider_instance::ProviderAuth,
     traits::{
         ChatStreamState, ChatTransform, PreparedRequest, ProviderCapabilities, ProviderMeta,
-        StreamReaderKind,
+        StreamReaderKind, provider::encode_path_segment,
     },
     types::openai::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
 };
@@ -78,7 +78,7 @@ impl ProviderMeta for BedrockDef {
     }
 
     fn chat_endpoint_path(&self, model: &str) -> Cow<'static, str> {
-        Cow::Owned(format!("/model/{}/converse", model.replace('/', "%2F")))
+        Cow::Owned(format!("/model/{}/converse", encode_path_segment(model)))
     }
 
     fn stream_reader_kind(&self) -> StreamReaderKind {
@@ -270,6 +270,21 @@ mod tests {
         assert_eq!(
             url,
             "https://bedrock-runtime.us-east-1.amazonaws.com/model/inference-profile%2Fus.anthropic.claude-3-7-sonnet-20250219-v1:0/converse"
+        );
+    }
+
+    #[test]
+    fn build_url_percent_encodes_reserved_model_id_characters() {
+        let provider = BedrockDef;
+
+        let url = provider.build_url(
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model",
+            "profile name/50%?blue#canary",
+        );
+
+        assert_eq!(
+            url,
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/profile%20name%2F50%25%3Fblue%23canary/converse"
         );
     }
 
