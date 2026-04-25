@@ -5,13 +5,24 @@
     "name": { "type": "string" },
     "type": {
       "type": "string",
-      "enum": ["anthropic", "bedrock", "deepseek", "gemini", "openai"]
+      "enum": ["anthropic", "azure", "bedrock", "deepseek", "gemini", "openai"]
     },
     "config": { "type": "object" }
   },
   "required": ["name", "type", "config"],
   "additionalProperties": false,
   "allOf": [
+    {
+      "if": {
+        "properties": { "type": { "const": "azure" } },
+        "required": ["type"]
+      },
+      "then": {
+        "properties": {
+          "config": { "$ref": "#/$defs/azure" }
+        }
+      }
+    },
     {
       "if": {
         "properties": { "type": { "const": "bedrock" } },
@@ -44,6 +55,16 @@
       "properties": {
         "api_key": { "type": "string" },
         "api_base": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "azure": {
+      "type": "object",
+      "required": ["api_key", "api_base"],
+      "properties": {
+        "api_key": { "type": "string" },
+        "api_base": { "type": "string" },
+        "api_version": { "type": "string" }
       },
       "additionalProperties": false
     },

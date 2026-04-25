@@ -39,6 +39,7 @@ export interface Model {
 
 export type ProviderType =
   | 'anthropic'
+  | 'azure'
   | 'bedrock'
   | 'deepseek'
   | 'gemini'
@@ -47,6 +48,12 @@ export type ProviderType =
 export interface ApiBaseProviderConfig {
   api_key: string;
   api_base?: string;
+}
+
+export interface AzureProviderConfig {
+  api_key: string;
+  api_base: string;
+  api_version?: string;
 }
 
 export interface BedrockProviderConfig {
@@ -62,6 +69,11 @@ export type Provider =
       name: string;
       type: 'anthropic';
       config: ApiBaseProviderConfig;
+    }
+  | {
+      name: string;
+      type: 'azure';
+      config: AzureProviderConfig;
     }
   | {
       name: string;
