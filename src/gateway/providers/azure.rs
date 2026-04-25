@@ -17,8 +17,13 @@ use crate::gateway::{
     },
 };
 
+/// Provider identifier string used to look up this provider in the gateway registry.
 pub const IDENTIFIER: &str = "azure";
-pub const DEFAULT_API_VERSION: &str = "2024-10-21";
+
+/// Default Azure OpenAI REST API version sent as the `api-version` query parameter.
+/// Overridable per deployment via [`AzureProviderConfig::api_version`].
+/// See https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#api-versioning for details.
+pub const DEFAULT_API_VERSION: &str = "v1";
 const DEFAULT_BASE_URL: &str = "https://example.openai.azure.com";
 
 /// Configuration for an Azure OpenAI provider deployment.
