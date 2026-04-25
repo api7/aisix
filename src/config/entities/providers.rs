@@ -24,6 +24,8 @@ pub static SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> =
 pub enum ProviderConfig {
     #[serde(rename = "anthropic")]
     Anthropic(configs::AnthropicProviderConfig),
+    #[serde(rename = "azure")]
+    Azure(configs::AzureProviderConfig),
     #[serde(rename = "bedrock")]
     Bedrock(configs::BedrockProviderConfig),
     #[serde(rename = "deepseek")]
@@ -38,6 +40,7 @@ impl ProviderConfig {
     pub fn provider_type(&self) -> &'static str {
         match self {
             Self::Anthropic(_) => identifiers::ANTHROPIC,
+            Self::Azure(_) => identifiers::AZURE,
             Self::Bedrock(_) => identifiers::BEDROCK,
             Self::DeepSeek(_) => identifiers::DEEPSEEK,
             Self::Gemini(_) => identifiers::GEMINI,
@@ -111,6 +114,14 @@ mod tests {
         "type": "openai",
         "config": { "api_key": "test_key" }
     }), true, None)]
+    #[case::azure_ok(json!({
+        "name": "azure-primary",
+        "type": "azure",
+        "config": {
+            "api_key": "test_key",
+            "api_base": "https://example-resource.openai.azure.com"
+        }
+    }), true, None)]
     #[case::bedrock_ok(json!({
         "name": "bedrock-primary",
         "type": "bedrock",
@@ -129,6 +140,11 @@ mod tests {
         "type": "openai",
         "config": {}
     }), false, Some(r#"property "/config" validation failed: "api_key" is a required property"#.to_string()))]
+    #[case::invalid_azure_config(json!({
+        "name": "azure-primary",
+        "type": "azure",
+        "config": { "api_key": "test_key" }
+    }), false, Some(r#"property "/config" validation failed: "api_base" is a required property"#.to_string()))]
     #[case::invalid_bedrock_config(json!({
         "name": "bedrock-primary",
         "type": "bedrock",

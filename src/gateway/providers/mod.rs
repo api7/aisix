@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod azure;
 pub mod bedrock;
 pub mod deepseek;
 pub mod gemini;
@@ -6,15 +7,17 @@ pub mod macros;
 pub mod openai;
 
 pub use anthropic::AnthropicDef;
+pub use azure::AzureDef;
 pub use bedrock::BedrockDef;
 pub use deepseek::DeepSeek;
 pub use gemini::GoogleDef;
 pub use openai::OpenAIDef;
 
 pub mod identifiers {
-    use super::{anthropic, bedrock, deepseek, gemini, openai};
+    use super::{anthropic, azure, bedrock, deepseek, gemini, openai};
 
     pub const ANTHROPIC: &str = anthropic::IDENTIFIER;
+    pub const AZURE: &str = azure::IDENTIFIER;
     pub const BEDROCK: &str = bedrock::IDENTIFIER;
     pub const DEEPSEEK: &str = deepseek::IDENTIFIER;
     pub const GEMINI: &str = gemini::IDENTIFIER;
@@ -23,9 +26,9 @@ pub mod identifiers {
 
 pub mod configs {
     pub use super::{
-        anthropic::AnthropicProviderConfig, bedrock::BedrockProviderConfig,
-        deepseek::DeepSeekProviderConfig, gemini::GeminiProviderConfig,
-        openai::OpenAIProviderConfig,
+        anthropic::AnthropicProviderConfig, azure::AzureProviderConfig,
+        bedrock::BedrockProviderConfig, deepseek::DeepSeekProviderConfig,
+        gemini::GeminiProviderConfig, openai::OpenAIProviderConfig,
     };
 }
 
@@ -33,11 +36,12 @@ use crate::gateway::{error::Result, provider_instance::ProviderRegistry};
 
 pub fn default_provider_registry() -> Result<ProviderRegistry> {
     let builder = ProviderRegistry::builder()
-        .register(OpenAIDef)?
         .register(AnthropicDef)?
+        .register(AzureDef)?
         .register(BedrockDef)?
+        .register(DeepSeek)?
         .register(GoogleDef)?
-        .register(DeepSeek)?;
+        .register(OpenAIDef)?;
     Ok(builder.build())
 }
 
@@ -50,6 +54,7 @@ mod tests {
         let registry = default_provider_registry().unwrap();
 
         assert_eq!(registry.get("openai").unwrap().name(), "openai");
+        assert_eq!(registry.get("azure").unwrap().name(), "azure");
         assert_eq!(registry.get("anthropic").unwrap().name(), "anthropic");
         assert_eq!(registry.get("bedrock").unwrap().name(), "bedrock");
         assert_eq!(registry.get("gemini").unwrap().name(), "gemini");

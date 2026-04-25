@@ -66,6 +66,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions 0.31.0",
  "opentelemetry_sdk",
+ "percent-encoding",
  "pin-project",
  "pretty_assertions",
  "rand 0.10.1",

@@ -38,6 +38,7 @@ export interface ProviderFormProps {
 
 const PROVIDER_TYPES: ProviderType[] = [
   'openai',
+  'azure',
   'anthropic',
   'gemini',
   'deepseek',
@@ -69,6 +70,8 @@ export function ProviderForm({
         initial?.type !== 'bedrock' ? (initial?.config.api_key ?? '') : '',
       api_base:
         initial?.type !== 'bedrock' ? (initial?.config.api_base ?? '') : '',
+      api_version:
+        initial?.type === 'azure' ? (initial.config.api_version ?? '') : '',
       region: initial?.type === 'bedrock' ? initial.config.region : '',
       access_key_id:
         initial?.type === 'bedrock' ? initial.config.access_key_id : '',
@@ -131,15 +134,36 @@ export function ProviderForm({
         return;
       }
 
+      const apiBase = trimOptional(value.api_base);
+
+      if (value.type === 'azure') {
+        if (!apiBase) {
+          setClientError(t('providers.form.apiBaseRequired'));
+          return;
+        }
+
+        setClientError(undefined);
+        await onSubmit({
+          name,
+          type: 'azure',
+          config: {
+            api_key: apiKey,
+            api_base: apiBase,
+            ...(trimOptional(value.api_version)
+              ? { api_version: trimOptional(value.api_version) }
+              : {}),
+          },
+        });
+        return;
+      }
+
       setClientError(undefined);
       await onSubmit({
         name,
         type: value.type,
         config: {
           api_key: apiKey,
-          ...(trimOptional(value.api_base)
-            ? { api_base: trimOptional(value.api_base) }
-            : {}),
+          ...(apiBase ? { api_base: apiBase } : {}),
         },
       });
     },
@@ -335,18 +359,56 @@ export function ProviderForm({
                 <form.Field name="api_base">
                   {(field) => (
                     <Field
-                      label={t('providers.form.apiBase')}
-                      hint={t('providers.form.apiBaseHint')}
+                      label={
+                        providerType === 'azure'
+                          ? `${t('providers.form.apiBase')} *`
+                          : t('providers.form.apiBase')
+                      }
+                      hint={t(
+                        providerType === 'azure'
+                          ? 'providers.form.azureApiBaseHint'
+                          : 'providers.form.apiBaseHint',
+                      )}
                     >
                       <Input
                         value={field.state.value}
-                        onChange={(e) => field.handleChange(e.target.value)}
+                        onChange={(e) => {
+                          setClientError(undefined);
+                          field.handleChange(e.target.value);
+                        }}
                         onBlur={field.handleBlur}
-                        placeholder={t('providers.form.apiBasePlaceholder')}
+                        placeholder={t(
+                          providerType === 'azure'
+                            ? 'providers.form.azureApiBasePlaceholder'
+                            : 'providers.form.apiBasePlaceholder',
+                        )}
                       />
                     </Field>
                   )}
                 </form.Field>
+
+                {providerType === 'azure' && (
+                  <form.Field name="api_version">
+                    {(field) => (
+                      <Field
+                        label={t('providers.form.apiVersionLabel')}
+                        hint={t('providers.form.apiVersionHint')}
+                      >
+                        <Input
+                          value={field.state.value}
+                          onChange={(e) => {
+                            setClientError(undefined);
+                            field.handleChange(e.target.value);
+                          }}
+                          onBlur={field.handleBlur}
+                          placeholder={t(
+                            'providers.form.apiVersionPlaceholder',
+                          )}
+                        />
+                      </Field>
+                    )}
+                  </form.Field>
+                )}
               </div>
             )}
           </section>
