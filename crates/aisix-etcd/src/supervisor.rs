@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 
 use crate::backoff::ExpBackoff;
 use crate::key;
@@ -42,6 +43,16 @@ pub struct Supervisor<P: ConfigProvider> {
     state: Mutex<HashMap<String, RawEntry>>,
     revision: Mutex<i64>,
     cache: SnapshotCache,
+
+    // JoinHandles for in-flight `flush_cache` writes. Tests use
+    // [`Self::await_pending_cache_writes`] to deterministically wait
+    // for these without relying on a wall-clock sleep, which proved
+    // flaky on slow CI runners. Production code does not read this
+    // field; if a handle is dropped (e.g. during shutdown), the
+    // underlying write either completed or was cancelled — either
+    // way the on-disk cache is best-effort and the next live cycle
+    // re-publishes from etcd.
+    pending_writes: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl<P: ConfigProvider> Supervisor<P> {
@@ -63,6 +74,25 @@ impl<P: ConfigProvider> Supervisor<P> {
             state: Mutex::new(HashMap::new()),
             revision: Mutex::new(0),
             cache,
+            pending_writes: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Drain the JoinHandles for any in-flight cache writes spawned
+    /// by [`Self::flush_cache`] and await them. Test-only synchroniser:
+    /// production code never needs to block on disk persistence.
+    #[cfg(test)]
+    pub async fn await_pending_cache_writes(&self) {
+        let handles: Vec<JoinHandle<()>> = {
+            let mut pending = self.pending_writes.lock().unwrap();
+            std::mem::take(&mut *pending)
+        };
+        for handle in handles {
+            // Failures here are not test failures — a write that
+            // panicked is its own bug surfaced separately. We only
+            // need the await to deterministically order against the
+            // disk read that follows.
+            let _ = handle.await;
         }
     }
 
@@ -230,8 +260,15 @@ impl<P: ConfigProvider> Supervisor<P> {
         let cache = self.cache.clone();
         // Spawn the actual write so the apply path stays sync. If we
         // aren't inside a runtime (cache::disabled() tests), just skip.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move { cache.store(&entries, revision).await });
+        // Track the JoinHandle so tests can deterministically await
+        // the write via [`Self::await_pending_cache_writes`] instead
+        // of leaning on `tokio::time::sleep`, which under CI load
+        // raced the spawn (~50ms wasn't enough on heavily loaded
+        // GitHub Actions runners).
+        if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
+            let join =
+                rt_handle.spawn(async move { cache.store(&entries, revision).await });
+            self.pending_writes.lock().unwrap().push(join);
         }
     }
 
@@ -524,10 +561,10 @@ mod tests {
             ));
             let sup = Supervisor::with_cache(provider, "/aisix", SnapshotCache::new(&cache_path));
             sup.load_once().await.unwrap();
-            // Yield so the spawned cache write has a chance to complete
-            // before we drop the supervisor.
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Deterministically wait for the spawned cache write to
+            // complete before we drop the supervisor. Replaces an
+            // earlier 50ms sleep that flaked on slow CI runners.
+            sup.await_pending_cache_writes().await;
         }
 
         // Second lifecycle: provider returns nothing, but restore_from_cache
@@ -557,15 +594,15 @@ mod tests {
 
         sup.apply_put(&entry("/aisix/models/m-1", VALID_MODEL, 5));
         sup.apply_put(&entry("/aisix/models/m-2", VALID_MODEL, 6));
-        // Yield so the spawned cache writes have a chance to complete.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Wait for both spawned cache writes to flush before reading.
+        sup.await_pending_cache_writes().await;
 
         let cache = SnapshotCache::new(&cache_path);
         let (entries, _) = cache.load().expect("cache file present");
         assert_eq!(entries.len(), 2);
 
         sup.apply_delete("/aisix/models/m-1");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sup.await_pending_cache_writes().await;
 
         let (entries, _) = cache.load().expect("cache file present");
         assert_eq!(entries.len(), 1);
