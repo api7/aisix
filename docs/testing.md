@@ -71,14 +71,14 @@ Used when a test needs a real external service.
 Current integration suites:
 
 - `crates/aisix-cache/tests/redis_integration.rs` — runs against a
-  real Redis. Requires `AISIX_REDIS_URL`; tests no-op silently if the
+  real Redis. Requires `CACHE_TEST_REDIS_URL`; tests no-op silently if the
   env var is unset, so local `cargo test` stays hermetic.
 
 CI exposes the env vars these tests need:
 
 | Test | Service | Env var |
 |---|---|---|
-| `redis_integration` | `redis:7-alpine` | `AISIX_REDIS_URL=redis://127.0.0.1:6379` |
+| `redis_integration` | `redis:7-alpine` | `CACHE_TEST_REDIS_URL=redis://127.0.0.1:6379` |
 
 Future suites that need etcd, an OTLP collector, or a Langfuse mock
 will follow the same pattern: a service container in CI, a no-op
@@ -226,7 +226,7 @@ Job descriptions:
 | Job | Purpose |
 |---|---|
 | `lint` | `cargo fmt --check`, `cargo clippy -D warnings`, `pnpm typecheck` |
-| `rust-unit` | `cargo llvm-cov --workspace --all-features` → uploads `lcov-unit.info`. Spins a `redis:7-alpine` service so `AISIX_REDIS_URL` integration tests can run |
+| `rust-unit` | `cargo llvm-cov --workspace --all-features` → uploads `lcov-unit.info`. Spins a `redis:7-alpine` service so `CACHE_TEST_REDIS_URL` integration tests can run |
 | `build-ui` | `pnpm build` in `ui/` → uploads `ui-dist` artifact for the next job |
 | `build-bin` | `cargo build` of `aisix-server` with `RUSTFLAGS=-C instrument-coverage` → uploads the binary artifact for the e2e job |
 | `e2e` | Spins etcd + redis services, downloads the binary artifact, runs Vitest. Currently `continue-on-error: true` while the harness stabilises across CI runners |

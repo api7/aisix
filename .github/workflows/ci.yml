@@ -51,7 +51,14 @@ jobs:
     env:
       # Picked up by crates/aisix-cache/tests/redis_integration.rs.
       # The tests no-op when this is unset (local dev), so absence is safe.
-      AISIX_REDIS_URL: redis://127.0.0.1:6379
+      #
+      # MUST NOT start with the `AISIX_` prefix — Config::load_from_path
+      # merges every AISIX_* env var into the root Config (via
+      # config-rs Environment::with_prefix("AISIX")), and Config has
+      # `#[serde(deny_unknown_fields)]`. An AISIX_REDIS_URL leaks into
+      # every Config::load_from_path test as `redis_url` and breaks
+      # the entire `aisix-core::config::tests` module.
+      CACHE_TEST_REDIS_URL: redis://127.0.0.1:6379
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -66,6 +73,12 @@ jobs:
       - name: unit tests with coverage
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov-unit.info
       - uses: actions/upload-artifact@v4
+        # Soft until the org-level Actions storage quota refreshes (every
+        # 6-12h per GH). Tests passing is the gating signal here; the
+        # coverage artifact only feeds the advisory coverage-gate job.
+        # Remove this `continue-on-error` when storage usage has been
+        # raised or has fallen below quota.
+        continue-on-error: true
         with:
           name: coverage-unit
           path: lcov-unit.info
@@ -92,6 +105,12 @@ jobs:
         working-directory: ui
         run: pnpm build
       - uses: actions/upload-artifact@v4
+        # Soft until the org-level Actions storage quota refreshes. The
+        # downstream build-bin / e2e jobs depend on this artifact; if
+        # the upload fails their download-artifact will fail and they
+        # will be skipped (e2e is already continue-on-error at the job
+        # level; coverage-gate is advisory). Remove when quota is OK.
+        continue-on-error: true
         with:
           name: ui-dist
           path: crates/aisix-admin/ui-dist
@@ -101,6 +120,11 @@ jobs:
     name: build aisix (instrumented)
     needs: build-ui
     runs-on: ubuntu-latest
+    # Soft while the artifact storage quota issue persists. This job
+    # only feeds the advisory e2e job; if its download-artifact for
+    # ui-dist fails because build-ui couldn't upload, don't fail the
+    # whole PR. Revert once quota is OK.
+    continue-on-error: true
     env:
       RUSTFLAGS: "-C instrument-coverage"
       LLVM_PROFILE_FILE: "coverage/aisix-%p-%m.profraw"
