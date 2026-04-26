@@ -120,6 +120,11 @@ jobs:
     name: build aisix (instrumented)
     needs: build-ui
     runs-on: ubuntu-latest
+    # Soft while the artifact storage quota issue persists. This job
+    # only feeds the advisory e2e job; if its download-artifact for
+    # ui-dist fails because build-ui couldn't upload, don't fail the
+    # whole PR. Revert once quota is OK.
+    continue-on-error: true
     env:
       RUSTFLAGS: "-C instrument-coverage"
       LLVM_PROFILE_FILE: "coverage/aisix-%p-%m.profraw"
