@@ -5,7 +5,15 @@
     "name": { "type": "string" },
     "type": {
       "type": "string",
-      "enum": ["anthropic", "azure", "bedrock", "deepseek", "gemini", "openai"]
+      "enum": [
+        "anthropic",
+        "azure",
+        "bedrock",
+        "deepseek",
+        "gemini",
+        "openai",
+        "openrouter"
+      ]
     },
     "config": { "type": "object" }
   },
@@ -37,7 +45,9 @@
     {
       "if": {
         "properties": {
-          "type": { "enum": ["anthropic", "deepseek", "gemini", "openai"] }
+          "type": {
+            "enum": ["anthropic", "deepseek", "gemini", "openai", "openrouter"]
+          }
         },
         "required": ["type"]
       },

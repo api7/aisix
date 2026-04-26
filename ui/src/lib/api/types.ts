@@ -37,13 +37,17 @@ export interface Model {
   rate_limit?: RateLimit;
 }
 
-export type ProviderType =
-  | 'anthropic'
-  | 'azure'
-  | 'bedrock'
-  | 'deepseek'
-  | 'gemini'
-  | 'openai';
+export const PROVIDER_TYPE_VARIANTS = [
+  'openai',
+  'openrouter',
+  'azure',
+  'anthropic',
+  'gemini',
+  'deepseek',
+  'bedrock',
+] as const;
+
+export type ProviderType = (typeof PROVIDER_TYPE_VARIANTS)[number];
 
 export interface ApiBaseProviderConfig {
   api_key: string;
@@ -88,6 +92,11 @@ export type Provider =
   | {
       name: string;
       type: 'openai';
+      config: ApiBaseProviderConfig;
+    }
+  | {
+      name: string;
+      type: 'openrouter';
       config: ApiBaseProviderConfig;
     }
   | {

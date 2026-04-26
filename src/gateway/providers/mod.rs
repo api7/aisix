@@ -5,6 +5,7 @@ pub mod deepseek;
 pub mod gemini;
 pub mod macros;
 pub mod openai;
+pub mod openrouter;
 
 pub use anthropic::AnthropicDef;
 pub use azure::AzureDef;
@@ -12,9 +13,10 @@ pub use bedrock::BedrockDef;
 pub use deepseek::DeepSeek;
 pub use gemini::GoogleDef;
 pub use openai::OpenAIDef;
+pub use openrouter::OpenRouter;
 
 pub mod identifiers {
-    use super::{anthropic, azure, bedrock, deepseek, gemini, openai};
+    use super::{anthropic, azure, bedrock, deepseek, gemini, openai, openrouter};
 
     pub const ANTHROPIC: &str = anthropic::IDENTIFIER;
     pub const AZURE: &str = azure::IDENTIFIER;
@@ -22,6 +24,7 @@ pub mod identifiers {
     pub const DEEPSEEK: &str = deepseek::IDENTIFIER;
     pub const GEMINI: &str = gemini::IDENTIFIER;
     pub const OPENAI: &str = openai::IDENTIFIER;
+    pub const OPENROUTER: &str = openrouter::IDENTIFIER;
 }
 
 pub mod configs {
@@ -29,6 +32,7 @@ pub mod configs {
         anthropic::AnthropicProviderConfig, azure::AzureProviderConfig,
         bedrock::BedrockProviderConfig, deepseek::DeepSeekProviderConfig,
         gemini::GeminiProviderConfig, openai::OpenAIProviderConfig,
+        openrouter::OpenRouterProviderConfig,
     };
 }
 
@@ -41,7 +45,8 @@ pub fn default_provider_registry() -> Result<ProviderRegistry> {
         .register(BedrockDef)?
         .register(DeepSeek)?
         .register(GoogleDef)?
-        .register(OpenAIDef)?;
+        .register(OpenAIDef)?
+        .register(OpenRouter)?;
     Ok(builder.build())
 }
 
@@ -59,6 +64,7 @@ mod tests {
         assert_eq!(registry.get("bedrock").unwrap().name(), "bedrock");
         assert_eq!(registry.get("gemini").unwrap().name(), "gemini");
         assert_eq!(registry.get("deepseek").unwrap().name(), "deepseek");
+        assert_eq!(registry.get("openrouter").unwrap().name(), "openrouter");
         assert!(registry.get("missing").is_none());
     }
 }

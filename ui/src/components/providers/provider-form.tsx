@@ -24,6 +24,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip';
+import { PROVIDER_TYPE_VARIANTS } from '@/lib/api/types';
 import type { Provider, ProviderType } from '@/lib/api/types';
 
 export interface ProviderFormProps {
@@ -36,14 +37,7 @@ export interface ProviderFormProps {
   extraActions?: React.ReactNode;
 }
 
-const PROVIDER_TYPES: ProviderType[] = [
-  'openai',
-  'azure',
-  'anthropic',
-  'gemini',
-  'deepseek',
-  'bedrock',
-];
+const PROVIDER_TYPES = Array.from(PROVIDER_TYPE_VARIANTS);
 
 function trimOptional(value: string): string | undefined {
   const trimmed = value.trim();

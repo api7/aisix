@@ -34,6 +34,8 @@ pub enum ProviderConfig {
     Gemini(configs::GeminiProviderConfig),
     #[serde(rename = "openai")]
     OpenAI(configs::OpenAIProviderConfig),
+    #[serde(rename = "openrouter")]
+    OpenRouter(configs::OpenRouterProviderConfig),
 }
 
 impl ProviderConfig {
@@ -45,6 +47,7 @@ impl ProviderConfig {
             Self::DeepSeek(_) => identifiers::DEEPSEEK,
             Self::Gemini(_) => identifiers::GEMINI,
             Self::OpenAI(_) => identifiers::OPENAI,
+            Self::OpenRouter(_) => identifiers::OPENROUTER,
         }
     }
 }
@@ -130,6 +133,11 @@ mod tests {
             "access_key_id": "AKIA123",
             "secret_access_key": "secret"
         }
+    }), true, None)]
+    #[case::openrouter_ok(json!({
+        "name": "openrouter-primary",
+        "type": "openrouter",
+        "config": { "api_key": "test_key" }
     }), true, None)]
     #[case::missing_type(json!({
         "name": "openai-primary",

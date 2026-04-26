@@ -70,6 +70,10 @@ fn provider_auth_and_base_url(config: &ProviderConfig) -> Result<(ProviderAuth, 
             ProviderAuth::ApiKey(config.api_key.clone()),
             parse_base_url(config.api_base.as_deref())?,
         ),
+        ProviderConfig::OpenRouter(config) => (
+            ProviderAuth::ApiKey(config.api_key.clone()),
+            parse_base_url(config.api_base.as_deref())?,
+        ),
     };
 
     Ok((auth, base_url_override))
@@ -155,7 +159,9 @@ mod tests {
     use super::provider_auth_and_base_url;
     use crate::{
         config::entities::providers::ProviderConfig,
-        gateway::providers::configs::{AzureProviderConfig, BedrockProviderConfig},
+        gateway::providers::configs::{
+            AzureProviderConfig, BedrockProviderConfig, OpenRouterProviderConfig,
+        },
     };
 
     #[test]
@@ -194,6 +200,22 @@ mod tests {
         assert_eq!(
             query.get("api-version").map(String::as_str),
             Some("2024-06-01")
+        );
+    }
+
+    #[test]
+    fn provider_auth_and_base_url_returns_openrouter_api_key_and_optional_base_url() {
+        let config = ProviderConfig::OpenRouter(OpenRouterProviderConfig {
+            api_key: "openrouter-key".into(),
+            api_base: Some("https://openrouter.ai/api/v1".into()),
+        });
+
+        let (auth, base_url_override) = provider_auth_and_base_url(&config).unwrap();
+
+        assert_eq!(auth.api_key_for("openrouter").unwrap(), "openrouter-key");
+        assert_eq!(
+            base_url_override.as_ref().map(Url::as_str),
+            Some("https://openrouter.ai/api/v1")
         );
     }
 
