@@ -73,6 +73,12 @@ jobs:
       - name: unit tests with coverage
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov-unit.info
       - uses: actions/upload-artifact@v4
+        # Soft until the org-level Actions storage quota refreshes (every
+        # 6-12h per GH). Tests passing is the gating signal here; the
+        # coverage artifact only feeds the advisory coverage-gate job.
+        # Remove this `continue-on-error` when storage usage has been
+        # raised or has fallen below quota.
+        continue-on-error: true
         with:
           name: coverage-unit
           path: lcov-unit.info
@@ -99,6 +105,12 @@ jobs:
         working-directory: ui
         run: pnpm build
       - uses: actions/upload-artifact@v4
+        # Soft until the org-level Actions storage quota refreshes. The
+        # downstream build-bin / e2e jobs depend on this artifact; if
+        # the upload fails their download-artifact will fail and they
+        # will be skipped (e2e is already continue-on-error at the job
+        # level; coverage-gate is advisory). Remove when quota is OK.
+        continue-on-error: true
         with:
           name: ui-dist
           path: crates/aisix-admin/ui-dist
