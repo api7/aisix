@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   AdminClient,
@@ -9,6 +10,18 @@ import {
   type OpenAiUpstream,
   type SpawnedApp,
 } from "../harness/index.js";
+
+// v3 self-hosted CP wire (§9A.7B.4): the snapshot stores SHA-256 of
+// the plaintext bearer, never the plaintext itself. The DP hashes
+// incoming `Bearer <plaintext>` and looks the key up by hash.
+// Keep this helper inline so the test independently re-derives the
+// hash the same way `aisix_core::ApiKey::hash_bearer` does on the
+// Rust side — divergence between the two is the bug we want to
+// catch.
+const CALLER_PLAINTEXT = "sk-smoke-caller";
+const CALLER_KEY_HASH = createHash("sha256")
+  .update(CALLER_PLAINTEXT)
+  .digest("hex");
 
 describe("smoke: admin write → proxy read", () => {
   let app: SpawnedApp | undefined;
@@ -43,13 +56,13 @@ describe("smoke: admin write → proxy read", () => {
       provider_config: { api_key: "sk-mock", api_base: `${upstream.baseUrl}/v1` },
     });
     await admin.createApiKey({
-      key: "sk-smoke-caller",
+      key_hash: CALLER_KEY_HASH,
       allowed_models: ["smoke-gpt"],
     });
 
     await waitConfigPropagation();
 
-    const proxy = new ProxyClient(app.proxyUrl, "sk-smoke-caller");
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     const { status, body } = await proxy.listModels();
 
     expect(status).toBe(200);
@@ -65,7 +78,7 @@ describe("smoke: admin write → proxy read", () => {
       return;
     }
 
-    const proxy = new ProxyClient(app.proxyUrl, "sk-smoke-caller");
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
     const { status, body } = await proxy.chat({
       model: "smoke-gpt",
       messages: [{ role: "user", content: "hello" }],
