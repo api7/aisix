@@ -162,10 +162,10 @@ fn apikey_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
-        "required": ["key", "allowed_models"],
+        "required": ["key_hash", "allowed_models"],
         "additionalProperties": false,
         "properties": {
-            "key": { "type": "string", "minLength": 1 },
+            "key_hash": { "type": "string", "minLength": 1 },
             "allowed_models": {
                 "type": "array",
                 "items": { "type": "string" }
@@ -297,13 +297,14 @@ mod tests {
 
     #[test]
     fn apikey_happy_path_passes() {
-        let v = json!({"key":"sk-x","allowed_models":["a","b"]});
+        let v = json!({"key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20","allowed_models":["a","b"]});
         validate_apikey(&v).unwrap();
     }
 
     #[test]
     fn apikey_missing_allowed_models_fails() {
-        let v = json!({"key":"sk-x"});
+        let v =
+            json!({"key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20"});
         let err = validate_apikey(&v).unwrap_err();
         assert!(err.message.to_lowercase().contains("allowed_models"));
     }
@@ -311,7 +312,7 @@ mod tests {
     #[test]
     fn apikey_empty_allowed_models_is_valid_but_denies_all() {
         // Schema permits []; runtime ApiKey::can_access enforces deny-all.
-        let v = json!({"key":"sk-x","allowed_models":[]});
+        let v = json!({"key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20","allowed_models":[]});
         validate_apikey(&v).unwrap();
     }
 

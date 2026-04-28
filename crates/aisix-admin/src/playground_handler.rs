@@ -94,8 +94,10 @@ mod tests {
     }
 
     fn apikey_entry() -> ResourceEntry<ApiKey> {
-        let k: ApiKey =
-            serde_json::from_str(r#"{"key":"sk-proxy","allowed_models":["*"]}"#).unwrap();
+        let k: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"946bcbef196665b410dd95685673c8bd7d9d27209f1ae9b9e80aac336d57b26c","allowed_models":["*"]}"#,
+        )
+        .unwrap();
         ResourceEntry::new("k-1", k, 1)
     }
 

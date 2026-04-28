@@ -69,12 +69,16 @@ pub async fn get_spend(_auth: AdminAuth, State(state): State<AdminState>) -> Jso
             // snapshot secondary index is by `key` (the bearer string),
             // not by uuid, so we do a linear scan here. This is called
             // only for human-facing reporting — not on the hot path.
+            // v3 (§9A.7B.4): plaintext is unavailable post-creation;
+            // the hash is what we have. The hint is informational, so
+            // showing the first 8 chars of the SHA-256 hex is fine for
+            // operator-facing reporting (and stable across restarts).
             let api_key_hint = snapshot
                 .apikeys
                 .entries()
                 .into_iter()
                 .find(|e| e.id == api_key_id)
-                .map(|e| mask_key(&e.value.key));
+                .map(|e| mask_key(&e.value.key_hash));
             SpendEntry {
                 api_key_id,
                 api_key_hint,

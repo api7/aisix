@@ -58,7 +58,7 @@ mod tests {
     }
 
     fn sample_apikey() -> ApiKey {
-        serde_json::from_str(r#"{"key": "sk-my-api-key-123", "allowed_models": ["my-gpt4"]}"#)
+        serde_json::from_str(r#"{"key_hash": "91ed2dbc407561556f3e7be98ba0bd2a57986d6a868c482d867d19c6d40d201c", "allowed_models": ["my-gpt4"]}"#)
             .unwrap()
     }
 
@@ -98,7 +98,12 @@ mod tests {
         assert_eq!(s.total_entries(), 4);
         assert_eq!(s.models.get_by_name("my-gpt4").unwrap().id, "m-1");
         assert_eq!(
-            s.apikeys.get_by_name("sk-my-api-key-123").unwrap().id,
+            // Snapshot's by_name index for ApiKey is keyed by key_hash
+            // (§9A.7B.4) — the SHA-256 of the bearer plaintext.
+            s.apikeys
+                .get_by_name("91ed2dbc407561556f3e7be98ba0bd2a57986d6a868c482d867d19c6d40d201c")
+                .unwrap()
+                .id,
             "k-1",
         );
         assert_eq!(s.credentials.get_by_name("openai-prod").unwrap().id, "c-1");

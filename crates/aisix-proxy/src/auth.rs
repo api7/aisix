@@ -39,9 +39,15 @@ where
         let token = extract_bearer(parts)?;
         let proxy_state = ProxyState::from_ref(state);
         let snapshot = proxy_state.snapshot.load();
+        // Self-hosted CP (prd-09a §9A.7B.4): the snapshot stores
+        // SHA-256 hashes of the plaintext bearer, never the plaintext
+        // itself. Hash the incoming token via the canonical helper
+        // and look up by the hex digest. cp-api hashes with the same
+        // function before persistence, so the two sides agree byte
+        // for byte.
         let entry = snapshot
             .apikeys
-            .get_by_name(&token)
+            .get_by_name(&ApiKey::hash_bearer(&token))
             .ok_or(ProxyError::InvalidApiKey)?;
         Ok(AuthenticatedKey { entry })
     }

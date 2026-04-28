@@ -140,8 +140,10 @@ mod tests {
     }
 
     fn apikey_entry(key: &str, allowed: &[&str]) -> ResourceEntry<ApiKey> {
+        // Plaintext in, hash on the wire (§9A.7B.4).
+        let key_hash = ApiKey::hash_bearer(key);
         let json = format!(
-            r#"{{"key": "{key}", "allowed_models": {}}}"#,
+            r#"{{"key_hash": "{key_hash}", "allowed_models": {}}}"#,
             serde_json::to_string(&allowed).unwrap()
         );
         let k: ApiKey = serde_json::from_str(&json).unwrap();

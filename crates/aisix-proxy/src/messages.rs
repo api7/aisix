@@ -329,7 +329,7 @@ mod tests {
 
     fn apikey_entry(allowed: &[&str]) -> ResourceEntry<ApiKey> {
         let json = format!(
-            r#"{{"key": "sk-caller", "allowed_models": {}}}"#,
+            r#"{{"key_hash": "8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891", "allowed_models": {}}}"#,
             serde_json::to_string(&allowed).unwrap()
         );
         let k: ApiKey = serde_json::from_str(&json).unwrap();

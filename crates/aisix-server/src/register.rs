@@ -92,6 +92,10 @@ pub async fn register_and_persist(cfg: &ManagedConfig) -> anyhow::Result<Registe
     )
     .await?;
     persist_dp_id(&cfg.dp_id_file, &resp.dp_id).await?;
+    // Persist env_id alongside the bundle so subsequent boots
+    // (bundle-on-disk path) can keep scoping etcd reads to
+    // `/aisix/<env_id>/` without re-registering.
+    persist_env_id(&cfg.mtls_dir, &resp.env_id).await?;
 
     Ok(Registered {
         dp_id: resp.dp_id,
@@ -129,6 +133,27 @@ pub fn client_cert_path(mtls_dir: impl AsRef<Path>) -> PathBuf {
 /// Well-known filename within `mtls_dir` for the DP's client key.
 pub fn client_key_path(mtls_dir: impl AsRef<Path>) -> PathBuf {
     mtls_dir.as_ref().join("client.key")
+}
+
+/// Well-known filename within `mtls_dir` for the env_id this DP is
+/// scoped to. Persisted at register time so bundle-on-disk boots can
+/// re-derive the etcd prefix (`/aisix/<env_id>/`) without re-registering.
+pub fn env_id_path(mtls_dir: impl AsRef<Path>) -> PathBuf {
+    mtls_dir.as_ref().join("env_id")
+}
+
+/// Read the env_id file written by `register_and_persist`. Trims
+/// trailing whitespace and rejects an empty payload — an empty env_id
+/// would silently widen the etcd prefix to the global scope.
+pub fn read_env_id(mtls_dir: impl AsRef<Path>) -> anyhow::Result<String> {
+    let path = env_id_path(mtls_dir);
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("read env_id from {}", path.display()))?;
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        bail!("env_id file {} is empty", path.display());
+    }
+    Ok(trimmed)
 }
 
 // ---------------------------------------------------------------------
@@ -277,6 +302,17 @@ async fn persist_dp_id(path: &str, id: &str) -> anyhow::Result<()> {
     write_atomic(&path, id.as_bytes(), 0o600).await
 }
 
+/// Persist `env_id` to `<mtls_dir>/env_id` atomically. `mtls_dir` is
+/// already created by `persist_mtls`, but we re-create defensively in
+/// case this helper is called in isolation.
+async fn persist_env_id(mtls_dir: &str, env_id: &str) -> anyhow::Result<()> {
+    let dir = PathBuf::from(mtls_dir);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("create {}", dir.display()))?;
+    write_atomic(&dir.join("env_id"), env_id.as_bytes(), 0o600).await
+}
+
 /// Write `data` to `path` atomically with the given mode. Strategy:
 /// write to `path.tmp`, fsync, rename → path. A crash between write
 /// and rename leaves either the old file or no file, never a
@@ -406,6 +442,39 @@ mod tests {
         // dp_id persisted.
         let id = std::fs::read_to_string(&dp_id_file).unwrap();
         assert_eq!(id, "ed5e0f3e-2c32-4f3a-9b9e-d6c9d2c4d4e1");
+
+        // env_id persisted alongside the bundle. Subsequent boots
+        // (bundle-on-disk path in main.rs) read this back to scope
+        // etcd reads to `/aisix/<env_id>/`.
+        let env_id_file = mtls_dir.join("env_id");
+        let env_id_on_disk = std::fs::read_to_string(&env_id_file).unwrap();
+        assert_eq!(env_id_on_disk, "11111111-1111-1111-1111-111111111111");
+        // read_env_id() helper trims trailing whitespace and yields the
+        // same value — this is the path main.rs takes on boot.
+        assert_eq!(
+            read_env_id(&mtls_dir).unwrap(),
+            "11111111-1111-1111-1111-111111111111"
+        );
+        // env_id file is also 0600 — not strictly secret but matches
+        // the rest of the bundle's permission bits.
+        use std::os::unix::fs::PermissionsExt;
+        let m = std::fs::metadata(&env_id_file).unwrap();
+        assert_eq!(m.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn read_env_id_rejects_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("env_id"), "   \n").unwrap();
+        let err = read_env_id(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("empty"), "got: {err}");
+    }
+
+    #[test]
+    fn read_env_id_surfaces_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_env_id(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("read env_id"), "got: {err}");
     }
 
     #[tokio::test]

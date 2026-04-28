@@ -169,7 +169,7 @@ mod tests {
     }"#;
 
     const VALID_APIKEY: &[u8] = br#"{
-        "key": "sk-abc",
+        "key_hash": "1460db1b6902f8b1fc2a40d9381a24d0fd22c3bc1b2c6f999c521da73776fbe0",
         "allowed_models": ["my-gpt4"]
     }"#;
 
@@ -185,7 +185,14 @@ mod tests {
         assert_eq!(snap.models.len(), 1);
         assert_eq!(snap.apikeys.len(), 1);
         assert_eq!(snap.models.get_by_name("my-gpt4").unwrap().id, "m-1");
-        assert_eq!(snap.apikeys.get_by_name("sk-abc").unwrap().id, "k-1");
+        // by_name index for ApiKey is keyed by key_hash (§9A.7B.4).
+        assert_eq!(
+            snap.apikeys
+                .get_by_name("1460db1b6902f8b1fc2a40d9381a24d0fd22c3bc1b2c6f999c521da73776fbe0")
+                .unwrap()
+                .id,
+            "k-1"
+        );
     }
 
     #[test]

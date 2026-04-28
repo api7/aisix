@@ -202,7 +202,10 @@ mod tests {
     }
 
     fn apikey_payload(key: &str, allowed: &[&str]) -> Value {
-        json!({"key": key, "allowed_models": allowed})
+        // Tests pass plaintext bearers (e.g. "sk-x"); the wire schema
+        // stores SHA-256 hashes (§9A.7B.4).
+        let key_hash = aisix_core::ApiKey::hash_bearer(key);
+        json!({"key_hash": key_hash, "allowed_models": allowed})
     }
 
     fn auth_req(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
@@ -608,8 +611,13 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let created = body_json(resp).await;
         let id = created["id"].as_str().unwrap().to_string();
-        let original_key = created["value"]["key"].as_str().unwrap().to_string();
-        assert_eq!(original_key, "sk-original");
+        let original_hash = created["value"]["key_hash"].as_str().unwrap().to_string();
+        // The created hash matches SHA-256(sk-original) — the wire
+        // schema stores hashes only (§9A.7B.4).
+        assert_eq!(
+            original_hash,
+            aisix_core::ApiKey::hash_bearer("sk-original")
+        );
         assert_eq!(created["revision"], 1);
 
         // Rotate.
@@ -621,15 +629,27 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let rotated = body_json(resp).await;
-        let new_key = rotated["value"]["key"].as_str().unwrap().to_string();
 
-        // Key must have changed and start with "sk-".
-        assert_ne!(new_key, original_key, "key did not change after rotation");
-        assert!(new_key.starts_with("sk-"), "rotated key lacks sk- prefix");
+        // Rotation response shape: { entry: ResourceEntry<ApiKey>, plaintext: "sk-..." }.
+        // The plaintext is shown exactly once.
+        let new_plaintext = rotated["plaintext"].as_str().unwrap().to_string();
+        assert!(
+            new_plaintext.starts_with("sk-"),
+            "rotated plaintext lacks sk- prefix"
+        );
+
+        let entry = &rotated["entry"];
+        let new_hash = entry["value"]["key_hash"].as_str().unwrap().to_string();
+        assert_ne!(
+            new_hash, original_hash,
+            "hash did not change after rotation"
+        );
+        // The new hash matches SHA-256(new_plaintext).
+        assert_eq!(new_hash, aisix_core::ApiKey::hash_bearer(&new_plaintext));
         // Revision must bump.
-        assert_eq!(rotated["revision"], 2);
+        assert_eq!(entry["revision"], 2);
         // Other fields preserved.
-        let allowed: Vec<&str> = rotated["value"]["allowed_models"]
+        let allowed: Vec<&str> = entry["value"]["allowed_models"]
             .as_array()
             .unwrap()
             .iter()

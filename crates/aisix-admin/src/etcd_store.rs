@@ -12,7 +12,7 @@
 //!   models/
 //!     <uuid>  → { "name": "...", "model": "...", "provider_config": {...}, ... }
 //!   apikeys/
-//!     <uuid>  → { "key": "...", "allowed_models": [...], ... }
+//!     <uuid>  → { "key_hash": "...", "allowed_models": [...], ... }
 //! ```
 //!
 //! Production wires this in `aisix-server`'s bootstrap; tests that want

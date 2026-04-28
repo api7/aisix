@@ -218,8 +218,10 @@ mod tests {
             .await
             .unwrap();
 
-        let apikey: ApiKey =
-            serde_json::from_str(r#"{"key":"sk-k","allowed_models":["m"]}"#).unwrap();
+        let apikey: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"a46d2918c4e3ed1b981dab16292c90a30237b937a6a71c49a867e2479519b186","allowed_models":["m"]}"#,
+        )
+        .unwrap();
         store
             .put_apikey(ResourceEntry::new("shared-id", apikey, 1))
             .await

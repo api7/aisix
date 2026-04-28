@@ -155,7 +155,13 @@ mod tests {
             Some(v) => format!(", \"rate_limit\": {v}"),
             None => String::new(),
         };
-        let cfg = format!(r#"{{"key": "{key}", "allowed_models": {allowed_json}{rl_tail}}}"#);
+        // Tests pass the plaintext bearer here (e.g. "sk-caller"); the
+        // wire schema stores its SHA-256 (§9A.7B.4). Hash via the
+        // canonical helper so request-side `Bearer <plaintext>` lookups
+        // line up.
+        let key_hash = ApiKey::hash_bearer(key);
+        let cfg =
+            format!(r#"{{"key_hash": "{key_hash}", "allowed_models": {allowed_json}{rl_tail}}}"#);
         let apikey: ApiKey = serde_json::from_str(&cfg).unwrap();
         ResourceEntry::new("key-id-1", apikey, 1)
     }

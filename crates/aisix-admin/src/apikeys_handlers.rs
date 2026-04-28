@@ -51,7 +51,7 @@ pub async fn create_apikey(
 ) -> Result<Json<ResourceEntry<ApiKey>>, AdminError> {
     let apikey = decode_apikey(&raw)?;
     let all = state.store.list_apikeys().await?;
-    assert_unique_key(&all, &apikey.key, None)?;
+    assert_unique_key(&all, &apikey.key_hash, None)?;
 
     let id = Uuid::new_v4().to_string();
     let entry = ResourceEntry::new(&id, apikey, STARTING_REVISION);
@@ -73,7 +73,7 @@ pub async fn update_apikey(
     let apikey = decode_apikey(&raw)?;
 
     let all = state.store.list_apikeys().await?;
-    assert_unique_key(&all, &apikey.key, Some(&id))?;
+    assert_unique_key(&all, &apikey.key_hash, Some(&id))?;
 
     let entry = ResourceEntry::new(&id, apikey, existing.revision + 1);
     state.store.put_apikey(entry.clone()).await?;
@@ -94,30 +94,39 @@ pub async fn delete_apikey(
 
 /// `POST /admin/v1/apikeys/:id/rotate`
 ///
-/// Replaces the `key` field with a new `sk-<uuid>` value, bumps the
-/// revision, and returns the updated entry. The old key stops working as
+/// Generates a new plaintext bearer (`sk-<uuid>`) and replaces the
+/// stored `key_hash` with its SHA-256. The old hash stops working as
 /// soon as the etcd watch propagates the new snapshot (≤ 500 ms).
+///
+/// **Returns the new plaintext exactly once** in the response body
+/// under `plaintext` — admin caller MUST capture it. Subsequent GETs
+/// only expose the hash. (Mirrors the cp-api self-hosted behavior in
+/// prd-09a §9A.7B.4.)
 pub async fn rotate_apikey(
     _auth: AdminAuth,
     Path(id): Path<String>,
     State(state): State<AdminState>,
-) -> Result<Json<ResourceEntry<ApiKey>>, AdminError> {
+) -> Result<Json<Value>, AdminError> {
     let existing = state
         .store
         .get_apikey(&id)
         .await?
         .ok_or(AdminError::NotFound)?;
 
-    // Generate a new key: `sk-` prefix + first segment of a UUID v4 gives
-    // a 12-hex-char suffix that's unguessable yet short.
-    let new_key = format!("sk-{}", Uuid::new_v4().as_simple());
+    // `sk-` prefix + first segment of a UUID v4 gives a 12-hex-char
+    // suffix that's unguessable yet short.
+    let new_plaintext = format!("sk-{}", Uuid::new_v4().as_simple());
+    let new_hash = ApiKey::hash_bearer(&new_plaintext);
 
     let mut updated = existing.value.clone();
-    updated.key = new_key;
+    updated.key_hash = new_hash;
 
     let entry = ResourceEntry::new(&id, updated, existing.revision + 1);
     state.store.put_apikey(entry.clone()).await?;
-    Ok(Json(entry))
+    Ok(Json(serde_json::json!({
+        "entry":     entry,
+        "plaintext": new_plaintext,
+    })))
 }
 
 fn decode_apikey(raw: &Value) -> Result<ApiKey, AdminError> {
@@ -128,12 +137,12 @@ fn decode_apikey(raw: &Value) -> Result<ApiKey, AdminError> {
 
 fn assert_unique_key(
     existing: &[ResourceEntry<ApiKey>],
-    key: &str,
+    key_hash: &str,
     self_id: Option<&str>,
 ) -> Result<(), AdminError> {
     for e in existing {
-        if e.value.key == key && self_id.is_none_or(|sid| sid != e.id) {
-            return Err(AdminError::Conflict(key.to_string()));
+        if e.value.key_hash == key_hash && self_id.is_none_or(|sid| sid != e.id) {
+            return Err(AdminError::Conflict(key_hash.to_string()));
         }
     }
     Ok(())

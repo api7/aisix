@@ -148,28 +148,30 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 client_key_file: r.client_key_path.to_string_lossy().into_owned(),
                 domain_name: None, // derive from endpoint host
             });
-            // v3 heartbeat is mTLS-required (cp-side reads peer cert
-            // SAN for dp_id), bearer-token path was retired with the
-            // v2 CP. The PHASE-2 follow-up swaps HeartbeatConfig to
-            // an mTLS-aware reqwest client. For now we use the
-            // cp_base_url + heartbeat_path the register response
-            // told us about; the v3 dp-manager will return 401
-            // (MTLS_REQUIRED) until phase 2 lands. The DP keeps
-            // running — heartbeat is liveness-only, not load-bearing.
+            // v3 heartbeat is mTLS-only — cp-api derives dp_id from
+            // the peer cert SAN URI, so the request carries no
+            // Authorization header (§9A.7.2). Hand the heartbeat
+            // worker the freshly-persisted bundle paths.
             let cp_base = cfg.managed.cp_base_url.clone().unwrap_or_default();
             Some(heartbeat::HeartbeatConfig::sanitised(
                 format!("{}{}", cp_base.trim_end_matches('/'), r.heartbeat_path),
                 r.dp_id,
                 std::time::Duration::from_secs(15),
+                heartbeat::MtlsBundle {
+                    ca_cert_path: r.ca_cert_path.clone(),
+                    client_cert_path: r.client_cert_path.clone(),
+                    client_key_path: r.client_key_path.clone(),
+                },
             ))
         } else if bundle_on_disk {
             // Bundle persisted from a previous boot; load the dp_id
-            // and synthesise heartbeat config from the configured
-            // cp_base_url. Registration doesn't re-run — but we still
-            // have to carry over the etcd bundle paths, otherwise the
-            // etcd client falls back to the unencrypted placeholder
-            // from config.managed.yaml and the gRPC connect blows up
-            // with an opaque "dns error".
+            // and env_id from disk and synthesise heartbeat config
+            // from the configured cp_base_url. Registration doesn't
+            // re-run — but we still have to carry over the etcd
+            // bundle paths and env_id, otherwise the etcd client
+            // falls back to the unencrypted placeholder from
+            // config.managed.yaml and reads/writes against the wrong
+            // (empty) tenant prefix.
             tracing::info!("managed mode: reusing persisted mTLS bundle");
             cfg.etcd.tls = Some(EtcdTlsConfig {
                 ca_cert_file: register::ca_cert_path(&cfg.managed.mtls_dir)
@@ -183,6 +185,17 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     .into_owned(),
                 domain_name: None,
             });
+            // Restore env_id from the sibling file written at register
+            // time so `etcd.effective_prefix()` keeps scoping reads to
+            // `/aisix/<env_id>/` across DP restarts. Missing file is a
+            // hard error — proceeding without env_id would silently
+            // pull the wrong (empty-prefix) tenant.
+            cfg.etcd.env_id = register::read_env_id(&cfg.managed.mtls_dir).map_err(|e| {
+                anyhow::anyhow!(
+                    "managed mode: bundle on disk but env_id file unreadable at {:?}: {e}",
+                    register::env_id_path(&cfg.managed.mtls_dir),
+                )
+            })?;
             match load_heartbeat_config_from_disk(&cfg.managed) {
                 Ok(h) => Some(h),
                 Err(e) => {
@@ -575,6 +588,11 @@ fn load_heartbeat_config_from_disk(
         url,
         dp_id,
         std::time::Duration::from_secs(15),
+        heartbeat::MtlsBundle {
+            ca_cert_path: register::ca_cert_path(&managed.mtls_dir),
+            client_cert_path: register::client_cert_path(&managed.mtls_dir),
+            client_key_path: register::client_key_path(&managed.mtls_dir),
+        },
     ))
 }
 

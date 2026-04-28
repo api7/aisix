@@ -1,5 +1,13 @@
 //! `ApiKey` entity — the caller-facing credential presented in
-//! `Authorization: Bearer <key>` (spec §3, §7).
+//! `Authorization: Bearer <plaintext>` (spec §3, §7).
+//!
+//! Self-hosted CP (prd-09a §9A.7B.4): the KV payload stores
+//! **`key_hash`** (SHA-256 hex of the plaintext bearer) instead of
+//! the plaintext. cp-api stores only the hash and shows the
+//! plaintext to the user exactly once at create time. The DP proxy
+//! hashes incoming bearer tokens (`aisix-proxy/src/auth.rs`) and
+//! looks up by the hash. Net security win: no plaintext API key
+//! ever sits in the DB or KV.
 
 use serde::{Deserialize, Serialize};
 
@@ -9,11 +17,14 @@ use crate::resource::Resource;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiKey {
-    /// The actual secret bearer value. Secondary-indexed for O(1) auth.
-    pub key: String,
+    /// SHA-256 hex of the plaintext bearer. Secondary-indexed for
+    /// O(1) auth — the proxy hashes incoming bearers before lookup.
+    pub key_hash: String,
 
-    /// Whitelisted Model names. An **empty array** denies every model —
-    /// it is not a shortcut for "all" (spec §3 authz rule).
+    /// Whitelisted Model identifiers. cp-api stores them as model
+    /// UUIDs; self-hosted dev fixtures may still use names — the DP
+    /// does string equality and doesn't care which. An **empty
+    /// array** denies every model (spec §3 authz rule).
     pub allowed_models: Vec<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -31,6 +42,19 @@ pub struct ApiKey {
 }
 
 impl ApiKey {
+    /// Canonical hash function for converting an `Authorization:
+    /// Bearer <plaintext>` value to the form persisted in the
+    /// snapshot (and on the cp-api side as `api_keys.key_hash`).
+    /// SHA-256, lowercase hex. Both sides MUST use this exact
+    /// function — test fixtures and the `aisix-proxy::auth`
+    /// extractor both call through here.
+    pub fn hash_bearer(plaintext: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(plaintext.as_bytes());
+        hex::encode(h.finalize())
+    }
+
     /// True if this key is allowed to call the given Model.
     ///
     /// A wildcard entry `"*"` grants access to every model, matching
@@ -66,10 +90,12 @@ impl Resource for ApiKey {
         &self.runtime_id
     }
 
-    /// For ApiKey the "secondary-indexed" field is `key`, not a human name.
-    /// The name-index in the snapshot therefore points from key → id.
+    /// For ApiKey the "secondary-indexed" field is `key_hash` — the
+    /// proxy hashes the incoming bearer once and uses that as the
+    /// lookup key. The name-index in the snapshot therefore points
+    /// from key_hash → id.
     fn name(&self) -> &str {
-        &self.key
+        &self.key_hash
     }
 
     /// Path segment under `/aisix/<env>/`. v3 (prd-09a §9A.7B.2) uses
@@ -85,29 +111,44 @@ impl Resource for ApiKey {
 mod tests {
     use super::*;
 
+    /// SHA-256 hex of `"sk-my-api-key-123"`.
+    const SAMPLE_PLAINTEXT: &str = "sk-my-api-key-123";
+    const SAMPLE_HASH: &str = "91ed2dbc407561556f3e7be98ba0bd2a57986d6a868c482d867d19c6d40d201c";
+
     fn sample() -> ApiKey {
-        serde_json::from_str(
-            r#"{
-              "key": "sk-my-api-key-123",
+        serde_json::from_str(&format!(
+            r#"{{
+              "key_hash": "{SAMPLE_HASH}",
               "allowed_models": ["my-gpt4", "my-claude"],
-              "rate_limit": {"rpm": 60, "concurrency": 5}
-            }"#,
-        )
+              "rate_limit": {{"rpm": 60, "concurrency": 5}}
+            }}"#
+        ))
         .unwrap()
     }
 
     #[test]
     fn deserialises_spec_sample() {
         let k = sample();
-        assert_eq!(k.key, "sk-my-api-key-123");
+        assert_eq!(k.key_hash, SAMPLE_HASH);
         assert_eq!(k.allowed_models.len(), 2);
         assert_eq!(k.rate_limit.as_ref().unwrap().concurrency, Some(5));
     }
 
     #[test]
+    fn key_hash_is_sha256_of_plaintext() {
+        // Pin the SAMPLE_HASH constant to its plaintext so future
+        // fixture rotations can't drift one without the other.
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(SAMPLE_PLAINTEXT.as_bytes());
+        let got = hex::encode(h.finalize());
+        assert_eq!(got, SAMPLE_HASH);
+    }
+
+    #[test]
     fn empty_allowed_models_denies_everything() {
         let k = ApiKey {
-            key: "sk-x".into(),
+            key_hash: "abc".into(),
             allowed_models: vec![],
             rate_limit: None,
             max_budget_usd: None,
@@ -127,14 +168,16 @@ mod tests {
 
     #[test]
     fn wildcard_grants_access_to_any_model() {
-        let k: ApiKey = serde_json::from_str(r#"{"key":"sk-x","allowed_models":["*"]}"#).unwrap();
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["*"]}"#).unwrap();
         assert!(k.can_access("my-gpt4"));
         assert!(k.can_access("literally-anything"));
     }
 
     #[test]
     fn accessible_models_expands_wildcard_to_full_universe() {
-        let k: ApiKey = serde_json::from_str(r#"{"key":"sk-x","allowed_models":["*"]}"#).unwrap();
+        let k: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"abc","allowed_models":["*"]}"#).unwrap();
         let universe = ["a", "b", "c"];
         let accessible = k.accessible_models(universe.iter().copied());
         assert_eq!(accessible, vec!["a", "b", "c"]);
@@ -151,7 +194,7 @@ mod tests {
 
     #[test]
     fn accessible_models_empty_list_returns_nothing() {
-        let k: ApiKey = serde_json::from_str(r#"{"key":"sk-x","allowed_models":[]}"#).unwrap();
+        let k: ApiKey = serde_json::from_str(r#"{"key_hash":"abc","allowed_models":[]}"#).unwrap();
         let universe = ["a", "b"];
         assert!(k.accessible_models(universe.iter().copied()).is_empty());
     }
@@ -159,7 +202,7 @@ mod tests {
     #[test]
     fn rejects_unknown_fields() {
         let r: Result<ApiKey, _> =
-            serde_json::from_str(r#"{"key":"x","allowed_models":[],"extra":1}"#);
+            serde_json::from_str(r#"{"key_hash":"x","allowed_models":[],"extra":1}"#);
         assert!(r.is_err());
     }
 
@@ -169,6 +212,7 @@ mod tests {
         k.runtime_id = "uuid-ak".into();
         assert_eq!(<ApiKey as Resource>::kind(), "api_keys");
         assert_eq!(k.id(), "uuid-ak");
-        assert_eq!(k.name(), "sk-my-api-key-123");
+        // Resource::name now returns key_hash, not plaintext.
+        assert_eq!(k.name(), SAMPLE_HASH);
     }
 }
