@@ -2,15 +2,17 @@ mod admin;
 pub mod config;
 mod gateway;
 mod proxy;
-mod utils;
+pub mod utils;
 
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 use axum::Router;
 use clap::Parser;
 use log::{error, info};
 use tokio::{select, sync::oneshot};
+
+use crate::utils::observability::init_observability;
 
 /// Git hash of the aisix core at build time.
 pub const GIT_HASH: &str = env!("VERGEN_GIT_SHA");
@@ -117,88 +119,6 @@ pub async fn run_with_provider(
         .context("failed to shutdown observability")?;
 
     res
-}
-
-/// Initialize observability (logging, tracing, metrics).
-///
-/// Returns `(shutdown_sender, shutdown_task_handle)`.
-/// Call `shutdown_sender.send(())` to flush and shut down observability.
-pub fn init_observability() -> Result<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)> {
-    use std::{borrow::Cow, time::Duration};
-
-    use fastrace::collector::Config;
-    use fastrace_opentelemetry::OpenTelemetryReporter;
-    use logforth::{
-        append::{FastraceEvent, Stdout},
-        filter::env_filter::EnvFilterBuilder,
-        layout::TextLayout,
-    };
-    use metrics_exporter_otel::OpenTelemetryRecorder;
-    use opentelemetry::{InstrumentationScope, metrics::MeterProvider};
-    use opentelemetry_otlp::SpanExporter;
-    use opentelemetry_sdk::{
-        Resource,
-        metrics::{PeriodicReader, SdkMeterProvider},
-    };
-
-    const INSTRUMENTATION_NAME: &str = "aisix";
-
-    let (tx, rx) = oneshot::channel::<()>();
-
-    // log
-    logforth::starter_log::builder()
-        .dispatch(|d| {
-            d.filter(EnvFilterBuilder::from_default_env_or("info,opentelemetry_sdk=off").build())
-                .append(Stdout::default().with_layout(TextLayout::default()))
-        })
-        .dispatch(|d| {
-            d.filter(EnvFilterBuilder::from_default_env_or("info").build())
-                .append(FastraceEvent::default())
-        })
-        .apply();
-
-    // trace
-    let reporter = OpenTelemetryReporter::new(
-        SpanExporter::builder()
-            .build()
-            .context("failed to initialize otlp exporter")?,
-        Cow::Owned(Resource::builder().build()),
-        InstrumentationScope::builder(INSTRUMENTATION_NAME)
-            .with_version(env!("CARGO_PKG_VERSION"))
-            .build(),
-    );
-    fastrace::set_reporter(
-        reporter,
-        Config::default().report_interval(Duration::from_secs(1)),
-    );
-
-    // metric
-    let exporter = opentelemetry_otlp::MetricExporter::builder().build()?;
-
-    let reader = PeriodicReader::builder(exporter).build();
-
-    let meter_provider = SdkMeterProvider::builder().with_reader(reader).build();
-    let meter = meter_provider.meter(INSTRUMENTATION_NAME);
-
-    metrics::set_global_recorder(OpenTelemetryRecorder::new(meter))
-        .context("failed to initialize metrics recorder")?;
-    utils::metrics::describe_metrics();
-
-    // shutting down signal handler
-    let shutdown_handle = tokio::spawn(async move {
-        let _ = rx.await;
-
-        fastrace::flush();
-
-        if let Err(e) = meter_provider.shutdown() {
-            error!("Error shutting down meter provider: {}", e);
-        }
-
-        logforth::core::default_logger().flush();
-        logforth::core::default_logger().exit();
-    });
-
-    Ok((tx, shutdown_handle))
 }
 
 async fn serve_proxy(config: Arc<config::Config>, router: Router) -> Result<()> {
