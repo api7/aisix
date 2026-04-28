@@ -4,13 +4,16 @@ mod gateway;
 mod proxy;
 mod utils;
 
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use axum::Router;
 use clap::Parser;
 use log::{error, info};
+use opentelemetry_otlp::SpanExporter;
 use tokio::{select, sync::oneshot};
+
+use crate::utils::observability::BoxedSpanExporter;
 
 /// Git hash of the aisix core at build time.
 pub const GIT_HASH: &str = env!("VERGEN_GIT_SHA");
@@ -34,7 +37,7 @@ pub struct Args {
 /// and blocks until a signal is received or a server error occurs.
 pub async fn run(config_file: Option<String>) -> Result<()> {
     let (ob_shutdown_signal, ob_shutdown_task) =
-        init_observability().context("failed to initialize observability")?;
+        init_observability(None).context("failed to initialize observability")?;
     let config = match config::load(config_file).context("failed to load configuration") {
         Ok(c) => Arc::new(c),
         Err(e) => {
@@ -121,10 +124,16 @@ pub async fn run_with_provider(
 
 /// Initialize observability (logging, tracing, metrics).
 ///
+/// When `span_exporter` is `Some`, the provided boxed exporter is used to
+/// construct the tracing reporter. Otherwise an OTLP span exporter is created
+/// internally.
+///
 /// Returns `(shutdown_sender, shutdown_task_handle)`.
 /// Call `shutdown_sender.send(())` to flush and shut down observability.
-pub fn init_observability() -> Result<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)> {
-    use std::{borrow::Cow, time::Duration};
+pub fn init_observability(
+    span_exporter: Option<BoxedSpanExporter>,
+) -> Result<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)> {
+    use std::borrow::Cow;
 
     use fastrace::collector::Config;
     use fastrace_opentelemetry::OpenTelemetryReporter;
@@ -135,7 +144,6 @@ pub fn init_observability() -> Result<(oneshot::Sender<()>, tokio::task::JoinHan
     };
     use metrics_exporter_otel::OpenTelemetryRecorder;
     use opentelemetry::{InstrumentationScope, metrics::MeterProvider};
-    use opentelemetry_otlp::SpanExporter;
     use opentelemetry_sdk::{
         Resource,
         metrics::{PeriodicReader, SdkMeterProvider},
@@ -158,10 +166,16 @@ pub fn init_observability() -> Result<(oneshot::Sender<()>, tokio::task::JoinHan
         .apply();
 
     // trace
+    let span_exporter = match span_exporter {
+        Some(exporter) => exporter,
+        None => BoxedSpanExporter::new(
+            SpanExporter::builder()
+                .build()
+                .context("failed to initialize otlp exporter")?,
+        ),
+    };
     let reporter = OpenTelemetryReporter::new(
-        SpanExporter::builder()
-            .build()
-            .context("failed to initialize otlp exporter")?,
+        span_exporter,
         Cow::Owned(Resource::builder().build()),
         InstrumentationScope::builder(INSTRUMENTATION_NAME)
             .with_version(env!("CARGO_PKG_VERSION"))
