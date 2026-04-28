@@ -76,10 +76,7 @@ pub fn init_observability_trace(
             .with_version(env!("CARGO_PKG_VERSION"))
             .build(),
     );
-    fastrace::set_reporter(
-        reporter,
-        config.unwrap_or_else(|| FastraceConfig::default()),
-    );
+    fastrace::set_reporter(reporter, config.unwrap_or_default());
 
     Ok(shutdown_handler(|| async move { fastrace::flush() }))
 }
