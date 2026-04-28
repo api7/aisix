@@ -165,7 +165,7 @@ impl<T: Clone + 'static> ResourceStore<T> {
         deleted
     }
 
-    #[cfg(test)]
+    /// Get an entry by its primary key
     fn get(&self, key: &str) -> Option<ResourceEntry<T>> {
         self.data.load().primary.get(key).cloned()
     }
@@ -295,14 +295,14 @@ impl<T: DeserializeOwned + Clone + Send + Sync + 'static> EntityStore<T> {
         Self { store }
     }
 
-    /// Get the value of the specified key
-    #[cfg(test)]
-    pub fn get(&self, key: &str) -> Option<ResourceEntry<T>> {
-        self.store.get(key)
-    }
-
+    /// Get a snapshot of all entries
     pub fn list(&self) -> Arc<HashMap<String, ResourceEntry<T>>> {
         self.store.primary_snapshot()
+    }
+
+    /// Get the value of the specified key
+    pub fn get(&self, key: &str) -> Option<ResourceEntry<T>> {
+        self.store.get(key)
     }
 
     /// Get an entry via a secondary index

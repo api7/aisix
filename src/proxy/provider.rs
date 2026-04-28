@@ -2,9 +2,7 @@ use http::HeaderMap;
 use reqwest::Url;
 
 use crate::{
-    config::entities::{
-        Model, Provider, ResourceEntry, ResourceRegistry, providers::ProviderConfig,
-    },
+    config::entities::{Provider, ResourceEntry, providers::ProviderConfig},
     gateway::{
         Gateway,
         error::{GatewayError, Result},
@@ -13,13 +11,10 @@ use crate::{
 };
 
 /// Creates a gateway provider instance for the given model using the gateway registry.
-#[fastrace::trace]
 pub fn create_provider_instance(
     gateway: &Gateway,
-    resources: &ResourceRegistry,
-    model: &ResourceEntry<Model>,
+    provider: &ResourceEntry<Provider>,
 ) -> Result<ProviderInstance> {
-    let provider = resolve_provider(resources, &model.provider_id)?;
     let provider_name = provider.provider_type();
     let def = gateway.registry().get(provider_name).ok_or_else(|| {
         GatewayError::Internal(format!(
@@ -36,18 +31,6 @@ pub fn create_provider_instance(
         base_url_override,
         custom_headers: HeaderMap::new(),
     })
-}
-
-fn resolve_provider(
-    resources: &ResourceRegistry,
-    provider_id: &str,
-) -> Result<ResourceEntry<Provider>> {
-    resources
-        .providers
-        .list()
-        .get(provider_id)
-        .cloned()
-        .ok_or_else(|| GatewayError::Internal(format!("provider {} not found", provider_id)))
 }
 
 fn provider_auth_and_base_url(config: &ProviderConfig) -> Result<(ProviderAuth, Option<Url>)> {

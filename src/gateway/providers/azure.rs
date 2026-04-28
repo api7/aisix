@@ -9,7 +9,7 @@ use crate::gateway::{
     provider_instance::ProviderAuth,
     traits::{
         ChatTransform, CompatQuirks, EmbedTransform, ProviderCapabilities, ProviderMeta,
-        provider::encode_path_segment,
+        ProviderSemanticConventions, provider::encode_path_segment,
     },
     types::{
         embed::{EmbedRequestBody, EmbeddingRequest},
@@ -49,6 +49,14 @@ impl ProviderMeta for AzureDef {
 
     fn default_base_url(&self) -> &'static str {
         DEFAULT_BASE_URL
+    }
+
+    fn semantic_conventions(&self) -> ProviderSemanticConventions {
+        ProviderSemanticConventions {
+            gen_ai_provider_name: "azure.ai.openai",
+            llm_system: "openai",
+            llm_provider: Some("azure"),
+        }
     }
 
     fn chat_endpoint_path(&self, model: &str) -> Cow<'static, str> {
@@ -124,7 +132,10 @@ mod tests {
     use super::{AzureDef, DEFAULT_API_VERSION};
     use crate::gateway::{
         provider_instance::ProviderAuth,
-        traits::{ChatTransform, EmbedTransform, ProviderCapabilities, ProviderMeta},
+        traits::{
+            ChatTransform, EmbedTransform, ProviderCapabilities, ProviderMeta,
+            ProviderSemanticConventions,
+        },
         types::{embed::EmbedRequestBody, openai::ChatCompletionRequest},
     };
 
@@ -171,6 +182,14 @@ mod tests {
         );
         assert_eq!(embed_url.query(), Some("api-version=v1"));
         assert!(provider.as_embed_transform().is_some());
+        assert_eq!(
+            provider.semantic_conventions(),
+            ProviderSemanticConventions {
+                gen_ai_provider_name: "azure.ai.openai",
+                llm_system: "openai",
+                llm_provider: Some("azure"),
+            }
+        );
     }
 
     #[test]

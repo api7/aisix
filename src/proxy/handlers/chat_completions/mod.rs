@@ -1,10 +1,11 @@
+mod span_attributes;
 mod types;
 
 use std::{convert::Infallible, time::Duration};
 
 use axum::{
     Json,
-    extract::{Extension, State},
+    extract::State,
     response::{
         IntoResponse, Response,
         sse::{Event as SseEvent, Sse},
@@ -12,12 +13,17 @@ use axum::{
 };
 use fastrace::prelude::{Event as TraceEvent, *};
 use log::error;
-use tokio::sync::oneshot;
+use span_attributes::{
+    StreamOutputCollector, apply_span_properties, chunk_span_properties, request_span_properties,
+    response_span_properties, usage_span_properties,
+};
+use tokio::sync::{oneshot, oneshot::error::TryRecvError};
 pub use types::ChatCompletionError;
 
 use crate::{
     config::entities::{Model, ResourceEntry},
     gateway::{
+        error::GatewayError,
         formats::OpenAIChatFormat,
         traits::ChatFormat,
         types::{
@@ -31,13 +37,11 @@ use crate::{
         hooks::{self, RequestContext},
         provider::create_provider_instance,
     },
-    utils::future::maybe_timeout,
+    utils::future::{WithSpan, maybe_timeout},
 };
 
-#[fastrace::trace]
 pub async fn chat_completions(
     State(state): State<AppState>,
-    Extension(span_ctx): Extension<SpanContext>,
     mut request_ctx: RequestContext,
     Json(mut request_data): Json<ChatCompletionRequest>,
 ) -> Result<Response, ChatCompletionError> {
@@ -62,27 +66,51 @@ pub async fn chat_completions(
 
     let gateway = state.gateway();
     let resources = state.resources();
-    let provider_instance = create_provider_instance(gateway.as_ref(), resources.as_ref(), &model)?;
+    let provider = model.provider(resources.as_ref()).ok_or_else(|| {
+        GatewayError::Internal(format!("provider {} not found", model.provider_id))
+    })?;
+    let provider_instance = create_provider_instance(gateway.as_ref(), &provider)?;
+    let provider_base_url = provider_instance.effective_base_url().ok();
 
-    match maybe_timeout(
-        timeout,
-        gateway.chat_completion(&request_data, &provider_instance),
-    )
-    .await
-    {
-        Ok(response) => match response? {
-            ChatResponse::Complete { response, usage } => {
-                handle_regular_request(response, usage, &mut request_ctx).await
-            }
-            ChatResponse::Stream { stream, usage_rx } => {
-                handle_stream_request(stream, usage_rx, &mut request_ctx, span_ctx).await
-            }
-        },
-        Err(err) => Err(ChatCompletionError::Timeout(err)),
+    let span = Span::enter_with_local_parent("aisix.llm.chat_completion");
+    apply_span_properties(
+        &span,
+        request_span_properties(
+            &request_data,
+            provider_instance.def.as_ref(),
+            provider_base_url.as_ref(),
+        ),
+    );
+
+    let (response, span) = (WithSpan {
+        inner: maybe_timeout(
+            timeout,
+            gateway.chat_completion(&request_data, &provider_instance),
+        ),
+        span: Some(span),
+    })
+    .await;
+
+    match response {
+        Ok(Ok(ChatResponse::Complete { response, usage })) => {
+            LocalSpan::add_properties(|| response_span_properties(&response, &usage));
+            handle_regular_request(response, usage, &mut request_ctx).await
+        }
+        Ok(Ok(ChatResponse::Stream { stream, usage_rx })) => {
+            LocalSpan::add_property(|| ("error.type", "no_stream"));
+            handle_stream_request(stream, usage_rx, &mut request_ctx, span).await
+        }
+        Ok(Err(err)) => {
+            LocalSpan::add_property(|| ("error.type", "gateway_error"));
+            Err(err.into())
+        }
+        Err(err) => {
+            LocalSpan::add_property(|| ("error.type", "timeout"));
+            Err(ChatCompletionError::Timeout(err))
+        }
     }
 }
 
-#[fastrace::trace]
 async fn handle_regular_request(
     response: ChatCompletionResponse,
     usage: Usage,
@@ -119,29 +147,36 @@ fn spawn_stream_usage_observer(request_ctx: RequestContext, usage_rx: oneshot::R
     });
 }
 
-#[fastrace::trace]
 async fn handle_stream_request(
     stream: ChatResponseStream<OpenAIChatFormat>,
     usage_rx: oneshot::Receiver<Usage>,
     request_ctx: &mut RequestContext,
-    span_ctx: SpanContext,
+    span: Span,
 ) -> Result<Response, ChatCompletionError> {
     use futures::stream::StreamExt;
 
-    spawn_stream_usage_observer(request_ctx.clone(), usage_rx);
-
     let stream_request_ctx = request_ctx.clone();
-    let stream_span = Span::root("sse_connection", span_ctx);
     let sse_stream = futures::stream::unfold(
         (
             stream,
-            stream_span,
+            span,
             0usize,
             stream_request_ctx,
             false,
             false,
+            Some(usage_rx),
+            StreamOutputCollector::default(),
         ),
-        |(mut stream, span, idx, mut request_ctx, done, saw_chunk)| async move {
+        |(
+            mut stream,
+            span,
+            idx,
+            mut request_ctx,
+            done,
+            saw_chunk,
+            mut usage_rx,
+            mut output_collector,
+        )| async move {
             if done {
                 drop(span);
                 return None;
@@ -149,12 +184,22 @@ async fn handle_stream_request(
 
             match stream.next().await {
                 Some(Ok(chunk)) => {
+                    output_collector.record_chunk(&chunk);
+
                     if idx == 0 {
                         hooks::observability::record_first_token_latency(&mut request_ctx).await;
-                        span.add_event(TraceEvent::new(format!(
-                            "{} first token arrived",
-                            OpenAIChatFormat::name()
-                        )));
+                        span.add_event(TraceEvent::new("first token arrived"));
+                        span.add_properties(|| chunk_span_properties(&chunk));
+                    } else {
+                        let properties = chunk_span_properties(&chunk);
+                        properties
+                            .iter()
+                            .filter(|(key, _)| {
+                                key == "gen_ai.response.finish_reasons"
+                                    || key == "llm.finish_reason"
+                                    || key == "llm.token_count.completion_details.reasoning"
+                            })
+                            .for_each(|item| span.add_property(|| item.clone()));
                     }
 
                     let mut event =
@@ -164,18 +209,75 @@ async fn handle_stream_request(
                     }
                     let event = Ok::<SseEvent, Infallible>(event);
 
-                    Some((event, (stream, span, idx + 1, request_ctx, false, true)))
+                    Some((
+                        event,
+                        (
+                            stream,
+                            span,
+                            idx + 1,
+                            request_ctx,
+                            false,
+                            true,
+                            usage_rx,
+                            output_collector,
+                        ),
+                    ))
                 }
                 Some(Err(err)) => {
                     error!("Gateway stream error: {}", err);
+                    span.add_property(|| ("error.type", "stream_error"));
+                    span.add_properties(|| output_collector.output_message_span_properties());
+                    if let Some(usage_rx) = usage_rx.take() {
+                        spawn_stream_usage_observer(request_ctx.clone(), usage_rx);
+                    }
                     drop(span);
                     None
                 }
                 None => {
+                    span.add_properties(|| output_collector.output_message_span_properties());
+
+                    if let Some(mut usage_rx) = usage_rx.take() {
+                        match usage_rx.try_recv() {
+                            Ok(usage) => {
+                                if let Err(err) = hooks::rate_limit::post_check_streaming(
+                                    &mut request_ctx,
+                                    &usage,
+                                )
+                                .await
+                                {
+                                    error!("Rate limit post_check_streaming error: {}", err);
+                                }
+                                hooks::observability::record_streaming_usage(
+                                    &mut request_ctx,
+                                    &usage,
+                                )
+                                .await;
+                                span.add_properties(|| usage_span_properties(&usage));
+                            }
+                            Err(TryRecvError::Empty) => {
+                                spawn_stream_usage_observer(request_ctx.clone(), usage_rx);
+                            }
+                            Err(TryRecvError::Closed) => {
+                                error!(
+                                    "Failed to receive streaming usage from gateway: channel closed"
+                                );
+                            }
+                        }
+                    }
+
                     if saw_chunk {
                         Some((
                             Ok(SseEvent::default().data("[DONE]")),
-                            (stream, span, idx + 1, request_ctx, true, saw_chunk),
+                            (
+                                stream,
+                                span,
+                                idx + 1,
+                                request_ctx,
+                                true,
+                                saw_chunk,
+                                usage_rx,
+                                output_collector,
+                            ),
                         ))
                     } else {
                         drop(span);

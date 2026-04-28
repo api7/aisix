@@ -25,6 +25,8 @@ use opentelemetry_semantic_conventions::trace::{
     HTTP_REQUEST_METHOD, HTTP_RESPONSE_STATUS_CODE, HTTP_ROUTE, URL_PATH,
 };
 
+use crate::utils::future::WithSpan;
+
 pub const TRACEPARENT_HEADER: &str = "traceparent";
 
 pub struct TimedBody {
@@ -34,6 +36,7 @@ pub struct TimedBody {
     metric_endpoint: String,
     metric_status_code: u16,
     latency_recorded: bool,
+    span: Option<Span>,
 }
 
 impl http_body::Body for TimedBody {
@@ -47,10 +50,19 @@ impl http_body::Body for TimedBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let poll = Pin::new(&mut self.inner).poll_frame(cx);
 
-        if let Poll::Ready(None) = &poll {
+        match &poll {
+            Poll::Ready(Some(Ok(frame))) => {
+                self.on_body_chunk(frame);
+            }
             // At this moment, all frames have been consumed by hyper, but it remains uncertain whether
             // the data has been written to the kernel TCP buffer or sent to the client.
-            self.record_latency();
+            Poll::Ready(None) => {
+                self.on_eos();
+            }
+            Poll::Ready(Some(Err(_))) => {
+                self.on_eos();
+            }
+            Poll::Pending => {}
         }
 
         poll
@@ -75,6 +87,13 @@ impl Drop for TimedBody {
 }
 
 impl TimedBody {
+    fn on_body_chunk(&mut self, _frame: &Frame<Bytes>) {}
+
+    fn on_eos(&mut self) {
+        self.record_latency();
+        self.span.take();
+    }
+
     fn record_latency(&mut self) {
         if self.latency_recorded {
             return;
@@ -107,13 +126,13 @@ pub async fn trace(mut req: Request, next: Next) -> Response<TimedBody> {
         .to_string();
     let path = req.uri().path().to_string();
 
-    let (span, span_ctx) = generate_span(&req);
+    let (root_span, span_ctx) = generate_span(&req);
 
     // Inject span context to facilitate generate new root spans throughout the project.
     // A typical use case is span recording for SSE streams.
     req.extensions_mut().insert(span_ctx);
 
-    span.add_properties(|| {
+    root_span.add_properties(|| {
         [
             (HTTP_REQUEST_METHOD, method.to_string()),
             (URL_PATH, path.clone()),
@@ -121,20 +140,22 @@ pub async fn trace(mut req: Request, next: Next) -> Response<TimedBody> {
     });
 
     if let Some(ref route) = matched_path {
-        span.add_property(|| (HTTP_ROUTE, route.as_str().to_string()));
+        root_span.add_property(|| (HTTP_ROUTE, route.as_str().to_string()));
     }
 
-    let response = async {
-        let response = next.run(req).await;
-        LocalSpan::add_property(|| {
-            (
-                HTTP_RESPONSE_STATUS_CODE,
-                response.status().as_u16().to_string(),
-            )
-        });
-        response
-    }
-    .in_span(span)
+    let (response, root_span) = (WithSpan {
+        inner: async {
+            let response = next.run(req).await;
+            LocalSpan::add_property(|| {
+                (
+                    HTTP_RESPONSE_STATUS_CODE,
+                    response.status().as_u16().to_string(),
+                )
+            });
+            response
+        },
+        span: Some(root_span),
+    })
     .await;
 
     let (parts, body) = response.into_parts();
@@ -156,6 +177,7 @@ pub async fn trace(mut req: Request, next: Next) -> Response<TimedBody> {
             metric_endpoint: metric_endpoint.clone(),
             metric_status_code,
             latency_recorded: false,
+            span: Some(root_span),
         },
     );
 

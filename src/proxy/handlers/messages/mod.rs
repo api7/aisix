@@ -18,6 +18,7 @@ pub use types::MessagesError;
 use crate::{
     config::entities::{Model, ResourceEntry},
     gateway::{
+        error::GatewayError,
         formats::AnthropicMessagesFormat,
         traits::ChatFormat,
         types::{
@@ -69,7 +70,10 @@ pub async fn messages(
 
     let gateway = state.gateway();
     let resources = state.resources();
-    let provider_instance = create_provider_instance(gateway.as_ref(), resources.as_ref(), &model)?;
+    let provider = model.provider(resources.as_ref()).ok_or_else(|| {
+        GatewayError::Internal(format!("provider {} not found", model.provider_id))
+    })?;
+    let provider_instance = create_provider_instance(gateway.as_ref(), &provider)?;
 
     match maybe_timeout(timeout, gateway.messages(&request_data, &provider_instance)).await {
         Ok(response) => match response? {
@@ -146,10 +150,7 @@ async fn handle_stream_request(
                 Some(Ok(event)) => {
                     if idx == 0 {
                         hooks::observability::record_first_token_latency(&mut request_ctx).await;
-                        span.add_event(TraceEvent::new(format!(
-                            "{} first token arrived",
-                            AnthropicMessagesFormat::name()
-                        )));
+                        span.add_event(TraceEvent::new("first token arrived"));
                     }
 
                     let sse_event = Ok::<SseEvent, Infallible>(serialize_stream_event(&event));

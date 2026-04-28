@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 use crate::gateway::{
     error::{GatewayError, Result},
     provider_instance::ProviderAuth,
-    traits::{ChatTransform, EmbedTransform, ProviderCapabilities, ProviderMeta},
+    traits::{
+        ChatTransform, EmbedTransform, ProviderCapabilities, ProviderMeta,
+        ProviderSemanticConventions,
+    },
 };
 
 pub const IDENTIFIER: &str = "gemini";
@@ -28,6 +31,14 @@ impl ProviderMeta for GoogleDef {
 
     fn default_base_url(&self) -> &'static str {
         "https://generativelanguage.googleapis.com/v1beta/openai"
+    }
+
+    fn semantic_conventions(&self) -> ProviderSemanticConventions {
+        ProviderSemanticConventions {
+            gen_ai_provider_name: "gcp.gemini",
+            llm_system: "gemini",
+            llm_provider: Some("google"),
+        }
     }
 
     fn chat_endpoint_path(&self, _model: &str) -> Cow<'static, str> {
@@ -67,7 +78,7 @@ mod tests {
     use super::GoogleDef;
     use crate::gateway::{
         provider_instance::ProviderAuth,
-        traits::{EmbedTransform, ProviderCapabilities, ProviderMeta},
+        traits::{EmbedTransform, ProviderCapabilities, ProviderMeta, ProviderSemanticConventions},
     };
 
     #[test]
@@ -92,5 +103,13 @@ mod tests {
         );
         assert_eq!(headers["x-goog-api-key"], "gemini-key");
         assert!(provider.as_embed_transform().is_some());
+        assert_eq!(
+            provider.semantic_conventions(),
+            ProviderSemanticConventions {
+                gen_ai_provider_name: "gcp.gemini",
+                llm_system: "gemini",
+                llm_provider: Some("google"),
+            }
+        );
     }
 }

@@ -98,6 +98,10 @@ impl ProvidersStore {
     pub fn list(&self) -> Arc<HashMap<String, ResourceEntry<Provider>>> {
         self.store.list()
     }
+
+    pub fn get_by_id(&self, id: &str) -> Option<ResourceEntry<Provider>> {
+        self.store.get(id)
+    }
 }
 
 #[cfg(test)]

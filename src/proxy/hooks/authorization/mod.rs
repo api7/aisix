@@ -57,7 +57,7 @@ impl IntoResponse for AuthorizationError {
     }
 }
 
-#[fastrace::trace]
+#[fastrace::trace(name = "aisix.proxy.hook.authz")]
 pub async fn check(ctx: &mut RequestContext, model_name: String) -> Result<(), AuthorizationError> {
     let model = match ctx.app_state().resources().models.get_by_name(&model_name) {
         Some(model) => model,

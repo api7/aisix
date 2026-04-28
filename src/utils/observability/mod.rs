@@ -19,7 +19,7 @@ use opentelemetry_sdk::{
     metrics::{PeriodicReader, SdkMeterProvider},
 };
 use tokio::{sync::oneshot, task::JoinHandle};
-pub use trace::*;
+pub use trace::{BoxedSpanExporter, DynSpanExporter};
 
 use crate::utils;
 

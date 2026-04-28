@@ -17,7 +17,7 @@ use crate::gateway::{
     provider_instance::ProviderAuth,
     traits::{
         ChatStreamState, ChatTransform, PreparedRequest, ProviderCapabilities, ProviderMeta,
-        StreamReaderKind, provider::encode_path_segment,
+        ProviderSemanticConventions, StreamReaderKind, provider::encode_path_segment,
     },
     types::openai::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
 };
@@ -75,6 +75,14 @@ impl ProviderMeta for BedrockDef {
 
     fn default_base_url(&self) -> &'static str {
         DEFAULT_BASE_URL
+    }
+
+    fn semantic_conventions(&self) -> ProviderSemanticConventions {
+        ProviderSemanticConventions {
+            gen_ai_provider_name: "aws.bedrock",
+            llm_system: "amazon",
+            llm_provider: Some("aws"),
+        }
     }
 
     fn chat_endpoint_path(&self, model: &str) -> Cow<'static, str> {
@@ -217,7 +225,7 @@ mod tests {
     use super::{BedrockDef, BedrockProviderConfig};
     use crate::gateway::{
         provider_instance::ProviderAuth,
-        traits::{PreparedRequest, ProviderMeta},
+        traits::{PreparedRequest, ProviderMeta, ProviderSemanticConventions},
     };
 
     #[test]
@@ -261,6 +269,15 @@ mod tests {
     #[test]
     fn build_url_uses_overlap_handling_and_encodes_model_ids_with_slashes() {
         let provider = BedrockDef;
+
+        assert_eq!(
+            provider.semantic_conventions(),
+            ProviderSemanticConventions {
+                gen_ai_provider_name: "aws.bedrock",
+                llm_system: "amazon",
+                llm_provider: Some("aws"),
+            }
+        );
 
         let url = provider.build_url(
             "https://bedrock-runtime.us-east-1.amazonaws.com/model",

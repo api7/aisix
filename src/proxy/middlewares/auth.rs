@@ -4,6 +4,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use fastrace::Span;
 use serde_json::json;
 
 use crate::{
@@ -53,6 +54,8 @@ pub async fn auth(
     mut req: Request,
     next: Next,
 ) -> Result<Response, AuthError> {
+    let span = Span::enter_with_local_parent("aisix.proxy.middleware.authn");
+
     let api_key = if let Some(value) = req.headers().get(http::header::AUTHORIZATION) {
         let header = value.to_str().unwrap_or("");
         let (prefix, rest) = header.split_at(7.min(header.len()));
@@ -73,8 +76,13 @@ pub async fn auth(
             return Err(AuthError::InvalidApiKey);
         }
     };
+
+    span.add_property(|| ("aisix.apikey_id", api_key.id.clone()));
+
     req.extensions_mut()
         .insert::<ResourceEntry<ApiKey>>(api_key);
+
+    drop(span);
 
     Ok(next.run(req).await)
 }

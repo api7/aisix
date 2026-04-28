@@ -45,10 +45,25 @@ pub(crate) fn encode_path_segment(segment: &str) -> String {
     utf8_percent_encode(segment, PATH_SEGMENT_ENCODE_SET).to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderSemanticConventions {
+    pub gen_ai_provider_name: &'static str,
+    pub llm_system: &'static str,
+    pub llm_provider: Option<&'static str>,
+}
+
 /// Provider metadata with no data transformation logic.
 pub trait ProviderMeta: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     fn default_base_url(&self) -> &'static str;
+
+    fn semantic_conventions(&self) -> ProviderSemanticConventions {
+        ProviderSemanticConventions {
+            gen_ai_provider_name: self.name(),
+            llm_system: self.name(),
+            llm_provider: None,
+        }
+    }
 
     /// Chat endpoint path for the provider. Implementations may use `model`
     /// for providers whose route shape depends on the model name.
@@ -306,7 +321,10 @@ mod tests {
     use http::HeaderMap;
     use serde_json::json;
 
-    use super::{ChatTransform, CompatQuirks, EmbedTransform, ProviderMeta, StreamReaderKind};
+    use super::{
+        ChatTransform, CompatQuirks, EmbedTransform, ProviderMeta,
+        ProviderSemanticConventions, StreamReaderKind,
+    };
     use crate::gateway::{
         provider_instance::ProviderAuth,
         traits::chat_format::ChatStreamState,
@@ -419,6 +437,20 @@ mod tests {
         quirks.apply_to_request(&mut body);
 
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn provider_meta_uses_name_based_default_semantic_conventions() {
+        let provider = DummyProvider;
+
+        assert_eq!(
+            provider.semantic_conventions(),
+            ProviderSemanticConventions {
+                gen_ai_provider_name: "dummy",
+                llm_system: "dummy",
+                llm_provider: None,
+            }
+        );
     }
 
     #[test]

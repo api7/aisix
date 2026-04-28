@@ -26,6 +26,7 @@ pub trait ChatFormat: Send + Sync + 'static {
     type NativeStreamState: Default + Send + Unpin;
 
     /// Stable format name used for logs and diagnostics.
+    #[allow(unused)]
     fn name() -> &'static str;
 
     /// Whether the request expects a streaming response.

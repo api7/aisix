@@ -12,9 +12,12 @@ pub use types::EmbeddingError;
 
 use crate::{
     config::entities::{Model, ResourceEntry},
-    gateway::types::{
-        common::Usage,
-        embed::{EmbeddingRequest, EmbeddingResponse},
+    gateway::{
+        error::GatewayError,
+        types::{
+            common::Usage,
+            embed::{EmbeddingRequest, EmbeddingResponse},
+        },
     },
     proxy::{
         AppState,
@@ -54,7 +57,10 @@ pub async fn embeddings(
 
     let gateway = state.gateway();
     let resources = state.resources();
-    let provider_instance = create_provider_instance(gateway.as_ref(), resources.as_ref(), &model)?;
+    let provider = model.provider(resources.as_ref()).ok_or_else(|| {
+        GatewayError::Internal(format!("provider {} not found", model.provider_id))
+    })?;
+    let provider_instance = create_provider_instance(gateway.as_ref(), &provider)?;
     let timeout = model.timeout.map(Duration::from_millis);
 
     // Replace request model name with real model name

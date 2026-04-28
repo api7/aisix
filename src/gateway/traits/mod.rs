@@ -10,7 +10,7 @@ pub use native::{
 pub use native::{NativeOpenAIResponsesSupport, OpenAIResponsesNativeStreamState};
 pub use provider::{
     ChatTransform, CompatQuirks, EmbedTransform, PreparedRequest, ProviderCapabilities,
-    ProviderMeta, StreamReaderKind,
+    ProviderMeta, ProviderSemanticConventions, StreamReaderKind,
 };
 #[allow(unused_imports)]
 pub use provider::{ImageGenTransform, SttTransform, TtsTransform};
