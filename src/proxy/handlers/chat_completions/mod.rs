@@ -97,7 +97,6 @@ pub async fn chat_completions(
             handle_regular_request(response, usage, &mut request_ctx).await
         }
         Ok(Ok(ChatResponse::Stream { stream, usage_rx })) => {
-            LocalSpan::add_property(|| ("error.type", "no_stream"));
             handle_stream_request(stream, usage_rx, &mut request_ctx, span).await
         }
         Ok(Err(err)) => {

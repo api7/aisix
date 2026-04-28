@@ -10,7 +10,7 @@ use crate::{
     },
 };
 
-/// Creates a gateway provider instance for the given model using the gateway registry.
+/// Creates a gateway provider instance for the given provider using the gateway registry.
 pub fn create_provider_instance(
     gateway: &Gateway,
     provider: &ResourceEntry<Provider>,

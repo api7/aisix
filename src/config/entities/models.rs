@@ -36,6 +36,7 @@ pub struct Model {
 }
 
 impl Model {
+    /// Get provider of current model
     pub fn provider(&self, resources: &ResourceRegistry) -> Option<ResourceEntry<Provider>> {
         resources.providers.get_by_id(&self.provider_id)
     }

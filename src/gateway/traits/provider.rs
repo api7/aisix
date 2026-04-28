@@ -45,6 +45,7 @@ pub(crate) fn encode_path_segment(segment: &str) -> String {
     utf8_percent_encode(segment, PATH_SEGMENT_ENCODE_SET).to_string()
 }
 
+/// OpenTelemetry and OpenInference semantic conventions for the provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderSemanticConventions {
     pub gen_ai_provider_name: &'static str,
@@ -57,6 +58,8 @@ pub trait ProviderMeta: Send + Sync + 'static {
     fn name(&self) -> &'static str;
     fn default_base_url(&self) -> &'static str;
 
+    /// Get the provider's semantic conventions.
+    /// Used for OpenTelemetry and OpenInference semantic conventions.
     fn semantic_conventions(&self) -> ProviderSemanticConventions {
         ProviderSemanticConventions {
             gen_ai_provider_name: self.name(),
@@ -322,8 +325,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ChatTransform, CompatQuirks, EmbedTransform, ProviderMeta,
-        ProviderSemanticConventions, StreamReaderKind,
+        ChatTransform, CompatQuirks, EmbedTransform, ProviderMeta, ProviderSemanticConventions,
+        StreamReaderKind,
     };
     use crate::gateway::{
         provider_instance::ProviderAuth,
