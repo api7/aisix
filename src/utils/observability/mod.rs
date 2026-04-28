@@ -104,20 +104,11 @@ pub fn init_observability_metric() -> Result<(oneshot::Sender<()>, JoinHandle<()
 
 /// Initialize observability (logging, tracing, metrics).
 ///
-/// When `span_exporter` is `Some`, the provided boxed exporter is used to
-/// construct the tracing reporter. Otherwise an OTLP span exporter is created
-/// internally.
-///
 /// Returns `(shutdown_sender, shutdown_task_handle)`.
 /// Call `shutdown_sender.send(())` to flush and shut down observability.
 pub fn init_observability() -> Result<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)> {
-    // log
     let (log_tx, log_shutdown_handle) = init_observability_log()?;
-
-    // trace
     let (trace_tx, trace_shutdown_handle) = init_observability_trace(None, None)?;
-
-    // metric
     let (metric_tx, metric_shutdown_handle) = init_observability_metric()?;
 
     Ok(shutdown_handler(|| async move {

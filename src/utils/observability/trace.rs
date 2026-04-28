@@ -22,19 +22,19 @@ pub trait DynSpanExporter: Send + Sync + Debug {
 #[async_trait]
 impl<T: SpanExporter> DynSpanExporter for T {
     async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
-        Self::export(self, batch).await
+        SpanExporter::export(self, batch).await
     }
 
     fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
-        Self::shutdown_with_timeout(self, timeout)
+        SpanExporter::shutdown_with_timeout(self, timeout)
     }
 
     fn force_flush(&self) -> OTelSdkResult {
-        Self::force_flush(self)
+        SpanExporter::force_flush(self)
     }
 
     fn set_resource(&mut self, resource: &Resource) {
-        Self::set_resource(self, resource)
+        SpanExporter::set_resource(self, resource)
     }
 }
 
