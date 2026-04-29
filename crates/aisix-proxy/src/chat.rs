@@ -19,7 +19,7 @@
 use aisix_cache::CacheKey;
 use aisix_gateway::{BridgeContext, BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
-use aisix_obs::{AccessLog, LangfuseEvent, Metrics, RequestOutcome};
+use aisix_obs::{AccessLog, LangfuseEvent, Metrics, RequestOutcome, UsageEvent, UsageSink};
 use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -80,6 +80,18 @@ pub async fn chat_completions(
                 success.total_tokens,
                 &request_id,
             );
+            emit_usage_event(
+                &state.usage_sink,
+                &request_id,
+                &success.model_id,
+                &api_key_id,
+                status,
+                elapsed,
+                success.prompt_tokens.unwrap_or(0) as u32,
+                success.completion_tokens.unwrap_or(0) as u32,
+                success.cost_usd,
+                /* guardrail_blocked */ false,
+            );
             if let Some(lf) = state.langfuse.as_ref() {
                 lf.emit(LangfuseEvent {
                     trace_id: request_id.clone(),
@@ -125,6 +137,25 @@ pub async fn chat_completions(
                 None,
                 &request_id,
             );
+            // Telemetry for the failure path. We don't know the resolved
+            // model_id when dispatch fails before model lookup (e.g.
+            // empty messages); the helper handles that with an empty
+            // string. ContentFiltered (guardrail) is recorded with the
+            // dedicated `guardrail_blocked` flag so the dashboard can
+            // surface it on the Blocked tab.
+            let guardrail_blocked = matches!(err, ProxyError::ContentFiltered(_));
+            emit_usage_event(
+                &state.usage_sink,
+                &request_id,
+                /* model_id */ "",
+                &api_key_id,
+                status,
+                elapsed,
+                /* prompt_tokens */ 0,
+                /* completion_tokens */ 0,
+                /* cost_usd */ 0.0,
+                guardrail_blocked,
+            );
             if let Some(lf) = state.langfuse.as_ref() {
                 lf.emit(LangfuseEvent {
                     trace_id: request_id.clone(),
@@ -151,9 +182,16 @@ pub async fn chat_completions(
 struct Success {
     response: Response,
     provider: String,
+    /// UUID of the v3 Model row this request resolved to (the virtual
+    /// model the caller asked for, before any routing fan-out). Empty
+    /// in the unlikely case the resolver was bypassed.
+    model_id: String,
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
+    /// Cost computed via the per-key Budget's pricing table, in USD.
+    /// 0.0 when no budget is configured for the key.
+    cost_usd: f64,
 }
 
 async fn dispatch(
@@ -173,6 +211,7 @@ async fn dispatch(
         .models
         .get_by_name(&req.model)
         .ok_or_else(|| ProxyError::ModelNotFound(req.model.clone()))?;
+    let model_id = virtual_entry.id.clone();
 
     if !auth.key().can_access(&req.model) {
         return Err(ProxyError::ModelForbidden(req.model.clone()));
@@ -270,9 +309,14 @@ async fn dispatch(
         return Ok(Success {
             response: response.into_response(),
             provider: format!("{provider:?}").to_lowercase(),
+            model_id: model_id.clone(),
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
+            // Streaming path doesn't compute cost yet (no token totals
+            // until the stream completes upstream). Phase 2 wires
+            // mid-stream accumulation; for now telemetry records 0.
+            cost_usd: 0.0,
         });
     }
 
@@ -304,9 +348,13 @@ async fn dispatch(
                 return Ok(Success {
                     response,
                     provider: provider_label,
+                    model_id: model_id.clone(),
                     prompt_tokens: Some(prompt),
                     completion_tokens: Some(completion),
                     total_tokens: Some(total),
+                    // Cache hits don't burn cost on our side (we already
+                    // paid the upstream price the first time around).
+                    cost_usd: 0.0,
                 });
             }
             Ok(None) => {}
@@ -385,10 +433,16 @@ async fn dispatch(
     // Budget post-deduct. Add the actual cost; doesn't gate the
     // current response (we already paid for it) but shapes future
     // pre-checks within the same calendar month.
-    if let Some(b) = budget_for_key.as_ref() {
+    let cost_usd = if let Some(b) = budget_for_key.as_ref() {
         let cost = b.value.cost_for(total);
         state.budgets.add(&auth.entry.id, cost);
-    }
+        cost
+    } else {
+        // No budget configured for this key → no per-request pricing
+        // table. Telemetry records 0; cp-api stores it as $0 and the
+        // /usage page treats it as untracked.
+        0.0
+    };
 
     if let GuardrailVerdict::Block { reason } = state.guardrails.check_output(&upstream).await {
         return Err(ProxyError::ContentFiltered(reason));
@@ -410,9 +464,11 @@ async fn dispatch(
     Ok(Success {
         response,
         provider: provider_name,
+        model_id,
         prompt_tokens: Some(prompt),
         completion_tokens: Some(completion),
         total_tokens: Some(total),
+        cost_usd,
     })
 }
 
@@ -429,6 +485,40 @@ fn record_success(
     if let Some(total) = s.total_tokens {
         metrics.record_tokens(provider, model, total);
     }
+}
+
+/// Push one telemetry event onto the CP-side sink. Non-blocking;
+/// drops with a tracing::warn! if the worker queue is full.
+/// Centralised here so success / error / streaming all share the same
+/// event-construction logic and the wire shape stays consistent
+/// across paths.
+#[allow(clippy::too_many_arguments)]
+fn emit_usage_event(
+    sink: &UsageSink,
+    request_id: &str,
+    model_id: &str,
+    api_key_id: &str,
+    status_code: u16,
+    elapsed: Duration,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cost_usd: f64,
+    guardrail_blocked: bool,
+) {
+    sink.try_emit(UsageEvent {
+        request_id: request_id.to_string(),
+        // RFC 3339 UTC. cp-api parses with time.Parse(time.RFC3339, ...);
+        // chrono's `to_rfc3339_opts(Secs, true)` emits the trailing Z.
+        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        model_id: model_id.to_string(),
+        api_key_id: api_key_id.to_string(),
+        prompt_tokens,
+        completion_tokens,
+        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        status_code,
+        cost_usd,
+        guardrail_blocked,
+    });
 }
 
 fn record_error(metrics: &Metrics, err: &ProxyError, model: &str, status: u16, elapsed: Duration) {

@@ -19,7 +19,7 @@ use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ProxyConfig};
 use aisix_gateway::Hub;
 use aisix_guardrails::{Guardrail, GuardrailChain};
-use aisix_obs::{LangfuseSender, Metrics};
+use aisix_obs::{LangfuseSender, Metrics, UsageSink};
 use aisix_ratelimit::Limiter;
 use std::sync::Arc;
 
@@ -47,6 +47,11 @@ pub struct ProxyState {
     /// Optional Langfuse exporter. When `Some`, chat handlers emit one
     /// generation event at end-of-request. `None` disables emission.
     pub langfuse: Option<Arc<LangfuseSender>>,
+    /// CP-side usage telemetry sink. Backed by an mpsc channel into the
+    /// sender worker spawned in aisix-server (see `telemetry::spawn`).
+    /// Defaults to a no-op sink when running outside managed mode so
+    /// chat handlers don't have to special-case `Option`.
+    pub usage_sink: UsageSink,
     pub request_body_limit_bytes: usize,
 }
 
@@ -63,6 +68,7 @@ impl ProxyState {
             budgets: Arc::new(BudgetTracker::new()),
             health: Arc::new(HealthTracker::new()),
             langfuse: None,
+            usage_sink: UsageSink::disabled(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }
@@ -86,6 +92,7 @@ impl ProxyState {
             budgets: Arc::new(BudgetTracker::new()),
             health: Arc::new(HealthTracker::new()),
             langfuse: None,
+            usage_sink: UsageSink::disabled(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }
@@ -112,6 +119,7 @@ impl ProxyState {
             budgets: Arc::new(BudgetTracker::new()),
             health: Arc::new(HealthTracker::new()),
             langfuse: None,
+            usage_sink: UsageSink::disabled(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }
@@ -134,6 +142,14 @@ impl ProxyState {
     /// no events are emitted regardless of request volume.
     pub fn with_langfuse(mut self, sender: Arc<LangfuseSender>) -> Self {
         self.langfuse = Some(sender);
+        self
+    }
+
+    /// Attach a CP-side usage telemetry sink. Default is `disabled()`;
+    /// the server bootstrap calls this in managed mode after spawning
+    /// the sender worker.
+    pub fn with_usage_sink(mut self, sink: UsageSink) -> Self {
+        self.usage_sink = sink;
         self
     }
 }

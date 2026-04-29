@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 mod heartbeat;
 mod register;
+mod telemetry;
 
 use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore};
 use aisix_cache::{Cache, MemoryCache, RedisCache};
@@ -282,7 +283,25 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // Spawn heartbeat worker if we have a config for it. The
     // JoinHandle is awaited after graceful shutdown below so the
     // final in-flight beat drains cleanly.
+    //
+    // Telemetry shares the heartbeat config: same on-disk mTLS bundle
+    // (issued by /dp/register) + same cp_base URL host. We derive the
+    // /dp/telemetry URL from the /dp/heartbeat URL by swapping the
+    // path suffix so the two stay in lock-step on cp_base changes.
+    let telemetry_cfg = heartbeat_cfg.as_ref().map(|h| {
+        telemetry::TelemetryConfig::new(
+            h.url.replace("/dp/heartbeat", "/dp/telemetry"),
+            h.mtls.clone(),
+        )
+    });
     let heartbeat_task = heartbeat_cfg.map(|h| heartbeat::spawn(h, cancel_rx.clone()));
+    let (usage_sink, telemetry_task) = match telemetry_cfg {
+        Some(cfg) => {
+            let (sink, handle) = telemetry::spawn(cfg, cancel_rx.clone());
+            (sink, Some(handle))
+        }
+        None => (aisix_obs::UsageSink::disabled(), None),
+    };
 
     // Steps 7-8: build Hub, shared components, then routers.
     let hub = Arc::new(build_hub());
@@ -336,6 +355,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     if let Some(sender) = langfuse_sender {
         proxy_state = proxy_state.with_langfuse(sender);
     }
+    proxy_state = proxy_state.with_usage_sink(usage_sink);
     // Clone shared trackers before consuming proxy_state in build_router.
     let budget_tracker = proxy_state.budgets.clone();
     let health_tracker = proxy_state.health.clone();
@@ -403,6 +423,9 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     let _ = signal_task.await;
     let _ = watch_task.await;
     if let Some(task) = heartbeat_task {
+        let _ = task.await;
+    }
+    if let Some(task) = telemetry_task {
         let _ = task.await;
     }
     tracing::info!("aisix shut down cleanly");
