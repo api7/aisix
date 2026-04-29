@@ -35,10 +35,11 @@ pub struct Args {
 /// Initialises observability, loads config, starts proxy and admin servers,
 /// and blocks until a signal is received or a server error occurs.
 pub async fn run(config_file: Option<String>) -> Result<()> {
-    instance::init().context("failed to initialize instance")?;
-
     let (ob_shutdown_signal, ob_shutdown_task) =
         init_observability().context("failed to initialize observability")?;
+
+    instance::init().context("failed to initialize instance")?;
+
     let config = match config::load(config_file).context("failed to load configuration") {
         Ok(c) => Arc::new(c),
         Err(e) => {

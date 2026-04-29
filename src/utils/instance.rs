@@ -33,10 +33,14 @@ pub fn instance_id() -> String {
 }
 
 fn resolve_instance_id_from_path(path: &Path) -> Result<String> {
-    if let Ok(Some(id)) = read_id_file(path) {
-        debug!("agent: loaded instance_id from {:?}", path);
-        return Ok(id);
-    }
+    match read_id_file(path) {
+        Ok(Some(id)) => {
+            debug!("agent: loaded instance_id from {:?}", path);
+            return Ok(id);
+        }
+        Err(e) => return Err(e),
+        Ok(None) => {}
+    };
 
     let id = Uuid::new_v4().to_string();
 
