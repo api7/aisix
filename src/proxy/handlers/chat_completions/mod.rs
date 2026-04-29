@@ -187,7 +187,10 @@ async fn handle_stream_request(
 
                     if idx == 0 {
                         hooks::observability::record_first_token_latency(&mut request_ctx).await;
-                        span.add_event(TraceEvent::new("first token arrived"));
+                        span.add_event(
+                            TraceEvent::new("first token arrived")
+                                .with_property(|| ("kind", "first_token_arrived")),
+                        );
                         span.add_properties(|| chunk_span_properties(&chunk));
                     } else {
                         let properties = chunk_span_properties(&chunk);
