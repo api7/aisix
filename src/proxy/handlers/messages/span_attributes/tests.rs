@@ -1,3 +1,4 @@
+use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 
 use super::{
@@ -67,28 +68,28 @@ fn request_span_properties_include_system_tool_and_user_attributes() {
 
     let properties = request_span_properties(&request, &provider, None);
 
-    pretty_assertions::assert_eq!(property_value(&properties, "user.id"), Some("user-123"));
-    pretty_assertions::assert_eq!(
+    assert_eq!(property_value(&properties, "user.id"), Some("user-123"));
+    assert_eq!(
         property_value(&properties, "gen_ai.request.top_k"),
         Some("5")
     );
-    pretty_assertions::assert_eq!(
+    assert_eq!(
         property_value(&properties, "llm.input_messages.0.message.role"),
         Some("system")
     );
-    pretty_assertions::assert_eq!(
+    assert_eq!(
         property_value(&properties, "llm.input_messages.1.message.role"),
         Some("user")
     );
-    pretty_assertions::assert_eq!(
+    assert_eq!(
         property_value(&properties, "llm.input_messages.2.message.role"),
         Some("tool")
     );
-    pretty_assertions::assert_eq!(
+    assert_eq!(
         property_value(&properties, "llm.input_messages.2.message.tool_call_id"),
         Some("tool_1")
     );
-    pretty_assertions::assert_eq!(
+    assert_eq!(
         property_value(&properties, "llm.tools.0.tool.name"),
         Some("get_weather")
     );
@@ -96,14 +97,14 @@ fn request_span_properties_include_system_tool_and_user_attributes() {
     let input_messages: Value =
         serde_json::from_str(property_value(&properties, "gen_ai.input.messages").unwrap())
             .unwrap();
-    pretty_assertions::assert_eq!(input_messages[0]["role"], "system");
-    pretty_assertions::assert_eq!(input_messages[2]["role"], "tool");
-    pretty_assertions::assert_eq!(input_messages[2]["parts"][0]["type"], "tool_call_response");
+    assert_eq!(input_messages[0]["role"], "system");
+    assert_eq!(input_messages[2]["role"], "tool");
+    assert_eq!(input_messages[2]["parts"][0]["type"], "tool_call_response");
 
     let tool_definitions: Value =
         serde_json::from_str(property_value(&properties, "gen_ai.tool.definitions").unwrap())
             .unwrap();
-    pretty_assertions::assert_eq!(tool_definitions[0]["name"], "get_weather");
+    assert_eq!(tool_definitions[0]["name"], "get_weather");
 }
 
 #[test]
@@ -138,22 +139,22 @@ fn response_span_properties_include_output_messages_and_usage() {
 
     let properties = response_span_properties(&response, &Usage::default());
 
-    pretty_assertions::assert_eq!(
+    assert_eq!(
         property_value(&properties, "llm.output_messages.0.message.role"),
         Some("assistant")
     );
-    pretty_assertions::assert_eq!(
+    assert_eq!(
         property_value(
             &properties,
             "llm.output_messages.0.message.tool_calls.0.tool_call.function.name",
         ),
         Some("get_weather")
     );
-    pretty_assertions::assert_eq!(
+    assert_eq!(
         property_value(&properties, "gen_ai.usage.input_tokens"),
         Some("15")
     );
-    pretty_assertions::assert_eq!(
+    assert_eq!(
         property_value(&properties, "llm.token_count.total"),
         Some("35")
     );
@@ -161,8 +162,8 @@ fn response_span_properties_include_output_messages_and_usage() {
     let output_messages: Value =
         serde_json::from_str(property_value(&properties, "gen_ai.output.messages").unwrap())
             .unwrap();
-    pretty_assertions::assert_eq!(output_messages[0]["finish_reason"], "tool_use");
-    pretty_assertions::assert_eq!(output_messages[0]["parts"][1]["type"], "tool_call");
+    assert_eq!(output_messages[0]["finish_reason"], "tool_use");
+    assert_eq!(output_messages[0]["parts"][1]["type"], "tool_call");
 }
 
 #[test]
@@ -198,19 +199,19 @@ fn chunk_span_properties_include_message_start_and_stop_reason() {
     let start_properties = chunk_span_properties(&message_start);
     let delta_properties = chunk_span_properties(&message_delta);
 
-    pretty_assertions::assert_eq!(
+    assert_eq!(
         property_value(&start_properties, "gen_ai.response.id"),
         Some("msg_123")
     );
-    pretty_assertions::assert_eq!(
+    assert_eq!(
         property_value(&start_properties, "gen_ai.usage.input_tokens"),
         Some("12")
     );
-    pretty_assertions::assert_eq!(
+    assert_eq!(
         property_value(&delta_properties, "llm.finish_reason"),
         Some("end_turn")
     );
-    pretty_assertions::assert_eq!(
+    assert_eq!(
         property_value(&delta_properties, "gen_ai.usage.output_tokens"),
         Some("11")
     );
@@ -267,11 +268,11 @@ fn stream_output_collector_accumulates_events_into_output_messages() {
 
     let properties = collector.output_message_span_properties();
 
-    pretty_assertions::assert_eq!(
+    assert_eq!(
         property_value(&properties, "llm.output_messages.0.message.content"),
         Some("Hello")
     );
-    pretty_assertions::assert_eq!(
+    assert_eq!(
         property_value(
             &properties,
             "llm.output_messages.0.message.tool_calls.0.tool_call.function.arguments",
@@ -282,5 +283,5 @@ fn stream_output_collector_accumulates_events_into_output_messages() {
     let output_messages: Value =
         serde_json::from_str(property_value(&properties, "gen_ai.output.messages").unwrap())
             .unwrap();
-    pretty_assertions::assert_eq!(output_messages[0]["parts"][1]["arguments"]["city"], "SF");
+    assert_eq!(output_messages[0]["parts"][1]["arguments"]["city"], "SF");
 }
