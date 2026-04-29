@@ -168,6 +168,7 @@ async fn handle_stream_request(
             false,
             Some(usage_rx),
             StreamOutputCollector::default(),
+            false,
         ),
         |(
             mut stream,
@@ -177,6 +178,7 @@ async fn handle_stream_request(
             should_terminate,
             mut usage_rx,
             mut output_collector,
+            mut first_token_arrived,
         )| async move {
             if should_terminate {
                 drop(span);
@@ -187,7 +189,10 @@ async fn handle_stream_request(
                 Some(Ok(event)) => {
                     output_collector.record_event(&event);
 
-                    if let AnthropicStreamEvent::ContentBlockStart { .. } = event {
+                    if let AnthropicStreamEvent::ContentBlockStart { .. } = event
+                        && !first_token_arrived
+                    {
+                        first_token_arrived = true;
                         hooks::observability::record_first_token_latency(&mut request_ctx).await;
                         span.add_event(
                             TraceEvent::new("first token arrived")
@@ -209,6 +214,7 @@ async fn handle_stream_request(
                             false,
                             usage_rx,
                             output_collector,
+                            first_token_arrived,
                         ),
                     ))
                 }
@@ -229,6 +235,7 @@ async fn handle_stream_request(
                             true,
                             usage_rx,
                             output_collector,
+                            first_token_arrived,
                         ),
                     ))
                 }
