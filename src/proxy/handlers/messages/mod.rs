@@ -187,7 +187,7 @@ async fn handle_stream_request(
                 Some(Ok(event)) => {
                     output_collector.record_event(&event);
 
-                    if idx == 0 {
+                    if let AnthropicStreamEvent::ContentBlockStart { .. } = event {
                         hooks::observability::record_first_token_latency(&mut request_ctx).await;
                         span.add_event(
                             TraceEvent::new("first token arrived")
