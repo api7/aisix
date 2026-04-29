@@ -93,18 +93,18 @@ pub async fn chat_completions(
 
     match response {
         Ok(Ok(ChatResponse::Complete { response, usage })) => {
-            LocalSpan::add_properties(|| response_span_properties(&response, &usage));
+            span.add_properties(|| response_span_properties(&response, &usage));
             handle_regular_request(response, usage, &mut request_ctx).await
         }
         Ok(Ok(ChatResponse::Stream { stream, usage_rx })) => {
             handle_stream_request(stream, usage_rx, &mut request_ctx, span).await
         }
         Ok(Err(err)) => {
-            LocalSpan::add_property(|| ("error.type", "gateway_error"));
+            span.add_property(|| ("error.type", "gateway_error"));
             Err(err.into())
         }
         Err(err) => {
-            LocalSpan::add_property(|| ("error.type", "timeout"));
+            span.add_property(|| ("error.type", "timeout"));
             Err(ChatCompletionError::Timeout(err))
         }
     }
