@@ -1,26 +1,25 @@
-use fastrace::prelude::Span;
 use reqwest::Url;
 use serde_json::{Map, Value};
 
+use super::message_attributes::{
+    append_openinference_message_properties, append_openinference_output_message_properties,
+    append_openinference_tool_properties, gen_ai_input_messages_json, gen_ai_output_messages_json,
+    gen_ai_tool_definitions_json, message_view_from_chat_message, response_output_message_views,
+};
 use crate::{
-    gateway::types::{
-        common::Usage,
-        openai::{
-            ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice,
-            ChatCompletionRequest, ChatCompletionResponse, ChatCompletionUsage,
-            ResponseFormat, StopCondition,
+    gateway::{
+        traits::ProviderCapabilities,
+        types::{
+            common::Usage,
+            openai::{
+                ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice,
+                ChatCompletionRequest, ChatCompletionResponse, ChatCompletionUsage, ResponseFormat,
+                StopCondition,
+            },
         },
     },
-    gateway::traits::ProviderCapabilities,
-};
-
-use super::{
-    message_attributes::{
-        append_openinference_message_properties,
-        append_openinference_output_message_properties,
-        append_openinference_tool_properties, gen_ai_input_messages_json,
-        gen_ai_output_messages_json, gen_ai_tool_definitions_json,
-        message_view_from_chat_message, response_output_message_views,
+    proxy::utils::trace::span_attributes::{
+        append_finish_reason_properties, append_usage_properties, collect_finish_reasons,
     },
 };
 
@@ -42,7 +41,10 @@ pub(in crate::proxy::handlers::chat_completions) fn request_span_properties(
             "gen_ai.provider.name".into(),
             provider_semantics.gen_ai_provider_name.to_string(),
         ),
-        ("llm.system".into(), provider_semantics.llm_system.to_string()),
+        (
+            "llm.system".into(),
+            provider_semantics.llm_system.to_string(),
+        ),
         ("gen_ai.request.model".into(), request.model.clone()),
     ];
 
@@ -101,11 +103,7 @@ pub(in crate::proxy::handlers::chat_completions) fn request_span_properties(
         properties.push(("user.id".into(), user_id.clone()));
     }
 
-    append_openinference_message_properties(
-        &mut properties,
-        "llm.input_messages",
-        &input_messages,
-    );
+    append_openinference_message_properties(&mut properties, "llm.input_messages", &input_messages);
 
     if let Some(value) = gen_ai_input_messages_json(&input_messages) {
         properties.push(("gen_ai.input.messages".into(), value));
@@ -181,25 +179,6 @@ pub(in crate::proxy::handlers::chat_completions) fn chunk_span_properties(
     append_chunk_usage_properties(&mut properties, chunk.usage.as_ref());
 
     properties
-}
-
-pub(in crate::proxy::handlers::chat_completions) fn usage_span_properties(
-    usage: &Usage,
-) -> Vec<(String, String)> {
-    let mut properties = Vec::new();
-    append_usage_properties(&mut properties, usage);
-    properties
-}
-
-pub(in crate::proxy::handlers::chat_completions) fn apply_span_properties(
-    span: &Span,
-    properties: Vec<(String, String)>,
-) {
-    if properties.is_empty() {
-        return;
-    }
-
-    span.add_properties(move || properties);
 }
 
 fn response_format_output_type(response_format: Option<&ResponseFormat>) -> Option<&'static str> {
@@ -303,95 +282,6 @@ fn request_invocation_parameters(request: &ChatCompletionRequest) -> Option<Stri
     }
 
     serde_json::to_string(&Value::Object(params)).ok()
-}
-
-fn collect_finish_reasons<I>(finish_reasons: I) -> Vec<String>
-where
-    I: IntoIterator<Item = Option<String>>,
-{
-    let mut values = Vec::new();
-
-    for finish_reason in finish_reasons.into_iter().flatten() {
-        if !values.iter().any(|value| value == &finish_reason) {
-            values.push(finish_reason);
-        }
-    }
-
-    values
-}
-
-fn append_finish_reason_properties(
-    properties: &mut Vec<(String, String)>,
-    finish_reasons: Vec<String>,
-) {
-    if finish_reasons.is_empty() {
-        return;
-    }
-
-    properties.push((
-        "gen_ai.response.finish_reasons".into(),
-        serde_json::to_string(&finish_reasons).unwrap_or_default(),
-    ));
-
-    if let Some(finish_reason) = finish_reasons.first() {
-        properties.push(("llm.finish_reason".into(), finish_reason.clone()));
-    }
-}
-
-fn append_usage_properties(properties: &mut Vec<(String, String)>, usage: &Usage) {
-    if let Some(input_tokens) = usage.input_tokens {
-        let input_tokens = input_tokens.to_string();
-        properties.push(("gen_ai.usage.input_tokens".into(), input_tokens.clone()));
-        properties.push(("llm.token_count.prompt".into(), input_tokens));
-    }
-
-    if let Some(output_tokens) = usage.output_tokens {
-        let output_tokens = output_tokens.to_string();
-        properties.push(("gen_ai.usage.output_tokens".into(), output_tokens.clone()));
-        properties.push(("llm.token_count.completion".into(), output_tokens));
-    }
-
-    if let Some(total_tokens) = usage.resolved_total_tokens() {
-        properties.push(("llm.token_count.total".into(), total_tokens.to_string()));
-    }
-
-    if let Some(cache_creation_input_tokens) = usage.cache_creation_input_tokens {
-        let cache_creation_input_tokens = cache_creation_input_tokens.to_string();
-        properties.push((
-            "gen_ai.usage.cache_creation.input_tokens".into(),
-            cache_creation_input_tokens.clone(),
-        ));
-        properties.push((
-            "llm.token_count.prompt_details.cache_write".into(),
-            cache_creation_input_tokens,
-        ));
-    }
-
-    if let Some(cache_read_input_tokens) = usage.cache_read_input_tokens {
-        let cache_read_input_tokens = cache_read_input_tokens.to_string();
-        properties.push((
-            "gen_ai.usage.cache_read.input_tokens".into(),
-            cache_read_input_tokens.clone(),
-        ));
-        properties.push((
-            "llm.token_count.prompt_details.cache_read".into(),
-            cache_read_input_tokens,
-        ));
-    }
-
-    if let Some(input_audio_tokens) = usage.input_audio_tokens {
-        properties.push((
-            "llm.token_count.prompt_details.audio".into(),
-            input_audio_tokens.to_string(),
-        ));
-    }
-
-    if let Some(output_audio_tokens) = usage.output_audio_tokens {
-        properties.push((
-            "llm.token_count.completion_details.audio".into(),
-            output_audio_tokens.to_string(),
-        ));
-    }
 }
 
 fn append_response_usage_properties(

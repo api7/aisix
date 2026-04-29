@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
-use super::message_attributes::{
-    MessageContentView, MessageView, OutputMessageView, ToolCallView,
-    append_openinference_output_message_properties, gen_ai_output_messages_json,
+use super::message_attributes::{MessageContentView, MessageView, OutputMessageView, ToolCallView};
+use crate::{
+    gateway::types::openai::ChatCompletionChunk,
+    proxy::utils::trace::span_message_attributes::output_message_span_properties,
 };
-use crate::gateway::types::openai::ChatCompletionChunk;
 
 #[derive(Default)]
 struct StreamOutputToolCall {
@@ -72,20 +72,7 @@ impl StreamOutputCollector {
     pub(in crate::proxy::handlers::chat_completions) fn output_message_span_properties(
         &self,
     ) -> Vec<(String, String)> {
-        let output_messages = self.output_message_views();
-        let mut properties = Vec::new();
-
-        append_openinference_output_message_properties(
-            &mut properties,
-            "llm.output_messages",
-            &output_messages,
-        );
-
-        if let Some(value) = gen_ai_output_messages_json(&output_messages) {
-            properties.push(("gen_ai.output.messages".into(), value));
-        }
-
-        properties
+        output_message_span_properties(&self.output_message_views())
     }
 
     fn output_message_views(&self) -> Vec<OutputMessageView> {
