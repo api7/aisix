@@ -117,6 +117,15 @@ mod tests {
     }
 
     #[test]
+    fn returns_error_when_existing_path_is_not_readable_as_file() {
+        let dir = tmp_dir();
+        let path = dir.join("instance_id");
+        std::fs::create_dir_all(&path).unwrap();
+
+        assert!(resolve_instance_id_from_path(&path).is_err());
+    }
+
+    #[test]
     fn writes_new_id_when_file_absent() {
         let dir = tmp_dir();
         let path = dir.join("sub/instance_id");
@@ -128,9 +137,12 @@ mod tests {
 
     #[test]
     fn falls_back_to_memory_when_unwritable() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tmp_dir();
         let blocked = dir.join("blocked");
-        std::fs::write(&blocked, "not-a-dir").unwrap();
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         let target = blocked.join("instance_id");
         let id = resolve_instance_id_from_path(&target).unwrap();
