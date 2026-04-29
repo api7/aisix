@@ -12,7 +12,7 @@ use clap::Parser;
 use log::{error, info};
 use tokio::{select, sync::oneshot};
 
-use crate::utils::observability::init_observability;
+use crate::utils::{instance, observability::init_observability};
 
 /// Git hash of the aisix core at build time.
 pub const GIT_HASH: &str = env!("VERGEN_GIT_SHA");
@@ -37,6 +37,9 @@ pub struct Args {
 pub async fn run(config_file: Option<String>) -> Result<()> {
     let (ob_shutdown_signal, ob_shutdown_task) =
         init_observability().context("failed to initialize observability")?;
+
+    instance::init().context("failed to initialize instance")?;
+
     let config = match config::load(config_file).context("failed to load configuration") {
         Ok(c) => Arc::new(c),
         Err(e) => {
