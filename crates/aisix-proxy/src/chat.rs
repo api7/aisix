@@ -224,22 +224,13 @@ async fn dispatch(
         return Err(ProxyError::ContentFiltered(reason));
     }
 
-    // Budget pre-check. Refuse if the previous request already pushed
-    // monthly spend past the cap. Mid-request overshoot is bounded by
-    // one request worth of tokens — acceptable for V1; a future
-    // pre-debit-by-prompt-tokens-only mode can tighten it.
-    let budget_for_key = snapshot
-        .budgets
-        .entries()
-        .into_iter()
-        .find(|b| b.value.api_key_id == auth.entry.id);
-    if let Some(b) = budget_for_key.as_ref() {
-        if state
-            .budgets
-            .would_exceed(&auth.entry.id, b.value.monthly_usd_cap)
-        {
-            return Err(ProxyError::BudgetExceeded(auth.entry.id.clone()));
-        }
+    // Budget pre-check via cp-api. The DP no longer owns budget state;
+    // cp-api returns a cached/live decision per api_key.
+    let decision = state.budgets.check(&auth.entry.id).await;
+    if !decision.allowed {
+        return Err(ProxyError::BudgetExceeded(
+            decision.reason.unwrap_or_else(|| auth.entry.id.clone()),
+        ));
     }
 
     // Resolve the attempt-list of underlying Model entries. For a
@@ -430,19 +421,9 @@ async fn dispatch(
     let total = upstream.usage.total_tokens as u64;
     reservation.commit_tokens(total);
 
-    // Budget post-deduct. Add the actual cost; doesn't gate the
-    // current response (we already paid for it) but shapes future
-    // pre-checks within the same calendar month.
-    let cost_usd = if let Some(b) = budget_for_key.as_ref() {
-        let cost = b.value.cost_for(total);
-        state.budgets.add(&auth.entry.id, cost);
-        cost
-    } else {
-        // No budget configured for this key → no per-request pricing
-        // table. Telemetry records 0; cp-api stores it as $0 and the
-        // /usage page treats it as untracked.
-        0.0
-    };
+    // cp-api recomputes cost server-side from its pricing catalog when
+    // ingesting telemetry; the DP just records 0.0 on the wire.
+    let cost_usd = 0.0;
 
     if let GuardrailVerdict::Block { reason } = state.guardrails.check_output(&upstream).await {
         return Err(ProxyError::ContentFiltered(reason));

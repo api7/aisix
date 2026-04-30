@@ -1,233 +1,366 @@
-//! In-process budget tracker.
+//! Budget client — asks cp-api per request whether an api_key may proceed.
 //!
-//! Tracks accumulated USD spend per (api_key_id, calendar month) tuple.
-//! Lookup is O(1); the tracker resets a key's counter automatically
-//! when the calendar month rolls over. State is process-local for V1
-//! — operators who need cross-restart durability swap in a future
-//! Redis-backed tracker behind the same trait shape.
-//!
-//! The clock is injectable so unit tests can step time without
-//! sleeping wall-clock.
+//! Decisions are cached in an LRU (capacity 10000, TTL 5s) keyed by
+//! api_key_id. When cp-api is unreachable we honor the last cached
+//! decision (sticky) up to AISIX_DP_BUDGET_STALE_MAX_SECONDS (default
+//! 600s); past that we apply the fail_mode that came back on the last
+//! good response.
 
-use chrono::{DateTime, Datelike, Utc};
 use dashmap::DashMap;
+use serde::Deserialize;
+use std::time::{Duration, Instant};
 
-/// Wall-clock seam.
-pub trait BudgetClock: Send + Sync + 'static {
-    fn now(&self) -> DateTime<Utc>;
+const CACHE_TTL: Duration = Duration::from_secs(5);
+const CACHE_CAPACITY: usize = 10_000;
+const DEFAULT_STALE_MAX_SECONDS: u64 = 600;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailMode {
+    Sticky,
+    Open,
+    Closed,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SystemBudgetClock;
-
-impl BudgetClock for SystemBudgetClock {
-    fn now(&self) -> DateTime<Utc> {
-        Utc::now()
+impl FailMode {
+    fn parse(s: &str) -> Self {
+        match s {
+            "open" => FailMode::Open,
+            "closed" => FailMode::Closed,
+            _ => FailMode::Sticky,
+        }
     }
 }
 
-/// (year, month_of_year) — the monthly bucket key.
-type MonthKey = (i32, u32);
-
-#[derive(Debug, Default)]
-struct Entry {
-    bucket: MonthKey,
-    spend_usd: f64,
+#[derive(Debug, Clone)]
+pub struct Decision {
+    pub allowed: bool,
+    pub fail_mode: FailMode,
+    pub reason: Option<String>,
 }
 
-pub struct BudgetTracker<C: BudgetClock = SystemBudgetClock> {
-    inner: DashMap<String, Entry>,
-    clock: C,
+impl Decision {
+    fn allow_all() -> Self {
+        Self {
+            allowed: true,
+            fail_mode: FailMode::Open,
+            reason: None,
+        }
+    }
 }
 
-impl<C: BudgetClock> std::fmt::Debug for BudgetTracker<C> {
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    decision: Decision,
+    fetched_at: Instant,
+}
+
+/// Mode for the client: live (talks to cp-api) or disabled (allow-all).
+enum Mode {
+    Live {
+        http: reqwest::Client,
+        base_url: String,
+        token: Option<String>,
+        stale_max: Duration,
+    },
+    Disabled,
+}
+
+pub struct BudgetClient {
+    mode: Mode,
+    cache: DashMap<String, CacheEntry>,
+}
+
+impl std::fmt::Debug for BudgetClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BudgetTracker")
-            .field("tracked_keys", &self.inner.len())
+        let mode = match &self.mode {
+            Mode::Live { base_url, .. } => format!("live({base_url})"),
+            Mode::Disabled => "disabled".into(),
+        };
+        f.debug_struct("BudgetClient")
+            .field("mode", &mode)
+            .field("cached", &self.cache.len())
             .finish()
     }
 }
 
-impl Default for BudgetTracker<SystemBudgetClock> {
-    fn default() -> Self {
+impl BudgetClient {
+    /// Live client that asks cp-api per request. The base URL should be the
+    /// cp-api root (e.g. `https://cp.aisix.cloud`). Auth token comes from the
+    /// `AISIX_DP_CP_TOKEN` env var; if unset, requests go without an
+    /// Authorization header (cp-api will reject them — operators should run
+    /// `disabled()` instead in that case).
+    pub fn new(base_url: impl Into<String>, http: reqwest::Client) -> Self {
+        let base_url = base_url.into().trim_end_matches('/').to_string();
+        let token = std::env::var("AISIX_DP_CP_TOKEN").ok();
+        let stale_max = std::env::var("AISIX_DP_BUDGET_STALE_MAX_SECONDS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_STALE_MAX_SECONDS);
         Self {
-            inner: DashMap::new(),
-            clock: SystemBudgetClock,
+            mode: Mode::Live {
+                http,
+                base_url,
+                token,
+                stale_max: Duration::from_secs(stale_max),
+            },
+            cache: DashMap::new(),
         }
     }
-}
 
-impl BudgetTracker<SystemBudgetClock> {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl<C: BudgetClock> BudgetTracker<C> {
-    pub fn with_clock(clock: C) -> Self {
+    /// Allow-all client. Used in dev / tests / standalone mode where no
+    /// cp-api is reachable.
+    pub fn disabled() -> Self {
         Self {
-            inner: DashMap::new(),
-            clock,
+            mode: Mode::Disabled,
+            cache: DashMap::new(),
         }
     }
 
-    /// Current month's spend for an ApiKey. Auto-resets if the bucket
-    /// is stale.
-    pub fn spend(&self, api_key_id: &str) -> f64 {
-        let now = self.clock.now();
-        let bucket = month_key(&now);
-        match self.inner.get(api_key_id) {
-            Some(e) if e.bucket == bucket => e.spend_usd,
-            _ => 0.0,
-        }
-    }
-
-    /// Add `usd` to the current month's running total. Resets the
-    /// bucket if the month rolled over since the last call.
-    pub fn add(&self, api_key_id: &str, usd: f64) {
-        let now = self.clock.now();
-        let bucket = month_key(&now);
-        let mut entry = self.inner.entry(api_key_id.to_string()).or_default();
-        if entry.bucket != bucket {
-            entry.bucket = bucket;
-            entry.spend_usd = 0.0;
-        }
-        entry.spend_usd += usd;
-    }
-
-    /// True if `(current spend + projected_cost) > cap`. The check
-    /// excludes the projected request itself — used for pre-commit
-    /// short-circuit when the *previous* month's tail already
-    /// over-shot the cap.
-    pub fn would_exceed(&self, api_key_id: &str, cap_usd: f64) -> bool {
-        self.spend(api_key_id) >= cap_usd
-    }
-
-    /// Snapshot of all (api_key_id, spend_usd) pairs for the current
-    /// calendar month. Entries from previous months are omitted (they
-    /// will auto-reset on next write). Used by the admin spend endpoint.
-    pub fn all_entries(&self) -> Vec<(String, f64)> {
-        let now = self.clock.now();
-        let bucket = month_key(&now);
-        self.inner
-            .iter()
-            .filter_map(|e| {
-                if e.value().bucket == bucket {
-                    Some((e.key().clone(), e.value().spend_usd))
-                } else {
-                    None
+    /// Check whether `api_key_id` may proceed. Returns a `Decision`; the
+    /// caller maps `!allowed` to `ProxyError::BudgetExceeded`.
+    pub async fn check(&self, api_key_id: &str) -> Decision {
+        match &self.mode {
+            Mode::Disabled => Decision::allow_all(),
+            Mode::Live {
+                http,
+                base_url,
+                token,
+                stale_max,
+            } => {
+                // Fast path: cache hit within TTL.
+                if let Some(cached) = self.cache.get(api_key_id) {
+                    if cached.fetched_at.elapsed() < CACHE_TTL {
+                        return cached.decision.clone();
+                    }
                 }
-            })
-            .collect()
+
+                match fetch_decision(http, base_url, token.as_deref(), api_key_id).await {
+                    Ok(decision) => {
+                        self.insert(api_key_id, decision.clone());
+                        decision
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            api_key_id = %api_key_id,
+                            error = %err,
+                            "budget_check failed; falling back to cache or fail_mode",
+                        );
+                        self.fallback(api_key_id, *stale_max)
+                    }
+                }
+            }
+        }
     }
 
-    /// Total spend across all api-keys for the current month.
-    pub fn total_spend(&self) -> f64 {
-        self.all_entries().iter().map(|(_, v)| v).sum()
+    fn fallback(&self, api_key_id: &str, stale_max: Duration) -> Decision {
+        if let Some(cached) = self.cache.get(api_key_id) {
+            if cached.fetched_at.elapsed() < stale_max {
+                return cached.decision.clone();
+            }
+            // Outer staleness ceiling exceeded: apply the fail_mode from
+            // the last good response.
+            return apply_fail_mode(&cached.decision);
+        }
+        // No cache at all — sticky-default to deny.
+        Decision {
+            allowed: false,
+            fail_mode: FailMode::Sticky,
+            reason: Some("cp-api unreachable and no cached decision".to_string()),
+        }
+    }
+
+    fn insert(&self, api_key_id: &str, decision: Decision) {
+        if self.cache.len() >= CACHE_CAPACITY {
+            self.evict_oldest();
+        }
+        self.cache.insert(
+            api_key_id.to_string(),
+            CacheEntry {
+                decision,
+                fetched_at: Instant::now(),
+            },
+        );
+    }
+
+    fn evict_oldest(&self) {
+        let oldest_key = self
+            .cache
+            .iter()
+            .min_by_key(|e| e.value().fetched_at)
+            .map(|e| e.key().clone());
+        if let Some(k) = oldest_key {
+            self.cache.remove(&k);
+        }
     }
 }
 
-fn month_key(t: &DateTime<Utc>) -> MonthKey {
-    (t.year(), t.month())
+fn apply_fail_mode(prev: &Decision) -> Decision {
+    match prev.fail_mode {
+        FailMode::Open => Decision {
+            allowed: true,
+            fail_mode: FailMode::Open,
+            reason: None,
+        },
+        FailMode::Closed => Decision {
+            allowed: false,
+            fail_mode: FailMode::Closed,
+            reason: Some("cp-api unreachable; fail_mode=closed".to_string()),
+        },
+        FailMode::Sticky => Decision {
+            allowed: false,
+            fail_mode: FailMode::Sticky,
+            reason: Some("cp-api unreachable; cached decision stale".to_string()),
+        },
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WireEnvelope {
+    data: WireDecision,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireDecision {
+    allowed: bool,
+    #[serde(default)]
+    fail_mode: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn fetch_decision(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: Option<&str>,
+    api_key_id: &str,
+) -> Result<Decision, reqwest::Error> {
+    let url = format!("{base_url}/api/internal/budget_check");
+    let mut req = http
+        .post(url)
+        .json(&serde_json::json!({ "api_key_id": api_key_id }));
+    if let Some(tok) = token {
+        req = req.bearer_auth(tok);
+    }
+    let resp = req.send().await?.error_for_status()?;
+    let env: WireEnvelope = resp.json().await?;
+    Ok(Decision {
+        allowed: env.data.allowed,
+        fail_mode: FailMode::parse(&env.data.fail_mode),
+        reason: env.data.reason,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Utc};
-    use std::sync::atomic::{AtomicI64, Ordering};
-    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Test clock that returns whatever epoch second is set on it.
-    struct TestClock {
-        epoch_secs: AtomicI64,
+    #[tokio::test]
+    async fn disabled_client_always_allows() {
+        let c = BudgetClient::disabled();
+        let d = c.check("any-key").await;
+        assert!(d.allowed);
     }
 
-    impl TestClock {
-        fn new(t: DateTime<Utc>) -> Self {
-            Self {
-                epoch_secs: AtomicI64::new(t.timestamp()),
-            }
+    #[tokio::test]
+    async fn live_client_returns_cp_api_decision() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/internal/budget_check"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"allowed": true, "fail_mode": "sticky"}
+            })))
+            .mount(&server)
+            .await;
+
+        let c = BudgetClient::new(server.uri(), reqwest::Client::new());
+        let d = c.check("k-1").await;
+        assert!(d.allowed);
+        assert_eq!(d.fail_mode, FailMode::Sticky);
+    }
+
+    #[tokio::test]
+    async fn live_client_returns_deny_when_cp_says_no() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/internal/budget_check"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"allowed": false, "fail_mode": "closed", "reason": "monthly cap"}
+            })))
+            .mount(&server)
+            .await;
+
+        let c = BudgetClient::new(server.uri(), reqwest::Client::new());
+        let d = c.check("k-1").await;
+        assert!(!d.allowed);
+        assert_eq!(d.fail_mode, FailMode::Closed);
+        assert_eq!(d.reason.as_deref(), Some("monthly cap"));
+    }
+
+    #[tokio::test]
+    async fn cache_hit_skips_network_within_ttl() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/internal/budget_check"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"allowed": true, "fail_mode": "sticky"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = BudgetClient::new(server.uri(), reqwest::Client::new());
+        let _ = c.check("k-1").await;
+        let _ = c.check("k-1").await;
+        let _ = c.check("k-1").await;
+        // expect(1) on Drop validates only one network call landed.
+    }
+
+    #[tokio::test]
+    async fn fallback_serves_cache_when_cp_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/internal/budget_check"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"allowed": true, "fail_mode": "open"}
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Subsequent calls 500.
+        Mock::given(method("POST"))
+            .and(path("/api/internal/budget_check"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let c = BudgetClient::new(server.uri(), reqwest::Client::new());
+        let first = c.check("k-1").await;
+        assert!(first.allowed);
+
+        // Force expiry by manually invalidating the cache entry's age.
+        // Easier: insert a stale fetched_at via direct cache mutation.
+        if let Some(mut e) = c.cache.get_mut("k-1") {
+            e.fetched_at = Instant::now() - Duration::from_secs(10);
         }
-        fn set(&self, t: DateTime<Utc>) {
-            self.epoch_secs.store(t.timestamp(), Ordering::SeqCst);
-        }
+        let second = c.check("k-1").await;
+        // cp-api now 500s but stale_max default is 600s, so the cached
+        // decision is still served.
+        assert!(second.allowed);
     }
 
-    impl BudgetClock for TestClock {
-        fn now(&self) -> DateTime<Utc> {
-            Utc.timestamp_opt(self.epoch_secs.load(Ordering::SeqCst), 0)
-                .single()
-                .unwrap()
-        }
-    }
+    #[tokio::test]
+    async fn fallback_with_no_cache_denies() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/internal/budget_check"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
 
-    fn jan(day: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 1, day, 12, 0, 0)
-            .single()
-            .unwrap()
-    }
-    fn feb(day: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 2, day, 12, 0, 0)
-            .single()
-            .unwrap()
-    }
-
-    #[test]
-    fn empty_tracker_reports_zero_spend() {
-        let t = BudgetTracker::with_clock(TestClock::new(jan(1)));
-        assert_eq!(t.spend("k1"), 0.0);
-        assert!(!t.would_exceed("k1", 10.0));
-    }
-
-    #[test]
-    fn add_accumulates_within_the_same_month() {
-        let t = BudgetTracker::with_clock(TestClock::new(jan(1)));
-        t.add("k1", 1.5);
-        t.add("k1", 2.5);
-        assert!((t.spend("k1") - 4.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn would_exceed_fires_only_when_cap_reached() {
-        let t = BudgetTracker::with_clock(TestClock::new(jan(1)));
-        t.add("k1", 9.0);
-        assert!(!t.would_exceed("k1", 10.0));
-        t.add("k1", 1.0);
-        assert!(t.would_exceed("k1", 10.0));
-    }
-
-    #[test]
-    fn month_rollover_resets_bucket_automatically() {
-        let clock = Arc::new(TestClock::new(jan(15)));
-        let t = BudgetTracker::with_clock(ClockHandle(clock.clone()));
-        t.add("k1", 50.0);
-        assert!((t.spend("k1") - 50.0).abs() < 1e-9);
-
-        // Roll into February.
-        clock.set(feb(1));
-        // Reading first auto-resets the bucket.
-        assert_eq!(t.spend("k1"), 0.0);
-        // And subsequent adds start fresh.
-        t.add("k1", 1.0);
-        assert!((t.spend("k1") - 1.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn keys_are_independent_of_each_other() {
-        let t = BudgetTracker::with_clock(TestClock::new(jan(1)));
-        t.add("k1", 5.0);
-        t.add("k2", 10.0);
-        assert!((t.spend("k1") - 5.0).abs() < 1e-9);
-        assert!((t.spend("k2") - 10.0).abs() < 1e-9);
-    }
-
-    /// Handle wrapper so we can share a clock between the test's
-    /// BudgetTracker and the test scope without `&` lifetime juggling.
-    struct ClockHandle(Arc<TestClock>);
-    impl BudgetClock for ClockHandle {
-        fn now(&self) -> DateTime<Utc> {
-            self.0.now()
-        }
+        let c = BudgetClient::new(server.uri(), reqwest::Client::new());
+        let d = c.check("k-1").await;
+        assert!(!d.allowed);
     }
 }

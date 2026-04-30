@@ -19,7 +19,7 @@
 //! deterministic behaviour continue to use [`crate::InMemoryStore`].
 
 use aisix_core::resource::ResourceEntry;
-use aisix_core::{ApiKey, Budget, Credential, Model, Team};
+use aisix_core::{ApiKey, Credential, Model, Team};
 use etcd_client::{Client, DeleteOptions, GetOptions};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -32,7 +32,6 @@ use crate::store::{ConfigStore, StoreError};
 pub const MODELS_SUBKEY: &str = "models";
 pub const APIKEYS_SUBKEY: &str = "api_keys";
 pub const CREDENTIALS_SUBKEY: &str = "credentials";
-pub const BUDGETS_SUBKEY: &str = "budgets";
 pub const TEAMS_SUBKEY: &str = "teams";
 
 pub struct EtcdConfigStore {
@@ -236,32 +235,6 @@ impl ConfigStore for EtcdConfigStore {
 
     async fn delete_credential(&self, id: &str) -> Result<bool, StoreError> {
         self.delete_one(&self.key_for(CREDENTIALS_SUBKEY, id)).await
-    }
-
-    async fn put_budget(&self, entry: ResourceEntry<Budget>) -> Result<(), StoreError> {
-        let key = self.key_for(BUDGETS_SUBKEY, &entry.id);
-        self.put_json(&key, &entry.value).await
-    }
-
-    async fn get_budget(&self, id: &str) -> Result<Option<ResourceEntry<Budget>>, StoreError> {
-        let key = self.key_for(BUDGETS_SUBKEY, id);
-        Ok(self
-            .get_one::<Budget>(&key)
-            .await?
-            .map(|(v, rev)| ResourceEntry::new(id, v, rev)))
-    }
-
-    async fn list_budgets(&self) -> Result<Vec<ResourceEntry<Budget>>, StoreError> {
-        Ok(self
-            .list_range::<Budget>(BUDGETS_SUBKEY)
-            .await?
-            .into_iter()
-            .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
-            .collect())
-    }
-
-    async fn delete_budget(&self, id: &str) -> Result<bool, StoreError> {
-        self.delete_one(&self.key_for(BUDGETS_SUBKEY, id)).await
     }
 
     async fn put_team(&self, entry: ResourceEntry<Team>) -> Result<(), StoreError> {

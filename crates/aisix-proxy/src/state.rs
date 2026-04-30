@@ -23,7 +23,7 @@ use aisix_obs::{LangfuseSender, Metrics, UsageSink};
 use aisix_ratelimit::Limiter;
 use std::sync::Arc;
 
-use crate::budget::BudgetTracker;
+use crate::budget::BudgetClient;
 use crate::health::HealthTracker;
 use crate::routing::RoutingRegistry;
 
@@ -38,9 +38,9 @@ pub struct ProxyState {
     /// Content-policy hooks. Default is an empty chain (no-op); the
     /// server bootstrap loads a real chain from config.
     pub guardrails: Arc<dyn Guardrail>,
-    /// Per-ApiKey monthly USD spend tracker. Process-local for V1;
-    /// future PR can swap behind a trait for Redis-backed durability.
-    pub budgets: Arc<BudgetTracker>,
+    /// Per-request budget gate. Asks cp-api whether the api_key may
+    /// proceed; cached for 5s with sticky fallback on cp-api outage.
+    pub budgets: Arc<BudgetClient>,
     /// Per-model health tracker. Updated on every upstream call outcome;
     /// read by `GET /admin/v1/health`.
     pub health: Arc<HealthTracker>,
@@ -65,7 +65,7 @@ impl ProxyState {
             cache: Some(Arc::new(MemoryCache::with_defaults())),
             routing: Arc::new(RoutingRegistry::new()),
             guardrails: Arc::new(GuardrailChain::empty()),
-            budgets: Arc::new(BudgetTracker::new()),
+            budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             langfuse: None,
             usage_sink: UsageSink::disabled(),
@@ -89,7 +89,7 @@ impl ProxyState {
             cache: Some(Arc::new(MemoryCache::with_defaults())),
             routing: Arc::new(RoutingRegistry::new()),
             guardrails: Arc::new(GuardrailChain::empty()),
-            budgets: Arc::new(BudgetTracker::new()),
+            budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             langfuse: None,
             usage_sink: UsageSink::disabled(),
@@ -116,7 +116,7 @@ impl ProxyState {
             cache,
             routing: Arc::new(RoutingRegistry::new()),
             guardrails: Arc::new(GuardrailChain::empty()),
-            budgets: Arc::new(BudgetTracker::new()),
+            budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             langfuse: None,
             usage_sink: UsageSink::disabled(),
@@ -150,6 +150,13 @@ impl ProxyState {
     /// the sender worker.
     pub fn with_usage_sink(mut self, sink: UsageSink) -> Self {
         self.usage_sink = sink;
+        self
+    }
+
+    /// Swap in a live `BudgetClient` that talks to cp-api. Default is
+    /// the disabled (allow-all) client used in self-hosted dev.
+    pub fn with_budget_client(mut self, client: Arc<BudgetClient>) -> Self {
+        self.budgets = client;
         self
     }
 }

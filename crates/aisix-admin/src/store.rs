@@ -7,7 +7,7 @@
 //! in the handler layer so the store stays dumb and fast.
 
 use aisix_core::resource::ResourceEntry;
-use aisix_core::{ApiKey, Budget, Credential, Model, Team};
+use aisix_core::{ApiKey, Credential, Model, Team};
 use dashmap::DashMap;
 use std::sync::Arc;
 
@@ -39,11 +39,6 @@ pub trait ConfigStore: Send + Sync + 'static {
     async fn list_credentials(&self) -> Result<Vec<ResourceEntry<Credential>>, StoreError>;
     async fn delete_credential(&self, id: &str) -> Result<bool, StoreError>;
 
-    async fn put_budget(&self, entry: ResourceEntry<Budget>) -> Result<(), StoreError>;
-    async fn get_budget(&self, id: &str) -> Result<Option<ResourceEntry<Budget>>, StoreError>;
-    async fn list_budgets(&self) -> Result<Vec<ResourceEntry<Budget>>, StoreError>;
-    async fn delete_budget(&self, id: &str) -> Result<bool, StoreError>;
-
     async fn put_team(&self, entry: ResourceEntry<Team>) -> Result<(), StoreError>;
     async fn get_team(&self, id: &str) -> Result<Option<ResourceEntry<Team>>, StoreError>;
     async fn list_teams(&self) -> Result<Vec<ResourceEntry<Team>>, StoreError>;
@@ -57,7 +52,6 @@ pub struct InMemoryStore {
     models: DashMap<String, ResourceEntry<Model>>,
     apikeys: DashMap<String, ResourceEntry<ApiKey>>,
     credentials: DashMap<String, ResourceEntry<Credential>>,
-    budgets: DashMap<String, ResourceEntry<Budget>>,
     teams: DashMap<String, ResourceEntry<Team>>,
 }
 
@@ -121,23 +115,6 @@ impl ConfigStore for InMemoryStore {
 
     async fn delete_credential(&self, id: &str) -> Result<bool, StoreError> {
         Ok(self.credentials.remove(id).is_some())
-    }
-
-    async fn put_budget(&self, entry: ResourceEntry<Budget>) -> Result<(), StoreError> {
-        self.budgets.insert(entry.id.clone(), entry);
-        Ok(())
-    }
-
-    async fn get_budget(&self, id: &str) -> Result<Option<ResourceEntry<Budget>>, StoreError> {
-        Ok(self.budgets.get(id).map(|r| r.clone()))
-    }
-
-    async fn list_budgets(&self) -> Result<Vec<ResourceEntry<Budget>>, StoreError> {
-        Ok(self.budgets.iter().map(|r| r.clone()).collect())
-    }
-
-    async fn delete_budget(&self, id: &str) -> Result<bool, StoreError> {
-        Ok(self.budgets.remove(id).is_some())
     }
 
     async fn put_team(&self, entry: ResourceEntry<Team>) -> Result<(), StoreError> {

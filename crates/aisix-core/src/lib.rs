@@ -30,9 +30,9 @@ pub use error::{
     AdminError, AdminErrorEnvelope, BootstrapError, ProxyError, ProxyErrorEnvelope, RateLimitScope,
 };
 pub use models::{
-    validate_apikey, validate_budget, validate_credential, validate_model, validate_team,
-    AisixSnapshot, ApiKey, Budget, Credential, Model, Provider, ProviderConfig, RateLimit, Routing,
-    RoutingStrategy, RoutingTarget, SchemaError, Team,
+    validate_apikey, validate_credential, validate_model, validate_team, AisixSnapshot, ApiKey,
+    Credential, Model, Provider, ProviderConfig, RateLimit, Routing, RoutingStrategy,
+    RoutingTarget, SchemaError, Team,
 };
 pub use resource::{Resource, ResourceEntry};
 pub use snapshot::{ResourceTable, SnapshotHandle};

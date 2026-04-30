@@ -25,7 +25,6 @@ pub struct Schemas {
     pub model: Validator,
     pub apikey: Validator,
     pub credential: Validator,
-    pub budget: Validator,
     pub team: Validator,
 }
 
@@ -43,9 +42,6 @@ impl Schemas {
             credential: jsonschema::options()
                 .build(&credential_schema())
                 .expect("credential schema is well-formed"),
-            budget: jsonschema::options()
-                .build(&budget_schema())
-                .expect("budget schema is well-formed"),
             team: jsonschema::options()
                 .build(&team_schema())
                 .expect("team schema is well-formed"),
@@ -83,10 +79,6 @@ pub fn validate_apikey(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_credential(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.credential, value)
-}
-
-pub fn validate_budget(value: &Value) -> Result<(), SchemaError> {
-    validate(&SCHEMAS.budget, value)
 }
 
 pub fn validate_team(value: &Value) -> Result<(), SchemaError> {
@@ -198,21 +190,6 @@ fn credential_schema() -> Value {
             "name":     { "type": "string", "minLength": 1 },
             "api_key":  { "type": "string", "minLength": 1 },
             "api_base": { "type": "string" }
-        }
-    })
-}
-
-fn budget_schema() -> Value {
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["name", "api_key_id", "monthly_usd_cap", "usd_per_1k_tokens"],
-        "additionalProperties": false,
-        "properties": {
-            "name":              { "type": "string", "minLength": 1 },
-            "api_key_id":        { "type": "string", "minLength": 1 },
-            "monthly_usd_cap":   { "type": "number", "exclusiveMinimum": 0 },
-            "usd_per_1k_tokens": { "type": "number", "minimum": 0 }
         }
     })
 }

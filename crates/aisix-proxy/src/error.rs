@@ -107,7 +107,7 @@ impl ProxyError {
             ProxyError::InvalidRequest(_) => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
             ProxyError::ContentFiltered(_) => "content_filter",
-            ProxyError::BudgetExceeded(_) => "budget_exceeded",
+            ProxyError::BudgetExceeded(_) => "billing_error",
             ProxyError::RateLimit(_) => "rate_limit_exceeded",
             ProxyError::Bridge(b) => b.error_type(),
         }
@@ -124,7 +124,11 @@ impl ProxyError {
     }
 
     pub fn envelope(&self) -> ErrorEnvelope {
-        ErrorEnvelope::new(self.to_string(), self.kind())
+        let env = ErrorEnvelope::new(self.to_string(), self.kind());
+        match self {
+            ProxyError::BudgetExceeded(_) => env.with_code("budget_exceeded"),
+            _ => env,
+        }
     }
 }
 

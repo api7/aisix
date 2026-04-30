@@ -12,8 +12,7 @@
 //! entry; it serves the rest."
 
 use aisix_core::models::{
-    validate_apikey, validate_budget, validate_credential, validate_model, ApiKey, Budget,
-    Credential, Model, SchemaError,
+    validate_apikey, validate_credential, validate_model, ApiKey, Credential, Model, SchemaError,
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
@@ -94,18 +93,6 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     &mut stats,
                 ) {
                     snapshot.credentials.insert(entry);
-                }
-            }
-            "budgets" => {
-                if let Some(entry) = validate_and_parse::<Budget>(
-                    &raw.key,
-                    raw.revision,
-                    parsed,
-                    &value,
-                    validate_budget,
-                    &mut stats,
-                ) {
-                    snapshot.budgets.insert(entry);
                 }
             }
             other => {

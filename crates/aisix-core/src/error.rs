@@ -104,7 +104,7 @@ impl ProxyError {
             Self::InvalidRequest(_) => "invalid_request_error",
             Self::RateLimitExceeded { .. } => "rate_limit_error",
             Self::ConcurrencyLimitExceeded => "rate_limit_error",
-            Self::BudgetExceeded => "rate_limit_error",
+            Self::BudgetExceeded => "billing_error",
             Self::RequestTimeout(_) => "api_error",
             Self::ProviderError(_) => "api_error",
             Self::ContentPolicyViolation => "invalid_request_error",

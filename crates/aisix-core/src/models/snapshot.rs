@@ -8,7 +8,6 @@
 //! Credential + Budget arrived with PR #19; Team / Guardrail will follow.
 
 use super::apikey::ApiKey;
-use super::budget::Budget;
 use super::credential::Credential;
 use super::model::Model;
 use super::team::Team;
@@ -21,7 +20,6 @@ pub struct AisixSnapshot {
     pub models: ResourceTable<Model>,
     pub apikeys: ResourceTable<ApiKey>,
     pub credentials: ResourceTable<Credential>,
-    pub budgets: ResourceTable<Budget>,
     pub teams: ResourceTable<Team>,
 }
 
@@ -33,11 +31,7 @@ impl AisixSnapshot {
     /// Convenience: total entry count across all tables. Handy for debug /
     /// readiness checks.
     pub fn total_entries(&self) -> usize {
-        self.models.len()
-            + self.apikeys.len()
-            + self.credentials.len()
-            + self.budgets.len()
-            + self.teams.len()
+        self.models.len() + self.apikeys.len() + self.credentials.len() + self.teams.len()
     }
 }
 
@@ -66,13 +60,6 @@ mod tests {
         serde_json::from_str(r#"{"name":"openai-prod","api_key":"sk-prod"}"#).unwrap()
     }
 
-    fn sample_budget() -> Budget {
-        serde_json::from_str(
-            r#"{"name":"team-a","api_key_id":"k-1","monthly_usd_cap":50.0,"usd_per_1k_tokens":0.005}"#,
-        )
-        .unwrap()
-    }
-
     #[test]
     fn empty_snapshot_has_no_entries() {
         let s = AisixSnapshot::new();
@@ -80,11 +67,10 @@ mod tests {
         assert!(s.models.is_empty());
         assert!(s.apikeys.is_empty());
         assert!(s.credentials.is_empty());
-        assert!(s.budgets.is_empty());
     }
 
     #[test]
-    fn all_four_tables_are_independent() {
+    fn all_three_tables_are_independent() {
         let s = AisixSnapshot::new();
         s.models
             .insert(ResourceEntry::new("m-1", sample_model(), 1));
@@ -92,10 +78,8 @@ mod tests {
             .insert(ResourceEntry::new("k-1", sample_apikey(), 1));
         s.credentials
             .insert(ResourceEntry::new("c-1", sample_credential(), 1));
-        s.budgets
-            .insert(ResourceEntry::new("b-1", sample_budget(), 1));
 
-        assert_eq!(s.total_entries(), 4);
+        assert_eq!(s.total_entries(), 3);
         assert_eq!(s.models.get_by_name("my-gpt4").unwrap().id, "m-1");
         assert_eq!(
             // Snapshot's by_name index for ApiKey is keyed by key_hash
@@ -107,6 +91,5 @@ mod tests {
             "k-1",
         );
         assert_eq!(s.credentials.get_by_name("openai-prod").unwrap().id, "c-1");
-        assert_eq!(s.budgets.get_by_name("team-a").unwrap().id, "b-1");
     }
 }

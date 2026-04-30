@@ -1149,38 +1149,40 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn budget_exceeded_returns_429() {
-        use aisix_core::Budget;
+        use crate::budget::BudgetClient;
 
-        // Wiremock should NOT be hit — the budget check fires before dispatch.
+        // cp-api stand-in: returns a deny decision for our key.
+        let cp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/internal/budget_check"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "allowed": false,
+                    "fail_mode": "closed",
+                    "reason": "monthly cap exceeded"
+                }
+            })))
+            .mount(&cp)
+            .await;
+
+        // Upstream chat endpoint must NOT be hit — the budget check
+        // fires before dispatch.
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200))
-            .expect(0) // hard expectation: budget blocks before upstream
+            .expect(0)
             .mount(&upstream)
             .await;
 
         let hub = Arc::new(Hub::new());
         hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
 
-        // Budget entity caps "key-id-1" at $1 / month.
-        let budget: Budget = serde_json::from_str(
-            r#"{
-            "name": "test-budget",
-            "api_key_id": "key-id-1",
-            "monthly_usd_cap": 1.0,
-            "usd_per_1k_tokens": 0.005
-        }"#,
-        )
-        .unwrap();
-        let budget_entry = ResourceEntry::new("b-1", budget, 1);
-
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
-        snap.budgets.insert(budget_entry);
-
-        let state = build_state(snap, hub);
-        // Simulate previous spend that already hit the cap.
-        state.budgets.add("key-id-1", 1.5); // $1.50 > $1.00 cap
+        let state = build_state(snap, hub).with_budget_client(Arc::new(BudgetClient::new(
+            cp.uri(),
+            reqwest::Client::new(),
+        )));
 
         let app = build_router(state);
         let body = serde_json::json!({
@@ -1199,73 +1201,7 @@ data: [DONE]\n\n";
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "budget_exceeded");
-    }
-
-    #[tokio::test]
-    async fn budget_accumulates_cost_on_success() {
-        use aisix_core::Budget;
-
-        let upstream = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "cmpl-up",
-                "model": "gpt-4o",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "ok"},
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-            })))
-            .mount(&upstream)
-            .await;
-
-        let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
-
-        // Budget at $100 cap — won't be exceeded.
-        let budget: Budget = serde_json::from_str(
-            r#"{
-            "name": "test-budget",
-            "api_key_id": "key-id-1",
-            "monthly_usd_cap": 100.0,
-            "usd_per_1k_tokens": 0.005
-        }"#,
-        )
-        .unwrap();
-        let budget_entry = ResourceEntry::new("b-1", budget, 1);
-
-        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
-        snap.budgets.insert(budget_entry);
-
-        let state = build_state(snap, hub);
-        let budgets = state.budgets.clone();
-        assert_eq!(budgets.spend("key-id-1"), 0.0); // starts at zero
-
-        let app = build_router(state);
-        let body = serde_json::json!({
-            "model": "my-gpt4",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("authorization", "Bearer sk-caller")
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
-
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        // 15 tokens × $0.005 / 1k = $0.000075
-        let expected = 15.0 * 0.005 / 1000.0;
-        let spend = budgets.spend("key-id-1");
-        assert!(
-            (spend - expected).abs() < 1e-9,
-            "expected {expected} USD spend, got {spend}"
-        );
+        assert_eq!(v["error"]["type"], "billing_error");
+        assert_eq!(v["error"]["code"], "budget_exceeded");
     }
 }

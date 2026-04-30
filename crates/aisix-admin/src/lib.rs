@@ -20,7 +20,6 @@
 
 mod apikeys_handlers;
 mod auth;
-mod budgets_handlers;
 mod credentials_handlers;
 mod embedded_ui;
 mod error;
@@ -29,7 +28,6 @@ mod health_handler;
 mod models_handlers;
 mod openapi;
 mod playground_handler;
-mod spend_handler;
 mod state;
 pub mod store;
 mod teams_handlers;
@@ -94,16 +92,6 @@ pub fn build_router(state: AdminState) -> Router {
                 .delete(credentials_handlers::delete_credential),
         )
         .route(
-            "/admin/v1/budgets",
-            get(budgets_handlers::list_budgets).post(budgets_handlers::create_budget),
-        )
-        .route(
-            "/admin/v1/budgets/:id",
-            get(budgets_handlers::get_budget)
-                .put(budgets_handlers::update_budget)
-                .delete(budgets_handlers::delete_budget),
-        )
-        .route(
             "/admin/v1/teams",
             get(teams_handlers::list_teams).post(teams_handlers::create_team),
         )
@@ -115,8 +103,6 @@ pub fn build_router(state: AdminState) -> Router {
         )
         // Health — per-model upstream health levels (0/1/2).
         .route("/admin/v1/health", get(health_handler::get_health))
-        // Spend reporting — returns current-month USD per ApiKey.
-        .route("/admin/v1/spend", get(spend_handler::get_spend))
         // Playground: forwards in-process to the proxy router (no network hop).
         // Accepts a *proxy* API key (not an admin key); auth is enforced by the
         // proxy middleware stack that runs inside the forwarded request.
@@ -894,106 +880,5 @@ mod tests {
         assert_eq!(v["status"], "ok");
         // Empty snapshot → empty model list, but endpoint is operational.
         assert!(v["models"].is_array());
-    }
-
-    // ──────────────────── Spend endpoint ────────────────────
-
-    #[tokio::test]
-    async fn spend_returns_empty_when_no_tracker_wired() {
-        // Default build_state() does not attach a budget_tracker.
-        let app = build_router(build_state());
-        let resp = run(app, auth_req("GET", "/admin/v1/spend", None)).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v = body_json(resp).await;
-        assert!(v["period"].as_str().is_some(), "period field missing");
-        assert_eq!(v["total_usd"], 0.0);
-        assert_eq!(v["entries"].as_array().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn spend_requires_admin_auth() {
-        let app = build_router(build_state());
-        let req = Request::builder()
-            .uri("/admin/v1/spend")
-            .body(Body::empty())
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn spend_reflects_tracker_entries_and_total() {
-        use aisix_proxy::budget::BudgetTracker;
-
-        // Build a tracker with known entries.
-        let tracker = Arc::new(BudgetTracker::new());
-        tracker.add("key-a", 5.0);
-        tracker.add("key-a", 3.0); // 8.0 total for key-a
-        tracker.add("key-b", 2.5);
-
-        let handle = SnapshotHandle::new(AisixSnapshot::new());
-        let store = InMemoryStore::new() as Arc<dyn ConfigStore>;
-        let state = AdminState::new(handle, store, &cfg()).with_budget_tracker(tracker);
-
-        let app = build_router(state);
-        let resp = run(app, auth_req("GET", "/admin/v1/spend", None)).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v = body_json(resp).await;
-
-        // Total must equal 10.5.
-        let total = v["total_usd"].as_f64().unwrap();
-        assert!(
-            (total - 10.5).abs() < 1e-9,
-            "expected total 10.5 but got {total}"
-        );
-
-        // Entries: one per key.
-        let entries = v["entries"].as_array().unwrap();
-        assert_eq!(entries.len(), 2);
-
-        // Find key-a and key-b entries by api_key_id.
-        let key_a = entries
-            .iter()
-            .find(|e| e["api_key_id"] == "key-a")
-            .expect("key-a not in entries");
-        let spend_a = key_a["spend_usd"].as_f64().unwrap();
-        assert!(
-            (spend_a - 8.0).abs() < 1e-9,
-            "expected 8.0 for key-a but got {spend_a}"
-        );
-
-        let key_b = entries
-            .iter()
-            .find(|e| e["api_key_id"] == "key-b")
-            .expect("key-b not in entries");
-        let spend_b = key_b["spend_usd"].as_f64().unwrap();
-        assert!(
-            (spend_b - 2.5).abs() < 1e-9,
-            "expected 2.5 for key-b but got {spend_b}"
-        );
-    }
-
-    #[tokio::test]
-    async fn spend_period_matches_current_year_month() {
-        use aisix_proxy::budget::BudgetTracker;
-
-        let tracker = Arc::new(BudgetTracker::new());
-        let handle = SnapshotHandle::new(AisixSnapshot::new());
-        let store = InMemoryStore::new() as Arc<dyn ConfigStore>;
-        let state = AdminState::new(handle, store, &cfg()).with_budget_tracker(tracker);
-
-        let app = build_router(state);
-        let resp = run(app, auth_req("GET", "/admin/v1/spend", None)).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v = body_json(resp).await;
-
-        let period = v["period"].as_str().unwrap();
-        // Must be "YYYY-MM" format with 7 chars.
-        assert_eq!(period.len(), 7, "unexpected period format: {period}");
-        let mut parts = period.splitn(2, '-');
-        let year: u32 = parts.next().unwrap().parse().unwrap();
-        let month: u32 = parts.next().unwrap().parse().unwrap();
-        assert!(year >= 2026, "year {year} looks wrong");
-        assert!((1..=12).contains(&month), "month {month} out of range");
     }
 }

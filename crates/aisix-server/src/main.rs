@@ -357,7 +357,6 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     }
     proxy_state = proxy_state.with_usage_sink(usage_sink);
     // Clone shared trackers before consuming proxy_state in build_router.
-    let budget_tracker = proxy_state.budgets.clone();
     let health_tracker = proxy_state.health.clone();
     let proxy_router = aisix_proxy::build_router(proxy_state);
 
@@ -370,9 +369,6 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             Arc::new(EtcdConfigStore::new(admin_client, etcd_prefix.clone()));
         let admin_state = AdminState::new(snapshot_handle.clone(), admin_store, &cfg.admin)
             .with_metrics(metrics.clone())
-            // Share the in-process budget tracker so /admin/v1/spend reports
-            // live current-month spend without a database round-trip.
-            .with_budget_tracker(budget_tracker)
             // Share the health tracker so /admin/v1/health reflects live
             // per-model upstream failure counts.
             .with_health_tracker(health_tracker)
@@ -389,9 +385,9 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         Some(tokio::spawn(async move { admin_serve.await }))
     } else {
         // Drop unused shared components so the compiler can see they
-        // don't escape managed mode. The budget/health trackers exist
-        // on proxy_state and keep working regardless.
-        let _ = (&budget_tracker, &health_tracker);
+        // don't escape managed mode. The health tracker exists on
+        // proxy_state and keeps working regardless.
+        let _ = &health_tracker;
         tracing::info!("managed mode enabled — admin surface not bound");
         None
     };
