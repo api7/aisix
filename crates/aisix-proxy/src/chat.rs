@@ -49,7 +49,12 @@ pub async fn chat_completions(
     let started = Instant::now();
     let method = "POST";
     let path = "/v1/chat/completions";
-    let request_id = format!("req-{}", Uuid::new_v4());
+    // Pure UUID — cp-api's telemetry handler stores this in the
+    // `request_id UUID` column of dpmgr_usage_events, so a "req-…"
+    // prefix on the wire would be rejected (event 0: request_id must
+    // be a uuid). The downstream `x-aisix-call-id` header carries the
+    // same value for human correlation.
+    let request_id = Uuid::new_v4().to_string();
     let api_key_id = auth.entry.id.clone();
     let model_name = req.model.clone();
 

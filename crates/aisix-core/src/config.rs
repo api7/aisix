@@ -238,15 +238,24 @@ impl EtcdConfig {
     }
 
     /// The full env-scoped key prefix the DP watches and parses.
-    /// v3: `<prefix>/<env_id>` (e.g. `/aisix/<uuid>`); v2 fallback
+    /// v3: `<prefix>/<env_id>/` (e.g. `/aisix/<uuid>/`); v2 fallback
     /// (env_id empty): bare `<prefix>` for backwards compat with
     /// self-managed deployments that haven't migrated yet.
+    ///
+    /// The trailing slash matters for the kine etcd-auth interceptor
+    /// (internal/dpmgr/etcdauth on the dp-manager side): it requires
+    /// the DP's Range key to start with `<prefix>/<env_id>/`, NOT
+    /// `<prefix>/<env_id>`. Without the slash a bare `<prefix>/<env_id>`
+    /// Range request gets `PermissionDenied: outside env <env_id> prefix`
+    /// because the auth check sees the bare-prefix Range as escaping
+    /// into a sibling env's space (the env-id substring could be any
+    /// prefix-of-prefix until the slash terminates it).
     pub fn effective_prefix(&self) -> String {
         if self.env_id.is_empty() {
             self.prefix.clone()
         } else {
             let trimmed = self.prefix.trim_end_matches('/');
-            format!("{trimmed}/{}", self.env_id)
+            format!("{trimmed}/{}/", self.env_id)
         }
     }
 }
