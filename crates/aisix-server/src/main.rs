@@ -229,7 +229,14 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // fails). Both outcomes narrow triage substantially.
     probe_etcd_dns(&cfg.etcd.endpoints).await;
 
-    let connect_options = build_etcd_connect_options(&cfg.etcd)?;
+    // managed.cp_ca_cert_file (when set) is a PEM-encoded trust root
+    // appended to the etcd TLS verify chain — needed for e2e / on-prem
+    // deployments where the dp-manager etcd listener serves a cert not
+    // covered by the cert-manager-issued CA. Production with public-CA
+    // certs leaves this `None`.
+    let extra_ca_pem = register::read_optional_ca_pem(cfg.managed.cp_ca_cert_file.as_deref())?;
+    let connect_options =
+        build_etcd_connect_options_with_extra_ca(&cfg.etcd, extra_ca_pem.as_deref())?;
     // effective_prefix() is `<prefix>/<env_id>` in v3 managed mode
     // (env_id populated from the register response above), bare
     // `<prefix>` in self-hosted dev where env_id is empty.
@@ -469,7 +476,15 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
 ///   endpoint. Callers only need to override when the CA issues certs
 ///   under a different name than the DNS they're dialing (rare but
 ///   possible when the endpoint is an IP or internal alias).
+#[cfg(test)]
 fn build_etcd_connect_options(etcd: &EtcdConfig) -> anyhow::Result<Option<ConnectOptions>> {
+    build_etcd_connect_options_with_extra_ca(etcd, None)
+}
+
+fn build_etcd_connect_options_with_extra_ca(
+    etcd: &EtcdConfig,
+    extra_ca_pem: Option<&[u8]>,
+) -> anyhow::Result<Option<ConnectOptions>> {
     let mut needs_options = false;
     let mut options = ConnectOptions::new();
 
@@ -482,8 +497,18 @@ fn build_etcd_connect_options(etcd: &EtcdConfig) -> anyhow::Result<Option<Connec
     }
 
     if let Some(tls) = etcd.tls.as_ref() {
-        let ca_pem = std::fs::read(&tls.ca_cert_file)
+        let mut ca_pem = std::fs::read(&tls.ca_cert_file)
             .map_err(|e| anyhow::anyhow!("etcd.tls.ca_cert_file = {:?}: {e}", tls.ca_cert_file))?;
+        // Append the operator-supplied extra trust root (typically a
+        // self-signed dev CA in e2e). rustls's PEM parser handles
+        // multi-cert blobs natively, so concatenation is enough — no
+        // need to construct a chain explicitly.
+        if let Some(extra) = extra_ca_pem {
+            if !ca_pem.ends_with(b"\n") {
+                ca_pem.push(b'\n');
+            }
+            ca_pem.extend_from_slice(extra);
+        }
         let cert_pem = std::fs::read(&tls.client_cert_file).map_err(|e| {
             anyhow::anyhow!(
                 "etcd.tls.client_cert_file = {:?}: {e}",

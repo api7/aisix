@@ -83,7 +83,15 @@ pub async fn register_and_persist(cfg: &ManagedConfig) -> anyhow::Result<Registe
     let private_key_pem = keypair.serialize_pem();
     let public_key_pem = keypair.public_key_pem();
 
-    let resp = call_register(base, token, &gather_host_info()?, &public_key_pem).await?;
+    let extra_ca = read_optional_ca_pem(cfg.cp_ca_cert_file.as_deref())?;
+    let resp = call_register(
+        base,
+        token,
+        &gather_host_info()?,
+        &public_key_pem,
+        extra_ca.as_deref(),
+    )
+    .await?;
     let (ca_path, cert_path, key_path) = persist_mtls(
         &cfg.mtls_dir,
         &resp.ca_certificate,
@@ -118,6 +126,20 @@ pub fn bundle_exists(mtls_dir: impl AsRef<Path>) -> bool {
     ["ca.crt", "client.crt", "client.key"]
         .iter()
         .all(|name| dir.join(name).is_file())
+}
+
+/// Read a PEM-encoded CA bundle from disk if `path` is `Some`. Returns
+/// `Ok(None)` when the path is `None` or empty so the rest of the
+/// boot path doesn't have to special-case the unset case. Surfaces
+/// the path on read errors — a misconfigured or unmounted bundle in
+/// e2e is the most common reason this fires, and the path tells the
+/// operator exactly what to fix.
+pub fn read_optional_ca_pem(path: Option<&str>) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(p) = path.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(p).with_context(|| format!("read managed.cp_ca_cert_file = {p}"))?;
+    Ok(Some(bytes))
 }
 
 /// Well-known filename within `mtls_dir` for the issuer's CA cert.
@@ -186,12 +208,21 @@ async fn call_register(
     token: &str,
     host: &HostInfo,
     public_key_pem: &str,
+    extra_ca_pem: Option<&[u8]>,
 ) -> anyhow::Result<RegisterResponse> {
-    let client = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
-        .user_agent(format!("aisix-dp/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("build reqwest client")?;
+        .user_agent(format!("aisix-dp/{}", env!("CARGO_PKG_VERSION")));
+    // Operator-supplied extra trust root, e.g. a self-signed dev CA in
+    // e2e or an on-prem private CA in air-gapped deployments. The
+    // public-CA chain remains in effect alongside this; we never swap
+    // it out, so production deployments don't lose any verification.
+    if let Some(pem) = extra_ca_pem {
+        let cert = reqwest::Certificate::from_pem(pem)
+            .context("parse managed.cp_ca_cert_file as PEM certificate")?;
+        builder = builder.add_root_certificate(cert);
+    }
+    let client = builder.build().context("build reqwest client")?;
 
     let url = format!("{}/dp/register", base_url.trim_end_matches('/'));
     let resp = client
@@ -368,6 +399,34 @@ mod tests {
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[test]
+    fn read_optional_ca_pem_returns_none_for_unset_path() {
+        assert!(read_optional_ca_pem(None).unwrap().is_none());
+        assert!(read_optional_ca_pem(Some("")).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_optional_ca_pem_reads_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, b"-----BEGIN CERTIFICATE-----\nXX\n-----END CERTIFICATE-----\n")
+            .unwrap();
+        let bytes = read_optional_ca_pem(Some(path.to_str().unwrap()))
+            .unwrap()
+            .expect("Some when path is set");
+        assert!(bytes.starts_with(b"-----BEGIN CERTIFICATE-----"));
+    }
+
+    #[test]
+    fn read_optional_ca_pem_surfaces_path_on_read_error() {
+        let err = read_optional_ca_pem(Some("/no/such/path/ca.pem")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("/no/such/path/ca.pem"),
+            "error must surface the configured path so operators can fix the mount: {msg}",
+        );
+    }
+
     fn fake_v3_response_body() -> serde_json::Value {
         json!({
             "dp_id":            "ed5e0f3e-2c32-4f3a-9b9e-d6c9d2c4d4e1",
@@ -405,6 +464,7 @@ mod tests {
             registration_token: Some("tok-xyz".into()),
             cp_base_url: Some(server.uri()),
             cp_etcd_endpoint: Some("etcd.local:7943".into()),
+            cp_ca_cert_file: None,
             mtls_dir: mtls_dir.to_string_lossy().into_owned(),
             dp_id_file: dp_id_file.to_string_lossy().into_owned(),
             snapshot_cache_path: String::new(),
@@ -499,6 +559,7 @@ mod tests {
             registration_token: Some("t".into()),
             cp_base_url: Some(server.uri()),
             cp_etcd_endpoint: Some("etcd.local:7943".into()),
+            cp_ca_cert_file: None,
             mtls_dir: dir.path().join("mtls").to_string_lossy().into_owned(),
             dp_id_file: dir.path().join("dp_id").to_string_lossy().into_owned(),
             snapshot_cache_path: String::new(),
@@ -527,6 +588,7 @@ mod tests {
             registration_token: Some("t".into()),
             cp_base_url: Some(server.uri()),
             cp_etcd_endpoint: Some("etcd.local:7943".into()),
+            cp_ca_cert_file: None,
             mtls_dir: dir.path().join("mtls").to_string_lossy().into_owned(),
             dp_id_file: dir.path().join("dp_id").to_string_lossy().into_owned(),
             snapshot_cache_path: String::new(),
@@ -564,6 +626,7 @@ mod tests {
             registration_token: Some("t".into()),
             cp_base_url: Some(server.uri()),
             cp_etcd_endpoint: Some("etcd.local:7943".into()),
+            cp_ca_cert_file: None,
             mtls_dir: dir.path().join("mtls").to_string_lossy().into_owned(),
             dp_id_file: dir.path().join("dp_id").to_string_lossy().into_owned(),
             snapshot_cache_path: String::new(),
@@ -595,6 +658,7 @@ mod tests {
             registration_token: Some("spent".into()),
             cp_base_url: Some(server.uri()),
             cp_etcd_endpoint: Some("etcd.local:7943".into()),
+            cp_ca_cert_file: None,
             mtls_dir: dir.path().join("mtls").to_string_lossy().into_owned(),
             dp_id_file: dir.path().join("dp_id").to_string_lossy().into_owned(),
             snapshot_cache_path: String::new(),

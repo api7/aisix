@@ -147,6 +147,25 @@ pub struct ManagedConfig {
     #[serde(default)]
     pub cp_etcd_endpoint: Option<String>,
 
+    /// Optional path to a PEM-encoded CA bundle the DP adds as an
+    /// additional trust root for outbound calls to the CP — both the
+    /// `/dp/register` HTTPS handshake and the etcd v3 gRPC connection
+    /// after registration.
+    ///
+    /// In production the CP terminates TLS with a public-CA-issued
+    /// certificate that the system trust store already covers, so
+    /// this is `None`. In e2e / dev / on-prem deployments the CP
+    /// often serves a self-signed or private-CA-signed cert; pointing
+    /// this at the issuing CA's PEM bundle lets the DP trust it
+    /// without disabling verification entirely.
+    ///
+    /// The file is read at boot — rotation requires a DP restart.
+    /// When set but unreadable the boot fails fast with the path so
+    /// the operator can fix the mount; we never silently fall through
+    /// to `InsecureSkipVerify`.
+    #[serde(default)]
+    pub cp_ca_cert_file: Option<String>,
+
     /// Directory where the DP persists `ca.crt`, `client.crt`,
     /// `client.key` received from the register response. Files are
     /// written `0600`. Parent directory must already exist and be
