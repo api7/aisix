@@ -77,6 +77,13 @@ async fn main() -> anyhow::Result<()> {
 /// Factored out of `main` so the integration tests can drive the full
 /// startup with a real config struct and still use `#[tokio::test]`.
 async fn run(mut cfg: Config) -> anyhow::Result<()> {
+    // Operator-supplied extra trust root, threaded into every
+    // outbound mTLS client (register, etcd, heartbeat, telemetry,
+    // BudgetClient). Needed for e2e / on-prem deployments where the
+    // CP serves a cert distinct from the cert-manager-issued client-
+    // cert CA. Production with public-CA certs leaves this `None`.
+    let extra_ca_pem = register::read_optional_ca_pem(cfg.managed.cp_ca_cert_file.as_deref())?;
+
     // Managed-mode bootstrap. If we have to register (first boot),
     // we also capture the heartbeat config the CP sent back so the
     // worker can be spawned a few lines below. If the bundle is
@@ -163,6 +170,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     ca_cert_path: r.ca_cert_path.clone(),
                     client_cert_path: r.client_cert_path.clone(),
                     client_key_path: r.client_key_path.clone(),
+                    extra_ca_pem: extra_ca_pem.clone(),
                 },
             ))
         } else if bundle_on_disk {
@@ -198,7 +206,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     register::env_id_path(&cfg.managed.mtls_dir),
                 )
             })?;
-            match load_heartbeat_config_from_disk(&cfg.managed) {
+            match load_heartbeat_config_from_disk(&cfg.managed, extra_ca_pem.clone()) {
                 Ok(h) => Some(h),
                 Err(e) => {
                     tracing::warn!(error = %e,
@@ -229,12 +237,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // fails). Both outcomes narrow triage substantially.
     probe_etcd_dns(&cfg.etcd.endpoints).await;
 
-    // managed.cp_ca_cert_file (when set) is a PEM-encoded trust root
-    // appended to the etcd TLS verify chain — needed for e2e / on-prem
-    // deployments where the dp-manager etcd listener serves a cert not
-    // covered by the cert-manager-issued CA. Production with public-CA
-    // certs leaves this `None`.
-    let extra_ca_pem = register::read_optional_ca_pem(cfg.managed.cp_ca_cert_file.as_deref())?;
+    // Same extra trust root reused by the etcd connect options.
     let connect_options =
         build_etcd_connect_options_with_extra_ca(&cfg.etcd, extra_ca_pem.as_deref())?;
     // effective_prefix() is `<prefix>/<env_id>` in v3 managed mode
@@ -636,6 +639,7 @@ fn default_domain_from_endpoint(endpoint: &str) -> anyhow::Result<String> {
 /// an inconsistent on-disk state an operator should know about.
 fn load_heartbeat_config_from_disk(
     managed: &aisix_core::ManagedConfig,
+    extra_ca_pem: Option<Vec<u8>>,
 ) -> anyhow::Result<heartbeat::HeartbeatConfig> {
     let base = managed
         .cp_base_url
@@ -660,6 +664,7 @@ fn load_heartbeat_config_from_disk(
             ca_cert_path: register::ca_cert_path(&managed.mtls_dir),
             client_cert_path: register::client_cert_path(&managed.mtls_dir),
             client_key_path: register::client_key_path(&managed.mtls_dir),
+            extra_ca_pem,
         },
     ))
 }

@@ -30,11 +30,21 @@ use tokio::sync::watch;
 /// to cp-api. Same three files written by `register::register_and_persist`
 /// (and re-used on every subsequent boot when the bundle is already on
 /// disk).
+///
+/// `extra_ca_pem` is an optional second CA bundle the operator points
+/// at via `managed.cp_ca_cert_file` — needed in e2e / on-prem
+/// deployments where dp-manager's *server* cert is signed by a CA
+/// distinct from the cert-manager-issued one (which only signs DP
+/// *client* certs). When set, every outbound mTLS client built from
+/// this bundle (heartbeat, telemetry, BudgetClient) appends it to
+/// the verify chain. Production with public-CA certs leaves this
+/// `None`.
 #[derive(Debug, Clone)]
 pub struct MtlsBundle {
     pub ca_cert_path: PathBuf,
     pub client_cert_path: PathBuf,
     pub client_key_path: PathBuf,
+    pub extra_ca_pem: Option<Vec<u8>>,
 }
 
 /// Configuration captured at register time. `url`, `dp_id`, `interval`
@@ -185,12 +195,21 @@ fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
 
     let ca = reqwest::Certificate::from_pem(&ca_pem).context("parse CA certificate")?;
 
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent(format!("aisix-dp/{}", env!("CARGO_PKG_VERSION")))
         .identity(identity)
         .add_root_certificate(ca)
-        .use_rustls_tls()
+        .use_rustls_tls();
+    // Operator-supplied extra root (e2e / on-prem). Covers the dp-
+    // manager server cert when it's signed by a CA distinct from the
+    // cert-manager-issued client-cert CA.
+    if let Some(extra) = mtls.extra_ca_pem.as_ref() {
+        let extra_ca = reqwest::Certificate::from_pem(extra)
+            .context("parse managed.cp_ca_cert_file as PEM certificate")?;
+        builder = builder.add_root_certificate(extra_ca);
+    }
+    builder
         .build()
         .context("build reqwest client with mTLS")
 }
@@ -239,6 +258,7 @@ mod tests {
             ca_cert_path: ca_path,
             client_cert_path: cert_path,
             client_key_path: key_path,
+            extra_ca_pem: None,
         }
     }
 
@@ -398,6 +418,7 @@ mod tests {
             ca_cert_path: "/definitely/missing/ca.crt".into(),
             client_cert_path: "/definitely/missing/client.crt".into(),
             client_key_path: "/definitely/missing/client.key".into(),
+            extra_ca_pem: None,
         };
         let err = build_client(&mtls).unwrap_err();
         // The error must mention which file was missing — operators

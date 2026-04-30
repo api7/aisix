@@ -236,12 +236,20 @@ fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
 
     let ca = reqwest::Certificate::from_pem(&ca_pem).context("parse CA certificate")?;
 
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent(format!("aisix-dp/{}", env!("CARGO_PKG_VERSION")))
         .identity(identity)
         .add_root_certificate(ca)
-        .use_rustls_tls()
+        .use_rustls_tls();
+    // Mirror heartbeat::build_client — pick up the operator-supplied
+    // extra trust root (managed.cp_ca_cert_file) when set.
+    if let Some(extra) = mtls.extra_ca_pem.as_ref() {
+        let extra_ca = reqwest::Certificate::from_pem(extra)
+            .context("parse managed.cp_ca_cert_file as PEM certificate")?;
+        builder = builder.add_root_certificate(extra_ca);
+    }
+    builder
         .build()
         .context("build reqwest client with mTLS")
 }
@@ -285,6 +293,7 @@ mod tests {
             ca_cert_path: ca_path,
             client_cert_path: cert_path,
             client_key_path: key_path,
+            extra_ca_pem: None,
         }
     }
 
