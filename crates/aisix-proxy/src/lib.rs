@@ -1152,14 +1152,25 @@ data: [DONE]\n\n";
         use crate::budget::BudgetClient;
 
         // cp-api stand-in: returns a deny decision for our key.
+        // Wire shape mirrors cp-api's budgetCheckResponse — see
+        // internal/cpapi/resources/budget_check.go (prd-09b rev 2 §5.5).
         let cp = MockServer::start().await;
-        Mock::given(method("POST"))
+        Mock::given(method("GET"))
             .and(path("/api/internal/budget_check"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": {
-                    "allowed": false,
-                    "fail_mode": "closed",
-                    "reason": "monthly cap exceeded"
+                "allow": false,
+                "fail_mode": "closed",
+                "reason": {
+                    "type": "billing_error",
+                    "code": "budget_exceeded",
+                    "message": "monthly cap exceeded",
+                    "scope": "api_key",
+                    "scope_ref": "ak-uuid",
+                    "limit_usd": "10.00",
+                    "spent_usd": "10.50",
+                    "period": "month",
+                    "period_resets_at": "2026-05-01T00:00:00Z",
+                    "retry_after_seconds": 86400
                 }
             })))
             .mount(&cp)

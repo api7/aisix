@@ -214,18 +214,38 @@ fn apply_fail_mode(prev: &Decision) -> Decision {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct WireEnvelope {
-    data: WireDecision,
-}
-
+// Wire shape mirrors cp-api's `budgetCheckResponse` in
+// internal/cpapi/resources/budget_check.go (prd-09b rev 2 §5.5/§5.8):
+//
+//   {
+//     "allow": bool,
+//     "fail_mode": "sticky"|"open"|"closed",
+//     "reason": {                         // present iff allow == false
+//       "type": "billing_error",
+//       "code": "budget_exceeded",
+//       "message": "...",
+//       "scope": "...", "scope_ref": "...",
+//       "limit_usd": "...", "spent_usd": "...",
+//       "period": "...", "period_resets_at": "...",
+//       "retry_after_seconds": <int>
+//     }
+//   }
+//
+// We surface only `message` to ProxyError::BudgetExceeded; the other
+// fields exist for the dashboard banner once we plumb them through.
 #[derive(Debug, Deserialize)]
 struct WireDecision {
-    allowed: bool,
+    allow: bool,
     #[serde(default)]
     fail_mode: String,
     #[serde(default)]
-    reason: Option<String>,
+    reason: Option<WireReason>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireReason {
+    #[serde(default)]
+    message: String,
 }
 
 async fn fetch_decision(
@@ -235,18 +255,23 @@ async fn fetch_decision(
     api_key_id: &str,
 ) -> Result<Decision, reqwest::Error> {
     let url = format!("{base_url}/api/internal/budget_check");
-    let mut req = http
-        .post(url)
-        .json(&serde_json::json!({ "api_key_id": api_key_id }));
+    let mut req = http.get(url).query(&[("api_key_id", api_key_id)]);
     if let Some(tok) = token {
         req = req.bearer_auth(tok);
     }
     let resp = req.send().await?.error_for_status()?;
-    let env: WireEnvelope = resp.json().await?;
+    let wire: WireDecision = resp.json().await?;
+    let reason = wire.reason.and_then(|r| {
+        if r.message.is_empty() {
+            None
+        } else {
+            Some(r.message)
+        }
+    });
     Ok(Decision {
-        allowed: env.data.allowed,
-        fail_mode: FailMode::parse(&env.data.fail_mode),
-        reason: env.data.reason,
+        allowed: wire.allow,
+        fail_mode: FailMode::parse(&wire.fail_mode),
+        reason,
     })
 }
 
@@ -266,10 +291,10 @@ mod tests {
     #[tokio::test]
     async fn live_client_returns_cp_api_decision() {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
+        Mock::given(method("GET"))
             .and(path("/api/internal/budget_check"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": {"allowed": true, "fail_mode": "sticky"}
+                "allow": true, "fail_mode": "sticky"
             })))
             .mount(&server)
             .await;
@@ -283,10 +308,23 @@ mod tests {
     #[tokio::test]
     async fn live_client_returns_deny_when_cp_says_no() {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
+        Mock::given(method("GET"))
             .and(path("/api/internal/budget_check"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": {"allowed": false, "fail_mode": "closed", "reason": "monthly cap"}
+                "allow": false,
+                "fail_mode": "closed",
+                "reason": {
+                    "type": "billing_error",
+                    "code": "budget_exceeded",
+                    "message": "org budget 'monthly' exceeded ($10.00/month). Resets 2026-05-01 00:00 UTC.",
+                    "scope": "org",
+                    "scope_ref": "org-uuid-1",
+                    "limit_usd": "10.00",
+                    "spent_usd": "10.50",
+                    "period": "month",
+                    "period_resets_at": "2026-05-01T00:00:00Z",
+                    "retry_after_seconds": 86400
+                }
             })))
             .mount(&server)
             .await;
@@ -295,16 +333,20 @@ mod tests {
         let d = c.check("k-1").await;
         assert!(!d.allowed);
         assert_eq!(d.fail_mode, FailMode::Closed);
-        assert_eq!(d.reason.as_deref(), Some("monthly cap"));
+        assert!(d
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("org budget 'monthly' exceeded"));
     }
 
     #[tokio::test]
     async fn cache_hit_skips_network_within_ttl() {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
+        Mock::given(method("GET"))
             .and(path("/api/internal/budget_check"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": {"allowed": true, "fail_mode": "sticky"}
+                "allow": true, "fail_mode": "sticky"
             })))
             .expect(1)
             .mount(&server)
@@ -320,16 +362,16 @@ mod tests {
     #[tokio::test]
     async fn fallback_serves_cache_when_cp_fails() {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
+        Mock::given(method("GET"))
             .and(path("/api/internal/budget_check"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": {"allowed": true, "fail_mode": "open"}
+                "allow": true, "fail_mode": "open"
             })))
             .up_to_n_times(1)
             .mount(&server)
             .await;
         // Subsequent calls 500.
-        Mock::given(method("POST"))
+        Mock::given(method("GET"))
             .and(path("/api/internal/budget_check"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
@@ -353,7 +395,7 @@ mod tests {
     #[tokio::test]
     async fn fallback_with_no_cache_denies() {
         let server = MockServer::start().await;
-        Mock::given(method("POST"))
+        Mock::given(method("GET"))
             .and(path("/api/internal/budget_check"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
