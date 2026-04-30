@@ -1156,7 +1156,7 @@ data: [DONE]\n\n";
         // internal/cpapi/resources/budget_check.go (prd-09b rev 2 §5.5).
         let cp = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/api/internal/budget_check"))
+            .and(path("/dp/budget_check"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "allow": false,
                 "fail_mode": "closed",

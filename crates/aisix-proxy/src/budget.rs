@@ -1,5 +1,12 @@
 //! Budget client — asks cp-api per request whether an api_key may proceed.
 //!
+//! Wire: `GET {dpmgr_base}/dp/budget_check?api_key_id=<uuid>`. Auth is
+//! mTLS — the caller supplies a `reqwest::Client` already loaded with
+//! the same client cert + CA bundle the heartbeat worker uses. cp-api
+//! authenticates the DP by peer cert SAN (env_id, dp_id) and rejects
+//! requests for api_keys outside that env (403). See prd-09b rev 2 §5.5
+//! and AISIX-Cloud PR #95 for the CP-side route.
+//!
 //! Decisions are cached in an LRU (capacity 10000, TTL 5s) keyed by
 //! api_key_id. When cp-api is unreachable we honor the last cached
 //! decision (sticky) up to AISIX_DP_BUDGET_STALE_MAX_SECONDS (default
@@ -59,7 +66,6 @@ enum Mode {
     Live {
         http: reqwest::Client,
         base_url: String,
-        token: Option<String>,
         stale_max: Duration,
     },
     Disabled,
@@ -84,14 +90,14 @@ impl std::fmt::Debug for BudgetClient {
 }
 
 impl BudgetClient {
-    /// Live client that asks cp-api per request. The base URL should be the
-    /// cp-api root (e.g. `https://cp.aisix.cloud`). Auth token comes from the
-    /// `AISIX_DP_CP_TOKEN` env var; if unset, requests go without an
-    /// Authorization header (cp-api will reject them — operators should run
-    /// `disabled()` instead in that case).
+    /// Live client that asks cp-api per request via mTLS. `base_url` is
+    /// the same dpmgr origin the heartbeat worker hits (e.g.
+    /// `https://cp.aisix.cloud:9101`); `http` must be a reqwest client
+    /// already loaded with the DP's client cert + CA bundle. Build it
+    /// with `aisix_server::heartbeat::build_mtls_client` (or its
+    /// equivalent) using the same `MtlsBundle` `/dp/register` persisted.
     pub fn new(base_url: impl Into<String>, http: reqwest::Client) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
-        let token = std::env::var("AISIX_DP_CP_TOKEN").ok();
         let stale_max = std::env::var("AISIX_DP_BUDGET_STALE_MAX_SECONDS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -100,7 +106,6 @@ impl BudgetClient {
             mode: Mode::Live {
                 http,
                 base_url,
-                token,
                 stale_max: Duration::from_secs(stale_max),
             },
             cache: DashMap::new(),
@@ -124,7 +129,6 @@ impl BudgetClient {
             Mode::Live {
                 http,
                 base_url,
-                token,
                 stale_max,
             } => {
                 // Fast path: cache hit within TTL.
@@ -134,7 +138,7 @@ impl BudgetClient {
                     }
                 }
 
-                match fetch_decision(http, base_url, token.as_deref(), api_key_id).await {
+                match fetch_decision(http, base_url, api_key_id).await {
                     Ok(decision) => {
                         self.insert(api_key_id, decision.clone());
                         decision
@@ -251,15 +255,15 @@ struct WireReason {
 async fn fetch_decision(
     http: &reqwest::Client,
     base_url: &str,
-    token: Option<&str>,
     api_key_id: &str,
 ) -> Result<Decision, reqwest::Error> {
-    let url = format!("{base_url}/api/internal/budget_check");
-    let mut req = http.get(url).query(&[("api_key_id", api_key_id)]);
-    if let Some(tok) = token {
-        req = req.bearer_auth(tok);
-    }
-    let resp = req.send().await?.error_for_status()?;
+    let url = format!("{base_url}/dp/budget_check");
+    let resp = http
+        .get(url)
+        .query(&[("api_key_id", api_key_id)])
+        .send()
+        .await?
+        .error_for_status()?;
     let wire: WireDecision = resp.json().await?;
     let reason = wire.reason.and_then(|r| {
         if r.message.is_empty() {
@@ -292,7 +296,7 @@ mod tests {
     async fn live_client_returns_cp_api_decision() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/api/internal/budget_check"))
+            .and(path("/dp/budget_check"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "allow": true, "fail_mode": "sticky"
             })))
@@ -309,7 +313,7 @@ mod tests {
     async fn live_client_returns_deny_when_cp_says_no() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/api/internal/budget_check"))
+            .and(path("/dp/budget_check"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "allow": false,
                 "fail_mode": "closed",
@@ -344,7 +348,7 @@ mod tests {
     async fn cache_hit_skips_network_within_ttl() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/api/internal/budget_check"))
+            .and(path("/dp/budget_check"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "allow": true, "fail_mode": "sticky"
             })))
@@ -363,7 +367,7 @@ mod tests {
     async fn fallback_serves_cache_when_cp_fails() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/api/internal/budget_check"))
+            .and(path("/dp/budget_check"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "allow": true, "fail_mode": "open"
             })))
@@ -372,7 +376,7 @@ mod tests {
             .await;
         // Subsequent calls 500.
         Mock::given(method("GET"))
-            .and(path("/api/internal/budget_check"))
+            .and(path("/dp/budget_check"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
@@ -396,7 +400,7 @@ mod tests {
     async fn fallback_with_no_cache_denies() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/api/internal/budget_check"))
+            .and(path("/dp/budget_check"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;

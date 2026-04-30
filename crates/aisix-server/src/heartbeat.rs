@@ -157,6 +157,15 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
 /// the presenting identity. Files are read here (not at config-load
 /// time) so an unreadable/rotated bundle surfaces an actionable error
 /// at the same place every other heartbeat error does.
+///
+/// Public so the BudgetClient (aisix-proxy) and any future per-request
+/// CP caller can reuse the same identity without duplicating the PEM-
+/// loading dance. `aisix-server::telemetry` keeps its own copy because
+/// it predates the extraction; consolidating later is fine.
+pub fn build_mtls_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
+    build_client(mtls)
+}
+
 fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
     let ca_pem = std::fs::read(&mtls.ca_cert_path)
         .with_context(|| format!("read {}", mtls.ca_cert_path.display()))?;

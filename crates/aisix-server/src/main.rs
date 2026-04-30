@@ -31,6 +31,7 @@ use aisix_provider_anthropic::AnthropicBridge;
 use aisix_provider_deepseek::deepseek_bridge;
 use aisix_provider_gemini::gemini_bridge;
 use aisix_provider_openai::OpenAiBridge;
+use aisix_proxy::budget::BudgetClient;
 use aisix_proxy::ProxyState;
 use aisix_ratelimit::Limiter;
 use clap::Parser;
@@ -294,6 +295,26 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             h.mtls.clone(),
         )
     });
+    // Budget gate. Same on-disk mTLS bundle as heartbeat; URL is the
+    // dpmgr origin (heartbeat URL minus the /dp/heartbeat suffix), the
+    // BudgetClient appends /dp/budget_check itself. See prd-09b rev 2
+    // §5.5 and AISIX-Cloud PR #95. When the bundle build fails the DP
+    // logs and falls back to the default disabled() (allow-all) — a
+    // mid-boot config glitch shouldn't take the proxy down.
+    let budget_client = heartbeat_cfg.as_ref().and_then(|h| {
+        let dpmgr_base = h
+            .url
+            .strip_suffix("/dp/heartbeat")
+            .unwrap_or(h.url.as_str())
+            .to_string();
+        match heartbeat::build_mtls_client(&h.mtls) {
+            Ok(http) => Some(Arc::new(BudgetClient::new(dpmgr_base, http))),
+            Err(e) => {
+                tracing::warn!(error = %e, "budget_check disabled: mTLS client build failed");
+                None
+            }
+        }
+    });
     let heartbeat_task = heartbeat_cfg.map(|h| heartbeat::spawn(h, cancel_rx.clone()));
     let (usage_sink, telemetry_task) = match telemetry_cfg {
         Some(cfg) => {
@@ -356,6 +377,9 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         proxy_state = proxy_state.with_langfuse(sender);
     }
     proxy_state = proxy_state.with_usage_sink(usage_sink);
+    if let Some(client) = budget_client {
+        proxy_state = proxy_state.with_budget_client(client);
+    }
     // Clone shared trackers before consuming proxy_state in build_router.
     let health_tracker = proxy_state.health.clone();
     let proxy_router = aisix_proxy::build_router(proxy_state);
