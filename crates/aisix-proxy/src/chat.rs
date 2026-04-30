@@ -89,6 +89,15 @@ pub async fn chat_completions(
                 elapsed,
                 success.prompt_tokens.unwrap_or(0) as u32,
                 success.completion_tokens.unwrap_or(0) as u32,
+                UsageExtras {
+                    cached_prompt_tokens: success.cached_prompt_tokens,
+                    reasoning_tokens: success.reasoning_tokens,
+                    cache_creation_tokens: success.cache_creation_tokens,
+                    cache_read_tokens: success.cache_read_tokens,
+                    provider_request_id: success.provider_request_id.clone(),
+                    provider_model_version: success.provider_model_version.clone(),
+                    finish_reason: success.finish_reason.clone(),
+                },
                 success.cost_usd,
                 /* guardrail_blocked */ false,
             );
@@ -153,6 +162,10 @@ pub async fn chat_completions(
                 elapsed,
                 /* prompt_tokens */ 0,
                 /* completion_tokens */ 0,
+                // Error path never reached the upstream — no provider
+                // id / model version / finish_reason to record, all
+                // zero / empty.
+                UsageExtras::default(),
                 /* cost_usd */ 0.0,
                 guardrail_blocked,
             );
@@ -189,6 +202,22 @@ struct Success {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     total_tokens: Option<u64>,
+    /// Provider-specific cache + reasoning token counters. Default 0
+    /// for providers that don't expose them; cp-api falls back to the
+    /// standard prompt / completion rate when these are 0.
+    cached_prompt_tokens: u32,
+    reasoning_tokens: u32,
+    cache_creation_tokens: u32,
+    cache_read_tokens: u32,
+    /// Provider response `id` (OpenAI chat.completion.id or Anthropic
+    /// message id) — empty when the cached path served the request
+    /// (re-using a stored response's id would mislead reconciliation).
+    provider_request_id: String,
+    /// Resolved model the provider actually billed.
+    provider_model_version: String,
+    /// finish_reason / stop_reason as the upstream returned it. Empty
+    /// for streaming (no terminal event yet) and cache hits.
+    finish_reason: String,
     /// Cost computed via the per-key Budget's pricing table, in USD.
     /// 0.0 when no budget is configured for the key.
     cost_usd: f64,
@@ -308,6 +337,15 @@ async fn dispatch(
             // until the stream completes upstream). Phase 2 wires
             // mid-stream accumulation; for now telemetry records 0.
             cost_usd: 0.0,
+            // Cache / reasoning counters require parsing the terminal
+            // SSE chunk's usage block; not wired yet — Phase 2.
+            cached_prompt_tokens: 0,
+            reasoning_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            provider_request_id: String::new(),
+            provider_model_version: String::new(),
+            finish_reason: String::new(),
         });
     }
 
@@ -325,6 +363,16 @@ async fn dispatch(
                 let prompt = cached.usage.prompt_tokens as u64;
                 let completion = cached.usage.completion_tokens as u64;
                 let total = cached.usage.total_tokens as u64;
+                // Snapshot the cache / reasoning counters BEFORE the
+                // value moves into render_response below. Cache hits
+                // replay the original upstream's usage — we already
+                // paid the cost first time around — so the dashboard's
+                // "of which N were cache hits" stat reflects the
+                // original event accurately.
+                let cached_prompt_tokens = cached.usage.cached_prompt_tokens;
+                let reasoning_tokens = cached.usage.reasoning_tokens;
+                let cache_creation_tokens = cached.usage.cache_creation_tokens;
+                let cache_read_tokens = cached.usage.cache_read_tokens;
                 // The provider label points at the first attempt — for a
                 // cache hit we don't know (or care) which target ran the
                 // original call; the fingerprint identified the answer.
@@ -343,6 +391,17 @@ async fn dispatch(
                     prompt_tokens: Some(prompt),
                     completion_tokens: Some(completion),
                     total_tokens: Some(total),
+                    cached_prompt_tokens,
+                    reasoning_tokens,
+                    cache_creation_tokens,
+                    cache_read_tokens,
+                    // The cache stored the original provider response;
+                    // a stable id here would mislead reconciliation
+                    // (the request didn't actually hit the upstream),
+                    // so we leave these blank deliberately.
+                    provider_request_id: String::new(),
+                    provider_model_version: String::new(),
+                    finish_reason: String::new(),
                     // Cache hits don't burn cost on our side (we already
                     // paid the upstream price the first time around).
                     cost_usd: 0.0,
@@ -419,6 +478,16 @@ async fn dispatch(
     let prompt = upstream.usage.prompt_tokens as u64;
     let completion = upstream.usage.completion_tokens as u64;
     let total = upstream.usage.total_tokens as u64;
+    // Snapshot the cache / reasoning counters + provider identity before
+    // the upstream gets moved into render_response below — we need them
+    // on the Success struct for telemetry.
+    let cached_prompt_tokens = upstream.usage.cached_prompt_tokens;
+    let reasoning_tokens = upstream.usage.reasoning_tokens;
+    let cache_creation_tokens = upstream.usage.cache_creation_tokens;
+    let cache_read_tokens = upstream.usage.cache_read_tokens;
+    let provider_request_id = upstream.id.clone();
+    let provider_model_version = upstream.model.clone();
+    let finish_reason = finish_reason_label(&upstream.finish_reason);
     reservation.commit_tokens(total);
 
     // cp-api recomputes cost server-side from its pricing catalog when
@@ -449,8 +518,29 @@ async fn dispatch(
         prompt_tokens: Some(prompt),
         completion_tokens: Some(completion),
         total_tokens: Some(total),
+        cached_prompt_tokens,
+        reasoning_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        provider_request_id,
+        provider_model_version,
+        finish_reason,
         cost_usd,
     })
+}
+
+/// Wire-shape label for `FinishReason`. cp-api stores this verbatim
+/// in `dpmgr_usage_events.finish_reason`; the dashboard reads it back
+/// to distinguish normal stops from truncation / content_filter.
+fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
+    use aisix_gateway::FinishReason;
+    match reason {
+        FinishReason::Stop => "stop".into(),
+        FinishReason::Length => "length".into(),
+        FinishReason::ContentFilter => "content_filter".into(),
+        FinishReason::ToolCalls => "tool_calls".into(),
+        FinishReason::Other(s) => s.clone(),
+    }
 }
 
 fn record_success(
@@ -470,9 +560,9 @@ fn record_success(
 
 /// Push one telemetry event onto the CP-side sink. Non-blocking;
 /// drops with a tracing::warn! if the worker queue is full.
-/// Centralised here so success / error / streaming all share the same
-/// event-construction logic and the wire shape stays consistent
-/// across paths.
+/// Centralised here so success / error / streaming / cache-hit paths
+/// all share the same event-construction logic and the wire shape
+/// stays consistent across them.
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     sink: &UsageSink,
@@ -483,6 +573,7 @@ fn emit_usage_event(
     elapsed: Duration,
     prompt_tokens: u32,
     completion_tokens: u32,
+    extras: UsageExtras,
     cost_usd: f64,
     guardrail_blocked: bool,
 ) {
@@ -495,11 +586,35 @@ fn emit_usage_event(
         api_key_id: api_key_id.to_string(),
         prompt_tokens,
         completion_tokens,
+        cached_prompt_tokens: extras.cached_prompt_tokens,
+        reasoning_tokens: extras.reasoning_tokens,
+        cache_creation_tokens: extras.cache_creation_tokens,
+        cache_read_tokens: extras.cache_read_tokens,
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
+        provider_request_id: extras.provider_request_id,
+        provider_model_version: extras.provider_model_version,
+        finish_reason: extras.finish_reason,
         cost_usd,
         guardrail_blocked,
     });
+}
+
+/// Provider-detail bundle for `emit_usage_event`. Grouped here so the
+/// helper signature stays under the clippy-too-many-arguments bar
+/// without losing the structural relationship between the seven new
+/// fields. All seven default to "" / 0, which is exactly the
+/// "no provider info / no cache or reasoning detail" case (error path,
+/// streaming pre-Phase-2).
+#[derive(Default)]
+struct UsageExtras {
+    cached_prompt_tokens: u32,
+    reasoning_tokens: u32,
+    cache_creation_tokens: u32,
+    cache_read_tokens: u32,
+    provider_request_id: String,
+    provider_model_version: String,
+    finish_reason: String,
 }
 
 fn record_error(metrics: &Metrics, err: &ProxyError, model: &str, status: u16, elapsed: Duration) {

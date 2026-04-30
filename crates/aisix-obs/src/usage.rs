@@ -44,7 +44,7 @@ use serde::Serialize;
 /// cp-api stores empty strings as SQL NULL; the field is `Option`
 /// here so the JSON serialiser emits `""` (not `null`) — matches what
 /// the cp-api parser expects.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct UsageEvent {
     /// DP-supplied request id (idempotency key). Use the same id the
     /// `x-aisix-call-id` response header carries so logs join.
@@ -65,18 +65,64 @@ pub struct UsageEvent {
 
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+
+    /// OpenAI prompt-cache hit count. Subset of `prompt_tokens`.
+    /// Defaults to 0 for providers that don't expose prompt caching.
+    /// Serialised with `omitempty`-equivalent behaviour: cp-api accepts
+    /// the absent-or-zero case identically.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub cached_prompt_tokens: u32,
+
+    /// OpenAI o1/o3 reasoning tokens. Subset of `completion_tokens`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub reasoning_tokens: u32,
+
+    /// Anthropic cache_creation_input_tokens. Separate counter on top
+    /// of input_tokens; bills at ~1.25× prompt rate (per-model rate
+    /// resolved by cp-api from model_pricing).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub cache_creation_tokens: u32,
+
+    /// Anthropic cache_read_input_tokens. Separate counter on top of
+    /// input_tokens; bills at ~0.10× prompt rate.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub cache_read_tokens: u32,
+
     pub latency_ms: u32,
 
     /// HTTP status code the proxy returned to the downstream caller.
     pub status_code: u16,
 
+    /// Provider response `id` — OpenAI's `chat.completion.id` or
+    /// Anthropic's message `id`. Empty when the request never reached
+    /// the upstream (guardrail block / pre-dispatch error).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider_request_id: String,
+
+    /// Resolved model the provider actually billed (e.g.
+    /// `gpt-4o-2024-08-06` when the request said `gpt-4o`). Differs
+    /// from cp-api's `model_id` which points at the dashboard alias.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider_model_version: String,
+
+    /// finish_reason / stop_reason from the upstream response. Empty
+    /// for upstream errors and guardrail blocks.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub finish_reason: String,
+
     /// Cost the DP computed for this request in US dollars. Zero when
     /// the request never reached cost calculation (e.g. blocked by a
-    /// guardrail before dispatch).
+    /// guardrail before dispatch). cp-api recomputes this server-side
+    /// from its pricing catalog; the DP-supplied value is dropped.
     pub cost_usd: f64,
 
     /// True when a guardrail rejected the request (input or output).
     pub guardrail_blocked: bool,
+}
+
+#[inline]
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 /// Cheap clonable handle the proxy hands to request handlers. Backed
@@ -173,6 +219,7 @@ mod tests {
             status_code: 200,
             cost_usd: 0.0012,
             guardrail_blocked: false,
+            ..Default::default()
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains(r#""request_id":"req-1""#));
@@ -182,18 +229,58 @@ mod tests {
         assert!(json.contains(r#""guardrail_blocked":false"#));
     }
 
+    #[test]
+    fn cache_and_reasoning_fields_are_omitted_when_zero() {
+        // Older DP builds and providers without cache support emit
+        // events with these counters at 0. They must NOT appear in
+        // the JSON — cp-api treats absent and 0 identically, but a
+        // wire-compat regression here would inflate the request size
+        // for every event.
+        let ev = UsageEvent {
+            request_id: "req-1".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(!json.contains("cached_prompt_tokens"));
+        assert!(!json.contains("reasoning_tokens"));
+        assert!(!json.contains("cache_creation_tokens"));
+        assert!(!json.contains("cache_read_tokens"));
+        assert!(!json.contains("provider_request_id"));
+        assert!(!json.contains("provider_model_version"));
+        assert!(!json.contains("finish_reason"));
+    }
+
+    #[test]
+    fn cache_and_reasoning_fields_serialise_when_set() {
+        let ev = UsageEvent {
+            request_id: "req-2".into(),
+            prompt_tokens: 1000,
+            completion_tokens: 200,
+            cached_prompt_tokens: 500,
+            reasoning_tokens: 50,
+            cache_creation_tokens: 100,
+            cache_read_tokens: 80,
+            provider_request_id: "chatcmpl-abc".into(),
+            provider_model_version: "gpt-4o-2024-08-06".into(),
+            finish_reason: "stop".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""cached_prompt_tokens":500"#));
+        assert!(json.contains(r#""reasoning_tokens":50"#));
+        assert!(json.contains(r#""cache_creation_tokens":100"#));
+        assert!(json.contains(r#""cache_read_tokens":80"#));
+        assert!(json.contains(r#""provider_request_id":"chatcmpl-abc""#));
+        assert!(json.contains(r#""provider_model_version":"gpt-4o-2024-08-06""#));
+        assert!(json.contains(r#""finish_reason":"stop""#));
+    }
+
     fn sample_event(id: &str) -> UsageEvent {
         UsageEvent {
             request_id: id.into(),
             occurred_at: "2026-04-29T12:00:00Z".into(),
-            model_id: String::new(),
-            api_key_id: String::new(),
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            latency_ms: 0,
             status_code: 200,
-            cost_usd: 0.0,
-            guardrail_blocked: false,
+            ..Default::default()
         }
     }
 }

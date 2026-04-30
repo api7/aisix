@@ -115,11 +115,36 @@ pub(crate) struct OpenAiResponseMessage {
     pub content: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub(crate) struct OpenAiUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Present on responses that touched the prompt cache. Subset of
+    /// `prompt_tokens`. Optional so older API versions / non-cached
+    /// responses parse without the field.
+    #[serde(default)]
+    pub prompt_tokens_details: Option<OpenAiPromptDetails>,
+    /// Present on responses from o1 / o3 reasoning models. Subset of
+    /// `completion_tokens`.
+    #[serde(default)]
+    pub completion_tokens_details: Option<OpenAiCompletionDetails>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct OpenAiPromptDetails {
+    /// Tokens served from the prompt cache (50% of prompt rate).
+    #[serde(default)]
+    pub cached_tokens: u32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct OpenAiCompletionDetails {
+    /// o1/o3 reasoning tokens. Same rate as `completion_tokens`,
+    /// surfaced separately so admins can see "of which N were
+    /// reasoning" on the dashboard.
+    #[serde(default)]
+    pub reasoning_tokens: u32,
 }
 
 pub(crate) fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
@@ -153,6 +178,21 @@ fn into_usage(u: OpenAiUsage) -> UsageStats {
         prompt_tokens: u.prompt_tokens,
         completion_tokens: u.completion_tokens,
         total_tokens: u.total_tokens,
+        cached_prompt_tokens: u
+            .prompt_tokens_details
+            .as_ref()
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0),
+        reasoning_tokens: u
+            .completion_tokens_details
+            .as_ref()
+            .map(|d| d.reasoning_tokens)
+            .unwrap_or(0),
+        // OpenAI doesn't currently expose Anthropic-style cache
+        // creation/read counters; leave at 0 (cp-api falls back to
+        // prompt rate for unset cache counters).
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
     }
 }
 
@@ -310,6 +350,40 @@ mod tests {
         assert_eq!(out.message.content, "hi there");
         assert_eq!(out.finish_reason, FinishReason::Stop);
         assert_eq!(out.usage.total_tokens, 6);
+        // No cache / reasoning details on this minimal response →
+        // counters stay at 0 (cp-api falls back to standard rates).
+        assert_eq!(out.usage.cached_prompt_tokens, 0);
+        assert_eq!(out.usage.reasoning_tokens, 0);
+    }
+
+    #[test]
+    fn cache_and_reasoning_details_populate_when_present() {
+        // Verified shape from
+        // https://platform.openai.com/docs/api-reference/chat/object#chat/object-usage
+        // (prompt_tokens_details + completion_tokens_details).
+        let body = r#"{
+            "id": "cmpl-2",
+            "object": "chat.completion",
+            "model": "o1-2024-12-17",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 500,
+                "total_tokens": 1500,
+                "prompt_tokens_details": {"cached_tokens": 800},
+                "completion_tokens_details": {"reasoning_tokens": 200}
+            }
+        }"#;
+        let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        assert_eq!(out.usage.prompt_tokens, 1000);
+        assert_eq!(out.usage.cached_prompt_tokens, 800);
+        assert_eq!(out.usage.completion_tokens, 500);
+        assert_eq!(out.usage.reasoning_tokens, 200);
     }
 
     #[test]

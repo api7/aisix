@@ -169,10 +169,17 @@ pub(crate) enum AnthropicResponseBlock {
     Other,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub(crate) struct AnthropicUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Tokens written to the prompt cache (1.25× input rate). Optional
+    /// — present only on requests with cache_control segments.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
+    /// Tokens served from the prompt cache (0.10× input rate).
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
 }
 
 pub(crate) fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
@@ -188,7 +195,17 @@ pub(crate) fn response_into_chat_response(raw: AnthropicResponse) -> ChatRespons
 
     let usage = raw
         .usage
-        .map(|u| UsageStats::new(u.input_tokens, u.output_tokens))
+        .map(|u| UsageStats {
+            prompt_tokens: u.input_tokens,
+            completion_tokens: u.output_tokens,
+            total_tokens: u.input_tokens.saturating_add(u.output_tokens),
+            cache_creation_tokens: u.cache_creation_input_tokens,
+            cache_read_tokens: u.cache_read_input_tokens,
+            // Anthropic doesn't use OpenAI's cached-prompt-tokens or
+            // reasoning-tokens taxonomy; leave at 0.
+            cached_prompt_tokens: 0,
+            reasoning_tokens: 0,
+        })
         .unwrap_or_default();
 
     ChatResponse {
@@ -419,6 +436,37 @@ mod tests {
         assert_eq!(out.message.content, "hello");
         assert_eq!(out.finish_reason, FinishReason::Stop);
         assert_eq!(out.usage.total_tokens, 5);
+    }
+
+    #[test]
+    fn cache_creation_and_read_counters_populate_when_present() {
+        // Verified shape from
+        // https://docs.anthropic.com/en/api/messages (usage object
+        // with cache_creation_input_tokens + cache_read_input_tokens).
+        let body = r#"{
+            "id": "msg_cache_01",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 4,
+                "cache_creation_input_tokens": 200,
+                "cache_read_input_tokens": 800
+            }
+        }"#;
+        let raw: AnthropicResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        assert_eq!(out.usage.prompt_tokens, 10);
+        assert_eq!(out.usage.completion_tokens, 4);
+        assert_eq!(out.usage.cache_creation_tokens, 200);
+        assert_eq!(out.usage.cache_read_tokens, 800);
+        // Anthropic doesn't use OpenAI's cached_prompt / reasoning
+        // taxonomy — these stay 0.
+        assert_eq!(out.usage.cached_prompt_tokens, 0);
+        assert_eq!(out.usage.reasoning_tokens, 0);
     }
 
     #[test]

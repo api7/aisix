@@ -126,12 +126,52 @@ pub enum FinishReason {
     Other(String),
 }
 
+/// Token usage stats from one upstream chat completion. The four
+/// fine-grained counters that follow `total_tokens` carry the
+/// provider-specific cache / reasoning detail used by cp-api's cost
+/// formula (see `aisix-cloud:internal/dpmgr/dpstore/pricing.go`).
+///
+/// Provider-protocol mapping (the canonical comment lives in cp-api's
+/// schema; mirrored here for grep-ability):
+///
+///   OpenAI Chat Completions response.usage:
+///     prompt_tokens                              → prompt_tokens (TOTAL,
+///                                                  includes cached_prompt)
+///     completion_tokens                          → completion_tokens (TOTAL,
+///                                                  includes reasoning)
+///     prompt_tokens_details.cached_tokens        → cached_prompt_tokens
+///     completion_tokens_details.reasoning_tokens → reasoning_tokens
+///
+///   Anthropic Messages API response.usage:
+///     input_tokens                  → prompt_tokens (NON-cached input)
+///     output_tokens                 → completion_tokens
+///     cache_creation_input_tokens   → cache_creation_tokens
+///     cache_read_input_tokens       → cache_read_tokens
+///
+/// Provider bridges that don't surface these (gemini, deepseek,
+/// mistral, …) leave the four new counters at 0; cp-api treats 0 as
+/// "no distinct rate" and falls back to the standard prompt /
+/// completion price for that token class.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageStats {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// OpenAI prompt-cache hit count. Subset of `prompt_tokens`.
+    #[serde(default)]
+    pub cached_prompt_tokens: u32,
+    /// OpenAI o1/o3 reasoning tokens. Subset of `completion_tokens`.
+    #[serde(default)]
+    pub reasoning_tokens: u32,
+    /// Anthropic cache_creation_input_tokens (cache write). Separate
+    /// counter on top of input_tokens.
+    #[serde(default)]
+    pub cache_creation_tokens: u32,
+    /// Anthropic cache_read_input_tokens (cache read). Separate
+    /// counter on top of input_tokens.
+    #[serde(default)]
+    pub cache_read_tokens: u32,
 }
 
 impl UsageStats {
@@ -140,6 +180,7 @@ impl UsageStats {
             prompt_tokens: prompt,
             completion_tokens: completion,
             total_tokens: prompt.saturating_add(completion),
+            ..Self::default()
         }
     }
 }

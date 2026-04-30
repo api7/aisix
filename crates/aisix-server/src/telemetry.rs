@@ -300,6 +300,7 @@ mod tests {
             status_code: 200,
             cost_usd: 0.001,
             guardrail_blocked: false,
+            ..Default::default()
         }
     }
 
