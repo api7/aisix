@@ -118,6 +118,18 @@ pub struct UsageEvent {
 
     /// True when a guardrail rejected the request (input or output).
     pub guardrail_blocked: bool,
+
+    /// Set when at least one remote-API guardrail (today: kind=bedrock)
+    /// failed open: its upstream was unreachable but the operator
+    /// configured `fail_open=true`, so the request went through. The
+    /// reason ("bedrock_5xx" / "bedrock_timeout" / "bedrock_throttled")
+    /// is what gets recorded so a compliance audit can identify
+    /// requests that slipped past the policy. Empty string = no
+    /// bypass (the normal Allow / Block paths). cp-api persists this
+    /// to `dpmgr_usage_events.guardrail_bypassed_reason`; on the
+    /// wire empty maps to NULL via `skip_serializing_if`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub guardrail_bypassed_reason: String,
 }
 
 #[inline]

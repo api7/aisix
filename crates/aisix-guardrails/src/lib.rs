@@ -32,15 +32,38 @@ pub use keyword::{KeywordBlocklist, KeywordRule};
 pub use length::MaxContentLength;
 
 /// What a guardrail decided about a request or response.
+///
+/// `Bypass` exists for remote-API guardrails (kind=bedrock) whose
+/// upstream is unreachable but the operator configured `fail_open=true`:
+/// the request goes through, but the bypass is recorded on the
+/// telemetry event so a compliance audit can see what slipped past.
+/// `Bypass` is **not** a block — the chain doesn't short-circuit on
+/// it, and other guardrails downstream still get to inspect the
+/// request. See PRD-09c §6.4.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuardrailVerdict {
     Allow,
     Block { reason: String },
+    Bypass { reason: String },
 }
 
 impl GuardrailVerdict {
     pub fn is_block(&self) -> bool {
         matches!(self, GuardrailVerdict::Block { .. })
+    }
+
+    pub fn is_bypass(&self) -> bool {
+        matches!(self, GuardrailVerdict::Bypass { .. })
+    }
+
+    /// Extract the bypass reason if this is a `Bypass` verdict, else
+    /// `None`. Used by the chat handler to attach
+    /// `guardrail_bypassed_reason` to the telemetry event.
+    pub fn bypass_reason(&self) -> Option<&str> {
+        match self {
+            GuardrailVerdict::Bypass { reason } => Some(reason.as_str()),
+            _ => None,
+        }
     }
 }
 
@@ -70,5 +93,13 @@ mod tests {
     fn verdict_helpers() {
         assert!(!GuardrailVerdict::Allow.is_block());
         assert!(GuardrailVerdict::Block { reason: "x".into() }.is_block());
+        assert!(!GuardrailVerdict::Allow.is_bypass());
+        assert!(GuardrailVerdict::Bypass { reason: "y".into() }.is_bypass());
+        assert!(!GuardrailVerdict::Bypass { reason: "y".into() }.is_block());
+        assert_eq!(
+            GuardrailVerdict::Bypass { reason: "y".into() }.bypass_reason(),
+            Some("y"),
+        );
+        assert_eq!(GuardrailVerdict::Allow.bypass_reason(), None);
     }
 }

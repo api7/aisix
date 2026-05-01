@@ -102,6 +102,7 @@ pub async fn chat_completions(
                     provider_request_id: success.provider_request_id.clone(),
                     provider_model_version: success.provider_model_version.clone(),
                     finish_reason: success.finish_reason.clone(),
+                    bypass_reason: success.bypass_reason.clone().unwrap_or_default(),
                 },
                 success.cost_usd,
                 /* guardrail_blocked */ false,
@@ -229,6 +230,12 @@ struct Success {
     /// Cost computed via the per-key Budget's pricing table, in USD.
     /// 0.0 when no budget is configured for the key.
     cost_usd: f64,
+    /// Set when at least one guardrail returned `Bypass` (remote-API
+    /// guardrail upstream unreachable + `fail_open=true`). The first
+    /// bypass reason wins. Goes onto `usage_events.guardrail_bypassed_reason`
+    /// so a compliance audit can see what slipped past during a Bedrock
+    /// outage. None for the normal Allow / Block paths.
+    bypass_reason: Option<String>,
 }
 
 /// Returns `Ok(Success)` on the happy path, or `Err((resolved_model_id, err))`
@@ -269,9 +276,18 @@ async fn dispatch(
 
     // Input guardrails. Run before reservation so a blocked prompt
     // doesn't burn an RPM slot — content-policy refusals shouldn't
-    // count against quota.
-    if let GuardrailVerdict::Block { reason } = state.guardrails.check_input(req).await {
-        return Err(with_model(ProxyError::ContentFiltered(reason)));
+    // count against quota. Bypass (remote-API guardrail unavailable
+    // + fail_open=true) doesn't short-circuit; the reason is stashed
+    // and attached to the telemetry event when the request finishes.
+    let mut bypass_reason: Option<String> = None;
+    match state.guardrails.check_input(req).await {
+        GuardrailVerdict::Allow => {}
+        GuardrailVerdict::Block { reason } => {
+            return Err(with_model(ProxyError::ContentFiltered(reason)));
+        }
+        GuardrailVerdict::Bypass { reason } => {
+            bypass_reason = Some(reason);
+        }
     }
 
     // Budget pre-check via cp-api. The DP no longer owns budget state;
@@ -373,6 +389,7 @@ async fn dispatch(
             provider_request_id: String::new(),
             provider_model_version: String::new(),
             finish_reason: String::new(),
+            bypass_reason: bypass_reason.clone(),
         });
     }
 
@@ -432,6 +449,7 @@ async fn dispatch(
                     // Cache hits don't burn cost on our side (we already
                     // paid the upstream price the first time around).
                     cost_usd: 0.0,
+                    bypass_reason: bypass_reason.clone(),
                 });
             }
             Ok(None) => {}
@@ -521,8 +539,19 @@ async fn dispatch(
     // ingesting telemetry; the DP just records 0.0 on the wire.
     let cost_usd = 0.0;
 
-    if let GuardrailVerdict::Block { reason } = state.guardrails.check_output(&upstream).await {
-        return Err(with_model(ProxyError::ContentFiltered(reason)));
+    match state.guardrails.check_output(&upstream).await {
+        GuardrailVerdict::Allow => {}
+        GuardrailVerdict::Block { reason } => {
+            return Err(with_model(ProxyError::ContentFiltered(reason)));
+        }
+        GuardrailVerdict::Bypass { reason } => {
+            // First bypass wins — input bypass already populated
+            // bypass_reason if it fired, in which case we keep the
+            // earlier signal (it's the policy that failed first).
+            if bypass_reason.is_none() {
+                bypass_reason = Some(reason);
+            }
+        }
     }
 
     if let (Some(cache), Some(key)) = (state.cache.as_ref(), cache_key.as_ref()) {
@@ -553,6 +582,7 @@ async fn dispatch(
         provider_model_version,
         finish_reason,
         cost_usd,
+        bypass_reason,
     })
 }
 
@@ -624,6 +654,7 @@ fn emit_usage_event(
         finish_reason: extras.finish_reason,
         cost_usd,
         guardrail_blocked,
+        guardrail_bypassed_reason: extras.bypass_reason,
     });
 }
 
@@ -642,6 +673,12 @@ struct UsageExtras {
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
+    /// Set when at least one guardrail returned `Bypass` for this
+    /// request (remote-API guardrail upstream unreachable +
+    /// `fail_open=true`). Goes onto
+    /// `dpmgr_usage_events.guardrail_bypassed_reason`. Default empty
+    /// string = no bypass; cp-api stores NULL in that case.
+    bypass_reason: String,
 }
 
 fn record_error(metrics: &Metrics, err: &ProxyError, model: &str, status: u16, elapsed: Duration) {

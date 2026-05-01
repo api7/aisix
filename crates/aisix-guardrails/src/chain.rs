@@ -48,23 +48,45 @@ impl Guardrail for GuardrailChain {
     }
 
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
+        let mut bypass: Option<String> = None;
         for g in &self.guardrails {
             let verdict = g.check_input(req).await;
-            if verdict.is_block() {
-                return verdict;
+            match verdict {
+                GuardrailVerdict::Allow => continue,
+                GuardrailVerdict::Block { .. } => return verdict,
+                GuardrailVerdict::Bypass { reason } => {
+                    // First bypass sticks; downstream guardrails still
+                    // get to inspect the request (they may Block).
+                    if bypass.is_none() {
+                        bypass = Some(reason);
+                    }
+                }
             }
         }
-        GuardrailVerdict::Allow
+        match bypass {
+            Some(reason) => GuardrailVerdict::Bypass { reason },
+            None => GuardrailVerdict::Allow,
+        }
     }
 
     async fn check_output(&self, resp: &ChatResponse) -> GuardrailVerdict {
+        let mut bypass: Option<String> = None;
         for g in &self.guardrails {
             let verdict = g.check_output(resp).await;
-            if verdict.is_block() {
-                return verdict;
+            match verdict {
+                GuardrailVerdict::Allow => continue,
+                GuardrailVerdict::Block { .. } => return verdict,
+                GuardrailVerdict::Bypass { reason } => {
+                    if bypass.is_none() {
+                        bypass = Some(reason);
+                    }
+                }
             }
         }
-        GuardrailVerdict::Allow
+        match bypass {
+            Some(reason) => GuardrailVerdict::Bypass { reason },
+            None => GuardrailVerdict::Allow,
+        }
     }
 }
 
@@ -125,6 +147,57 @@ mod tests {
         ]);
         let v = chain.check_input(&req("this is way too long")).await;
         assert!(v.is_block());
+    }
+
+    /// Bypass doesn't short-circuit: a downstream Block must still
+    /// fire. This is the failure mode that matters when an operator
+    /// stacks a Bedrock guardrail (which can bypass on AWS 5xx) on
+    /// top of a keyword guardrail (which is local + always available).
+    #[tokio::test]
+    async fn bypass_does_not_short_circuit_keyword_block() {
+        struct AlwaysBypass;
+        #[async_trait]
+        impl Guardrail for AlwaysBypass {
+            fn name(&self) -> &'static str {
+                "always-bypass"
+            }
+            async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
+                GuardrailVerdict::Bypass { reason: "test".into() }
+            }
+        }
+        let chain = GuardrailChain::new(vec![
+            Arc::new(AlwaysBypass),
+            Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")])),
+        ]);
+        // Bypass first, then a keyword Block — Block must win.
+        let v = chain.check_input(&req("here is AKIAEXAMPLE")).await;
+        assert!(v.is_block(), "expected Block, got {v:?}");
+    }
+
+    /// When no guardrail blocks but at least one bypassed, the chain's
+    /// verdict is the first bypass reason — chat handler attaches
+    /// it to the telemetry event.
+    #[tokio::test]
+    async fn bypass_propagates_when_no_block_fires() {
+        struct AlwaysBypass(&'static str);
+        #[async_trait]
+        impl Guardrail for AlwaysBypass {
+            fn name(&self) -> &'static str {
+                "always-bypass"
+            }
+            async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
+                GuardrailVerdict::Bypass { reason: self.0.into() }
+            }
+        }
+        let chain = GuardrailChain::new(vec![
+            Arc::new(AlwaysBypass("first")),
+            Arc::new(AlwaysBypass("second")),
+        ]);
+        let v = chain.check_input(&req("hello")).await;
+        match v {
+            GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "first"),
+            other => panic!("expected Bypass, got {other:?}"),
+        }
     }
 
     #[tokio::test]
