@@ -122,6 +122,16 @@ tiktoken-rs = "0.5"
 humantime = "2.1"
 humantime-serde = "1.1"
 
+# AWS SDK — kind=bedrock guardrail dispatcher (PRD-09c §6 Phase 2).
+# Pulled into aisix-guardrails only; opt-out via `--no-default-features`
+# on the crate when the operator never plans to use Bedrock.
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"] }
+aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
+aws-credential-types = "1"
+aws-smithy-async = { version = "1", features = ["rt-tokio"] }
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
+
 # Test-only
 wiremock = "0.6"
 rstest = "0.23"

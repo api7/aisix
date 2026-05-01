@@ -289,17 +289,16 @@ fn guardrail_schema() -> Value {
             },
             "bedrock_aws_credentials": {
                 "type": "object",
-                // v1 ships kind=static (encrypted access keys);
+                // v1 ships kind=static (plaintext access keys on the
+                // kine wire — cp-api decrypts the envelope-encrypted
+                // secret at projection time, see PRD-09c §6.3).
                 // Phase 4 adds kind=role_arn (sts:AssumeRole) under
                 // the same `kind` discriminator.
-                "required": ["kind", "access_key_id"],
+                "required": ["kind", "access_key_id", "secret_access_key"],
                 "properties": {
                     "kind":              { "const": "static" },
                     "access_key_id":     { "type": "string", "minLength": 1 },
-                    "secret_ciphertext": { "type": "string" },
-                    "secret_nonce":      { "type": "string" },
-                    "encrypted_dek":     { "type": "string" },
-                    "master_key_id":     { "type": "string" }
+                    "secret_access_key": { "type": "string", "minLength": 1 }
                 },
                 "additionalProperties": false
             },
@@ -421,10 +420,7 @@ mod tests {
             "aws_credentials": {
                 "kind": "static",
                 "access_key_id": "AKIAEXAMPLE",
-                "secret_ciphertext": "Y2lwaGVy",
-                "secret_nonce": "bm9uY2U=",
-                "encrypted_dek": "ZGVr",
-                "master_key_id": "mk-1"
+                "secret_access_key": "PLAINTEXT"
             },
             "latency_mode": { "kind": "serial" }
         });
@@ -441,7 +437,8 @@ mod tests {
             "region": "us-east-1",
             "aws_credentials": {
                 "kind": "static",
-                "access_key_id": "AKIA"
+                "access_key_id": "AKIA",
+                "secret_access_key": "S"
             },
             "latency_mode": { "kind": "timed", "timeout_ms": 500 }
         });

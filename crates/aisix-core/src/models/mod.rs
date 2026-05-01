@@ -26,7 +26,10 @@ pub mod team;
 
 pub use apikey::ApiKey;
 pub use credential::Credential;
-pub use guardrail::{Guardrail, GuardrailHookPoint, GuardrailKind, KeywordConfig, KeywordPattern};
+pub use guardrail::{
+    BedrockAWSCredentials, BedrockConfig, BedrockLatencyMode, Guardrail, GuardrailHookPoint,
+    GuardrailKind, KeywordConfig, KeywordPattern,
+};
 pub use model::{Model, Provider, ProviderConfig};
 pub use rate_limit::RateLimit;
 pub use routing::{Routing, RoutingStrategy, RoutingTarget};

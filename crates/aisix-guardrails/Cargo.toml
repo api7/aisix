@@ -19,5 +19,27 @@ thiserror.workspace = true
 tracing.workspace = true
 regex.workspace = true
 
+# kind=bedrock guardrail (PRD-09c §6 Phase 2). Behind a default
+# feature so a build that never touches Bedrock can opt out via
+# `--no-default-features` on this crate to avoid the AWS SDK
+# transitive cost (~30s cold build + ~150 transitive crates).
+aws-config = { workspace = true, optional = true }
+aws-sdk-bedrockruntime = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+aws-smithy-async = { workspace = true, optional = true }
+aws-smithy-runtime-api = { workspace = true, optional = true }
+aws-smithy-types = { workspace = true, optional = true }
+
+[features]
+default = ["bedrock"]
+bedrock = [
+    "dep:aws-config",
+    "dep:aws-sdk-bedrockruntime",
+    "dep:aws-credential-types",
+    "dep:aws-smithy-async",
+    "dep:aws-smithy-runtime-api",
+    "dep:aws-smithy-types",
+]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

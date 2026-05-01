@@ -65,29 +65,23 @@ pub struct KeywordConfig {
     pub patterns: Vec<KeywordPattern>,
 }
 
-/// AWS credentials for `kind: "bedrock"`. Phase 1 supports
-/// `static` (encrypted access-key pair); Phase 4 adds `role_arn`
-/// (sts:AssumeRole). The four ciphertext fields mirror cp-api's
-/// `provider_keys` envelope-encryption layout. They arrive as
-/// base64-encoded strings (Go's default JSON marshalling of
-/// `[]byte`); Phase 2 decodes them at chain build time using the
-/// master key shared via the dp-manager registration channel.
+/// AWS credentials for `kind: "bedrock"`. Phase 2 supports
+/// `static` (access-key pair); Phase 4 adds `role_arn`
+/// (sts:AssumeRole) under the same tag.
+///
+/// Wire shape on the kine path is plaintext: cp-api decrypts the
+/// envelope-encrypted secret at projection time (same trust
+/// boundary as `provider_keys` — see PRD-09c §6.3). The DP only
+/// ever holds plaintext in memory; it does not need a master key.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BedrockAWSCredentials {
     Static {
         access_key_id: String,
-        /// Base64-encoded ciphertext. Phase 1 stores it; Phase 2
-        /// decodes + decrypts. Empty string on a corrupt cp-api
-        /// row — the chain builder will skip with a warn.
-        #[serde(default)]
-        secret_ciphertext: String,
-        #[serde(default)]
-        secret_nonce: String,
-        #[serde(default)]
-        encrypted_dek: String,
-        #[serde(default)]
-        master_key_id: String,
+        /// Decrypted by cp-api before kine projection; plaintext
+        /// in memory only, never logged. The DP feeds it to the
+        /// AWS SDK's static credentials provider.
+        secret_access_key: String,
     },
 }
 
@@ -284,10 +278,7 @@ mod tests {
             "aws_credentials": {
                 "kind": "static",
                 "access_key_id": "AKIAEXAMPLE",
-                "secret_ciphertext": "Y2lwaGVy",
-                "secret_nonce": "bm9uY2U=",
-                "encrypted_dek": "ZGVr",
-                "master_key_id": "mk-1"
+                "secret_access_key": "PLAINTEXT_FOR_TEST"
             },
             "latency_mode": { "kind": "serial" }
         });
@@ -300,11 +291,10 @@ mod tests {
                 match b.aws_credentials {
                     BedrockAWSCredentials::Static {
                         access_key_id,
-                        secret_ciphertext,
-                        ..
+                        secret_access_key,
                     } => {
                         assert_eq!(access_key_id, "AKIAEXAMPLE");
-                        assert_eq!(secret_ciphertext, "Y2lwaGVy");
+                        assert_eq!(secret_access_key, "PLAINTEXT_FOR_TEST");
                     }
                 }
             }
@@ -323,10 +313,7 @@ mod tests {
             "aws_credentials": {
                 "kind": "static",
                 "access_key_id": "AKIA",
-                "secret_ciphertext": "x",
-                "secret_nonce": "y",
-                "encrypted_dek": "z",
-                "master_key_id": "m"
+                "secret_access_key": "secret"
             },
             "latency_mode": { "kind": "timed", "timeout_ms": 500 }
         });

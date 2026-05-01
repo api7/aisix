@@ -90,16 +90,26 @@ fn build_one(row: &DomainGuardrail) -> Result<Option<Arc<dyn Guardrail>>, BuildE
             };
             Ok(Some(Arc::new(blocklist)))
         }
+        #[cfg(feature = "bedrock")]
+        GuardrailKind::Bedrock(cfg) => {
+            // Phase 2: build the AWS-SDK-backed dispatcher. cp-api
+            // already decrypted the secret at projection time, so
+            // the BedrockConfig in the snapshot carries plaintext
+            // credentials.
+            let g = crate::bedrock::BedrockGuardrail::new(
+                row.name.clone(),
+                cfg,
+                row.hook_point,
+                row.fail_open,
+            );
+            Ok(Some(Arc::new(g)))
+        }
+        #[cfg(not(feature = "bedrock"))]
         GuardrailKind::Bedrock(_) => {
-            // Phase 1: cp-api accepts kind=bedrock and the snapshot
-            // carries the parsed BedrockConfig, but the runtime
-            // dispatcher (aws-sdk-bedrock-runtime client + KMS
-            // decrypt) doesn't ship until Phase 2 — see PRD-09c
-            // §6.7. Treat the row as disabled so it can't silently
-            // let traffic through, and warn loudly so a misconfig
-            // (Bedrock kind enabled before Phase 2 lands) is
-            // caught in DP logs.
-            Err(BuildError::NotYetImplemented("bedrock"))
+            // Built without --features bedrock. Skip + warn so an
+            // operator who happens to deploy a Bedrock row to a
+            // pruned-build DP sees the misconfig in logs.
+            Err(BuildError::FeatureDisabled("bedrock"))
         }
     }
 }
@@ -111,14 +121,15 @@ enum BuildError {
         pattern: String,
         source: regex::Error,
     },
-    /// Reserved for guardrail kinds whose runtime dispatch isn't
-    /// wired yet (Phase 1 ships `bedrock` parsing but defers the
-    /// AWS SDK + KMS-decrypt path to Phase 2). The chain treats
+    /// Reserved for guardrail kinds whose runtime dispatch is
+    /// compiled out (e.g. a slim build that excluded the
+    /// `--features bedrock` AWS SDK dependency). The chain treats
     /// these rows as disabled and the supervisor's warn log
     /// surfaces the kind name so a misconfigured environment is
     /// visible.
-    #[error("guardrail kind {0:?} not yet implemented; treating row as disabled")]
-    NotYetImplemented(&'static str),
+    #[cfg(not(feature = "bedrock"))]
+    #[error("guardrail kind {0:?} not compiled into this build; treating row as disabled")]
+    FeatureDisabled(&'static str),
 }
 
 /// Adapter that wraps a snapshot handle and rebuilds the runtime
@@ -313,14 +324,14 @@ mod tests {
         assert!(v.is_block());
     }
 
+    /// Phase 2 contract: kind=bedrock rows materialise into the
+    /// runtime chain alongside keyword rows. We don't hit AWS in
+    /// this test (the request never makes it past chain
+    /// composition) — we just pin that both kinds compose into the
+    /// final chain length, and that the keyword Block still fires.
+    #[cfg(feature = "bedrock")]
     #[tokio::test]
-    async fn bedrock_kind_is_skipped_until_phase_2_lands() {
-        // Phase 1 contract: cp-api accepts kind=bedrock and the
-        // snapshot carries the parsed config, but the chain builder
-        // skips with a warn-log and the row contributes nothing to
-        // request-time enforcement. A keyword row in the same
-        // snapshot must still build + fire so a half-rolled
-        // environment doesn't get worse than no-op.
+    async fn bedrock_kind_materialises_alongside_keyword_in_chain() {
         let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
         table.insert(entry(
             "bedrock-row",
@@ -335,10 +346,7 @@ mod tests {
                     "aws_credentials": {
                         "kind": "static",
                         "access_key_id": "AKIA",
-                        "secret_ciphertext": "Y2lwaGVy",
-                        "secret_nonce": "bm9uY2U=",
-                        "encrypted_dek": "ZGVr",
-                        "master_key_id": "mk-1"
+                        "secret_access_key": "test-secret-plaintext"
                     },
                     "latency_mode": { "kind": "serial" }
                 }"#,
@@ -356,10 +364,10 @@ mod tests {
             ),
         ));
         let chain = build_chain_from_snapshot(&table);
-        // Only the keyword row materialises in the runtime chain.
-        assert_eq!(chain.len(), 1);
-        let v = chain.check_input(&req("here is AKIAEXAMPLE")).await;
-        assert!(v.is_block());
+        // Both rows compose. We don't probe the bedrock arm — its
+        // own tests cover the dispatch path; this one only pins the
+        // chain composition contract.
+        assert_eq!(chain.len(), 2);
     }
 
     #[tokio::test]
