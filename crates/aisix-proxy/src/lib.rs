@@ -1097,6 +1097,65 @@ data: [DONE]\n\n";
             .contains("forbidden-token"));
     }
 
+    /// Regression: a guardrail-blocked request must record the resolved
+    /// model_id on its telemetry event. Earlier the error path hard-coded
+    /// model_id="" for every failure, which left the dashboard /logs
+    /// "Guardrail blocks" tab showing an empty model column.
+    #[tokio::test]
+    async fn input_guardrail_block_records_resolved_model_id_in_telemetry() {
+        use aisix_guardrails::{GuardrailChain, KeywordBlocklist, KeywordRule};
+        use aisix_obs::UsageSink;
+
+        // Capturing usage sink — we read the emitted event off the
+        // receiver to assert telemetry shape, not just the HTTP response.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(KeywordBlocklist::new(
+            vec![KeywordRule::literal("forbidden-token")],
+        ))]));
+        let state = build_state(snap, hub)
+            .with_guardrails(guardrails)
+            .with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "say the forbidden-token please"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // The seeded model_entry uses the literal id "model-id-1"
+        // (see lib.rs::model_entry). Pinning the exact value catches
+        // regressions where the id silently becomes empty.
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("sender dropped without sending");
+        assert_eq!(event.model_id, "model-id-1");
+        assert_eq!(event.status_code, 422);
+        assert!(event.guardrail_blocked);
+    }
+
     #[tokio::test]
     async fn output_guardrail_block_returns_422_after_upstream_runs() {
         use aisix_guardrails::{GuardrailChain, KeywordBlocklist, KeywordRule};

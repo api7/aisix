@@ -134,7 +134,7 @@ pub async fn chat_completions(
             }
             success.response
         }
-        Err(err) => {
+        Err((resolved_model_id, err)) => {
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
             record_error(&state.metrics, &err, &model_name, status, elapsed);
@@ -151,17 +151,20 @@ pub async fn chat_completions(
                 None,
                 &request_id,
             );
-            // Telemetry for the failure path. We don't know the resolved
-            // model_id when dispatch fails before model lookup (e.g.
-            // empty messages); the helper handles that with an empty
-            // string. ContentFiltered (guardrail) is recorded with the
-            // dedicated `guardrail_blocked` flag so the dashboard can
-            // surface it on the Blocked tab.
+            // Telemetry for the failure path. `resolved_model_id` is
+            // populated by `dispatch` once the request's `req.model`
+            // has been resolved against the snapshot — so a guardrail
+            // / budget / rate-limit / bridge error after that point
+            // still records which model the request targeted. Errors
+            // before resolution (empty messages, ModelNotFound) keep
+            // an empty string. ContentFiltered (guardrail) is recorded
+            // with the dedicated `guardrail_blocked` flag so the
+            // dashboard can surface it on the Blocked tab.
             let guardrail_blocked = matches!(err, ProxyError::ContentFiltered(_));
             emit_usage_event(
                 &state.usage_sink,
                 &request_id,
-                /* model_id */ "",
+                resolved_model_id.as_deref().unwrap_or(""),
                 &api_key_id,
                 status,
                 elapsed,
@@ -228,15 +231,23 @@ struct Success {
     cost_usd: f64,
 }
 
+/// Returns `Ok(Success)` on the happy path, or `Err((resolved_model_id, err))`
+/// where `resolved_model_id` is `Some(id)` once the request's `req.model`
+/// has been resolved against the snapshot, and `None` for errors that
+/// fire before resolution (empty messages, ModelNotFound). The caller
+/// surfaces this id on the failure-path telemetry event so the
+/// dashboard's `/logs` page can show the model that was targeted by a
+/// guardrail-blocked / budget-exceeded / bridge-failed request.
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     req: &ChatFormat,
     request_id: &str,
-) -> Result<Success, ProxyError> {
+) -> Result<Success, (Option<String>, ProxyError)> {
     if req.messages.is_empty() {
-        return Err(ProxyError::InvalidRequest(
-            "messages array must not be empty".into(),
+        return Err((
+            None,
+            ProxyError::InvalidRequest("messages array must not be empty".into()),
         ));
     }
 
@@ -244,27 +255,32 @@ async fn dispatch(
     let virtual_entry = snapshot
         .models
         .get_by_name(&req.model)
-        .ok_or_else(|| ProxyError::ModelNotFound(req.model.clone()))?;
+        .ok_or_else(|| (None, ProxyError::ModelNotFound(req.model.clone())))?;
     let model_id = virtual_entry.id.clone();
 
+    // Every error from here on attaches the resolved model_id so the
+    // failure-path telemetry event in `chat_completions` can surface
+    // which model the request targeted.
+    let with_model = |e: ProxyError| (Some(model_id.clone()), e);
+
     if !auth.key().can_access(&req.model) {
-        return Err(ProxyError::ModelForbidden(req.model.clone()));
+        return Err(with_model(ProxyError::ModelForbidden(req.model.clone())));
     }
 
     // Input guardrails. Run before reservation so a blocked prompt
     // doesn't burn an RPM slot — content-policy refusals shouldn't
     // count against quota.
     if let GuardrailVerdict::Block { reason } = state.guardrails.check_input(req).await {
-        return Err(ProxyError::ContentFiltered(reason));
+        return Err(with_model(ProxyError::ContentFiltered(reason)));
     }
 
     // Budget pre-check via cp-api. The DP no longer owns budget state;
     // cp-api returns a cached/live decision per api_key.
     let decision = state.budgets.check(&auth.entry.id).await;
     if !decision.allowed {
-        return Err(ProxyError::BudgetExceeded(
+        return Err(with_model(ProxyError::BudgetExceeded(
             decision.reason.unwrap_or_else(|| auth.entry.id.clone()),
-        ));
+        )));
     }
 
     // Resolve the attempt-list of underlying Model entries. For a
@@ -274,16 +290,16 @@ async fn dispatch(
         if let Some(routing) = virtual_entry.value.routing.as_ref() {
             let names = state.routing.pick_order(&req.model, routing);
             if names.is_empty() {
-                return Err(ProxyError::InvalidRequest(
+                return Err(with_model(ProxyError::InvalidRequest(
                     "routing model has no targets".into(),
-                ));
+                )));
             }
             let mut resolved = Vec::with_capacity(names.len());
             for name in &names {
                 let target_entry = snapshot.models.get_by_name(name).ok_or_else(|| {
-                    ProxyError::InvalidRequest(format!(
+                    with_model(ProxyError::InvalidRequest(format!(
                         "routing target {name:?} does not resolve to a Model"
-                    ))
+                    )))
                 })?;
                 resolved.push(target_entry.value.clone());
             }
@@ -298,17 +314,20 @@ async fn dispatch(
     // single bad provider doesn't take down the whole request.
     if attempt_models.len() == 1 {
         let only = &attempt_models[0];
-        let provider = only
-            .provider()
-            .ok_or_else(|| ProxyError::InvalidRequest("model has no provider prefix".into()))?;
+        let provider = only.provider().ok_or_else(|| {
+            with_model(ProxyError::InvalidRequest("model has no provider prefix".into()))
+        })?;
         if state.hub.get(provider).is_none() {
-            return Err(ProxyError::ProviderUnavailable);
+            return Err(with_model(ProxyError::ProviderUnavailable));
         }
     }
 
     let rl_key = auth.entry.id.clone();
     let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
-    let reservation = state.limiter.pre_commit(&rl_key, &rl_limits)?;
+    let reservation = state
+        .limiter
+        .pre_commit(&rl_key, &rl_limits)
+        .map_err(|e| with_model(ProxyError::from(e)))?;
 
     let now = created_ts();
 
@@ -317,16 +336,19 @@ async fn dispatch(
     // failure mid-flight) and not worth the complexity for V1.
     if req.is_streaming() {
         let model = &attempt_models[0];
-        let provider = model
-            .provider()
-            .ok_or_else(|| ProxyError::InvalidRequest("model has no provider prefix".into()))?;
+        let provider = model.provider().ok_or_else(|| {
+            with_model(ProxyError::InvalidRequest("model has no provider prefix".into()))
+        })?;
         let bridge = state
             .hub
             .get(provider)
-            .ok_or(ProxyError::ProviderUnavailable)?;
+            .ok_or_else(|| with_model(ProxyError::ProviderUnavailable))?;
         let model_arc = Arc::new(model.clone());
         let ctx = BridgeContext::new(request_id, model_arc);
-        let upstream = bridge.chat_stream(req, &ctx).await?;
+        let upstream = bridge
+            .chat_stream(req, &ctx)
+            .await
+            .map_err(|e| with_model(ProxyError::Bridge(e)))?;
         reservation.commit_tokens(0);
         let sse_stream = build_sse_stream(upstream, now);
         let response =
@@ -473,7 +495,7 @@ async fn dispatch(
         let err = last_err.unwrap_or_else(|| {
             BridgeError::Config("routing exhausted with no targets attempted".into())
         });
-        return Err(ProxyError::Bridge(err));
+        return Err(with_model(ProxyError::Bridge(err)));
     };
     let provider_name = chosen_provider.unwrap_or_else(|| "unknown".into());
 
@@ -500,7 +522,7 @@ async fn dispatch(
     let cost_usd = 0.0;
 
     if let GuardrailVerdict::Block { reason } = state.guardrails.check_output(&upstream).await {
-        return Err(ProxyError::ContentFiltered(reason));
+        return Err(with_model(ProxyError::ContentFiltered(reason)));
     }
 
     if let (Some(cache), Some(key)) = (state.cache.as_ref(), cache_key.as_ref()) {
