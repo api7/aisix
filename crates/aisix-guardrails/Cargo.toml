@@ -43,3 +43,4 @@ bedrock = [
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock.workspace = true
