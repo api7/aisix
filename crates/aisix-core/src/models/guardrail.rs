@@ -14,15 +14,15 @@
 //! lets operators narrow a rule to just one side (e.g. a PII regex
 //! that's expensive to run on long outputs).
 //!
-//! Rule kinds. v1 ships a single in-process kind plus a placeholder
-//! for the AWS Bedrock provider:
+//! Rule kinds:
 //!
 //!   * `keyword` — literal/regex blocklist; runs entirely in DP
 //!     process. Configured via `keyword.patterns` (list of
 //!     `{ kind: "literal" | "regex", value: "..." }`).
-//!   * `bedrock` — calls AWS Bedrock's ApplyGuardrail (TODO; the v1
-//!     loader rejects this kind so a half-wired DP doesn't silently
-//!     skip the policy).
+//!   * `bedrock` — calls AWS Bedrock's `ApplyGuardrail`. Phase 1
+//!     parses + accepts the kind but the chain builder logs
+//!     "bedrock not yet implemented" and skips the row; Phase 2
+//!     wires the actual dispatch (PRD-09c §6.7).
 //!
 //! See `aisix-guardrails/src/keyword.rs` for the runtime semantics
 //! the snapshot is parsed into.
@@ -65,6 +65,61 @@ pub struct KeywordConfig {
     pub patterns: Vec<KeywordPattern>,
 }
 
+/// AWS credentials for `kind: "bedrock"`. Phase 1 supports
+/// `static` (encrypted access-key pair); Phase 4 adds `role_arn`
+/// (sts:AssumeRole). The four ciphertext fields mirror cp-api's
+/// `provider_keys` envelope-encryption layout. They arrive as
+/// base64-encoded strings (Go's default JSON marshalling of
+/// `[]byte`); Phase 2 decodes them at chain build time using the
+/// master key shared via the dp-manager registration channel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum BedrockAWSCredentials {
+    Static {
+        access_key_id: String,
+        /// Base64-encoded ciphertext. Phase 1 stores it; Phase 2
+        /// decodes + decrypts. Empty string on a corrupt cp-api
+        /// row — the chain builder will skip with a warn.
+        #[serde(default)]
+        secret_ciphertext: String,
+        #[serde(default)]
+        secret_nonce: String,
+        #[serde(default)]
+        encrypted_dek: String,
+        #[serde(default)]
+        master_key_id: String,
+    },
+}
+
+/// Per-guardrail latency policy for `kind: "bedrock"`. `serial`
+/// waits unconditionally; `timed` aborts at `timeout_ms` and
+/// applies the row-level `fail_open` flag. Range matches cp-api's
+/// validator (100..5000ms) — see PRD-09c §6.6.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum BedrockLatencyMode {
+    Serial,
+    Timed { timeout_ms: u32 },
+}
+
+/// Config block for `kind: "bedrock"`. Phase 1 stores the shape +
+/// passes it through `aisix-guardrails::build` which logs
+/// `bedrock not yet implemented` and skips the row.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BedrockConfig {
+    /// AWS-console-issued guardrail identifier (12 chars today).
+    pub guardrail_id: String,
+    /// Version label: `DRAFT`, `1`, `2`, ...
+    pub guardrail_version: String,
+    /// AWS region the Bedrock endpoint lives in (e.g. `us-east-1`).
+    pub region: String,
+    /// IAM credentials. v1 = static access keys (encrypted).
+    pub aws_credentials: BedrockAWSCredentials,
+    /// `serial` (default) or `timed { timeout_ms }`.
+    pub latency_mode: BedrockLatencyMode,
+}
+
 /// Provider discriminator. The kind drives which `*_config` block is
 /// expected; serde's `tag = "kind"` keeps us honest at parse time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,10 +127,10 @@ pub struct KeywordConfig {
 pub enum GuardrailKind {
     /// In-process literal/regex blocklist. Always available.
     Keyword(KeywordConfig),
-    // Bedrock placeholder lives in the spec/PRD only for v1 — the DP
-    // refuses to load it. Adding the variant here lands with the
-    // ApplyGuardrail wiring; left out now to keep the snapshot
-    // schema strict.
+    /// AWS Bedrock managed guardrail. Phase 1 parses + persists;
+    /// the chain builder skips it with a warn log. Phase 2 wires
+    /// real `ApplyGuardrail` dispatch.
+    Bedrock(BedrockConfig),
 }
 
 /// Top-level `Guardrail` resource shape. Mirrors what cp-api writes
@@ -103,6 +158,14 @@ pub struct Guardrail {
     #[serde(default)]
     pub hook_point: GuardrailHookPoint,
 
+    /// Behavior when a remote-API guardrail (today `kind=bedrock`)
+    /// can't reach its upstream. `true` lets the request through
+    /// (recorded in usage_events.guardrail_bypassed_reason);
+    /// `false` blocks with 422. No-op for `kind=keyword`. Defaults
+    /// `true` (matches the PG schema default + PRD-09c §6.4).
+    #[serde(default = "default_fail_open")]
+    pub fail_open: bool,
+
     /// The provider discriminator + its config. Use serde's flattening
     /// so the wire shape is `{ kind: "keyword", patterns: [...] }`
     /// rather than `{ kind: "keyword", keyword: { patterns: [...] }}`.
@@ -114,6 +177,10 @@ pub struct Guardrail {
 }
 
 fn default_enabled() -> bool {
+    true
+}
+
+fn default_fail_open() -> bool {
     true
 }
 
@@ -161,6 +228,7 @@ mod tests {
                     KeywordPattern::Regex(r"\bssn:\s*\d{3}-\d{2}-\d{4}".into())
                 );
             }
+            GuardrailKind::Bedrock(_) => panic!("expected Keyword variant"),
         }
     }
 
@@ -174,6 +242,19 @@ mod tests {
         let g: Guardrail = serde_json::from_value(v).unwrap();
         assert!(g.enabled);
         assert_eq!(g.hook_point, GuardrailHookPoint::Both);
+        assert!(g.fail_open);
+    }
+
+    #[test]
+    fn fail_open_round_trips() {
+        let v = json!({
+            "name": "strict-bedrock",
+            "kind": "keyword",
+            "patterns": [],
+            "fail_open": false
+        });
+        let g: Guardrail = serde_json::from_value(v).unwrap();
+        assert!(!g.fail_open);
     }
 
     #[test]
@@ -193,17 +274,70 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_kind_does_not_deserialise_yet() {
-        // Adding the variant lands when ApplyGuardrail is implemented.
-        // Until then the loader errors on `kind: "bedrock"` rather
-        // than silently letting a half-wired policy through.
+    fn bedrock_kind_parses_with_serial_latency() {
         let v = json!({
-            "name": "g",
+            "name": "block-pii",
             "kind": "bedrock",
-            "guardrail_id": "abc"
+            "guardrail_id": "abcdefgh1234",
+            "guardrail_version": "DRAFT",
+            "region": "us-east-1",
+            "aws_credentials": {
+                "kind": "static",
+                "access_key_id": "AKIAEXAMPLE",
+                "secret_ciphertext": "Y2lwaGVy",
+                "secret_nonce": "bm9uY2U=",
+                "encrypted_dek": "ZGVr",
+                "master_key_id": "mk-1"
+            },
+            "latency_mode": { "kind": "serial" }
         });
-        let r: Result<Guardrail, _> = serde_json::from_value(v);
-        assert!(r.is_err());
+        let g: Guardrail = serde_json::from_value(v).unwrap();
+        match g.config {
+            GuardrailKind::Bedrock(b) => {
+                assert_eq!(b.guardrail_id, "abcdefgh1234");
+                assert_eq!(b.region, "us-east-1");
+                assert!(matches!(b.latency_mode, BedrockLatencyMode::Serial));
+                match b.aws_credentials {
+                    BedrockAWSCredentials::Static {
+                        access_key_id,
+                        secret_ciphertext,
+                        ..
+                    } => {
+                        assert_eq!(access_key_id, "AKIAEXAMPLE");
+                        assert_eq!(secret_ciphertext, "Y2lwaGVy");
+                    }
+                }
+            }
+            _ => panic!("expected Bedrock variant"),
+        }
+    }
+
+    #[test]
+    fn bedrock_kind_parses_with_timed_latency() {
+        let v = json!({
+            "name": "block-pii",
+            "kind": "bedrock",
+            "guardrail_id": "id",
+            "guardrail_version": "1",
+            "region": "us-east-1",
+            "aws_credentials": {
+                "kind": "static",
+                "access_key_id": "AKIA",
+                "secret_ciphertext": "x",
+                "secret_nonce": "y",
+                "encrypted_dek": "z",
+                "master_key_id": "m"
+            },
+            "latency_mode": { "kind": "timed", "timeout_ms": 500 }
+        });
+        let g: Guardrail = serde_json::from_value(v).unwrap();
+        match g.config {
+            GuardrailKind::Bedrock(b) => match b.latency_mode {
+                BedrockLatencyMode::Timed { timeout_ms } => assert_eq!(timeout_ms, 500),
+                _ => panic!("expected Timed"),
+            },
+            _ => panic!("expected Bedrock variant"),
+        }
     }
 
     #[test]
