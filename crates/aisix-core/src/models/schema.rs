@@ -27,6 +27,7 @@ pub struct Schemas {
     pub credential: Validator,
     pub team: Validator,
     pub guardrail: Validator,
+    pub cache_policy: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile()));
@@ -49,6 +50,9 @@ impl Schemas {
             guardrail: jsonschema::options()
                 .build(&guardrail_schema())
                 .expect("guardrail schema is well-formed"),
+            cache_policy: jsonschema::options()
+                .build(&cache_policy_schema())
+                .expect("cache_policy schema is well-formed"),
         }
     }
 }
@@ -91,6 +95,10 @@ pub fn validate_team(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_guardrail(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.guardrail, value)
+}
+
+pub fn validate_cache_policy(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.cache_policy, value)
 }
 
 fn model_schema() -> Value {
@@ -321,6 +329,35 @@ fn guardrail_schema() -> Value {
                     }
                 ]
             }
+        }
+    })
+}
+
+// Mirrors cp-api's cache_policies validation rules (validateCachePolicyShape
+// in internal/cpapi/resources/cache_policies.go). The DP is the second
+// line of defence — cp-api rejects malformed payloads on write, but kine
+// can still surface stale or hand-edited rows on watch, so we re-validate
+// at parse time. `additionalProperties: true` keeps the schema
+// forward-compatible: cp-api can ship new optional fields ahead of a DP
+// rollout without locking the gateway out.
+fn cache_policy_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["name"],
+        "additionalProperties": true,
+        "properties": {
+            "name":        { "type": "string", "minLength": 1, "maxLength": 120 },
+            "enabled":     { "type": "boolean" },
+            "backend":     {
+                "enum": ["memory", "redis", "redis_semantic", "qdrant"]
+            },
+            "ttl_seconds": { "type": "integer", "minimum": 1, "maximum": 604800 },
+            "applies_to":  { "type": "string", "minLength": 1, "maxLength": 255 },
+            "similarity_threshold": {
+                "type": "number", "minimum": 0, "maximum": 1
+            },
+            "embedding_model": { "type": "string", "minLength": 1, "maxLength": 120 }
         }
     })
 }

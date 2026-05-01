@@ -130,6 +130,23 @@ pub struct UsageEvent {
     /// wire empty maps to NULL via `skip_serializing_if`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub guardrail_bypassed_reason: String,
+
+    /// Cache outcome on this request. One of:
+    ///
+    /// - `"hit"` — cached response served the request without a
+    ///   round-trip to the upstream
+    /// - `"miss"` — cache was consulted, no entry matched; the
+    ///   upstream response was just stored
+    /// - `"disabled"` — no enabled `cache_policy` in snapshot for
+    ///   this env, the cache gate was closed
+    ///
+    /// Empty string = cache state unknown / not applicable (error
+    /// paths that fail before the cache lookup). cp-api persists
+    /// this to `dpmgr_usage_events.cache_status`; on the wire empty
+    /// maps to NULL via `skip_serializing_if`. Source of truth is
+    /// `aisix_proxy::chat::CacheStatus::as_str`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cache_status: String,
 }
 
 #[inline]

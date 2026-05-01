@@ -103,6 +103,7 @@ pub async fn chat_completions(
                     provider_model_version: success.provider_model_version.clone(),
                     finish_reason: success.finish_reason.clone(),
                     bypass_reason: success.bypass_reason.clone().unwrap_or_default(),
+                    cache_status: success.cache_status.as_str().to_string(),
                 },
                 success.cost_usd,
                 /* guardrail_blocked */ false,
@@ -236,6 +237,41 @@ struct Success {
     /// so a compliance audit can see what slipped past during a Bedrock
     /// outage. None for the normal Allow / Block paths.
     bypass_reason: Option<String>,
+    /// Cache outcome for this request. `disabled` when no enabled
+    /// cache_policy is in snapshot for the env; `miss` when the cache
+    /// was consulted but no entry matched; `hit` when a stored entry
+    /// served the response. Lands on `usage_events.cache_status` for
+    /// the dashboard's /logs column. See `aisix-core::CachePolicy`
+    /// (Stage 2) and `aisix-cache::Cache` for the source of truth.
+    cache_status: CacheStatus,
+}
+
+/// Cache decision attached to every successful request. Wire shape
+/// (lowercase string) is what cp-api persists in
+/// `dpmgr_usage_events.cache_status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheStatus {
+    /// No enabled cache policy in snapshot — gate skipped the lookup.
+    /// Stage 3 will refine this to "no policy matched applies_to".
+    Disabled,
+    /// Cache consulted, no entry matched. The successful upstream
+    /// response is stored on the way out so future identical requests
+    /// hit. Maps to `x-aisix-cache: miss` on the response header.
+    Miss,
+    /// Cache consulted, entry returned without an upstream call. Maps
+    /// to `x-aisix-cache: hit` on the response header.
+    Hit,
+}
+
+impl CacheStatus {
+    /// Lowercase wire string the DP ships to cp-api in `cache_status`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            CacheStatus::Disabled => "disabled",
+            CacheStatus::Miss => "miss",
+            CacheStatus::Hit => "hit",
+        }
+    }
 }
 
 /// Returns `Ok(Success)` on the happy path, or `Err((resolved_model_id, err))`
@@ -390,17 +426,47 @@ async fn dispatch(
             provider_model_version: String::new(),
             finish_reason: String::new(),
             bypass_reason: bypass_reason.clone(),
+            // Streaming responses aren't cached at this layer — see
+            // crates/aisix-cache/src/lib.rs and Phase 2 above. Always
+            // surface as `disabled` on the streaming path.
+            cache_status: CacheStatus::Disabled,
         });
     }
 
+    // Policy gate: the cache is only consulted when at least one
+    // enabled `CachePolicy` exists in the snapshot for this env. cp-api
+    // owns the policy CRUD surface (`/api/environments/:env/cache_policies`,
+    // see Stage 1 — PR #134); kine fans out the rows; the loader
+    // populates `snapshot.cache_policies` (see aisix-etcd). Stage 2
+    // honors only the existence + `enabled` flag. Stage 3 will parse
+    // `applies_to` (currently treated as "all") + per-policy
+    // `ttl_seconds` (currently the cache backend's global TTL).
+    let cache_active_by_policy = snapshot
+        .cache_policies
+        .entries()
+        .iter()
+        .any(|entry| entry.value.enabled);
+
     // Cache lookup keyed on the *virtual* model name so a re-request
     // hits the cache regardless of which target served the original.
+    // Even with `cache_active_by_policy = false` we still build the
+    // key to keep the cache_status path uniform — `disabled` is the
+    // outcome when the gate is closed, but the request itself is
+    // shaped the same way.
     let cache_key = state
         .cache
         .as_ref()
         .map(|_| CacheKey::from_request(req).fingerprint());
 
-    if let (Some(cache), Some(key)) = (state.cache.as_ref(), cache_key.as_ref()) {
+    let cache_status = if cache_active_by_policy && state.cache.is_some() {
+        CacheStatus::Miss
+    } else {
+        CacheStatus::Disabled
+    };
+
+    if let (true, Some(cache), Some(key)) =
+        (cache_active_by_policy, state.cache.as_ref(), cache_key.as_ref())
+    {
         match cache.get(key).await {
             Ok(Some(cached)) => {
                 reservation.commit_tokens(0);
@@ -450,6 +516,7 @@ async fn dispatch(
                     // paid the upstream price the first time around).
                     cost_usd: 0.0,
                     bypass_reason: bypass_reason.clone(),
+                    cache_status: CacheStatus::Hit,
                 });
             }
             Ok(None) => {}
@@ -554,14 +621,23 @@ async fn dispatch(
         }
     }
 
-    if let (Some(cache), Some(key)) = (state.cache.as_ref(), cache_key.as_ref()) {
+    // Cache write is gated on the same policy as the lookup at the
+    // top of dispatch — without an enabled cache_policy in snapshot,
+    // we skip both read AND write so the cache backend doesn't fill
+    // up with entries that no policy ever asked for.
+    if let (true, Some(cache), Some(key)) =
+        (cache_active_by_policy, state.cache.as_ref(), cache_key.as_ref())
+    {
         if let Err(err) = cache.put(key, upstream.clone()).await {
             tracing::warn!(error = %err, key = %key, "cache write failed");
         }
     }
 
     let mut response = Json(render_response(now, upstream)).into_response();
-    if cache_key.is_some() {
+    if matches!(cache_status, CacheStatus::Miss) {
+        // Miss header only when the cache was actually consulted —
+        // policy-disabled requests have no cache header at all so a
+        // user can tell at a glance whether the gate was open.
         response
             .headers_mut()
             .insert(CACHE_HEADER, HeaderValue::from_static("miss"));
@@ -583,6 +659,7 @@ async fn dispatch(
         finish_reason,
         cost_usd,
         bypass_reason,
+        cache_status,
     })
 }
 
@@ -655,6 +732,7 @@ fn emit_usage_event(
         cost_usd,
         guardrail_blocked,
         guardrail_bypassed_reason: extras.bypass_reason,
+        cache_status: extras.cache_status,
     });
 }
 
@@ -679,6 +757,10 @@ struct UsageExtras {
     /// `dpmgr_usage_events.guardrail_bypassed_reason`. Default empty
     /// string = no bypass; cp-api stores NULL in that case.
     bypass_reason: String,
+    /// Lowercased `CacheStatus` (`"hit"` / `"miss"` / `"disabled"`).
+    /// Empty default for the error path where the cache lookup never
+    /// fired. Goes onto `dpmgr_usage_events.cache_status`.
+    cache_status: String,
 }
 
 fn record_error(metrics: &Metrics, err: &ProxyError, model: &str, status: u16, elapsed: Duration) {

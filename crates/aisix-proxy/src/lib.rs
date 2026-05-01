@@ -173,6 +173,18 @@ mod tests {
         snap
     }
 
+    /// Insert a default-enabled cache policy on the snapshot so the
+    /// proxy's cache gate (chat::dispatch) opens the lookup path.
+    /// Stage 2 honors only existence + `enabled`; the rest of the
+    /// fields exist on the wire so cp-api's contract round-trips
+    /// through serde even though the DP doesn't act on them yet.
+    fn seed_cache_policy(snap: &AisixSnapshot, name: &str) {
+        let cfg = format!(r#"{{"name": "{name}", "backend": "memory"}}"#);
+        let policy: aisix_core::models::CachePolicy = serde_json::from_str(&cfg).unwrap();
+        snap.cache_policies
+            .insert(ResourceEntry::new("cache-policy-id-1", policy, 1));
+    }
+
     fn seed_snapshot_with_limits(
         model: &str,
         allowed: &[&str],
@@ -697,6 +709,10 @@ data: [DONE]\n\n";
         let hub = Arc::new(Hub::new());
         hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        // Cache gate opens only when an enabled policy exists in
+        // snapshot. Without this seed step the test would 200 but
+        // the cache header would be absent (policy-disabled path).
+        seed_cache_policy(&snap, "test-cache");
         // Cache enabled — uses the default constructor.
         let state = build_state_with_cache(snap, hub);
         let body = serde_json::json!({
@@ -760,6 +776,7 @@ data: [DONE]\n\n";
         let hub = Arc::new(Hub::new());
         hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        seed_cache_policy(&snap, "test-cache");
         let state = build_state_with_cache(snap, hub);
 
         let body_a = serde_json::json!({

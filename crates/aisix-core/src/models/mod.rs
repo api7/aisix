@@ -15,6 +15,7 @@
 //! next to its runtime usage.
 
 pub mod apikey;
+pub mod cache_policy;
 pub mod credential;
 pub mod guardrail;
 pub mod model;
@@ -25,6 +26,7 @@ pub mod snapshot;
 pub mod team;
 
 pub use apikey::ApiKey;
+pub use cache_policy::{CacheBackend, CachePolicy};
 pub use credential::Credential;
 pub use guardrail::{
     BedrockAWSCredentials, BedrockConfig, BedrockLatencyMode, Guardrail, GuardrailHookPoint,
@@ -34,8 +36,8 @@ pub use model::{Model, Provider, ProviderConfig};
 pub use rate_limit::RateLimit;
 pub use routing::{Routing, RoutingStrategy, RoutingTarget};
 pub use schema::{
-    validate_apikey, validate_credential, validate_guardrail, validate_model, validate_team,
-    SchemaError,
+    validate_apikey, validate_cache_policy, validate_credential, validate_guardrail,
+    validate_model, validate_team, SchemaError,
 };
 pub use snapshot::AisixSnapshot;
 pub use team::Team;

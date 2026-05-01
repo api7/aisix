@@ -8,6 +8,7 @@
 //! Credential + Budget arrived with PR #19; Team / Guardrail will follow.
 
 use super::apikey::ApiKey;
+use super::cache_policy::CachePolicy;
 use super::credential::Credential;
 use super::guardrail::Guardrail;
 use super::model::Model;
@@ -23,6 +24,10 @@ pub struct AisixSnapshot {
     pub credentials: ResourceTable<Credential>,
     pub teams: ResourceTable<Team>,
     pub guardrails: ResourceTable<Guardrail>,
+    /// Per-env cache policies. Stage 2 honors only the existence of an
+    /// enabled row to gate the cache; Stage 3 will parse `applies_to`
+    /// + per-policy `ttl_seconds`. See `aisix-core::CachePolicy`.
+    pub cache_policies: ResourceTable<CachePolicy>,
 }
 
 impl AisixSnapshot {
@@ -38,6 +43,7 @@ impl AisixSnapshot {
             + self.credentials.len()
             + self.teams.len()
             + self.guardrails.len()
+            + self.cache_policies.len()
     }
 }
 
