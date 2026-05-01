@@ -16,6 +16,7 @@
 
 pub mod apikey;
 pub mod credential;
+pub mod guardrail;
 pub mod model;
 pub mod rate_limit;
 pub mod routing;
@@ -25,11 +26,13 @@ pub mod team;
 
 pub use apikey::ApiKey;
 pub use credential::Credential;
+pub use guardrail::{Guardrail, GuardrailHookPoint, GuardrailKind, KeywordConfig, KeywordPattern};
 pub use model::{Model, Provider, ProviderConfig};
 pub use rate_limit::RateLimit;
 pub use routing::{Routing, RoutingStrategy, RoutingTarget};
 pub use schema::{
-    validate_apikey, validate_credential, validate_model, validate_team, SchemaError,
+    validate_apikey, validate_credential, validate_guardrail, validate_model, validate_team,
+    SchemaError,
 };
 pub use snapshot::AisixSnapshot;
 pub use team::Team;

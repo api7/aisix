@@ -9,6 +9,7 @@
 
 use super::apikey::ApiKey;
 use super::credential::Credential;
+use super::guardrail::Guardrail;
 use super::model::Model;
 use super::team::Team;
 use crate::snapshot::ResourceTable;
@@ -21,6 +22,7 @@ pub struct AisixSnapshot {
     pub apikeys: ResourceTable<ApiKey>,
     pub credentials: ResourceTable<Credential>,
     pub teams: ResourceTable<Team>,
+    pub guardrails: ResourceTable<Guardrail>,
 }
 
 impl AisixSnapshot {
@@ -31,7 +33,11 @@ impl AisixSnapshot {
     /// Convenience: total entry count across all tables. Handy for debug /
     /// readiness checks.
     pub fn total_entries(&self) -> usize {
-        self.models.len() + self.apikeys.len() + self.credentials.len() + self.teams.len()
+        self.models.len()
+            + self.apikeys.len()
+            + self.credentials.len()
+            + self.teams.len()
+            + self.guardrails.len()
     }
 }
 

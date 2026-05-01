@@ -18,6 +18,7 @@ aisix-etcd = { path = "../aisix-etcd" }
 aisix-gateway = { path = "../aisix-gateway" }
 aisix-obs = { path = "../aisix-obs" }
 aisix-proxy = { path = "../aisix-proxy" }
+aisix-guardrails = { path = "../aisix-guardrails" }
 aisix-admin = { path = "../aisix-admin" }
 aisix-provider-openai = { path = "../aisix-provider-openai" }
 aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }

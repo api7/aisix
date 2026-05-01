@@ -390,6 +390,16 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     if let Some(client) = budget_client {
         proxy_state = proxy_state.with_budget_client(client);
     }
+    // Live guardrail chain: rebuilds itself whenever the etcd watch
+    // supervisor stores a fresh snapshot, so dashboard mutations
+    // (`/guardrails` create / enable / delete) take effect within
+    // one watch tick. Empty `guardrails` table → chain is a noop;
+    // adding the wrapper costs one mutex + ptr-compare per chat,
+    // never a regex compile on the hot path. See
+    // `aisix_guardrails::LiveGuardrailChain`.
+    proxy_state = proxy_state.with_guardrails(aisix_guardrails::LiveGuardrailChain::new(
+        snapshot_handle.clone(),
+    ));
     // Clone shared trackers before consuming proxy_state in build_router.
     let health_tracker = proxy_state.health.clone();
     let proxy_router = aisix_proxy::build_router(proxy_state);

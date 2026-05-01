@@ -12,7 +12,8 @@
 //! entry; it serves the rest."
 
 use aisix_core::models::{
-    validate_apikey, validate_credential, validate_model, ApiKey, Credential, Model, SchemaError,
+    validate_apikey, validate_credential, validate_guardrail, validate_model, ApiKey, Credential,
+    Guardrail, Model, SchemaError,
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
@@ -93,6 +94,18 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     &mut stats,
                 ) {
                     snapshot.credentials.insert(entry);
+                }
+            }
+            "guardrails" => {
+                if let Some(entry) = validate_and_parse::<Guardrail>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_guardrail,
+                    &mut stats,
+                ) {
+                    snapshot.guardrails.insert(entry);
                 }
             }
             other => {

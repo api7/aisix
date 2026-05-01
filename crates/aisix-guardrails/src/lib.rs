@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+mod build;
 mod chain;
 mod keyword;
 mod length;
@@ -25,6 +26,7 @@ mod length;
 use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 
+pub use build::{build_chain_from_snapshot, LiveGuardrailChain};
 pub use chain::GuardrailChain;
 pub use keyword::{KeywordBlocklist, KeywordRule};
 pub use length::MaxContentLength;

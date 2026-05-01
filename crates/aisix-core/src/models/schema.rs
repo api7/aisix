@@ -26,6 +26,7 @@ pub struct Schemas {
     pub apikey: Validator,
     pub credential: Validator,
     pub team: Validator,
+    pub guardrail: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile()));
@@ -45,6 +46,9 @@ impl Schemas {
             team: jsonschema::options()
                 .build(&team_schema())
                 .expect("team schema is well-formed"),
+            guardrail: jsonschema::options()
+                .build(&guardrail_schema())
+                .expect("guardrail schema is well-formed"),
         }
     }
 }
@@ -83,6 +87,10 @@ pub fn validate_credential(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_team(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.team, value)
+}
+
+pub fn validate_guardrail(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.guardrail, value)
 }
 
 fn model_schema() -> Value {
@@ -219,6 +227,48 @@ fn team_schema() -> Value {
                     "rpm":         { "type": "integer", "minimum": 0 },
                     "rpd":         { "type": "integer", "minimum": 0 },
                     "concurrency": { "type": "integer", "minimum": 0 }
+                }
+            }
+        }
+    })
+}
+
+fn guardrail_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["name", "kind"],
+        // The keyword variant adds `patterns`; we don't lock it down
+        // at the top level because future kinds will introduce their
+        // own keys. The kind-specific oneOf below pins per-kind.
+        "additionalProperties": true,
+        "properties": {
+            "name":       { "type": "string", "minLength": 1 },
+            "enabled":    { "type": "boolean" },
+            "hook_point": { "enum": ["input", "output", "both"] },
+            "kind":       { "enum": ["keyword"] }
+        },
+        "oneOf": [
+            {
+                "type": "object",
+                "required": ["kind", "patterns"],
+                "properties": {
+                    "kind":     { "const": "keyword" },
+                    "patterns": {
+                        "type": "array",
+                        "items": { "$ref": "#/$defs/keyword_pattern" }
+                    }
+                }
+            }
+        ],
+        "$defs": {
+            "keyword_pattern": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "value"],
+                "properties": {
+                    "kind":  { "enum": ["literal", "regex"] },
+                    "value": { "type": "string", "minLength": 1 }
                 }
             }
         }
