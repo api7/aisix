@@ -28,6 +28,7 @@ pub struct Schemas {
     pub team: Validator,
     pub guardrail: Validator,
     pub cache_policy: Validator,
+    pub observability_exporter: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile()));
@@ -53,6 +54,9 @@ impl Schemas {
             cache_policy: jsonschema::options()
                 .build(&cache_policy_schema())
                 .expect("cache_policy schema is well-formed"),
+            observability_exporter: jsonschema::options()
+                .build(&observability_exporter_schema())
+                .expect("observability_exporter schema is well-formed"),
         }
     }
 }
@@ -99,6 +103,10 @@ pub fn validate_guardrail(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_cache_policy(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.cache_policy, value)
+}
+
+pub fn validate_observability_exporter(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.observability_exporter, value)
 }
 
 fn model_schema() -> Value {
@@ -359,6 +367,45 @@ fn cache_policy_schema() -> Value {
             },
             "embedding_model": { "type": "string", "minLength": 1, "maxLength": 120 }
         }
+    })
+}
+
+fn observability_exporter_schema() -> Value {
+    // MVP: single discriminator value `otlp_http` whose fields land
+    // flat at the top level (matches the Guardrail wire shape — see
+    // `models/observability_exporter.rs` doc comment). Phase 2 adds
+    // `helicone` / `langfuse` / `datadog_logs` / `s3_ndjson` as
+    // additional discriminator values with their own `if`/`then`
+    // branches below.
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["name", "kind"],
+        "additionalProperties": false,
+        "properties": {
+            "name":    { "type": "string", "minLength": 1, "maxLength": 120 },
+            "enabled": { "type": "boolean" },
+            "kind":    { "type": "string", "enum": ["otlp_http"] },
+            // otlp_http branch — flat fields.
+            "endpoint": {
+                "type": "string",
+                // Reject http:// and any non-URL by anchoring on https://.
+                // Loopback bypass for e2e: allow http://mock-otlp:* /
+                // http://127.0.0.1 / http://localhost so the compose
+                // test can wire a fake receiver without TLS.
+                "pattern": "^https://.+|^http://(mock-otlp|otel-collector|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$"
+            },
+            "headers": {
+                "type": "object",
+                "additionalProperties": { "type": "string" }
+            }
+        },
+        "allOf": [
+            {
+                "if":   { "properties": { "kind": { "const": "otlp_http" } } },
+                "then": { "required": ["endpoint"] }
+            }
+        ]
     })
 }
 

@@ -19,6 +19,7 @@ pub mod cache_policy;
 pub mod credential;
 pub mod guardrail;
 pub mod model;
+pub mod observability_exporter;
 pub mod rate_limit;
 pub mod routing;
 pub mod schema;
@@ -33,11 +34,12 @@ pub use guardrail::{
     GuardrailKind, KeywordConfig, KeywordPattern,
 };
 pub use model::{Model, Provider, ProviderConfig};
+pub use observability_exporter::{ExporterKind, ObservabilityExporter, OtlpHttpConfig};
 pub use rate_limit::RateLimit;
 pub use routing::{Routing, RoutingStrategy, RoutingTarget};
 pub use schema::{
     validate_apikey, validate_cache_policy, validate_credential, validate_guardrail,
-    validate_model, validate_team, SchemaError,
+    validate_model, validate_observability_exporter, validate_team, SchemaError,
 };
 pub use snapshot::AisixSnapshot;
 pub use team::Team;

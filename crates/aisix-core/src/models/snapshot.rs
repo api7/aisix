@@ -12,6 +12,7 @@ use super::cache_policy::CachePolicy;
 use super::credential::Credential;
 use super::guardrail::Guardrail;
 use super::model::Model;
+use super::observability_exporter::ObservabilityExporter;
 use super::team::Team;
 use crate::snapshot::ResourceTable;
 
@@ -28,6 +29,9 @@ pub struct AisixSnapshot {
     /// enabled row to gate the cache; Stage 3 will parse `applies_to`
     /// + per-policy `ttl_seconds`. See `aisix-core::CachePolicy`.
     pub cache_policies: ResourceTable<CachePolicy>,
+    /// Per-env observability exporters. Each enabled row receives a
+    /// fan-out POST per chat completion (see `aisix-obs::OtlpHttpFanOut`).
+    pub observability_exporters: ResourceTable<ObservabilityExporter>,
 }
 
 impl AisixSnapshot {
@@ -44,6 +48,7 @@ impl AisixSnapshot {
             + self.teams.len()
             + self.guardrails.len()
             + self.cache_policies.len()
+            + self.observability_exporters.len()
     }
 }
 

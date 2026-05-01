@@ -19,7 +19,7 @@ use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ProxyConfig};
 use aisix_gateway::Hub;
 use aisix_guardrails::{Guardrail, GuardrailChain};
-use aisix_obs::{LangfuseSender, Metrics, UsageSink};
+use aisix_obs::{LangfuseSender, Metrics, OtlpHttpFanOut, UsageSink};
 use aisix_ratelimit::Limiter;
 use std::sync::Arc;
 
@@ -52,6 +52,12 @@ pub struct ProxyState {
     /// Defaults to a no-op sink when running outside managed mode so
     /// chat handlers don't have to special-case `Option`.
     pub usage_sink: UsageSink,
+    /// Per-env OTLP/HTTP fan-out — POSTs one OTLP-encoded span per
+    /// chat request to every enabled `ObservabilityExporter` in the
+    /// snapshot. Cheap clonable handle holding a shared
+    /// `reqwest::Client` connection pool. Always present (the
+    /// no-exporters case = empty snapshot table = no spawned tasks).
+    pub otlp_fan_out: OtlpHttpFanOut,
     pub request_body_limit_bytes: usize,
 }
 
@@ -69,6 +75,7 @@ impl ProxyState {
             health: Arc::new(HealthTracker::new()),
             langfuse: None,
             usage_sink: UsageSink::disabled(),
+            otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }
@@ -93,6 +100,7 @@ impl ProxyState {
             health: Arc::new(HealthTracker::new()),
             langfuse: None,
             usage_sink: UsageSink::disabled(),
+            otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }
@@ -120,6 +128,7 @@ impl ProxyState {
             health: Arc::new(HealthTracker::new()),
             langfuse: None,
             usage_sink: UsageSink::disabled(),
+            otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
         }
     }

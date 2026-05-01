@@ -16,6 +16,7 @@ pub mod access_log;
 pub mod langfuse;
 pub mod metrics;
 pub mod otlp;
+pub mod otlp_http_sink;
 pub mod usage;
 
 use aisix_core::ObservabilityConfig;
@@ -25,6 +26,7 @@ pub use access_log::AccessLog;
 pub use langfuse::{LangfuseError, LangfuseEvent, LangfuseHandle, LangfuseSender};
 pub use metrics::{Metrics, RequestOutcome};
 pub use otlp::{install_otlp_tracer, shutdown_otlp, OtlpError, OtlpHandle};
+pub use otlp_http_sink::OtlpHttpFanOut;
 pub use usage::{UsageEvent, UsageSink};
 
 #[derive(Debug, thiserror::Error)]

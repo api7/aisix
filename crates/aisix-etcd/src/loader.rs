@@ -12,8 +12,9 @@
 //! entry; it serves the rest."
 
 use aisix_core::models::{
-    validate_apikey, validate_cache_policy, validate_credential, validate_guardrail, validate_model,
-    ApiKey, CachePolicy, Credential, Guardrail, Model, SchemaError,
+    validate_apikey, validate_cache_policy, validate_credential, validate_guardrail,
+    validate_model, validate_observability_exporter, ApiKey, CachePolicy, Credential, Guardrail,
+    Model, ObservabilityExporter, SchemaError,
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
@@ -118,6 +119,18 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     &mut stats,
                 ) {
                     snapshot.cache_policies.insert(entry);
+                }
+            }
+            "observability_exporters" => {
+                if let Some(entry) = validate_and_parse::<ObservabilityExporter>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_observability_exporter,
+                    &mut stats,
+                ) {
+                    snapshot.observability_exporters.insert(entry);
                 }
             }
             other => {

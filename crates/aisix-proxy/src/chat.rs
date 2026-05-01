@@ -19,7 +19,7 @@
 use aisix_cache::CacheKey;
 use aisix_gateway::{BridgeContext, BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
-use aisix_obs::{AccessLog, LangfuseEvent, Metrics, RequestOutcome, UsageEvent, UsageSink};
+use aisix_obs::{AccessLog, LangfuseEvent, Metrics, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -86,7 +86,7 @@ pub async fn chat_completions(
                 &request_id,
             );
             emit_usage_event(
-                &state.usage_sink,
+                &state,
                 &request_id,
                 &success.model_id,
                 &api_key_id,
@@ -164,7 +164,7 @@ pub async fn chat_completions(
             // dashboard can surface it on the Blocked tab.
             let guardrail_blocked = matches!(err, ProxyError::ContentFiltered(_));
             emit_usage_event(
-                &state.usage_sink,
+                &state,
                 &request_id,
                 resolved_model_id.as_deref().unwrap_or(""),
                 &api_key_id,
@@ -367,7 +367,9 @@ async fn dispatch(
     if attempt_models.len() == 1 {
         let only = &attempt_models[0];
         let provider = only.provider().ok_or_else(|| {
-            with_model(ProxyError::InvalidRequest("model has no provider prefix".into()))
+            with_model(ProxyError::InvalidRequest(
+                "model has no provider prefix".into(),
+            ))
         })?;
         if state.hub.get(provider).is_none() {
             return Err(with_model(ProxyError::ProviderUnavailable));
@@ -389,7 +391,9 @@ async fn dispatch(
     if req.is_streaming() {
         let model = &attempt_models[0];
         let provider = model.provider().ok_or_else(|| {
-            with_model(ProxyError::InvalidRequest("model has no provider prefix".into()))
+            with_model(ProxyError::InvalidRequest(
+                "model has no provider prefix".into(),
+            ))
         })?;
         let bridge = state
             .hub
@@ -464,9 +468,11 @@ async fn dispatch(
         CacheStatus::Disabled
     };
 
-    if let (true, Some(cache), Some(key)) =
-        (cache_active_by_policy, state.cache.as_ref(), cache_key.as_ref())
-    {
+    if let (true, Some(cache), Some(key)) = (
+        cache_active_by_policy,
+        state.cache.as_ref(),
+        cache_key.as_ref(),
+    ) {
         match cache.get(key).await {
             Ok(Some(cached)) => {
                 reservation.commit_tokens(0);
@@ -625,9 +631,11 @@ async fn dispatch(
     // top of dispatch — without an enabled cache_policy in snapshot,
     // we skip both read AND write so the cache backend doesn't fill
     // up with entries that no policy ever asked for.
-    if let (true, Some(cache), Some(key)) =
-        (cache_active_by_policy, state.cache.as_ref(), cache_key.as_ref())
-    {
+    if let (true, Some(cache), Some(key)) = (
+        cache_active_by_policy,
+        state.cache.as_ref(),
+        cache_key.as_ref(),
+    ) {
         if let Err(err) = cache.put(key, upstream.clone()).await {
             tracing::warn!(error = %err, key = %key, "cache write failed");
         }
@@ -692,14 +700,15 @@ fn record_success(
     }
 }
 
-/// Push one telemetry event onto the CP-side sink. Non-blocking;
-/// drops with a tracing::warn! if the worker queue is full.
-/// Centralised here so success / error / streaming / cache-hit paths
-/// all share the same event-construction logic and the wire shape
-/// stays consistent across them.
+/// Push one telemetry event onto the CP-side sink **and** fan it out
+/// to every per-env OTLP/HTTP exporter in the live snapshot.
+/// Non-blocking on both legs: the CP sink drops on full queue, the
+/// OTLP fan-out detaches a tokio task per exporter. Centralised here
+/// so success / error / streaming / cache-hit paths share one event
+/// construction and the two emit legs stay in lockstep.
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
-    sink: &UsageSink,
+    state: &ProxyState,
     request_id: &str,
     model_id: &str,
     api_key_id: &str,
@@ -711,7 +720,7 @@ fn emit_usage_event(
     cost_usd: f64,
     guardrail_blocked: bool,
 ) {
-    sink.try_emit(UsageEvent {
+    let event = UsageEvent {
         request_id: request_id.to_string(),
         // RFC 3339 UTC. cp-api parses with time.Parse(time.RFC3339, ...);
         // chrono's `to_rfc3339_opts(Secs, true)` emits the trailing Z.
@@ -733,7 +742,17 @@ fn emit_usage_event(
         guardrail_blocked,
         guardrail_bypassed_reason: extras.bypass_reason,
         cache_status: extras.cache_status,
-    });
+    };
+    state.usage_sink.try_emit(event.clone());
+    // Per-env OTLP/HTTP fan-out. The snapshot's exporter table is
+    // empty for envs that haven't configured any, so this is a cheap
+    // no-op on the common path. Spawned tasks own the POST work and
+    // never block the request return.
+    let snap = state.snapshot.load();
+    let exporters = snap.observability_exporters.entries();
+    state
+        .otlp_fan_out
+        .fan_out(&event, exporters.iter().map(|e| &e.value));
 }
 
 /// Provider-detail bundle for `emit_usage_event`. Grouped here so the
