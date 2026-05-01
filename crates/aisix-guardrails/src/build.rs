@@ -90,6 +90,17 @@ fn build_one(row: &DomainGuardrail) -> Result<Option<Arc<dyn Guardrail>>, BuildE
             };
             Ok(Some(Arc::new(blocklist)))
         }
+        GuardrailKind::Bedrock(_) => {
+            // Phase 1: cp-api accepts kind=bedrock and the snapshot
+            // carries the parsed BedrockConfig, but the runtime
+            // dispatcher (aws-sdk-bedrock-runtime client + KMS
+            // decrypt) doesn't ship until Phase 2 — see PRD-09c
+            // §6.7. Treat the row as disabled so it can't silently
+            // let traffic through, and warn loudly so a misconfig
+            // (Bedrock kind enabled before Phase 2 lands) is
+            // caught in DP logs.
+            Err(BuildError::NotYetImplemented("bedrock"))
+        }
     }
 }
 
@@ -100,6 +111,14 @@ enum BuildError {
         pattern: String,
         source: regex::Error,
     },
+    /// Reserved for guardrail kinds whose runtime dispatch isn't
+    /// wired yet (Phase 1 ships `bedrock` parsing but defers the
+    /// AWS SDK + KMS-decrypt path to Phase 2). The chain treats
+    /// these rows as disabled and the supervisor's warn log
+    /// surfaces the kind name so a misconfigured environment is
+    /// visible.
+    #[error("guardrail kind {0:?} not yet implemented; treating row as disabled")]
+    NotYetImplemented(&'static str),
 }
 
 /// Adapter that wraps a snapshot handle and rebuilds the runtime
@@ -291,6 +310,55 @@ mod tests {
         // Only the good row makes it in.
         assert_eq!(chain.len(), 1);
         let v = chain.check_input(&req("ok")).await;
+        assert!(v.is_block());
+    }
+
+    #[tokio::test]
+    async fn bedrock_kind_is_skipped_until_phase_2_lands() {
+        // Phase 1 contract: cp-api accepts kind=bedrock and the
+        // snapshot carries the parsed config, but the chain builder
+        // skips with a warn-log and the row contributes nothing to
+        // request-time enforcement. A keyword row in the same
+        // snapshot must still build + fire so a half-rolled
+        // environment doesn't get worse than no-op.
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "bedrock-row",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "bedrock-row",
+                    "kind": "bedrock",
+                    "guardrail_id": "abcdefgh1234",
+                    "guardrail_version": "DRAFT",
+                    "region": "us-east-1",
+                    "aws_credentials": {
+                        "kind": "static",
+                        "access_key_id": "AKIA",
+                        "secret_ciphertext": "Y2lwaGVy",
+                        "secret_nonce": "bm9uY2U=",
+                        "encrypted_dek": "ZGVr",
+                        "master_key_id": "mk-1"
+                    },
+                    "latency_mode": { "kind": "serial" }
+                }"#,
+            ),
+        ));
+        table.insert(entry(
+            "keyword-row",
+            "g-2",
+            parse(
+                r#"{
+                    "name": "keyword-row",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table);
+        // Only the keyword row materialises in the runtime chain.
+        assert_eq!(chain.len(), 1);
+        let v = chain.check_input(&req("here is AKIAEXAMPLE")).await;
         assert!(v.is_block());
     }
 

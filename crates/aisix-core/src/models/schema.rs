@@ -238,15 +238,16 @@ fn guardrail_schema() -> Value {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "required": ["name", "kind"],
-        // The keyword variant adds `patterns`; we don't lock it down
-        // at the top level because future kinds will introduce their
-        // own keys. The kind-specific oneOf below pins per-kind.
+        // Each kind variant adds its own keys; the per-kind oneOf
+        // below pins them. Top-level stays open so future kinds
+        // (lakera, protect_ai) only edit the oneOf branch.
         "additionalProperties": true,
         "properties": {
             "name":       { "type": "string", "minLength": 1 },
             "enabled":    { "type": "boolean" },
             "hook_point": { "enum": ["input", "output", "both"] },
-            "kind":       { "enum": ["keyword"] }
+            "fail_open":  { "type": "boolean" },
+            "kind":       { "enum": ["keyword", "bedrock"] }
         },
         "oneOf": [
             {
@@ -259,6 +260,21 @@ fn guardrail_schema() -> Value {
                         "items": { "$ref": "#/$defs/keyword_pattern" }
                     }
                 }
+            },
+            {
+                "type": "object",
+                "required": [
+                    "kind", "guardrail_id", "guardrail_version",
+                    "region", "aws_credentials", "latency_mode"
+                ],
+                "properties": {
+                    "kind":               { "const": "bedrock" },
+                    "guardrail_id":       { "type": "string", "minLength": 1, "maxLength": 64 },
+                    "guardrail_version":  { "type": "string", "minLength": 1, "maxLength": 16 },
+                    "region":             { "type": "string", "minLength": 1 },
+                    "aws_credentials":    { "$ref": "#/$defs/bedrock_aws_credentials" },
+                    "latency_mode":       { "$ref": "#/$defs/bedrock_latency_mode" }
+                }
             }
         ],
         "$defs": {
@@ -270,6 +286,41 @@ fn guardrail_schema() -> Value {
                     "kind":  { "enum": ["literal", "regex"] },
                     "value": { "type": "string", "minLength": 1 }
                 }
+            },
+            "bedrock_aws_credentials": {
+                "type": "object",
+                // v1 ships kind=static (encrypted access keys);
+                // Phase 4 adds kind=role_arn (sts:AssumeRole) under
+                // the same `kind` discriminator.
+                "required": ["kind", "access_key_id"],
+                "properties": {
+                    "kind":              { "const": "static" },
+                    "access_key_id":     { "type": "string", "minLength": 1 },
+                    "secret_ciphertext": { "type": "string" },
+                    "secret_nonce":      { "type": "string" },
+                    "encrypted_dek":     { "type": "string" },
+                    "master_key_id":     { "type": "string" }
+                },
+                "additionalProperties": false
+            },
+            "bedrock_latency_mode": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["kind"],
+                        "properties": { "kind": { "const": "serial" } }
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["kind", "timeout_ms"],
+                        "properties": {
+                            "kind":       { "const": "timed" },
+                            "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 5000 }
+                        }
+                    }
+                ]
             }
         }
     })
@@ -357,5 +408,72 @@ mod tests {
         let a = Arc::as_ptr(&*SCHEMAS);
         let b = Arc::as_ptr(&*SCHEMAS);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn guardrail_bedrock_serial_passes() {
+        let v = json!({
+            "name": "block-pii",
+            "kind": "bedrock",
+            "guardrail_id": "abcdefgh1234",
+            "guardrail_version": "DRAFT",
+            "region": "us-east-1",
+            "aws_credentials": {
+                "kind": "static",
+                "access_key_id": "AKIAEXAMPLE",
+                "secret_ciphertext": "Y2lwaGVy",
+                "secret_nonce": "bm9uY2U=",
+                "encrypted_dek": "ZGVr",
+                "master_key_id": "mk-1"
+            },
+            "latency_mode": { "kind": "serial" }
+        });
+        validate_guardrail(&v).unwrap();
+    }
+
+    #[test]
+    fn guardrail_bedrock_timed_with_valid_timeout_passes() {
+        let v = json!({
+            "name": "block-pii",
+            "kind": "bedrock",
+            "guardrail_id": "id",
+            "guardrail_version": "1",
+            "region": "us-east-1",
+            "aws_credentials": {
+                "kind": "static",
+                "access_key_id": "AKIA"
+            },
+            "latency_mode": { "kind": "timed", "timeout_ms": 500 }
+        });
+        validate_guardrail(&v).unwrap();
+    }
+
+    #[test]
+    fn guardrail_bedrock_timeout_below_min_rejected() {
+        let v = json!({
+            "name": "g",
+            "kind": "bedrock",
+            "guardrail_id": "id",
+            "guardrail_version": "1",
+            "region": "us-east-1",
+            "aws_credentials": { "kind": "static", "access_key_id": "AKIA" },
+            "latency_mode": { "kind": "timed", "timeout_ms": 50 }
+        });
+        assert!(validate_guardrail(&v).is_err());
+    }
+
+    #[test]
+    fn guardrail_bedrock_unknown_credential_kind_rejected() {
+        let v = json!({
+            "name": "g",
+            "kind": "bedrock",
+            "guardrail_id": "id",
+            "guardrail_version": "1",
+            "region": "us-east-1",
+            "aws_credentials": { "kind": "role_arn", "access_key_id": "AKIA" },
+            "latency_mode": { "kind": "serial" }
+        });
+        // Phase 4 will add role_arn; today it's rejected.
+        assert!(validate_guardrail(&v).is_err());
     }
 }
