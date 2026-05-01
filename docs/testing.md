@@ -61,6 +61,11 @@ Conventions:
   prevailing.
 - Use `wiremock` for HTTP-level mocking of upstream providers
   (already a workspace dep).
+- For `aws-sdk-bedrockruntime` (kind=bedrock guardrail): point
+  the SDK client at a wiremock server via `endpoint_url` — see
+  `crates/aisix-guardrails/src/bedrock.rs::tests` for the
+  pattern. The SDK serializes / signs / parses normally; only
+  the HTTP transport is redirected.
 - Use `rstest` for parameterised tests where it improves clarity.
 
 ## 3. Cargo integration tests

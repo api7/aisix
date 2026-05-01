@@ -80,6 +80,21 @@ impl BedrockGuardrail {
         hook_point: GuardrailHookPoint,
         fail_open: bool,
     ) -> Self {
+        Self::with_endpoint(row_name, cfg, hook_point, fail_open, None)
+    }
+
+    /// Internal constructor that accepts an optional `endpoint_url`
+    /// override. Production calls `new()` (None → real AWS Bedrock);
+    /// tests pass a wiremock URL to point the SDK at a local
+    /// canned-response server. Also used by anyone wiring Bedrock
+    /// against a self-hosted gateway / proxy.
+    fn with_endpoint(
+        row_name: impl Into<String>,
+        cfg: &BedrockConfig,
+        hook_point: GuardrailHookPoint,
+        fail_open: bool,
+        endpoint_url: Option<String>,
+    ) -> Self {
         let BedrockAWSCredentials::Static {
             access_key_id,
             secret_access_key,
@@ -94,7 +109,7 @@ impl BedrockGuardrail {
             None,
             "aisix-guardrails-bedrock",
         );
-        let sdk_cfg = aws_config::SdkConfig::builder()
+        let mut builder = aws_config::SdkConfig::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(cfg.region.clone()))
             .credentials_provider(SharedCredentialsProvider::new(creds))
@@ -103,8 +118,11 @@ impl BedrockGuardrail {
             // the rt-tokio feature is on (see workspace Cargo.toml).
             .sleep_impl(aws_smithy_async::rt::sleep::SharedAsyncSleep::new(
                 aws_smithy_async::rt::sleep::TokioSleep::new(),
-            ))
-            .build();
+            ));
+        if let Some(url) = endpoint_url {
+            builder = builder.endpoint_url(url);
+        }
+        let sdk_cfg = builder.build();
         let client = Client::new(&sdk_cfg);
         Self {
             row_name: row_name.into(),
@@ -369,5 +387,216 @@ mod tests {
 
     fn build_test(fail_open: bool) -> BedrockGuardrail {
         BedrockGuardrail::new("test-row", &cfg(), GuardrailHookPoint::Both, fail_open)
+    }
+
+    // --- wiremock integration tests --------------------------------
+    //
+    // The unit tests above exercise the failure-mapping logic
+    // (`handle_failure`) directly. These tests stand up a local
+    // wiremock server, point the SDK client at it via
+    // `endpoint_url`, and exercise `apply()` end-to-end including:
+    //
+    //   * SDK-level request serialization (ApplyGuardrail HTTP body)
+    //   * sigv4 signing + transport
+    //   * Response deserialization back into the SDK's typed shape
+    //   * Verdict translation (Allow / Block / Bypass)
+    //
+    // We don't try to assert on the exact HTTP path — different SDK
+    // versions encode the URL slightly differently (the v1 shape is
+    // POST /guardrail/{id}/version/{ver}/apply); broad path matching
+    // keeps the test robust to SDK upgrades.
+
+    use aws_sdk_bedrockruntime::types::GuardrailContentSource;
+    use serde_json::json;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn build_with_endpoint(endpoint: String, fail_open: bool) -> BedrockGuardrail {
+        BedrockGuardrail::with_endpoint(
+            "wiremock-test",
+            &cfg(),
+            GuardrailHookPoint::Both,
+            fail_open,
+            Some(endpoint),
+        )
+    }
+
+    /// Happy-path: Bedrock returns `action=NONE` → Allow. This is the
+    /// most common production response (the operator's guardrail
+    /// didn't fire). Also pins that the request actually hits
+    /// `apply_guardrail` — wiremock's mounted matcher requires
+    /// exactly one POST under `/guardrail/.../apply`.
+    #[tokio::test]
+    async fn apply_returns_allow_on_action_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "action": "NONE",
+                "outputs": [],
+                "assessments": [],
+                "usage": {
+                    "topicPolicyUnits": 0,
+                    "contentPolicyUnits": 0,
+                    "wordPolicyUnits": 0,
+                    "sensitiveInformationPolicyUnits": 0,
+                    "sensitiveInformationPolicyFreeUnits": 0,
+                    "contextualGroundingPolicyUnits": 0
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let g = build_with_endpoint(server.uri(), true);
+        let v = g.apply(GuardrailContentSource::Input, "hello".into()).await;
+        assert_eq!(v, GuardrailVerdict::Allow);
+    }
+
+    /// `action=GUARDRAIL_INTERVENED` → Block. Operator's policy
+    /// fired (PII / topic / word filter etc.) and the request
+    /// should never reach the upstream LLM.
+    #[tokio::test]
+    async fn apply_returns_block_on_action_intervened() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "action": "GUARDRAIL_INTERVENED",
+                "outputs": [{ "text": "I cannot help with that request." }],
+                "assessments": [],
+                "usage": {
+                    "topicPolicyUnits": 1,
+                    "contentPolicyUnits": 0,
+                    "wordPolicyUnits": 0,
+                    "sensitiveInformationPolicyUnits": 0,
+                    "sensitiveInformationPolicyFreeUnits": 0,
+                    "contextualGroundingPolicyUnits": 0
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let g = build_with_endpoint(server.uri(), true);
+        let v = g.apply(GuardrailContentSource::Input, "leak something".into()).await;
+        match v {
+            GuardrailVerdict::Block { reason } => {
+                assert!(
+                    reason.contains("abcdefgh1234"),
+                    "block reason should mention guardrail_id, got {reason}",
+                );
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    /// HTTP 500 + `fail_open=true` → Bypass tagged `bedrock_5xx`.
+    /// The SDK retries 500s a couple of times by default (we set
+    /// `sleep_impl` for that). wiremock returns 500 every time, so
+    /// the SDK gives up and we map the failure.
+    #[tokio::test]
+    async fn apply_5xx_with_fail_open_true_returns_bypass() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "__type": "InternalServerException",
+                "message": "Bedrock is having a bad day"
+            })))
+            .mount(&server)
+            .await;
+
+        let g = build_with_endpoint(server.uri(), true);
+        let v = g.apply(GuardrailContentSource::Input, "anything".into()).await;
+        match v {
+            GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "bedrock_5xx"),
+            other => panic!("expected Bypass, got {other:?}"),
+        }
+    }
+
+    /// HTTP 500 + `fail_open=false` → Block. Operator chose to
+    /// block on Bedrock outage (correctness over availability).
+    #[tokio::test]
+    async fn apply_5xx_with_fail_open_false_returns_block() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "__type": "InternalServerException",
+                "message": "Bedrock is having a bad day"
+            })))
+            .mount(&server)
+            .await;
+
+        let g = build_with_endpoint(server.uri(), false);
+        let v = g.apply(GuardrailContentSource::Input, "anything".into()).await;
+        assert!(v.is_block(), "expected Block, got {v:?}");
+    }
+
+    /// 429 ThrottlingException → tagged `bedrock_throttled`. Distinct
+    /// from generic 5xx because operators triage AWS-quota issues
+    /// differently from Bedrock service outages.
+    #[tokio::test]
+    async fn apply_429_throttling_with_fail_open_tags_throttled() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+                "__type": "ThrottlingException",
+                "message": "Rate exceeded"
+            })))
+            .mount(&server)
+            .await;
+
+        let g = build_with_endpoint(server.uri(), true);
+        let v = g.apply(GuardrailContentSource::Input, "anything".into()).await;
+        match v {
+            GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "bedrock_throttled"),
+            other => panic!("expected Bypass(bedrock_throttled), got {other:?}"),
+        }
+    }
+
+    /// `latency_mode=timed` + Bedrock takes longer than the timeout
+    /// → tagged `bedrock_timeout`. wiremock's `set_delay` makes the
+    /// server hang past our 100ms timeout.
+    #[tokio::test]
+    async fn apply_timed_mode_aborts_at_timeout_and_tags_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/guardrail/.+/apply$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(800))
+                    .set_body_json(json!({
+                        "action": "NONE",
+                        "outputs": [],
+                        "assessments": [],
+                        "usage": {
+                            "topicPolicyUnits": 0,
+                            "contentPolicyUnits": 0,
+                            "wordPolicyUnits": 0,
+                            "sensitiveInformationPolicyUnits": 0,
+                            "sensitiveInformationPolicyFreeUnits": 0,
+                            "contextualGroundingPolicyUnits": 0
+                        }
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let mut tight = cfg();
+        tight.latency_mode = BedrockLatencyMode::Timed { timeout_ms: 100 };
+        let g = BedrockGuardrail::with_endpoint(
+            "timed-test",
+            &tight,
+            GuardrailHookPoint::Both,
+            /* fail_open */ true,
+            Some(server.uri()),
+        );
+        let v = g.apply(GuardrailContentSource::Input, "anything".into()).await;
+        match v {
+            GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "bedrock_timeout"),
+            other => panic!("expected Bypass(bedrock_timeout), got {other:?}"),
+        }
     }
 }
