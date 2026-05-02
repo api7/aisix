@@ -2363,6 +2363,8 @@ dependencies = [
  "portable-atomic",
  "rand 0.9.4",
  "thiserror",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

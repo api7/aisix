@@ -1,5 +1,3 @@
-mod trace;
-
 use std::borrow::Cow;
 
 use anyhow::{Context, Result};
@@ -13,13 +11,12 @@ use logforth::{
 };
 use metrics_exporter_otel::OpenTelemetryRecorder;
 use opentelemetry::{InstrumentationScope, metrics::MeterProvider};
-use opentelemetry_otlp::SpanExporter;
+use opentelemetry_otlp::{MetricExporter, SpanExporter};
 use opentelemetry_sdk::{
     Resource,
-    metrics::{PeriodicReader, SdkMeterProvider},
+    metrics::{SdkMeterProvider, periodic_reader_with_async_runtime::PeriodicReader},
 };
 use tokio::{sync::oneshot, task::JoinHandle};
-pub use trace::{BoxedSpanExporter, DynSpanExporter};
 
 use crate::utils;
 
@@ -59,19 +56,21 @@ pub fn init_observability_log() -> Result<(oneshot::Sender<()>, JoinHandle<()>)>
 
 /// Initialize observability tracing.
 pub fn init_observability_trace(
-    span_exporter: Option<BoxedSpanExporter>,
+    span_exporter: Option<SpanExporter>,
     config: Option<FastraceConfig>,
 ) -> Result<(oneshot::Sender<()>, JoinHandle<()>)> {
     let reporter = OpenTelemetryReporter::new(
         match span_exporter {
             Some(exporter) => exporter,
-            None => BoxedSpanExporter::new(
-                SpanExporter::builder()
-                    .build()
-                    .context("failed to initialize otlp exporter")?,
-            ),
+            None => SpanExporter::builder()
+                .build()
+                .context("failed to initialize otlp exporter")?,
         },
-        Cow::Owned(Resource::builder().build()),
+        Cow::Owned(
+            Resource::builder()
+                .with_service_name(INSTRUMENTATION_NAME)
+                .build(),
+        ),
         InstrumentationScope::builder(INSTRUMENTATION_NAME)
             .with_version(env!("CARGO_PKG_VERSION"))
             .build(),
@@ -82,16 +81,27 @@ pub fn init_observability_trace(
 }
 
 /// Initialize observability metrics.
-pub fn init_observability_metric() -> Result<(oneshot::Sender<()>, JoinHandle<()>)> {
-    let exporter = opentelemetry_otlp::MetricExporter::builder().build()?;
+pub fn init_observability_metric(
+    metric_exporter: Option<MetricExporter>,
+) -> Result<(oneshot::Sender<()>, JoinHandle<()>)> {
+    let exporter = match metric_exporter {
+        Some(exporter) => exporter,
+        None => MetricExporter::builder()
+            .build()
+            .context("failed to initialize metric exporter")?,
+    };
 
-    let reader = PeriodicReader::builder(exporter).build();
-
-    let meter_provider = SdkMeterProvider::builder().with_reader(reader).build();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_reader(
+            PeriodicReader::builder(exporter, opentelemetry_sdk::runtime::Tokio)
+                .with_interval(std::time::Duration::from_secs(15))
+                .build(),
+        )
+        .build();
     let meter = meter_provider.meter(INSTRUMENTATION_NAME);
 
     metrics::set_global_recorder(OpenTelemetryRecorder::new(meter))
-        .context("failed to initialize metrics recorder")?;
+        .context("failed to initialize metric recorder")?;
     utils::metrics::describe_metrics();
 
     // shutting down signal handler
@@ -109,7 +119,7 @@ pub fn init_observability_metric() -> Result<(oneshot::Sender<()>, JoinHandle<()
 pub fn init_observability() -> Result<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)> {
     let (log_tx, log_shutdown_handle) = init_observability_log()?;
     let (trace_tx, trace_shutdown_handle) = init_observability_trace(None, None)?;
-    let (metric_tx, metric_shutdown_handle) = init_observability_metric()?;
+    let (metric_tx, metric_shutdown_handle) = init_observability_metric(None)?;
 
     Ok(shutdown_handler(|| async move {
         let _ = trace_tx.send(());
