@@ -409,8 +409,11 @@ mod tests {
     fn read_optional_ca_pem_reads_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ca.pem");
-        std::fs::write(&path, b"-----BEGIN CERTIFICATE-----\nXX\n-----END CERTIFICATE-----\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            b"-----BEGIN CERTIFICATE-----\nXX\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
         let bytes = read_optional_ca_pem(Some(path.to_str().unwrap()))
             .unwrap()
             .expect("Some when path is set");

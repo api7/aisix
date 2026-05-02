@@ -181,7 +181,10 @@ impl LiveGuardrailChain {
     fn current(&self) -> Arc<GuardrailChain> {
         let snap = self.snapshot.load();
         let cur_ptr = Arc::as_ptr(&snap) as usize;
-        let mut cache = self.cache.lock().expect("LiveGuardrailChain mutex poisoned");
+        let mut cache = self
+            .cache
+            .lock()
+            .expect("LiveGuardrailChain mutex poisoned");
         if cache.last_snapshot_addr != cur_ptr {
             cache.chain = Arc::new(build_chain_from_snapshot(&snap.guardrails));
             cache.last_snapshot_addr = cur_ptr;

@@ -249,9 +249,7 @@ fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
             .context("parse managed.cp_ca_cert_file as PEM certificate")?;
         builder = builder.add_root_certificate(extra_ca);
     }
-    builder
-        .build()
-        .context("build reqwest client with mTLS")
+    builder.build().context("build reqwest client with mTLS")
 }
 
 #[cfg(test)]

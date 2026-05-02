@@ -162,7 +162,9 @@ mod tests {
                 "always-bypass"
             }
             async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
-                GuardrailVerdict::Bypass { reason: "test".into() }
+                GuardrailVerdict::Bypass {
+                    reason: "test".into(),
+                }
             }
         }
         let chain = GuardrailChain::new(vec![
@@ -186,7 +188,9 @@ mod tests {
                 "always-bypass"
             }
             async fn check_input(&self, _req: &ChatFormat) -> GuardrailVerdict {
-                GuardrailVerdict::Bypass { reason: self.0.into() }
+                GuardrailVerdict::Bypass {
+                    reason: self.0.into(),
+                }
             }
         }
         let chain = GuardrailChain::new(vec![

@@ -189,11 +189,8 @@ impl BedrockGuardrail {
         let result = match self.latency_mode {
             BedrockLatencyMode::Serial => req.send().await.map_err(BedrockFailure::from_sdk),
             BedrockLatencyMode::Timed { timeout_ms } => {
-                match tokio::time::timeout(
-                    Duration::from_millis(timeout_ms as u64),
-                    req.send(),
-                )
-                .await
+                match tokio::time::timeout(Duration::from_millis(timeout_ms as u64), req.send())
+                    .await
                 {
                     Ok(Ok(resp)) => Ok(resp),
                     Ok(Err(e)) => Err(BedrockFailure::from_sdk(e)),
@@ -205,10 +202,7 @@ impl BedrockGuardrail {
         match result {
             Ok(resp) => match resp.action() {
                 GuardrailAction::GuardrailIntervened => GuardrailVerdict::Block {
-                    reason: format!(
-                        "bedrock guardrail {} intervened",
-                        self.guardrail_id
-                    ),
+                    reason: format!("bedrock guardrail {} intervened", self.guardrail_id),
                 },
                 GuardrailAction::None => GuardrailVerdict::Allow,
                 other => {
@@ -512,7 +506,9 @@ mod tests {
             .await;
 
         let g = build_with_endpoint(server.uri(), true);
-        let v = g.apply(GuardrailContentSource::Input, "leak something".into()).await;
+        let v = g
+            .apply(GuardrailContentSource::Input, "leak something".into())
+            .await;
         match v {
             GuardrailVerdict::Block { reason } => {
                 assert!(
@@ -541,7 +537,9 @@ mod tests {
             .await;
 
         let g = build_with_endpoint(server.uri(), true);
-        let v = g.apply(GuardrailContentSource::Input, "anything".into()).await;
+        let v = g
+            .apply(GuardrailContentSource::Input, "anything".into())
+            .await;
         match v {
             GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "bedrock_5xx"),
             other => panic!("expected Bypass, got {other:?}"),
@@ -563,7 +561,9 @@ mod tests {
             .await;
 
         let g = build_with_endpoint(server.uri(), false);
-        let v = g.apply(GuardrailContentSource::Input, "anything".into()).await;
+        let v = g
+            .apply(GuardrailContentSource::Input, "anything".into())
+            .await;
         assert!(v.is_block(), "expected Block, got {v:?}");
     }
 
@@ -583,7 +583,9 @@ mod tests {
             .await;
 
         let g = build_with_endpoint(server.uri(), true);
-        let v = g.apply(GuardrailContentSource::Input, "anything".into()).await;
+        let v = g
+            .apply(GuardrailContentSource::Input, "anything".into())
+            .await;
         match v {
             GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "bedrock_throttled"),
             other => panic!("expected Bypass(bedrock_throttled), got {other:?}"),
@@ -643,7 +645,9 @@ mod tests {
             /* fail_open */ true,
             Some(server.uri()),
         );
-        let v = g.apply(GuardrailContentSource::Input, "anything".into()).await;
+        let v = g
+            .apply(GuardrailContentSource::Input, "anything".into())
+            .await;
         match v {
             GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "bedrock_timeout"),
             other => panic!("expected Bypass(bedrock_timeout), got {other:?}"),
