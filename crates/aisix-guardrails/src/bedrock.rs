@@ -44,6 +44,20 @@ use aws_smithy_runtime_api::http::Response;
 
 use crate::{Guardrail, GuardrailVerdict};
 
+/// Deployment-wide override for the Bedrock endpoint URL. Read by
+/// `BedrockGuardrail::new` (production code path); unset means the
+/// SDK default (real AWS) is used.
+///
+/// Set this in `e2e/compose.yml` to point the DP at a local
+/// fakecloud / LocalStack instance. Operators of self-hosted
+/// stacks behind an outbound HTTP proxy can also use this to route
+/// through their proxy.
+///
+/// Scoped to the env var name (not a per-guardrail config field)
+/// because endpoint overrides are a deployment concern, not a
+/// per-row configuration that a tenant should be able to set.
+pub const BEDROCK_ENDPOINT_URL_ENV_VAR: &str = "AISIX_BEDROCK_ENDPOINT_URL";
+
 /// One Bedrock guardrail row, materialised into a request-time
 /// dispatcher. Built once per snapshot from
 /// [`aisix_core::models::Guardrail`] + plaintext credentials.
@@ -80,7 +94,27 @@ impl BedrockGuardrail {
         hook_point: GuardrailHookPoint,
         fail_open: bool,
     ) -> Self {
-        Self::with_endpoint(row_name, cfg, hook_point, fail_open, None)
+        // Honor the deployment-wide endpoint override. This lets the
+        // e2e suite point at fakecloud (or any AWS-compatible local
+        // mock) without changing the cp-api wire shape, and lets a
+        // self-hosted operator route Bedrock through a proxy. Empty
+        // string is treated as unset so a `docker run -e
+        // AISIX_BEDROCK_ENDPOINT_URL=` doesn't accidentally redirect.
+        let endpoint_url = std::env::var(BEDROCK_ENDPOINT_URL_ENV_VAR)
+            .ok()
+            .filter(|s| !s.is_empty());
+        if let Some(url) = endpoint_url.as_ref() {
+            // Visible at INFO so an operator inspecting DP logs sees
+            // "Bedrock isn't talking to AWS" without having to grep
+            // env. Prints once per BedrockGuardrail materialised from
+            // the snapshot, which is rare (snapshot rebuild only).
+            tracing::info!(
+                endpoint = %url,
+                guardrail_id = %cfg.guardrail_id,
+                "BedrockGuardrail using endpoint URL override (AISIX_BEDROCK_ENDPOINT_URL)",
+            );
+        }
+        Self::with_endpoint(row_name, cfg, hook_point, fail_open, endpoint_url)
     }
 
     /// Internal constructor that accepts an optional `endpoint_url`
@@ -555,6 +589,22 @@ mod tests {
             other => panic!("expected Bypass(bedrock_throttled), got {other:?}"),
         }
     }
+
+    // The env-var path (`new()` reads `AISIX_BEDROCK_ENDPOINT_URL`)
+    // isn't unit-tested here because:
+    //   1. `aisix-guardrails` declares `#![forbid(unsafe_code)]` and
+    //      `std::env::set_var` is unsafe in modern Rust; the
+    //      forbidden lint can't be relaxed for a single test without
+    //      moving it to a separate `tests/` integration binary.
+    //   2. The override logic is two lines of trivial mapping
+    //      (`env::var().ok().filter(non-empty)`) → `with_endpoint`,
+    //      which the wiremock tests above already exercise
+    //      thoroughly.
+    //   3. The deployment-wide override is verified end-to-end by
+    //      `dashboard/tests/e2e/bedrock-live.spec.ts` against a real
+    //      fakecloud sidecar — see PRD-09c §6.7 + the e2e compose
+    //      file. That's the contract test that catches a regression
+    //      where the env var stops being read.
 
     /// `latency_mode=timed` + Bedrock takes longer than the timeout
     /// → tagged `bedrock_timeout`. wiremock's `set_delay` makes the
