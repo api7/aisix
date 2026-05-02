@@ -433,19 +433,32 @@ async fn dispatch(
         });
     }
 
-    // Policy gate: the cache is only consulted when at least one
-    // enabled `CachePolicy` exists in the snapshot for this env. cp-api
-    // owns the policy CRUD surface (`/api/environments/:env/cache_policies`,
-    // see Stage 1 — PR #134); kine fans out the rows; the loader
-    // populates `snapshot.cache_policies` (see aisix-etcd). Stage 2
-    // honors only the existence + `enabled` flag. Stage 3 will parse
-    // `applies_to` (currently treated as "all") + per-policy
-    // `ttl_seconds` (currently the cache backend's global TTL).
+    // Policy gate (Stage 3): the cache is only consulted when at
+    // least one enabled `CachePolicy` in the snapshot has an
+    // `applies_to` clause that matches THIS request. cp-api owns
+    // the policy CRUD surface (`/api/environments/:env/cache_policies`,
+    // see Stage 1); kine fans out the rows; the loader populates
+    // `snapshot.cache_policies` (see aisix-etcd). Stage 4 will add
+    // per-policy `ttl_seconds` propagation into the cache backend
+    // and the semantic backends.
+    //
+    // Match order: first enabled policy whose `parsed_applies_to()`
+    // accepts (req.model, auth.entry.id) wins. Iteration order on a
+    // ResourceTable isn't stable, but the first-match-wins rule is
+    // deterministic enough for the cache_status / x-aisix-cache header
+    // to stay stable across requests; ties only matter when an env
+    // legitimately has overlapping policies.
     let cache_active_by_policy = snapshot
         .cache_policies
         .entries()
         .iter()
-        .any(|entry| entry.value.enabled);
+        .any(|entry| {
+            entry.value.enabled
+                && entry
+                    .value
+                    .parsed_applies_to()
+                    .matches(&req.model, &auth.entry.id)
+        });
 
     // Cache lookup keyed on the *virtual* model name so a re-request
     // hits the cache regardless of which target served the original.

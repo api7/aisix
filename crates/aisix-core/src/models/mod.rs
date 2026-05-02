@@ -26,7 +26,7 @@ pub mod snapshot;
 pub mod team;
 
 pub use apikey::ApiKey;
-pub use cache_policy::{CacheBackend, CachePolicy};
+pub use cache_policy::{AppliesTo, CacheBackend, CachePolicy};
 pub use credential::Credential;
 pub use guardrail::{
     BedrockAWSCredentials, BedrockConfig, BedrockLatencyMode, Guardrail, GuardrailHookPoint,

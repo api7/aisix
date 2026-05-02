@@ -123,6 +123,61 @@ impl CachePolicy {
         self.runtime_id = id.into();
         self
     }
+
+    /// Parse `applies_to` into a typed matcher. Stage 3 understands:
+    ///
+    ///   - `"all"`            → matches every request in the env
+    ///   - `"model:<name>"`   → matches requests targeting that model alias
+    ///   - `"api_key:<id>"`   → matches requests authenticated by that api_key UUID
+    ///
+    /// Anything else (including the empty string) parses as `All` —
+    /// the conservative default keeps caching on for legacy / future
+    /// policy values rather than silently disabling them on a typo.
+    /// cp-api validation prevents the empty-string case at write time
+    /// (see internal/cpapi/resources/cache_policies.go::validateCachePolicyShape),
+    /// so the conservative branch is dead in practice.
+    pub fn parsed_applies_to(&self) -> AppliesTo {
+        let raw = self.applies_to.trim();
+        if let Some(rest) = raw.strip_prefix("model:") {
+            return AppliesTo::Model(rest.trim().to_string());
+        }
+        if let Some(rest) = raw.strip_prefix("api_key:") {
+            return AppliesTo::ApiKey(rest.trim().to_string());
+        }
+        AppliesTo::All
+    }
+}
+
+/// Typed view of `CachePolicy::applies_to`. The proxy uses this to
+/// pick the first matching enabled policy on every request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppliesTo {
+    /// Every request in the env matches this policy.
+    All,
+    /// Only requests whose `req.model` equals the inner string match.
+    /// String-compare against the model alias the caller asked for —
+    /// router fan-out happens AFTER cache lookup, so the alias is the
+    /// stable identifier here.
+    Model(String),
+    /// Only requests authenticated by the api_key whose UUID equals
+    /// the inner string. The UUID is the cp-api row id, the same
+    /// value the dashboard exposes on the api keys page.
+    ApiKey(String),
+}
+
+impl AppliesTo {
+    /// True iff this matcher accepts a request with the given
+    /// (model, api_key_id) pair. The caller is responsible for
+    /// passing the values it has at cache-lookup time — both are
+    /// stable strings, so no heap allocation is needed beyond the
+    /// references the proxy already holds.
+    pub fn matches(&self, model: &str, api_key_id: &str) -> bool {
+        match self {
+            AppliesTo::All => true,
+            AppliesTo::Model(want) => model == want,
+            AppliesTo::ApiKey(want) => api_key_id == want,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +231,46 @@ mod tests {
             serde_json::from_value(json!({"name": "x", "backend": "memory"})).unwrap();
         let p = p.with_runtime_id("uuid-1");
         assert_eq!(<CachePolicy as Resource>::id(&p), "uuid-1");
+    }
+
+    #[test]
+    fn applies_to_all_matches_anything() {
+        let p: CachePolicy =
+            serde_json::from_value(json!({"name": "x", "applies_to": "all"})).unwrap();
+        assert_eq!(p.parsed_applies_to(), AppliesTo::All);
+        assert!(p.parsed_applies_to().matches("any-model", "any-key"));
+    }
+
+    #[test]
+    fn applies_to_model_matches_only_named_model() {
+        let p: CachePolicy =
+            serde_json::from_value(json!({"name": "x", "applies_to": "model:gpt-4o"})).unwrap();
+        assert_eq!(p.parsed_applies_to(), AppliesTo::Model("gpt-4o".into()));
+        assert!(p.parsed_applies_to().matches("gpt-4o", "any-key"));
+        assert!(!p.parsed_applies_to().matches("claude-3-opus", "any-key"));
+    }
+
+    #[test]
+    fn applies_to_api_key_matches_only_named_key() {
+        let kid = "11111111-1111-1111-1111-111111111111";
+        let p: CachePolicy = serde_json::from_value(json!({
+            "name": "x",
+            "applies_to": format!("api_key:{kid}")
+        }))
+        .unwrap();
+        assert_eq!(p.parsed_applies_to(), AppliesTo::ApiKey(kid.into()));
+        assert!(p.parsed_applies_to().matches("gpt-4o", kid));
+        assert!(!p.parsed_applies_to().matches("gpt-4o", "different-key-id"));
+    }
+
+    #[test]
+    fn applies_to_unknown_prefix_falls_back_to_all() {
+        // cp-api validation rejects this on write, but a hand-edited
+        // kine row could surface here — we deliberately fall back to
+        // All rather than disabling caching on an unknown discriminator.
+        let p: CachePolicy =
+            serde_json::from_value(json!({"name": "x", "applies_to": "team:eng"})).unwrap();
+        assert_eq!(p.parsed_applies_to(), AppliesTo::All);
     }
 
     #[test]
