@@ -601,6 +601,8 @@ fn current_unix_timestamp() -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     use super::{
@@ -698,10 +700,10 @@ mod tests {
             mapped.choices[0].finish_reason.as_deref(),
             Some("tool_calls")
         );
-        assert!(matches!(
+        assert_matches!(
             mapped.choices[0].message.content.as_ref(),
             Some(MessageContent::Text(text)) if text == "Need a tool."
-        ));
+        );
         assert_eq!(
             mapped.choices[0].message.tool_calls.as_ref().unwrap()[0]
                 .function

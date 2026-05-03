@@ -743,6 +743,8 @@ fn now_unix_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     use super::{
@@ -789,10 +791,10 @@ mod tests {
         assert_eq!(anthropic.messages.len(), 1);
         assert_eq!(anthropic.messages[0].role, "user");
         assert_eq!(anthropic.tools.as_ref().unwrap()[0].name, "get_weather");
-        assert!(matches!(
+        assert_matches!(
             anthropic.tool_choice,
             Some(crate::gateway::types::anthropic::AnthropicToolChoice::Auto)
-        ));
+        );
         assert_eq!(
             anthropic.metadata.as_ref().unwrap().user_id.as_deref(),
             Some("user-123")
@@ -829,10 +831,10 @@ mod tests {
             openai.choices[0].finish_reason.as_deref(),
             Some("tool_calls")
         );
-        assert!(matches!(
+        assert_matches!(
             openai.choices[0].message.content.as_ref(),
             Some(crate::gateway::types::openai::MessageContent::Text(text)) if text == "Let me check."
-        ));
+        );
         let tool_call = &openai.choices[0].message.tool_calls.as_ref().unwrap()[0];
         assert_eq!(tool_call.id, "tu_1");
         assert_eq!(tool_call.function.name, "get_weather");
@@ -925,7 +927,7 @@ mod tests {
         );
 
         let events = parse_anthropic_native_sse(r#"data: {"type":"ping"}"#).unwrap();
-        assert!(matches!(events.as_slice(), [AnthropicStreamEvent::Ping]));
+        assert_matches!(events.as_slice(), [AnthropicStreamEvent::Ping]);
     }
 
     #[test]
@@ -938,12 +940,12 @@ mod tests {
         .unwrap();
 
         let error = openai_to_anthropic_request(&request).unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             error,
             crate::gateway::error::GatewayError::Bridge(message)
                 if message.contains("n=1")
                     && message.contains('2')
-        ));
+        );
     }
 
     #[test]
@@ -956,10 +958,10 @@ mod tests {
         .unwrap();
 
         let error = openai_to_anthropic_request(&request).unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             error,
             crate::gateway::error::GatewayError::Bridge(message)
                 if message.contains("requires tools")
-        ));
+        );
     }
 }

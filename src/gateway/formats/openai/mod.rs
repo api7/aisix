@@ -68,6 +68,8 @@ impl ChatFormat for OpenAIChatFormat {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     use super::OpenAIChatFormat;
@@ -224,10 +226,10 @@ mod tests {
         let error = OpenAIChatFormat::transform_native_stream_chunk(&provider, "data: {}", &mut ())
             .unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             error,
             GatewayError::NativeNotSupported { provider } if provider == "dummy"
-        ));
+        );
         assert!(OpenAIChatFormat::native_support(&provider).is_none());
     }
 }

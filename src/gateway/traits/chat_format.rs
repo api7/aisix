@@ -145,6 +145,8 @@ pub struct ChatStreamState {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
+    use pretty_assertions::assert_eq;
     use std::borrow::Cow;
 
     use http::HeaderMap;
@@ -282,10 +284,10 @@ mod tests {
         let native = NativeHandler::OpenAIResponses(&provider);
 
         let error = DummyFormat::call_native(&native, &json!({}), false).unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             error,
             GatewayError::NativeNotSupported { provider } if provider == "dummy-native-provider"
-        ));
+        );
     }
 
     #[test]
@@ -294,12 +296,12 @@ mod tests {
         let native = NativeHandler::OpenAIResponses(&provider);
 
         let error = DummyFormat::parse_native_response(&native, json!({})).unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             error,
             GatewayError::Bridge(message)
             if message.contains("parse_native_response called on a non-native format")
                 && message.contains("dummy-native-provider")
-        ));
+        );
     }
 
     #[test]

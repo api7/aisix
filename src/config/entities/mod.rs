@@ -448,6 +448,7 @@ impl<T: DeserializeOwned + Clone + Send + Sync + 'static> EntityStore<T> {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use std::{sync::Mutex, time::Duration};
 
     use anyhow::Result;

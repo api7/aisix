@@ -71,6 +71,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
+    use pretty_assertions::assert_eq;
     use bytes::Bytes;
     use futures::StreamExt;
 
@@ -116,10 +118,10 @@ mod tests {
 
         let mut reader = sse_reader(byte_stream);
 
-        assert!(matches!(
+        assert_matches!(
             reader.next().await.unwrap(),
             Err(GatewayError::Http(_))
-        ));
+        );
         assert!(reader.next().await.is_none());
     }
 }

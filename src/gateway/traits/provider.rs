@@ -319,6 +319,7 @@ pub trait ImageGenTransform: Send + Sync + 'static {}
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use std::borrow::Cow;
 
     use http::HeaderMap;
@@ -483,8 +484,8 @@ mod tests {
         let body = provider.transform_embeddings_request(&request).unwrap();
         match body {
             EmbedRequestBody::Json(value) => {
-                pretty_assertions::assert_eq!(value["model"], "text-embedding-3-large");
-                pretty_assertions::assert_eq!(value["input"], "hello");
+                assert_eq!(value["model"], "text-embedding-3-large");
+                assert_eq!(value["input"], "hello");
             }
         }
 
@@ -501,14 +502,14 @@ mod tests {
             })))
             .unwrap();
 
-        pretty_assertions::assert_eq!(response.data.len(), 1);
+        assert_eq!(response.data.len(), 1);
 
         let usage = match response.usage {
             Some(usage) => usage,
             None => panic!("expected usage in embedding response"),
         };
 
-        pretty_assertions::assert_eq!(usage.total_tokens, 2);
+        assert_eq!(usage.total_tokens, 2);
     }
 
     #[test]

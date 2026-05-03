@@ -56,6 +56,8 @@ impl ProviderCapabilities for OpenAIDef {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     use super::OpenAIDef;
@@ -102,12 +104,12 @@ mod tests {
             .build_auth_headers(&ProviderAuth::None)
             .unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             error,
             crate::gateway::error::GatewayError::Validation(message)
                 if message.contains("openai")
                     && message.contains("ProviderAuth::ApiKey")
-        ));
+        );
     }
 
     #[test]

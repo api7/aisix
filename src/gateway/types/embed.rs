@@ -60,6 +60,8 @@ pub struct EmbeddingResponse {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     use super::{EmbeddingRequest, EmbeddingResponse, OneOrMany};
@@ -76,7 +78,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.model, "text-embedding-3-large");
-        assert!(matches!(request.input, OneOrMany::Many(_)));
+        assert_matches!(request.input, OneOrMany::Many(_));
 
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["dimensions"], 256);
@@ -91,7 +93,7 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(matches!(request.input, OneOrMany::One(_)));
+        assert_matches!(request.input, OneOrMany::One(_));
 
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["input"], "hello");

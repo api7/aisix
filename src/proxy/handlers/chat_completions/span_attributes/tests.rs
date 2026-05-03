@@ -1,3 +1,4 @@
+use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 
 use super::{StreamOutputCollector, request_span_properties, response_span_properties};

@@ -406,6 +406,8 @@ impl ResponsesApiStreamEvent {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     use super::*;
@@ -418,7 +420,7 @@ mod tests {
         });
         let req: ResponsesApiRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.model, "gpt-4.1");
-        assert!(matches!(req.input, ResponsesInput::Text(ref s) if s == "Hello"));
+        assert_matches!(req.input, ResponsesInput::Text(ref s) if s == "Hello");
     }
 
     #[test]
@@ -477,11 +479,11 @@ mod tests {
         assert!(
             matches!(req.conversation, Some(ConversationReference::Descriptor { ref id }) if id == "conv_123")
         );
-        assert!(matches!(
+        assert_matches!(
             req.prompt_cache_retention,
             Some(PromptCacheRetention::InMemory)
-        ));
-        assert!(matches!(req.truncation, Some(Truncation::Auto)));
+        );
+        assert_matches!(req.truncation, Some(Truncation::Auto));
         assert_eq!(req.top_logprobs, Some(5));
 
         let serialized = serde_json::to_value(&req).unwrap();
@@ -527,8 +529,8 @@ mod tests {
         let req: ResponsesApiRequest = serde_json::from_value(json).unwrap();
         let tools = req.tools.unwrap();
         assert_eq!(tools.len(), 3);
-        assert!(matches!(&tools[0], ResponsesTool::Function { name, .. } if name == "get_weather"));
-        assert!(matches!(&tools[1], ResponsesTool::WebSearch { .. }));
+        assert_matches!(&tools[0], ResponsesTool::Function { name, .. } if name == "get_weather");
+        assert_matches!(&tools[1], ResponsesTool::WebSearch { .. });
         assert!(
             matches!(&tools[2], ResponsesTool::FileSearch { vector_store_ids, .. } if vector_store_ids == &["vs_1"])
         );

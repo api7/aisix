@@ -88,6 +88,7 @@ pub type Result<T> = std::result::Result<T, GatewayError>;
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     use super::*;

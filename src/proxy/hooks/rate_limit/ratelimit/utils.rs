@@ -255,6 +255,7 @@ impl IntoResponse for RateLimitResponse {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use std::time::Duration;
 
     use super::*;

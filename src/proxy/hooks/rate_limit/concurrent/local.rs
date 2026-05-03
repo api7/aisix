@@ -111,6 +111,9 @@ impl ConcurrencyLimiter for LocalConcurrencyLimiter {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
+    use pretty_assertions::assert_eq;
+
     use super::*;
 
     #[tokio::test]
@@ -145,13 +148,13 @@ mod tests {
         let _p2 = limiter.try_acquire("k3", 2).await.unwrap();
 
         let err = limiter.try_acquire("k3", 2).await;
-        assert!(matches!(
-            err,
+        assert_matches!(
+            err.map(|_| ()),
             Err(ConcurrencyError::Exceeded {
                 limit: 2,
                 current: 2,
             })
-        ));
+        );
     }
 
     #[tokio::test]
@@ -186,7 +189,7 @@ mod tests {
 
         // "Hot reload" — decrease limit to 1; existing permits stay, new ones rejected
         let err = limiter.try_acquire("hrd", 1).await;
-        assert!(matches!(err, Err(ConcurrencyError::Exceeded { .. })));
+        assert_matches!(err.map(|_| ()), Err(ConcurrencyError::Exceeded { .. }));
 
         // After existing permits drop, should work again with new limit
         drop(_p1);

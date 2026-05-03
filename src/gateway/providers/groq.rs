@@ -78,6 +78,7 @@ impl ProviderCapabilities for Groq {}
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     use super::Groq;
@@ -90,10 +91,10 @@ mod tests {
     fn provider_metadata_and_url_are_correct() {
         let provider = Groq;
 
-        pretty_assertions::assert_eq!(provider.name(), "groq");
-        pretty_assertions::assert_eq!(provider.default_base_url(), "https://api.groq.com/openai");
+        assert_eq!(provider.name(), "groq");
+        assert_eq!(provider.default_base_url(), "https://api.groq.com/openai");
 
-        pretty_assertions::assert_eq!(
+        assert_eq!(
             provider.build_url(provider.default_base_url(), "ignored"),
             "https://api.groq.com/openai/v1/chat/completions"
         );

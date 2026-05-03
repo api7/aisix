@@ -25,6 +25,8 @@ provider!(Mistral {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use super::Mistral;
     use crate::gateway::traits::{ChatTransform, ProviderMeta};
 
@@ -32,14 +34,14 @@ mod tests {
     fn provider_macro_expands_correctly() {
         let provider = Mistral;
 
-        pretty_assertions::assert_eq!(provider.name(), "mistral");
-        pretty_assertions::assert_eq!(provider.default_base_url(), "https://api.mistral.ai");
+        assert_eq!(provider.name(), "mistral");
+        assert_eq!(provider.default_base_url(), "https://api.mistral.ai");
 
-        pretty_assertions::assert_eq!(
+        assert_eq!(
             provider.build_url(provider.default_base_url(), "ignored"),
             "https://api.mistral.ai/v1/chat/completions"
         );
 
-        pretty_assertions::assert_eq!(provider.default_quirks().tool_args_may_be_object, true);
+        assert!(provider.default_quirks().tool_args_may_be_object);
     }
 }
