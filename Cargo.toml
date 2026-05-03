@@ -46,9 +46,17 @@ arc-swap = "1"
 anyhow = "1"
 fastrace = { version = "0.7.16", features = ["enable"] }
 fastrace-axum = "0.2.0"
-fastrace-opentelemetry = "0.16.0"
+fastrace-opentelemetry = "0.17.0"
 opentelemetry = "0.31.0"
-opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic"] }
+opentelemetry-otlp = { version = "0.31.0", default-features = false, features = [
+  "http-proto",
+  "internal-logs",
+  "logs",
+  "metrics",
+  "reqwest-client",
+  "trace",
+  "grpc-tonic",
+] }
 opentelemetry_sdk = { version = "0.31.0", features = [
   "rt-tokio",
   "experimental_async_runtime",

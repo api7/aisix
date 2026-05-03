@@ -16,7 +16,7 @@ use opentelemetry_sdk::{
     Resource,
     metrics::{SdkMeterProvider, periodic_reader_with_async_runtime::PeriodicReader},
 };
-use tokio::{sync::oneshot, task::JoinHandle};
+use tokio::{runtime::Handle, sync::oneshot, task::JoinHandle};
 
 use crate::utils;
 
@@ -59,6 +59,7 @@ pub fn init_observability_trace(
     span_exporter: Option<SpanExporter>,
     config: Option<FastraceConfig>,
 ) -> Result<(oneshot::Sender<()>, JoinHandle<()>)> {
+    let handle = Handle::current();
     let reporter = OpenTelemetryReporter::new(
         match span_exporter {
             Some(exporter) => exporter,
@@ -74,7 +75,8 @@ pub fn init_observability_trace(
         InstrumentationScope::builder(INSTRUMENTATION_NAME)
             .with_version(env!("CARGO_PKG_VERSION"))
             .build(),
-    );
+    )
+    .with_block_on(move |fut| handle.block_on(fut));
     fastrace::set_reporter(reporter, config.unwrap_or_default());
 
     Ok(shutdown_handler(|| async move { fastrace::flush() }))
