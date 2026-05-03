@@ -149,6 +149,7 @@
       "providers": {
         "openai": "OpenAI",
         "openrouter": "OpenRouter",
+        "cohere": "Cohere",
         "groq": "Groq",
         "xai": "xAI",
         "mistral": "Mistral",
@@ -221,6 +222,7 @@
       "types": {
         "openai": "OpenAI",
         "openrouter": "OpenRouter",
+        "cohere": "Cohere",
         "groq": "Groq",
         "xai": "xAI",
         "azure": "Azure OpenAI",

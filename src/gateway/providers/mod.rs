@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod azure;
 pub mod bedrock;
+pub mod cohere;
 pub mod deepseek;
 pub mod gemini;
 pub mod groq;
@@ -13,6 +14,7 @@ pub mod xai;
 pub use anthropic::AnthropicDef;
 pub use azure::AzureDef;
 pub use bedrock::BedrockDef;
+pub use cohere::Cohere;
 pub use deepseek::DeepSeek;
 pub use gemini::GoogleDef;
 pub use groq::Groq;
@@ -23,12 +25,13 @@ pub use xai::Xai;
 
 pub mod identifiers {
     use super::{
-        anthropic, azure, bedrock, deepseek, gemini, groq, mistral, openai, openrouter, xai,
+        anthropic, azure, bedrock, cohere, deepseek, gemini, groq, mistral, openai, openrouter, xai,
     };
 
     pub const ANTHROPIC: &str = anthropic::IDENTIFIER;
     pub const AZURE: &str = azure::IDENTIFIER;
     pub const BEDROCK: &str = bedrock::IDENTIFIER;
+    pub const COHERE: &str = cohere::IDENTIFIER;
     pub const DEEPSEEK: &str = deepseek::IDENTIFIER;
     pub const GEMINI: &str = gemini::IDENTIFIER;
     pub const GROQ: &str = groq::IDENTIFIER;
@@ -41,9 +44,10 @@ pub mod identifiers {
 pub mod configs {
     pub use super::{
         anthropic::AnthropicProviderConfig, azure::AzureProviderConfig,
-        bedrock::BedrockProviderConfig, deepseek::DeepSeekProviderConfig,
-        gemini::GeminiProviderConfig, groq::GroqProviderConfig, mistral::MistralProviderConfig,
-        openai::OpenAIProviderConfig, openrouter::OpenRouterProviderConfig, xai::XaiProviderConfig,
+        bedrock::BedrockProviderConfig, cohere::CohereProviderConfig,
+        deepseek::DeepSeekProviderConfig, gemini::GeminiProviderConfig, groq::GroqProviderConfig,
+        mistral::MistralProviderConfig, openai::OpenAIProviderConfig,
+        openrouter::OpenRouterProviderConfig, xai::XaiProviderConfig,
     };
 }
 
@@ -54,6 +58,7 @@ pub fn default_provider_registry() -> Result<ProviderRegistry> {
         .register(AnthropicDef)?
         .register(AzureDef)?
         .register(BedrockDef)?
+        .register(Cohere)?
         .register(DeepSeek)?
         .register(GoogleDef)?
         .register(Groq)?
@@ -78,6 +83,7 @@ mod tests {
         assert_eq!(registry.get("azure").unwrap().name(), "azure");
         assert_eq!(registry.get("anthropic").unwrap().name(), "anthropic");
         assert_eq!(registry.get("bedrock").unwrap().name(), "bedrock");
+        assert_eq!(registry.get("cohere").unwrap().name(), "cohere");
         assert_eq!(registry.get("gemini").unwrap().name(), "gemini");
         assert_eq!(registry.get("groq").unwrap().name(), "groq");
         assert_eq!(registry.get("mistral").unwrap().name(), "mistral");

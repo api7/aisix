@@ -9,6 +9,7 @@
         "anthropic",
         "azure",
         "bedrock",
+        "cohere",
         "deepseek",
         "gemini",
         "groq",
@@ -51,6 +52,7 @@
           "type": {
             "enum": [
               "anthropic",
+              "cohere",
               "deepseek",
               "gemini",
               "groq",
