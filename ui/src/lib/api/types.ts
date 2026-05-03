@@ -40,6 +40,7 @@ export interface Model {
 export const PROVIDER_TYPE_VARIANTS = [
   'openai',
   'openrouter',
+  'groq',
   'azure',
   'anthropic',
   'gemini',
@@ -97,6 +98,11 @@ export type Provider =
   | {
       name: string;
       type: 'openrouter';
+      config: ApiBaseProviderConfig;
+    }
+  | {
+      name: string;
+      type: 'groq';
       config: ApiBaseProviderConfig;
     }
   | {

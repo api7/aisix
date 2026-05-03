@@ -11,6 +11,7 @@
         "bedrock",
         "deepseek",
         "gemini",
+        "groq",
         "openai",
         "openrouter"
       ]
@@ -46,7 +47,14 @@
       "if": {
         "properties": {
           "type": {
-            "enum": ["anthropic", "deepseek", "gemini", "openai", "openrouter"]
+            "enum": [
+              "anthropic",
+              "deepseek",
+              "gemini",
+              "groq",
+              "openai",
+              "openrouter"
+            ]
           }
         },
         "required": ["type"]

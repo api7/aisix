@@ -32,6 +32,8 @@ pub enum ProviderConfig {
     DeepSeek(configs::DeepSeekProviderConfig),
     #[serde(rename = "gemini")]
     Gemini(configs::GeminiProviderConfig),
+    #[serde(rename = "groq")]
+    Groq(configs::GroqProviderConfig),
     #[serde(rename = "openai")]
     OpenAI(configs::OpenAIProviderConfig),
     #[serde(rename = "openrouter")]
@@ -46,6 +48,7 @@ impl ProviderConfig {
             Self::Bedrock(_) => identifiers::BEDROCK,
             Self::DeepSeek(_) => identifiers::DEEPSEEK,
             Self::Gemini(_) => identifiers::GEMINI,
+            Self::Groq(_) => identifiers::GROQ,
             Self::OpenAI(_) => identifiers::OPENAI,
             Self::OpenRouter(_) => identifiers::OPENROUTER,
         }
@@ -141,6 +144,11 @@ mod tests {
     #[case::openrouter_ok(json!({
         "name": "openrouter-primary",
         "type": "openrouter",
+        "config": { "api_key": "test_key" }
+    }), true, None)]
+    #[case::groq_ok(json!({
+        "name": "groq-primary",
+        "type": "groq",
         "config": { "api_key": "test_key" }
     }), true, None)]
     #[case::missing_type(json!({

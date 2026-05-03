@@ -49,6 +49,10 @@ fn provider_auth_and_base_url(config: &ProviderConfig) -> Result<(ProviderAuth, 
             ProviderAuth::ApiKey(config.api_key.clone()),
             parse_base_url(config.api_base.as_deref())?,
         ),
+        ProviderConfig::Groq(config) => (
+            ProviderAuth::ApiKey(config.api_key.clone()),
+            parse_base_url(config.api_base.as_deref())?,
+        ),
         ProviderConfig::OpenAI(config) => (
             ProviderAuth::ApiKey(config.api_key.clone()),
             parse_base_url(config.api_base.as_deref())?,
@@ -143,7 +147,8 @@ mod tests {
     use crate::{
         config::entities::providers::ProviderConfig,
         gateway::providers::configs::{
-            AzureProviderConfig, BedrockProviderConfig, OpenRouterProviderConfig,
+            AzureProviderConfig, BedrockProviderConfig, GroqProviderConfig,
+            OpenRouterProviderConfig,
         },
     };
 
@@ -199,6 +204,22 @@ mod tests {
         assert_eq!(
             base_url_override.as_ref().map(Url::as_str),
             Some("https://openrouter.ai/api/v1")
+        );
+    }
+
+    #[test]
+    fn provider_auth_and_base_url_returns_groq_api_key_and_optional_base_url() {
+        let config = ProviderConfig::Groq(GroqProviderConfig {
+            api_key: "groq-key".into(),
+            api_base: Some("https://api.groq.com/openai".into()),
+        });
+
+        let (auth, base_url_override) = provider_auth_and_base_url(&config).unwrap();
+
+        assert_eq!(auth.api_key_for("groq").unwrap(), "groq-key");
+        assert_eq!(
+            base_url_override.as_ref().map(Url::as_str),
+            Some("https://api.groq.com/openai")
         );
     }
 
