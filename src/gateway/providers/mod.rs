@@ -3,6 +3,7 @@ pub mod azure;
 pub mod bedrock;
 pub mod cohere;
 pub mod deepseek;
+pub mod fireworks;
 pub mod gemini;
 pub mod groq;
 pub mod macros;
@@ -16,6 +17,7 @@ pub use azure::AzureDef;
 pub use bedrock::BedrockDef;
 pub use cohere::Cohere;
 pub use deepseek::DeepSeek;
+pub use fireworks::FireworksAi;
 pub use gemini::GoogleDef;
 pub use groq::Groq;
 pub use mistral::Mistral;
@@ -25,7 +27,8 @@ pub use xai::Xai;
 
 pub mod identifiers {
     use super::{
-        anthropic, azure, bedrock, cohere, deepseek, gemini, groq, mistral, openai, openrouter, xai,
+        anthropic, azure, bedrock, cohere, deepseek, fireworks, gemini, groq, mistral, openai,
+        openrouter, xai,
     };
 
     pub const ANTHROPIC: &str = anthropic::IDENTIFIER;
@@ -33,6 +36,7 @@ pub mod identifiers {
     pub const BEDROCK: &str = bedrock::IDENTIFIER;
     pub const COHERE: &str = cohere::IDENTIFIER;
     pub const DEEPSEEK: &str = deepseek::IDENTIFIER;
+    pub const FIREWORKS_AI: &str = fireworks::IDENTIFIER;
     pub const GEMINI: &str = gemini::IDENTIFIER;
     pub const GROQ: &str = groq::IDENTIFIER;
     pub const MISTRAL: &str = mistral::IDENTIFIER;
@@ -45,9 +49,9 @@ pub mod configs {
     pub use super::{
         anthropic::AnthropicProviderConfig, azure::AzureProviderConfig,
         bedrock::BedrockProviderConfig, cohere::CohereProviderConfig,
-        deepseek::DeepSeekProviderConfig, gemini::GeminiProviderConfig, groq::GroqProviderConfig,
-        mistral::MistralProviderConfig, openai::OpenAIProviderConfig,
-        openrouter::OpenRouterProviderConfig, xai::XaiProviderConfig,
+        deepseek::DeepSeekProviderConfig, fireworks::FireworksAiProviderConfig,
+        gemini::GeminiProviderConfig, groq::GroqProviderConfig, mistral::MistralProviderConfig,
+        openai::OpenAIProviderConfig, openrouter::OpenRouterProviderConfig, xai::XaiProviderConfig,
     };
 }
 
@@ -60,6 +64,7 @@ pub fn default_provider_registry() -> Result<ProviderRegistry> {
         .register(BedrockDef)?
         .register(Cohere)?
         .register(DeepSeek)?
+        .register(FireworksAi)?
         .register(GoogleDef)?
         .register(Groq)?
         .register(Mistral)?
@@ -84,6 +89,7 @@ mod tests {
         assert_eq!(registry.get("anthropic").unwrap().name(), "anthropic");
         assert_eq!(registry.get("bedrock").unwrap().name(), "bedrock");
         assert_eq!(registry.get("cohere").unwrap().name(), "cohere");
+        assert_eq!(registry.get("fireworks-ai").unwrap().name(), "fireworks-ai");
         assert_eq!(registry.get("gemini").unwrap().name(), "gemini");
         assert_eq!(registry.get("groq").unwrap().name(), "groq");
         assert_eq!(registry.get("mistral").unwrap().name(), "mistral");

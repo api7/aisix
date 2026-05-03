@@ -32,6 +32,8 @@ pub enum ProviderConfig {
     Cohere(configs::CohereProviderConfig),
     #[serde(rename = "deepseek")]
     DeepSeek(configs::DeepSeekProviderConfig),
+    #[serde(rename = "fireworks-ai")]
+    FireworksAi(configs::FireworksAiProviderConfig),
     #[serde(rename = "gemini")]
     Gemini(configs::GeminiProviderConfig),
     #[serde(rename = "groq")]
@@ -54,6 +56,7 @@ impl ProviderConfig {
             Self::Bedrock(_) => identifiers::BEDROCK,
             Self::Cohere(_) => identifiers::COHERE,
             Self::DeepSeek(_) => identifiers::DEEPSEEK,
+            Self::FireworksAi(_) => identifiers::FIREWORKS_AI,
             Self::Gemini(_) => identifiers::GEMINI,
             Self::Groq(_) => identifiers::GROQ,
             Self::Xai(_) => identifiers::XAI,
@@ -155,6 +158,11 @@ mod tests {
     #[case::cohere_ok(json!({
         "name": "cohere-primary",
         "type": "cohere",
+        "config": { "api_key": "test_key" }
+    }), true, None)]
+    #[case::fireworks_ai_ok(json!({
+        "name": "fireworks-primary",
+        "type": "fireworks-ai",
         "config": { "api_key": "test_key" }
     }), true, None)]
     #[case::openrouter_ok(json!({

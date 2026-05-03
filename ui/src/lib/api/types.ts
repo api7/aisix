@@ -41,6 +41,7 @@ export const PROVIDER_TYPE_VARIANTS = [
   'openai',
   'openrouter',
   'cohere',
+  'fireworks-ai',
   'groq',
   'xai',
   'mistral',
@@ -106,6 +107,11 @@ export type Provider =
   | {
       name: string;
       type: 'cohere';
+      config: ApiBaseProviderConfig;
+    }
+  | {
+      name: string;
+      type: 'fireworks-ai';
       config: ApiBaseProviderConfig;
     }
   | {
