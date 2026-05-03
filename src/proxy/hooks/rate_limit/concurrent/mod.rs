@@ -82,6 +82,7 @@ pub fn get_concurrency_limiter() -> Arc<dyn ConcurrencyLimiter> {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use super::*;
 
     #[test]

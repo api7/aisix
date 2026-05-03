@@ -23,6 +23,7 @@ provider!(OpenRouter {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use super::OpenRouter;
     use crate::gateway::traits::ProviderMeta;
 
@@ -30,11 +31,11 @@ mod tests {
     fn provider_macro_expands_correctly() {
         let provider = OpenRouter;
 
-        pretty_assertions::assert_eq!(provider.name(), "openrouter");
-        pretty_assertions::assert_eq!(provider.default_base_url(), "https://openrouter.ai/api/v1");
-        pretty_assertions::assert_eq!(provider.chat_endpoint_path("ignored"), "/chat/completions");
+        assert_eq!(provider.name(), "openrouter");
+        assert_eq!(provider.default_base_url(), "https://openrouter.ai/api/v1");
+        assert_eq!(provider.chat_endpoint_path("ignored"), "/chat/completions");
 
-        pretty_assertions::assert_eq!(
+        assert_eq!(
             provider.build_url(provider.default_base_url(), "ignored"),
             "https://openrouter.ai/api/v1/chat/completions"
         );

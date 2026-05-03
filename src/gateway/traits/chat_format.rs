@@ -145,6 +145,7 @@ pub struct ChatStreamState {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use std::borrow::Cow;
 
     use http::HeaderMap;

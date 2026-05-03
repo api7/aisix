@@ -145,6 +145,7 @@ fn default_bedrock_base_url(region: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use reqwest::Url;
 
     use super::provider_auth_and_base_url;

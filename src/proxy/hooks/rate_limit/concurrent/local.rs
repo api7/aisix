@@ -111,6 +111,7 @@ impl ConcurrencyLimiter for LocalConcurrencyLimiter {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use super::*;
 
     #[tokio::test]

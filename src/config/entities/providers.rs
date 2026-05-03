@@ -112,6 +112,7 @@ impl ProvidersStore {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     use super::{SCHEMA, SCHEMA_VALIDATOR, format_evaluation_error};

@@ -1000,6 +1000,7 @@ fn openai_finish_reason_to_anthropic_stream(finish_reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     use super::AnthropicMessagesFormat;

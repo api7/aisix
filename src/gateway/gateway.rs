@@ -402,6 +402,7 @@ async fn provider_error(response: reqwest::Response, provider: &str) -> GatewayE
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use std::{
         borrow::Cow,
         sync::{

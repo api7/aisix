@@ -60,6 +60,7 @@ pub fn default_provider_registry() -> Result<ProviderRegistry> {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use super::default_provider_registry;
 
     #[test]

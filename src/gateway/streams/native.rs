@@ -119,6 +119,7 @@ impl<F: ChatFormat> PinnedDrop for NativeStream<F> {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use std::sync::Arc;
 
     use futures::StreamExt;

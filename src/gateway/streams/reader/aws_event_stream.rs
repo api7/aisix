@@ -180,6 +180,7 @@ fn build_aws_event_stream_exception_message(exception_type: &str, payload: &[u8]
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use aws_smithy_eventstream::frame::write_message_to;
     use aws_smithy_types::event_stream::{Header, HeaderValue, Message};
     use bytes::Bytes;

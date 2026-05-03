@@ -63,6 +63,7 @@ impl RateLimiter for LocalRateLimiter {
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
     use http::HeaderMap;
 
     use super::*;
