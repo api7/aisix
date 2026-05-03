@@ -12,6 +12,7 @@ pub mod moonshot;
 pub mod openai;
 pub mod openrouter;
 pub mod xai;
+pub mod zhipuai;
 
 pub use anthropic::AnthropicDef;
 pub use azure::AzureDef;
@@ -26,11 +27,12 @@ pub use moonshot::{MoonshotAi, MoonshotAiCn};
 pub use openai::OpenAIDef;
 pub use openrouter::OpenRouter;
 pub use xai::Xai;
+pub use zhipuai::ZhipuAi;
 
 pub mod identifiers {
     use super::{
         anthropic, azure, bedrock, cohere, deepseek, fireworks, gemini, groq, mistral, moonshot,
-        openai, openrouter, xai,
+        openai, openrouter, xai, zhipuai,
     };
 
     pub const ANTHROPIC: &str = anthropic::IDENTIFIER;
@@ -47,6 +49,7 @@ pub mod identifiers {
     pub const OPENAI: &str = openai::IDENTIFIER;
     pub const OPENROUTER: &str = openrouter::IDENTIFIER;
     pub const XAI: &str = xai::IDENTIFIER;
+    pub const ZHIPUAI: &str = zhipuai::IDENTIFIER;
 }
 
 pub mod configs {
@@ -64,6 +67,7 @@ pub mod configs {
         openai::OpenAIProviderConfig,
         openrouter::OpenRouterProviderConfig,
         xai::XaiProviderConfig,
+        zhipuai::ZhipuAiProviderConfig,
     };
 }
 
@@ -84,7 +88,8 @@ pub fn default_provider_registry() -> Result<ProviderRegistry> {
         .register(MoonshotAiCn)?
         .register(OpenAIDef)?
         .register(OpenRouter)?
-        .register(Xai)?;
+        .register(Xai)?
+        .register(ZhipuAi)?;
     Ok(builder.build())
 }
 
@@ -115,6 +120,7 @@ mod tests {
         assert_eq!(registry.get("deepseek").unwrap().name(), "deepseek");
         assert_eq!(registry.get("openrouter").unwrap().name(), "openrouter");
         assert_eq!(registry.get("xai").unwrap().name(), "xai");
+        assert_eq!(registry.get("zhipuai").unwrap().name(), "zhipuai");
         assert!(registry.get("missing").is_none());
     }
 }

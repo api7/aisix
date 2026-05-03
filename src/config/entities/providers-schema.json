@@ -19,7 +19,8 @@
         "moonshotai",
         "moonshotai-cn",
         "openai",
-        "openrouter"
+        "openrouter",
+        "zhipuai"
       ]
     },
     "config": { "type": "object" }
@@ -65,7 +66,8 @@
               "moonshotai",
               "moonshotai-cn",
               "openai",
-              "openrouter"
+              "openrouter",
+              "zhipuai"
             ]
           }
         },

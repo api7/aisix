@@ -85,6 +85,10 @@ fn provider_auth_and_base_url(config: &ProviderConfig) -> Result<(ProviderAuth, 
             ProviderAuth::ApiKey(config.api_key.clone()),
             parse_base_url(config.api_base.as_deref())?,
         ),
+        ProviderConfig::ZhipuAi(config) => (
+            ProviderAuth::ApiKey(config.api_key.clone()),
+            parse_base_url(config.api_base.as_deref())?,
+        ),
     };
 
     Ok((auth, base_url_override))
@@ -176,7 +180,7 @@ mod tests {
             AzureProviderConfig, BedrockProviderConfig, CohereProviderConfig,
             FireworksAiProviderConfig, GroqProviderConfig, MistralProviderConfig,
             MoonshotAiCnProviderConfig, MoonshotAiProviderConfig, OpenRouterProviderConfig,
-            XaiProviderConfig,
+            XaiProviderConfig, ZhipuAiProviderConfig,
         },
     };
 
@@ -347,6 +351,22 @@ mod tests {
         assert_eq!(
             base_url_override.as_ref().map(Url::as_str),
             Some("https://api.x.ai/v1")
+        );
+    }
+
+    #[test]
+    fn provider_auth_and_base_url_returns_zhipuai_api_key_and_optional_base_url() {
+        let config = ProviderConfig::ZhipuAi(ZhipuAiProviderConfig {
+            api_key: "zhipu-key".into(),
+            api_base: Some("https://open.bigmodel.cn/api/paas/v4".into()),
+        });
+
+        let (auth, base_url_override) = provider_auth_and_base_url(&config).unwrap();
+
+        assert_eq!(auth.api_key_for("zhipuai").unwrap(), "zhipu-key");
+        assert_eq!(
+            base_url_override.as_ref().map(Url::as_str),
+            Some("https://open.bigmodel.cn/api/paas/v4")
         );
     }
 

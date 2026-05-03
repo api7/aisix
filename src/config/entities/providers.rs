@@ -50,6 +50,8 @@ pub enum ProviderConfig {
     OpenAI(configs::OpenAIProviderConfig),
     #[serde(rename = "openrouter")]
     OpenRouter(configs::OpenRouterProviderConfig),
+    #[serde(rename = "zhipuai")]
+    ZhipuAi(configs::ZhipuAiProviderConfig),
 }
 
 impl ProviderConfig {
@@ -69,6 +71,7 @@ impl ProviderConfig {
             Self::MoonshotAiCn(_) => identifiers::MOONSHOT_AI_CN,
             Self::OpenAI(_) => identifiers::OPENAI,
             Self::OpenRouter(_) => identifiers::OPENROUTER,
+            Self::ZhipuAi(_) => identifiers::ZHIPUAI,
         }
     }
 }
@@ -199,6 +202,11 @@ mod tests {
     #[case::moonshotai_cn_ok(json!({
         "name": "moonshot-cn-primary",
         "type": "moonshotai-cn",
+        "config": { "api_key": "test_key" }
+    }), true, None)]
+    #[case::zhipuai_ok(json!({
+        "name": "zhipu-primary",
+        "type": "zhipuai",
         "config": { "api_key": "test_key" }
     }), true, None)]
     #[case::missing_type(json!({
