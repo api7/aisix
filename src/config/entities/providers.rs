@@ -34,6 +34,8 @@ pub enum ProviderConfig {
     Gemini(configs::GeminiProviderConfig),
     #[serde(rename = "groq")]
     Groq(configs::GroqProviderConfig),
+    #[serde(rename = "mistral")]
+    Mistral(configs::MistralProviderConfig),
     #[serde(rename = "openai")]
     OpenAI(configs::OpenAIProviderConfig),
     #[serde(rename = "openrouter")]
@@ -49,6 +51,7 @@ impl ProviderConfig {
             Self::DeepSeek(_) => identifiers::DEEPSEEK,
             Self::Gemini(_) => identifiers::GEMINI,
             Self::Groq(_) => identifiers::GROQ,
+            Self::Mistral(_) => identifiers::MISTRAL,
             Self::OpenAI(_) => identifiers::OPENAI,
             Self::OpenRouter(_) => identifiers::OPENROUTER,
         }
@@ -149,6 +152,11 @@ mod tests {
     #[case::groq_ok(json!({
         "name": "groq-primary",
         "type": "groq",
+        "config": { "api_key": "test_key" }
+    }), true, None)]
+    #[case::mistral_ok(json!({
+        "name": "mistral-primary",
+        "type": "mistral",
         "config": { "api_key": "test_key" }
     }), true, None)]
     #[case::missing_type(json!({

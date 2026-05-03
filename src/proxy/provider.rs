@@ -53,6 +53,10 @@ fn provider_auth_and_base_url(config: &ProviderConfig) -> Result<(ProviderAuth, 
             ProviderAuth::ApiKey(config.api_key.clone()),
             parse_base_url(config.api_base.as_deref())?,
         ),
+        ProviderConfig::Mistral(config) => (
+            ProviderAuth::ApiKey(config.api_key.clone()),
+            parse_base_url(config.api_base.as_deref())?,
+        ),
         ProviderConfig::OpenAI(config) => (
             ProviderAuth::ApiKey(config.api_key.clone()),
             parse_base_url(config.api_base.as_deref())?,
@@ -147,7 +151,7 @@ mod tests {
     use crate::{
         config::entities::providers::ProviderConfig,
         gateway::providers::configs::{
-            AzureProviderConfig, BedrockProviderConfig, GroqProviderConfig,
+            AzureProviderConfig, BedrockProviderConfig, GroqProviderConfig, MistralProviderConfig,
             OpenRouterProviderConfig,
         },
     };
@@ -220,6 +224,22 @@ mod tests {
         assert_eq!(
             base_url_override.as_ref().map(Url::as_str),
             Some("https://api.groq.com/openai")
+        );
+    }
+
+    #[test]
+    fn provider_auth_and_base_url_returns_mistral_api_key_and_optional_base_url() {
+        let config = ProviderConfig::Mistral(MistralProviderConfig {
+            api_key: "mistral-key".into(),
+            api_base: Some("https://api.mistral.ai".into()),
+        });
+
+        let (auth, base_url_override) = provider_auth_and_base_url(&config).unwrap();
+
+        assert_eq!(auth.api_key_for("mistral").unwrap(), "mistral-key");
+        assert_eq!(
+            base_url_override.as_ref().map(Url::as_str),
+            Some("https://api.mistral.ai/")
         );
     }
 

@@ -5,6 +5,7 @@ pub mod deepseek;
 pub mod gemini;
 pub mod groq;
 pub mod macros;
+pub mod mistral;
 pub mod openai;
 pub mod openrouter;
 
@@ -14,11 +15,12 @@ pub use bedrock::BedrockDef;
 pub use deepseek::DeepSeek;
 pub use gemini::GoogleDef;
 pub use groq::Groq;
+pub use mistral::Mistral;
 pub use openai::OpenAIDef;
 pub use openrouter::OpenRouter;
 
 pub mod identifiers {
-    use super::{anthropic, azure, bedrock, deepseek, gemini, groq, openai, openrouter};
+    use super::{anthropic, azure, bedrock, deepseek, gemini, groq, mistral, openai, openrouter};
 
     pub const ANTHROPIC: &str = anthropic::IDENTIFIER;
     pub const AZURE: &str = azure::IDENTIFIER;
@@ -26,6 +28,7 @@ pub mod identifiers {
     pub const DEEPSEEK: &str = deepseek::IDENTIFIER;
     pub const GEMINI: &str = gemini::IDENTIFIER;
     pub const GROQ: &str = groq::IDENTIFIER;
+    pub const MISTRAL: &str = mistral::IDENTIFIER;
     pub const OPENAI: &str = openai::IDENTIFIER;
     pub const OPENROUTER: &str = openrouter::IDENTIFIER;
 }
@@ -34,8 +37,8 @@ pub mod configs {
     pub use super::{
         anthropic::AnthropicProviderConfig, azure::AzureProviderConfig,
         bedrock::BedrockProviderConfig, deepseek::DeepSeekProviderConfig,
-        gemini::GeminiProviderConfig, groq::GroqProviderConfig, openai::OpenAIProviderConfig,
-        openrouter::OpenRouterProviderConfig,
+        gemini::GeminiProviderConfig, groq::GroqProviderConfig, mistral::MistralProviderConfig,
+        openai::OpenAIProviderConfig, openrouter::OpenRouterProviderConfig,
     };
 }
 
@@ -49,6 +52,7 @@ pub fn default_provider_registry() -> Result<ProviderRegistry> {
         .register(DeepSeek)?
         .register(GoogleDef)?
         .register(Groq)?
+        .register(Mistral)?
         .register(OpenAIDef)?
         .register(OpenRouter)?;
     Ok(builder.build())
@@ -68,6 +72,7 @@ mod tests {
         assert_eq!(registry.get("bedrock").unwrap().name(), "bedrock");
         assert_eq!(registry.get("gemini").unwrap().name(), "gemini");
         assert_eq!(registry.get("groq").unwrap().name(), "groq");
+        assert_eq!(registry.get("mistral").unwrap().name(), "mistral");
         assert_eq!(registry.get("deepseek").unwrap().name(), "deepseek");
         assert_eq!(registry.get("openrouter").unwrap().name(), "openrouter");
         assert!(registry.get("missing").is_none());

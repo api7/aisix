@@ -41,6 +41,7 @@ export const PROVIDER_TYPE_VARIANTS = [
   'openai',
   'openrouter',
   'groq',
+  'mistral',
   'azure',
   'anthropic',
   'gemini',
@@ -103,6 +104,11 @@ export type Provider =
   | {
       name: string;
       type: 'groq';
+      config: ApiBaseProviderConfig;
+    }
+  | {
+      name: string;
+      type: 'mistral';
       config: ApiBaseProviderConfig;
     }
   | {
