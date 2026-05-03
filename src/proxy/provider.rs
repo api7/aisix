@@ -53,6 +53,10 @@ fn provider_auth_and_base_url(config: &ProviderConfig) -> Result<(ProviderAuth, 
             ProviderAuth::ApiKey(config.api_key.clone()),
             parse_base_url(config.api_base.as_deref())?,
         ),
+        ProviderConfig::Xai(config) => (
+            ProviderAuth::ApiKey(config.api_key.clone()),
+            parse_base_url(config.api_base.as_deref())?,
+        ),
         ProviderConfig::Mistral(config) => (
             ProviderAuth::ApiKey(config.api_key.clone()),
             parse_base_url(config.api_base.as_deref())?,
@@ -154,7 +158,7 @@ mod tests {
         config::entities::providers::ProviderConfig,
         gateway::providers::configs::{
             AzureProviderConfig, BedrockProviderConfig, GroqProviderConfig, MistralProviderConfig,
-            OpenRouterProviderConfig,
+            OpenRouterProviderConfig, XaiProviderConfig,
         },
     };
 
@@ -242,6 +246,22 @@ mod tests {
         assert_eq!(
             base_url_override.as_ref().map(Url::as_str),
             Some("https://api.mistral.ai/")
+        );
+    }
+
+    #[test]
+    fn provider_auth_and_base_url_returns_xai_api_key_and_optional_base_url() {
+        let config = ProviderConfig::Xai(XaiProviderConfig {
+            api_key: "xai-key".into(),
+            api_base: Some("https://api.x.ai/v1".into()),
+        });
+
+        let (auth, base_url_override) = provider_auth_and_base_url(&config).unwrap();
+
+        assert_eq!(auth.api_key_for("xai").unwrap(), "xai-key");
+        assert_eq!(
+            base_url_override.as_ref().map(Url::as_str),
+            Some("https://api.x.ai/v1")
         );
     }
 

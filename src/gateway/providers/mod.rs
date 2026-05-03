@@ -8,6 +8,7 @@ pub mod macros;
 pub mod mistral;
 pub mod openai;
 pub mod openrouter;
+pub mod xai;
 
 pub use anthropic::AnthropicDef;
 pub use azure::AzureDef;
@@ -18,9 +19,12 @@ pub use groq::Groq;
 pub use mistral::Mistral;
 pub use openai::OpenAIDef;
 pub use openrouter::OpenRouter;
+pub use xai::Xai;
 
 pub mod identifiers {
-    use super::{anthropic, azure, bedrock, deepseek, gemini, groq, mistral, openai, openrouter};
+    use super::{
+        anthropic, azure, bedrock, deepseek, gemini, groq, mistral, openai, openrouter, xai,
+    };
 
     pub const ANTHROPIC: &str = anthropic::IDENTIFIER;
     pub const AZURE: &str = azure::IDENTIFIER;
@@ -31,6 +35,7 @@ pub mod identifiers {
     pub const MISTRAL: &str = mistral::IDENTIFIER;
     pub const OPENAI: &str = openai::IDENTIFIER;
     pub const OPENROUTER: &str = openrouter::IDENTIFIER;
+    pub const XAI: &str = xai::IDENTIFIER;
 }
 
 pub mod configs {
@@ -38,7 +43,7 @@ pub mod configs {
         anthropic::AnthropicProviderConfig, azure::AzureProviderConfig,
         bedrock::BedrockProviderConfig, deepseek::DeepSeekProviderConfig,
         gemini::GeminiProviderConfig, groq::GroqProviderConfig, mistral::MistralProviderConfig,
-        openai::OpenAIProviderConfig, openrouter::OpenRouterProviderConfig,
+        openai::OpenAIProviderConfig, openrouter::OpenRouterProviderConfig, xai::XaiProviderConfig,
     };
 }
 
@@ -54,13 +59,15 @@ pub fn default_provider_registry() -> Result<ProviderRegistry> {
         .register(Groq)?
         .register(Mistral)?
         .register(OpenAIDef)?
-        .register(OpenRouter)?;
+        .register(OpenRouter)?
+        .register(Xai)?;
     Ok(builder.build())
 }
 
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+
     use super::default_provider_registry;
 
     #[test]
@@ -76,6 +83,7 @@ mod tests {
         assert_eq!(registry.get("mistral").unwrap().name(), "mistral");
         assert_eq!(registry.get("deepseek").unwrap().name(), "deepseek");
         assert_eq!(registry.get("openrouter").unwrap().name(), "openrouter");
+        assert_eq!(registry.get("xai").unwrap().name(), "xai");
         assert!(registry.get("missing").is_none());
     }
 }

@@ -12,6 +12,7 @@
         "deepseek",
         "gemini",
         "groq",
+        "xai",
         "mistral",
         "openai",
         "openrouter"
@@ -53,6 +54,7 @@
               "deepseek",
               "gemini",
               "groq",
+              "xai",
               "mistral",
               "openai",
               "openrouter"
