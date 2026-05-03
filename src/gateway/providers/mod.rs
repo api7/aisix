@@ -8,6 +8,7 @@ pub mod gemini;
 pub mod groq;
 pub mod macros;
 pub mod mistral;
+pub mod moonshot;
 pub mod openai;
 pub mod openrouter;
 pub mod xai;
@@ -21,14 +22,15 @@ pub use fireworks::FireworksAi;
 pub use gemini::GoogleDef;
 pub use groq::Groq;
 pub use mistral::Mistral;
+pub use moonshot::{MoonshotAi, MoonshotAiCn};
 pub use openai::OpenAIDef;
 pub use openrouter::OpenRouter;
 pub use xai::Xai;
 
 pub mod identifiers {
     use super::{
-        anthropic, azure, bedrock, cohere, deepseek, fireworks, gemini, groq, mistral, openai,
-        openrouter, xai,
+        anthropic, azure, bedrock, cohere, deepseek, fireworks, gemini, groq, mistral, moonshot,
+        openai, openrouter, xai,
     };
 
     pub const ANTHROPIC: &str = anthropic::IDENTIFIER;
@@ -40,6 +42,8 @@ pub mod identifiers {
     pub const GEMINI: &str = gemini::IDENTIFIER;
     pub const GROQ: &str = groq::IDENTIFIER;
     pub const MISTRAL: &str = mistral::IDENTIFIER;
+    pub const MOONSHOT_AI: &str = moonshot::IDENTIFIER;
+    pub const MOONSHOT_AI_CN: &str = moonshot::CN_IDENTIFIER;
     pub const OPENAI: &str = openai::IDENTIFIER;
     pub const OPENROUTER: &str = openrouter::IDENTIFIER;
     pub const XAI: &str = xai::IDENTIFIER;
@@ -47,11 +51,19 @@ pub mod identifiers {
 
 pub mod configs {
     pub use super::{
-        anthropic::AnthropicProviderConfig, azure::AzureProviderConfig,
-        bedrock::BedrockProviderConfig, cohere::CohereProviderConfig,
-        deepseek::DeepSeekProviderConfig, fireworks::FireworksAiProviderConfig,
-        gemini::GeminiProviderConfig, groq::GroqProviderConfig, mistral::MistralProviderConfig,
-        openai::OpenAIProviderConfig, openrouter::OpenRouterProviderConfig, xai::XaiProviderConfig,
+        anthropic::AnthropicProviderConfig,
+        azure::AzureProviderConfig,
+        bedrock::BedrockProviderConfig,
+        cohere::CohereProviderConfig,
+        deepseek::DeepSeekProviderConfig,
+        fireworks::FireworksAiProviderConfig,
+        gemini::GeminiProviderConfig,
+        groq::GroqProviderConfig,
+        mistral::MistralProviderConfig,
+        moonshot::{MoonshotAiCnProviderConfig, MoonshotAiProviderConfig},
+        openai::OpenAIProviderConfig,
+        openrouter::OpenRouterProviderConfig,
+        xai::XaiProviderConfig,
     };
 }
 
@@ -68,6 +80,8 @@ pub fn default_provider_registry() -> Result<ProviderRegistry> {
         .register(GoogleDef)?
         .register(Groq)?
         .register(Mistral)?
+        .register(MoonshotAi)?
+        .register(MoonshotAiCn)?
         .register(OpenAIDef)?
         .register(OpenRouter)?
         .register(Xai)?;
@@ -93,6 +107,11 @@ mod tests {
         assert_eq!(registry.get("gemini").unwrap().name(), "gemini");
         assert_eq!(registry.get("groq").unwrap().name(), "groq");
         assert_eq!(registry.get("mistral").unwrap().name(), "mistral");
+        assert_eq!(registry.get("moonshotai").unwrap().name(), "moonshotai");
+        assert_eq!(
+            registry.get("moonshotai-cn").unwrap().name(),
+            "moonshotai-cn"
+        );
         assert_eq!(registry.get("deepseek").unwrap().name(), "deepseek");
         assert_eq!(registry.get("openrouter").unwrap().name(), "openrouter");
         assert_eq!(registry.get("xai").unwrap().name(), "xai");

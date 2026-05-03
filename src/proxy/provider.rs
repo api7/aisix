@@ -69,6 +69,14 @@ fn provider_auth_and_base_url(config: &ProviderConfig) -> Result<(ProviderAuth, 
             ProviderAuth::ApiKey(config.api_key.clone()),
             parse_base_url(config.api_base.as_deref())?,
         ),
+        ProviderConfig::MoonshotAi(config) => (
+            ProviderAuth::ApiKey(config.api_key.clone()),
+            parse_base_url(config.api_base.as_deref())?,
+        ),
+        ProviderConfig::MoonshotAiCn(config) => (
+            ProviderAuth::ApiKey(config.api_key.clone()),
+            parse_base_url(config.api_base.as_deref())?,
+        ),
         ProviderConfig::OpenAI(config) => (
             ProviderAuth::ApiKey(config.api_key.clone()),
             parse_base_url(config.api_base.as_deref())?,
@@ -167,7 +175,8 @@ mod tests {
         gateway::providers::configs::{
             AzureProviderConfig, BedrockProviderConfig, CohereProviderConfig,
             FireworksAiProviderConfig, GroqProviderConfig, MistralProviderConfig,
-            OpenRouterProviderConfig, XaiProviderConfig,
+            MoonshotAiCnProviderConfig, MoonshotAiProviderConfig, OpenRouterProviderConfig,
+            XaiProviderConfig,
         },
     };
 
@@ -287,6 +296,41 @@ mod tests {
         assert_eq!(
             base_url_override.as_ref().map(Url::as_str),
             Some("https://api.mistral.ai/")
+        );
+    }
+
+    #[test]
+    fn provider_auth_and_base_url_returns_moonshot_api_key_and_optional_base_url() {
+        let config = ProviderConfig::MoonshotAi(MoonshotAiProviderConfig {
+            api_key: "moonshot-key".into(),
+            api_base: Some("https://api.moonshot.cn/v1".into()),
+        });
+
+        let (auth, base_url_override) = provider_auth_and_base_url(&config).unwrap();
+
+        assert_eq!(auth.api_key_for("moonshotai").unwrap(), "moonshot-key");
+        assert_eq!(
+            base_url_override.as_ref().map(Url::as_str),
+            Some("https://api.moonshot.cn/v1")
+        );
+    }
+
+    #[test]
+    fn provider_auth_and_base_url_returns_moonshot_cn_api_key_and_optional_base_url() {
+        let config = ProviderConfig::MoonshotAiCn(MoonshotAiCnProviderConfig {
+            api_key: "moonshot-cn-key".into(),
+            api_base: Some("https://api.moonshot.cn/v1".into()),
+        });
+
+        let (auth, base_url_override) = provider_auth_and_base_url(&config).unwrap();
+
+        assert_eq!(
+            auth.api_key_for("moonshotai-cn").unwrap(),
+            "moonshot-cn-key"
+        );
+        assert_eq!(
+            base_url_override.as_ref().map(Url::as_str),
+            Some("https://api.moonshot.cn/v1")
         );
     }
 
