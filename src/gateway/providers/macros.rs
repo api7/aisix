@@ -147,6 +147,7 @@ pub(crate) use provider;
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
     use pretty_assertions::assert_eq;
     use std::borrow::Cow;
 
@@ -203,11 +204,11 @@ mod tests {
             .build_auth_headers(&ProviderAuth::None)
             .unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             error,
             crate::gateway::error::GatewayError::Validation(message)
                 if message.contains("macro-test")
                     && message.contains("ProviderAuth::ApiKey")
-        ));
+        );
     }
 }

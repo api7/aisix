@@ -63,6 +63,7 @@ impl RateLimiter for LocalRateLimiter {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
     use pretty_assertions::assert_eq;
     use http::HeaderMap;
 
@@ -313,8 +314,8 @@ mod tests {
             assert!(run_check(&e, CheckPhase::Pre).await.is_ok());
         }
         let (m, err) = run_check(&e, CheckPhase::Pre).await.unwrap_err();
-        assert!(matches!(m, RateLimitMetric::RPM));
-        assert!(matches!(err, RateLimitError::Exceeded(_)));
+        assert_matches!(m, RateLimitMetric::RPM);
+        assert_matches!(err, RateLimitError::Exceeded(_));
     }
 
     #[tokio::test]
@@ -322,8 +323,8 @@ mod tests {
         let e = make_entity("exc_2", None, Some(100));
         assert!(run_check(&e, CheckPhase::Post(90)).await.is_ok());
         let (m, err) = run_check(&e, CheckPhase::Post(20)).await.unwrap_err();
-        assert!(matches!(m, RateLimitMetric::TPM));
-        assert!(matches!(err, RateLimitError::Exceeded(_)));
+        assert_matches!(m, RateLimitMetric::TPM);
+        assert_matches!(err, RateLimitError::Exceeded(_));
     }
 
     #[tokio::test]

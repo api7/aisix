@@ -325,6 +325,7 @@ pub struct AnthropicError {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -358,7 +359,7 @@ mod tests {
             "messages": [{"role": "user", "content": "Hi"}]
         });
         let req: AnthropicMessagesRequest = serde_json::from_value(json).unwrap();
-        assert!(matches!(req.system, Some(SystemPrompt::Text(ref s)) if s == "You are helpful."));
+        assert_matches!(req.system, Some(SystemPrompt::Text(ref s)) if s == "You are helpful.");
     }
 
     #[test]
@@ -412,7 +413,7 @@ mod tests {
         });
         let req: AnthropicMessagesRequest = serde_json::from_value(json).unwrap();
         assert_eq!(req.tools.as_ref().unwrap().len(), 1);
-        assert!(matches!(req.tool_choice, Some(AnthropicToolChoice::Auto)));
+        assert_matches!(req.tool_choice, Some(AnthropicToolChoice::Auto));
     }
 
     #[test]

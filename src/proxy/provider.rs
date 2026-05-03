@@ -145,6 +145,7 @@ fn default_bedrock_base_url(region: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
     use pretty_assertions::assert_eq;
     use reqwest::Url;
 
@@ -299,10 +300,10 @@ mod tests {
 
         let error = provider_auth_and_base_url(&config).unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             error,
             crate::gateway::error::GatewayError::Internal(message)
                 if message.contains("unsupported scheme")
-        ));
+        );
     }
 }

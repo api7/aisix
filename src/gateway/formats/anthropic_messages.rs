@@ -1000,6 +1000,7 @@ fn openai_finish_reason_to_anthropic_stream(finish_reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -1149,24 +1150,24 @@ mod tests {
             &BridgeContext::default(),
         )
         .unwrap();
-        assert!(matches!(
+        assert_matches!(
             &events[0],
             crate::gateway::types::anthropic::AnthropicStreamEvent::MessageStart { message }
                 if message.id == "chatcmpl-123"
                     && message.usage.input_tokens.is_none()
                     && message.usage.output_tokens.is_none()
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             &events[1],
             crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockStart { index, .. }
                 if *index == 0
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             &events[2],
             crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockDelta { index, delta }
                 if *index == 0
                     && matches!(delta, crate::gateway::types::anthropic::ContentDelta::TextDelta { text } if text == "hello")
-        ));
+        );
 
         assert!(
             AnthropicMessagesFormat::from_hub_stream(
@@ -1180,12 +1181,12 @@ mod tests {
 
         let end_events =
             AnthropicMessagesFormat::stream_end_events(&mut state, &BridgeContext::default());
-        assert!(matches!(
+        assert_matches!(
             &end_events[0],
             crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockStop { index }
                 if *index == 0
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             &end_events[1],
             crate::gateway::types::anthropic::AnthropicStreamEvent::MessageDelta { delta, usage }
                 if delta.stop_reason.is_none()
@@ -1193,11 +1194,11 @@ mod tests {
                     && usage.output_tokens == Some(9)
                     && usage.cache_creation_input_tokens == Some(0)
                     && usage.cache_read_input_tokens == Some(2)
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             &end_events[2],
             crate::gateway::types::anthropic::AnthropicStreamEvent::MessageStop
-        ));
+        );
     }
 
     #[test]
@@ -1243,16 +1244,16 @@ mod tests {
         assert_eq!(bridged.usage.output_tokens, 7);
         assert_eq!(bridged.usage.cache_read_input_tokens, 2);
         assert!(bridged.usage.cache_creation.is_none());
-        assert!(matches!(
+        assert_matches!(
             &bridged.content[0],
             crate::gateway::types::anthropic::AnthropicContentBlock::Text { text, .. }
                 if text == "Calling tool"
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             &bridged.content[1],
             crate::gateway::types::anthropic::AnthropicContentBlock::ToolUse { name, .. }
                 if name == "get_weather"
-        ));
+        );
     }
 
     #[test]
@@ -1309,18 +1310,18 @@ mod tests {
             &BridgeContext::default(),
         )
         .unwrap();
-        assert!(matches!(
+        assert_matches!(
             &first_events[1],
             crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockStart { index, content_block }
                 if *index == 0
                     && matches!(content_block, crate::gateway::types::anthropic::AnthropicContentBlock::ToolUse { name, .. } if name == "get_weather")
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             &first_events[2],
             crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockDelta { index, delta }
                 if *index == 0
                     && matches!(delta, crate::gateway::types::anthropic::ContentDelta::InputJsonDelta { partial_json } if partial_json == "{\"city\"")
-        ));
+        );
 
         let second_events = AnthropicMessagesFormat::from_hub_stream(
             &second_chunk,
@@ -1328,20 +1329,20 @@ mod tests {
             &BridgeContext::default(),
         )
         .unwrap();
-        assert!(matches!(
+        assert_matches!(
             &second_events[0],
             crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockDelta { index, delta }
                 if *index == 0
                     && matches!(delta, crate::gateway::types::anthropic::ContentDelta::InputJsonDelta { partial_json } if partial_json == ":\"SF\"}")
-        ));
+        );
 
         let end_events =
             AnthropicMessagesFormat::stream_end_events(&mut state, &BridgeContext::default());
-        assert!(matches!(
+        assert_matches!(
             &end_events[1],
             crate::gateway::types::anthropic::AnthropicStreamEvent::MessageDelta { delta, .. }
                 if delta.stop_reason.as_deref() == Some("tool_use")
-        ));
+        );
     }
 
     #[test]
@@ -1375,11 +1376,11 @@ mod tests {
             &mut missing_type_state,
             &BridgeContext::default(),
         );
-        assert!(matches!(
+        assert_matches!(
             missing_type_result,
             Err(GatewayError::Bridge(message))
                 if message.contains("requires tool call types")
-        ));
+        );
 
         let mut invalid_type_state = super::AnthropicBridgeState::default();
         let invalid_type_chunk: crate::gateway::types::openai::ChatCompletionChunk =
@@ -1411,11 +1412,11 @@ mod tests {
             &mut invalid_type_state,
             &BridgeContext::default(),
         );
-        assert!(matches!(
+        assert_matches!(
             invalid_type_result,
             Err(GatewayError::Bridge(message))
                 if message.contains("only supports function tool calls")
-        ));
+        );
     }
 
     #[test]

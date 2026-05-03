@@ -402,7 +402,6 @@ async fn provider_error(response: reqwest::Response, provider: &str) -> GatewayE
 
 #[cfg(test)]
 mod tests {
-    use pretty_assertions::assert_eq;
     use std::{
         borrow::Cow,
         sync::{
@@ -411,6 +410,7 @@ mod tests {
         },
     };
 
+    use assert_matches::assert_matches;
     use aws_smithy_eventstream::frame::write_message_to;
     use aws_smithy_types::event_stream::{Header, HeaderValue as EventStreamHeaderValue, Message};
     use axum::{Json, Router, extract::OriginalUri, routing::post};
@@ -420,6 +420,7 @@ mod tests {
         HeaderMap, HeaderValue, StatusCode,
         header::{AUTHORIZATION, CONTENT_TYPE, HeaderName},
     };
+    use pretty_assertions::assert_eq;
     use reqwest::Url;
     use serde_json::{Value, json};
     use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
@@ -908,11 +909,11 @@ mod tests {
         };
 
         assert_eq!(response.model, "gpt-test");
-        assert!(matches!(
+        assert_matches!(
             response.choices[0].message.content.as_ref(),
             Some(crate::gateway::types::openai::MessageContent::Text(text))
                 if text == "hello from hub"
-        ));
+        );
         assert_eq!(usage.input_tokens, Some(7));
         assert_eq!(usage.output_tokens, Some(9));
         assert_eq!(usage.total_tokens, Some(16));
@@ -1065,11 +1066,11 @@ mod tests {
         );
         assert!(response.id.starts_with("bedrock-"));
         assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
-        assert!(matches!(
+        assert_matches!(
             response.choices[0].message.content.as_ref(),
             Some(crate::gateway::types::openai::MessageContent::Text(text))
                 if text == "hello from bedrock"
-        ));
+        );
         assert_eq!(usage.total_tokens, Some(16));
 
         let observed = observed.lock().await.take().unwrap();
@@ -1166,11 +1167,11 @@ mod tests {
 
         let error = gateway.embed(&request, &instance).await.unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             error,
             GatewayError::EmbeddingsNotSupported { provider }
                 if provider == "native-test"
-        ));
+        );
     }
 
     #[tokio::test]
@@ -1297,10 +1298,10 @@ mod tests {
         assert_eq!(response.usage.input_tokens, 5);
         assert_eq!(response.usage.output_tokens, 9);
         assert_eq!(response.usage.cache_read_input_tokens, 2);
-        assert!(matches!(
+        assert_matches!(
             &response.content[0],
             AnthropicContentBlock::Text { text, .. } if text == "hello from hub"
-        ));
+        );
         assert_eq!(usage.input_tokens, Some(7));
         assert_eq!(usage.output_tokens, Some(9));
         assert_eq!(usage.total_tokens, Some(16));
@@ -1396,39 +1397,39 @@ mod tests {
         let message_stop = stream.next().await.unwrap().unwrap();
         assert!(stream.next().await.is_none());
 
-        assert!(matches!(
+        assert_matches!(
             message_start,
             crate::gateway::types::anthropic::AnthropicStreamEvent::MessageStart { message }
                 if message.id == "chatcmpl-789"
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             block_start,
             crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockStart { index, .. }
                 if index == 0
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             block_delta,
             crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockDelta { index, delta }
                 if index == 0
                     && matches!(&delta, crate::gateway::types::anthropic::ContentDelta::TextDelta { text } if text == "hello")
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             block_stop,
             crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockStop { index }
                 if index == 0
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             message_delta,
             crate::gateway::types::anthropic::AnthropicStreamEvent::MessageDelta { usage, .. }
                 if usage.input_tokens == Some(5)
                     && usage.output_tokens == Some(9)
                     && usage.cache_creation_input_tokens == Some(0)
                     && usage.cache_read_input_tokens == Some(2)
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             message_stop,
             crate::gateway::types::anthropic::AnthropicStreamEvent::MessageStop
-        ));
+        );
 
         let usage = usage_rx.await.unwrap();
         assert_eq!(usage.input_tokens, Some(7));
@@ -1496,10 +1497,10 @@ mod tests {
 
         assert_eq!(response.id, "msg_123");
         assert_eq!(response.model, "claude-3-5-sonnet-20241022");
-        assert!(matches!(
+        assert_matches!(
             &response.content[0],
             AnthropicContentBlock::Text { text, .. } if text == "hello from native"
-        ));
+        );
         assert_eq!(usage.input_tokens, Some(10));
         assert_eq!(usage.output_tokens, Some(4));
         assert_eq!(usage.total_tokens, Some(14));
@@ -1574,42 +1575,42 @@ mod tests {
         let message_stop = stream.next().await.unwrap().unwrap();
         assert!(stream.next().await.is_none());
 
-        assert!(matches!(
+        assert_matches!(
             message_start,
             crate::gateway::types::anthropic::AnthropicStreamEvent::MessageStart { message }
                 if message.usage.input_tokens == Some(3)
                     && message.usage.output_tokens == Some(1)
                     && message.usage.cache_creation_input_tokens == Some(5)
                     && message.usage.cache_read_input_tokens == Some(2)
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             block_start,
             crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockStart { index, .. }
                 if index == 0
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             block_delta,
             crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockDelta { index, delta }
                 if index == 0
                     && matches!(&delta, crate::gateway::types::anthropic::ContentDelta::TextDelta { text } if text == "hello")
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             block_stop,
             crate::gateway::types::anthropic::AnthropicStreamEvent::ContentBlockStop { index }
                 if index == 0
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             message_delta,
             crate::gateway::types::anthropic::AnthropicStreamEvent::MessageDelta { usage, .. }
                 if usage.input_tokens == Some(3)
                     && usage.output_tokens == Some(4)
                     && usage.cache_creation_input_tokens.is_none()
                     && usage.cache_read_input_tokens.is_none()
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             message_stop,
             crate::gateway::types::anthropic::AnthropicStreamEvent::MessageStop
-        ));
+        );
 
         let usage = usage_rx.await.unwrap();
         assert_eq!(usage.input_tokens, Some(10));
@@ -1939,11 +1940,11 @@ mod tests {
         .unwrap();
 
         let result = gateway.chat_completion(&request, &instance).await;
-        assert!(matches!(
-            result,
+        assert_matches!(
+            result.map(|_| ()),
             Err(GatewayError::Validation(message))
                 if message.contains("JsonArrayStream")
-        ));
+        );
         assert_eq!(request_count.load(Ordering::SeqCst), 0);
 
         server.abort();
@@ -1984,11 +1985,11 @@ mod tests {
         let result = gateway
             .chat::<StreamingNativeFormat>(&request, &instance)
             .await;
-        assert!(matches!(
-            result,
+        assert_matches!(
+            result.map(|_| ()),
             Err(GatewayError::Validation(message))
                 if message.contains("JsonArrayStream")
-        ));
+        );
         assert_eq!(request_count.load(Ordering::SeqCst), 0);
 
         server.abort();

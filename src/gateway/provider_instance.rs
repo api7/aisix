@@ -159,6 +159,7 @@ impl ProviderRegistryBuilder {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
     use pretty_assertions::assert_eq;
     use std::{borrow::Cow, sync::Arc};
 
@@ -284,23 +285,23 @@ mod tests {
         );
 
         let error = ProviderAuth::None.api_key().unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             error,
             GatewayError::Validation(message)
                 if message.contains("ProviderAuth::ApiKey")
-        ));
+        );
     }
 
     #[test]
     fn provider_auth_api_key_for_adds_provider_context() {
         let error = ProviderAuth::None.api_key_for("deepseek").unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             error,
             GatewayError::Validation(message)
                 if message.contains("deepseek")
                     && message.contains("ProviderAuth::ApiKey")
-        ));
+        );
     }
 
     #[test]
@@ -318,12 +319,12 @@ mod tests {
         let error = ProviderAuth::None
             .aws_static_credentials_for("bedrock")
             .unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             error,
             GatewayError::Validation(message)
                 if message.contains("bedrock")
                     && message.contains("ProviderAuth::AwsStatic")
-        ));
+        );
     }
 
     #[test]
@@ -352,12 +353,12 @@ mod tests {
 
         let error = instance.effective_base_url().unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             error,
             GatewayError::Validation(message)
                 if message.contains("invalid-url")
                     && message.contains("default_base_url")
-        ));
+        );
     }
 
     #[test]
@@ -401,11 +402,11 @@ mod tests {
             .err()
             .unwrap();
 
-        assert!(matches!(
+        assert_matches!(
             error,
             GatewayError::Validation(message)
                 if message.contains("dummy")
                     && message.contains("already registered")
-        ));
+        );
     }
 }

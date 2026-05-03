@@ -112,6 +112,7 @@ impl ProvidersStore {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -213,9 +214,6 @@ mod tests {
 
         assert_eq!(provider.name, "openai-primary");
         assert_eq!(provider.provider_type(), "openai");
-        assert!(matches!(
-            provider.provider,
-            super::ProviderConfig::OpenAI(_)
-        ));
+        assert_matches!(provider.provider, super::ProviderConfig::OpenAI(_));
     }
 }

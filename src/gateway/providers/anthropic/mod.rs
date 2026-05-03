@@ -120,6 +120,7 @@ impl NativeAnthropicMessagesSupport for AnthropicDef {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -182,7 +183,7 @@ mod tests {
 
         assert_eq!(body["model"], "claude-3-5-sonnet-20241022");
         assert_eq!(parsed.id, "msg_123");
-        assert!(matches!(events.as_slice(), [AnthropicStreamEvent::Ping]));
+        assert_matches!(events.as_slice(), [AnthropicStreamEvent::Ping]);
     }
 
     #[test]

@@ -321,6 +321,7 @@ pub struct ChunkFunctionCall {
 
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -360,7 +361,7 @@ mod tests {
         let req: ChatCompletionRequest = serde_json::from_value(json).unwrap();
         assert!(req.tools.is_some());
         assert_eq!(req.tools.as_ref().unwrap().len(), 1);
-        assert!(matches!(req.tool_choice, Some(ToolChoice::Mode(ref s)) if s == "auto"));
+        assert_matches!(req.tool_choice, Some(ToolChoice::Mode(ref s)) if s == "auto");
     }
 
     #[test]
@@ -438,7 +439,7 @@ mod tests {
     fn message_content_string_or_parts() {
         let json = json!({"role": "user", "content": "Hello"});
         let msg: ChatMessage = serde_json::from_value(json).unwrap();
-        assert!(matches!(msg.content, Some(MessageContent::Text(ref s)) if s == "Hello"));
+        assert_matches!(msg.content, Some(MessageContent::Text(ref s)) if s == "Hello");
 
         let json = json!({
             "role": "user",
@@ -448,15 +449,15 @@ mod tests {
             ]
         });
         let msg: ChatMessage = serde_json::from_value(json).unwrap();
-        assert!(matches!(msg.content, Some(MessageContent::Parts(ref p)) if p.len() == 2));
+        assert_matches!(msg.content, Some(MessageContent::Parts(ref p)) if p.len() == 2);
     }
 
     #[test]
     fn stop_condition_single_or_multiple() {
         let single: StopCondition = serde_json::from_value(json!("stop")).unwrap();
-        assert!(matches!(single, StopCondition::Single(ref s) if s == "stop"));
+        assert_matches!(single, StopCondition::Single(ref s) if s == "stop");
 
         let multiple: StopCondition = serde_json::from_value(json!(["stop", "end"])).unwrap();
-        assert!(matches!(multiple, StopCondition::Multiple(ref v) if v.len() == 2));
+        assert_matches!(multiple, StopCondition::Multiple(ref v) if v.len() == 2);
     }
 }
