@@ -29,6 +29,11 @@ use crate::utils::future::WithSpan;
 
 pub const TRACEPARENT_HEADER: &str = "traceparent";
 
+mod attributes {
+    pub const AISIX_INSTANCE_ID: &str = "aisix.instance_id";
+    pub const AISIX_INSTANCE_RUN_ID: &str = "aisix.instance_run_id";
+}
+
 pub struct TimedBody {
     start_time: Instant,
     inner: Body,
@@ -134,6 +139,14 @@ pub async fn trace(mut req: Request, next: Next) -> Response<TimedBody> {
 
     root_span.add_properties(|| {
         [
+            (
+                attributes::AISIX_INSTANCE_ID,
+                crate::utils::instance::instance_id(),
+            ),
+            (
+                attributes::AISIX_INSTANCE_RUN_ID,
+                crate::utils::instance::run_id(),
+            ),
             (HTTP_REQUEST_METHOD, method.to_string()),
             (URL_PATH, path.clone()),
         ]
