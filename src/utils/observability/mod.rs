@@ -67,11 +67,7 @@ pub fn init_observability_trace(
                 .build()
                 .context("failed to initialize otlp exporter")?,
         },
-        Cow::Owned(
-            Resource::builder()
-                .with_service_name(INSTRUMENTATION_NAME)
-                .build(),
-        ),
+        Cow::Owned(get_resource()),
         InstrumentationScope::builder(INSTRUMENTATION_NAME)
             .with_version(env!("CARGO_PKG_VERSION"))
             .build(),
@@ -99,6 +95,7 @@ pub fn init_observability_metric(
                 .with_interval(std::time::Duration::from_secs(15))
                 .build(),
         )
+        .with_resource(get_resource())
         .build();
     let meter = meter_provider.meter(INSTRUMENTATION_NAME);
 
@@ -131,4 +128,10 @@ pub fn init_observability() -> Result<(oneshot::Sender<()>, tokio::task::JoinHan
         let _ = log_tx.send(());
         let _ = log_shutdown_handle.await;
     }))
+}
+
+fn get_resource() -> Resource {
+    Resource::builder()
+        .with_service_name(INSTRUMENTATION_NAME)
+        .build()
 }
