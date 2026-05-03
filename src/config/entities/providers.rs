@@ -28,6 +28,8 @@ pub enum ProviderConfig {
     Azure(configs::AzureProviderConfig),
     #[serde(rename = "bedrock")]
     Bedrock(configs::BedrockProviderConfig),
+    #[serde(rename = "cohere")]
+    Cohere(configs::CohereProviderConfig),
     #[serde(rename = "deepseek")]
     DeepSeek(configs::DeepSeekProviderConfig),
     #[serde(rename = "gemini")]
@@ -50,6 +52,7 @@ impl ProviderConfig {
             Self::Anthropic(_) => identifiers::ANTHROPIC,
             Self::Azure(_) => identifiers::AZURE,
             Self::Bedrock(_) => identifiers::BEDROCK,
+            Self::Cohere(_) => identifiers::COHERE,
             Self::DeepSeek(_) => identifiers::DEEPSEEK,
             Self::Gemini(_) => identifiers::GEMINI,
             Self::Groq(_) => identifiers::GROQ,
@@ -148,6 +151,11 @@ mod tests {
             "access_key_id": "AKIA123",
             "secret_access_key": "secret"
         }
+    }), true, None)]
+    #[case::cohere_ok(json!({
+        "name": "cohere-primary",
+        "type": "cohere",
+        "config": { "api_key": "test_key" }
     }), true, None)]
     #[case::openrouter_ok(json!({
         "name": "openrouter-primary",

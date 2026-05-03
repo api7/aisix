@@ -40,6 +40,7 @@ export interface Model {
 export const PROVIDER_TYPE_VARIANTS = [
   'openai',
   'openrouter',
+  'cohere',
   'groq',
   'xai',
   'mistral',
@@ -100,6 +101,11 @@ export type Provider =
   | {
       name: string;
       type: 'openrouter';
+      config: ApiBaseProviderConfig;
+    }
+  | {
+      name: string;
+      type: 'cohere';
       config: ApiBaseProviderConfig;
     }
   | {

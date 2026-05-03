@@ -41,6 +41,10 @@ fn provider_auth_and_base_url(config: &ProviderConfig) -> Result<(ProviderAuth, 
         ),
         ProviderConfig::Azure(config) => azure_auth_and_base_url(config)?,
         ProviderConfig::Bedrock(config) => bedrock_auth_and_base_url(config)?,
+        ProviderConfig::Cohere(config) => (
+            ProviderAuth::ApiKey(config.api_key.clone()),
+            parse_base_url(config.api_base.as_deref())?,
+        ),
         ProviderConfig::DeepSeek(config) => (
             ProviderAuth::ApiKey(config.api_key.clone()),
             parse_base_url(config.api_base.as_deref())?,
@@ -157,8 +161,8 @@ mod tests {
     use crate::{
         config::entities::providers::ProviderConfig,
         gateway::providers::configs::{
-            AzureProviderConfig, BedrockProviderConfig, GroqProviderConfig, MistralProviderConfig,
-            OpenRouterProviderConfig, XaiProviderConfig,
+            AzureProviderConfig, BedrockProviderConfig, CohereProviderConfig, GroqProviderConfig,
+            MistralProviderConfig, OpenRouterProviderConfig, XaiProviderConfig,
         },
     };
 
@@ -214,6 +218,22 @@ mod tests {
         assert_eq!(
             base_url_override.as_ref().map(Url::as_str),
             Some("https://openrouter.ai/api/v1")
+        );
+    }
+
+    #[test]
+    fn provider_auth_and_base_url_returns_cohere_api_key_and_optional_base_url() {
+        let config = ProviderConfig::Cohere(CohereProviderConfig {
+            api_key: "cohere-key".into(),
+            api_base: Some("https://api.cohere.ai/compatibility/v1".into()),
+        });
+
+        let (auth, base_url_override) = provider_auth_and_base_url(&config).unwrap();
+
+        assert_eq!(auth.api_key_for("cohere").unwrap(), "cohere-key");
+        assert_eq!(
+            base_url_override.as_ref().map(Url::as_str),
+            Some("https://api.cohere.ai/compatibility/v1")
         );
     }
 
