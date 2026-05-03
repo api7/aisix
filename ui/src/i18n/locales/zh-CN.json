@@ -150,6 +150,7 @@
         "openai": "OpenAI",
         "openrouter": "OpenRouter",
         "cohere": "Cohere",
+        "fireworks-ai": "Fireworks AI",
         "groq": "Groq",
         "xai": "xAI",
         "mistral": "Mistral",
