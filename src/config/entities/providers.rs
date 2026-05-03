@@ -42,6 +42,10 @@ pub enum ProviderConfig {
     Xai(configs::XaiProviderConfig),
     #[serde(rename = "mistral")]
     Mistral(configs::MistralProviderConfig),
+    #[serde(rename = "moonshotai")]
+    MoonshotAi(configs::MoonshotAiProviderConfig),
+    #[serde(rename = "moonshotai-cn")]
+    MoonshotAiCn(configs::MoonshotAiCnProviderConfig),
     #[serde(rename = "openai")]
     OpenAI(configs::OpenAIProviderConfig),
     #[serde(rename = "openrouter")]
@@ -61,6 +65,8 @@ impl ProviderConfig {
             Self::Groq(_) => identifiers::GROQ,
             Self::Xai(_) => identifiers::XAI,
             Self::Mistral(_) => identifiers::MISTRAL,
+            Self::MoonshotAi(_) => identifiers::MOONSHOT_AI,
+            Self::MoonshotAiCn(_) => identifiers::MOONSHOT_AI_CN,
             Self::OpenAI(_) => identifiers::OPENAI,
             Self::OpenRouter(_) => identifiers::OPENROUTER,
         }
@@ -183,6 +189,16 @@ mod tests {
     #[case::mistral_ok(json!({
         "name": "mistral-primary",
         "type": "mistral",
+        "config": { "api_key": "test_key" }
+    }), true, None)]
+    #[case::moonshotai_ok(json!({
+        "name": "moonshot-primary",
+        "type": "moonshotai",
+        "config": { "api_key": "test_key" }
+    }), true, None)]
+    #[case::moonshotai_cn_ok(json!({
+        "name": "moonshot-cn-primary",
+        "type": "moonshotai-cn",
         "config": { "api_key": "test_key" }
     }), true, None)]
     #[case::missing_type(json!({

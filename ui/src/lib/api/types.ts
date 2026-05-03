@@ -45,6 +45,8 @@ export const PROVIDER_TYPE_VARIANTS = [
   'groq',
   'xai',
   'mistral',
+  'moonshotai',
+  'moonshotai-cn',
   'azure',
   'anthropic',
   'gemini',
@@ -127,6 +129,16 @@ export type Provider =
   | {
       name: string;
       type: 'mistral';
+      config: ApiBaseProviderConfig;
+    }
+  | {
+      name: string;
+      type: 'moonshotai';
+      config: ApiBaseProviderConfig;
+    }
+  | {
+      name: string;
+      type: 'moonshotai-cn';
       config: ApiBaseProviderConfig;
     }
   | {
