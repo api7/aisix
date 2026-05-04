@@ -1031,28 +1031,30 @@ mod tests {
             "usage": {"prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16}
         }))
         .unwrap();
-        let mut ctx = BridgeContext::default();
-        ctx.openai_responses_extras = Some(OpenAIResponsesExtras {
-            previous_response_id: Some("resp_prev".into()),
-            instructions: None,
-            store: None,
-            metadata: Some(json!({"trace": "abc"})),
-            background: None,
-            context_management: None,
-            conversation: None,
-            include: None,
-            max_tool_calls: None,
-            prompt: None,
-            prompt_cache_key: None,
-            prompt_cache_retention: None,
-            reasoning: None,
-            safety_identifier: None,
-            service_tier: None,
-            stream_options: None,
-            text: None,
-            top_logprobs: None,
-            truncation: None,
-        });
+        let ctx = BridgeContext {
+            openai_responses_extras: Some(OpenAIResponsesExtras {
+                previous_response_id: Some("resp_prev".into()),
+                instructions: None,
+                store: None,
+                metadata: Some(json!({"trace": "abc"})),
+                background: None,
+                context_management: None,
+                conversation: None,
+                include: None,
+                max_tool_calls: None,
+                prompt: None,
+                prompt_cache_key: None,
+                prompt_cache_retention: None,
+                reasoning: None,
+                safety_identifier: None,
+                service_tier: None,
+                stream_options: None,
+                text: None,
+                top_logprobs: None,
+                truncation: None,
+            }),
+            ..Default::default()
+        };
 
         let bridged = ResponsesApiFormat::from_hub(&response, &ctx).unwrap();
 
