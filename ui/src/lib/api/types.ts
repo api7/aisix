@@ -49,6 +49,7 @@ export const PROVIDER_TYPE_VARIANTS = [
   'modelscope-cn',
   'siliconflow',
   'siliconflow-cn',
+  'stepfun',
   'moonshotai',
   'moonshotai-cn',
   'zhipuai',
@@ -154,6 +155,11 @@ export type Provider =
   | {
       name: string;
       type: 'siliconflow-cn';
+      config: ApiBaseProviderConfig;
+    }
+  | {
+      name: string;
+      type: 'stepfun';
       config: ApiBaseProviderConfig;
     }
   | {

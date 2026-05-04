@@ -50,6 +50,8 @@ pub enum ProviderConfig {
     SiliconFlow(configs::SiliconFlowProviderConfig),
     #[serde(rename = "siliconflow-cn")]
     SiliconFlowCn(configs::SiliconFlowCnProviderConfig),
+    #[serde(rename = "stepfun")]
+    StepFun(configs::StepFunProviderConfig),
     #[serde(rename = "moonshotai")]
     MoonshotAi(configs::MoonshotAiProviderConfig),
     #[serde(rename = "moonshotai-cn")]
@@ -79,6 +81,7 @@ impl ProviderConfig {
             Self::ModelScopeCn(_) => identifiers::MODELSCOPE_CN,
             Self::SiliconFlow(_) => identifiers::SILICONFLOW,
             Self::SiliconFlowCn(_) => identifiers::SILICONFLOW_CN,
+            Self::StepFun(_) => identifiers::STEPFUN,
             Self::MoonshotAi(_) => identifiers::MOONSHOT_AI,
             Self::MoonshotAiCn(_) => identifiers::MOONSHOT_AI_CN,
             Self::OpenAI(_) => identifiers::OPENAI,
@@ -224,6 +227,11 @@ mod tests {
     #[case::siliconflow_cn_ok(json!({
         "name": "siliconflow-cn-primary",
         "type": "siliconflow-cn",
+        "config": { "api_key": "test_key" }
+    }), true, None)]
+    #[case::stepfun_ok(json!({
+        "name": "stepfun-primary",
+        "type": "stepfun",
         "config": { "api_key": "test_key" }
     }), true, None)]
     #[case::moonshotai_ok(json!({
