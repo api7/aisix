@@ -37,9 +37,10 @@ pub struct ResponsesBridgeState {
     usage: Usage,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct StreamingTextOutput {
     text: String,
+    output_index: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -47,6 +48,7 @@ struct StreamingToolCall {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+    output_index: Option<usize>,
 }
 
 impl ChatFormat for ResponsesApiFormat {
@@ -202,13 +204,17 @@ impl ChatFormat for ResponsesApiFormat {
             .filter(|content| !content.is_empty())
         {
             if state.text_output.is_none() {
-                state.text_output = Some(StreamingTextOutput::default());
+                let output_index = next_stream_output_index(state);
+                state.text_output = Some(StreamingTextOutput {
+                    text: String::new(),
+                    output_index,
+                });
                 events.push(ResponsesApiStreamEvent::OutputItemAdded {
-                    output_index: 0,
+                    output_index,
                     item: streaming_message_output_item(state, false),
                 });
                 events.push(ResponsesApiStreamEvent::ContentPartAdded {
-                    output_index: 0,
+                    output_index,
                     content_index: 0,
                     part: ResponsesOutputContent::OutputText {
                         text: String::new(),
@@ -220,8 +226,14 @@ impl ChatFormat for ResponsesApiFormat {
                 text_output.text.push_str(content);
             }
 
+            let output_index = state
+                .text_output
+                .as_ref()
+                .map(|text_output| text_output.output_index)
+                .expect("text output state should exist before emitting text deltas");
+
             events.push(ResponsesApiStreamEvent::OutputTextDelta {
-                output_index: 0,
+                output_index,
                 content_index: 0,
                 delta: content.clone(),
             });
@@ -229,13 +241,31 @@ impl ChatFormat for ResponsesApiFormat {
 
         if let Some(tool_calls) = choice.delta.tool_calls.as_ref() {
             for tool_call in tool_calls {
-                let output_index = tool_output_index(state, tool_call.index);
-                let tool_state = state.tool_calls.entry(tool_call.index).or_default();
-                let is_new_tool = tool_state.id.is_none()
-                    && tool_state.name.is_none()
-                    && tool_state.arguments.is_empty();
-
-                merge_streaming_tool_call(tool_state, tool_call);
+                let next_output_index = state
+                    .tool_calls
+                    .get(&tool_call.index)
+                    .and_then(|tool_state| tool_state.output_index)
+                    .unwrap_or_else(|| next_stream_output_index(state));
+                let arguments_delta = tool_call
+                    .function
+                    .as_ref()
+                    .and_then(|function| function.arguments.as_ref())
+                    .filter(|arguments| !arguments.is_empty())
+                    .cloned();
+                let (is_new_tool, output_index) = {
+                    let tool_state = state.tool_calls.entry(tool_call.index).or_default();
+                    let is_new_tool = tool_state.output_index.is_none();
+                    if is_new_tool {
+                        tool_state.output_index = Some(next_output_index);
+                    }
+                    merge_streaming_tool_call(tool_state, tool_call);
+                    (
+                        is_new_tool,
+                        tool_state
+                            .output_index
+                            .expect("streaming tool call should have a stable output index"),
+                    )
+                };
 
                 if is_new_tool {
                     events.push(ResponsesApiStreamEvent::OutputItemAdded {
@@ -244,15 +274,10 @@ impl ChatFormat for ResponsesApiFormat {
                     });
                 }
 
-                if let Some(arguments) = tool_call
-                    .function
-                    .as_ref()
-                    .and_then(|function| function.arguments.as_ref())
-                    .filter(|arguments| !arguments.is_empty())
-                {
+                if let Some(arguments) = arguments_delta {
                     events.push(ResponsesApiStreamEvent::FunctionCallArgumentsDelta {
                         output_index,
-                        delta: arguments.clone(),
+                        delta: arguments,
                     });
                 }
             }
@@ -272,28 +297,30 @@ impl ChatFormat for ResponsesApiFormat {
         let mut events = Vec::new();
         if let Some(text_output) = state.text_output.as_ref() {
             events.push(ResponsesApiStreamEvent::OutputTextDone {
-                output_index: 0,
+                output_index: text_output.output_index,
                 content_index: 0,
                 text: text_output.text.clone(),
             });
             events.push(ResponsesApiStreamEvent::ContentPartDone {
-                output_index: 0,
+                output_index: text_output.output_index,
                 content_index: 0,
                 part: ResponsesOutputContent::OutputText {
                     text: text_output.text.clone(),
                 },
             });
             events.push(ResponsesApiStreamEvent::OutputItemDone {
-                output_index: 0,
+                output_index: text_output.output_index,
                 item: streaming_message_output_item(state, true),
             });
         }
 
         for tool_index in state.tool_calls.keys().copied().collect::<Vec<_>>() {
-            let output_index = tool_output_index(state, tool_index);
             let Some(tool_call) = state.tool_calls.get(&tool_index) else {
                 continue;
             };
+            let output_index = tool_call
+                .output_index
+                .expect("streaming tool call should have a stable output index");
 
             events.push(ResponsesApiStreamEvent::FunctionCallArgumentsDone {
                 output_index,
@@ -728,16 +755,17 @@ fn streaming_message_output_item(
     completed: bool,
 ) -> ResponsesOutputItem {
     let response_id = state.response_id.as_deref().unwrap_or("response");
-    let text = state
+    let text_output = state
         .text_output
         .as_ref()
-        .map(|text| text.text.clone())
-        .unwrap_or_default();
+        .expect("text output state should exist before building output item");
 
     ResponsesOutputItem::Message {
-        id: response_message_output_id(response_id, 0),
+        id: response_message_output_id(response_id, text_output.output_index),
         role: "assistant".into(),
-        content: vec![ResponsesOutputContent::OutputText { text }],
+        content: vec![ResponsesOutputContent::OutputText {
+            text: text_output.text.clone(),
+        }],
         status: if completed {
             "completed".into()
         } else {
@@ -777,12 +805,20 @@ fn streaming_function_call_output_item(
     }
 }
 
-fn tool_output_index(state: &ResponsesBridgeState, tool_index: usize) -> usize {
-    if state.text_output.is_some() {
-        tool_index + 1
-    } else {
-        tool_index
-    }
+fn next_stream_output_index(state: &ResponsesBridgeState) -> usize {
+    state
+        .text_output
+        .as_ref()
+        .map(|text_output| text_output.output_index)
+        .into_iter()
+        .chain(
+            state
+                .tool_calls
+                .values()
+                .filter_map(|tool_call| tool_call.output_index),
+        )
+        .max()
+        .map_or(0, |output_index| output_index + 1)
 }
 
 fn partial_stream_response(
@@ -791,16 +827,26 @@ fn partial_stream_response(
     status: &str,
 ) -> ResponsesApiResponse {
     let mut output = Vec::new();
-    if state.text_output.is_some() {
-        output.push(streaming_message_output_item(state, status == "completed"));
-    }
-    for tool_index in state.tool_calls.keys().copied() {
-        output.push(streaming_function_call_output_item(
-            state,
-            tool_index,
-            status == "completed",
+    if let Some(text_output) = state.text_output.as_ref() {
+        output.push((
+            text_output.output_index,
+            streaming_message_output_item(state, status == "completed"),
         ));
     }
+    for tool_index in state.tool_calls.keys().copied() {
+        let Some(tool_call) = state.tool_calls.get(&tool_index) else {
+            continue;
+        };
+        let Some(output_index) = tool_call.output_index else {
+            continue;
+        };
+        output.push((
+            output_index,
+            streaming_function_call_output_item(state, tool_index, status == "completed"),
+        ));
+    }
+    output.sort_by_key(|(output_index, _)| *output_index);
+    let output = output.into_iter().map(|(_, item)| item).collect();
 
     let extras = ctx.openai_responses_extras.as_ref();
     ResponsesApiResponse {
@@ -865,7 +911,10 @@ mod tests {
             common::{BridgeContext, OpenAIResponsesExtras},
             openai::{
                 ChatCompletionChunk, ChatCompletionResponse,
-                responses::{ResponsesApiRequest, ResponsesApiResponse, ResponsesApiStreamEvent},
+                responses::{
+                    ResponsesApiRequest, ResponsesApiResponse, ResponsesApiStreamEvent,
+                    ResponsesOutputItem,
+                },
             },
         },
     };
@@ -1151,6 +1200,115 @@ mod tests {
         } else {
             panic!("expected response.completed event");
         }
+    }
+
+    #[test]
+    fn stream_bridge_keeps_stable_output_indexes_when_text_follows_tool_call() {
+        let first_chunk: ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "chatcmpl_123",
+            "object": "chat.completion.chunk",
+            "created": 1700000000,
+            "model": "gpt-4.1",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"S"}
+                    }]
+                }
+            }]
+        }))
+        .unwrap();
+        let second_chunk: ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "chatcmpl_123",
+            "object": "chat.completion.chunk",
+            "created": 1700000000,
+            "model": "gpt-4.1",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "Hello"}
+            }]
+        }))
+        .unwrap();
+        let third_chunk: ChatCompletionChunk = serde_json::from_value(json!({
+            "id": "chatcmpl_123",
+            "object": "chat.completion.chunk",
+            "created": 1700000000,
+            "model": "gpt-4.1",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {"arguments": "F\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }))
+        .unwrap();
+
+        let mut state = super::ResponsesBridgeState::default();
+        let ctx = BridgeContext::default();
+
+        let start_events =
+            ResponsesApiFormat::from_hub_stream(&first_chunk, &mut state, &ctx).unwrap();
+        let text_events =
+            ResponsesApiFormat::from_hub_stream(&second_chunk, &mut state, &ctx).unwrap();
+        let tool_events =
+            ResponsesApiFormat::from_hub_stream(&third_chunk, &mut state, &ctx).unwrap();
+        let end_events = ResponsesApiFormat::stream_end_events(&mut state, &ctx);
+
+        assert_matches!(
+            &start_events[2],
+            ResponsesApiStreamEvent::OutputItemAdded { output_index, .. } if *output_index == 0
+        );
+        assert_matches!(
+            &start_events[3],
+            ResponsesApiStreamEvent::FunctionCallArgumentsDelta { output_index, delta }
+                if *output_index == 0 && delta == "{\"city\":\"S"
+        );
+
+        assert_matches!(
+            &text_events[0],
+            ResponsesApiStreamEvent::OutputItemAdded { output_index, .. } if *output_index == 1
+        );
+        assert_matches!(
+            &text_events[1],
+            ResponsesApiStreamEvent::ContentPartAdded { output_index, .. } if *output_index == 1
+        );
+        assert_matches!(
+            &text_events[2],
+            ResponsesApiStreamEvent::OutputTextDelta { output_index, delta, .. }
+                if *output_index == 1 && delta == "Hello"
+        );
+
+        assert_matches!(
+            &tool_events[0],
+            ResponsesApiStreamEvent::FunctionCallArgumentsDelta { output_index, delta }
+                if *output_index == 0 && delta == "F\"}"
+        );
+
+        assert!(end_events.iter().any(|event| {
+            matches!(
+                event,
+                ResponsesApiStreamEvent::FunctionCallArgumentsDone { output_index, arguments }
+                    if *output_index == 0 && arguments == "{\"city\":\"SF\"}"
+            )
+        }));
+
+        let completed = end_events
+            .iter()
+            .find_map(|event| match event {
+                ResponsesApiStreamEvent::ResponseCompleted { response } => Some(response),
+                _ => None,
+            })
+            .expect("expected response.completed event");
+        assert!(matches!(completed.output[0], ResponsesOutputItem::FunctionCall { .. }));
+        assert!(matches!(completed.output[1], ResponsesOutputItem::Message { .. }));
     }
 
     #[test]
