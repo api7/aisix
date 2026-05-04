@@ -46,6 +46,10 @@ pub enum ProviderConfig {
     ModelScope(configs::ModelScopeProviderConfig),
     #[serde(rename = "modelscope-cn")]
     ModelScopeCn(configs::ModelScopeCnProviderConfig),
+    #[serde(rename = "siliconflow")]
+    SiliconFlow(configs::SiliconFlowProviderConfig),
+    #[serde(rename = "siliconflow-cn")]
+    SiliconFlowCn(configs::SiliconFlowCnProviderConfig),
     #[serde(rename = "moonshotai")]
     MoonshotAi(configs::MoonshotAiProviderConfig),
     #[serde(rename = "moonshotai-cn")]
@@ -73,6 +77,8 @@ impl ProviderConfig {
             Self::Mistral(_) => identifiers::MISTRAL,
             Self::ModelScope(_) => identifiers::MODELSCOPE,
             Self::ModelScopeCn(_) => identifiers::MODELSCOPE_CN,
+            Self::SiliconFlow(_) => identifiers::SILICONFLOW,
+            Self::SiliconFlowCn(_) => identifiers::SILICONFLOW_CN,
             Self::MoonshotAi(_) => identifiers::MOONSHOT_AI,
             Self::MoonshotAiCn(_) => identifiers::MOONSHOT_AI_CN,
             Self::OpenAI(_) => identifiers::OPENAI,
@@ -208,6 +214,16 @@ mod tests {
     #[case::modelscope_cn_ok(json!({
         "name": "modelscope-cn-primary",
         "type": "modelscope-cn",
+        "config": { "api_key": "test_key" }
+    }), true, None)]
+    #[case::siliconflow_ok(json!({
+        "name": "siliconflow-primary",
+        "type": "siliconflow",
+        "config": { "api_key": "test_key" }
+    }), true, None)]
+    #[case::siliconflow_cn_ok(json!({
+        "name": "siliconflow-cn-primary",
+        "type": "siliconflow-cn",
         "config": { "api_key": "test_key" }
     }), true, None)]
     #[case::moonshotai_ok(json!({

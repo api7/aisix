@@ -77,6 +77,14 @@ fn provider_auth_and_base_url(config: &ProviderConfig) -> Result<(ProviderAuth, 
             ProviderAuth::ApiKey(config.api_key.clone()),
             parse_base_url(config.api_base.as_deref())?,
         ),
+        ProviderConfig::SiliconFlow(config) => (
+            ProviderAuth::ApiKey(config.api_key.clone()),
+            parse_base_url(config.api_base.as_deref())?,
+        ),
+        ProviderConfig::SiliconFlowCn(config) => (
+            ProviderAuth::ApiKey(config.api_key.clone()),
+            parse_base_url(config.api_base.as_deref())?,
+        ),
         ProviderConfig::MoonshotAi(config) => (
             ProviderAuth::ApiKey(config.api_key.clone()),
             parse_base_url(config.api_base.as_deref())?,
@@ -188,8 +196,8 @@ mod tests {
             AzureProviderConfig, BedrockProviderConfig, CohereProviderConfig,
             FireworksAiProviderConfig, GroqProviderConfig, MistralProviderConfig,
             ModelScopeCnProviderConfig, ModelScopeProviderConfig, MoonshotAiCnProviderConfig,
-            MoonshotAiProviderConfig, OpenRouterProviderConfig, XaiProviderConfig,
-            ZhipuAiProviderConfig,
+            MoonshotAiProviderConfig, OpenRouterProviderConfig, SiliconFlowCnProviderConfig,
+            SiliconFlowProviderConfig, XaiProviderConfig, ZhipuAiProviderConfig,
         },
     };
 
@@ -344,6 +352,41 @@ mod tests {
         assert_eq!(
             base_url_override.as_ref().map(Url::as_str),
             Some("https://api-inference.modelscope.cn/v1")
+        );
+    }
+
+    #[test]
+    fn provider_auth_and_base_url_returns_siliconflow_api_key_and_optional_base_url() {
+        let config = ProviderConfig::SiliconFlow(SiliconFlowProviderConfig {
+            api_key: "siliconflow-key".into(),
+            api_base: Some("https://api.siliconflow.com/v1".into()),
+        });
+
+        let (auth, base_url_override) = provider_auth_and_base_url(&config).unwrap();
+
+        assert_eq!(auth.api_key_for("siliconflow").unwrap(), "siliconflow-key");
+        assert_eq!(
+            base_url_override.as_ref().map(Url::as_str),
+            Some("https://api.siliconflow.com/v1")
+        );
+    }
+
+    #[test]
+    fn provider_auth_and_base_url_returns_siliconflow_cn_api_key_and_optional_base_url() {
+        let config = ProviderConfig::SiliconFlowCn(SiliconFlowCnProviderConfig {
+            api_key: "siliconflow-cn-key".into(),
+            api_base: Some("https://api.siliconflow.cn/v1".into()),
+        });
+
+        let (auth, base_url_override) = provider_auth_and_base_url(&config).unwrap();
+
+        assert_eq!(
+            auth.api_key_for("siliconflow-cn").unwrap(),
+            "siliconflow-cn-key"
+        );
+        assert_eq!(
+            base_url_override.as_ref().map(Url::as_str),
+            Some("https://api.siliconflow.cn/v1")
         );
     }
 

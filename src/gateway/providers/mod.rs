@@ -12,6 +12,7 @@ pub mod modelscope;
 pub mod moonshot;
 pub mod openai;
 pub mod openrouter;
+pub mod siliconflow;
 pub mod xai;
 pub mod zhipuai;
 
@@ -28,13 +29,14 @@ pub use modelscope::{ModelScope, ModelScopeCn};
 pub use moonshot::{MoonshotAi, MoonshotAiCn};
 pub use openai::OpenAIDef;
 pub use openrouter::OpenRouter;
+pub use siliconflow::{SiliconFlow, SiliconFlowCn};
 pub use xai::Xai;
 pub use zhipuai::ZhipuAi;
 
 pub mod identifiers {
     use super::{
-        anthropic, azure, bedrock, cohere, deepseek, fireworks, gemini, groq, mistral, moonshot,
-        modelscope, openai, openrouter, xai, zhipuai,
+        anthropic, azure, bedrock, cohere, deepseek, fireworks, gemini, groq, mistral, modelscope,
+        moonshot, openai, openrouter, siliconflow, xai, zhipuai,
     };
 
     pub const ANTHROPIC: &str = anthropic::IDENTIFIER;
@@ -48,6 +50,8 @@ pub mod identifiers {
     pub const MISTRAL: &str = mistral::IDENTIFIER;
     pub const MODELSCOPE: &str = modelscope::IDENTIFIER;
     pub const MODELSCOPE_CN: &str = modelscope::CN_IDENTIFIER;
+    pub const SILICONFLOW: &str = siliconflow::IDENTIFIER;
+    pub const SILICONFLOW_CN: &str = siliconflow::CN_IDENTIFIER;
     pub const MOONSHOT_AI: &str = moonshot::IDENTIFIER;
     pub const MOONSHOT_AI_CN: &str = moonshot::CN_IDENTIFIER;
     pub const OPENAI: &str = openai::IDENTIFIER;
@@ -71,6 +75,7 @@ pub mod configs {
         moonshot::{MoonshotAiCnProviderConfig, MoonshotAiProviderConfig},
         openai::OpenAIProviderConfig,
         openrouter::OpenRouterProviderConfig,
+        siliconflow::{SiliconFlowCnProviderConfig, SiliconFlowProviderConfig},
         xai::XaiProviderConfig,
         zhipuai::ZhipuAiProviderConfig,
     };
@@ -91,6 +96,8 @@ pub fn default_provider_registry() -> Result<ProviderRegistry> {
         .register(Mistral)?
         .register(ModelScope)?
         .register(ModelScopeCn)?
+        .register(SiliconFlow)?
+        .register(SiliconFlowCn)?
         .register(MoonshotAi)?
         .register(MoonshotAiCn)?
         .register(OpenAIDef)?
@@ -120,7 +127,15 @@ mod tests {
         assert_eq!(registry.get("groq").unwrap().name(), "groq");
         assert_eq!(registry.get("mistral").unwrap().name(), "mistral");
         assert_eq!(registry.get("modelscope").unwrap().name(), "modelscope");
-        assert_eq!(registry.get("modelscope-cn").unwrap().name(), "modelscope-cn");
+        assert_eq!(
+            registry.get("modelscope-cn").unwrap().name(),
+            "modelscope-cn"
+        );
+        assert_eq!(registry.get("siliconflow").unwrap().name(), "siliconflow");
+        assert_eq!(
+            registry.get("siliconflow-cn").unwrap().name(),
+            "siliconflow-cn"
+        );
         assert_eq!(registry.get("moonshotai").unwrap().name(), "moonshotai");
         assert_eq!(
             registry.get("moonshotai-cn").unwrap().name(),

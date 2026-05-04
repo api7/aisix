@@ -86,7 +86,7 @@ function ProvidersPage() {
       size: 140,
       cell: (info) => (
         <Badge variant="secondary">
-          {t(`providers.form.types.${info.getValue()}`)}
+          {t(`providerTypes.${info.getValue()}`)}
         </Badge>
       ),
     }),
