@@ -43,7 +43,7 @@ pub(super) fn request_span_properties(
         properties.push(("embedding.invocation_parameters".into(), value));
     }
 
-    if let Some(value) = serde_json::to_string(&request.input).ok() {
+    if let Ok(value) = serde_json::to_string(&request.input) {
         properties.push(("input.value".into(), value));
     }
 
@@ -86,7 +86,7 @@ pub(super) fn response_span_properties(
         ));
     }
 
-    if let Some(value) = serde_json::to_string(response).ok() {
+    if let Ok(value) = serde_json::to_string(response) {
         properties.push(("output.value".into(), value));
     }
 
