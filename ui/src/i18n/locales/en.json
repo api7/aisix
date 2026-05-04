@@ -40,6 +40,27 @@
     "id": "ID",
     "copy": "Copy"
   },
+  "providerTypes": {
+    "openai": "OpenAI",
+    "openrouter": "OpenRouter",
+    "cohere": "Cohere",
+    "fireworks-ai": "Fireworks AI",
+    "groq": "Groq",
+    "xai": "xAI",
+    "mistral": "Mistral",
+    "modelscope": "ModelScope",
+    "modelscope-cn": "ModelScope (CN)",
+    "siliconflow": "SiliconFlow",
+    "siliconflow-cn": "SiliconFlow (CN)",
+    "moonshotai": "Moonshot AI",
+    "moonshotai-cn": "Moonshot AI (CN)",
+    "zhipuai": "ZhipuAI",
+    "azure": "Azure OpenAI",
+    "anthropic": "Anthropic",
+    "gemini": "Gemini",
+    "deepseek": "DeepSeek",
+    "bedrock": "AWS Bedrock"
+  },
   "playground": {
     "title": "Playground",
     "addComparison": "Add Comparison",
@@ -145,26 +166,7 @@
       "rpmHint": "Requests / minute",
       "rpd": "RPD",
       "rpdHint": "Requests / day",
-      "concurrency": "Concurrency",
-      "providers": {
-        "openai": "OpenAI",
-        "openrouter": "OpenRouter",
-        "cohere": "Cohere",
-        "fireworks-ai": "Fireworks AI",
-        "groq": "Groq",
-        "xai": "xAI",
-        "mistral": "Mistral",
-        "modelscope": "ModelScope",
-        "modelscope-cn": "ModelScope (CN)",
-        "moonshotai": "Moonshot AI",
-        "moonshotai-cn": "Moonshot AI (CN)",
-        "zhipuai": "ZhipuAI",
-        "azure": "Azure OpenAI",
-        "anthropic": "Anthropic",
-        "gemini": "Gemini",
-        "deepseek": "DeepSeek",
-        "bedrock": "AWS Bedrock"
-      }
+      "concurrency": "Concurrency"
     }
   },
   "providers": {
@@ -224,26 +226,7 @@
       "sessionTokenHint": "Optional temporary credential when using STS or assumed roles.",
       "sessionTokenPlaceholder": "Optional temporary credential",
       "endpointLabel": "Bedrock Endpoint Override",
-      "endpointHint": "Leave blank to use the standard runtime endpoint for the selected region.",
-      "types": {
-        "openai": "OpenAI",
-        "openrouter": "OpenRouter",
-        "cohere": "Cohere",
-        "fireworks-ai": "Fireworks AI",
-        "groq": "Groq",
-        "xai": "xAI",
-        "mistral": "Mistral",
-        "modelscope": "ModelScope",
-        "modelscope-cn": "ModelScope (CN)",
-        "moonshotai": "Moonshot AI",
-        "moonshotai-cn": "Moonshot AI (CN)",
-        "zhipuai": "ZhipuAI",
-        "azure": "Azure OpenAI",
-        "anthropic": "Anthropic",
-        "gemini": "Gemini",
-        "deepseek": "DeepSeek",
-        "bedrock": "AWS Bedrock"
-      }
+      "endpointHint": "Leave blank to use the standard runtime endpoint for the selected region."
     }
   },
   "apiKeys": {

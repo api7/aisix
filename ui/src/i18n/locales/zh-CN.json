@@ -40,6 +40,27 @@
     "id": "ID",
     "copy": "复制"
   },
+  "providerTypes": {
+    "openai": "OpenAI",
+    "openrouter": "OpenRouter",
+    "cohere": "Cohere",
+    "fireworks-ai": "Fireworks AI",
+    "groq": "Groq",
+    "xai": "xAI",
+    "mistral": "Mistral",
+    "modelscope": "ModelScope",
+    "modelscope-cn": "ModelScope (CN)",
+    "siliconflow": "SiliconFlow",
+    "siliconflow-cn": "硅基流动",
+    "moonshotai": "Moonshot AI",
+    "moonshotai-cn": "Moonshot AI (CN)",
+    "zhipuai": "智谱",
+    "azure": "Azure OpenAI",
+    "anthropic": "Anthropic",
+    "gemini": "Gemini",
+    "deepseek": "DeepSeek",
+    "bedrock": "AWS Bedrock"
+  },
   "playground": {
     "title": "Playground",
     "addComparison": "添加对比",
@@ -145,26 +166,7 @@
       "rpmHint": "每分钟请求数",
       "rpd": "RPD",
       "rpdHint": "每天请求数",
-      "concurrency": "并发",
-      "providers": {
-        "openai": "OpenAI",
-        "openrouter": "OpenRouter",
-        "cohere": "Cohere",
-        "fireworks-ai": "Fireworks AI",
-        "groq": "Groq",
-        "xai": "xAI",
-        "mistral": "Mistral",
-        "modelscope": "ModelScope",
-        "modelscope-cn": "ModelScope (CN)",
-        "moonshotai": "Moonshot AI",
-        "moonshotai-cn": "Moonshot AI (CN)",
-        "zhipuai": "智谱",
-        "azure": "Azure OpenAI",
-        "anthropic": "Anthropic",
-        "gemini": "Gemini",
-        "deepseek": "DeepSeek",
-        "bedrock": "AWS Bedrock"
-      }
+      "concurrency": "并发"
     }
   },
   "providers": {
@@ -224,26 +226,7 @@
       "sessionTokenHint": "使用 STS 或 AssumeRole 临时凭证时可选。",
       "sessionTokenPlaceholder": "可选的临时凭证",
       "endpointLabel": "Bedrock Endpoint Override",
-      "endpointHint": "留空则根据所选 Region 使用标准运行时地址。",
-      "types": {
-        "openai": "OpenAI",
-        "openrouter": "OpenRouter",
-        "cohere": "Cohere",
-        "fireworks-ai": "Fireworks AI",
-        "groq": "Groq",
-        "xai": "xAI",
-        "mistral": "Mistral",
-        "modelscope": "ModelScope",
-        "modelscope-cn": "ModelScope (CN)",
-        "moonshotai": "Moonshot AI",
-        "moonshotai-cn": "Moonshot AI (CN)",
-        "zhipuai": "智谱",
-        "azure": "Azure OpenAI",
-        "anthropic": "Anthropic",
-        "gemini": "Gemini",
-        "deepseek": "DeepSeek",
-        "bedrock": "AWS Bedrock"
-      }
+      "endpointHint": "留空则根据所选 Region 使用标准运行时地址。"
     }
   },
   "apiKeys": {

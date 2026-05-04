@@ -213,7 +213,7 @@ export function ProviderForm({
                   <SelectContent align="start" position="popper">
                     {PROVIDER_TYPES.map((providerType) => (
                       <SelectItem key={providerType} value={providerType}>
-                        {t(`providers.form.types.${providerType}`)}
+                        {t(`providerTypes.${providerType}`)}
                       </SelectItem>
                     ))}
                   </SelectContent>

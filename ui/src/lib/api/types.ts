@@ -47,6 +47,8 @@ export const PROVIDER_TYPE_VARIANTS = [
   'mistral',
   'modelscope',
   'modelscope-cn',
+  'siliconflow',
+  'siliconflow-cn',
   'moonshotai',
   'moonshotai-cn',
   'zhipuai',
@@ -142,6 +144,16 @@ export type Provider =
   | {
       name: string;
       type: 'modelscope-cn';
+      config: ApiBaseProviderConfig;
+    }
+  | {
+      name: string;
+      type: 'siliconflow';
+      config: ApiBaseProviderConfig;
+    }
+  | {
+      name: string;
+      type: 'siliconflow-cn';
       config: ApiBaseProviderConfig;
     }
   | {

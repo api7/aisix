@@ -206,9 +206,12 @@ export function ModelForm({
               } else if (providerOptions.length === 0) {
                 providerHint = t('models.form.providerEmpty');
               } else if (selectedProvider) {
+                const providerTypeLabel = t(
+                  `providerTypes.${selectedProvider.type}`,
+                );
                 providerHint = t('models.form.providerSelectedHint', {
                   name: selectedProvider.name,
-                  type: selectedProvider.type,
+                  type: providerTypeLabel,
                 });
               }
 
