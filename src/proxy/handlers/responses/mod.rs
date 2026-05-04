@@ -1,3 +1,4 @@
+mod span_attributes;
 mod types;
 
 use std::{convert::Infallible, time::Duration};
@@ -12,6 +13,10 @@ use axum::{
 };
 use fastrace::prelude::{Event as TraceEvent, *};
 use log::error;
+use span_attributes::{
+    StreamOutputCollector, apply_span_properties, chunk_span_properties, event_starts_output,
+    request_span_properties, response_span_properties, usage_span_properties,
+};
 use tokio::sync::{oneshot, oneshot::error::TryRecvError};
 pub use types::ResponsesError;
 
@@ -66,8 +71,17 @@ pub async fn responses(
         GatewayError::Internal(format!("provider {} not found", model.provider_id))
     })?;
     let provider_instance = create_provider_instance(gateway.as_ref(), &provider)?;
+    let provider_base_url = provider_instance.effective_base_url().ok();
 
     let span = Span::enter_with_local_parent("aisix.llm.responses");
+    apply_span_properties(
+        &span,
+        request_span_properties(
+            &request_data,
+            provider_instance.def.as_ref(),
+            provider_base_url.as_ref(),
+        ),
+    );
 
     let (response, span) = (WithSpan {
         inner: maybe_timeout(
@@ -80,6 +94,7 @@ pub async fn responses(
 
     match response {
         Ok(Ok(ChatResponse::Complete { response, usage })) => {
+            span.add_properties(|| response_span_properties(&response, &usage));
             handle_regular_request(response, usage, &mut request_ctx).await
         }
         Ok(Ok(ChatResponse::Stream { stream, usage_rx })) => {
@@ -145,12 +160,21 @@ async fn handle_stream_request(
         (
             stream,
             span,
-            0usize,
             stream_request_ctx,
             false,
             Some(usage_rx),
+            StreamOutputCollector::default(),
+            false,
         ),
-        |(mut stream, span, idx, mut request_ctx, should_terminate, mut usage_rx)| async move {
+        |(
+            mut stream,
+            span,
+            mut request_ctx,
+            should_terminate,
+            mut usage_rx,
+            mut output_collector,
+            mut first_token_arrived,
+        )| async move {
             if should_terminate {
                 drop(span);
                 return None;
@@ -158,7 +182,10 @@ async fn handle_stream_request(
 
             match stream.next().await {
                 Some(Ok(event)) => {
-                    if idx == 0 {
+                    output_collector.record_event(&event);
+
+                    if event_starts_output(&event) && !first_token_arrived {
+                        first_token_arrived = true;
                         hooks::observability::record_first_token_latency(&mut request_ctx).await;
                         span.add_event(
                             TraceEvent::new("first token arrived")
@@ -166,27 +193,28 @@ async fn handle_stream_request(
                         );
                     }
 
+                    span.add_properties(|| chunk_span_properties(&event));
+
                     let sse_event = Ok::<SseEvent, Infallible>(serialize_stream_event(&event));
 
                     Some((
                         sse_event,
-                        (stream, span, idx + 1, request_ctx, false, usage_rx),
+                        (
+                            stream,
+                            span,
+                            request_ctx,
+                            false,
+                            usage_rx,
+                            output_collector,
+                            first_token_arrived,
+                        ),
                     ))
                 }
                 Some(Err(err)) => {
                     error!("Gateway stream error: {}", err);
                     span.add_property(|| ("error.type", "stream_error"));
-                    if let Some(usage_rx) = usage_rx.take() {
-                        spawn_stream_usage_observer(request_ctx.clone(), usage_rx);
-                    }
-                    Some((
-                        Ok(serialize_stream_event(&ResponsesApiStreamEvent::Error {
-                            message: err.to_string(),
-                        })),
-                        (stream, span, idx + 1, request_ctx, true, usage_rx),
-                    ))
-                }
-                None => {
+                    span.add_properties(|| output_collector.output_message_span_properties());
+
                     if let Some(mut usage_rx) = usage_rx.take() {
                         match usage_rx.try_recv() {
                             Ok(usage) => {
@@ -203,6 +231,54 @@ async fn handle_stream_request(
                                     &usage,
                                 )
                                 .await;
+                                span.add_properties(|| usage_span_properties(&usage));
+                            }
+                            Err(TryRecvError::Empty) => {
+                                spawn_stream_usage_observer(request_ctx.clone(), usage_rx);
+                            }
+                            Err(TryRecvError::Closed) => {
+                                error!(
+                                    "Failed to receive streaming usage from gateway: channel closed"
+                                );
+                            }
+                        }
+                    }
+
+                    Some((
+                        Ok(serialize_stream_event(&ResponsesApiStreamEvent::Error {
+                            message: err.to_string(),
+                        })),
+                        (
+                            stream,
+                            span,
+                            request_ctx,
+                            true,
+                            usage_rx,
+                            output_collector,
+                            first_token_arrived,
+                        ),
+                    ))
+                }
+                None => {
+                    span.add_properties(|| output_collector.output_message_span_properties());
+
+                    if let Some(mut usage_rx) = usage_rx.take() {
+                        match usage_rx.try_recv() {
+                            Ok(usage) => {
+                                if let Err(err) = hooks::rate_limit::post_check_streaming(
+                                    &mut request_ctx,
+                                    &usage,
+                                )
+                                .await
+                                {
+                                    error!("Rate limit post_check_streaming error: {}", err);
+                                }
+                                hooks::observability::record_streaming_usage(
+                                    &mut request_ctx,
+                                    &usage,
+                                )
+                                .await;
+                                span.add_properties(|| usage_span_properties(&usage));
                             }
                             Err(TryRecvError::Empty) => {
                                 spawn_stream_usage_observer(request_ctx.clone(), usage_rx);
