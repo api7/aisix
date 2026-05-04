@@ -72,7 +72,7 @@ pub async fn chat_completions(
     let provider_instance = create_provider_instance(gateway.as_ref(), &provider)?;
     let provider_base_url = provider_instance.effective_base_url().ok();
 
-    let span = Span::enter_with_local_parent("aisix.llm.chat_completion");
+    let span = Span::enter_with_local_parent("aisix.llm.chat_completions");
     apply_span_properties(
         &span,
         request_span_properties(
