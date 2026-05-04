@@ -1307,8 +1307,14 @@ mod tests {
                 _ => None,
             })
             .expect("expected response.completed event");
-        assert!(matches!(completed.output[0], ResponsesOutputItem::FunctionCall { .. }));
-        assert!(matches!(completed.output[1], ResponsesOutputItem::Message { .. }));
+        assert!(matches!(
+            completed.output[0],
+            ResponsesOutputItem::FunctionCall { .. }
+        ));
+        assert!(matches!(
+            completed.output[1],
+            ResponsesOutputItem::Message { .. }
+        ));
     }
 
     #[test]
