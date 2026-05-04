@@ -59,6 +59,7 @@ pub fn create_router(state: AppState) -> Router {
             "/v1/messages",
             post(handlers::messages::messages).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
+        .route("/v1/responses", post(handlers::responses::responses))
         .route("/v1/embeddings", post(handlers::embeddings::embeddings))
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(from_fn_with_state(state.clone(), middlewares::auth))

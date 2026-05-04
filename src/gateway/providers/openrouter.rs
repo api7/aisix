@@ -24,6 +24,7 @@ provider!(OpenRouter {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+
     use super::OpenRouter;
     use crate::gateway::traits::ProviderMeta;
 

@@ -159,14 +159,14 @@ impl ProviderRegistryBuilder {
 
 #[cfg(test)]
 mod tests {
-    use assert_matches::assert_matches;
-    use pretty_assertions::assert_eq;
     use std::{borrow::Cow, sync::Arc};
 
+    use assert_matches::assert_matches;
     use http::{
         HeaderMap, HeaderValue,
         header::{AUTHORIZATION, HeaderName},
     };
+    use pretty_assertions::assert_eq;
 
     use super::{AwsStaticCredentials, ProviderAuth, ProviderInstance, ProviderRegistry};
     use crate::gateway::{

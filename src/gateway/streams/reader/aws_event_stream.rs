@@ -97,20 +97,21 @@ fn drain_aws_event_stream_messages(state: &mut AwsEventStreamReaderState) -> Vec
                 state.pending_frame = buffered_len > 0;
                 break;
             }
-            Ok(DecodedFrame::Complete(message)) => match normalize_aws_event_stream_message(&message)
-            {
-                Ok(line) => {
-                    state.pending_frame = !state.buffer.is_empty();
-                    items.push(Ok(line));
+            Ok(DecodedFrame::Complete(message)) => {
+                match normalize_aws_event_stream_message(&message) {
+                    Ok(line) => {
+                        state.pending_frame = !state.buffer.is_empty();
+                        items.push(Ok(line));
+                    }
+                    Err(error) => {
+                        state.buffer.clear();
+                        state.pending_frame = false;
+                        state.terminated = true;
+                        items.push(Err(error));
+                        break;
+                    }
                 }
-                Err(error) => {
-                    state.buffer.clear();
-                    state.pending_frame = false;
-                    state.terminated = true;
-                    items.push(Err(error));
-                    break;
-                }
-            },
+            }
             Err(error) => {
                 state.buffer.clear();
                 state.pending_frame = false;
@@ -146,10 +147,12 @@ fn normalize_aws_event_stream_message(message: &Message) -> Result<String> {
             }))
             .map_err(|error| GatewayError::Transform(error.to_string()))
         }
-        "exception" => Err(GatewayError::Stream(build_aws_event_stream_exception_message(
-            headers.smithy_type.as_str(),
-            message.payload(),
-        ))),
+        "exception" => Err(GatewayError::Stream(
+            build_aws_event_stream_exception_message(
+                headers.smithy_type.as_str(),
+                message.payload(),
+            ),
+        )),
         other => Err(GatewayError::Stream(format!(
             "unsupported aws event stream message type: {other}"
         ))),
@@ -181,11 +184,11 @@ fn build_aws_event_stream_exception_message(exception_type: &str, payload: &[u8]
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
-    use pretty_assertions::assert_eq;
     use aws_smithy_eventstream::frame::write_message_to;
     use aws_smithy_types::event_stream::{Header, HeaderValue, Message};
     use bytes::Bytes;
     use futures::StreamExt;
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     use super::aws_event_stream_reader;
@@ -193,12 +196,18 @@ mod tests {
 
     #[tokio::test]
     async fn aws_event_stream_reader_decodes_split_event_frames() {
-        let message_start = encode_event_message("messageStart", json!({
-            "role": "assistant"
-        }));
-        let metadata = encode_event_message("metadata", json!({
-            "usage": {"inputTokens": 3, "outputTokens": 5, "totalTokens": 8}
-        }));
+        let message_start = encode_event_message(
+            "messageStart",
+            json!({
+                "role": "assistant"
+            }),
+        );
+        let metadata = encode_event_message(
+            "metadata",
+            json!({
+                "usage": {"inputTokens": 3, "outputTokens": 5, "totalTokens": 8}
+            }),
+        );
 
         let split_at = message_start.len() / 2;
         let byte_stream = futures::stream::iter(vec![
@@ -209,8 +218,8 @@ mod tests {
 
         let mut reader = aws_event_stream_reader(byte_stream);
 
-        let first: serde_json::Value = serde_json::from_str(&reader.next().await.unwrap().unwrap())
-            .unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(&reader.next().await.unwrap().unwrap()).unwrap();
         let second: serde_json::Value =
             serde_json::from_str(&reader.next().await.unwrap().unwrap()).unwrap();
 

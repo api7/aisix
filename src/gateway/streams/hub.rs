@@ -107,11 +107,11 @@ impl Stream for HubChunkStream {
 
 #[cfg(test)]
 mod tests {
-    use pretty_assertions::assert_eq;
     use std::sync::Arc;
 
     use futures::StreamExt;
     use http::HeaderMap;
+    use pretty_assertions::assert_eq;
 
     use super::HubChunkStream;
     use crate::gateway::{
