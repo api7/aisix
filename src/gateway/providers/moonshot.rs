@@ -109,7 +109,9 @@ fn transform_request(request: &ChatCompletionRequest) -> Result<Value> {
     let model = map
         .get("model")
         .and_then(Value::as_str)
-        .ok_or_else(|| GatewayError::Validation("moonshot providers require a string model".into()))?
+        .ok_or_else(|| {
+            GatewayError::Validation("moonshot providers require a string model".into())
+        })?
         .to_string();
 
     apply_model_specific_quirks(map, model.as_str());

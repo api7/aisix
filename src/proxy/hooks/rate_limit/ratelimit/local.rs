@@ -64,8 +64,8 @@ impl RateLimiter for LocalRateLimiter {
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
-    use pretty_assertions::assert_eq;
     use http::HeaderMap;
+    use pretty_assertions::assert_eq;
 
     use super::*;
     use crate::{

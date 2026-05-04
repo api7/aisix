@@ -100,6 +100,7 @@ pub fn get_rate_limiter() -> Arc<dyn RateLimiter> {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+
     use super::*;
     use crate::config::entities::types::RateLimit;
 

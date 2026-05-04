@@ -147,9 +147,10 @@ pub(crate) use provider;
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use assert_matches::assert_matches;
     use pretty_assertions::assert_eq;
-    use std::borrow::Cow;
 
     use crate::gateway::{
         provider_instance::ProviderAuth,
