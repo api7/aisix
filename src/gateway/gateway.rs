@@ -56,6 +56,7 @@ impl Gateway {
     }
 
     /// Enables server-side session state for formats that need it.
+    #[allow(dead_code)]
     pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
         self.session_store = Some(store);
         self
@@ -227,6 +228,7 @@ impl Gateway {
             messages,
             model: hub_response.model.clone(),
             created_at: hub_response.created,
+            insertion_index: 0,
             metadata: responses_metadata(ctx.openai_responses_extras.as_ref()),
         };
         store.put_session(&session).await

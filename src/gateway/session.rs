@@ -1,4 +1,7 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -6,6 +9,7 @@ use tokio::sync::RwLock;
 
 use crate::gateway::{error::Result, types::openai::ChatMessage};
 
+#[allow(dead_code)]
 #[async_trait]
 pub trait SessionStore: Send + Sync + 'static {
     async fn get_by_response_id(&self, response_id: &str) -> Result<Option<StoredSession>>;
@@ -14,6 +18,7 @@ pub trait SessionStore: Send + Sync + 'static {
     async fn delete_session(&self, response_id: &str) -> Result<()>;
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct StoredSession {
     pub response_id: String,
@@ -21,12 +26,15 @@ pub struct StoredSession {
     pub messages: Vec<ChatMessage>,
     pub model: String,
     pub created_at: u64,
+    pub insertion_index: u64,
     pub metadata: HashMap<String, Value>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct InMemorySessionStore {
     sessions: RwLock<HashMap<String, StoredSession>>,
+    next_insertion_index: AtomicU64,
 }
 
 #[async_trait]
@@ -44,15 +52,18 @@ impl SessionStore for InMemorySessionStore {
             .filter(|session| session.conversation_id.as_deref() == Some(conv_id))
             .cloned()
             .collect();
-        sessions.sort_by_key(|session| session.created_at);
+        sessions.sort_by_key(|session| (session.created_at, session.insertion_index));
         Ok(sessions)
     }
 
     async fn put_session(&self, session: &StoredSession) -> Result<()> {
-        self.sessions
-            .write()
-            .await
-            .insert(session.response_id.clone(), session.clone());
+        let mut stored = session.clone();
+        let mut sessions = self.sessions.write().await;
+        stored.insertion_index = sessions
+            .get(&stored.response_id)
+            .map(|existing| existing.insertion_index)
+            .unwrap_or_else(|| self.next_insertion_index.fetch_add(1, Ordering::Relaxed));
+        sessions.insert(stored.response_id.clone(), stored);
         Ok(())
     }
 
@@ -91,6 +102,7 @@ mod tests {
             messages: vec![sample_message("hello")],
             model: "gpt-test".into(),
             created_at: 10,
+            insertion_index: 0,
             metadata: HashMap::from([("trace".into(), json!("abc"))]),
         };
 
@@ -120,6 +132,7 @@ mod tests {
             messages: vec![sample_message("newer")],
             model: "gpt-test".into(),
             created_at: 20,
+            insertion_index: 0,
             metadata: HashMap::new(),
         };
         let older = StoredSession {
@@ -128,6 +141,7 @@ mod tests {
             messages: vec![sample_message("older")],
             model: "gpt-test".into(),
             created_at: 10,
+            insertion_index: 0,
             metadata: HashMap::new(),
         };
 
@@ -138,5 +152,37 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].response_id, "resp_1");
         assert_eq!(sessions[1].response_id, "resp_2");
+    }
+
+    #[tokio::test]
+    async fn in_memory_session_store_breaks_created_at_ties_by_insertion_order() {
+        let store = InMemorySessionStore::default();
+        let first = StoredSession {
+            response_id: "resp_1".into(),
+            conversation_id: Some("conv_1".into()),
+            messages: vec![sample_message("first")],
+            model: "gpt-test".into(),
+            created_at: 10,
+            insertion_index: 0,
+            metadata: HashMap::new(),
+        };
+        let second = StoredSession {
+            response_id: "resp_2".into(),
+            conversation_id: Some("conv_1".into()),
+            messages: vec![sample_message("second")],
+            model: "gpt-test".into(),
+            created_at: 10,
+            insertion_index: 0,
+            metadata: HashMap::new(),
+        };
+
+        store.put_session(&first).await.unwrap();
+        store.put_session(&second).await.unwrap();
+
+        let sessions = store.get_by_conversation_id("conv_1").await.unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].response_id, "resp_1");
+        assert_eq!(sessions[1].response_id, "resp_2");
+        assert!(sessions[0].insertion_index < sessions[1].insertion_index);
     }
 }
