@@ -1,3 +1,9 @@
+use opentelemetry_semantic_conventions::attribute::{
+    GEN_AI_OPERATION_NAME, GEN_AI_REQUEST_MAX_TOKENS, GEN_AI_REQUEST_MODEL,
+    GEN_AI_REQUEST_STOP_SEQUENCES, GEN_AI_REQUEST_TEMPERATURE, GEN_AI_REQUEST_TOP_K,
+    GEN_AI_REQUEST_TOP_P, GEN_AI_RESPONSE_ID, GEN_AI_RESPONSE_MODEL, GEN_AI_USAGE_INPUT_TOKENS,
+    GEN_AI_USAGE_OUTPUT_TOKENS, SERVER_ADDRESS, SERVER_PORT, USER_ID,
+};
 use reqwest::Url;
 use serde_json::{Map, Value};
 
@@ -30,7 +36,7 @@ pub(in crate::proxy::handlers::messages) fn request_span_properties(
     let provider_semantics = provider.semantic_conventions();
     let input_messages = request_input_message_views(request);
     let mut properties = vec![
-        ("gen_ai.operation.name".into(), "chat".into()),
+        (GEN_AI_OPERATION_NAME.into(), "chat".into()),
         ("openinference.span.kind".into(), "LLM".into()),
         (
             "gen_ai.provider.name".into(),
@@ -40,9 +46,9 @@ pub(in crate::proxy::handlers::messages) fn request_span_properties(
             "llm.system".into(),
             provider_semantics.llm_system.to_string(),
         ),
-        ("gen_ai.request.model".into(), request.model.clone()),
+        (GEN_AI_REQUEST_MODEL.into(), request.model.clone()),
         (
-            "gen_ai.request.max_tokens".into(),
+            GEN_AI_REQUEST_MAX_TOKENS.into(),
             request.max_tokens.to_string(),
         ),
     ];
@@ -52,19 +58,19 @@ pub(in crate::proxy::handlers::messages) fn request_span_properties(
     }
 
     if let Some(value) = request.temperature {
-        properties.push(("gen_ai.request.temperature".into(), value.to_string()));
+        properties.push((GEN_AI_REQUEST_TEMPERATURE.into(), value.to_string()));
     }
 
     if let Some(value) = request.top_p {
-        properties.push(("gen_ai.request.top_p".into(), value.to_string()));
+        properties.push((GEN_AI_REQUEST_TOP_P.into(), value.to_string()));
     }
 
     if let Some(value) = request.top_k {
-        properties.push(("gen_ai.request.top_k".into(), value.to_string()));
+        properties.push((GEN_AI_REQUEST_TOP_K.into(), value.to_string()));
     }
 
     if let Some(value) = stop_sequences_json(request.stop_sequences.as_deref()) {
-        properties.push(("gen_ai.request.stop_sequences".into(), value));
+        properties.push((GEN_AI_REQUEST_STOP_SEQUENCES.into(), value));
     }
 
     if let Some(value) = request_invocation_parameters(request) {
@@ -77,7 +83,7 @@ pub(in crate::proxy::handlers::messages) fn request_span_properties(
         .and_then(|metadata| metadata.user_id.as_ref())
         .filter(|user_id| !user_id.is_empty())
     {
-        properties.push(("user.id".into(), user_id.clone()));
+        properties.push((USER_ID.into(), user_id.clone()));
     }
 
     append_openinference_message_properties(&mut properties, "llm.input_messages", &input_messages);
@@ -96,10 +102,10 @@ pub(in crate::proxy::handlers::messages) fn request_span_properties(
 
     if let Some(base_url) = base_url {
         if let Some(address) = base_url.host_str() {
-            properties.push(("server.address".into(), address.to_string()));
+            properties.push((SERVER_ADDRESS.into(), address.to_string()));
         }
         if let Some(port) = base_url.port_or_known_default() {
-            properties.push(("server.port".into(), port.to_string()));
+            properties.push((SERVER_PORT.into(), port.to_string()));
         }
     }
 
@@ -112,8 +118,8 @@ pub(in crate::proxy::handlers::messages) fn response_span_properties(
 ) -> Vec<(String, String)> {
     let output_messages = response_output_message_views(response);
     let mut properties = vec![
-        ("gen_ai.response.id".into(), response.id.clone()),
-        ("gen_ai.response.model".into(), response.model.clone()),
+        (GEN_AI_RESPONSE_ID.into(), response.id.clone()),
+        (GEN_AI_RESPONSE_MODEL.into(), response.model.clone()),
         ("llm.model_name".into(), response.model.clone()),
     ];
 
@@ -142,8 +148,8 @@ pub(in crate::proxy::handlers::messages) fn chunk_span_properties(
 
     match event {
         AnthropicStreamEvent::MessageStart { message } => {
-            properties.push(("gen_ai.response.id".into(), message.id.clone()));
-            properties.push(("gen_ai.response.model".into(), message.model.clone()));
+            properties.push((GEN_AI_RESPONSE_ID.into(), message.id.clone()));
+            properties.push((GEN_AI_RESPONSE_MODEL.into(), message.model.clone()));
             properties.push(("llm.model_name".into(), message.model.clone()));
             append_message_start_usage_properties(&mut properties, &message.usage);
         }
@@ -224,13 +230,13 @@ fn append_response_usage_properties(
 
     if usage.input_tokens.is_none() {
         let input_tokens = raw_input_tokens.to_string();
-        properties.push(("gen_ai.usage.input_tokens".into(), input_tokens.clone()));
+        properties.push((GEN_AI_USAGE_INPUT_TOKENS.into(), input_tokens.clone()));
         properties.push(("llm.token_count.prompt".into(), input_tokens));
     }
 
     if usage.output_tokens.is_none() {
         let output_tokens = raw_usage.output_tokens.to_string();
-        properties.push(("gen_ai.usage.output_tokens".into(), output_tokens.clone()));
+        properties.push((GEN_AI_USAGE_OUTPUT_TOKENS.into(), output_tokens.clone()));
         properties.push(("llm.token_count.completion".into(), output_tokens));
     }
 
@@ -304,13 +310,13 @@ fn append_message_usage_values(
 
     if let Some(input_tokens) = input_tokens {
         let input_tokens = input_tokens.to_string();
-        properties.push(("gen_ai.usage.input_tokens".into(), input_tokens.clone()));
+        properties.push((GEN_AI_USAGE_INPUT_TOKENS.into(), input_tokens.clone()));
         properties.push(("llm.token_count.prompt".into(), input_tokens));
     }
 
     if let Some(output_tokens) = output_tokens {
         let output_tokens = output_tokens.to_string();
-        properties.push(("gen_ai.usage.output_tokens".into(), output_tokens.clone()));
+        properties.push((GEN_AI_USAGE_OUTPUT_TOKENS.into(), output_tokens.clone()));
         properties.push(("llm.token_count.completion".into(), output_tokens));
     }
 

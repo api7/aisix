@@ -1,4 +1,7 @@
 use fastrace::prelude::Span;
+use opentelemetry_semantic_conventions::attribute::{
+    GEN_AI_RESPONSE_FINISH_REASONS, GEN_AI_USAGE_INPUT_TOKENS, GEN_AI_USAGE_OUTPUT_TOKENS,
+};
 
 use crate::gateway::types::common::Usage;
 
@@ -26,7 +29,7 @@ pub(crate) fn append_finish_reason_properties(
     }
 
     properties.push((
-        "gen_ai.response.finish_reasons".into(),
+        GEN_AI_RESPONSE_FINISH_REASONS.into(),
         serde_json::to_string(&finish_reasons).unwrap_or_default(),
     ));
 
@@ -38,13 +41,13 @@ pub(crate) fn append_finish_reason_properties(
 pub(crate) fn append_usage_properties(properties: &mut Vec<(String, String)>, usage: &Usage) {
     if let Some(input_tokens) = usage.input_tokens {
         let input_tokens = input_tokens.to_string();
-        properties.push(("gen_ai.usage.input_tokens".into(), input_tokens.clone()));
+        properties.push((GEN_AI_USAGE_INPUT_TOKENS.into(), input_tokens.clone()));
         properties.push(("llm.token_count.prompt".into(), input_tokens));
     }
 
     if let Some(output_tokens) = usage.output_tokens {
         let output_tokens = output_tokens.to_string();
-        properties.push(("gen_ai.usage.output_tokens".into(), output_tokens.clone()));
+        properties.push((GEN_AI_USAGE_OUTPUT_TOKENS.into(), output_tokens.clone()));
         properties.push(("llm.token_count.completion".into(), output_tokens));
     }
 

@@ -1,3 +1,11 @@
+use opentelemetry_semantic_conventions::attribute::{
+    GEN_AI_OPERATION_NAME, GEN_AI_OUTPUT_TYPE, GEN_AI_REQUEST_CHOICE_COUNT,
+    GEN_AI_REQUEST_FREQUENCY_PENALTY, GEN_AI_REQUEST_MAX_TOKENS, GEN_AI_REQUEST_MODEL,
+    GEN_AI_REQUEST_PRESENCE_PENALTY, GEN_AI_REQUEST_SEED, GEN_AI_REQUEST_STOP_SEQUENCES,
+    GEN_AI_REQUEST_TEMPERATURE, GEN_AI_REQUEST_TOP_K, GEN_AI_REQUEST_TOP_P, GEN_AI_RESPONSE_ID,
+    GEN_AI_RESPONSE_MODEL, GEN_AI_USAGE_INPUT_TOKENS, GEN_AI_USAGE_OUTPUT_TOKENS, SERVER_ADDRESS,
+    SERVER_PORT, USER_ID,
+};
 use reqwest::Url;
 use serde_json::{Map, Value};
 
@@ -35,7 +43,7 @@ pub(in crate::proxy::handlers::chat_completions) fn request_span_properties(
         .map(message_view_from_chat_message)
         .collect();
     let mut properties = vec![
-        ("gen_ai.operation.name".into(), "chat".into()),
+        (GEN_AI_OPERATION_NAME.into(), "chat".into()),
         ("openinference.span.kind".into(), "LLM".into()),
         (
             "gen_ai.provider.name".into(),
@@ -45,7 +53,7 @@ pub(in crate::proxy::handlers::chat_completions) fn request_span_properties(
             "llm.system".into(),
             provider_semantics.llm_system.to_string(),
         ),
-        ("gen_ai.request.model".into(), request.model.clone()),
+        (GEN_AI_REQUEST_MODEL.into(), request.model.clone()),
     ];
 
     if let Some(llm_provider) = provider_semantics.llm_provider {
@@ -53,46 +61,43 @@ pub(in crate::proxy::handlers::chat_completions) fn request_span_properties(
     }
 
     if let Some(choice_count) = request.n.filter(|count| *count != 1) {
-        properties.push((
-            "gen_ai.request.choice.count".into(),
-            choice_count.to_string(),
-        ));
+        properties.push((GEN_AI_REQUEST_CHOICE_COUNT.into(), choice_count.to_string()));
     }
 
     if let Some(seed) = request.seed {
-        properties.push(("gen_ai.request.seed".into(), seed.to_string()));
+        properties.push((GEN_AI_REQUEST_SEED.into(), seed.to_string()));
     }
 
     if let Some(max_tokens) = request.max_completion_tokens.or(request.max_tokens) {
-        properties.push(("gen_ai.request.max_tokens".into(), max_tokens.to_string()));
+        properties.push((GEN_AI_REQUEST_MAX_TOKENS.into(), max_tokens.to_string()));
     }
 
     if let Some(value) = request.frequency_penalty {
-        properties.push(("gen_ai.request.frequency_penalty".into(), value.to_string()));
+        properties.push((GEN_AI_REQUEST_FREQUENCY_PENALTY.into(), value.to_string()));
     }
 
     if let Some(value) = request.presence_penalty {
-        properties.push(("gen_ai.request.presence_penalty".into(), value.to_string()));
+        properties.push((GEN_AI_REQUEST_PRESENCE_PENALTY.into(), value.to_string()));
     }
 
     if let Some(value) = request.temperature {
-        properties.push(("gen_ai.request.temperature".into(), value.to_string()));
+        properties.push((GEN_AI_REQUEST_TEMPERATURE.into(), value.to_string()));
     }
 
     if let Some(value) = request.top_p {
-        properties.push(("gen_ai.request.top_p".into(), value.to_string()));
+        properties.push((GEN_AI_REQUEST_TOP_P.into(), value.to_string()));
     }
 
     if let Some(value) = numeric_extra_to_string(request.extra.get("top_k")) {
-        properties.push(("gen_ai.request.top_k".into(), value));
+        properties.push((GEN_AI_REQUEST_TOP_K.into(), value));
     }
 
     if let Some(value) = stop_sequences_json(request.stop.as_ref()) {
-        properties.push(("gen_ai.request.stop_sequences".into(), value));
+        properties.push((GEN_AI_REQUEST_STOP_SEQUENCES.into(), value));
     }
 
     if let Some(value) = response_format_output_type(request.response_format.as_ref()) {
-        properties.push(("gen_ai.output.type".into(), value.to_string()));
+        properties.push((GEN_AI_OUTPUT_TYPE.into(), value.to_string()));
     }
 
     if let Some(value) = request_invocation_parameters(request) {
@@ -100,7 +105,7 @@ pub(in crate::proxy::handlers::chat_completions) fn request_span_properties(
     }
 
     if let Some(user_id) = request.user.as_ref().filter(|user_id| !user_id.is_empty()) {
-        properties.push(("user.id".into(), user_id.clone()));
+        properties.push((USER_ID.into(), user_id.clone()));
     }
 
     append_openinference_message_properties(&mut properties, "llm.input_messages", &input_messages);
@@ -119,10 +124,10 @@ pub(in crate::proxy::handlers::chat_completions) fn request_span_properties(
 
     if let Some(base_url) = base_url {
         if let Some(address) = base_url.host_str() {
-            properties.push(("server.address".into(), address.to_string()));
+            properties.push((SERVER_ADDRESS.into(), address.to_string()));
         }
         if let Some(port) = base_url.port_or_known_default() {
-            properties.push(("server.port".into(), port.to_string()));
+            properties.push((SERVER_PORT.into(), port.to_string()));
         }
     }
 
@@ -135,8 +140,8 @@ pub(in crate::proxy::handlers::chat_completions) fn response_span_properties(
 ) -> Vec<(String, String)> {
     let output_messages = response_output_message_views(response);
     let mut properties = vec![
-        ("gen_ai.response.id".into(), response.id.clone()),
-        ("gen_ai.response.model".into(), response.model.clone()),
+        (GEN_AI_RESPONSE_ID.into(), response.id.clone()),
+        (GEN_AI_RESPONSE_MODEL.into(), response.model.clone()),
         ("llm.model_name".into(), response.model.clone()),
     ];
 
@@ -164,11 +169,11 @@ pub(in crate::proxy::handlers::chat_completions) fn chunk_span_properties(
     let mut properties = Vec::new();
 
     if !chunk.id.is_empty() {
-        properties.push(("gen_ai.response.id".into(), chunk.id.clone()));
+        properties.push((GEN_AI_RESPONSE_ID.into(), chunk.id.clone()));
     }
 
     if !chunk.model.is_empty() {
-        properties.push(("gen_ai.response.model".into(), chunk.model.clone()));
+        properties.push((GEN_AI_RESPONSE_MODEL.into(), chunk.model.clone()));
         properties.push(("llm.model_name".into(), chunk.model.clone()));
     }
 
@@ -297,13 +302,13 @@ fn append_response_usage_properties(
 
     if usage.input_tokens.is_none() {
         let input_tokens = raw_usage.prompt_tokens.to_string();
-        properties.push(("gen_ai.usage.input_tokens".into(), input_tokens.clone()));
+        properties.push((GEN_AI_USAGE_INPUT_TOKENS.into(), input_tokens.clone()));
         properties.push(("llm.token_count.prompt".into(), input_tokens));
     }
 
     if usage.output_tokens.is_none() {
         let output_tokens = raw_usage.completion_tokens.to_string();
-        properties.push(("gen_ai.usage.output_tokens".into(), output_tokens.clone()));
+        properties.push((GEN_AI_USAGE_OUTPUT_TOKENS.into(), output_tokens.clone()));
         properties.push(("llm.token_count.completion".into(), output_tokens));
     }
 

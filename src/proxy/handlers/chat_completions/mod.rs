@@ -13,6 +13,7 @@ use axum::{
 };
 use fastrace::prelude::{Event as TraceEvent, *};
 use log::error;
+use opentelemetry_semantic_conventions::attribute::GEN_AI_RESPONSE_FINISH_REASONS;
 use span_attributes::{
     StreamOutputCollector, apply_span_properties, chunk_span_properties, request_span_properties,
     response_span_properties, usage_span_properties,
@@ -72,7 +73,7 @@ pub async fn chat_completions(
     let provider_instance = create_provider_instance(gateway.as_ref(), &provider)?;
     let provider_base_url = provider_instance.effective_base_url().ok();
 
-    let span = Span::enter_with_local_parent("aisix.llm.chat_completion");
+    let span = Span::enter_with_local_parent("aisix.llm.chat_completions");
     apply_span_properties(
         &span,
         request_span_properties(
@@ -197,7 +198,7 @@ async fn handle_stream_request(
                         properties
                             .iter()
                             .filter(|(key, _)| {
-                                key == "gen_ai.response.finish_reasons"
+                                key == GEN_AI_RESPONSE_FINISH_REASONS
                                     || key == "llm.finish_reason"
                                     || key == "llm.token_count.completion_details.reasoning"
                             })
