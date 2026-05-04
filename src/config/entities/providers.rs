@@ -42,6 +42,10 @@ pub enum ProviderConfig {
     Xai(configs::XaiProviderConfig),
     #[serde(rename = "mistral")]
     Mistral(configs::MistralProviderConfig),
+    #[serde(rename = "modelscope")]
+    ModelScope(configs::ModelScopeProviderConfig),
+    #[serde(rename = "modelscope-cn")]
+    ModelScopeCn(configs::ModelScopeCnProviderConfig),
     #[serde(rename = "moonshotai")]
     MoonshotAi(configs::MoonshotAiProviderConfig),
     #[serde(rename = "moonshotai-cn")]
@@ -67,6 +71,8 @@ impl ProviderConfig {
             Self::Groq(_) => identifiers::GROQ,
             Self::Xai(_) => identifiers::XAI,
             Self::Mistral(_) => identifiers::MISTRAL,
+            Self::ModelScope(_) => identifiers::MODELSCOPE,
+            Self::ModelScopeCn(_) => identifiers::MODELSCOPE_CN,
             Self::MoonshotAi(_) => identifiers::MOONSHOT_AI,
             Self::MoonshotAiCn(_) => identifiers::MOONSHOT_AI_CN,
             Self::OpenAI(_) => identifiers::OPENAI,
@@ -192,6 +198,16 @@ mod tests {
     #[case::mistral_ok(json!({
         "name": "mistral-primary",
         "type": "mistral",
+        "config": { "api_key": "test_key" }
+    }), true, None)]
+    #[case::modelscope_ok(json!({
+        "name": "modelscope-primary",
+        "type": "modelscope",
+        "config": { "api_key": "test_key" }
+    }), true, None)]
+    #[case::modelscope_cn_ok(json!({
+        "name": "modelscope-cn-primary",
+        "type": "modelscope-cn",
         "config": { "api_key": "test_key" }
     }), true, None)]
     #[case::moonshotai_ok(json!({

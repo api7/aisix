@@ -45,6 +45,8 @@ export const PROVIDER_TYPE_VARIANTS = [
   'groq',
   'xai',
   'mistral',
+  'modelscope',
+  'modelscope-cn',
   'moonshotai',
   'moonshotai-cn',
   'zhipuai',
@@ -130,6 +132,16 @@ export type Provider =
   | {
       name: string;
       type: 'mistral';
+      config: ApiBaseProviderConfig;
+    }
+  | {
+      name: string;
+      type: 'modelscope';
+      config: ApiBaseProviderConfig;
+    }
+  | {
+      name: string;
+      type: 'modelscope-cn';
       config: ApiBaseProviderConfig;
     }
   | {

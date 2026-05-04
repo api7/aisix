@@ -8,6 +8,7 @@ pub mod gemini;
 pub mod groq;
 pub mod macros;
 pub mod mistral;
+pub mod modelscope;
 pub mod moonshot;
 pub mod openai;
 pub mod openrouter;
@@ -23,6 +24,7 @@ pub use fireworks::FireworksAi;
 pub use gemini::GoogleDef;
 pub use groq::Groq;
 pub use mistral::Mistral;
+pub use modelscope::{ModelScope, ModelScopeCn};
 pub use moonshot::{MoonshotAi, MoonshotAiCn};
 pub use openai::OpenAIDef;
 pub use openrouter::OpenRouter;
@@ -32,7 +34,7 @@ pub use zhipuai::ZhipuAi;
 pub mod identifiers {
     use super::{
         anthropic, azure, bedrock, cohere, deepseek, fireworks, gemini, groq, mistral, moonshot,
-        openai, openrouter, xai, zhipuai,
+        modelscope, openai, openrouter, xai, zhipuai,
     };
 
     pub const ANTHROPIC: &str = anthropic::IDENTIFIER;
@@ -44,6 +46,8 @@ pub mod identifiers {
     pub const GEMINI: &str = gemini::IDENTIFIER;
     pub const GROQ: &str = groq::IDENTIFIER;
     pub const MISTRAL: &str = mistral::IDENTIFIER;
+    pub const MODELSCOPE: &str = modelscope::IDENTIFIER;
+    pub const MODELSCOPE_CN: &str = modelscope::CN_IDENTIFIER;
     pub const MOONSHOT_AI: &str = moonshot::IDENTIFIER;
     pub const MOONSHOT_AI_CN: &str = moonshot::CN_IDENTIFIER;
     pub const OPENAI: &str = openai::IDENTIFIER;
@@ -63,6 +67,7 @@ pub mod configs {
         gemini::GeminiProviderConfig,
         groq::GroqProviderConfig,
         mistral::MistralProviderConfig,
+        modelscope::{ModelScopeCnProviderConfig, ModelScopeProviderConfig},
         moonshot::{MoonshotAiCnProviderConfig, MoonshotAiProviderConfig},
         openai::OpenAIProviderConfig,
         openrouter::OpenRouterProviderConfig,
@@ -84,6 +89,8 @@ pub fn default_provider_registry() -> Result<ProviderRegistry> {
         .register(GoogleDef)?
         .register(Groq)?
         .register(Mistral)?
+        .register(ModelScope)?
+        .register(ModelScopeCn)?
         .register(MoonshotAi)?
         .register(MoonshotAiCn)?
         .register(OpenAIDef)?
@@ -112,6 +119,8 @@ mod tests {
         assert_eq!(registry.get("gemini").unwrap().name(), "gemini");
         assert_eq!(registry.get("groq").unwrap().name(), "groq");
         assert_eq!(registry.get("mistral").unwrap().name(), "mistral");
+        assert_eq!(registry.get("modelscope").unwrap().name(), "modelscope");
+        assert_eq!(registry.get("modelscope-cn").unwrap().name(), "modelscope-cn");
         assert_eq!(registry.get("moonshotai").unwrap().name(), "moonshotai");
         assert_eq!(
             registry.get("moonshotai-cn").unwrap().name(),
