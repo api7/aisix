@@ -1,3 +1,7 @@
+mod responses;
+
+pub use responses::ResponsesApiFormat;
+
 use crate::gateway::{
     error::{GatewayError, Result},
     traits::{ChatFormat, NativeHandler, ProviderCapabilities},

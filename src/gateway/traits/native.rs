@@ -21,7 +21,9 @@ pub struct AnthropicMessagesNativeStreamState {
 /// Stateful data for native OpenAI Responses streaming transforms.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
-pub struct OpenAIResponsesNativeStreamState;
+pub struct OpenAIResponsesNativeStreamState {
+    pub usage: Usage,
+}
 
 /// Native Anthropic Messages support for providers that can bypass the hub format.
 pub trait NativeAnthropicMessagesSupport: ChatTransform {
