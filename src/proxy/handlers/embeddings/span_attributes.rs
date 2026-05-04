@@ -1,3 +1,7 @@
+use opentelemetry_semantic_conventions::attribute::{
+    GEN_AI_OPERATION_NAME, GEN_AI_REQUEST_ENCODING_FORMATS, GEN_AI_REQUEST_MODEL,
+    GEN_AI_RESPONSE_MODEL, SERVER_ADDRESS, SERVER_PORT, USER_ID,
+};
 use reqwest::Url;
 use serde_json::{Map, Value};
 
@@ -20,19 +24,19 @@ pub(super) fn request_span_properties(
     let provider_semantics = provider.semantic_conventions();
     let input_texts = request_input_texts(request);
     let mut properties = vec![
-        ("gen_ai.operation.name".into(), "embeddings".into()),
+        (GEN_AI_OPERATION_NAME.into(), "embeddings".into()),
         ("openinference.span.kind".into(), "EMBEDDING".into()),
         (
             "gen_ai.provider.name".into(),
             provider_semantics.gen_ai_provider_name.to_string(),
         ),
-        ("gen_ai.request.model".into(), request.model.clone()),
+        (GEN_AI_REQUEST_MODEL.into(), request.model.clone()),
         ("embedding.model_name".into(), request.model.clone()),
         ("input.mime_type".into(), "application/json".into()),
     ];
 
     if let Some(value) = encoding_formats_json(request.encoding_format.as_deref()) {
-        properties.push(("gen_ai.request.encoding_formats".into(), value));
+        properties.push((GEN_AI_REQUEST_ENCODING_FORMATS.into(), value));
     }
 
     if let Some(value) = embedding_invocation_parameters(request) {
@@ -44,7 +48,7 @@ pub(super) fn request_span_properties(
     }
 
     if let Some(user_id) = request.user.as_ref().filter(|user_id| !user_id.is_empty()) {
-        properties.push(("user.id".into(), user_id.clone()));
+        properties.push((USER_ID.into(), user_id.clone()));
     }
 
     for (index, text) in input_texts.iter().enumerate() {
@@ -56,10 +60,10 @@ pub(super) fn request_span_properties(
 
     if let Some(base_url) = base_url {
         if let Some(address) = base_url.host_str() {
-            properties.push(("server.address".into(), address.to_string()));
+            properties.push((SERVER_ADDRESS.into(), address.to_string()));
         }
         if let Some(port) = base_url.port_or_known_default() {
-            properties.push(("server.port".into(), port.to_string()));
+            properties.push((SERVER_PORT.into(), port.to_string()));
         }
     }
 
@@ -71,7 +75,7 @@ pub(super) fn response_span_properties(
     usage: &Usage,
 ) -> Vec<(String, String)> {
     let mut properties = vec![
-        ("gen_ai.response.model".into(), response.model.clone()),
+        (GEN_AI_RESPONSE_MODEL.into(), response.model.clone()),
         ("output.mime_type".into(), "application/json".into()),
     ];
 
@@ -200,7 +204,10 @@ mod tests {
             property_value(&properties, "embedding.embeddings.1.embedding.text"),
             Some("world")
         );
-        assert_eq!(property_value(&properties, "server.address"), Some("api.openai.com"));
+        assert_eq!(
+            property_value(&properties, "server.address"),
+            Some("api.openai.com")
+        );
         assert_eq!(property_value(&properties, "server.port"), Some("443"));
         assert_eq!(property_value(&properties, "llm.system"), None);
         assert_eq!(property_value(&properties, "llm.provider"), None);
@@ -269,8 +276,14 @@ mod tests {
             property_value(&properties, "gen_ai.embeddings.dimension.count"),
             Some("2")
         );
-        assert_eq!(property_value(&properties, "llm.token_count.prompt"), Some("8"));
-        assert_eq!(property_value(&properties, "llm.token_count.total"), Some("8"));
+        assert_eq!(
+            property_value(&properties, "llm.token_count.prompt"),
+            Some("8")
+        );
+        assert_eq!(
+            property_value(&properties, "llm.token_count.total"),
+            Some("8")
+        );
 
         let output_value: Value =
             serde_json::from_str(property_value(&properties, "output.value").unwrap()).unwrap();
