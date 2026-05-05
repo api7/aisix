@@ -55,13 +55,13 @@ jobs:
         run: cargo build -p aisix-admin-ui --features build-ui -vv
 
       - name: Run Lint
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build
         run: cargo build --locked
 
       - name: Run Test
-        run: cargo test --locked
+        run: cargo test --workspace --locked
 
       - name: Run E2E Test
         run: |
