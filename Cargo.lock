@@ -29,6 +29,7 @@ dependencies = [
 name = "aisix"
 version = "0.1.0"
 dependencies = [
+ "aisix-admin-ui",
  "aisix-llm",
  "anyhow",
  "arc-swap",
@@ -61,7 +62,6 @@ dependencies = [
  "logforth",
  "metrics",
  "metrics-exporter-otel",
- "mime_guess",
  "openssl",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -88,6 +88,19 @@ dependencies = [
  "uuid",
  "validator",
  "vergen-git2",
+]
+
+[[package]]
+name = "aisix-admin-ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assert_matches",
+ "axum",
+ "http 1.4.0",
+ "mime_guess",
+ "pretty_assertions",
+ "rust-embed",
 ]
 
 [[package]]

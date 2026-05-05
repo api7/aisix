@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/aisix-llm"]
+members = ["crates/aisix-llm", "crates/admin-ui"]
 resolver = "3"
 
 [workspace.package]
@@ -8,6 +8,7 @@ edition = "2024"
 rust-version = "1.85"
 
 [workspace.dependencies]
+anyhow = "1"
 async-trait = "0.1"
 assert_matches = "1.5"
 aws-credential-types = "1.2.14"
@@ -51,35 +52,42 @@ edition = "2024"
 rust-version = "1.85"
 
 [features]
-build-ui = []
+build-ui = ["aisix-admin-ui/build-ui"]
 
 [dependencies]
 aisix-llm = { path = "crates/aisix-llm" }
+aisix-admin-ui = { path = "crates/admin-ui" }
+anyhow.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+http.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+aws-credential-types.workspace = true
+aws-sigv4.workspace = true
+aws-smithy-eventstream.workspace = true
+aws-smithy-runtime-api.workspace = true
+aws-smithy-types.workspace = true
+futures.workspace = true
+bytes.workspace = true
+fastrace.workspace = true
+pin-project.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+utoipa.workspace = true
+percent-encoding.workspace = true
+
 log = { version = "0.4.29", features = ["kv", "kv_serde"] }
-tokio = { workspace = true }
-reqwest = { workspace = true }
 openssl = { version = "0.10.77" }
 tokio-openssl = "0.6"
 clap = { version = "4.6.0", features = ["derive"] }
 config = "0.15"
-http = { workspace = true }
 http-body = "1.0.1"
 http-body-util = "0.1.3"
-axum = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 etcd-client = { version = "0.18.0", features = ["tls-openssl"] }
-async-trait = { workspace = true }
-aws-credential-types = { workspace = true }
-aws-sigv4 = { workspace = true }
-aws-smithy-eventstream = { workspace = true }
-aws-smithy-runtime-api = { workspace = true }
-aws-smithy-types = { workspace = true }
-futures = { workspace = true }
-bytes = { workspace = true }
 arc-swap = "1"
-anyhow = "1"
-fastrace = { workspace = true }
 fastrace-axum = "0.2.0"
 fastrace-opentelemetry = "0.17.0"
 opentelemetry = "0.31.0"
@@ -109,23 +117,18 @@ opentelemetry-semantic-conventions = { version = "0.31.0", features = [
 ] }
 metrics = "0.24.2"
 metrics-exporter-otel = "0.3.0"
-pin-project = { workspace = true }
 dashmap = "6.1.0"
-thiserror = { workspace = true }
 skp-ratelimit = { git = "https://github.com/bzp2010/skp-ratelimit.git", branch = "bzp/feat-custom-cost", default-features = false, features = [
   "memory",
 ] }
 rand = "0.10.1"
 jsonschema = { version = "0.46.0", default-features = false }
-uuid = { workspace = true }
-utoipa = { workspace = true }
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 rust-embed = { version = "8.11.0", default-features = false, features = [
   "axum-ex",
   "debug-embed",
   "deterministic-timestamps",
 ] }
-mime_guess = "2.0.5"
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
 validator = { version = "0.20", features = ["derive"] }
 axum-server = { version = "0.8.0", default-features = false, features = [
@@ -134,16 +137,15 @@ axum-server = { version = "0.8.0", default-features = false, features = [
 backon = { version = "1.6.0", default-features = false, features = [
   "tokio-sleep",
 ] }
-percent-encoding = { workspace = true }
 
 [build-dependencies]
 vergen-git2 = { version = "9.1.0" }
 anyhow = "1"
 
 [dev-dependencies]
+assert_matches.workspace = true
+pretty_assertions.workspace = true
 tokio-test = "0.4"
-assert_matches = { workspace = true }
-pretty_assertions = { workspace = true }
 rstest = "0.26"
 tempfile = "3"
 

@@ -1,0 +1,26 @@
+[package]
+name = "aisix-admin-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+build-ui = []
+
+[dependencies]
+axum.workspace = true
+http.workspace = true
+mime_guess = "2.0.5"
+rust-embed = { version = "8.11.0", default-features = false, features = [
+  "axum-ex",
+  "debug-embed",
+  "deterministic-timestamps",
+] }
+
+[dev-dependencies]
+axum.workspace = true
+assert_matches.workspace = true
+pretty_assertions.workspace = true
+
+[build-dependencies]
+anyhow.workspace = true

@@ -5,7 +5,7 @@ use rust_embed::Embed;
 const UI_INDEX_HTML: &str = "index.html";
 
 #[derive(Embed)]
-#[folder = "ui/dist/"]
+#[folder = "ui-dist/"]
 struct Assets;
 
 pub async fn handler(uri: Uri) -> Response {

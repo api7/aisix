@@ -3,7 +3,6 @@ mod models;
 mod playground;
 mod providers;
 mod types;
-mod ui;
 
 use std::sync::Arc;
 
@@ -147,8 +146,8 @@ pub fn create_router(state: AppState) -> Router {
             Router::new().route("/chat/completions", post(playground::chat_completions)),
         )
         .route("/ui", get(|| async { Redirect::to("/ui/") }))
-        .route("/ui/", get(ui::handler))
-        .route("/ui/{*path}", get(ui::handler))
+        .route("/ui/", get(aisix_admin_ui::handler))
+        .route("/ui/{*path}", get(aisix_admin_ui::handler))
         .merge(Scalar::with_url("/openapi", ApiDoc::openapi()))
         .with_state(state)
 }

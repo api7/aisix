@@ -7,8 +7,7 @@
 
 # Node.js/TypeScript/Vite
 node_modules/
-ui/node_modules/
-ui/dist/
+ui-dist/
 ui/.vite/
 ui/.cache/
 *.tsbuildinfo
