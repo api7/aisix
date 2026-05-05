@@ -2,9 +2,9 @@ name: Build
 
 on:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
   pull_request:
-    branches: ["main"]
+    branches: [ "main" ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,7 +27,7 @@ jobs:
         with:
           node-version: lts/*
           cache: "pnpm"
-          cache-dependency-path: ui/pnpm-lock.yaml
+          cache-dependency-path: crates/admin-ui/ui/pnpm-lock.yaml
 
       - name: Setup Rust toolchain
         run: rustup toolchain install stable --profile minimal
@@ -43,7 +43,8 @@ jobs:
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # 5.0.4
         with:
           path: ui/dist
-          key: ui-dist-${{ hashFiles('ui/src/**', 'ui/index.html', 'ui/vite.config.ts', 'ui/tsconfig*.json', 'ui/package.json', 'ui/pnpm-lock.yaml') }}
+          key: ui-dist-${{ hashFiles('ui/src/**', 'ui/index.html', 'ui/vite.config.ts',
+            'ui/tsconfig*.json', 'ui/package.json', 'ui/pnpm-lock.yaml') }}
 
       - name: Build UI
         if: steps.ui-cache.outputs.cache-hit != 'true'
