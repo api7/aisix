@@ -42,15 +42,17 @@ jobs:
         id: ui-cache
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # 5.0.4
         with:
-          path: ui/dist
-          key: ui-dist-${{ hashFiles('ui/src/**', 'ui/index.html', 'ui/vite.config.ts',
-            'ui/tsconfig*.json', 'ui/package.json', 'ui/pnpm-lock.yaml') }}
+          path: crates/admin-ui/ui-dist
+          key: ui-dist-${{ hashFiles('crates/admin-ui/ui/src/**',
+            'crates/admin-ui/ui/index.html',
+            'crates/admin-ui/ui/vite.config.ts',
+            'crates/admin-ui/ui/tsconfig*.json',
+            'crates/admin-ui/ui/package.json',
+            'crates/admin-ui/ui/pnpm-lock.yaml') }}
 
       - name: Build UI
         if: steps.ui-cache.outputs.cache-hit != 'true'
-        run: |
-          pnpm -C ui install --frozen-lockfile
-          pnpm -C ui build
+        run: cargo build -p aisix-admin-ui --features build-ui -vv
 
       - name: Run Lint
         run: cargo clippy --all-targets --locked -- -D warnings
