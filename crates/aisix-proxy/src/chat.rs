@@ -104,6 +104,8 @@ pub async fn chat_completions(
                     finish_reason: success.finish_reason.clone(),
                     bypass_reason: success.bypass_reason.clone().unwrap_or_default(),
                     cache_status: success.cache_status.as_str().to_string(),
+                    cache_hit_saved_input_tokens: success.cache_hit_saved_input_tokens,
+                    cache_hit_saved_output_tokens: success.cache_hit_saved_output_tokens,
                 },
                 success.cost_usd,
                 /* guardrail_blocked */ false,
@@ -244,6 +246,14 @@ struct Success {
     /// the dashboard's /logs column. See `aisix-core::CachePolicy`
     /// (Stage 2) and `aisix-cache::Cache` for the source of truth.
     cache_status: CacheStatus,
+    /// On a cache HIT, the prompt + completion tokens of the cached
+    /// response — the work the upstream would have repeated had the
+    /// cache not served the request. Both 0 on miss / disabled. cp-api
+    /// multiplies these by its pricing catalog to derive
+    /// `cost_saved_usd` on ingestion (matches the existing `cost_usd`
+    /// pattern: DP records tokens, cp-api owns pricing). See #88.
+    cache_hit_saved_input_tokens: u32,
+    cache_hit_saved_output_tokens: u32,
 }
 
 /// Cache decision attached to every successful request. Wire shape
@@ -434,6 +444,8 @@ async fn dispatch(
             // crates/aisix-cache/src/lib.rs and Phase 2 above. Always
             // surface as `disabled` on the streaming path.
             cache_status: CacheStatus::Disabled,
+            cache_hit_saved_input_tokens: 0,
+            cache_hit_saved_output_tokens: 0,
         });
     }
 
@@ -540,6 +552,14 @@ async fn dispatch(
                     cost_usd: 0.0,
                     bypass_reason: bypass_reason.clone(),
                     cache_status: CacheStatus::Hit,
+                    // The whole point of #88: cache hit replays the
+                    // upstream's prompt + completion tokens. Surfacing
+                    // them as a dedicated counter (rather than relying
+                    // on the existing prompt_tokens column + cache_status
+                    // filter) lets cp-api compute `cost_saved_usd`
+                    // without joining on the status enum.
+                    cache_hit_saved_input_tokens: prompt.try_into().unwrap_or(u32::MAX),
+                    cache_hit_saved_output_tokens: completion.try_into().unwrap_or(u32::MAX),
                 });
             }
             Ok(None) => {}
@@ -689,6 +709,10 @@ async fn dispatch(
         cost_usd,
         bypass_reason,
         cache_status,
+        // Cache-saved counters are zero on the upstream-served path —
+        // the request *did* hit the upstream, no work was saved.
+        cache_hit_saved_input_tokens: 0,
+        cache_hit_saved_output_tokens: 0,
     })
 }
 
@@ -763,6 +787,8 @@ fn emit_usage_event(
         guardrail_blocked,
         guardrail_bypassed_reason: extras.bypass_reason,
         cache_status: extras.cache_status,
+        cache_hit_saved_input_tokens: extras.cache_hit_saved_input_tokens,
+        cache_hit_saved_output_tokens: extras.cache_hit_saved_output_tokens,
     };
     state.usage_sink.try_emit(event.clone());
     // Per-env OTLP/HTTP fan-out. The snapshot's exporter table is
@@ -801,6 +827,11 @@ struct UsageExtras {
     /// Empty default for the error path where the cache lookup never
     /// fired. Goes onto `dpmgr_usage_events.cache_status`.
     cache_status: String,
+    /// On a cache HIT, the cached response's prompt + completion
+    /// tokens. Zero otherwise. cp-api derives `cost_saved_usd` on
+    /// ingest from these + its pricing catalog (see #88).
+    cache_hit_saved_input_tokens: u32,
+    cache_hit_saved_output_tokens: u32,
 }
 
 fn record_error(metrics: &Metrics, err: &ProxyError, model: &str, status: u16, elapsed: Duration) {

@@ -147,6 +147,24 @@ pub struct UsageEvent {
     /// `aisix_proxy::chat::CacheStatus::as_str`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cache_status: String,
+
+    /// On a cache HIT, the prompt tokens of the cached response — i.e.
+    /// the input tokens the request *would* have spent on the upstream
+    /// if the cache hadn't served it. Zero on miss / disabled / error.
+    ///
+    /// cp-api derives `cost_saved_usd` server-side by multiplying these
+    /// counters by the model's pricing (same pattern as `cost_usd` on
+    /// non-cache rows — the DP doesn't own the pricing catalog).
+    /// Surfacing tokens (not USD) here keeps pricing changes a cp-api-
+    /// only deploy and lets the dashboard show "tokens saved" too.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub cache_hit_saved_input_tokens: u32,
+
+    /// On a cache HIT, the completion tokens of the cached response.
+    /// Zero on miss / disabled / error. See `cache_hit_saved_input_tokens`
+    /// for the full pricing-derivation story.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub cache_hit_saved_output_tokens: u32,
 }
 
 #[inline]

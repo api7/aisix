@@ -762,6 +762,80 @@ data: [DONE]\n\n";
         assert_eq!(v["choices"][0]["message"]["content"], "cached");
     }
 
+    /// Regression for #88. On a cache hit the DP must surface the
+    /// cached response's prompt + completion tokens on a dedicated
+    /// `cache_hit_saved_*` pair so cp-api can multiply by its pricing
+    /// catalog server-side and report `cost_saved_usd` on `/usage`.
+    /// Miss rows must keep the saved counters at zero.
+    #[tokio::test]
+    async fn cache_hit_emits_saved_token_counters_on_telemetry_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "cached"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 11, "total_tokens": 18}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        seed_cache_policy(&snap, "test-cache");
+        let state = build_state_with_cache(snap, hub).with_usage_sink(UsageSink::new(tx));
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // Miss: saved counters must be zero (the request paid the upstream).
+        let _ = run(build_router(state.clone()), make_req()).await;
+        let miss_event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("miss event was never emitted")
+            .expect("sender dropped");
+        assert_eq!(miss_event.cache_status, "miss");
+        assert_eq!(miss_event.cache_hit_saved_input_tokens, 0);
+        assert_eq!(miss_event.cache_hit_saved_output_tokens, 0);
+
+        // Hit: saved counters must mirror the cached response's usage.
+        let _ = run(build_router(state), make_req()).await;
+        let hit_event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("hit event was never emitted")
+            .expect("sender dropped");
+        assert_eq!(hit_event.cache_status, "hit");
+        assert_eq!(hit_event.cache_hit_saved_input_tokens, 7);
+        assert_eq!(hit_event.cache_hit_saved_output_tokens, 11);
+        // `prompt_tokens` keeps mirroring the cached usage too — the
+        // existing dashboard rollups stay correct. The new field is
+        // additive, not a substitute.
+        assert_eq!(hit_event.prompt_tokens, 7);
+        assert_eq!(hit_event.completion_tokens, 11);
+    }
+
     #[tokio::test]
     async fn cache_miss_when_request_payload_differs() {
         let upstream = MockServer::start().await;
