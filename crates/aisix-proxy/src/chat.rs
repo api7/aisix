@@ -438,18 +438,25 @@ async fn dispatch(
     }
 
     // Policy gate: the cache is only consulted when at least one
-    // enabled `CachePolicy` exists in the snapshot for this env. cp-api
-    // owns the policy CRUD surface (`/api/environments/:env/cache_policies`,
-    // see Stage 1 — PR #134); kine fans out the rows; the loader
-    // populates `snapshot.cache_policies` (see aisix-etcd). Stage 2
-    // honors only the existence + `enabled` flag. Stage 3 will parse
-    // `applies_to` (currently treated as "all") + per-policy
-    // `ttl_seconds` (currently the cache backend's global TTL).
-    let cache_active_by_policy = snapshot
-        .cache_policies
-        .entries()
-        .iter()
-        .any(|entry| entry.value.enabled);
+    // enabled `CachePolicy` whose `applies_to` matches THIS request
+    // exists in the snapshot. cp-api owns the policy CRUD surface
+    // (`/api/environments/:env/cache_policies`, see Stage 1 PR #134);
+    // kine fans out the rows; the loader populates
+    // `snapshot.cache_policies` (see aisix-etcd).
+    //
+    // Match grammar (see CachePolicy::applies_to_request):
+    //   - "all" / ""       — every request in the env
+    //   - "model:<name>"   — only when the resolved model name matches
+    //   - "api_key:<id>"   — only when the authenticated key id matches
+    //
+    // Per-policy `ttl_seconds` still falls back to the cache backend's
+    // global TTL — that gap is tracked in P0b (moka Expiry trait).
+    let req_model = req.model.as_str();
+    let api_key_id = auth.entry.id.as_str();
+    let cache_active_by_policy =
+        snapshot.cache_policies.entries().iter().any(|entry| {
+            entry.value.enabled && entry.value.applies_to_request(req_model, api_key_id)
+        });
 
     // Cache lookup keyed on the *virtual* model name so a re-request
     // hits the cache regardless of which target served the original.

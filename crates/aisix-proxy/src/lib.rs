@@ -175,11 +175,18 @@ mod tests {
 
     /// Insert a default-enabled cache policy on the snapshot so the
     /// proxy's cache gate (chat::dispatch) opens the lookup path.
-    /// Stage 2 honors only existence + `enabled`; the rest of the
-    /// fields exist on the wire so cp-api's contract round-trips
-    /// through serde even though the DP doesn't act on them yet.
+    /// Stage 2 honors existence + `enabled`; Stage 3 (this PR) also
+    /// honors `applies_to` (defaults to `"all"` here).
     fn seed_cache_policy(snap: &AisixSnapshot, name: &str) {
-        let cfg = format!(r#"{{"name": "{name}", "backend": "memory"}}"#);
+        seed_cache_policy_with_applies_to(snap, name, "all");
+    }
+
+    /// Like `seed_cache_policy` but lets the caller pin `applies_to`.
+    /// Used by the matcher tests to verify that a policy with a
+    /// non-matching scope leaves the cache disabled.
+    fn seed_cache_policy_with_applies_to(snap: &AisixSnapshot, name: &str, applies_to: &str) {
+        let cfg =
+            format!(r#"{{"name": "{name}", "backend": "memory", "applies_to": "{applies_to}"}}"#);
         let policy: aisix_core::models::CachePolicy = serde_json::from_str(&cfg).unwrap();
         snap.cache_policies
             .insert(ResourceEntry::new("cache-policy-id-1", policy, 1));
@@ -808,6 +815,127 @@ data: [DONE]\n\n";
                 Some("miss"),
             );
         }
+    }
+
+    /// `applies_to` matcher: a policy scoped to a *different* model
+    /// must NOT open the cache gate for our request. Same-payload
+    /// requests therefore both miss (and both forward to the upstream
+    /// — the wiremock's `expect(2)` enforces it).
+    #[tokio::test]
+    async fn cache_disabled_when_applies_to_targets_other_model() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            // Two identical payloads → expect TWO upstream calls, NOT
+            // one + a cache replay. If the matcher regresses to "any
+            // enabled policy → cache opens" the second call would be
+            // intercepted and this expectation would fail.
+            .expect(2)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        // Policy targets a DIFFERENT model name. The seeded request
+        // uses model="my-gpt4", so this policy's applies_to=model:gpt-4o
+        // must NOT match → cache stays disabled.
+        seed_cache_policy_with_applies_to(&snap, "scoped-cache", "model:gpt-4o");
+        let state = build_state_with_cache(snap, hub);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // Both requests must succeed AND both must lack the cache
+        // header (policy-disabled path emits no x-aisix-cache).
+        let r1 = run(build_router(state.clone()), make_req()).await;
+        let r2 = run(build_router(state), make_req()).await;
+        for r in [r1, r2] {
+            assert_eq!(r.status(), StatusCode::OK);
+            assert!(
+                r.headers().get("x-aisix-cache").is_none(),
+                "applies_to mismatch must leave the cache header absent",
+            );
+        }
+    }
+
+    /// Mirror of the test above but with `applies_to=model:my-gpt4`,
+    /// which DOES target the seeded request's model. Cache must engage
+    /// — same behaviour as the unscoped `applies_to=all` case.
+    #[tokio::test]
+    async fn cache_engages_when_applies_to_matches_request_model() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "scoped"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1) // exactly one upstream hit; second request hits cache
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        seed_cache_policy_with_applies_to(&snap, "scoped-cache", "model:my-gpt4");
+        let state = build_state_with_cache(snap, hub);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let r1 = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(
+            r1.headers()
+                .get("x-aisix-cache")
+                .and_then(|v| v.to_str().ok()),
+            Some("miss"),
+        );
+        let r2 = run(build_router(state), make_req()).await;
+        assert_eq!(
+            r2.headers()
+                .get("x-aisix-cache")
+                .and_then(|v| v.to_str().ok()),
+            Some("hit"),
+        );
     }
 
     /// Build a `ResourceEntry<Model>` with a non-default id so the test

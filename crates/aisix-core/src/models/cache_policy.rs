@@ -123,6 +123,38 @@ impl CachePolicy {
         self.runtime_id = id.into();
         self
     }
+
+    /// Returns true when this policy's `applies_to` string targets the
+    /// given (model name, api_key uuid) pair.
+    ///
+    /// Grammar:
+    /// - `""` or `"all"` — matches every request
+    /// - `"model:<display_name>"` — matches when the request's
+    ///   resolved model name is exactly `<display_name>`
+    /// - `"api_key:<uuid>"` — matches when the authenticated
+    ///   ApiKey row's id is `<uuid>`
+    /// - anything else — **does not match anything**
+    ///
+    /// The "unknown prefix → no match" default is deliberately strict.
+    /// cp-api accepts any non-empty string today, so an operator who
+    /// writes `applies_to = "production"` (a free-form label) would
+    /// have silently been treated as "all" pre-Stage-3. Strict feedback
+    /// (cache stays disabled, dashboard's `cache_status="disabled"`
+    /// surfaces it) is safer than silently caching every request in
+    /// the env.
+    pub fn applies_to_request(&self, model_name: &str, api_key_id: &str) -> bool {
+        let s = self.applies_to.as_str().trim();
+        if s.is_empty() || s == "all" {
+            return true;
+        }
+        if let Some(rest) = s.strip_prefix("model:") {
+            return rest == model_name;
+        }
+        if let Some(rest) = s.strip_prefix("api_key:") {
+            return rest == api_key_id;
+        }
+        false
+    }
 }
 
 #[cfg(test)]
@@ -189,5 +221,57 @@ mod tests {
         });
         let p: CachePolicy = serde_json::from_value(v).unwrap();
         assert_eq!(p.name, "future");
+    }
+
+    fn policy_with_applies_to(s: &str) -> CachePolicy {
+        let mut p: CachePolicy =
+            serde_json::from_value(json!({"name": "x", "backend": "memory"})).unwrap();
+        p.applies_to = s.to_string();
+        p
+    }
+
+    #[test]
+    fn applies_to_all_matches_everything() {
+        assert!(policy_with_applies_to("all").applies_to_request("gpt-4o", "ak-1"));
+        assert!(policy_with_applies_to("").applies_to_request("anything", ""));
+        // Whitespace-only also collapses to All — operators paste freely.
+        assert!(policy_with_applies_to("   ").applies_to_request("gpt-4o", "ak-1"));
+    }
+
+    #[test]
+    fn applies_to_model_matches_only_exact_name() {
+        let p = policy_with_applies_to("model:gpt-4o");
+        assert!(p.applies_to_request("gpt-4o", "any-key"));
+        assert!(!p.applies_to_request("gpt-4o-mini", "any-key"));
+        assert!(!p.applies_to_request("", "any-key"));
+        // Case sensitive — Bedrock/OpenAI model ids are case-sensitive
+        // upstream so we don't normalise here.
+        assert!(!p.applies_to_request("GPT-4O", "any-key"));
+    }
+
+    #[test]
+    fn applies_to_api_key_matches_only_exact_uuid() {
+        let p = policy_with_applies_to("api_key:11111111-2222-3333-4444-555555555555");
+        assert!(p.applies_to_request("any-model", "11111111-2222-3333-4444-555555555555"));
+        assert!(!p.applies_to_request("any-model", "other-uuid"));
+        assert!(!p.applies_to_request("any-model", ""));
+    }
+
+    #[test]
+    fn applies_to_unknown_prefix_matches_nothing() {
+        // Strict: free-form labels like "production" or "team:foo" no
+        // longer accidentally cache every request in the env.
+        // Operators see cache_status=disabled and learn to fix it.
+        let p = policy_with_applies_to("production");
+        assert!(!p.applies_to_request("gpt-4o", "ak-1"));
+
+        let p = policy_with_applies_to("team:platform");
+        assert!(!p.applies_to_request("gpt-4o", "ak-1"));
+
+        let p = policy_with_applies_to("model:");
+        // Empty model name: only matches a request with literally
+        // empty model name (which the proxy rejects upstream anyway).
+        assert!(p.applies_to_request("", "ak-1"));
+        assert!(!p.applies_to_request("gpt-4o", "ak-1"));
     }
 }
