@@ -145,11 +145,11 @@ pub struct ChatStreamState {
 
 #[cfg(test)]
 mod tests {
-    use assert_matches::assert_matches;
-    use pretty_assertions::assert_eq;
     use std::borrow::Cow;
 
+    use assert_matches::assert_matches;
     use http::HeaderMap;
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     use super::{ChatFormat, ChatStreamState, ToolCallAccumulator};

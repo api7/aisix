@@ -138,11 +138,11 @@ impl<F: ChatFormat> PinnedDrop for BridgedStream<F> {
 
 #[cfg(test)]
 mod tests {
-    use pretty_assertions::assert_eq;
     use std::sync::Arc;
 
     use futures::StreamExt;
     use http::HeaderMap;
+    use pretty_assertions::assert_eq;
     use serde_json::Value;
     use tokio::sync::oneshot;
 

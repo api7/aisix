@@ -181,8 +181,8 @@ fn gateway_error_type(error: &GatewayError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use pretty_assertions::assert_eq;
     use http::StatusCode;
+    use pretty_assertions::assert_eq;
     use serde_json::json;
 
     use super::{gateway_error_message, gateway_error_type};

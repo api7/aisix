@@ -112,15 +112,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(global.name(), "modelscope");
-        assert_eq!(global.default_base_url(), "https://api-inference.modelscope.ai/v1");
-        assert_eq!(global_headers["authorization"], "Bearer modelscope-global-key");
+        assert_eq!(
+            global.default_base_url(),
+            "https://api-inference.modelscope.ai/v1"
+        );
+        assert_eq!(
+            global_headers["authorization"],
+            "Bearer modelscope-global-key"
+        );
         assert_eq!(
             global.build_url(global.default_base_url(), "ignored"),
             "https://api-inference.modelscope.ai/v1/chat/completions"
         );
 
         assert_eq!(cn.name(), "modelscope-cn");
-        assert_eq!(cn.default_base_url(), "https://api-inference.modelscope.cn/v1");
+        assert_eq!(
+            cn.default_base_url(),
+            "https://api-inference.modelscope.cn/v1"
+        );
         assert_eq!(cn_headers["authorization"], "Bearer modelscope-cn-key");
         assert_eq!(
             cn.build_url(cn.default_base_url(), "ignored"),
