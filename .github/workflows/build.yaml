@@ -48,7 +48,8 @@ jobs:
             'crates/admin-ui/ui/vite.config.ts',
             'crates/admin-ui/ui/tsconfig*.json',
             'crates/admin-ui/ui/package.json',
-            'crates/admin-ui/ui/pnpm-lock.yaml') }}
+            'crates/admin-ui/ui/pnpm-lock.yaml', 'crates/admin-ui/build.rs',
+            'crates/admin-ui/Cargo.toml') }}
 
       - name: Build UI
         if: steps.ui-cache.outputs.cache-hit != 'true'
