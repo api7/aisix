@@ -1,0 +1,31 @@
+[package]
+name = "aisix-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+http.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+aws-credential-types.workspace = true
+aws-sigv4.workspace = true
+aws-smithy-eventstream.workspace = true
+aws-smithy-runtime-api.workspace = true
+aws-smithy-types.workspace = true
+futures.workspace = true
+fastrace.workspace = true
+pin-project.workspace = true
+thiserror.workspace = true
+percent-encoding.workspace = true
+utoipa.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+assert_matches.workspace = true
+pretty_assertions.workspace = true
