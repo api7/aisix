@@ -447,22 +447,26 @@ async fn dispatch(
     // and the semantic backends.
     //
     // Match order: first enabled policy whose `parsed_applies_to()`
-    // accepts (req.model, auth.entry.id) wins. Iteration order on a
-    // ResourceTable isn't stable, but the first-match-wins rule is
-    // deterministic enough for the cache_status / x-aisix-cache header
-    // to stay stable across requests; ties only matter when an env
-    // legitimately has overlapping policies.
-    let cache_active_by_policy = snapshot
+    // accepts (req.model, auth.entry.id) wins. We grab the WHOLE
+    // matching entry (not just `any`) so the post-call write below
+    // can use that policy's `ttl_seconds` via `put_with_ttl`. When
+    // multiple policies match the same request, the entry-table
+    // iteration order decides — that's an unspecified-but-stable
+    // tiebreak we'll formalise (probably "narrowest scope wins") in a
+    // follow-up if operators ever care.
+    let matched_policy_ttl = snapshot
         .cache_policies
         .entries()
         .iter()
-        .any(|entry| {
+        .find(|entry| {
             entry.value.enabled
                 && entry
                     .value
                     .parsed_applies_to()
                     .matches(&req.model, &auth.entry.id)
-        });
+        })
+        .map(|entry| Duration::from_secs(u64::from(entry.value.ttl_seconds)));
+    let cache_active_by_policy = matched_policy_ttl.is_some();
 
     // Cache lookup keyed on the *virtual* model name so a re-request
     // hits the cache regardless of which target served the original.
@@ -641,15 +645,19 @@ async fn dispatch(
     }
 
     // Cache write is gated on the same policy as the lookup at the
-    // top of dispatch — without an enabled cache_policy in snapshot,
-    // we skip both read AND write so the cache backend doesn't fill
-    // up with entries that no policy ever asked for.
-    if let (true, Some(cache), Some(key)) = (
-        cache_active_by_policy,
-        state.cache.as_ref(),
-        cache_key.as_ref(),
-    ) {
-        if let Err(err) = cache.put(key, upstream.clone()).await {
+    // top of dispatch — without a matching enabled cache_policy in
+    // snapshot, we skip both read AND write so the cache backend
+    // doesn't fill up with entries that no policy ever asked for.
+    //
+    // `matched_policy_ttl` carries the policy's `ttl_seconds`; we feed
+    // it to `put_with_ttl` so each entry expires per its own policy,
+    // not the cache backend's global fallback. Backends without
+    // per-entry support (defined via `Cache::put_with_ttl`'s default
+    // impl) silently fall back to `put`.
+    if let (Some(ttl), Some(cache), Some(key)) =
+        (matched_policy_ttl, state.cache.as_ref(), cache_key.as_ref())
+    {
+        if let Err(err) = cache.put_with_ttl(key, upstream.clone(), ttl).await {
             tracing::warn!(error = %err, key = %key, "cache write failed");
         }
     }

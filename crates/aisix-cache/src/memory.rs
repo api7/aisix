@@ -1,30 +1,63 @@
 //! In-memory backend backed by `moka`.
 //!
-//! TTL is per-cache (set at construction); per-entry overrides are not
-//! supported by moka's TTL eviction strategy, which fits our model —
-//! every entry expires the same way.
+//! TTL strategy:
+//! - The constructor's `ttl` argument is the **fallback** TTL — used
+//!   when the proxy calls `put` (no per-policy override available).
+//! - When the proxy calls `put_with_ttl` it ships the matching
+//!   `CachePolicy::ttl_seconds`. Each entry then expires according to
+//!   its own policy. moka's `Expiry` trait reads the per-entry TTL
+//!   we stash next to the response.
 
 use aisix_gateway::ChatResponse;
 use async_trait::async_trait;
 use moka::future::Cache as MokaCache;
-use std::time::Duration;
+use moka::Expiry;
+use std::time::{Duration, Instant};
 
 use crate::cache::{Cache, CacheError};
 
 pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
 pub const DEFAULT_CAPACITY: u64 = 10_000;
 
+/// What we actually store inside moka — the response plus the TTL the
+/// caller asked for. The Expiry impl below reads the second field on
+/// `expire_after_create` to set the per-entry deadline.
+#[derive(Debug, Clone)]
+struct Entry {
+    response: ChatResponse,
+    ttl: Duration,
+}
+
 #[derive(Debug)]
 pub struct MemoryCache {
-    inner: MokaCache<String, ChatResponse>,
+    inner: MokaCache<String, Entry>,
+    /// Fallback TTL used by the no-override `put` path. Kept for the
+    /// `ttl()` accessor + tests; not consulted by the Expiry impl.
     ttl: Duration,
+}
+
+/// Per-entry expiry that defers to the value's stashed `ttl`.
+/// `expire_after_read` / `expire_after_update` return `None` so reads
+/// don't extend an entry's life (semantic is "expires N seconds from
+/// insert", not "expires N seconds from last access").
+struct PerEntryExpiry;
+
+impl Expiry<String, Entry> for PerEntryExpiry {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &Entry,
+        _current_time: Instant,
+    ) -> Option<Duration> {
+        Some(value.ttl)
+    }
 }
 
 impl MemoryCache {
     pub fn new(ttl: Duration, capacity: u64) -> Self {
         let inner = MokaCache::builder()
             .max_capacity(capacity)
-            .time_to_live(ttl)
+            .expire_after(PerEntryExpiry)
             .build();
         Self { inner, ttl }
     }
@@ -47,11 +80,37 @@ impl Default for MemoryCache {
 #[async_trait]
 impl Cache for MemoryCache {
     async fn get(&self, key: &str) -> Result<Option<ChatResponse>, CacheError> {
-        Ok(self.inner.get(key).await)
+        Ok(self.inner.get(key).await.map(|e| e.response))
     }
 
     async fn put(&self, key: &str, value: ChatResponse) -> Result<(), CacheError> {
-        self.inner.insert(key.to_string(), value).await;
+        self.inner
+            .insert(
+                key.to_string(),
+                Entry {
+                    response: value,
+                    ttl: self.ttl,
+                },
+            )
+            .await;
+        Ok(())
+    }
+
+    async fn put_with_ttl(
+        &self,
+        key: &str,
+        value: ChatResponse,
+        ttl: Duration,
+    ) -> Result<(), CacheError> {
+        self.inner
+            .insert(
+                key.to_string(),
+                Entry {
+                    response: value,
+                    ttl,
+                },
+            )
+            .await;
         Ok(())
     }
 }
@@ -109,5 +168,42 @@ mod tests {
         cache.put("k", updated).await.unwrap();
         let got = cache.get("k").await.unwrap().unwrap();
         assert_eq!(got.message.content, "second");
+    }
+
+    /// Per-entry TTL: two keys inserted at the same time with
+    /// different TTLs must expire independently. Without the
+    /// `Expiry` impl moka would use one global TTL and either both
+    /// entries survive or both die — this test catches that
+    /// regression.
+    #[tokio::test]
+    async fn put_with_ttl_uses_per_entry_expiry() {
+        // Long-fallback cache so a regression that ignores the
+        // per-entry TTL doesn't accidentally pass by global eviction.
+        let cache = MemoryCache::new(Duration::from_secs(300), 100);
+        cache
+            .put_with_ttl("short", sample_response(), Duration::from_millis(50))
+            .await
+            .unwrap();
+        cache
+            .put_with_ttl("long", sample_response(), Duration::from_secs(60))
+            .await
+            .unwrap();
+
+        // Both alive immediately after insert.
+        assert!(cache.get("short").await.unwrap().is_some());
+        assert!(cache.get("long").await.unwrap().is_some());
+
+        // Wait past the short TTL only.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        cache.inner.run_pending_tasks().await;
+
+        assert!(
+            cache.get("short").await.unwrap().is_none(),
+            "short-TTL entry should have expired",
+        );
+        assert!(
+            cache.get("long").await.unwrap().is_some(),
+            "long-TTL entry must survive past the short TTL",
+        );
     }
 }

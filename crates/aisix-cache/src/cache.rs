@@ -9,6 +9,7 @@
 
 use aisix_gateway::ChatResponse;
 use async_trait::async_trait;
+use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
@@ -37,6 +38,22 @@ impl CacheOutcome {
 pub trait Cache: Send + Sync + 'static {
     async fn get(&self, key: &str) -> Result<Option<ChatResponse>, CacheError>;
     async fn put(&self, key: &str, value: ChatResponse) -> Result<(), CacheError>;
+
+    /// Insert with an explicit TTL override. Used by the proxy when
+    /// the matching `CachePolicy` carries a `ttl_seconds` value, so
+    /// each entry expires according to its own policy rather than the
+    /// cache backend's global TTL. Backends that can't honor
+    /// per-entry TTL must document the gap; the default impl falls
+    /// back to `put` (= the backend's global TTL) so adding a new
+    /// backend doesn't have to ship per-entry support up front.
+    async fn put_with_ttl(
+        &self,
+        key: &str,
+        value: ChatResponse,
+        _ttl: Duration,
+    ) -> Result<(), CacheError> {
+        self.put(key, value).await
+    }
 }
 
 #[cfg(test)]

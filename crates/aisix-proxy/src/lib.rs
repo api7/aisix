@@ -187,9 +187,8 @@ mod tests {
     /// clause — used by the Stage 3 tests that pin the matcher's
     /// behaviour on `model:<name>` / `api_key:<id>`.
     fn seed_cache_policy_with_applies_to(snap: &AisixSnapshot, name: &str, applies_to: &str) {
-        let cfg = format!(
-            r#"{{"name": "{name}", "backend": "memory", "applies_to": "{applies_to}"}}"#,
-        );
+        let cfg =
+            format!(r#"{{"name": "{name}", "backend": "memory", "applies_to": "{applies_to}"}}"#,);
         let policy: aisix_core::models::CachePolicy = serde_json::from_str(&cfg).unwrap();
         snap.cache_policies
             .insert(ResourceEntry::new(format!("cp-id-{name}"), policy, 1));
