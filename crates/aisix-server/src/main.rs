@@ -21,7 +21,7 @@ mod register;
 mod telemetry;
 
 use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore};
-use aisix_cache::{Cache, MemoryCache, RedisCache};
+use aisix_cache::{Cache, MemoryCache, PgvectorCache, RedisCache};
 use aisix_core::models::Provider;
 use aisix_core::{CacheBackend, Config, EtcdConfig, EtcdTlsConfig};
 use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor};
@@ -325,6 +325,27 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             }
         }
     });
+    // Pgvector semantic cache client. Reuses the heartbeat mTLS bundle
+    // and dpmgr origin; piggybacks on the same /dp routes mounted by
+    // dp-manager (see AISIX-Cloud `internal/dpmgr/api/cache.go`). When
+    // the bundle build fails or we're outside managed mode the proxy
+    // falls back to surfacing matched pgvector policies as
+    // cache_status=Disabled — no traffic impact, just no semantic-cache
+    // benefit. See `aisix_cache::pgvector` for the wire client.
+    let pgvector_cache = heartbeat_cfg.as_ref().and_then(|h| {
+        let dpmgr_base = h
+            .url
+            .strip_suffix("/dp/heartbeat")
+            .unwrap_or(h.url.as_str())
+            .to_string();
+        match heartbeat::build_mtls_client(&h.mtls) {
+            Ok(http) => Some(Arc::new(PgvectorCache::new(http, dpmgr_base))),
+            Err(e) => {
+                tracing::warn!(error = %e, "pgvector cache disabled: mTLS client build failed");
+                None
+            }
+        }
+    });
     let heartbeat_task = heartbeat_cfg.map(|h| heartbeat::spawn(h, cancel_rx.clone()));
     let (usage_sink, telemetry_task) = match telemetry_cfg {
         Some(cfg) => {
@@ -389,6 +410,9 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     proxy_state = proxy_state.with_usage_sink(usage_sink);
     if let Some(client) = budget_client {
         proxy_state = proxy_state.with_budget_client(client);
+    }
+    if let Some(client) = pgvector_cache {
+        proxy_state = proxy_state.with_pgvector_cache(client);
     }
     // Live guardrail chain: rebuilds itself whenever the etcd watch
     // supervisor stores a fresh snapshot, so dashboard mutations

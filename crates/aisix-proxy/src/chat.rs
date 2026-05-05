@@ -16,7 +16,8 @@
 //!    line. Errors surface via [`ProxyError`] which carries the right
 //!    status, error type, and (for rate-limits) Retry-After.
 
-use aisix_cache::CacheKey;
+use aisix_cache::{embed_prompt, CacheKey};
+use aisix_core::models::CacheBackend;
 use aisix_gateway::{BridgeContext, BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
 use aisix_obs::{AccessLog, LangfuseEvent, Metrics, RequestOutcome, UsageEvent};
@@ -437,26 +438,20 @@ async fn dispatch(
         });
     }
 
-    // Policy gate (Stage 3): the cache is only consulted when at
-    // least one enabled `CachePolicy` in the snapshot has an
-    // `applies_to` clause that matches THIS request. cp-api owns
-    // the policy CRUD surface (`/api/environments/:env/cache_policies`,
-    // see Stage 1); kine fans out the rows; the loader populates
-    // `snapshot.cache_policies` (see aisix-etcd). Stage 4 will add
-    // per-policy `ttl_seconds` propagation into the cache backend
-    // and the semantic backends.
+    // Policy gate (Stage 3 + 4b): pick the first enabled `cache_policy`
+    // whose `applies_to` clause accepts THIS request's
+    // (model, api_key_id) pair. Stage 4b extends the gate to dispatch
+    // by `backend`: `pgvector` → semantic lookup via dp-manager
+    // `/dp/cache/{lookup,put}`; everything else (memory / unsupported
+    // preview backends) → existing moka path.
     //
-    // Match order: first enabled policy whose `parsed_applies_to()`
-    // accepts (req.model, auth.entry.id) wins. Iteration order on a
-    // ResourceTable isn't stable, but the first-match-wins rule is
-    // deterministic enough for the cache_status / x-aisix-cache header
-    // to stay stable across requests; ties only matter when an env
-    // legitimately has overlapping policies.
-    let cache_active_by_policy = snapshot
+    // `applies_to` parsing + match logic lives on `CachePolicy` itself
+    // (see aisix-core::cache_policy::AppliesTo).
+    let matched_policy = snapshot
         .cache_policies
         .entries()
-        .iter()
-        .any(|entry| {
+        .into_iter()
+        .find(|entry| {
             entry.value.enabled
                 && entry
                     .value
@@ -464,18 +459,176 @@ async fn dispatch(
                     .matches(&req.model, &auth.entry.id)
         });
 
+    // Branch: pgvector backend uses the semantic cache; any other
+    // matched backend falls back to the moka path. The two paths
+    // share the cache_status emission shape so the dashboard /logs
+    // column reads identically across both.
+    let pgvector_match = matched_policy
+        .as_ref()
+        .filter(|p| matches!(p.value.backend, CacheBackend::Pgvector));
+
+    // ─── pgvector semantic path ─────────────────────────────────────
+    //
+    // Embeds the last user message via the env's first OpenAI model
+    // (see aisix-cache::embed_prompt) and looks up against
+    // dp-manager's /dp/cache/lookup. On hit we return the cached
+    // response with cache_status=Hit + x-aisix-cache=hit. On miss we
+    // capture the embedding so the post-success path can call /put
+    // without re-embedding.
+    //
+    // Failure mode is fail-open per the Stage 4b design note: any
+    // error here logs a warn + falls through to the upstream as if
+    // the cache were disabled (cache_status stays Disabled in that
+    // case, NOT Miss — operators reading /logs see "the gate is
+    // closed" rather than "we tried and missed").
+    let pgvector_embedding: Option<Vec<f32>>;
+    let pgvector_prompt_text: Option<String>;
+    let pgvector_policy_id: Option<String>;
+    let pgvector_ttl_seconds: Option<u32>;
+    if let (Some(matched), Some(pgvector)) =
+        (pgvector_match, state.pgvector_cache.as_ref())
+    {
+        let embedding_model = matched
+            .value
+            .embedding_model
+            .as_deref()
+            .unwrap_or("text-embedding-3-small");
+        let prompt_text = last_user_message_text(req).unwrap_or_default();
+        if prompt_text.is_empty() {
+            // No user turn to embed — fall through with Disabled
+            // status. Shouldn't normally happen (the empty-messages
+            // check at function entry already rejects), but keep the
+            // graceful path so an exotic system-only request doesn't
+            // panic.
+            pgvector_embedding = None;
+            pgvector_prompt_text = None;
+            pgvector_policy_id = None;
+            pgvector_ttl_seconds = None;
+        } else {
+            match embed_prompt(
+                &snapshot,
+                &state.hub,
+                embedding_model,
+                &prompt_text,
+                request_id,
+            )
+            .await
+            {
+                Ok(vec) => {
+                    let policy_id = matched.id.clone();
+                    let threshold = matched.value.similarity_threshold;
+                    match pgvector.lookup(&policy_id, &vec, threshold).await {
+                        Ok(Some(hit)) => {
+                            reservation.commit_tokens(0);
+                            let prompt = hit.prompt_tokens as u64;
+                            let completion = hit.completion_tokens as u64;
+                            let total = prompt.saturating_add(completion);
+                            let cached_prompt_tokens = hit.response.usage.cached_prompt_tokens;
+                            let reasoning_tokens = hit.response.usage.reasoning_tokens;
+                            let cache_creation_tokens =
+                                hit.response.usage.cache_creation_tokens;
+                            let cache_read_tokens = hit.response.usage.cache_read_tokens;
+                            let provider_label = attempt_models[0]
+                                .provider()
+                                .map(|p| format!("{p:?}").to_lowercase())
+                                .unwrap_or_else(|| "unknown".into());
+                            tracing::debug!(
+                                request_id = %request_id,
+                                policy_id = %policy_id,
+                                similarity = hit.similarity,
+                                "pgvector cache hit",
+                            );
+                            let mut response =
+                                Json(render_response(now, hit.response)).into_response();
+                            response
+                                .headers_mut()
+                                .insert(CACHE_HEADER, HeaderValue::from_static("hit"));
+                            return Ok(Success {
+                                response,
+                                provider: provider_label,
+                                model_id: model_id.clone(),
+                                prompt_tokens: Some(prompt),
+                                completion_tokens: Some(completion),
+                                total_tokens: Some(total),
+                                cached_prompt_tokens,
+                                reasoning_tokens,
+                                cache_creation_tokens,
+                                cache_read_tokens,
+                                provider_request_id: String::new(),
+                                provider_model_version: String::new(),
+                                finish_reason: String::new(),
+                                cost_usd: 0.0,
+                                bypass_reason: bypass_reason.clone(),
+                                cache_status: CacheStatus::Hit,
+                            });
+                        }
+                        Ok(None) => {
+                            // Miss — record state for the post-success put.
+                            pgvector_embedding = Some(vec);
+                            pgvector_prompt_text = Some(prompt_text);
+                            pgvector_policy_id = Some(policy_id);
+                            pgvector_ttl_seconds = Some(matched.value.ttl_seconds);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                policy_id = %policy_id,
+                                "pgvector lookup failed; falling open to upstream",
+                            );
+                            pgvector_embedding = None;
+                            pgvector_prompt_text = None;
+                            pgvector_policy_id = None;
+                            pgvector_ttl_seconds = None;
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        embedding_model = %embedding_model,
+                        "pgvector embedding failed; falling open to upstream",
+                    );
+                    pgvector_embedding = None;
+                    pgvector_prompt_text = None;
+                    pgvector_policy_id = None;
+                    pgvector_ttl_seconds = None;
+                }
+            }
+        }
+    } else {
+        pgvector_embedding = None;
+        pgvector_prompt_text = None;
+        pgvector_policy_id = None;
+        pgvector_ttl_seconds = None;
+    }
+
+    // For the moka path: only consult the cache when the matched
+    // policy's backend is Memory (or the matched policy isn't
+    // pgvector AND the moka cache is configured). Stage 2's
+    // any-policy gate is replaced here by the per-backend dispatch.
+    let cache_active_by_policy = matched_policy
+        .as_ref()
+        .map(|p| matches!(p.value.backend, CacheBackend::Memory))
+        .unwrap_or(false);
+
     // Cache lookup keyed on the *virtual* model name so a re-request
     // hits the cache regardless of which target served the original.
-    // Even with `cache_active_by_policy = false` we still build the
-    // key to keep the cache_status path uniform — `disabled` is the
-    // outcome when the gate is closed, but the request itself is
-    // shaped the same way.
     let cache_key = state
         .cache
         .as_ref()
         .map(|_| CacheKey::from_request(req).fingerprint());
 
-    let cache_status = if cache_active_by_policy && state.cache.is_some() {
+    let cache_status = if pgvector_policy_id.is_some() {
+        // We tried the pgvector path and missed (or the embedding
+        // / lookup errored after the gate was open). Either way the
+        // request is heading upstream; record Miss when we'll write
+        // back, Disabled when we won't.
+        if pgvector_embedding.is_some() {
+            CacheStatus::Miss
+        } else {
+            CacheStatus::Disabled
+        }
+    } else if cache_active_by_policy && state.cache.is_some() {
         CacheStatus::Miss
     } else {
         CacheStatus::Disabled
@@ -654,6 +807,39 @@ async fn dispatch(
         }
     }
 
+    // pgvector backend: if the lookup at the top of dispatch missed
+    // (and the embedding succeeded), persist the upstream response
+    // so the next semantically-similar request can hit. Errors on
+    // /dp/cache/put are warned but don't fail the request — the
+    // caller already got their answer.
+    if let (Some(pgvector), Some(embedding), Some(prompt_text), Some(policy_id)) = (
+        state.pgvector_cache.as_ref(),
+        pgvector_embedding.as_deref(),
+        pgvector_prompt_text.as_deref(),
+        pgvector_policy_id.as_deref(),
+    ) {
+        let prompt_tokens = upstream.usage.prompt_tokens;
+        let completion_tokens = upstream.usage.completion_tokens;
+        if let Err(err) = pgvector
+            .put(
+                policy_id,
+                prompt_text,
+                embedding,
+                &upstream,
+                prompt_tokens,
+                completion_tokens,
+                pgvector_ttl_seconds,
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %err,
+                policy_id = %policy_id,
+                "pgvector put failed; entry not stored",
+            );
+        }
+    }
+
     let mut response = Json(render_response(now, upstream)).into_response();
     if matches!(cache_status, CacheStatus::Miss) {
         // Miss header only when the cache was actually consulted —
@@ -696,6 +882,23 @@ fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
         FinishReason::ToolCalls => "tool_calls".into(),
         FinishReason::Other(s) => s.clone(),
     }
+}
+
+/// Pick the text we embed for the pgvector semantic cache: the
+/// content of the last `user` message in the request. Per the
+/// Stage 4b design note (option A), embedding the full conversation
+/// is a possible future option; today the last user turn is the
+/// stable signal that captures "what the caller is asking right
+/// now". Returns `None` when no user message is present so the
+/// caller can short-circuit out of the embedding path.
+fn last_user_message_text(req: &ChatFormat) -> Option<String> {
+    use aisix_gateway::Role;
+    req.messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::User))
+        .map(|m| m.content.clone())
+        .filter(|s| !s.is_empty())
 }
 
 fn record_success(

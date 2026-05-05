@@ -23,9 +23,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::resource::Resource;
 
-/// Cache backend choice. Stage 2 only enforces `Memory`. The other
-/// variants persist in cp-api + ship through kine but the DP falls
-/// back to memory until each backend wires up.
+/// Cache backend choice. The DP enforces:
+///   - `Memory` (Stage 2) — exact-match in-process LRU
+///   - `Pgvector` (Stage 4b) — semantic cosine-similarity over PG +
+///     pgvector via dp-manager `/dp/cache/{lookup,put}`
+///
+/// `Redis` / `RedisSemantic` / `Qdrant` persist in cp-api + ship
+/// through kine but the DP falls through to the memory path for
+/// them. They stay enum members so a future migration doesn't need
+/// a schema change to pick them up.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheBackend {
@@ -33,6 +39,7 @@ pub enum CacheBackend {
     Memory,
     Redis,
     RedisSemantic,
+    Pgvector,
     Qdrant,
 }
 
