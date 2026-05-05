@@ -18,10 +18,14 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 moka.workspace = true
+# pgvector backend talks to dp-manager over HTTP(S) — reuse the
+# workspace reqwest so the binary doesn't pull in two TLS stacks.
+reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls"] }
 redis = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
+wiremock.workspace = true
 
 [features]
 default = ["memory"]

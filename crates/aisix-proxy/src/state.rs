@@ -14,7 +14,7 @@
 //!
 //! Cheap to clone: every field is either an `Arc` or a small Copy scalar.
 
-use aisix_cache::{Cache, MemoryCache};
+use aisix_cache::{Cache, MemoryCache, PgvectorCache};
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ProxyConfig};
 use aisix_gateway::Hub;
@@ -34,6 +34,13 @@ pub struct ProxyState {
     pub limiter: Arc<Limiter>,
     pub metrics: Arc<Metrics>,
     pub cache: Option<Arc<dyn Cache>>,
+    /// Optional pgvector-backed semantic cache. When `Some`, the chat
+    /// handler routes requests with a matched policy of
+    /// `backend = pgvector` through this client. None disables the
+    /// pgvector path — matching policies surface as `Disabled` in
+    /// the cache_status telemetry. Cheap to clone — `PgvectorCache`
+    /// is `reqwest::Client` + a base URL.
+    pub pgvector_cache: Option<Arc<PgvectorCache>>,
     pub routing: Arc<RoutingRegistry>,
     /// Content-policy hooks. Default is an empty chain (no-op); the
     /// server bootstrap loads a real chain from config.
@@ -69,6 +76,7 @@ impl ProxyState {
             limiter: Arc::new(Limiter::new()),
             metrics: Arc::new(Metrics::new(false)),
             cache: Some(Arc::new(MemoryCache::with_defaults())),
+            pgvector_cache: None,
             routing: Arc::new(RoutingRegistry::new()),
             guardrails: Arc::new(GuardrailChain::empty()),
             budgets: Arc::new(BudgetClient::disabled()),
@@ -94,6 +102,7 @@ impl ProxyState {
             limiter,
             metrics: Arc::new(Metrics::new(false)),
             cache: Some(Arc::new(MemoryCache::with_defaults())),
+            pgvector_cache: None,
             routing: Arc::new(RoutingRegistry::new()),
             guardrails: Arc::new(GuardrailChain::empty()),
             budgets: Arc::new(BudgetClient::disabled()),
@@ -122,6 +131,7 @@ impl ProxyState {
             limiter,
             metrics,
             cache,
+            pgvector_cache: None,
             routing: Arc::new(RoutingRegistry::new()),
             guardrails: Arc::new(GuardrailChain::empty()),
             budgets: Arc::new(BudgetClient::disabled()),
@@ -166,6 +176,16 @@ impl ProxyState {
     /// the disabled (allow-all) client used in self-hosted dev.
     pub fn with_budget_client(mut self, client: Arc<BudgetClient>) -> Self {
         self.budgets = client;
+        self
+    }
+
+    /// Attach a pgvector semantic cache. The chat handler routes
+    /// requests with a matched policy of `backend = pgvector`
+    /// through this client. None disables the pgvector path —
+    /// matching policies surface as `Disabled` in the cache_status
+    /// telemetry so operators see the gate is closed.
+    pub fn with_pgvector_cache(mut self, client: Arc<PgvectorCache>) -> Self {
+        self.pgvector_cache = Some(client);
         self
     }
 }

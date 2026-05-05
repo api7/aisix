@@ -18,14 +18,18 @@
 #![deny(rust_2018_idioms)]
 
 mod cache;
+mod embed;
 mod key;
 mod memory;
+mod pgvector;
 #[cfg(feature = "redis")]
 mod redis;
 
 pub use cache::{Cache, CacheError, CacheOutcome};
+pub use embed::{embed_prompt, EmbedError};
 pub use key::CacheKey;
 pub use memory::{MemoryCache, DEFAULT_CAPACITY, DEFAULT_TTL};
+pub use pgvector::{PgvectorCache, SemanticCacheError, SemanticHit};
 #[cfg(feature = "redis")]
 pub use redis::{
     RedisCache, DEFAULT_PREFIX as REDIS_DEFAULT_PREFIX, DEFAULT_TTL as REDIS_DEFAULT_TTL,
