@@ -1,8 +1,11 @@
 mod admin;
 pub mod config;
-mod gateway;
 mod proxy;
 pub mod utils;
+
+pub mod gateway {
+    pub use aisix_llm::*;
+}
 
 use std::{fmt::Debug, sync::Arc};
 

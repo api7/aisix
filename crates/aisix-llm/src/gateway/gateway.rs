@@ -1,0 +1,2385 @@
+use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
+
+use bytes::Bytes;
+use futures::Stream;
+use http::{Method, StatusCode, header::CONTENT_TYPE};
+use serde_json::Value;
+use tokio::sync::oneshot;
+
+use crate::{
+    error::{GatewayError, Result},
+    formats::{AnthropicMessagesFormat, OpenAIChatFormat, ResponsesApiFormat},
+    provider_instance::{ProviderInstance, ProviderRegistry},
+    session::{SessionStore, StoredSession},
+    streams::{BridgedStream, HubChunkStream, NativeStream, aws_event_stream_reader, sse_reader},
+    traits::{ChatFormat, NativeHandler, PreparedRequest, StreamReaderKind},
+    types::{
+        anthropic::AnthropicMessagesRequest,
+        common::{BridgeContext, OpenAIResponsesExtras, Usage},
+        embed::{EmbedRequestBody, EmbedResponseBody, EmbeddingRequest, EmbeddingResponse},
+        openai::{
+            ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
+            responses::ConversationReference,
+        },
+        response::ChatResponse,
+    },
+};
+
+enum HttpResponseBody {
+    Json(Value),
+    Binary,
+}
+
+/// Typed Layer-3 gateway entry point.
+pub struct Gateway {
+    registry: ProviderRegistry,
+    http_client: reqwest::Client,
+    session_store: Option<Arc<dyn SessionStore>>,
+}
+
+impl Gateway {
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    const COMPLETE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Creates a new gateway with the provided provider registry.
+    pub fn new(registry: ProviderRegistry) -> Self {
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(Self::CONNECT_TIMEOUT)
+            .build()
+            .expect("failed to build gateway reqwest client with configured timeouts");
+
+        Self {
+            registry,
+            http_client,
+            session_store: None,
+        }
+    }
+
+    /// Enables server-side session state for formats that need it.
+    #[allow(dead_code)]
+    pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.session_store = Some(store);
+        self
+    }
+
+    /// Returns the immutable provider registry backing this gateway.
+    pub fn registry(&self) -> &ProviderRegistry {
+        &self.registry
+    }
+
+    /// Typed chat entry point for both complete and streaming requests.
+    #[fastrace::trace]
+    pub async fn chat<F: ChatFormat>(
+        &self,
+        request: &F::Request,
+        instance: &ProviderInstance,
+    ) -> Result<ChatResponse<F>> {
+        let stream = F::is_stream(request);
+
+        if let Some(native) = F::native_support(instance.def.as_ref()) {
+            return self
+                .call_chat_native::<F>(&native, instance, request, stream)
+                .await;
+        }
+
+        let (mut hub_request, ctx) = F::to_hub(request)?;
+        if F::name() == ResponsesApiFormat::name() {
+            self.resolve_session(&mut hub_request, &ctx).await?;
+        }
+
+        if stream {
+            let hub_stream = self.call_chat_hub_stream(instance, &hub_request).await?;
+            let (usage_tx, usage_rx) = oneshot::channel();
+            let bridged_stream = BridgedStream::<F>::new(hub_stream, ctx, usage_tx);
+
+            return Ok(ChatResponse::Stream {
+                stream: Box::pin(bridged_stream),
+                usage_rx,
+            });
+        }
+
+        let hub_response = self.call_chat_hub(instance, &hub_request).await?;
+        if F::name() == ResponsesApiFormat::name() {
+            self.save_session(&ctx, &hub_request, &hub_response).await?;
+        }
+        let usage = extract_chat_usage_from_response(&hub_response).unwrap_or_default();
+        let response = F::from_hub(&hub_response, &ctx)?;
+
+        Ok(ChatResponse::Complete { response, usage })
+    }
+
+    /// Convenience wrapper for the OpenAI Chat format.
+    #[fastrace::trace]
+    pub async fn chat_completion(
+        &self,
+        request: &ChatCompletionRequest,
+        instance: &ProviderInstance,
+    ) -> Result<ChatResponse<OpenAIChatFormat>> {
+        self.chat::<OpenAIChatFormat>(request, instance).await
+    }
+
+    /// Convenience wrapper for the Anthropic Messages format.
+    #[fastrace::trace]
+    pub async fn messages(
+        &self,
+        request: &AnthropicMessagesRequest,
+        instance: &ProviderInstance,
+    ) -> Result<ChatResponse<AnthropicMessagesFormat>> {
+        self.chat::<AnthropicMessagesFormat>(request, instance)
+            .await
+    }
+
+    /// Typed embeddings entry point.
+    #[fastrace::trace]
+    pub async fn embed(
+        &self,
+        request: &EmbeddingRequest,
+        instance: &ProviderInstance,
+    ) -> Result<EmbeddingResponse> {
+        let transform = instance.def.as_embed_transform().ok_or_else(|| {
+            GatewayError::EmbeddingsNotSupported {
+                provider: instance.def.name().to_string(),
+            }
+        })?;
+
+        let endpoint_path = transform.embeddings_endpoint_path(&request.model);
+        let base_url = instance.effective_base_url()?;
+        let url = instance
+            .def
+            .build_url_for_endpoint(base_url.as_str(), endpoint_path.as_ref());
+        let headers = instance.build_headers()?;
+        let EmbedRequestBody::Json(body) = transform.transform_embeddings_request(request)?;
+        let request =
+            self.prepare_json_request(instance, Method::POST, url, headers, &body, false)?;
+
+        let response = self.send_request(request).await?;
+
+        if !response.status().is_success() {
+            return Err(provider_error(response, instance.def.name()).await);
+        }
+
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let bytes = response.bytes().await.map_err(GatewayError::Http)?;
+
+        let body = parse_http_response_body(content_type.as_deref(), bytes)?;
+
+        let response_body = match body {
+            HttpResponseBody::Json(value) => EmbedResponseBody::Json(value),
+            HttpResponseBody::Binary => {
+                return Err(GatewayError::Transform(
+                    "embedding response must be JSON".into(),
+                ));
+            }
+        };
+
+        transform.transform_embeddings_response(response_body)
+    }
+
+    async fn resolve_session(
+        &self,
+        hub_request: &mut ChatCompletionRequest,
+        ctx: &BridgeContext,
+    ) -> Result<()> {
+        let Some(store) = self.session_store.as_deref() else {
+            return Ok(());
+        };
+        let Some(history) = load_responses_session_messages(store, ctx).await? else {
+            return Ok(());
+        };
+
+        let insert_at = usize::from(responses_instructions_present(ctx));
+        hub_request.messages.splice(insert_at..insert_at, history);
+        Ok(())
+    }
+
+    async fn save_session(
+        &self,
+        ctx: &BridgeContext,
+        hub_request: &ChatCompletionRequest,
+        hub_response: &ChatCompletionResponse,
+    ) -> Result<()> {
+        let Some(store) = self.session_store.as_deref() else {
+            return Ok(());
+        };
+        if matches!(
+            ctx.openai_responses_extras
+                .as_ref()
+                .and_then(|extras| extras.store),
+            Some(false)
+        ) {
+            return Ok(());
+        }
+
+        let mut messages = session_messages_from_hub_request(hub_request, ctx);
+        messages.extend(
+            hub_response
+                .choices
+                .iter()
+                .map(|choice| choice.message.clone()),
+        );
+
+        let session = StoredSession {
+            response_id: hub_response.id.clone(),
+            conversation_id: responses_conversation_id(ctx.openai_responses_extras.as_ref()),
+            messages,
+            model: hub_response.model.clone(),
+            created_at: hub_response.created,
+            insertion_index: 0,
+            metadata: responses_metadata(ctx.openai_responses_extras.as_ref()),
+        };
+        store.put_session(&session).await
+    }
+
+    fn prepare_json_request(
+        &self,
+        instance: &ProviderInstance,
+        method: Method,
+        url: String,
+        mut headers: http::HeaderMap,
+        body: &Value,
+        stream: bool,
+    ) -> Result<PreparedRequest> {
+        let url = reqwest::Url::parse(&url).map_err(|error| {
+            GatewayError::Validation(format!(
+                "provider {} produced invalid request url {}: {}",
+                instance.def.name(),
+                url,
+                error
+            ))
+        })?;
+        let body = serde_json::to_vec(body)
+            .map(Bytes::from)
+            .map_err(|error| GatewayError::Transform(error.to_string()))?;
+
+        headers
+            .entry(CONTENT_TYPE)
+            .or_insert(http::HeaderValue::from_static("application/json"));
+
+        instance.prepare_request(PreparedRequest {
+            method,
+            url,
+            headers,
+            body,
+            stream,
+        })
+    }
+
+    async fn send_request(&self, request: PreparedRequest) -> Result<reqwest::Response> {
+        let PreparedRequest {
+            method,
+            url,
+            headers,
+            body,
+            stream,
+        } = request;
+
+        let request = self
+            .http_client
+            .request(method, url)
+            .headers(headers)
+            .body(body);
+        let request = if stream {
+            request
+        } else {
+            request.timeout(Self::COMPLETE_REQUEST_TIMEOUT)
+        };
+
+        request.send().await.map_err(GatewayError::Http)
+    }
+
+    async fn call_chat_native<F: ChatFormat>(
+        &self,
+        native: &NativeHandler<'_>,
+        instance: &ProviderInstance,
+        request: &F::Request,
+        stream: bool,
+    ) -> Result<ChatResponse<F>> {
+        let (endpoint_path, body) = F::call_native(native, request, stream)?;
+        if stream {
+            ensure_chat_stream_reader_supported(instance.def.stream_reader_kind())?;
+        }
+
+        let base_url = instance.effective_base_url()?;
+        let url = join_url(base_url.as_str(), &endpoint_path);
+        let headers = instance.build_headers()?;
+
+        let request =
+            self.prepare_json_request(instance, Method::POST, url, headers, &body, stream)?;
+        let response = self.send_request(request).await?;
+
+        if !response.status().is_success() {
+            return Err(provider_error(response, instance.def.name()).await);
+        }
+
+        if stream {
+            let raw_chunks =
+                select_chat_stream_reader(instance.def.stream_reader_kind(), response)?;
+            let (usage_tx, usage_rx) = oneshot::channel();
+            let native_stream = NativeStream::<F>::new(raw_chunks, instance.def.clone(), usage_tx);
+
+            return Ok(ChatResponse::Stream {
+                stream: Box::pin(native_stream),
+                usage_rx,
+            });
+        }
+
+        let body: Value = response.json().await.map_err(GatewayError::Http)?;
+        let response = F::parse_native_response(native, body)?;
+        let usage = F::response_usage(&response);
+
+        Ok(ChatResponse::Complete { response, usage })
+    }
+
+    async fn call_chat_hub(
+        &self,
+        instance: &ProviderInstance,
+        request: &ChatCompletionRequest,
+    ) -> Result<ChatCompletionResponse> {
+        let provider_body = instance.def.transform_request(request)?;
+        let url = instance.build_url(&request.model)?;
+        let headers = instance.build_headers()?;
+
+        let prepared_request =
+            self.prepare_json_request(instance, Method::POST, url, headers, &provider_body, false)?;
+        let response = self.send_request(prepared_request).await?;
+
+        if !response.status().is_success() {
+            return Err(provider_error(response, instance.def.name()).await);
+        }
+
+        let body: Value = response.json().await.map_err(GatewayError::Http)?;
+        instance.def.transform_response_with_request(request, body)
+    }
+
+    async fn call_chat_hub_stream(
+        &self,
+        instance: &ProviderInstance,
+        request: &ChatCompletionRequest,
+    ) -> Result<HubChunkStream> {
+        ensure_chat_stream_reader_supported(instance.def.stream_reader_kind())?;
+
+        let provider_body = instance.def.transform_request(request)?;
+        let url = instance.build_url(&request.model)?;
+        let headers = instance.build_headers()?;
+
+        let prepared_request =
+            self.prepare_json_request(instance, Method::POST, url, headers, &provider_body, true)?;
+        let response = self.send_request(prepared_request).await?;
+
+        if !response.status().is_success() {
+            return Err(provider_error(response, instance.def.name()).await);
+        }
+
+        let raw_chunks = select_chat_stream_reader(instance.def.stream_reader_kind(), response)?;
+        let mut stream = HubChunkStream::new(raw_chunks, instance.def.clone());
+        stream.state.response_model = Some(request.model.clone());
+        Ok(stream)
+    }
+}
+
+async fn load_responses_session_messages(
+    store: &dyn SessionStore,
+    ctx: &BridgeContext,
+) -> Result<Option<Vec<ChatMessage>>> {
+    let extras = ctx.openai_responses_extras.as_ref();
+
+    if let Some(previous_response_id) =
+        extras.and_then(|extras| extras.previous_response_id.as_deref())
+    {
+        let session = store
+            .get_by_response_id(previous_response_id)
+            .await?
+            .ok_or_else(|| {
+                GatewayError::Validation(format!(
+                    "previous_response_not_found: {}",
+                    previous_response_id
+                ))
+            })?;
+        return Ok(Some(session.messages));
+    }
+
+    let Some(conversation_id) = responses_conversation_id(extras) else {
+        return Ok(None);
+    };
+    let sessions = store.get_by_conversation_id(&conversation_id).await?;
+    Ok(sessions.last().map(|session| session.messages.clone()))
+}
+
+fn session_messages_from_hub_request(
+    hub_request: &ChatCompletionRequest,
+    ctx: &BridgeContext,
+) -> Vec<ChatMessage> {
+    let skip = usize::from(responses_instructions_present(ctx));
+    hub_request.messages.iter().skip(skip).cloned().collect()
+}
+
+fn responses_instructions_present(ctx: &BridgeContext) -> bool {
+    ctx.openai_responses_extras
+        .as_ref()
+        .and_then(|extras| extras.instructions.as_ref())
+        .is_some_and(|instructions| !instructions.is_empty())
+}
+
+fn responses_conversation_id(extras: Option<&OpenAIResponsesExtras>) -> Option<String> {
+    match extras?.conversation.as_ref()? {
+        ConversationReference::Id(id) => Some(id.clone()),
+        ConversationReference::Descriptor { id } => Some(id.clone()),
+    }
+}
+
+fn responses_metadata(extras: Option<&OpenAIResponsesExtras>) -> HashMap<String, Value> {
+    extras
+        .and_then(|extras| extras.metadata.as_ref())
+        .and_then(Value::as_object)
+        .map(|metadata| metadata.clone().into_iter().collect())
+        .unwrap_or_default()
+}
+
+fn ensure_chat_stream_reader_supported(kind: StreamReaderKind) -> Result<()> {
+    match kind {
+        StreamReaderKind::Sse | StreamReaderKind::AwsEventStream => Ok(()),
+        other => Err(GatewayError::Validation(format!(
+            "stream reader kind {:?} is not implemented yet",
+            other
+        ))),
+    }
+}
+
+fn select_chat_stream_reader(
+    kind: StreamReaderKind,
+    response: reqwest::Response,
+) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+    ensure_chat_stream_reader_supported(kind)?;
+
+    match kind {
+        StreamReaderKind::Sse => Ok(sse_reader(response.bytes_stream())),
+        StreamReaderKind::AwsEventStream => Ok(aws_event_stream_reader(response.bytes_stream())),
+        StreamReaderKind::JsonArrayStream => {
+            unreachable!(
+                "unsupported stream reader kind should be rejected before response wrapping"
+            )
+        }
+    }
+}
+
+fn join_url(base_url: &str, endpoint_path: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    if endpoint_path.starts_with('/') {
+        format!("{base_url}{endpoint_path}")
+    } else {
+        format!("{base_url}/{endpoint_path}")
+    }
+}
+
+fn parse_http_response_body(content_type: Option<&str>, bytes: Bytes) -> Result<HttpResponseBody> {
+    let expects_json = content_type
+        .map(|value| value.contains("json"))
+        .unwrap_or(false);
+
+    if expects_json {
+        let value = serde_json::from_slice(&bytes)
+            .map_err(|error| GatewayError::Transform(error.to_string()))?;
+        return Ok(HttpResponseBody::Json(value));
+    }
+
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => Ok(HttpResponseBody::Json(value)),
+        Err(_) => Ok(HttpResponseBody::Binary),
+    }
+}
+
+fn extract_chat_usage_from_response(response: &ChatCompletionResponse) -> Option<Usage> {
+    response.usage.as_ref().map(|usage| Usage {
+        input_tokens: Some(usage.prompt_tokens),
+        output_tokens: Some(usage.completion_tokens),
+        total_tokens: Some(usage.total_tokens),
+        input_audio_tokens: usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.audio_tokens),
+        output_audio_tokens: usage
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.audio_tokens),
+        cache_read_input_tokens: usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens),
+        ..Default::default()
+    })
+}
+
+async fn provider_error(response: reqwest::Response, provider: &str) -> GatewayError {
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .map(|bytes| {
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+        })
+        .unwrap_or(Value::Null);
+
+    GatewayError::Provider {
+        status,
+        body,
+        provider: provider.to_string(),
+        retryable: status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        borrow::Cow,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use assert_matches::assert_matches;
+    use aws_smithy_eventstream::frame::write_message_to;
+    use aws_smithy_types::event_stream::{Header, HeaderValue as EventStreamHeaderValue, Message};
+    use axum::{Json, Router, extract::OriginalUri, routing::post};
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE, HeaderName},
+    };
+    use pretty_assertions::assert_eq;
+    use reqwest::Url;
+    use serde_json::{Value, json};
+    use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
+
+    use super::Gateway;
+    use crate::{
+        error::{GatewayError, Result},
+        formats::ResponsesApiFormat,
+        provider_instance::{
+            AwsStaticCredentials, ProviderAuth, ProviderInstance, ProviderRegistry,
+        },
+        providers::{AnthropicDef, BedrockDef},
+        session::InMemorySessionStore,
+        traits::{
+            ChatFormat, ChatTransform, EmbedTransform, NativeHandler, NativeOpenAIResponsesSupport,
+            OpenAIResponsesNativeStreamState, PreparedRequest, ProviderCapabilities, ProviderMeta,
+            StreamReaderKind,
+        },
+        types::{
+            anthropic::{AnthropicContentBlock, AnthropicMessagesRequest},
+            common::{BridgeContext, OpenAIResponsesExtras, Usage},
+            embed::EmbeddingRequest,
+            openai::{
+                ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
+                responses::{ResponsesApiRequest, ResponsesApiResponse, ResponsesApiStreamEvent},
+            },
+            response::ChatResponse,
+        },
+    };
+
+    type ObservedRequest = Option<(Option<String>, Value)>;
+    type PreparedObservedRequest = Option<(Option<String>, Option<String>, Value)>;
+    type BedrockObservedRequest = Option<(String, Option<String>, Option<String>, Value)>;
+
+    struct HubTestProvider;
+
+    struct PreparedHubTestProvider;
+
+    struct NativeTestProvider;
+
+    struct UnsupportedHubStreamTestProvider;
+
+    struct UnsupportedNativeStreamTestProvider;
+
+    struct DummyNativeFormat;
+
+    #[derive(Default)]
+    struct StreamingNativeState {
+        usage: Usage,
+    }
+
+    struct StreamingNativeFormat;
+
+    impl ProviderMeta for HubTestProvider {
+        fn name(&self) -> &'static str {
+            "hub-test"
+        }
+
+        fn default_base_url(&self) -> &'static str {
+            "https://example.invalid"
+        }
+
+        fn chat_endpoint_path(&self, _model: &str) -> Cow<'static, str> {
+            Cow::Borrowed("/v1/chat/completions")
+        }
+
+        fn stream_reader_kind(&self) -> StreamReaderKind {
+            StreamReaderKind::Sse
+        }
+
+        fn build_auth_headers(&self, auth: &ProviderAuth) -> Result<HeaderMap> {
+            bearer_headers(self.name(), auth)
+        }
+    }
+
+    impl ChatTransform for HubTestProvider {}
+
+    impl EmbedTransform for HubTestProvider {}
+
+    impl ProviderCapabilities for HubTestProvider {
+        fn as_embed_transform(&self) -> Option<&dyn EmbedTransform> {
+            Some(self)
+        }
+    }
+
+    impl ProviderMeta for PreparedHubTestProvider {
+        fn name(&self) -> &'static str {
+            "prepared-hub-test"
+        }
+
+        fn default_base_url(&self) -> &'static str {
+            "https://example.invalid"
+        }
+
+        fn chat_endpoint_path(&self, _model: &str) -> Cow<'static, str> {
+            Cow::Borrowed("/v1/chat/completions")
+        }
+
+        fn prepare_request(
+            &self,
+            mut request: PreparedRequest,
+            _auth: &ProviderAuth,
+        ) -> Result<PreparedRequest> {
+            request.headers.insert(
+                HeaderName::from_static("x-prepared"),
+                HeaderValue::from_static("yes"),
+            );
+            Ok(request)
+        }
+
+        fn build_auth_headers(&self, auth: &ProviderAuth) -> Result<HeaderMap> {
+            bearer_headers(self.name(), auth)
+        }
+    }
+
+    impl ChatTransform for PreparedHubTestProvider {}
+
+    impl ProviderCapabilities for PreparedHubTestProvider {}
+
+    impl ProviderMeta for NativeTestProvider {
+        fn name(&self) -> &'static str {
+            "native-test"
+        }
+
+        fn default_base_url(&self) -> &'static str {
+            "https://example.invalid"
+        }
+
+        fn stream_reader_kind(&self) -> StreamReaderKind {
+            StreamReaderKind::Sse
+        }
+
+        fn build_auth_headers(&self, auth: &ProviderAuth) -> Result<HeaderMap> {
+            bearer_headers(self.name(), auth)
+        }
+    }
+
+    impl ChatTransform for NativeTestProvider {}
+
+    impl NativeOpenAIResponsesSupport for NativeTestProvider {
+        fn native_openai_responses_endpoint(&self, _model: &str) -> Cow<'static, str> {
+            Cow::Borrowed("/v1/native")
+        }
+
+        fn transform_openai_responses_request(&self, _req: &ResponsesApiRequest) -> Result<Value> {
+            Ok(json!({}))
+        }
+
+        fn transform_openai_responses_response(
+            &self,
+            _body: Value,
+        ) -> Result<ResponsesApiResponse> {
+            unreachable!("not used in this test")
+        }
+
+        fn transform_openai_responses_stream_chunk(
+            &self,
+            _raw: &str,
+            _state: &mut OpenAIResponsesNativeStreamState,
+        ) -> Result<Vec<ResponsesApiStreamEvent>> {
+            Ok(vec![])
+        }
+    }
+
+    impl ProviderCapabilities for NativeTestProvider {
+        fn as_native_openai_responses(&self) -> Option<&dyn NativeOpenAIResponsesSupport> {
+            Some(self)
+        }
+    }
+
+    impl ProviderMeta for UnsupportedHubStreamTestProvider {
+        fn name(&self) -> &'static str {
+            "unsupported-hub-stream-test"
+        }
+
+        fn default_base_url(&self) -> &'static str {
+            "https://example.invalid"
+        }
+
+        fn chat_endpoint_path(&self, _model: &str) -> Cow<'static, str> {
+            Cow::Borrowed("/v1/chat/completions")
+        }
+
+        fn stream_reader_kind(&self) -> StreamReaderKind {
+            StreamReaderKind::JsonArrayStream
+        }
+
+        fn build_auth_headers(&self, auth: &ProviderAuth) -> Result<HeaderMap> {
+            bearer_headers(self.name(), auth)
+        }
+    }
+
+    impl ChatTransform for UnsupportedHubStreamTestProvider {}
+
+    impl ProviderCapabilities for UnsupportedHubStreamTestProvider {}
+
+    impl ProviderMeta for UnsupportedNativeStreamTestProvider {
+        fn name(&self) -> &'static str {
+            "unsupported-native-stream-test"
+        }
+
+        fn default_base_url(&self) -> &'static str {
+            "https://example.invalid"
+        }
+
+        fn stream_reader_kind(&self) -> StreamReaderKind {
+            StreamReaderKind::JsonArrayStream
+        }
+
+        fn build_auth_headers(&self, auth: &ProviderAuth) -> Result<HeaderMap> {
+            bearer_headers(self.name(), auth)
+        }
+    }
+
+    impl ChatTransform for UnsupportedNativeStreamTestProvider {}
+
+    impl NativeOpenAIResponsesSupport for UnsupportedNativeStreamTestProvider {
+        fn native_openai_responses_endpoint(&self, _model: &str) -> Cow<'static, str> {
+            Cow::Borrowed("/v1/native")
+        }
+
+        fn transform_openai_responses_request(&self, _req: &ResponsesApiRequest) -> Result<Value> {
+            Ok(json!({}))
+        }
+
+        fn transform_openai_responses_response(
+            &self,
+            _body: Value,
+        ) -> Result<ResponsesApiResponse> {
+            unreachable!("not used in this test")
+        }
+
+        fn transform_openai_responses_stream_chunk(
+            &self,
+            _raw: &str,
+            _state: &mut OpenAIResponsesNativeStreamState,
+        ) -> Result<Vec<ResponsesApiStreamEvent>> {
+            Ok(vec![])
+        }
+    }
+
+    impl ProviderCapabilities for UnsupportedNativeStreamTestProvider {
+        fn as_native_openai_responses(&self) -> Option<&dyn NativeOpenAIResponsesSupport> {
+            Some(self)
+        }
+    }
+
+    impl ChatFormat for DummyNativeFormat {
+        type Request = Value;
+        type Response = Value;
+        type StreamChunk = Value;
+        type BridgeState = ();
+        type NativeStreamState = ();
+
+        fn name() -> &'static str {
+            "dummy_native"
+        }
+
+        fn is_stream(_req: &Self::Request) -> bool {
+            false
+        }
+
+        fn extract_model(req: &Self::Request) -> &str {
+            req.get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("dummy-native-model")
+        }
+
+        fn to_hub(_req: &Self::Request) -> Result<(ChatCompletionRequest, BridgeContext)> {
+            unreachable!("not used in this test")
+        }
+
+        fn from_hub(
+            _resp: &ChatCompletionResponse,
+            _ctx: &BridgeContext,
+        ) -> Result<Self::Response> {
+            unreachable!("not used in this test")
+        }
+
+        fn from_hub_stream(
+            _chunk: &ChatCompletionChunk,
+            _state: &mut Self::BridgeState,
+            _ctx: &BridgeContext,
+        ) -> Result<Vec<Self::StreamChunk>> {
+            unreachable!("not used in this test")
+        }
+
+        fn native_support(provider: &dyn ProviderCapabilities) -> Option<NativeHandler<'_>>
+        where
+            Self: Sized,
+        {
+            provider
+                .as_native_openai_responses()
+                .map(NativeHandler::OpenAIResponses)
+        }
+
+        fn call_native(
+            _native: &NativeHandler<'_>,
+            request: &Self::Request,
+            _stream: bool,
+        ) -> Result<(String, Value)>
+        where
+            Self: Sized,
+        {
+            Ok(("/v1/native".into(), request.clone()))
+        }
+
+        fn transform_native_stream_chunk(
+            _provider: &dyn ProviderCapabilities,
+            _raw: &str,
+            _state: &mut Self::NativeStreamState,
+        ) -> Result<Vec<Self::StreamChunk>> {
+            Ok(vec![])
+        }
+
+        fn parse_native_response(_native: &NativeHandler<'_>, body: Value) -> Result<Self::Response>
+        where
+            Self: Sized,
+        {
+            Ok(body)
+        }
+
+        fn serialize_chunk_payload(chunk: &Self::StreamChunk) -> String {
+            serde_json::to_string(chunk).unwrap()
+        }
+    }
+
+    impl ChatFormat for StreamingNativeFormat {
+        type Request = Value;
+        type Response = Value;
+        type StreamChunk = Value;
+        type BridgeState = ();
+        type NativeStreamState = StreamingNativeState;
+
+        fn name() -> &'static str {
+            "streaming_native"
+        }
+
+        fn is_stream(req: &Self::Request) -> bool {
+            req.get("stream").and_then(Value::as_bool).unwrap_or(false)
+        }
+
+        fn extract_model(req: &Self::Request) -> &str {
+            req.get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("streaming-native-model")
+        }
+
+        fn to_hub(_req: &Self::Request) -> Result<(ChatCompletionRequest, BridgeContext)> {
+            unreachable!("not used in this test")
+        }
+
+        fn from_hub(
+            _resp: &ChatCompletionResponse,
+            _ctx: &BridgeContext,
+        ) -> Result<Self::Response> {
+            unreachable!("not used in this test")
+        }
+
+        fn from_hub_stream(
+            _chunk: &ChatCompletionChunk,
+            _state: &mut Self::BridgeState,
+            _ctx: &BridgeContext,
+        ) -> Result<Vec<Self::StreamChunk>> {
+            unreachable!("not used in this test")
+        }
+
+        fn native_support(provider: &dyn ProviderCapabilities) -> Option<NativeHandler<'_>>
+        where
+            Self: Sized,
+        {
+            provider
+                .as_native_openai_responses()
+                .map(NativeHandler::OpenAIResponses)
+        }
+
+        fn call_native(
+            _native: &NativeHandler<'_>,
+            request: &Self::Request,
+            stream: bool,
+        ) -> Result<(String, Value)>
+        where
+            Self: Sized,
+        {
+            let path = if stream {
+                "/v1/native-stream"
+            } else {
+                "/v1/native"
+            };
+            Ok((path.into(), request.clone()))
+        }
+
+        fn transform_native_stream_chunk(
+            _provider: &dyn ProviderCapabilities,
+            raw: &str,
+            state: &mut Self::NativeStreamState,
+        ) -> Result<Vec<Self::StreamChunk>> {
+            match raw {
+                "data: buffered" => Ok(vec![json!({"value": "first"}), json!({"value": "second"})]),
+                "data: usage" => {
+                    state.usage = Usage {
+                        input_tokens: Some(5),
+                        output_tokens: Some(8),
+                        total_tokens: Some(13),
+                        ..Default::default()
+                    };
+                    Ok(vec![])
+                }
+                _ => Ok(vec![]),
+            }
+        }
+
+        fn parse_native_response(_native: &NativeHandler<'_>, body: Value) -> Result<Self::Response>
+        where
+            Self: Sized,
+        {
+            Ok(body)
+        }
+
+        fn native_usage(state: &Self::NativeStreamState) -> Usage {
+            state.usage.clone()
+        }
+
+        fn serialize_chunk_payload(chunk: &Self::StreamChunk) -> String {
+            serde_json::to_string(chunk).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_completion_uses_hub_path_and_extracts_usage() {
+        let observed: Arc<Mutex<ObservedRequest>> = Arc::new(Mutex::new(None));
+        let observed_clone = Arc::clone(&observed);
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let observed = Arc::clone(&observed_clone);
+                async move {
+                    let auth = headers
+                        .get(AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    *observed.lock().await = Some((auth, body));
+
+                    Json(json!({
+                        "id": "chatcmpl-123",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": "gpt-test",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "hello from hub"
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 7,
+                            "completion_tokens": 9,
+                            "total_tokens": 16,
+                            "prompt_tokens_details": {"cached_tokens": 2},
+                            "completion_tokens_details": {"audio_tokens": 1}
+                        }
+                    }))
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        assert!(gateway.registry().get("hub-test").is_none());
+
+        let instance = ProviderInstance {
+            def: Arc::new(HubTestProvider),
+            auth: ProviderAuth::ApiKey("hub-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let response = gateway.chat_completion(&request, &instance).await.unwrap();
+        let ChatResponse::Complete { response, usage } = response else {
+            panic!("expected complete response")
+        };
+
+        assert_eq!(response.model, "gpt-test");
+        assert_matches!(
+            response.choices[0].message.content.as_ref(),
+            Some(crate::types::openai::MessageContent::Text(text))
+                if text == "hello from hub"
+        );
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(9));
+        assert_eq!(usage.total_tokens, Some(16));
+        assert_eq!(usage.cache_read_input_tokens, Some(2));
+        assert_eq!(usage.output_audio_tokens, Some(1));
+
+        let observed = observed.lock().await.take().unwrap();
+        assert_eq!(observed.0.as_deref(), Some("Bearer hub-secret"));
+        assert_eq!(observed.1["model"], "gpt-test");
+        assert_eq!(observed.1["messages"][0]["content"], "hello");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_requests_save_and_resolve_previous_response_id_sessions() {
+        let observed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let observed_clone = Arc::clone(&observed);
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let observed = Arc::clone(&observed_clone);
+                async move {
+                    let mut observed = observed.lock().await;
+                    observed.push(body);
+                    let request_number = observed.len();
+                    let reply = if request_number == 1 {
+                        "first reply"
+                    } else {
+                        "second reply"
+                    };
+
+                    Json(json!({
+                        "id": format!("chatcmpl-{}", request_number),
+                        "object": "chat.completion",
+                        "created": request_number,
+                        "model": "gpt-test",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": reply
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build())
+            .with_session_store(Arc::new(InMemorySessionStore::default()));
+        let instance = ProviderInstance {
+            def: Arc::new(HubTestProvider),
+            auth: ProviderAuth::ApiKey("hub-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+
+        let first_request: ResponsesApiRequest = serde_json::from_value(json!({
+            "model": "gpt-test",
+            "input": "hello"
+        }))
+        .unwrap();
+        let first_response = gateway
+            .chat::<ResponsesApiFormat>(&first_request, &instance)
+            .await
+            .unwrap();
+        let ChatResponse::Complete {
+            response: first_response,
+            ..
+        } = first_response
+        else {
+            panic!("expected complete responses response")
+        };
+        assert_eq!(first_response.id, "chatcmpl-1");
+
+        let second_request: ResponsesApiRequest = serde_json::from_value(json!({
+            "model": "gpt-test",
+            "input": "how are you?",
+            "previous_response_id": "chatcmpl-1"
+        }))
+        .unwrap();
+        let second_response = gateway
+            .chat::<ResponsesApiFormat>(&second_request, &instance)
+            .await
+            .unwrap();
+        let ChatResponse::Complete {
+            response: second_response,
+            ..
+        } = second_response
+        else {
+            panic!("expected complete responses response")
+        };
+        assert_eq!(second_response.id, "chatcmpl-2");
+
+        let observed = observed.lock().await;
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0]["messages"][0]["content"], "hello");
+        assert_eq!(observed[1]["messages"][0]["role"], "user");
+        assert_eq!(observed[1]["messages"][0]["content"], "hello");
+        assert_eq!(observed[1]["messages"][1]["role"], "assistant");
+        assert_eq!(observed[1]["messages"][1]["content"], "first reply");
+        assert_eq!(observed[1]["messages"][2]["role"], "user");
+        assert_eq!(observed[1]["messages"][2]["content"], "how are you?");
+
+        server.abort();
+    }
+
+    #[test]
+    fn session_messages_from_hub_request_drops_synthetic_responses_instructions() {
+        let hub_request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-test",
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hello"}
+            ]
+        }))
+        .unwrap();
+        let ctx = BridgeContext {
+            openai_responses_extras: Some(OpenAIResponsesExtras {
+                previous_response_id: None,
+                instructions: Some("be terse".into()),
+                store: None,
+                metadata: None,
+                background: None,
+                context_management: None,
+                conversation: None,
+                include: None,
+                max_tool_calls: None,
+                prompt: None,
+                prompt_cache_key: None,
+                prompt_cache_retention: None,
+                reasoning: None,
+                safety_identifier: None,
+                service_tier: None,
+                stream_options: None,
+                text: None,
+                top_logprobs: None,
+                truncation: None,
+            }),
+            ..Default::default()
+        };
+
+        let session_messages = super::session_messages_from_hub_request(&hub_request, &ctx);
+
+        assert_eq!(session_messages.len(), 1);
+        assert_eq!(session_messages[0].role, "user");
+        assert_matches!(
+            session_messages[0].content.as_ref(),
+            Some(crate::types::openai::MessageContent::Text(text)) if text == "hello"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_previous_response_id_not_found_returns_validation() {
+        let gateway = Gateway::new(ProviderRegistry::builder().build())
+            .with_session_store(Arc::new(InMemorySessionStore::default()));
+        let instance = ProviderInstance {
+            def: Arc::new(HubTestProvider),
+            auth: ProviderAuth::ApiKey("hub-secret".into()),
+            base_url_override: Some(Url::parse("http://127.0.0.1:1").unwrap()),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: ResponsesApiRequest = serde_json::from_value(json!({
+            "model": "gpt-test",
+            "input": "hello",
+            "previous_response_id": "resp_missing"
+        }))
+        .unwrap();
+
+        let result = gateway
+            .chat::<ResponsesApiFormat>(&request, &instance)
+            .await;
+
+        assert_matches!(
+            result.map(|_| ()),
+            Err(GatewayError::Validation(message))
+                if message.contains("previous_response_not_found")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completion_applies_provider_prepare_request() {
+        let observed: Arc<Mutex<PreparedObservedRequest>> = Arc::new(Mutex::new(None));
+        let observed_clone = Arc::clone(&observed);
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let observed = Arc::clone(&observed_clone);
+                async move {
+                    let auth = headers
+                        .get(AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    let prepared = headers
+                        .get("x-prepared")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    *observed.lock().await = Some((auth, prepared, body));
+
+                    Json(json!({
+                        "id": "chatcmpl-123",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": "gpt-test",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "prepared"
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    }))
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(PreparedHubTestProvider),
+            auth: ProviderAuth::ApiKey("hub-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let response = gateway.chat_completion(&request, &instance).await.unwrap();
+        let ChatResponse::Complete { response, .. } = response else {
+            panic!("expected complete response")
+        };
+
+        assert_eq!(response.model, "gpt-test");
+
+        let observed = observed.lock().await.take().unwrap();
+        assert_eq!(observed.0.as_deref(), Some("Bearer hub-secret"));
+        assert_eq!(observed.1.as_deref(), Some("yes"));
+        assert_eq!(observed.2["model"], "gpt-test");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_completion_uses_bedrock_complete_path_and_signs_request() {
+        let observed: Arc<Mutex<BedrockObservedRequest>> = Arc::new(Mutex::new(None));
+        let observed_clone = Arc::clone(&observed);
+        let router = Router::new().route(
+            "/{*path}",
+            post(
+                move |OriginalUri(uri): OriginalUri,
+                      headers: HeaderMap,
+                      Json(body): Json<Value>| {
+                    let observed = Arc::clone(&observed_clone);
+                    async move {
+                        let authorization = headers
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        let session_token = headers
+                            .get("x-amz-security-token")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        *observed.lock().await =
+                            Some((uri.path().to_string(), authorization, session_token, body));
+
+                        Json(json!({
+                            "output": {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": [{"text": "hello from bedrock"}]
+                                }
+                            },
+                            "stopReason": "end_turn",
+                            "usage": {
+                                "inputTokens": 7,
+                                "outputTokens": 9,
+                                "totalTokens": 16
+                            }
+                        }))
+                    }
+                },
+            ),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(BedrockDef),
+            auth: ProviderAuth::AwsStatic(AwsStaticCredentials {
+                access_key_id: "AKIA123".into(),
+                secret_access_key: "secret".into(),
+                session_token: Some("token".into()),
+                region: "us-east-1".into(),
+            }),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let response = gateway.chat_completion(&request, &instance).await.unwrap();
+        let ChatResponse::Complete { response, usage } = response else {
+            panic!("expected complete response")
+        };
+
+        assert_eq!(
+            response.model,
+            "inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0"
+        );
+        assert!(response.id.starts_with("bedrock-"));
+        assert_eq!(response.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_matches!(
+            response.choices[0].message.content.as_ref(),
+            Some(crate::types::openai::MessageContent::Text(text))
+                if text == "hello from bedrock"
+        );
+        assert_eq!(usage.total_tokens, Some(16));
+
+        let observed = observed.lock().await.take().unwrap();
+        assert_eq!(
+            observed.0,
+            "/model/inference-profile%2Fus.anthropic.claude-3-7-sonnet-20250219-v1:0/converse"
+        );
+        assert!(
+            observed
+                .1
+                .as_deref()
+                .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256"))
+        );
+        assert_eq!(observed.2.as_deref(), Some("token"));
+        assert_eq!(observed.3["messages"][0]["content"][0]["text"], "hello");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn embed_uses_provider_transform_and_parses_response() {
+        let observed: Arc<Mutex<ObservedRequest>> = Arc::new(Mutex::new(None));
+        let observed_clone = Arc::clone(&observed);
+        let router = Router::new().route(
+            "/v1/embeddings",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let observed = Arc::clone(&observed_clone);
+                async move {
+                    let auth = headers
+                        .get(AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    *observed.lock().await = Some((auth, body));
+
+                    Json(json!({
+                        "object": "list",
+                        "data": [{
+                            "object": "embedding",
+                            "embedding": [0.1, 0.2],
+                            "index": 0
+                        }],
+                        "model": "text-embedding-3-large",
+                        "usage": {
+                            "prompt_tokens": 2,
+                            "total_tokens": 2
+                        }
+                    }))
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(HubTestProvider),
+            auth: ProviderAuth::ApiKey("hub-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: EmbeddingRequest = serde_json::from_value(json!({
+            "model": "text-embedding-3-large",
+            "input": ["hello"]
+        }))
+        .unwrap();
+
+        let response = gateway.embed(&request, &instance).await.unwrap();
+
+        assert_eq!(response.model, "text-embedding-3-large");
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.usage.as_ref().unwrap().total_tokens, 2);
+
+        let observed = observed.lock().await.take().unwrap();
+        assert_eq!(observed.0.as_deref(), Some("Bearer hub-secret"));
+        assert_eq!(observed.1["model"], "text-embedding-3-large");
+        assert_eq!(observed.1["input"][0], "hello");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn embed_rejects_provider_without_embed_transform() {
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(NativeTestProvider),
+            auth: ProviderAuth::ApiKey("native-secret".into()),
+            base_url_override: Some(Url::parse("https://example.invalid").unwrap()),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: EmbeddingRequest = serde_json::from_value(json!({
+            "model": "text-embedding-3-large",
+            "input": "hello"
+        }))
+        .unwrap();
+
+        let error = gateway.embed(&request, &instance).await.unwrap_err();
+
+        assert_matches!(
+            error,
+            GatewayError::EmbeddingsNotSupported { provider }
+                if provider == "native-test"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_uses_native_path_when_format_and_provider_support_it() {
+        let observed: Arc<Mutex<ObservedRequest>> = Arc::new(Mutex::new(None));
+        let observed_clone = Arc::clone(&observed);
+        let router = Router::new().route(
+            "/v1/native",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let observed = Arc::clone(&observed_clone);
+                async move {
+                    let auth = headers
+                        .get(AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    *observed.lock().await = Some((auth, body));
+
+                    Json(json!({
+                        "ok": true,
+                        "source": "native"
+                    }))
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(NativeTestProvider),
+            auth: ProviderAuth::ApiKey("native-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request = json!({
+            "model": "native-model",
+            "input": "hello"
+        });
+
+        let response = gateway
+            .chat::<DummyNativeFormat>(&request, &instance)
+            .await
+            .unwrap();
+        let ChatResponse::Complete { response, usage } = response else {
+            panic!("expected complete response")
+        };
+
+        assert_eq!(response, json!({"ok": true, "source": "native"}));
+        assert!(usage.input_tokens.is_none());
+        assert!(usage.output_tokens.is_none());
+
+        let observed = observed.lock().await.take().unwrap();
+        assert_eq!(observed.0.as_deref(), Some("Bearer native-secret"));
+        assert_eq!(observed.1, request);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messages_bridges_hub_response_into_anthropic_format() {
+        let observed: Arc<Mutex<ObservedRequest>> = Arc::new(Mutex::new(None));
+        let observed_clone = Arc::clone(&observed);
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let observed = Arc::clone(&observed_clone);
+                async move {
+                    let auth = headers
+                        .get(AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    *observed.lock().await = Some((auth, body));
+
+                    Json(json!({
+                        "id": "chatcmpl-456",
+                        "object": "chat.completion",
+                        "created": 1,
+                        "model": "gpt-test",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "hello from hub"
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 7,
+                            "completion_tokens": 9,
+                            "total_tokens": 16,
+                            "prompt_tokens_details": {"cached_tokens": 2}
+                        }
+                    }))
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(HubTestProvider),
+            auth: ProviderAuth::ApiKey("hub-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-test",
+            "max_tokens": 256,
+            "top_k": 5,
+            "system": "You are helpful.",
+            "messages": [{"role": "user", "content": "hello"}],
+            "metadata": {"user_id": "user-123"}
+        }))
+        .unwrap();
+
+        let response = gateway.messages(&request, &instance).await.unwrap();
+        let ChatResponse::Complete { response, usage } = response else {
+            panic!("expected complete response")
+        };
+
+        assert_eq!(response.id, "chatcmpl-456");
+        assert_eq!(response.r#type, "message");
+        assert_eq!(response.role, "assistant");
+        assert_eq!(response.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(response.usage.input_tokens, 5);
+        assert_eq!(response.usage.output_tokens, 9);
+        assert_eq!(response.usage.cache_read_input_tokens, 2);
+        assert_matches!(
+            &response.content[0],
+            AnthropicContentBlock::Text { text, .. } if text == "hello from hub"
+        );
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(9));
+        assert_eq!(usage.total_tokens, Some(16));
+
+        let observed = observed.lock().await.take().unwrap();
+        assert_eq!(observed.0.as_deref(), Some("Bearer hub-secret"));
+        assert_eq!(observed.1["messages"][0]["role"], "system");
+        assert_eq!(observed.1["messages"][1]["role"], "user");
+        assert_eq!(observed.1["user"], "user-123");
+        assert_eq!(observed.1["top_k"], 5);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messages_stream_hub_chunks_into_anthropic_events_and_usage() {
+        let sse_body = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::to_string(&json!({
+                "id": "chatcmpl-789",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "gpt-test",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": "hello"
+                    },
+                    "finish_reason": null
+                }]
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "id": "chatcmpl-789",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "gpt-test",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 9,
+                    "total_tokens": 16,
+                    "prompt_tokens_details": {"cached_tokens": 2}
+                }
+            }))
+            .unwrap(),
+        );
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let sse_body = sse_body.clone();
+                async move {
+                    http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(axum::body::Body::from(sse_body))
+                        .unwrap()
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(HubTestProvider),
+            auth: ProviderAuth::ApiKey("hub-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-test",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .unwrap();
+
+        let response = gateway.messages(&request, &instance).await.unwrap();
+        let ChatResponse::Stream {
+            mut stream,
+            usage_rx,
+        } = response
+        else {
+            panic!("expected streaming response")
+        };
+
+        let message_start = stream.next().await.unwrap().unwrap();
+        let block_start = stream.next().await.unwrap().unwrap();
+        let block_delta = stream.next().await.unwrap().unwrap();
+        let block_stop = stream.next().await.unwrap().unwrap();
+        let message_delta = stream.next().await.unwrap().unwrap();
+        let message_stop = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+
+        assert_matches!(
+            message_start,
+            crate::types::anthropic::AnthropicStreamEvent::MessageStart { message }
+                if message.id == "chatcmpl-789"
+        );
+        assert_matches!(
+            block_start,
+            crate::types::anthropic::AnthropicStreamEvent::ContentBlockStart { index, .. }
+                if index == 0
+        );
+        assert_matches!(
+            block_delta,
+            crate::types::anthropic::AnthropicStreamEvent::ContentBlockDelta { index, delta }
+                if index == 0
+                    && matches!(&delta, crate::types::anthropic::ContentDelta::TextDelta { text } if text == "hello")
+        );
+        assert_matches!(
+            block_stop,
+            crate::types::anthropic::AnthropicStreamEvent::ContentBlockStop { index }
+                if index == 0
+        );
+        assert_matches!(
+            message_delta,
+            crate::types::anthropic::AnthropicStreamEvent::MessageDelta { usage, .. }
+                if usage.input_tokens == Some(5)
+                    && usage.output_tokens == Some(9)
+                    && usage.cache_creation_input_tokens == Some(0)
+                    && usage.cache_read_input_tokens == Some(2)
+        );
+        assert_matches!(
+            message_stop,
+            crate::types::anthropic::AnthropicStreamEvent::MessageStop
+        );
+
+        let usage = usage_rx.await.unwrap();
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(9));
+        assert_eq!(usage.total_tokens, Some(16));
+        assert_eq!(usage.cache_read_input_tokens, Some(2));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messages_use_native_anthropic_path_when_supported() {
+        let observed: Arc<Mutex<ObservedRequest>> = Arc::new(Mutex::new(None));
+        let observed_clone = Arc::clone(&observed);
+        let router = Router::new().route(
+            "/v1/messages",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let observed = Arc::clone(&observed_clone);
+                async move {
+                    let auth = headers
+                        .get("x-api-key")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    *observed.lock().await = Some((auth, body));
+
+                    Json(json!({
+                        "id": "msg_123",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "hello from native"}],
+                        "model": "claude-3-5-sonnet-20241022",
+                        "stop_reason": "end_turn",
+                        "stop_sequence": null,
+                        "usage": {
+                            "input_tokens": 3,
+                            "output_tokens": 4,
+                            "cache_creation_input_tokens": 5,
+                            "cache_read_input_tokens": 2
+                        }
+                    }))
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(AnthropicDef),
+            auth: ProviderAuth::ApiKey("anthropic-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 256,
+            "system": "You are helpful.",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let response = gateway.messages(&request, &instance).await.unwrap();
+        let ChatResponse::Complete { response, usage } = response else {
+            panic!("expected complete response")
+        };
+
+        assert_eq!(response.id, "msg_123");
+        assert_eq!(response.model, "claude-3-5-sonnet-20241022");
+        assert_matches!(
+            &response.content[0],
+            AnthropicContentBlock::Text { text, .. } if text == "hello from native"
+        );
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(4));
+        assert_eq!(usage.total_tokens, Some(14));
+        assert_eq!(usage.cache_creation_input_tokens, Some(5));
+        assert_eq!(usage.cache_read_input_tokens, Some(2));
+
+        let observed = observed.lock().await.take().unwrap();
+        assert_eq!(observed.0.as_deref(), Some("anthropic-secret"));
+        assert_eq!(observed.1["messages"][0]["role"], "user");
+        assert_eq!(observed.1["messages"][0]["content"], "hello");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn messages_stream_native_anthropic_reports_cache_usage() {
+        let sse_body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet-20241022\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":2}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":4,\"input_tokens\":3}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let router = Router::new().route(
+            "/v1/messages",
+            post(move || async move {
+                http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from(sse_body))
+                    .unwrap()
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(AnthropicDef),
+            auth: ProviderAuth::ApiKey("anthropic-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: AnthropicMessagesRequest = serde_json::from_value(json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .unwrap();
+
+        let response = gateway.messages(&request, &instance).await.unwrap();
+        let ChatResponse::Stream {
+            mut stream,
+            usage_rx,
+        } = response
+        else {
+            panic!("expected stream response")
+        };
+
+        let message_start = stream.next().await.unwrap().unwrap();
+        let block_start = stream.next().await.unwrap().unwrap();
+        let block_delta = stream.next().await.unwrap().unwrap();
+        let block_stop = stream.next().await.unwrap().unwrap();
+        let message_delta = stream.next().await.unwrap().unwrap();
+        let message_stop = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+
+        assert_matches!(
+            message_start,
+            crate::types::anthropic::AnthropicStreamEvent::MessageStart { message }
+                if message.usage.input_tokens == Some(3)
+                    && message.usage.output_tokens == Some(1)
+                    && message.usage.cache_creation_input_tokens == Some(5)
+                    && message.usage.cache_read_input_tokens == Some(2)
+        );
+        assert_matches!(
+            block_start,
+            crate::types::anthropic::AnthropicStreamEvent::ContentBlockStart { index, .. }
+                if index == 0
+        );
+        assert_matches!(
+            block_delta,
+            crate::types::anthropic::AnthropicStreamEvent::ContentBlockDelta { index, delta }
+                if index == 0
+                    && matches!(&delta, crate::types::anthropic::ContentDelta::TextDelta { text } if text == "hello")
+        );
+        assert_matches!(
+            block_stop,
+            crate::types::anthropic::AnthropicStreamEvent::ContentBlockStop { index }
+                if index == 0
+        );
+        assert_matches!(
+            message_delta,
+            crate::types::anthropic::AnthropicStreamEvent::MessageDelta { usage, .. }
+                if usage.input_tokens == Some(3)
+                    && usage.output_tokens == Some(4)
+                    && usage.cache_creation_input_tokens.is_none()
+                    && usage.cache_read_input_tokens.is_none()
+        );
+        assert_matches!(
+            message_stop,
+            crate::types::anthropic::AnthropicStreamEvent::MessageStop
+        );
+
+        let usage = usage_rx.await.unwrap();
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(4));
+        assert_eq!(usage.total_tokens, Some(14));
+        assert_eq!(usage.cache_creation_input_tokens, Some(5));
+        assert_eq!(usage.cache_read_input_tokens, Some(2));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_completion_streams_hub_chunks_and_reports_usage() {
+        let sse_body = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            serde_json::to_string(&json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "gpt-test",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": "hello from stream"
+                    },
+                    "finish_reason": null
+                }]
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "gpt-test",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 9,
+                    "total_tokens": 16
+                }
+            }))
+            .unwrap(),
+        );
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let sse_body = sse_body.clone();
+                async move {
+                    http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(axum::body::Body::from(sse_body))
+                        .unwrap()
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(HubTestProvider),
+            auth: ProviderAuth::ApiKey("hub-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .unwrap();
+
+        let response = gateway.chat_completion(&request, &instance).await.unwrap();
+        let ChatResponse::Stream {
+            mut stream,
+            usage_rx,
+        } = response
+        else {
+            panic!("expected streaming response")
+        };
+
+        let first = stream.next().await.unwrap().unwrap();
+        let usage_chunk = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+
+        assert_eq!(
+            first.choices[0].delta.content.as_deref(),
+            Some("hello from stream")
+        );
+        assert_eq!(usage_chunk.usage.as_ref().unwrap().total_tokens, 16);
+
+        let usage = usage_rx.await.unwrap();
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(9));
+        assert_eq!(usage.total_tokens, Some(16));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_completion_streams_bedrock_chunks_and_reports_usage() {
+        let observed: Arc<Mutex<BedrockObservedRequest>> = Arc::new(Mutex::new(None));
+        let observed_clone = Arc::clone(&observed);
+        let body = encode_event_stream_body(vec![
+            (
+                "messageStart",
+                json!({
+                    "role": "assistant"
+                }),
+            ),
+            (
+                "contentBlockDelta",
+                json!({
+                    "contentBlockIndex": 0,
+                    "delta": {"text": "hello from bedrock stream"}
+                }),
+            ),
+            (
+                "messageStop",
+                json!({
+                    "stopReason": "end_turn"
+                }),
+            ),
+            (
+                "metadata",
+                json!({
+                    "usage": {
+                        "inputTokens": 7,
+                        "outputTokens": 9,
+                        "totalTokens": 16
+                    }
+                }),
+            ),
+        ]);
+        let router = Router::new().route(
+            "/{*path}",
+            post(
+                move |OriginalUri(uri): OriginalUri,
+                      headers: HeaderMap,
+                      Json(body_json): Json<Value>| {
+                    let observed = Arc::clone(&observed_clone);
+                    let body = body.clone();
+                    async move {
+                        let authorization = headers
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        let session_token = headers
+                            .get("x-amz-security-token")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        *observed.lock().await = Some((
+                            uri.path().to_string(),
+                            authorization,
+                            session_token,
+                            body_json,
+                        ));
+
+                        http::Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/vnd.amazon.eventstream")
+                            .body(axum::body::Body::from(body))
+                            .unwrap()
+                    }
+                },
+            ),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(BedrockDef),
+            auth: ProviderAuth::AwsStatic(AwsStaticCredentials {
+                access_key_id: "AKIA123".into(),
+                secret_access_key: "secret".into(),
+                session_token: Some("token".into()),
+                region: "us-east-1".into(),
+            }),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .unwrap();
+
+        let response = gateway.chat_completion(&request, &instance).await.unwrap();
+        let ChatResponse::Stream {
+            mut stream,
+            usage_rx,
+        } = response
+        else {
+            panic!("expected streaming response")
+        };
+
+        let role_chunk = stream.next().await.unwrap().unwrap();
+        let text_chunk = stream.next().await.unwrap().unwrap();
+        let stop_chunk = stream.next().await.unwrap().unwrap();
+        let usage_chunk = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+
+        assert!(role_chunk.id.starts_with("bedrock-"));
+        assert_eq!(
+            role_chunk.choices[0].delta.role.as_deref(),
+            Some("assistant")
+        );
+        assert_eq!(
+            text_chunk.choices[0].delta.content.as_deref(),
+            Some("hello from bedrock stream")
+        );
+        assert_eq!(stop_chunk.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(usage_chunk.usage.as_ref().unwrap().total_tokens, 16);
+
+        let usage = usage_rx.await.unwrap();
+        assert_eq!(usage.input_tokens, Some(7));
+        assert_eq!(usage.output_tokens, Some(9));
+        assert_eq!(usage.total_tokens, Some(16));
+
+        let observed = observed.lock().await.take().unwrap();
+        assert_eq!(
+            observed.0,
+            "/model/inference-profile%2Fus.anthropic.claude-3-7-sonnet-20250219-v1:0/converse-stream"
+        );
+        assert!(
+            observed
+                .1
+                .as_deref()
+                .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256"))
+        );
+        assert_eq!(observed.2.as_deref(), Some("token"));
+        assert_eq!(observed.3["messages"][0]["content"][0]["text"], "hello");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_streams_native_chunks_and_reports_usage() {
+        let router = Router::new().route(
+            "/v1/native-stream",
+            post(|| async {
+                http::Response::builder()
+                    .status(StatusCode::OK)
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from("data: buffered\n\ndata: usage\n\n"))
+                    .unwrap()
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(NativeTestProvider),
+            auth: ProviderAuth::ApiKey("native-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request = json!({
+            "model": "native-model",
+            "stream": true
+        });
+
+        let response = gateway
+            .chat::<StreamingNativeFormat>(&request, &instance)
+            .await
+            .unwrap();
+        let ChatResponse::Stream {
+            mut stream,
+            usage_rx,
+        } = response
+        else {
+            panic!("expected streaming response")
+        };
+
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            json!({"value": "first"})
+        );
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            json!({"value": "second"})
+        );
+        assert!(stream.next().await.is_none());
+
+        let usage = usage_rx.await.unwrap();
+        assert_eq!(usage.input_tokens, Some(5));
+        assert_eq!(usage.output_tokens, Some(8));
+        assert_eq!(usage.total_tokens, Some(13));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_completion_rejects_unsupported_stream_reader_before_dispatch() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_clone = Arc::clone(&request_count);
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let request_count = Arc::clone(&request_count_clone);
+                async move {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(axum::body::Body::from("data: [DONE]\n\n"))
+                        .unwrap()
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(UnsupportedHubStreamTestProvider),
+            auth: ProviderAuth::ApiKey("hub-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .unwrap();
+
+        let result = gateway.chat_completion(&request, &instance).await;
+        assert_matches!(
+            result.map(|_| ()),
+            Err(GatewayError::Validation(message))
+                if message.contains("JsonArrayStream")
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_native_rejects_unsupported_stream_reader_before_dispatch() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_clone = Arc::clone(&request_count);
+        let router = Router::new().route(
+            "/v1/native-stream",
+            post(move || {
+                let request_count = Arc::clone(&request_count_clone);
+                async move {
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    http::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(axum::body::Body::from("data: [DONE]\n\n"))
+                        .unwrap()
+                }
+            }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(UnsupportedNativeStreamTestProvider),
+            auth: ProviderAuth::ApiKey("native-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request = json!({
+            "model": "native-model",
+            "stream": true
+        });
+
+        let result = gateway
+            .chat::<StreamingNativeFormat>(&request, &instance)
+            .await;
+        assert_matches!(
+            result.map(|_| ()),
+            Err(GatewayError::Validation(message))
+                if message.contains("JsonArrayStream")
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_completion_preserves_non_json_provider_error_body() {
+        let router = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { (StatusCode::BAD_GATEWAY, "upstream exploded") }),
+        );
+        let (base_url, server) = spawn_server(router).await;
+
+        let gateway = Gateway::new(ProviderRegistry::builder().build());
+        let instance = ProviderInstance {
+            def: Arc::new(HubTestProvider),
+            auth: ProviderAuth::ApiKey("hub-secret".into()),
+            base_url_override: Some(base_url),
+            custom_headers: HeaderMap::new(),
+        };
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let result = gateway.chat_completion(&request, &instance).await;
+        match result {
+            Err(GatewayError::Provider {
+                status,
+                body,
+                provider,
+                retryable,
+            }) => {
+                assert_eq!(status, StatusCode::BAD_GATEWAY);
+                assert_eq!(body, Value::String("upstream exploded".into()));
+                assert_eq!(provider, "hub-test");
+                assert!(retryable);
+            }
+            Err(other) => panic!("unexpected gateway error: {other}"),
+            Ok(_) => panic!("expected provider error"),
+        }
+
+        server.abort();
+    }
+
+    fn bearer_headers(provider: &str, auth: &ProviderAuth) -> Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        let value = HeaderValue::from_str(&format!("Bearer {}", auth.api_key_for(provider)?))
+            .map_err(|error| GatewayError::Validation(error.to_string()))?;
+        headers.insert(AUTHORIZATION, value);
+        headers.insert(
+            HeaderName::from_static("x-provider-name"),
+            HeaderValue::from_str(provider)
+                .map_err(|error| GatewayError::Validation(error.to_string()))?,
+        );
+        Ok(headers)
+    }
+
+    fn encode_event_stream_body(events: Vec<(&str, Value)>) -> Bytes {
+        let mut buffer = Vec::new();
+        for (event_type, payload) in events {
+            let message = Message::new(serde_json::to_vec(&payload).unwrap())
+                .add_header(Header::new(
+                    ":message-type",
+                    EventStreamHeaderValue::String("event".into()),
+                ))
+                .add_header(Header::new(
+                    ":event-type",
+                    EventStreamHeaderValue::String(event_type.to_string().into()),
+                ))
+                .add_header(Header::new(
+                    ":content-type",
+                    EventStreamHeaderValue::String("application/json".into()),
+                ));
+            write_message_to(&message, &mut buffer).unwrap();
+        }
+        Bytes::from(buffer)
+    }
+
+    async fn spawn_server(router: Router) -> (Url, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let base_url = Url::parse(&format!("http://{addr}")).unwrap();
+        (base_url, server)
+    }
+}

@@ -29,6 +29,7 @@ dependencies = [
 name = "aisix"
 version = "0.1.0"
 dependencies = [
+ "aisix-llm",
  "anyhow",
  "arc-swap",
  "assert_matches",
@@ -87,6 +88,34 @@ dependencies = [
  "uuid",
  "validator",
  "vergen-git2",
+]
+
+[[package]]
+name = "aisix-llm"
+version = "0.1.0"
+dependencies = [
+ "assert_matches",
+ "async-trait",
+ "aws-credential-types",
+ "aws-sigv4",
+ "aws-smithy-eventstream",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "axum",
+ "bytes",
+ "fastrace",
+ "futures",
+ "http 1.4.0",
+ "percent-encoding",
+ "pin-project",
+ "pretty_assertions",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "utoipa",
+ "uuid",
 ]
 
 [[package]]
