@@ -2,8 +2,8 @@
 
 The Admin API is the operator surface served on the admin listener
 (default `:3001`). It owns CRUD for every configurable entity, the
-playground proxy, the embedded SPA, the OpenAPI Scalar UI, and the
-Prometheus scrape endpoint.
+playground proxy, the OpenAPI Scalar UI, and the Prometheus scrape
+endpoint.
 
 > **Network posture**: the admin listener is intended to be private —
 > bind it to `127.0.0.1` or to a private subnet. The proxy listener
@@ -27,9 +27,6 @@ The unauthenticated endpoints are:
 - `/metrics` — Prometheus scrape (intended to be private).
 - `/admin/openapi.json`, `/admin/openapi-scalar` — the OpenAPI spec
   and the Scalar UI.
-- `/ui`, `/ui/`, `/ui/*` — the embedded React SPA. The SPA
-  authenticates against the API by storing the admin key in
-  `localStorage` and sending it with every request.
 
 ## 2. Error envelope
 
@@ -202,8 +199,7 @@ Current-month accumulated USD spend per ApiKey from the in-process
 
 Proxies a chat completion through the proxy router **in-process** —
 no extra network hop, but the request is fully audited as if it had
-arrived on the proxy listener. Use this for the "Try it" panel in
-the admin UI.
+arrived on the proxy listener.
 
 This endpoint expects a **proxy** API key (an `ApiKey` from the
 snapshot), not an admin key. The admin key only protects the rest
@@ -218,13 +214,6 @@ of `/admin/v1/*`.
 
 These are unauthenticated by design: knowing the API surface should
 not require credentials.
-
-### 4.10 Embedded SPA
-
-- `GET /ui` → `303 /ui/`
-- `GET /ui/` → `index.html` (text/html)
-- `GET /ui/*path` → static asset, falling back to `index.html` for
-  unknown paths so client-side routes work.
 
 ## 5. Working with the snapshot
 

@@ -61,9 +61,9 @@ observability:
     # host: "https://cloud.langfuse.com"
 
 # Managed-mode switch. Uncomment when running as an aisix.cloud
-# tenant: the admin API, admin UI, and Playground will NOT be
-# bound — all configuration flows from etcd via the mTLS channel
-# above, driven by the aisix.cloud control plane.
+# tenant: the admin API and Playground will NOT be bound — all
+# configuration flows from etcd via the mTLS channel above, driven
+# by the aisix.cloud control plane.
 # managed:
 #   enabled: true
 

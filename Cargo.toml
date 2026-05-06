@@ -44,7 +44,6 @@ hyper-util = "0.1"
 http = "1.2"
 http-body-util = "0.1"
 mime = "0.3"
-mime_guess = "2.0"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "multipart"] }
@@ -107,9 +106,6 @@ hex = "0.4"
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
 utoipa-axum = "0.1"
 utoipa-scalar = { version = "0.2", features = ["axum"] }
-
-# Static embed
-rust-embed = { version = "8", features = ["compression"] }
 
 # Caching / storage backends
 moka = { version = "0.12", features = ["future"] }
