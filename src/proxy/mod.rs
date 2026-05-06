@@ -53,13 +53,21 @@ pub fn create_router(state: AppState) -> Router {
         .merge(Router::new().route("/v1/models", get(handlers::models::list_models)))
         .route(
             "/v1/chat/completions",
-            post(handlers::chat_completions::chat_completions),
+            post(
+                handlers::format_handler::format_handler::<
+                    handlers::chat_completions::ChatCompletionsAdapter,
+                >,
+            ),
         )
         .route(
             "/v1/messages",
-            post(handlers::messages::messages).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+            post(handlers::format_handler::format_handler::<handlers::messages::MessagesAdapter>)
+                .layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
-        .route("/v1/responses", post(handlers::responses::responses))
+        .route(
+            "/v1/responses",
+            post(handlers::format_handler::format_handler::<handlers::responses::ResponsesAdapter>),
+        )
         .route("/v1/embeddings", post(handlers::embeddings::embeddings))
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(from_fn_with_state(state.clone(), middlewares::auth))

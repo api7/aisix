@@ -22,15 +22,12 @@ struct StreamOutputChoice {
 }
 
 #[derive(Default)]
-pub(in crate::proxy::handlers::chat_completions) struct StreamOutputCollector {
+pub(crate) struct StreamOutputCollector {
     choices: BTreeMap<u32, StreamOutputChoice>,
 }
 
 impl StreamOutputCollector {
-    pub(in crate::proxy::handlers::chat_completions) fn record_chunk(
-        &mut self,
-        chunk: &ChatCompletionChunk,
-    ) {
+    pub(crate) fn record_chunk(&mut self, chunk: &ChatCompletionChunk) {
         for choice in &chunk.choices {
             let output_choice = self.choices.entry(choice.index).or_default();
 
@@ -69,9 +66,7 @@ impl StreamOutputCollector {
         }
     }
 
-    pub(in crate::proxy::handlers::chat_completions) fn output_message_span_properties(
-        &self,
-    ) -> Vec<(String, String)> {
+    pub(crate) fn output_message_span_properties(&self) -> Vec<(String, String)> {
         output_message_span_properties(&self.output_message_views())
     }
 

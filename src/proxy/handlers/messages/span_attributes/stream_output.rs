@@ -22,17 +22,14 @@ enum StreamOutputBlock {
 }
 
 #[derive(Default)]
-pub(in crate::proxy::handlers::messages) struct StreamOutputCollector {
+pub(crate) struct StreamOutputCollector {
     role: Option<String>,
     blocks: BTreeMap<usize, StreamOutputBlock>,
     finish_reason: Option<String>,
 }
 
 impl StreamOutputCollector {
-    pub(in crate::proxy::handlers::messages) fn record_event(
-        &mut self,
-        event: &AnthropicStreamEvent,
-    ) {
+    pub(crate) fn record_event(&mut self, event: &AnthropicStreamEvent) {
         match event {
             AnthropicStreamEvent::MessageStart { message } => {
                 self.role = Some(message.role.clone());
@@ -104,9 +101,7 @@ impl StreamOutputCollector {
         }
     }
 
-    pub(in crate::proxy::handlers::messages) fn output_message_span_properties(
-        &self,
-    ) -> Vec<(String, String)> {
+    pub(crate) fn output_message_span_properties(&self) -> Vec<(String, String)> {
         output_message_span_properties(&self.output_message_views())
     }
 

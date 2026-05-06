@@ -9,16 +9,13 @@ use crate::{
 };
 
 #[derive(Default)]
-pub(in crate::proxy::handlers::responses) struct StreamOutputCollector {
+pub(crate) struct StreamOutputCollector {
     items: BTreeMap<usize, ResponsesOutputItem>,
     completed_response: Option<ResponsesApiResponse>,
 }
 
 impl StreamOutputCollector {
-    pub(in crate::proxy::handlers::responses) fn record_event(
-        &mut self,
-        event: &ResponsesApiStreamEvent,
-    ) {
+    pub(crate) fn record_event(&mut self, event: &ResponsesApiStreamEvent) {
         match event {
             ResponsesApiStreamEvent::ResponseCreated { response }
             | ResponsesApiStreamEvent::ResponseInProgress { response } => {
@@ -108,9 +105,7 @@ impl StreamOutputCollector {
         }
     }
 
-    pub(in crate::proxy::handlers::responses) fn output_message_span_properties(
-        &self,
-    ) -> Vec<(String, String)> {
+    pub(crate) fn output_message_span_properties(&self) -> Vec<(String, String)> {
         if let Some(response) = &self.completed_response {
             return output_message_span_properties(&output_message_views_from_output_items(
                 &response.output,
