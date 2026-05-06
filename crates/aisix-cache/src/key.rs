@@ -16,6 +16,14 @@ use std::hash::{Hash, Hasher};
 /// Stable fingerprint of a chat request — the inputs to the upstream call.
 /// We hash this struct (not the whole `ChatFormat`) so caching policy is
 /// explicit about what counts as "the same request".
+///
+/// `extras` carries the OpenAI-shape fields that arrive through
+/// `ChatFormat::extra` (`tools`, `tool_choice`, `response_format`, `seed`,
+/// `stop`, `presence_penalty`, `frequency_penalty`, …). They materially
+/// change the upstream response — a tool-calling request and a non-tool
+/// request with the same prompt **must not** share a cache entry — so they
+/// must be part of the fingerprint. We hash a sorted snapshot of the map
+/// so the result is independent of JSON insertion order.
 #[derive(Debug, Clone)]
 pub struct CacheKey {
     pub model: String,
@@ -23,6 +31,11 @@ pub struct CacheKey {
     pub temperature_milli: Option<u32>,  // f32 isn't Hash; quantise to milli
     pub top_p_milli: Option<u32>,
     pub max_tokens: Option<u32>,
+    /// Sorted (key, canonical-json-value) pairs from `ChatFormat::extra`.
+    /// We pre-sort + pre-stringify here so `Hash` stays trivially
+    /// deterministic and so two requests that differ only in JSON key
+    /// order collapse to the same fingerprint.
+    pub extras: Vec<(String, String)>,
 }
 
 impl CacheKey {
@@ -36,6 +49,7 @@ impl CacheKey {
             temperature_milli: req.temperature.map(quantise_milli),
             top_p_milli: req.top_p.map(quantise_milli),
             max_tokens: req.max_tokens,
+            extras: canonical_extras(&req.extra),
         }
     }
 
@@ -57,6 +71,55 @@ impl Hash for CacheKey {
         self.temperature_milli.hash(state);
         self.top_p_milli.hash(state);
         self.max_tokens.hash(state);
+        for (k, v) in &self.extras {
+            k.hash(state);
+            v.hash(state);
+        }
+    }
+}
+
+/// Sort `extra` by key (recursively, into nested objects too) and emit
+/// a stable canonical-JSON string per value. The recursion matters: two
+/// callers can send byte-different JSON for `tools=[{...}]` if they
+/// serialise the inner `parameters` object's keys in different order;
+/// `serde_json::to_string` preserves whatever insertion order the parser
+/// saw, so without recursive sorting two semantically-equal requests
+/// would land in different cache slots.
+fn canonical_extras(extra: &serde_json::Map<String, serde_json::Value>) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = extra
+        .iter()
+        .map(|(k, v)| (k.clone(), canonical_json_string(v)))
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs
+}
+
+fn canonical_json_string(value: &serde_json::Value) -> String {
+    canonicalise(value).to_string()
+}
+
+/// Return a clone of `value` with every nested object's keys reordered
+/// alphabetically. `serde_json::Map` preserves insertion order on
+/// serialise, so reordering here is what makes the eventual string form
+/// deterministic.
+fn canonicalise(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let mut out = serde_json::Map::with_capacity(entries.len());
+            for (k, v) in entries {
+                out.insert(k.clone(), canonicalise(v));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            // Arrays are positional — `tools=[a, b]` ≠ `tools=[b, a]` for
+            // models that respect declaration order. Preserve order;
+            // canonicalise children only.
+            serde_json::Value::Array(items.iter().map(canonicalise).collect())
+        }
+        other => other.clone(),
     }
 }
 
@@ -140,12 +203,19 @@ mod tests {
         );
     }
 
+    /// Pre-#87 this test asserted that `extra` was excluded from the
+    /// fingerprint — that was the bug. Post-fix, `extra` is part of the
+    /// fingerprint, so the still-valid invariant is "no `extra` and an
+    /// empty `extra` produce the same hash" (i.e. the empty-extra
+    /// canonical form is stable).
     #[test]
-    fn extras_and_request_id_do_not_affect_fingerprint() {
-        let mut a = req("m", vec![ChatMessage::user("hi")], None);
-        a.extra
-            .insert("anything".into(), serde_json::json!({"x": 1}));
-        let b = req("m", vec![ChatMessage::user("hi")], None);
+    fn empty_extras_match_no_extras() {
+        let a = req("m", vec![ChatMessage::user("hi")], None);
+        let mut b = req("m", vec![ChatMessage::user("hi")], None);
+        // Touch `extra` (no-op insert + remove leaves it empty but
+        // exercises the map machinery).
+        b.extra.insert("k".into(), serde_json::json!(1));
+        b.extra.remove("k");
         assert_eq!(
             CacheKey::from_request(&a).fingerprint(),
             CacheKey::from_request(&b).fingerprint(),
@@ -158,6 +228,102 @@ mod tests {
         let fp = CacheKey::from_request(&f).fingerprint();
         assert_eq!(fp.len(), 16);
         assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// Tools / response_format / seed all arrive through `ChatFormat::extra`.
+    /// Two requests that differ only on one of those fields **must not**
+    /// share a cache entry — see issue #87 (silent correctness bug:
+    /// tool-calling requests cross-pollinating with non-tool requests).
+    #[test]
+    fn changing_tools_changes_the_fingerprint() {
+        let mut a = req("m", vec![ChatMessage::user("hi")], None);
+        let mut b = req("m", vec![ChatMessage::user("hi")], None);
+        a.extra.insert(
+            "tools".into(),
+            serde_json::json!([{"type": "function", "function": {"name": "get_weather"}}]),
+        );
+        // b has no tools at all — distinct fingerprint required.
+        b.extra.remove("tools");
+        assert_ne!(
+            CacheKey::from_request(&a).fingerprint(),
+            CacheKey::from_request(&b).fingerprint(),
+        );
+    }
+
+    #[test]
+    fn changing_response_format_changes_the_fingerprint() {
+        let mut a = req("m", vec![ChatMessage::user("hi")], None);
+        let mut b = req("m", vec![ChatMessage::user("hi")], None);
+        a.extra.insert(
+            "response_format".into(),
+            serde_json::json!({"type": "json_object"}),
+        );
+        b.extra.insert(
+            "response_format".into(),
+            serde_json::json!({"type": "text"}),
+        );
+        assert_ne!(
+            CacheKey::from_request(&a).fingerprint(),
+            CacheKey::from_request(&b).fingerprint(),
+        );
+    }
+
+    #[test]
+    fn changing_seed_changes_the_fingerprint() {
+        let mut a = req("m", vec![ChatMessage::user("hi")], None);
+        let mut b = req("m", vec![ChatMessage::user("hi")], None);
+        a.extra.insert("seed".into(), serde_json::json!(42));
+        b.extra.insert("seed".into(), serde_json::json!(43));
+        assert_ne!(
+            CacheKey::from_request(&a).fingerprint(),
+            CacheKey::from_request(&b).fingerprint(),
+        );
+    }
+
+    /// JSON insertion order must not affect the fingerprint, otherwise
+    /// callers using different SDKs get different cache slots for
+    /// equivalent requests. The canonicaliser sorts top-level + nested
+    /// object keys.
+    #[test]
+    fn extras_with_same_keys_in_different_order_share_a_fingerprint() {
+        let mut a = req("m", vec![ChatMessage::user("hi")], None);
+        let mut b = req("m", vec![ChatMessage::user("hi")], None);
+        // Top-level: insertion order seed-then-tools vs tools-then-seed.
+        a.extra.insert("seed".into(), serde_json::json!(7));
+        a.extra.insert(
+            "tools".into(),
+            serde_json::json!([{"type": "function", "function": {"name": "f", "parameters": {"a": 1, "b": 2}}}]),
+        );
+        b.extra.insert(
+            "tools".into(),
+            // Nested-object keys also reversed (`parameters` keys b before a).
+            serde_json::json!([{"function": {"parameters": {"b": 2, "a": 1}, "name": "f"}, "type": "function"}]),
+        );
+        b.extra.insert("seed".into(), serde_json::json!(7));
+        assert_eq!(
+            CacheKey::from_request(&a).fingerprint(),
+            CacheKey::from_request(&b).fingerprint(),
+        );
+    }
+
+    /// `tools=[a, b]` and `tools=[b, a]` are different declarations to
+    /// the model — preserve array order even while sorting object keys.
+    #[test]
+    fn tool_array_order_changes_the_fingerprint() {
+        let mut a = req("m", vec![ChatMessage::user("hi")], None);
+        let mut b = req("m", vec![ChatMessage::user("hi")], None);
+        a.extra.insert(
+            "tools".into(),
+            serde_json::json!([{"name": "x"}, {"name": "y"}]),
+        );
+        b.extra.insert(
+            "tools".into(),
+            serde_json::json!([{"name": "y"}, {"name": "x"}]),
+        );
+        assert_ne!(
+            CacheKey::from_request(&a).fingerprint(),
+            CacheKey::from_request(&b).fingerprint(),
+        );
     }
 
     #[test]
