@@ -56,7 +56,7 @@ API surface see [`api-proxy.md`](./api-proxy.md) and
                 │           ▲                                  │
                 │           │                                  │
    operator ───►│  :3001  Admin router (CRUD + Playground +    │
-   (UI / curl)  │           │  OpenAPI Scalar + embedded SPA)  │
+   (curl / SDK) │           │  OpenAPI Scalar)                 │
                 │           ▼                                  │
                 │       AdminState                             │
                 │       • SnapshotHandle (shared with proxy)   │
@@ -83,7 +83,7 @@ Two HTTP listeners run inside the same process:
 
 - **Proxy (`:3000`)** — public surface, accepts caller traffic.
 - **Admin (`:3001`)** — operator surface, accepts admin-key-authenticated
-  traffic plus the embedded SPA.
+  traffic.
 
 Each listener is an `axum::Router` with its own state struct
 (`ProxyState` / `AdminState`). They share the same `SnapshotHandle` and
@@ -338,7 +338,7 @@ See [`testing.md`](./testing.md) for the full test layout.
 | `aisix-gateway` | Hub, Bridge trait, SSE parser, normalised `ChatFormat`. |
 | `aisix-provider-{openai,anthropic,gemini,deepseek}` | Per-provider Bridge impls. |
 | `aisix-proxy` | `/v1/*` handlers, middleware, ProxyState, request rendering. |
-| `aisix-admin` | Admin CRUD, playground, UI embed, OpenAPI Scalar. |
+| `aisix-admin` | Admin CRUD, playground, OpenAPI Scalar. |
 | `aisix-obs` | `tracing` init, metrics, access log, OTLP, Langfuse. |
 | `aisix-ratelimit` | Fixed-window limiter + concurrency semaphore. |
 | `aisix-cache` | `Cache` trait, MemoryCache, RedisCache. |

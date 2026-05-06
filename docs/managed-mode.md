@@ -4,7 +4,6 @@ When `managed.enabled = true`, aisix runs as a tenant of an
 [aisix.cloud](https://github.com/api7/AISIX-Cloud) control plane:
 
 - The admin API listener is **not** bound.
-- The admin UI is **not** served.
 - The Playground endpoint is **not** exposed.
 - All entity configuration (models / API keys / routing / guardrails)
   is read from etcd over an mTLS channel.

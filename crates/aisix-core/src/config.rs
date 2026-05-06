@@ -44,9 +44,9 @@ pub struct Config {
     #[serde(default)]
     pub cache: CacheConfig,
     /// Optional managed-mode configuration. When `managed.enabled = true`
-    /// the admin API, admin UI, and Playground endpoints are **not**
-    /// bound — the DP is a pure etcd reader driven by the aisix.cloud
-    /// control plane. Missing or `enabled = false` runs standalone.
+    /// the admin API and Playground endpoints are **not** bound — the DP
+    /// is a pure etcd reader driven by the aisix.cloud control plane.
+    /// Missing or `enabled = false` runs standalone.
     #[serde(default)]
     pub managed: ManagedConfig,
 }
@@ -114,7 +114,6 @@ pub struct EtcdTlsConfig {
 /// When `enabled = true`, aisix runs as a tenant of aisix.cloud:
 ///
 /// - The admin API listener is **not** bound.
-/// - The admin UI is **not** served.
 /// - The Playground endpoint is **not** exposed.
 ///
 /// All configuration is read from etcd via the TLS channel (see

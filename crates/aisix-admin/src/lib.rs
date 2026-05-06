@@ -1,4 +1,4 @@
-//! aisix-admin — Admin API + Playground + embedded UI (:3001).
+//! aisix-admin — Admin API + Playground (:3001).
 //!
 //! Mounts the admin surface behind admin-key bearer auth:
 //! - `GET  /health`
@@ -21,7 +21,6 @@
 mod apikeys_handlers;
 mod auth;
 mod credentials_handlers;
-mod embedded_ui;
 mod error;
 pub mod etcd_store;
 mod health_handler;
@@ -50,12 +49,6 @@ pub fn build_router(state: AdminState) -> Router {
         // listener is private in production.
         .route("/admin/openapi.json", get(openapi::openapi_json))
         .route("/admin/openapi-scalar", get(openapi::openapi_scalar))
-        // Embedded SPA. Bare `/ui` redirects to `/ui/index.html`; the
-        // wildcard handles every static asset and falls back to
-        // index.html for unknown paths so client-side routing works.
-        .route("/ui", get(embedded_ui::ui_root))
-        .route("/ui/", get(embedded_ui::ui_root))
-        .route("/ui/*path", get(embedded_ui::ui_asset))
         .route(
             "/admin/v1/models",
             get(models_handlers::list_models).post(models_handlers::create_model),
@@ -243,20 +236,6 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("/admin/openapi.json"));
-    }
-
-    #[tokio::test]
-    async fn ui_root_redirects_to_index() {
-        let app = build_router(build_state());
-        let req = Request::builder().uri("/ui").body(Body::empty()).unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
-        let location = resp
-            .headers()
-            .get(axum::http::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert_eq!(location, "/ui/index.html");
     }
 
     #[tokio::test]

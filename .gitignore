@@ -6,21 +6,13 @@ Cargo.lock.bak
 *.profdata
 /coverage
 
-# Node
+# Node (tests/e2e harness)
 node_modules
 dist
 .pnpm-store
-.vite
-.turbo
 *.tsbuildinfo
 coverage/
 .nyc_output
-
-# Embedded UI build output (produced by Vite, consumed by rust-embed).
-# The directory itself is checked in (with a .gitkeep) so rust-embed can
-# build cleanly on a fresh clone before `pnpm build` has run.
-/crates/aisix-admin/ui-dist/*
-!/crates/aisix-admin/ui-dist/.gitkeep
 
 # Editor / OS
 .DS_Store

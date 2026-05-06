@@ -12,7 +12,7 @@ env:
 
 jobs:
   lint:
-    name: lint (fmt + clippy + tsc)
+    name: lint (fmt + clippy)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,19 +27,6 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - name: ui install
-        working-directory: ui
-        run: pnpm install --no-frozen-lockfile
-      - name: ui typecheck
-        working-directory: ui
-        run: pnpm typecheck || true   # lockfile is generated at first install; soft until PR #11
 
   rust-unit:
     name: rust unit + coverage
@@ -78,45 +65,14 @@ jobs:
           path: lcov-unit.info
           retention-days: 7
 
-  build-ui:
-    name: build ui
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - name: install
-        working-directory: ui
-        run: pnpm install --no-frozen-lockfile
-      - name: ui unit tests
-        working-directory: ui
-        run: pnpm test
-      - name: build
-        working-directory: ui
-        run: pnpm build
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ui-dist
-          path: crates/aisix-admin/ui-dist
-          retention-days: 7
-
   build-bin:
     name: build aisix (instrumented)
-    needs: build-ui
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: "-C instrument-coverage"
       LLVM_PROFILE_FILE: "coverage/aisix-%p-%m.profraw"
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: ui-dist
-          path: crates/aisix-admin/ui-dist
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -136,7 +92,7 @@ jobs:
 
   e2e:
     name: e2e (vitest) + coverage
-    needs: [build-bin, build-ui]
+    needs: [build-bin]
     runs-on: ubuntu-latest
     # Soft gate while the harness stabilises across CI runners (etcd
     # service startup, port detection, undici quirks). Flip to `false`

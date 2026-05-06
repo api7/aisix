@@ -9,8 +9,6 @@ Actions.
 
 ```
                  ┌─────────────────────────┐
-                 │   Playwright (UI E2E)   │   small — UI flows only
-                 ├─────────────────────────┤
                  │   Vitest E2E (Rust bin) │   medium — full request paths
                  ├─────────────────────────┤
                  │   Cargo integration     │   medium — per-crate, real backends
@@ -230,21 +228,13 @@ Job descriptions:
 
 | Job | Purpose |
 |---|---|
-| `lint` | `cargo fmt --check`, `cargo clippy -D warnings`, `pnpm typecheck` |
+| `lint` | `cargo fmt --check`, `cargo clippy -D warnings` |
 | `rust-unit` | `cargo llvm-cov --workspace --all-features` → uploads `lcov-unit.info`. Spins a `redis:7-alpine` service so `CACHE_TEST_REDIS_URL` integration tests can run |
-| `build-ui` | `pnpm build` in `ui/` → uploads `ui-dist` artifact for the next job |
 | `build-bin` | `cargo build` of `aisix-server` with `RUSTFLAGS=-C instrument-coverage` → uploads the binary artifact for the e2e job |
 | `e2e` | Spins etcd + redis services, downloads the binary artifact, runs Vitest. Currently `continue-on-error: true` while the harness stabilises across CI runners |
 | `coverage-gate` | Merges `lcov-unit.info` + `lcov-e2e.info` → fails if below threshold |
 
-## 7. Frontend tests
-
-`ui/` ships a small Vitest unit suite for hooks and pure utilities.
-Heavier UI flows belong in Playwright (planned, not yet wired). The
-build-ui job runs `pnpm test` plus `pnpm build` so a broken build
-fails CI before the binary ever picks up the static assets.
-
-## 8. Coverage policy
+## 7. Coverage policy
 
 The `coverage-gate` job is the source of truth. It reads
 `COVERAGE_THRESHOLD` (default `90`) and fails the build below that
@@ -265,7 +255,7 @@ When a PR drops combined coverage:
    `expect("invariant")`), document why coverage is acceptable and
    adjust the gate threshold conservatively in a follow-up.
 
-## 9. See also
+## 8. See also
 
 - [`architecture.md`](./architecture.md) — the system being tested.
 - [`api-proxy.md`](./api-proxy.md), [`api-admin.md`](./api-admin.md)
