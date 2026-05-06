@@ -165,6 +165,46 @@ pub struct ManagedConfig {
     #[serde(default)]
     pub cp_ca_cert_file: Option<String>,
 
+    /// Inline PEM-encoded leaf certificate for the api7ee-parity
+    /// cert-via-env-var bootstrap path (cp-api's
+    /// /api/environments/:id/gateway_certificates endpoint, dashboard
+    /// CertIssueCard). When all three of `cp_cert_pem` / `cp_key_pem`
+    /// / `cp_ca_pem` are set, the DP skips `/dp/register` entirely:
+    /// the operator has already minted the bundle on the dashboard
+    /// and inlined it here. env_id is parsed from the cert's URI SAN
+    /// (`x-aisix://env/<env_id>`).
+    ///
+    /// File-based variants below let operators store PEMs on disk
+    /// (e.g. systemd unit on a host VM) instead of inlining into env
+    /// vars. Inline-PEM and file-path variants are mutually exclusive
+    /// per pair (cert/key/ca); mixing them is a config error caught
+    /// at boot.
+    #[serde(default)]
+    pub cp_cert_pem: Option<String>,
+
+    /// Inline PEM-encoded private key paired with `cp_cert_pem`.
+    /// Mutually exclusive with `cp_key_file`.
+    #[serde(default)]
+    pub cp_key_pem: Option<String>,
+
+    /// Inline PEM-encoded CA certificate paired with `cp_cert_pem`.
+    /// The DP installs this as the trust anchor for outbound mTLS
+    /// to dp-manager. Mutually exclusive with `cp_ca_file`.
+    #[serde(default)]
+    pub cp_ca_pem: Option<String>,
+
+    /// File-path variant of `cp_cert_pem`.
+    #[serde(default)]
+    pub cp_cert_file: Option<String>,
+
+    /// File-path variant of `cp_key_pem`.
+    #[serde(default)]
+    pub cp_key_file: Option<String>,
+
+    /// File-path variant of `cp_ca_pem`.
+    #[serde(default)]
+    pub cp_ca_file: Option<String>,
+
     /// Directory where the DP persists `ca.crt`, `client.crt`,
     /// `client.key` received from the register response. Files are
     /// written `0600`. Parent directory must already exist and be
@@ -204,6 +244,23 @@ impl ManagedConfig {
             .as_deref()
             .is_some_and(|s| !s.is_empty())
             && self.cp_base_url.as_deref().is_some_and(|s| !s.is_empty())
+    }
+
+    /// True when the operator pre-provisioned a cert/key/CA bundle
+    /// via the api7ee-parity dashboard flow — either inlined as
+    /// PEM env vars (`cp_cert_pem` / `cp_key_pem` / `cp_ca_pem`) or
+    /// referenced by file path (`cp_cert_file` / `cp_key_file` /
+    /// `cp_ca_file`). All three slots in the same triplet must be
+    /// present together; mixing inline-and-file forms within a
+    /// single role is rejected at boot for clarity.
+    pub fn cert_bundle_provided(&self) -> bool {
+        let has_pem = self.cp_cert_pem.as_deref().is_some_and(|s| !s.is_empty())
+            && self.cp_key_pem.as_deref().is_some_and(|s| !s.is_empty())
+            && self.cp_ca_pem.as_deref().is_some_and(|s| !s.is_empty());
+        let has_file = self.cp_cert_file.as_deref().is_some_and(|s| !s.is_empty())
+            && self.cp_key_file.as_deref().is_some_and(|s| !s.is_empty())
+            && self.cp_ca_file.as_deref().is_some_and(|s| !s.is_empty());
+        has_pem || has_file
     }
 
     fn default_mtls_dir() -> String {

@@ -16,6 +16,7 @@ use std::error::Error as StdError;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod cert_bundle;
 mod heartbeat;
 mod register;
 mod telemetry;
@@ -92,34 +93,117 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     let heartbeat_cfg: Option<heartbeat::HeartbeatConfig> = if cfg.managed.is_managed() {
         let bundle_on_disk = register::bundle_exists(&cfg.managed.mtls_dir);
         let can_register = cfg.managed.registration_enabled();
+        let bundle_provided = cfg.managed.cert_bundle_provided();
         // Log the branch inputs so operators don't have to guess why
         // their DP didn't register (or why it tried to).
         tracing::info!(
             bundle_exists = bundle_on_disk,
             registration_enabled = can_register,
+            cert_bundle_provided = bundle_provided,
             mtls_dir = %cfg.managed.mtls_dir,
             "managed-mode bootstrap branch inputs",
         );
-        if !bundle_on_disk && !can_register {
-            // In managed mode we MUST have either a persisted bundle or
-            // enough config to go get one. Silently proceeding with the
-            // placeholder etcd endpoint from config.managed.yaml turns
-            // into an opaque gRPC "dns error" minutes later — instead,
-            // fail the boot loudly with exactly what's missing.
+        if !bundle_on_disk && !can_register && !bundle_provided {
+            // In managed mode we MUST have at least one of:
+            //   - a persisted bundle in mtls_dir (subsequent boot)
+            //   - registration_token + cp_base_url (legacy /dp/register)
+            //   - cert + key + CA PEMs (api7ee parity, dashboard mint)
+            // Silently proceeding with the placeholder etcd endpoint
+            // from config.managed.yaml turns into an opaque gRPC "dns
+            // error" minutes later — instead, fail the boot loudly
+            // with exactly what's missing.
             anyhow::bail!(
-                "managed mode is enabled but registration is not possible: \
-                 registration_token={}, cp_base_url={}; set both \
-                 AISIX_MANAGED__REGISTRATION_TOKEN and AISIX_MANAGED__CP_BASE_URL, \
+                "managed mode is enabled but no boot path is available: \
+                 registration_token={}, cp_base_url={}, cert_bundle_provided={}; \
+                 set AISIX_MANAGED__CP_CERT_PEM + _KEY_PEM + _CA_PEM (recommended) \
+                 OR AISIX_MANAGED__REGISTRATION_TOKEN + _CP_BASE_URL (legacy), \
                  or persist an mTLS bundle at {:?}",
                 cfg.managed
                     .registration_token
                     .as_deref()
                     .unwrap_or("<unset>"),
                 cfg.managed.cp_base_url.as_deref().unwrap_or("<unset>"),
+                bundle_provided,
                 cfg.managed.mtls_dir,
             );
         }
-        if !bundle_on_disk && can_register {
+        if !bundle_on_disk && bundle_provided {
+            // api7ee-parity bootstrap: operator minted a cert via the
+            // dashboard, inlined the three PEMs into env vars (or
+            // referenced files on disk). Materialise the bundle to
+            // `mtls_dir`, parse env_id + dp_id from the leaf SAN, and
+            // populate cfg.etcd.* exactly like the register branch
+            // does. No /dp/register round-trip.
+            tracing::info!("managed mode: provisioning from supplied cert bundle (api7ee parity)");
+            let p = cert_bundle::provision(&cfg.managed)
+                .await
+                .map_err(|e| anyhow::anyhow!("DP cert-bundle provisioning failed: {e:#}"))?;
+            // The cert-bundle path requires cp_base_url for the
+            // heartbeat worker but skips registration_token. cp-api
+            // also needs cp_etcd_endpoint to be set (cmux serves
+            // gRPC + REST on the same port, but the etcd-client
+            // crate wants a host:port string). We accept the same
+            // endpoint as the cp_base_url's host:port if
+            // cp_etcd_endpoint is unset.
+            let cp_base = cfg
+                .managed
+                .cp_base_url
+                .clone()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "managed.cp_base_url required when cert bundle is provided",
+                    )
+                })?;
+            let cp_etcd = cfg
+                .managed
+                .cp_etcd_endpoint
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    cp_base
+                        .trim_start_matches("https://")
+                        .trim_start_matches("http://")
+                        .to_string()
+                });
+            tracing::info!(
+                dp_id = %p.dp_id,
+                env_id = %p.env_id,
+                etcd = %cp_etcd,
+                "provisioned with dashboard-issued cert bundle",
+            );
+            cfg.etcd.endpoints = vec![format!("https://{cp_etcd}")];
+            cfg.etcd.env_id = p.env_id.clone();
+            cfg.etcd.tls = Some(EtcdTlsConfig {
+                ca_cert_file: p.ca_cert_path.to_string_lossy().into_owned(),
+                client_cert_file: p.client_cert_path.to_string_lossy().into_owned(),
+                client_key_file: p.client_key_path.to_string_lossy().into_owned(),
+                domain_name: None,
+            });
+            // Persist dp_id + env_id to the same on-disk paths the
+            // register branch uses, so subsequent boots take the
+            // bundle-on-disk path without re-running provisioning
+            // (which would be a no-op anyway, but the dp_id_file
+            // path is what the heartbeat-restore helper reads).
+            register::persist_dp_id_for_provisioning(&cfg.managed, &p.dp_id, &p.env_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("persist dp_id/env_id sidecars: {e:#}"))?;
+            // Heartbeat — same shape as register branch. The
+            // heartbeat path under cp_base_url is fixed
+            // (`/dp/heartbeat`); we don't need a server response to
+            // know it.
+            Some(heartbeat::HeartbeatConfig::sanitised(
+                format!("{}/dp/heartbeat", cp_base.trim_end_matches('/')),
+                p.dp_id,
+                std::time::Duration::from_secs(15),
+                heartbeat::MtlsBundle {
+                    ca_cert_path: p.ca_cert_path,
+                    client_cert_path: p.client_cert_path,
+                    client_key_path: p.client_key_path,
+                    extra_ca_pem: extra_ca_pem.clone(),
+                },
+            ))
+        } else if !bundle_on_disk && can_register {
             tracing::info!("managed mode: registering with aisix.cloud CP");
             let cp_etcd = cfg
                 .managed

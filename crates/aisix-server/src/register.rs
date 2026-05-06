@@ -333,6 +333,23 @@ async fn persist_dp_id(path: &str, id: &str) -> anyhow::Result<()> {
     write_atomic(&path, id.as_bytes(), 0o600).await
 }
 
+/// Persist dp_id (to `cfg.dp_id_file`) and env_id (sibling file in
+/// `mtls_dir`) for the api7ee-parity provisioning path. Mirrors what
+/// `persist_dp_id` + `persist_env_id` do at the end of
+/// `register_and_persist`, but exposed publicly so `cert_bundle::
+/// provision`'s caller (main.rs) can write the same sidecar files.
+/// Subsequent boots then take the `bundle_exists` branch and read
+/// dp_id + env_id straight off disk like the legacy register flow.
+pub async fn persist_dp_id_for_provisioning(
+    cfg: &ManagedConfig,
+    dp_id: &str,
+    env_id: &str,
+) -> anyhow::Result<()> {
+    persist_dp_id(&cfg.dp_id_file, dp_id).await?;
+    persist_env_id(&cfg.mtls_dir, env_id).await?;
+    Ok(())
+}
+
 /// Persist `env_id` to `<mtls_dir>/env_id` atomically. `mtls_dir` is
 /// already created by `persist_mtls`, but we re-create defensively in
 /// case this helper is called in isolation.
@@ -471,6 +488,7 @@ mod tests {
             mtls_dir: mtls_dir.to_string_lossy().into_owned(),
             dp_id_file: dp_id_file.to_string_lossy().into_owned(),
             snapshot_cache_path: String::new(),
+        ..ManagedConfig::default()
         };
 
         let out = register_and_persist(&cfg).await.expect("register");
@@ -566,6 +584,7 @@ mod tests {
             mtls_dir: dir.path().join("mtls").to_string_lossy().into_owned(),
             dp_id_file: dir.path().join("dp_id").to_string_lossy().into_owned(),
             snapshot_cache_path: String::new(),
+        ..ManagedConfig::default()
         };
         register_and_persist(&cfg).await.expect("register");
     }
@@ -595,6 +614,7 @@ mod tests {
             mtls_dir: dir.path().join("mtls").to_string_lossy().into_owned(),
             dp_id_file: dir.path().join("dp_id").to_string_lossy().into_owned(),
             snapshot_cache_path: String::new(),
+        ..ManagedConfig::default()
         };
         register_and_persist(&cfg).await.expect("register");
 
@@ -633,6 +653,7 @@ mod tests {
             mtls_dir: dir.path().join("mtls").to_string_lossy().into_owned(),
             dp_id_file: dir.path().join("dp_id").to_string_lossy().into_owned(),
             snapshot_cache_path: String::new(),
+        ..ManagedConfig::default()
         };
         let err = register_and_persist(&cfg).await.unwrap_err();
         let s = format!("{err:#}");
@@ -665,6 +686,7 @@ mod tests {
             mtls_dir: dir.path().join("mtls").to_string_lossy().into_owned(),
             dp_id_file: dir.path().join("dp_id").to_string_lossy().into_owned(),
             snapshot_cache_path: String::new(),
+        ..ManagedConfig::default()
         };
         let err = register_and_persist(&cfg).await.unwrap_err();
         let s = format!("{err:#}");
