@@ -218,9 +218,10 @@ mod tests {
     fn sample_model(name: &str) -> Model {
         let cfg = format!(
             r#"{{
-                "name": "{name}",
-                "model": "openai/gpt-4o",
-                "provider_config": {{"api_key": "sk-x"}}
+                "display_name": "{name}",
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "11111111-1111-1111-1111-111111111111"
             }}"#
         );
         serde_json::from_str(&cfg).unwrap()
@@ -233,7 +234,7 @@ mod tests {
         store.put_model(entry.clone()).await.unwrap();
         let got = store.get_model("m-1").await.unwrap().unwrap();
         assert_eq!(got.id, "m-1");
-        assert_eq!(got.value.name, "foo");
+        assert_eq!(got.value.display_name, "foo");
     }
 
     #[tokio::test]

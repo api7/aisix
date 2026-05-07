@@ -426,9 +426,10 @@ mod tests {
 
         let model: Model = serde_json::from_str(
             r#"{
-                "name": "it-gpt4",
-                "model": "openai/gpt-4o",
-                "provider_config": {"api_key": "sk-x"}
+                "display_name": "it-gpt4",
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "11111111-1111-1111-1111-111111111111"
             }"#,
         )
         .unwrap();
@@ -437,7 +438,7 @@ mod tests {
 
         let got = store.get_model("m-it-1").await.unwrap().unwrap();
         assert_eq!(got.id, "m-it-1");
-        assert_eq!(got.value.name, "it-gpt4");
+        assert_eq!(got.value.display_name, "it-gpt4");
         assert!(got.revision > 0, "etcd should return a real mod_revision");
 
         let listed = store.list_models().await.unwrap();

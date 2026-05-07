@@ -152,11 +152,17 @@ mod tests {
 
         let m = std::sync::Arc::new(
             serde_json::from_str::<aisix_core::Model>(
-                r#"{"name":"t","model":"openai/gpt-4o","provider_config":{"api_key":"k"}}"#,
+                r#"{"display_name":"t","provider":"openai","model_name":"gpt-4o","provider_key_id":"pk-1"}"#,
             )
             .unwrap(),
         );
-        let ctx = BridgeContext::new("req-1", m);
+        let pk = std::sync::Arc::new(
+            serde_json::from_str::<aisix_core::ProviderKey>(
+                r#"{"display_name":"pk","secret":"k"}"#,
+            )
+            .unwrap(),
+        );
+        let ctx = BridgeContext::new("req-1", m, pk);
         let req = ChatFormat::new("t", vec![ChatMessage::user("hi")]);
 
         let resp = bridge.chat(&req, &ctx).await.unwrap();

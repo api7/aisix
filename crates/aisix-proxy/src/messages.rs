@@ -42,8 +42,6 @@ use crate::state::ProxyState;
 
 /// Anthropic API version header value injected on every forwarded request.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-/// Default Anthropic base URL used when `api_base` is not set on the Model.
-const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
 
 pub async fn messages(
     State(state): State<ProxyState>,
@@ -137,23 +135,14 @@ async fn dispatch(
     // The Anthropic-upstream branch below stays as a byte-for-byte
     // passthrough to preserve features (cache_control, thinking
     // blocks, …) the cross-provider path can't lossily round-trip.
-    if model.provider() != Some(Provider::Anthropic) {
+    if model.provider != Some(Provider::Anthropic) {
         return cross_provider_dispatch(state, body, model, &model_name, request_id).await;
     }
 
-    let api_key = model.provider_config.api_key.as_str();
+    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?;
 
-    if api_key.is_empty() {
-        return Err(ProxyError::Bridge(aisix_gateway::BridgeError::Config(
-            "provider_config.api_key is empty".into(),
-        )));
-    }
-
-    // Resolve the upstream model name (strip "anthropic/" prefix).
-    let upstream_model = model
-        .upstream_model()
-        .ok_or_else(|| ProxyError::InvalidRequest("model field missing provider/ prefix".into()))?
-        .to_string();
+    let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
     // Rewrite the `model` field to the upstream value.
     if let Some(m) = body.get_mut("model") {
@@ -161,10 +150,7 @@ async fn dispatch(
     }
 
     // Build the target URL.
-    let base = match model.base_url() {
-        Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
-        _ => ANTHROPIC_DEFAULT_BASE.to_string(),
-    };
+    let base = crate::dispatch::resolve_base_url(Provider::Anthropic, &pk_entry.value);
     let url = format!("{base}/v1/messages");
 
     // Check if the request wants streaming.
@@ -440,28 +426,61 @@ mod tests {
         }
     }
 
-    fn anthropic_model(name: &str, api_base: &str) -> ResourceEntry<Model> {
+    const ANTHROPIC_PK_ID: &str = "11111111-1111-1111-1111-111111111111";
+    const OPENAI_PK_ID: &str = "22222222-2222-2222-2222-222222222222";
+
+    fn anthropic_model(name: &str) -> ResourceEntry<Model> {
         let json = format!(
             r#"{{
-                "name": "{name}",
-                "model": "anthropic/claude-3-5-haiku-20241022",
-                "provider_config": {{"api_key": "sk-ant-test", "api_base": "{api_base}"}}
+                "display_name": "{name}",
+                "provider": "anthropic",
+                "model_name": "claude-3-5-haiku-20241022",
+                "provider_key_id": "{ANTHROPIC_PK_ID}"
             }}"#
         );
         let m: Model = serde_json::from_str(&json).unwrap();
         ResourceEntry::new("m-1", m, 1)
     }
 
-    fn openai_model(name: &str, api_base: &str) -> ResourceEntry<Model> {
+    fn openai_model(name: &str) -> ResourceEntry<Model> {
         let json = format!(
             r#"{{
-                "name": "{name}",
-                "model": "openai/gpt-4o",
-                "provider_config": {{"api_key": "sk-openai-test", "api_base": "{api_base}"}}
+                "display_name": "{name}",
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "{OPENAI_PK_ID}"
             }}"#
         );
         let m: Model = serde_json::from_str(&json).unwrap();
         ResourceEntry::new("m-2", m, 1)
+    }
+
+    fn anthropic_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"anthropic-up","secret":"sk-ant-test","api_base":"{api_base}"}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(ANTHROPIC_PK_ID, pk, 1)
+    }
+
+    fn openai_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-openai-test","api_base":"{api_base}"}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(OPENAI_PK_ID, pk, 1)
+    }
+
+    fn new_snap_anthropic(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(anthropic_pk(api_base));
+        snap
+    }
+
+    fn new_snap_openai(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(api_base));
+        snap
     }
 
     fn apikey_entry(allowed: &[&str]) -> ResourceEntry<ApiKey> {
@@ -513,9 +532,8 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let snap = AisixSnapshot::new();
-        snap.models
-            .insert(anthropic_model("claude-haiku", &upstream.uri()));
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-haiku"));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);
@@ -543,9 +561,8 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let snap = AisixSnapshot::new();
-        snap.models
-            .insert(anthropic_model("my-claude", &upstream.uri()));
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);
@@ -564,9 +581,8 @@ mod tests {
 
     #[tokio::test]
     async fn unauthenticated_request_returns_401() {
-        let snap = AisixSnapshot::new();
-        snap.models
-            .insert(anthropic_model("claude-haiku", "http://unused"));
+        let snap = new_snap_anthropic("http://unused");
+        snap.models.insert(anthropic_model("claude-haiku"));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);
@@ -584,9 +600,8 @@ mod tests {
 
     #[tokio::test]
     async fn forbidden_model_returns_403() {
-        let snap = AisixSnapshot::new();
-        snap.models
-            .insert(anthropic_model("claude-haiku", "http://unused"));
+        let snap = new_snap_anthropic("http://unused");
+        snap.models.insert(anthropic_model("claude-haiku"));
         snap.apikeys.insert(apikey_entry(&["other-model"]));
 
         let app = build_app(snap);
@@ -601,7 +616,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_model_returns_404() {
-        let snap = AisixSnapshot::new();
+        let snap = new_snap_anthropic("http://unused");
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);
@@ -644,9 +659,8 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let snap = AisixSnapshot::new();
-        snap.models
-            .insert(openai_model("my-claude-alias", &upstream.uri()));
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("my-claude-alias"));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let hub = Arc::new(Hub::new());
@@ -759,9 +773,8 @@ data: [DONE]\n\n";
             .mount(&upstream)
             .await;
 
-        let snap = AisixSnapshot::new();
-        snap.models
-            .insert(anthropic_model("claude-haiku", &upstream.uri()));
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-haiku"));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);
@@ -776,7 +789,7 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn missing_model_field_returns_400() {
-        let snap = AisixSnapshot::new();
+        let snap = new_snap_anthropic("http://unused");
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);

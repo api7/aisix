@@ -284,27 +284,14 @@ async fn multipart_dispatch(
     }
 
     let model = &model_entry.value;
-    let upstream_model = model
-        .upstream_model()
-        .ok_or_else(|| ProxyError::InvalidRequest("model field missing provider/ prefix".into()))?
-        .to_string();
+    let provider = crate::dispatch::require_provider(model)?;
+    let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?;
 
-    let api_key = model.provider_config.api_key.as_str();
-    if api_key.is_empty() {
-        return Err(ProxyError::Bridge(aisix_gateway::BridgeError::Config(
-            "provider_config.api_key is empty".into(),
-        )));
-    }
-
-    let base = match model.base_url() {
-        Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
-        _ => "https://api.openai.com".to_string(),
-    };
+    let base = crate::dispatch::resolve_base_url(provider, &pk_entry.value);
     let url = format!("{base}{upstream_path}");
-    let provider_label = model
-        .provider()
-        .map(|p| format!("{p:?}").to_lowercase())
-        .unwrap_or_else(|| "unknown".to_string());
+    let provider_label = format!("{provider:?}").to_lowercase();
 
     // Rebuild the multipart form with `model` rewritten.
     let mut form = multipart::Form::new();
@@ -391,26 +378,13 @@ async fn speech_dispatch(
     }
 
     let model = &model_entry.value;
-    let upstream_model = model
-        .upstream_model()
-        .ok_or_else(|| ProxyError::InvalidRequest("model field missing provider/ prefix".into()))?
-        .to_string();
+    let provider = crate::dispatch::require_provider(model)?;
+    let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
+    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?;
 
-    let api_key = model.provider_config.api_key.as_str();
-    if api_key.is_empty() {
-        return Err(ProxyError::Bridge(aisix_gateway::BridgeError::Config(
-            "provider_config.api_key is empty".into(),
-        )));
-    }
-
-    let base = match model.base_url() {
-        Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
-        _ => "https://api.openai.com".to_string(),
-    };
-    let provider_label = model
-        .provider()
-        .map(|p| format!("{p:?}").to_lowercase())
-        .unwrap_or_else(|| "unknown".to_string());
+    let base = crate::dispatch::resolve_base_url(provider, &pk_entry.value);
+    let provider_label = format!("{provider:?}").to_lowercase();
 
     // Rewrite model field.
     if let Some(m) = body.get_mut("model") {
@@ -512,28 +486,45 @@ mod tests {
         }
     }
 
-    fn whisper_model(name: &str, api_base: &str) -> ResourceEntry<Model> {
+    const PK_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+    fn whisper_model(name: &str) -> ResourceEntry<Model> {
         let json = format!(
             r#"{{
-                "name": "{name}",
-                "model": "openai/whisper-1",
-                "provider_config": {{"api_key": "sk-up", "api_base": "{api_base}"}}
+                "display_name": "{name}",
+                "provider": "openai",
+                "model_name": "whisper-1",
+                "provider_key_id": "{PK_ID}"
             }}"#
         );
         let m: Model = serde_json::from_str(&json).unwrap();
         ResourceEntry::new("m-1", m, 1)
     }
 
-    fn tts_model(name: &str, api_base: &str) -> ResourceEntry<Model> {
+    fn tts_model(name: &str) -> ResourceEntry<Model> {
         let json = format!(
             r#"{{
-                "name": "{name}",
-                "model": "openai/tts-1",
-                "provider_config": {{"api_key": "sk-up", "api_base": "{api_base}"}}
+                "display_name": "{name}",
+                "provider": "openai",
+                "model_name": "tts-1",
+                "provider_key_id": "{PK_ID}"
             }}"#
         );
         let m: Model = serde_json::from_str(&json).unwrap();
         ResourceEntry::new("m-2", m, 1)
+    }
+
+    fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json =
+            format!(r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}"}}"#);
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
+    fn new_snap(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(provider_key_entry(api_base));
+        snap
     }
 
     fn apikey_entry(allowed: &[&str]) -> ResourceEntry<ApiKey> {
@@ -554,8 +545,8 @@ mod tests {
 
     #[tokio::test]
     async fn speech_unauthenticated_returns_401() {
-        let snap = AisixSnapshot::new();
-        snap.models.insert(tts_model("my-tts", "http://unused"));
+        let snap = new_snap("http://unused");
+        snap.models.insert(tts_model("my-tts"));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);
@@ -573,7 +564,7 @@ mod tests {
 
     #[tokio::test]
     async fn speech_unknown_model_returns_404() {
-        let snap = AisixSnapshot::new();
+        let snap = new_snap("http://unused");
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);
@@ -605,8 +596,8 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let snap = AisixSnapshot::new();
-        snap.models.insert(tts_model("my-tts", &upstream.uri()));
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(tts_model("my-tts"));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);
@@ -636,9 +627,8 @@ mod tests {
 
     #[tokio::test]
     async fn transcriptions_unauthenticated_returns_401() {
-        let snap = AisixSnapshot::new();
-        snap.models
-            .insert(whisper_model("my-whisper", "http://unused"));
+        let snap = new_snap("http://unused");
+        snap.models.insert(whisper_model("my-whisper"));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);

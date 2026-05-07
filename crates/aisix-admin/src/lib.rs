@@ -207,9 +207,10 @@ mod tests {
 
     fn model_payload(name: &str) -> Value {
         json!({
-            "name": name,
-            "model": "openai/gpt-4o",
-            "provider_config": {"api_key": "sk-x"}
+            "display_name": name,
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111"
         })
     }
 
@@ -351,7 +352,7 @@ mod tests {
         let v = body_json(resp).await;
         assert!(!v["id"].as_str().unwrap().is_empty());
         assert_eq!(v["revision"], 1);
-        assert_eq!(v["value"]["name"], "my-gpt4");
+        assert_eq!(v["value"]["display_name"], "my-gpt4");
     }
 
     #[tokio::test]
@@ -389,9 +390,10 @@ mod tests {
     async fn create_model_with_invalid_provider_prefix_is_400_schema_error() {
         let app = build_router(build_state());
         let body = json!({
-            "name": "x",
-            "model": "mistral/large",
-            "provider_config": {"api_key": "sk-x"}
+            "display_name": "x",
+            "provider": "mistral",
+            "model_name": "large",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111"
         });
         let resp = run(app, auth_req("POST", "/admin/v1/models", Some(body))).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -462,7 +464,7 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
-        assert_eq!(v["value"]["name"], "foo");
+        assert_eq!(v["value"]["display_name"], "foo");
     }
 
     #[tokio::test]
@@ -485,9 +487,10 @@ mod tests {
 
         // Change provider upstream.
         let updated_body = json!({
-            "name": "foo",
-            "model": "anthropic/claude-sonnet-4-5",
-            "provider_config": {"api_key": "sk-ant"}
+            "display_name": "foo",
+            "provider": "anthropic",
+            "model_name": "claude-sonnet-4-5",
+            "provider_key_id": "22222222-2222-2222-2222-222222222222"
         });
         let app = build_router(state);
         let resp = run(
@@ -498,7 +501,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         assert_eq!(v["revision"], 2);
-        assert_eq!(v["value"]["model"], "anthropic/claude-sonnet-4-5");
+        assert_eq!(v["value"]["provider"], "anthropic");
+        assert_eq!(v["value"]["model_name"], "claude-sonnet-4-5");
     }
 
     #[tokio::test]

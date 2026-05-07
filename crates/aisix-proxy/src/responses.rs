@@ -26,9 +26,6 @@ use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
 use crate::state::ProxyState;
 
-/// Default OpenAI base URL.
-const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com";
-
 pub async fn responses(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
@@ -114,33 +111,22 @@ async fn dispatch(
     let model = &model_entry.value;
 
     // Responses API is only available for OpenAI.
-    if model.provider() != Some(Provider::Openai) {
+    if model.provider != Some(Provider::Openai) {
         return Err(ProxyError::InvalidRequest(format!(
             "model `{model_name}` is not an OpenAI provider; /v1/responses requires OpenAI"
         )));
     }
 
-    let api_key = model.provider_config.api_key.as_str().to_string();
-    if api_key.is_empty() {
-        return Err(ProxyError::Bridge(aisix_gateway::BridgeError::Config(
-            "provider_config.api_key is empty".into(),
-        )));
-    }
-
-    let upstream_model = model
-        .upstream_model()
-        .ok_or_else(|| ProxyError::InvalidRequest("model field missing provider/ prefix".into()))?
-        .to_string();
+    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?.to_string();
+    let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
     // Rewrite model field to upstream name.
     if let Some(m) = body.get_mut("model") {
         *m = Value::String(upstream_model.clone());
     }
 
-    let base = match model.base_url() {
-        Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
-        _ => OPENAI_DEFAULT_BASE.to_string(),
-    };
+    let base = crate::dispatch::resolve_base_url(Provider::Openai, &pk_entry.value);
     let url = format!("{base}/v1/responses");
 
     let is_stream = body
@@ -257,9 +243,12 @@ mod tests {
         }
     }
 
-    fn openai_model(name: &str, api_base: &str) -> ResourceEntry<Model> {
+    const OPENAI_PK_ID: &str = "11111111-1111-1111-1111-111111111111";
+    const ANTHROPIC_PK_ID: &str = "22222222-2222-2222-2222-222222222222";
+
+    fn openai_model(name: &str) -> ResourceEntry<Model> {
         let json = format!(
-            r#"{{"name":"{name}","model":"openai/gpt-4o","provider_config":{{"api_key":"sk-test","api_base":"{api_base}"}}}}"#
+            r#"{{"display_name":"{name}","provider":"openai","model_name":"gpt-4o","provider_key_id":"{OPENAI_PK_ID}"}}"#
         );
         let m: Model = serde_json::from_str(&json).unwrap();
         ResourceEntry::new("m-1", m, 1)
@@ -267,10 +256,36 @@ mod tests {
 
     fn anthropic_model(name: &str) -> ResourceEntry<Model> {
         let json = format!(
-            r#"{{"name":"{name}","model":"anthropic/claude-3-haiku-20240307","provider_config":{{"api_key":"sk-ant-test"}}}}"#
+            r#"{{"display_name":"{name}","provider":"anthropic","model_name":"claude-3-haiku-20240307","provider_key_id":"{ANTHROPIC_PK_ID}"}}"#
         );
         let m: Model = serde_json::from_str(&json).unwrap();
         ResourceEntry::new("m-2", m, 1)
+    }
+
+    fn openai_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json =
+            format!(r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}"}}"#);
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(OPENAI_PK_ID, pk, 1)
+    }
+
+    fn anthropic_pk() -> ResourceEntry<aisix_core::ProviderKey> {
+        let pk: aisix_core::ProviderKey =
+            serde_json::from_str(r#"{"display_name":"anthropic-up","secret":"sk-ant-test"}"#)
+                .unwrap();
+        ResourceEntry::new(ANTHROPIC_PK_ID, pk, 1)
+    }
+
+    fn new_snap_openai(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk(api_base));
+        snap
+    }
+
+    fn new_snap_anthropic() -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(anthropic_pk());
+        snap
     }
 
     fn apikey_entry(allowed: &[&str]) -> ResourceEntry<ApiKey> {
@@ -301,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn unauthenticated_returns_401() {
-        let snap = AisixSnapshot::new();
+        let snap = new_snap_openai("http://unused");
         let app = build_app(snap);
 
         let req = Request::builder()
@@ -317,7 +332,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_model_returns_404() {
-        let snap = AisixSnapshot::new();
+        let snap = new_snap_openai("http://unused");
         snap.apikeys.insert(apikey_entry(&["*"]));
         let app = build_app(snap);
 
@@ -333,7 +348,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_openai_model_returns_400() {
-        let snap = AisixSnapshot::new();
+        let snap = new_snap_anthropic();
         snap.models.insert(anthropic_model("claude-haiku"));
         snap.apikeys.insert(apikey_entry(&["*"]));
         let app = build_app(snap);
@@ -362,9 +377,8 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let snap = AisixSnapshot::new();
-        snap.models
-            .insert(openai_model("gpt-4o-resp", &upstream.uri()));
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
         let app = build_app(snap);
 
@@ -391,9 +405,8 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let snap = AisixSnapshot::new();
-        snap.models
-            .insert(openai_model("gpt-4o-resp", &upstream.uri()));
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
         snap.apikeys.insert(apikey_entry(&["*"]));
         let app = build_app(snap);
 

@@ -16,7 +16,7 @@
 //! The trait is deliberately `async_trait` rather than GATs — ergonomic
 //! wins outweigh the boxing cost on the provider path.
 
-use aisix_core::Model;
+use aisix_core::{Model, ProviderKey};
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use std::time::Duration;
@@ -26,26 +26,34 @@ use crate::chat::{ChatChunk, ChatFormat, ChatResponse, EmbeddingRequest, Embeddi
 /// Context carried through the whole request lifecycle.
 ///
 /// The proxy layer fills this in after it has authenticated the request
-/// and resolved the target model. Bridges read from it but do not mutate
-/// it — the fields relevant to the transport (auth, timeout) are owned
-/// references to structures in the current [`aisix_core::AisixSnapshot`].
+/// and resolved both the target Model AND its referenced ProviderKey
+/// from the [`aisix_core::AisixSnapshot`]. Bridges read from it but
+/// do not mutate it.
 #[derive(Debug, Clone)]
 pub struct BridgeContext {
     /// Correlation id propagated into traces and error envelopes.
     pub request_id: String,
-    /// The resolved upstream model — the Bridge reads provider_config
-    /// (api_key, api_base) and the upstream model name from here.
+    /// The resolved Model — bridges read `model_name` (the upstream
+    /// model id) and metadata (timeout, rate_limit) from here.
     pub model: std::sync::Arc<Model>,
+    /// The ProviderKey the Model references — bridges read `secret`
+    /// (api key) and `api_base` (optional override) from here.
+    pub provider_key: std::sync::Arc<ProviderKey>,
     /// Deadline for the entire upstream call. Bridges are expected to
     /// honour this by cancelling any in-flight HTTP request.
     pub deadline: Option<Duration>,
 }
 
 impl BridgeContext {
-    pub fn new(request_id: impl Into<String>, model: std::sync::Arc<Model>) -> Self {
+    pub fn new(
+        request_id: impl Into<String>,
+        model: std::sync::Arc<Model>,
+        provider_key: std::sync::Arc<ProviderKey>,
+    ) -> Self {
         Self {
             request_id: request_id.into(),
             model,
+            provider_key,
             deadline: None,
         }
     }
@@ -244,7 +252,8 @@ mod tests {
     #[test]
     fn context_defaults_no_deadline_with_helper_setter() {
         let m = std::sync::Arc::new(sample_model());
-        let ctx = BridgeContext::new("req-1", m.clone());
+        let pk = std::sync::Arc::new(sample_provider_key());
+        let ctx = BridgeContext::new("req-1", m.clone(), pk);
         assert_eq!(ctx.request_id, "req-1");
         assert!(ctx.deadline.is_none());
         let ctx = ctx.with_deadline(Duration::from_secs(30));
@@ -254,17 +263,22 @@ mod tests {
     fn sample_model() -> Model {
         serde_json::from_str(
             r#"{
-                "name": "test",
-                "model": "openai/gpt-4o",
-                "provider_config": {"api_key": "sk-x"}
+                "display_name": "test",
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "11111111-1111-1111-1111-111111111111"
             }"#,
         )
         .unwrap()
     }
 
+    fn sample_provider_key() -> ProviderKey {
+        serde_json::from_str(r#"{"display_name":"openai-prod","secret":"sk-x"}"#).unwrap()
+    }
+
     #[test]
-    fn sample_model_parses_and_routes_to_openai() {
+    fn sample_model_resolves_to_openai() {
         let m = sample_model();
-        assert_eq!(m.provider(), Some(Provider::Openai));
+        assert_eq!(m.provider, Some(Provider::Openai));
     }
 }

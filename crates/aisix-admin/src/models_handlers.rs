@@ -50,7 +50,7 @@ pub async fn create_model(
 ) -> Result<Json<ResourceEntry<Model>>, AdminError> {
     let model = decode_model(&raw)?;
     let all = state.store.list_models().await?;
-    assert_unique_name(&all, &model.name, None)?;
+    assert_unique_name(&all, &model.display_name, None)?;
 
     let id = Uuid::new_v4().to_string();
     let entry = ResourceEntry::new(&id, model, STARTING_REVISION);
@@ -72,7 +72,7 @@ pub async fn update_model(
     let model = decode_model(&raw)?;
 
     let all = state.store.list_models().await?;
-    assert_unique_name(&all, &model.name, Some(&id))?;
+    assert_unique_name(&all, &model.display_name, Some(&id))?;
 
     let entry = ResourceEntry::new(&id, model, existing.revision + 1);
     state.store.put_model(entry.clone()).await?;
@@ -103,7 +103,7 @@ fn assert_unique_name(
     self_id: Option<&str>,
 ) -> Result<(), AdminError> {
     for e in existing {
-        if e.value.name == name && self_id.is_none_or(|sid| sid != e.id) {
+        if e.value.display_name == name && self_id.is_none_or(|sid| sid != e.id) {
             return Err(AdminError::Conflict(name.to_string()));
         }
     }

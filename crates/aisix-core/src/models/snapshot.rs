@@ -54,9 +54,10 @@ mod tests {
     fn sample_model() -> Model {
         serde_json::from_str(
             r#"{
-              "name": "my-gpt4",
-              "model": "openai/gpt-4o",
-              "provider_config": {"api_key": "sk-x"}
+              "display_name": "my-gpt4",
+              "provider": "openai",
+              "model_name": "gpt-4o",
+              "provider_key_id": "11111111-1111-1111-1111-111111111111"
             }"#,
         )
         .unwrap()
