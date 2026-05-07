@@ -167,12 +167,28 @@ impl<P: ConfigProvider> Supervisor<P> {
 
         let new = clone_snapshot(&self.handle.load());
 
-        // Move any entries from `tiny` into `new`.
+        // Move any entries from `tiny` into `new`. Must cover every
+        // ResourceTable on AisixSnapshot — a missing kind here means
+        // a watch event silently drops on the floor and the snapshot
+        // never sees the new entry, even though the loader and the
+        // proxy both know about it.
         for e in tiny.models.entries() {
             new.models.insert(clone_entry(&e));
         }
         for e in tiny.apikeys.entries() {
             new.apikeys.insert(clone_entry(&e));
+        }
+        for e in tiny.provider_keys.entries() {
+            new.provider_keys.insert(clone_entry(&e));
+        }
+        for e in tiny.guardrails.entries() {
+            new.guardrails.insert(clone_entry(&e));
+        }
+        for e in tiny.cache_policies.entries() {
+            new.cache_policies.insert(clone_entry(&e));
+        }
+        for e in tiny.observability_exporters.entries() {
+            new.observability_exporters.insert(clone_entry(&e));
         }
 
         self.handle.store(new);
@@ -209,6 +225,10 @@ impl<P: ConfigProvider> Supervisor<P> {
         let removed = match parsed.kind {
             "models" => new.models.remove(parsed.id).is_some(),
             "api_keys" => new.apikeys.remove(parsed.id).is_some(),
+            "provider_keys" => new.provider_keys.remove(parsed.id).is_some(),
+            "guardrails" => new.guardrails.remove(parsed.id).is_some(),
+            "cache_policies" => new.cache_policies.remove(parsed.id).is_some(),
+            "observability_exporters" => new.observability_exporters.remove(parsed.id).is_some(),
             _ => false,
         };
         if removed {
@@ -397,6 +417,18 @@ fn clone_snapshot(src: &AisixSnapshot) -> AisixSnapshot {
     for e in src.apikeys.entries() {
         out.apikeys.insert(clone_entry(&e));
     }
+    for e in src.provider_keys.entries() {
+        out.provider_keys.insert(clone_entry(&e));
+    }
+    for e in src.guardrails.entries() {
+        out.guardrails.insert(clone_entry(&e));
+    }
+    for e in src.cache_policies.entries() {
+        out.cache_policies.insert(clone_entry(&e));
+    }
+    for e in src.observability_exporters.entries() {
+        out.observability_exporters.insert(clone_entry(&e));
+    }
     out
 }
 
@@ -494,6 +526,86 @@ mod tests {
         sup.load_once().await.unwrap();
         assert!(sup.apply_put(&entry("/aisix/models/m-1", VALID_MODEL, 2)));
         assert_eq!(sup.handle().load().models.len(), 1);
+    }
+
+    /// Regression for the supervisor `apply_put` / `clone_snapshot`
+    /// drift: every kind on `AisixSnapshot` must be mergeable on a
+    /// watch event, otherwise admin writes for those resources land
+    /// in etcd but never reach the proxy snapshot. Smoke test #102
+    /// hit this for ProviderKey — the proxy saw the Model fine but
+    /// `dispatch::resolve_provider_key` blew up because the PK was
+    /// invisible to the watch path.
+    #[tokio::test]
+    async fn apply_put_propagates_every_resource_kind() {
+        const VALID_PROVIDER_KEY: &[u8] = br#"{
+            "display_name": "watch-pk",
+            "secret": "sk-watch"
+        }"#;
+        const VALID_GUARDRAIL: &[u8] = br#"{
+            "name": "watch-block",
+            "kind": "keyword",
+            "patterns": [{"kind": "literal", "value": "x"}]
+        }"#;
+        const VALID_CACHE_POLICY: &[u8] = br#"{
+            "name": "watch-cache",
+            "enabled": true
+        }"#;
+        const VALID_OBSERVABILITY_EXPORTER: &[u8] = br#"{
+            "name": "watch-otel",
+            "kind": "otlp_http",
+            "endpoint": "https://otel.example.com/v1/traces"
+        }"#;
+
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+
+        for (key, body, _kind) in [
+            ("/aisix/provider_keys/pk-1", VALID_PROVIDER_KEY, "PK"),
+            ("/aisix/guardrails/g-1", VALID_GUARDRAIL, "Guardrail"),
+            (
+                "/aisix/cache_policies/cp-1",
+                VALID_CACHE_POLICY,
+                "CachePolicy",
+            ),
+            (
+                "/aisix/observability_exporters/oe-1",
+                VALID_OBSERVABILITY_EXPORTER,
+                "ObservabilityExporter",
+            ),
+        ] {
+            assert!(
+                sup.apply_put(&entry(key, body, 2)),
+                "apply_put returned false for {key}"
+            );
+        }
+
+        let snap = sup.handle().load();
+        assert_eq!(snap.provider_keys.len(), 1, "ProviderKey not merged");
+        assert_eq!(snap.guardrails.len(), 1, "Guardrail not merged");
+        assert_eq!(snap.cache_policies.len(), 1, "CachePolicy not merged");
+        assert_eq!(
+            snap.observability_exporters.len(),
+            1,
+            "ObservabilityExporter not merged"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_delete_removes_every_resource_kind() {
+        let provider = Arc::new(FakeProvider::new(
+            vec![entry(
+                "/aisix/provider_keys/pk-1",
+                br#"{"display_name":"x","secret":"y"}"#,
+                1,
+            )],
+            1,
+        ));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+        assert_eq!(sup.handle().load().provider_keys.len(), 1);
+        assert!(sup.apply_delete("/aisix/provider_keys/pk-1"));
+        assert!(sup.handle().load().provider_keys.is_empty());
     }
 
     #[tokio::test]
