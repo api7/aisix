@@ -6,6 +6,8 @@
 //! - `GET|PUT|DELETE      /admin/v1/models/:id`
 //! - `GET|POST            /admin/v1/apikeys`
 //! - `GET|PUT|DELETE      /admin/v1/apikeys/:id`
+//! - `GET|POST            /admin/v1/provider_keys`
+//! - `GET|PUT|DELETE      /admin/v1/provider_keys/:id`
 //!
 //! Writes validate against the JSON Schemas from `aisix-core` and reject
 //! duplicate names (409). The storage layer is pluggable via the
@@ -20,16 +22,15 @@
 
 mod apikeys_handlers;
 mod auth;
-mod credentials_handlers;
 mod error;
 pub mod etcd_store;
 mod health_handler;
 mod models_handlers;
 mod openapi;
 mod playground_handler;
+mod provider_keys_handlers;
 mod state;
 pub mod store;
-mod teams_handlers;
 
 pub use auth::AdminAuth;
 pub use error::{AdminError, ErrorBody};
@@ -74,25 +75,15 @@ pub fn build_router(state: AdminState) -> Router {
             post(apikeys_handlers::rotate_apikey),
         )
         .route(
-            "/admin/v1/credentials",
-            get(credentials_handlers::list_credentials)
-                .post(credentials_handlers::create_credential),
+            "/admin/v1/provider_keys",
+            get(provider_keys_handlers::list_provider_keys)
+                .post(provider_keys_handlers::create_provider_key),
         )
         .route(
-            "/admin/v1/credentials/:id",
-            get(credentials_handlers::get_credential)
-                .put(credentials_handlers::update_credential)
-                .delete(credentials_handlers::delete_credential),
-        )
-        .route(
-            "/admin/v1/teams",
-            get(teams_handlers::list_teams).post(teams_handlers::create_team),
-        )
-        .route(
-            "/admin/v1/teams/:id",
-            get(teams_handlers::get_team)
-                .put(teams_handlers::update_team)
-                .delete(teams_handlers::delete_team),
+            "/admin/v1/provider_keys/:id",
+            get(provider_keys_handlers::get_provider_key)
+                .put(provider_keys_handlers::update_provider_key)
+                .delete(provider_keys_handlers::delete_provider_key),
         )
         // Health — per-model upstream health levels (0/1/2).
         .route("/admin/v1/health", get(health_handler::get_health))
@@ -678,99 +669,6 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    fn team_payload(name: &str) -> Value {
-        json!({"name": name, "members": ["k-1", "k-2"]})
-    }
-
-    #[tokio::test]
-    async fn team_crud_create_list_get_update_delete() {
-        let state = build_state();
-
-        // Create.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("POST", "/admin/v1/teams", Some(team_payload("eng-team"))),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let created = body_json(resp).await;
-        let id = created["id"].as_str().unwrap().to_string();
-        assert_eq!(created["value"]["name"], "eng-team");
-        assert_eq!(created["revision"], 1);
-
-        // Duplicate name rejected.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("POST", "/admin/v1/teams", Some(team_payload("eng-team"))),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-
-        // List.
-        let app = build_router(state.clone());
-        let resp = run(app, auth_req("GET", "/admin/v1/teams", None)).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let list = body_json(resp).await;
-        assert_eq!(list.as_array().unwrap().len(), 1);
-
-        // Get.
-        let app = build_router(state.clone());
-        let resp = run(app, auth_req("GET", &format!("/admin/v1/teams/{id}"), None)).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let got = body_json(resp).await;
-        assert_eq!(got["value"]["name"], "eng-team");
-
-        // Update.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req(
-                "PUT",
-                &format!("/admin/v1/teams/{id}"),
-                Some(json!({"name": "eng-team", "members": ["k-1"]})),
-            ),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let updated = body_json(resp).await;
-        assert_eq!(updated["revision"], 2);
-
-        // Delete.
-        let app = build_router(state.clone());
-        let resp = run(
-            app,
-            auth_req("DELETE", &format!("/admin/v1/teams/{id}"), None),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        // Subsequent GET returns 404.
-        let app = build_router(state);
-        let resp = run(app, auth_req("GET", &format!("/admin/v1/teams/{id}"), None)).await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn team_create_with_invalid_schema_returns_400() {
-        let app = build_router(build_state());
-        // Missing required `name` field.
-        let resp = run(
-            app,
-            auth_req("POST", "/admin/v1/teams", Some(json!({"members": ["k-1"]}))),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn team_get_missing_is_404() {
-        let app = build_router(build_state());
-        let resp = run(app, auth_req("GET", "/admin/v1/teams/nonexistent", None)).await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // ──────────────────── Health endpoint ────────────────────

@@ -10,7 +10,7 @@
 `aisix` is an AI inference gateway in the spirit of [LiteLLM](https://github.com/BerriAI/litellm) / [Portkey](https://github.com/Portkey-AI/gateway), rewritten in Rust for low cold-start, native streaming, and a single static binary.
 
 - **Proxy API (`:3000`)** — OpenAI-compatible `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`, `/v1/messages` (Anthropic native), plus passthrough
-- **Admin API (`:3001`)** — CRUD for models, API keys, teams, budgets, credentials, guardrails, fallbacks; playground proxy; OpenAPI (Scalar) at `/openapi`
+- **Admin API (`:3001`)** — CRUD for models, API keys, provider keys, guardrails, cache policies, observability exporters; per-key budgets inline; playground proxy; OpenAPI (Scalar) at `/openapi`
 - **Config store** — etcd with watch-driven, lock-free `ArcSwap` snapshot
 - **Rate limiting** — two-phase (RPM pre-commit + TPM post-deduct) with concurrency semaphore
 - **Observability** — Prometheus + OTLP (traces/metrics/logs) + structured access logs + Langfuse

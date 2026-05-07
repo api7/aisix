@@ -12,9 +12,9 @@
 //! entry; it serves the rest."
 
 use aisix_core::models::{
-    validate_apikey, validate_cache_policy, validate_credential, validate_guardrail,
-    validate_model, validate_observability_exporter, ApiKey, CachePolicy, Credential, Guardrail,
-    Model, ObservabilityExporter, SchemaError,
+    validate_apikey, validate_cache_policy, validate_guardrail, validate_model,
+    validate_observability_exporter, validate_provider_key, ApiKey, CachePolicy, Guardrail, Model,
+    ObservabilityExporter, ProviderKey, SchemaError,
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
@@ -85,16 +85,16 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     snapshot.apikeys.insert(entry);
                 }
             }
-            "credentials" => {
-                if let Some(entry) = validate_and_parse::<Credential>(
+            "provider_keys" => {
+                if let Some(entry) = validate_and_parse::<ProviderKey>(
                     &raw.key,
                     raw.revision,
                     parsed,
                     &value,
-                    validate_credential,
+                    validate_provider_key,
                     &mut stats,
                 ) {
-                    snapshot.credentials.insert(entry);
+                    snapshot.provider_keys.insert(entry);
                 }
             }
             "guardrails" => {
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn unknown_kinds_are_skipped() {
-        let entries = vec![raw("/aisix/teams/t-1", b"{}", 1)];
+        let entries = vec![raw("/aisix/unknown_kind/x-1", b"{}", 1)];
         let (snap, stats) = build_snapshot("/aisix", &entries);
         assert_eq!(stats.unknown_kind, 1);
         assert!(snap.models.is_empty());

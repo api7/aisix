@@ -1,6 +1,6 @@
 //! [`Resource`] trait and [`ResourceEntry`] wrapper.
 //!
-//! Every entity stored in etcd (Model, ApiKey, Team, Budget, …) is wrapped in a
+//! Every entity stored in etcd (Model, ApiKey, ProviderKey, …) is wrapped in a
 //! [`ResourceEntry<T>`] carrying its UUID and the etcd revision it came from.
 //!
 //! Downstream code (proxy handlers, admin handlers, routing) holds

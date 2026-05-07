@@ -3,17 +3,13 @@
 //! The etcd watch supervisor builds a fresh [`AisixSnapshot`] on every
 //! coherent rebuild (compaction, initial load) and atomically swaps it into
 //! a [`SnapshotHandle<AisixSnapshot>`]. The data plane only sees the handle.
-//!
-//! Tables grow as feature PRs add entities: Model + ApiKey landed first;
-//! Credential + Budget arrived with PR #19; Team / Guardrail will follow.
 
 use super::apikey::ApiKey;
 use super::cache_policy::CachePolicy;
-use super::credential::Credential;
 use super::guardrail::Guardrail;
 use super::model::Model;
 use super::observability_exporter::ObservabilityExporter;
-use super::team::Team;
+use super::provider_key::ProviderKey;
 use crate::snapshot::ResourceTable;
 
 /// Composite of every typed [`ResourceTable`] the gateway reads on the hot
@@ -22,8 +18,7 @@ use crate::snapshot::ResourceTable;
 pub struct AisixSnapshot {
     pub models: ResourceTable<Model>,
     pub apikeys: ResourceTable<ApiKey>,
-    pub credentials: ResourceTable<Credential>,
-    pub teams: ResourceTable<Team>,
+    pub provider_keys: ResourceTable<ProviderKey>,
     pub guardrails: ResourceTable<Guardrail>,
     /// Per-env cache policies. Stage 2 honors only the existence of an
     /// enabled row to gate the cache; Stage 3 will parse `applies_to`
@@ -44,8 +39,7 @@ impl AisixSnapshot {
     pub fn total_entries(&self) -> usize {
         self.models.len()
             + self.apikeys.len()
-            + self.credentials.len()
-            + self.teams.len()
+            + self.provider_keys.len()
             + self.guardrails.len()
             + self.cache_policies.len()
             + self.observability_exporters.len()
@@ -73,8 +67,8 @@ mod tests {
             .unwrap()
     }
 
-    fn sample_credential() -> Credential {
-        serde_json::from_str(r#"{"name":"openai-prod","api_key":"sk-prod"}"#).unwrap()
+    fn sample_provider_key() -> ProviderKey {
+        serde_json::from_str(r#"{"display_name":"openai-prod","secret":"sk-prod"}"#).unwrap()
     }
 
     #[test]
@@ -83,7 +77,7 @@ mod tests {
         assert_eq!(s.total_entries(), 0);
         assert!(s.models.is_empty());
         assert!(s.apikeys.is_empty());
-        assert!(s.credentials.is_empty());
+        assert!(s.provider_keys.is_empty());
     }
 
     #[test]
@@ -93,8 +87,8 @@ mod tests {
             .insert(ResourceEntry::new("m-1", sample_model(), 1));
         s.apikeys
             .insert(ResourceEntry::new("k-1", sample_apikey(), 1));
-        s.credentials
-            .insert(ResourceEntry::new("c-1", sample_credential(), 1));
+        s.provider_keys
+            .insert(ResourceEntry::new("pk-1", sample_provider_key(), 1));
 
         assert_eq!(s.total_entries(), 3);
         assert_eq!(s.models.get_by_name("my-gpt4").unwrap().id, "m-1");
@@ -107,6 +101,9 @@ mod tests {
                 .id,
             "k-1",
         );
-        assert_eq!(s.credentials.get_by_name("openai-prod").unwrap().id, "c-1");
+        assert_eq!(
+            s.provider_keys.get_by_name("openai-prod").unwrap().id,
+            "pk-1",
+        );
     }
 }

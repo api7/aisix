@@ -12,8 +12,8 @@
 //! - `len()` / `iter()` for listing
 //!
 //! Concrete Snapshot shape (which tables it holds) lives closer to the
-//! business types and will be filled in by PR #4 once `Model`, `ApiKey`,
-//! `Team`, etc. exist. This crate provides the primitive only.
+//! business types in `models::AisixSnapshot`. This crate provides the
+//! primitive only.
 
 use crate::resource::{Resource, ResourceEntry};
 use arc_swap::ArcSwap;

@@ -19,7 +19,7 @@
 //! deterministic behaviour continue to use [`crate::InMemoryStore`].
 
 use aisix_core::resource::ResourceEntry;
-use aisix_core::{ApiKey, Credential, Model, Team};
+use aisix_core::{ApiKey, Model, ProviderKey};
 use etcd_client::{Client, DeleteOptions, GetOptions};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -31,8 +31,7 @@ use crate::store::{ConfigStore, StoreError};
 /// `aisix-etcd`'s loader so the two paths agree at the byte level.
 pub const MODELS_SUBKEY: &str = "models";
 pub const APIKEYS_SUBKEY: &str = "api_keys";
-pub const CREDENTIALS_SUBKEY: &str = "credentials";
-pub const TEAMS_SUBKEY: &str = "teams";
+pub const PROVIDER_KEYS_SUBKEY: &str = "provider_keys";
 
 pub struct EtcdConfigStore {
     client: Mutex<Client>,
@@ -208,59 +207,34 @@ impl ConfigStore for EtcdConfigStore {
         self.delete_one(&self.key_for(APIKEYS_SUBKEY, id)).await
     }
 
-    async fn put_credential(&self, entry: ResourceEntry<Credential>) -> Result<(), StoreError> {
-        let key = self.key_for(CREDENTIALS_SUBKEY, &entry.id);
+    async fn put_provider_key(&self, entry: ResourceEntry<ProviderKey>) -> Result<(), StoreError> {
+        let key = self.key_for(PROVIDER_KEYS_SUBKEY, &entry.id);
         self.put_json(&key, &entry.value).await
     }
 
-    async fn get_credential(
+    async fn get_provider_key(
         &self,
         id: &str,
-    ) -> Result<Option<ResourceEntry<Credential>>, StoreError> {
-        let key = self.key_for(CREDENTIALS_SUBKEY, id);
+    ) -> Result<Option<ResourceEntry<ProviderKey>>, StoreError> {
+        let key = self.key_for(PROVIDER_KEYS_SUBKEY, id);
         Ok(self
-            .get_one::<Credential>(&key)
+            .get_one::<ProviderKey>(&key)
             .await?
             .map(|(v, rev)| ResourceEntry::new(id, v, rev)))
     }
 
-    async fn list_credentials(&self) -> Result<Vec<ResourceEntry<Credential>>, StoreError> {
+    async fn list_provider_keys(&self) -> Result<Vec<ResourceEntry<ProviderKey>>, StoreError> {
         Ok(self
-            .list_range::<Credential>(CREDENTIALS_SUBKEY)
+            .list_range::<ProviderKey>(PROVIDER_KEYS_SUBKEY)
             .await?
             .into_iter()
             .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
             .collect())
     }
 
-    async fn delete_credential(&self, id: &str) -> Result<bool, StoreError> {
-        self.delete_one(&self.key_for(CREDENTIALS_SUBKEY, id)).await
-    }
-
-    async fn put_team(&self, entry: ResourceEntry<Team>) -> Result<(), StoreError> {
-        let key = self.key_for(TEAMS_SUBKEY, &entry.id);
-        self.put_json(&key, &entry.value).await
-    }
-
-    async fn get_team(&self, id: &str) -> Result<Option<ResourceEntry<Team>>, StoreError> {
-        let key = self.key_for(TEAMS_SUBKEY, id);
-        Ok(self
-            .get_one::<Team>(&key)
-            .await?
-            .map(|(v, rev)| ResourceEntry::new(id, v, rev)))
-    }
-
-    async fn list_teams(&self) -> Result<Vec<ResourceEntry<Team>>, StoreError> {
-        Ok(self
-            .list_range::<Team>(TEAMS_SUBKEY)
-            .await?
-            .into_iter()
-            .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
-            .collect())
-    }
-
-    async fn delete_team(&self, id: &str) -> Result<bool, StoreError> {
-        self.delete_one(&self.key_for(TEAMS_SUBKEY, id)).await
+    async fn delete_provider_key(&self, id: &str) -> Result<bool, StoreError> {
+        self.delete_one(&self.key_for(PROVIDER_KEYS_SUBKEY, id))
+            .await
     }
 }
 

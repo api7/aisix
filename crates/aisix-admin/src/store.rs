@@ -7,7 +7,7 @@
 //! in the handler layer so the store stays dumb and fast.
 
 use aisix_core::resource::ResourceEntry;
-use aisix_core::{ApiKey, Credential, Model, Team};
+use aisix_core::{ApiKey, Model, ProviderKey};
 use dashmap::DashMap;
 use std::sync::Arc;
 
@@ -31,18 +31,13 @@ pub trait ConfigStore: Send + Sync + 'static {
     async fn list_apikeys(&self) -> Result<Vec<ResourceEntry<ApiKey>>, StoreError>;
     async fn delete_apikey(&self, id: &str) -> Result<bool, StoreError>;
 
-    async fn put_credential(&self, entry: ResourceEntry<Credential>) -> Result<(), StoreError>;
-    async fn get_credential(
+    async fn put_provider_key(&self, entry: ResourceEntry<ProviderKey>) -> Result<(), StoreError>;
+    async fn get_provider_key(
         &self,
         id: &str,
-    ) -> Result<Option<ResourceEntry<Credential>>, StoreError>;
-    async fn list_credentials(&self) -> Result<Vec<ResourceEntry<Credential>>, StoreError>;
-    async fn delete_credential(&self, id: &str) -> Result<bool, StoreError>;
-
-    async fn put_team(&self, entry: ResourceEntry<Team>) -> Result<(), StoreError>;
-    async fn get_team(&self, id: &str) -> Result<Option<ResourceEntry<Team>>, StoreError>;
-    async fn list_teams(&self) -> Result<Vec<ResourceEntry<Team>>, StoreError>;
-    async fn delete_team(&self, id: &str) -> Result<bool, StoreError>;
+    ) -> Result<Option<ResourceEntry<ProviderKey>>, StoreError>;
+    async fn list_provider_keys(&self) -> Result<Vec<ResourceEntry<ProviderKey>>, StoreError>;
+    async fn delete_provider_key(&self, id: &str) -> Result<bool, StoreError>;
 }
 
 /// In-memory store. Thread-safe via DashMap; mainly used by tests, but
@@ -51,8 +46,7 @@ pub trait ConfigStore: Send + Sync + 'static {
 pub struct InMemoryStore {
     models: DashMap<String, ResourceEntry<Model>>,
     apikeys: DashMap<String, ResourceEntry<ApiKey>>,
-    credentials: DashMap<String, ResourceEntry<Credential>>,
-    teams: DashMap<String, ResourceEntry<Team>>,
+    provider_keys: DashMap<String, ResourceEntry<ProviderKey>>,
 }
 
 impl InMemoryStore {
@@ -97,41 +91,24 @@ impl ConfigStore for InMemoryStore {
         Ok(self.apikeys.remove(id).is_some())
     }
 
-    async fn put_credential(&self, entry: ResourceEntry<Credential>) -> Result<(), StoreError> {
-        self.credentials.insert(entry.id.clone(), entry);
+    async fn put_provider_key(&self, entry: ResourceEntry<ProviderKey>) -> Result<(), StoreError> {
+        self.provider_keys.insert(entry.id.clone(), entry);
         Ok(())
     }
 
-    async fn get_credential(
+    async fn get_provider_key(
         &self,
         id: &str,
-    ) -> Result<Option<ResourceEntry<Credential>>, StoreError> {
-        Ok(self.credentials.get(id).map(|r| r.clone()))
+    ) -> Result<Option<ResourceEntry<ProviderKey>>, StoreError> {
+        Ok(self.provider_keys.get(id).map(|r| r.clone()))
     }
 
-    async fn list_credentials(&self) -> Result<Vec<ResourceEntry<Credential>>, StoreError> {
-        Ok(self.credentials.iter().map(|r| r.clone()).collect())
+    async fn list_provider_keys(&self) -> Result<Vec<ResourceEntry<ProviderKey>>, StoreError> {
+        Ok(self.provider_keys.iter().map(|r| r.clone()).collect())
     }
 
-    async fn delete_credential(&self, id: &str) -> Result<bool, StoreError> {
-        Ok(self.credentials.remove(id).is_some())
-    }
-
-    async fn put_team(&self, entry: ResourceEntry<Team>) -> Result<(), StoreError> {
-        self.teams.insert(entry.id.clone(), entry);
-        Ok(())
-    }
-
-    async fn get_team(&self, id: &str) -> Result<Option<ResourceEntry<Team>>, StoreError> {
-        Ok(self.teams.get(id).map(|r| r.clone()))
-    }
-
-    async fn list_teams(&self) -> Result<Vec<ResourceEntry<Team>>, StoreError> {
-        Ok(self.teams.iter().map(|r| r.clone()).collect())
-    }
-
-    async fn delete_team(&self, id: &str) -> Result<bool, StoreError> {
-        Ok(self.teams.remove(id).is_some())
+    async fn delete_provider_key(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.provider_keys.remove(id).is_some())
     }
 }
 

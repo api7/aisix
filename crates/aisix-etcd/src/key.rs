@@ -1,8 +1,9 @@
 //! Parse etcd keys of the shape `{prefix}/{kind}/{id}`.
 //!
 //! Every aisix entity is stored at this canonical path. The watch supervisor
-//! demultiplexes incoming events by the `kind` segment (`models`, `apikeys`,
-//! `teams`, …) so each typed table can be updated independently.
+//! demultiplexes incoming events by the `kind` segment (`models`, `api_keys`,
+//! `provider_keys`, `guardrails`, …) so each typed table can be updated
+//! independently.
 
 use std::fmt;
 

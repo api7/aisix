@@ -76,6 +76,7 @@ cache:
   #   url: "http://127.0.0.1:6333"
   #   collection: "aisix-semantic-cache"
 
-# Models, API keys, teams, budgets, credentials, guardrails, fallback policies
-# are NOT defined in this file. They are stored in etcd and managed via the
-# Admin API (see spec §10). This file only bootstraps the gateway.
+# Models, API keys, provider keys, guardrails, cache policies, and
+# observability exporters are NOT defined in this file. They are stored
+# in etcd and managed via the Admin API (see docs/api-admin.md). This
+# file only bootstraps the gateway.

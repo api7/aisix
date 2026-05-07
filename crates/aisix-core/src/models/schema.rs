@@ -24,8 +24,7 @@ use thiserror::Error;
 pub struct Schemas {
     pub model: Validator,
     pub apikey: Validator,
-    pub credential: Validator,
-    pub team: Validator,
+    pub provider_key: Validator,
     pub guardrail: Validator,
     pub cache_policy: Validator,
     pub observability_exporter: Validator,
@@ -42,12 +41,9 @@ impl Schemas {
             apikey: jsonschema::options()
                 .build(&apikey_schema())
                 .expect("apikey schema is well-formed"),
-            credential: jsonschema::options()
-                .build(&credential_schema())
-                .expect("credential schema is well-formed"),
-            team: jsonschema::options()
-                .build(&team_schema())
-                .expect("team schema is well-formed"),
+            provider_key: jsonschema::options()
+                .build(&provider_key_schema())
+                .expect("provider_key schema is well-formed"),
             guardrail: jsonschema::options()
                 .build(&guardrail_schema())
                 .expect("guardrail schema is well-formed"),
@@ -89,12 +85,8 @@ pub fn validate_apikey(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.apikey, value)
 }
 
-pub fn validate_credential(value: &Value) -> Result<(), SchemaError> {
-    validate(&SCHEMAS.credential, value)
-}
-
-pub fn validate_team(value: &Value) -> Result<(), SchemaError> {
-    validate(&SCHEMAS.team, value)
+pub fn validate_provider_key(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.provider_key, value)
 }
 
 pub fn validate_guardrail(value: &Value) -> Result<(), SchemaError> {
@@ -204,47 +196,16 @@ fn apikey_schema() -> Value {
     })
 }
 
-fn credential_schema() -> Value {
+fn provider_key_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
-        "required": ["name", "api_key"],
+        "required": ["display_name", "secret"],
         "additionalProperties": false,
         "properties": {
-            "name":     { "type": "string", "minLength": 1 },
-            "api_key":  { "type": "string", "minLength": 1 },
-            "api_base": { "type": "string" }
-        }
-    })
-}
-
-fn team_schema() -> Value {
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["name"],
-        "additionalProperties": false,
-        "properties": {
-            "name":      { "type": "string", "minLength": 1 },
-            "members":   {
-                "type": "array",
-                "items": { "type": "string", "minLength": 1 }
-            },
-            "budget_id": { "type": "string", "minLength": 1 },
-            "rate_limit": { "$ref": "#/$defs/rate_limit" }
-        },
-        "$defs": {
-            "rate_limit": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "tpm":         { "type": "integer", "minimum": 0 },
-                    "tpd":         { "type": "integer", "minimum": 0 },
-                    "rpm":         { "type": "integer", "minimum": 0 },
-                    "rpd":         { "type": "integer", "minimum": 0 },
-                    "concurrency": { "type": "integer", "minimum": 0 }
-                }
-            }
+            "display_name": { "type": "string", "minLength": 1 },
+            "secret":       { "type": "string", "minLength": 1 },
+            "api_base":     { "type": "string" }
         }
     })
 }

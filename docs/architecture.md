@@ -16,9 +16,9 @@ API surface see [`api-proxy.md`](./api-proxy.md) and
   on a writer.
 - First-class streaming. SSE responses pass through with controlled buffering
   and accurate end-of-stream telemetry.
-- Operator-driven configuration. Models, ApiKeys, Teams, Budgets, Credentials,
-  Guardrails, and FallbackPolicies all live in etcd and are mutated via the
-  Admin API at runtime.
+- Operator-driven configuration. Models, ApiKeys, ProviderKeys, Guardrails,
+  CachePolicies, and ObservabilityExporters all live in etcd and are
+  mutated via the Admin API at runtime.
 - >90% combined unit + E2E line coverage as a CI gate.
 
 **Non-goals (today)**
@@ -27,7 +27,7 @@ API surface see [`api-proxy.md`](./api-proxy.md) and
 - Native model hosting. aisix dispatches to upstream providers; it does not
   serve weights itself.
 - A full BYOC workflow. Bring your own API keys to upstream providers and
-  configure them through the Credential entity.
+  configure them through the ProviderKey entity.
 
 ## 2. Component model
 
@@ -102,11 +102,12 @@ populates an `AisixSnapshot`:
 
 ```
 AisixSnapshot
-├─ models       : ResourceTable<Model>
-├─ apikeys      : ResourceTable<ApiKey>
-├─ teams        : ResourceTable<Team>
-├─ budgets      : ResourceTable<Budget>
-└─ credentials  : ResourceTable<Credential>
+├─ models                   : ResourceTable<Model>
+├─ apikeys                  : ResourceTable<ApiKey>
+├─ provider_keys            : ResourceTable<ProviderKey>
+├─ guardrails               : ResourceTable<Guardrail>
+├─ cache_policies           : ResourceTable<CachePolicy>
+└─ observability_exporters  : ResourceTable<ObservabilityExporter>
 ```
 
 Each `ResourceTable<T>` is a primary `DashMap<id, ResourceEntry<T>>`
