@@ -27,16 +27,17 @@ Surfaces and capabilities currently in main:
 
 - **Providers** — OpenAI, Anthropic, Gemini, DeepSeek (one bridge crate per vendor; OpenAI-shape `model: "<provider>/<id>"` selects the bridge)
 
-- **Admin API (`:3001`)** — CRUD on every entity, JSON-Schema validated, OpenAPI 3 + Scalar UI at `/admin/openapi-scalar`
+- **Admin API (`:3001`)** — CRUD on the routing-related entities, JSON-Schema validated, OpenAPI 3 + Scalar UI at `/admin/openapi-scalar`
   - `/admin/v1/models`
   - `/admin/v1/apikeys` (+ `POST .../rotate`)
   - `/admin/v1/provider_keys`
-  - `/admin/v1/guardrails`
-  - `/admin/v1/cache_policies`
-  - `/admin/v1/observability_exporters`
   - `/admin/v1/health` — per-model upstream health (Healthy / Degraded / Down)
-  - `/admin/v1/spend` — current-month USD per ApiKey
   - `/playground/chat/completions` — in-process forward to the proxy router
+
+  Guardrails, cache policies, and observability exporters exist as
+  resource types in `aisix-core` and are honoured at runtime, but
+  standalone CRUD over those still goes through direct etcd writes
+  today — Admin handlers will follow.
 
 - **Config plane** — etcd with watch-driven `ArcSwap` snapshot. Lock-free reads on the hot path. Schema-rejected rows logged + skipped, never fatal.
 
