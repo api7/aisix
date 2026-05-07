@@ -35,6 +35,20 @@ jobs:
       redis:
         image: redis:7-alpine
         ports: ["6379:6379"]
+      # Real etcd for crates/aisix-admin/tests/etcd_integration.rs —
+      # exercises the full Admin handler → EtcdConfigStore →
+      # aisix-etcd::loader round-trip so regressions in subkey
+      # constants or KV serde shape get caught here, not at runtime.
+      # Bitnami's image lets us configure a single-node etcd via
+      # plain env vars (the official quay.io/coreos/etcd image needs
+      # a CMD override to listen on 0.0.0.0).
+      etcd:
+        image: bitnami/etcd:3.5
+        ports: ["2379:2379"]
+        env:
+          ALLOW_NONE_AUTHENTICATION: "yes"
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://0.0.0.0:2379
     env:
       # Picked up by crates/aisix-cache/tests/redis_integration.rs.
       # The tests no-op when this is unset (local dev), so absence is safe.
@@ -46,6 +60,9 @@ jobs:
       # every Config::load_from_path test as `redis_url` and breaks
       # the entire `aisix-core::config::tests` module.
       CACHE_TEST_REDIS_URL: redis://127.0.0.1:6379
+      # Picked up by crates/aisix-admin/tests/etcd_integration.rs.
+      # Same skip-if-unset pattern as the Redis case above.
+      ADMIN_TEST_ETCD_URL: http://127.0.0.1:2379
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
