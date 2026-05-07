@@ -110,14 +110,14 @@ Tracked as parent issues on this repo. P0 = pre-1.0 must-have, P1 = first follow
 - [#44] AWS Bedrock provider (chat + embeddings + image)
 - [#45] Azure OpenAI provider
 - [#46] 429 from upstream triggers routing fallback
-- [#47] Distributed (Redis-backed) rate limiting
 - [#48] Persist budget tracker (currently resets on restart)
 - [#49] Real OpenTelemetry tracing (currently scaffold-only)
 - [#50] Multimodal content blocks (vision, image input) on chat completions
+- [#51] AWS Bedrock Guardrails as a first-class guardrail kind
 
 **P1 (post-1.0)**
 
-- [#51] AWS Bedrock Guardrails as a first-class guardrail kind
+- [#47] Distributed (Redis-backed) rate limiting
 - [#52] Lakera + Presidio + OpenAI Moderation guardrail trio
 - [#53] JWT / OIDC auth for proxy clients (Entra ID / Google Workspace / Okta)
 - [#54] Latency-based + cost-based + tag-based routing strategies
