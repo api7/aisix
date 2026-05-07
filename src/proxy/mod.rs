@@ -7,6 +7,7 @@ mod utils;
 
 use std::sync::Arc;
 
+use anyhow::Result;
 use axum::{
     Router,
     extract::DefaultBodyLimit,
@@ -57,8 +58,8 @@ impl AppState {
     }
 }
 
-pub fn create_router(state: AppState) -> Router {
-    Router::new()
+pub fn create_router(state: AppState) -> Result<Router> {
+    let mut router = Router::new()
         .merge(Router::new().route("/v1/models", get(handlers::models::list_models)))
         .route(
             "/v1/chat/completions",
@@ -80,6 +81,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/embeddings", post(handlers::embeddings::embeddings))
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(from_fn_with_state(state.clone(), middlewares::auth))
-        .layer(from_fn(middlewares::trace))
-        .with_state(state)
+        .layer(from_fn(middlewares::trace));
+
+    let cors = &state.config.server.proxy.cors;
+    if cors.enabled {
+        router = router.layer(cors.to_cors_layer()?)
+    };
+
+    Ok(router.with_state(state))
 }

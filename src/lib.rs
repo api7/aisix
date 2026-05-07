@@ -99,7 +99,8 @@ pub async fn run_with_provider(
         resources.clone(),
         gateway,
         message_history_storage,
-    ));
+    ))
+    .context("failed to create proxy router")?;
 
     let res = select! {
         res = tokio::signal::ctrl_c() =>
@@ -143,7 +144,7 @@ async fn serve_admin(config: Arc<config::Config>, state: admin::AppState) -> Res
         "Admin",
         config.server.admin.listen,
         &config.server.admin.tls,
-        admin::create_router(state),
+        admin::create_router(state).context("failed to create admin router")?,
     )
     .await
 }

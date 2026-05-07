@@ -137,6 +137,7 @@ axum-server = { version = "0.8.0", default-features = false, features = [
 backon = { version = "1.6.0", default-features = false, features = [
   "tokio-sleep",
 ] }
+tower-http = { version = "0.6.10", features = ["cors"] }
 
 [build-dependencies]
 vergen-git2 = { version = "9.1.0" }

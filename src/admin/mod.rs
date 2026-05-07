@@ -6,6 +6,7 @@ mod types;
 
 use std::sync::Arc;
 
+use anyhow::Result;
 use axum::{
     Router,
     extract::{Request, State},
@@ -107,8 +108,8 @@ impl AppState {
     }
 }
 
-pub fn create_router(state: AppState) -> Router {
-    Router::new()
+pub fn create_router(state: AppState) -> Result<Router> {
+    let mut router = Router::new()
         .nest(
             PATH_PREFIX,
             Router::new()
@@ -148,8 +149,14 @@ pub fn create_router(state: AppState) -> Router {
         .route("/ui", get(|| async { Redirect::to("/ui/") }))
         .route("/ui/", get(aisix_admin_ui::handler))
         .route("/ui/{*path}", get(aisix_admin_ui::handler))
-        .merge(Scalar::with_url("/openapi", ApiDoc::openapi()))
-        .with_state(state)
+        .merge(Scalar::with_url("/openapi", ApiDoc::openapi()));
+
+    let cors = &state.config.server.admin.cors;
+    if cors.enabled {
+        router = router.layer(cors.to_cors_layer()?)
+    };
+
+    Ok(router.with_state(state))
 }
 
 async fn auth(

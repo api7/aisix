@@ -1,9 +1,11 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, str::FromStr};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
+use http::{HeaderValue, Method, header::HeaderName};
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::config::etcd;
 
@@ -46,12 +48,80 @@ pub struct ServerCommonTls {
     pub key_file: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ServerCommonCors {
+    #[serde(default)]
+    pub enabled: bool,
+    pub allowed_origins: Option<Vec<String>>,
+    pub allowed_methods: Option<Vec<String>>,
+    pub allowed_headers: Option<Vec<String>>,
+    pub exposed_headers: Option<Vec<String>>,
+    pub allow_credentials: Option<bool>,
+}
+
+impl ServerCommonCors {
+    pub fn to_cors_layer(&self) -> Result<CorsLayer> {
+        let mut cors = CorsLayer::new().allow_credentials(self.allow_credentials.unwrap_or(false));
+
+        if let Some(origins) = self.allowed_origins.as_deref() {
+            cors = cors.allow_origin(if origins.iter().any(|o| o == "*") {
+                AllowOrigin::any()
+            } else {
+                AllowOrigin::list(Self::parse_cors_values(
+                    "allowed_origin",
+                    origins,
+                    HeaderValue::from_str,
+                )?)
+            });
+        }
+
+        if let Some(methods) = self.allowed_methods.as_deref() {
+            cors = cors.allow_methods(Self::parse_cors_values(
+                "allowed_method",
+                methods,
+                Method::from_str,
+            )?);
+        }
+
+        if let Some(headers) = self.allowed_headers.as_deref() {
+            cors = cors.allow_headers(Self::parse_cors_values(
+                "allowed_header",
+                headers,
+                HeaderName::from_str,
+            )?);
+        }
+
+        if let Some(headers) = self.exposed_headers.as_deref() {
+            cors = cors.expose_headers(Self::parse_cors_values(
+                "exposed_header",
+                headers,
+                HeaderName::from_str,
+            )?);
+        }
+
+        Ok(cors)
+    }
+
+    fn parse_cors_values<T, E, F>(field: &str, values: &[String], mut parse: F) -> Result<Vec<T>>
+    where
+        F: FnMut(&str) -> std::result::Result<T, E>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        values
+            .iter()
+            .map(|value| parse(value).with_context(|| format!("Invalid CORS {}: {}", field, value)))
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ServerProxy {
     #[serde(default = "defaults::listen")]
     pub listen: SocketAddr,
     #[serde(default)]
     pub tls: ServerCommonTls,
+    #[serde(default)]
+    pub cors: ServerCommonCors,
 }
 
 impl Default for ServerProxy {
@@ -59,6 +129,7 @@ impl Default for ServerProxy {
         Self {
             listen: defaults::listen(),
             tls: ServerCommonTls::default(),
+            cors: ServerCommonCors::default(),
         }
     }
 }
@@ -69,6 +140,8 @@ pub struct ServerAdmin {
     pub listen: SocketAddr,
     #[serde(default)]
     pub tls: ServerCommonTls,
+    #[serde(default)]
+    pub cors: ServerCommonCors,
 }
 
 impl Default for ServerAdmin {
@@ -76,6 +149,7 @@ impl Default for ServerAdmin {
         Self {
             listen: defaults::admin_listen(),
             tls: ServerCommonTls::default(),
+            cors: ServerCommonCors::default(),
         }
     }
 }
@@ -210,5 +284,42 @@ impl dyn ConfigProvider {
                 mod_revision,
             })),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ServerCommonCors;
+
+    #[test]
+    fn to_cors_layer_accepts_valid_config() {
+        let cors = ServerCommonCors {
+            enabled: true,
+            allowed_origins: Some(vec!["https://example.com".into()]),
+            allowed_methods: Some(vec!["GET".into(), "POST".into()]),
+            allowed_headers: Some(vec!["content-type".into()]),
+            exposed_headers: Some(vec!["x-request-id".into()]),
+            allow_credentials: Some(true),
+        };
+
+        assert!(cors.to_cors_layer().is_ok());
+    }
+
+    #[test]
+    fn to_cors_layer_rejects_invalid_config() {
+        let cors = ServerCommonCors {
+            allowed_methods: Some(vec!["NOT A METHOD".into()]),
+            ..Default::default()
+        };
+
+        let result = cors.to_cors_layer();
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .map(|err| err.to_string().contains("Invalid CORS allowed_method"))
+                .unwrap_or(false)
+        );
     }
 }

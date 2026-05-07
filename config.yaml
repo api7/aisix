@@ -20,5 +20,16 @@ server:
       enabled: false
       cert_file: cert.pem
       key_file: key.pem
+    cors:
+      enabled: false
+      allowed_origins: [ "*" ]
+      allowed_methods: [ "GET", "POST" ]
+      allowed_headers: [ "Authorization", "Content-Type" ]
+      exposed_headers: []
+      allow_credentials: true
   admin:
     listen: 127.0.0.1:3001
+    tls:
+      enabled: false
+    cors:
+      enabled: false
