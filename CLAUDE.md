@@ -81,6 +81,54 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - If official docs and source code do not answer the question, say so explicitly and ask — do not invent an answer.
 - Cite the specific doc URL, file path, or commit/version when stating a fact about third-party behavior.
 
+## 7. Reference Implementations Before Building
+
+**Before implementing any feature, study how the established players did it. Avoid building a parallel reality that drifts from the ecosystem.**
+
+This gateway sits between customer SDKs and upstream LLM providers. Both
+sides have decades of accumulated wire-shape decisions, edge cases, and
+backward-compat constraints. Re-deriving them from first principles is
+how you ship a half-spec-compliant version that breaks on the first SDK
+the customer tries.
+
+**Before writing the first line of a new feature, read:**
+
+- **Reference gateway implementations** — at minimum
+  [LiteLLM](https://github.com/BerriAI/litellm) and
+  [Portkey](https://github.com/Portkey-AI/gateway). Both are open
+  source, both solve the multi-provider proxy problem, and both
+  encode years of "this provider returns X but actually means Y"
+  fixes. When in doubt about a request/response transform, search
+  their source for the same provider + endpoint and see how they
+  handle it.
+- **Upstream provider docs** — for any endpoint or feature, the
+  authoritative spec is the upstream provider's own docs:
+  - OpenAI: <https://platform.openai.com/docs/api-reference>
+  - Anthropic: <https://docs.anthropic.com/en/api>
+  - Google Gemini: <https://ai.google.dev/api>
+  - DeepSeek: <https://api-docs.deepseek.com>
+  - AWS Bedrock: <https://docs.aws.amazon.com/bedrock/>
+- **Upstream SDK source** — when the docs are vague (and they often
+  are about edge cases like `usage` block sub-fields, streaming
+  event ordering, or error envelope shape), the official SDK source
+  is the actual contract:
+  - <https://github.com/openai/openai-python>
+  - <https://github.com/anthropics/anthropic-sdk-python>
+  - <https://github.com/google-gemini/generative-ai-python>
+
+**The rule:**
+
+- Cite at least one reference implementation and one upstream-spec
+  source in the design notes / PR description for any new endpoint,
+  request transform, or response normalization.
+- If your design diverges from how LiteLLM / Portkey solve the same
+  problem, name the divergence explicitly and justify it. "I didn't
+  know they handled it" is not a reason; "they do X but we need Y
+  because of Z" is.
+- For any field, header, or status code you emit or parse, cite the
+  upstream doc URL or SDK file/line. Don't invent field names that
+  "feel right" — the ecosystem has already chosen one.
+
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
