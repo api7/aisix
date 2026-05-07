@@ -141,12 +141,30 @@ Forwards to the configured Model's `/v1/embeddings` endpoint.
 {"model": "my-embeddings", "input": ["foo", "bar"]}
 ```
 
-### 4.5 `POST /v1/messages` (Anthropic native)
+### 4.5 `POST /v1/messages` (Anthropic Messages — any upstream)
 
-Native Anthropic Messages API path. The body is forwarded with the
-`model` field rewritten to the upstream Anthropic model id. Use this
-when your client already speaks Anthropic and you want zero
-translation overhead.
+Native Anthropic Messages API path. Works against any configured
+upstream — Anthropic, OpenAI, Gemini, DeepSeek — based on the
+resolved `Model.provider`:
+
+- **Anthropic upstream** — byte-for-byte passthrough. The body is
+  forwarded with the `model` field rewritten to the upstream
+  Anthropic model id. SSE streamed verbatim. This preserves features
+  the gateway-internal `ChatFormat` can't lossily round-trip
+  (`cache_control`, thinking blocks, image blocks, tool_use blocks).
+- **Non-Anthropic upstream** — the gateway parses the Anthropic body
+  into its internal `ChatFormat` (folding `system` into a leading
+  system message, concatenating text content blocks), dispatches
+  through the `Hub` to the matching `Bridge`, and re-encodes the
+  bridge's response as Anthropic JSON or Anthropic SSE
+  (`message_start` / `content_block_start` / `content_block_delta` /
+  `content_block_stop` / `message_delta` / `message_stop`). The
+  `model` field in the response echoes the operator alias the client
+  sent, not the underlying upstream id.
+
+Today's translation supports text content blocks. Tool_use, image,
+and thinking blocks are scoped to a follow-up; current behavior is
+to skip non-text blocks silently on the inbound parse.
 
 ### 4.6 `POST /v1/responses` (OpenAI Responses)
 
@@ -210,6 +228,12 @@ possible:
 | Anthropic | `/v1/messages` | `/v1/chat/completions` (full translation) | The Hub maps content blocks ↔ messages, tool_use ↔ tool_calls, system extraction, cache_control passthrough, stop_reason normalisation |
 | Gemini | `/v1/chat/completions` (OpenAI-compat endpoint) | (same) | Uses Gemini's OpenAI-compatible base URL with `x-goog-api-key` auth |
 | DeepSeek | `/v1/chat/completions` (OpenAI-compat endpoint) | (same) | Uses Bearer auth, OpenAI-compatible payloads |
+
+`/v1/messages` is symmetric to `/v1/chat/completions` for the
+**inbound** axis: an Anthropic-SDK client can target an OpenAI /
+Gemini / DeepSeek upstream and the gateway translates both
+directions (text content blocks today; tool_use / image / thinking
+blocks land in a follow-up).
 
 For `gemini` and `deepseek` there is no separate "native" endpoint —
 both providers expose OpenAI-compatible APIs and the Bridge is a thin

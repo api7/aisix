@@ -271,6 +271,8 @@ dependencies = [
  "aisix-guardrails",
  "aisix-obs",
  "aisix-provider-anthropic",
+ "aisix-provider-deepseek",
+ "aisix-provider-gemini",
  "aisix-provider-openai",
  "aisix-ratelimit",
  "async-stream",

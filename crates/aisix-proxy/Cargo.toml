@@ -11,6 +11,13 @@ description = "aisix: /v1/* proxy router (OpenAI-compatible) + middleware + hook
 [dependencies]
 aisix-core = { path = "../aisix-core" }
 aisix-gateway = { path = "../aisix-gateway" }
+# /v1/messages handler reaches into the Anthropic wire helpers
+# (parse_inbound_request / chat_response_into_anthropic_json /
+# AnthropicSseEncoder) so it can translate Anthropic-protocol
+# requests into ChatFormat for any upstream and back. This is the
+# only provider crate the proxy depends on directly — others stay
+# behind the Bridge trait.
+aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
 aisix-obs = { path = "../aisix-obs" }
 aisix-ratelimit = { path = "../aisix-ratelimit" }
 aisix-cache = { path = "../aisix-cache" }
@@ -39,5 +46,8 @@ uuid.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
 aisix-provider-openai = { path = "../aisix-provider-openai" }
-aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
+# aisix-provider-anthropic moved to [dependencies] so the /v1/messages
+# handler can use its inbound wire helpers in non-test builds too.
+aisix-provider-deepseek = { path = "../aisix-provider-deepseek" }
+aisix-provider-gemini = { path = "../aisix-provider-gemini" }
 wiremock.workspace = true

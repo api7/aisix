@@ -16,7 +16,7 @@ Surfaces and capabilities currently in main:
 
 - **Proxy API (`:3000`)** — OpenAI-compatible
   - Chat completions: `POST /v1/chat/completions` with native SSE streaming
-  - Anthropic-shape: `POST /v1/messages` (Claude SDK works against `base_url`)
+  - Anthropic-shape: `POST /v1/messages` (Claude SDK works against `base_url`) — works against **any** configured upstream (OpenAI / Gemini / DeepSeek / Anthropic). When the targeted Model points at a non-Anthropic upstream, the gateway translates the Anthropic body → ChatFormat → bridge → response back to Anthropic JSON / SSE.
   - OpenAI Responses: `POST /v1/responses`
   - Embeddings: `POST /v1/embeddings`
   - Rerank: `POST /v1/rerank`

@@ -1,22 +1,27 @@
-//! `POST /v1/messages` — Anthropic native Messages API pass-through.
+//! `POST /v1/messages` — Anthropic Messages API, any upstream.
 //!
-//! This endpoint lets callers that already speak the Anthropic SDK send
-//! requests directly without going through the OpenAI-compat Hub
-//! translation layer. The gateway:
+//! Two dispatch paths share this entry point:
 //!
-//! 1. Authenticates the proxy API key and authorises model access.
-//! 2. Resolves the model name to a `Model` in the snapshot.
-//! 3. Enforces that the model uses the `anthropic/` provider — non-Anthropic
-//!    models are rejected with 422 ("model is not an Anthropic provider").
-//! 4. Rewrites the `model` field to the upstream model name (strips the
-//!    `anthropic/` prefix).
-//! 5. Forwards the body to `{api_base}/v1/messages` with the correct
-//!    `x-api-key` and `anthropic-version` headers.
-//! 6. Returns the response verbatim — both streaming (SSE) and non-streaming
-//!    are supported transparently.
+//! - **Anthropic upstream** (`Model.provider == anthropic`) — byte-for-byte
+//!   passthrough to `{api_base}/v1/messages`. Preserves features the
+//!   gateway-internal `ChatFormat` can't lossily round-trip (cache_control,
+//!   thinking blocks, tool_use, image blocks). Adds `x-api-key` +
+//!   `anthropic-version` headers, rewrites the `model` field to the
+//!   upstream id, and streams the SSE response verbatim.
 //!
-//! Rate-limiting and metrics are recorded using the same hooks as chat
-//! completions.
+//! - **Non-Anthropic upstream** (`Model.provider == openai|gemini|deepseek`)
+//!   — translates the Anthropic-shape body to the gateway's internal
+//!   [`ChatFormat`], dispatches through the [`Hub`] to the matching
+//!   [`Bridge`], and re-encodes the bridge's [`ChatResponse`] / chunk
+//!   stream as Anthropic JSON or Anthropic SSE events
+//!   (`message_start` / `content_block_*` / `message_delta` /
+//!   `message_stop`). The translation helpers live in
+//!   `aisix-provider-anthropic::wire`. Pattern lifted from LiteLLM's
+//!   experimental_pass_through adapter, scoped to text content blocks
+//!   today (tool_use / thinking / image blocks land in a follow-up).
+//!
+//! Both paths share the same auth, model lookup, allowed_models check,
+//! access-log emission, metrics labels, and health tracker hooks.
 //!
 //! Errors use the standard OpenAI-style envelope so clients on the proxy
 //! side can handle them consistently regardless of which endpoint was used.
@@ -125,11 +130,15 @@ async fn dispatch(
 
     let model = &model_entry.value;
 
-    // Validate the model is Anthropic — this endpoint is native-only.
+    // Cross-provider path: when the resolved Model points at a non-
+    // Anthropic upstream, parse the Anthropic-shape body into the
+    // gateway's internal ChatFormat, dispatch through the Hub, and
+    // re-encode the bridge's response as Anthropic JSON or SSE.
+    // The Anthropic-upstream branch below stays as a byte-for-byte
+    // passthrough to preserve features (cache_control, thinking
+    // blocks, …) the cross-provider path can't lossily round-trip.
     if model.provider() != Some(Provider::Anthropic) {
-        return Err(ProxyError::InvalidRequest(format!(
-            "model `{model_name}` is not an Anthropic provider; use /v1/chat/completions instead"
-        )));
+        return cross_provider_dispatch(state, body, model, &model_name, request_id).await;
     }
 
     let api_key = model.provider_config.api_key.as_str();
@@ -250,6 +259,134 @@ async fn dispatch(
 
         Ok((Json(json_body).into_response(), provider_label))
     }
+}
+
+/// Anthropic-protocol input → non-Anthropic upstream output.
+///
+/// Symmetric to `chat.rs::dispatch` but with Anthropic wire shapes on
+/// both ends of the gateway:
+///
+/// 1. parse_inbound_request(body) → ChatFormat (gateway-internal)
+/// 2. hub.get(model.provider) → Bridge for the configured upstream
+/// 3. For non-streaming: bridge.chat → ChatResponse →
+///    chat_response_into_anthropic_json
+/// 4. For streaming: bridge.chat_stream → AnthropicSseEncoder pumps
+///    each ChatChunk through the message_start / content_block_* /
+///    message_* state machine and writes SSE bytes
+async fn cross_provider_dispatch(
+    state: &ProxyState,
+    body: &Value,
+    model: &aisix_core::Model,
+    model_name: &str,
+    request_id: &str,
+) -> Result<(Response, String), ProxyError> {
+    use aisix_gateway::{Bridge, BridgeContext};
+    use aisix_provider_anthropic::{
+        chat_response_into_anthropic_json, parse_inbound_request, AnthropicSseEncoder,
+    };
+    use std::sync::Arc;
+
+    let provider = model.provider().ok_or_else(|| {
+        ProxyError::InvalidRequest(format!("model `{model_name}` has no provider prefix"))
+    })?;
+    let bridge: Arc<dyn Bridge> = state
+        .hub
+        .get(provider)
+        .ok_or(ProxyError::ProviderUnavailable)?;
+
+    // Parse the Anthropic-shape body into the gateway's normalised
+    // ChatFormat. Errors here are 400 — the request is malformed
+    // before it even hits the bridge.
+    let mut chat = parse_inbound_request(body)
+        .map_err(|e| ProxyError::InvalidRequest(format!("invalid Anthropic body: {e}")))?;
+    // Force the bridge dispatch to use the operator's display name
+    // (`model_name`) so the bridge can re-resolve the upstream id
+    // through `ctx.model.upstream_model()` exactly like chat.rs does.
+    chat.model = model_name.to_string();
+
+    let is_stream = chat.is_streaming();
+    let model_arc = Arc::new(model.clone());
+    let ctx = BridgeContext::new(request_id, model_arc);
+    let provider_label = format!("{provider:?}").to_lowercase();
+
+    if is_stream {
+        let upstream = bridge
+            .chat_stream(&chat, &ctx)
+            .await
+            .map_err(ProxyError::Bridge)?;
+        state.health.record_success(model_name);
+
+        let message_id = format!("msg_{}", Uuid::new_v4().simple());
+        let encoder = AnthropicSseEncoder::new(message_id, model_name, 0);
+        let sse_body = build_anthropic_sse_stream(upstream, encoder);
+
+        let mut response = axum::response::Response::new(sse_body);
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        );
+        if let Ok(hv) = HeaderValue::from_str(request_id) {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static("x-aisix-request-id"), hv);
+        }
+        return Ok((response, provider_label));
+    }
+
+    // Non-streaming.
+    let resp = bridge.chat(&chat, &ctx).await.map_err(ProxyError::Bridge)?;
+    state.health.record_success(model_name);
+
+    let json = chat_response_into_anthropic_json(&resp, model_name);
+    Ok((Json(json).into_response(), provider_label))
+}
+
+/// Pump `ChatChunk`s through an `AnthropicSseEncoder` and emit each
+/// resulting `AnthropicSseEvent` as `event: …\ndata: …\n\n` bytes.
+/// Errors in the stream surface as a final `event: error` frame so
+/// SSE clients see something actionable rather than a half-complete
+/// stream.
+fn build_anthropic_sse_stream(
+    upstream: aisix_gateway::ChatChunkStream,
+    encoder: aisix_provider_anthropic::AnthropicSseEncoder,
+) -> axum::body::Body {
+    use futures::StreamExt;
+
+    let mut encoder = encoder;
+    let stream = async_stream::stream! {
+        let mut upstream = upstream;
+        while let Some(item) = upstream.next().await {
+            match item {
+                Ok(chunk) => {
+                    for ev in encoder.next_events(&chunk) {
+                        yield Ok::<_, std::io::Error>(bytes::Bytes::from(ev.to_sse_string()));
+                    }
+                    if encoder.is_finished() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let frame = format!(
+                        "event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"{}\",\"message\":{}}}}}\n\n",
+                        e.error_type(),
+                        serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"error\"".into()),
+                    );
+                    yield Ok(bytes::Bytes::from(frame));
+                    return;
+                }
+            }
+        }
+        if !encoder.is_finished() {
+            for ev in encoder.force_finish() {
+                yield Ok(bytes::Bytes::from(ev.to_sse_string()));
+            }
+        }
+    };
+    axum::body::Body::from_stream(stream)
 }
 
 fn emit_access_log(
@@ -477,21 +614,140 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// Cross-provider path: client speaks Anthropic protocol but the
+    /// resolved Model points at an OpenAI upstream. The handler now
+    /// translates Anthropic body → ChatFormat, dispatches through the
+    /// OpenAi bridge, and re-encodes the OpenAI response as
+    /// Anthropic-shape JSON (`{type:"message", role:"assistant",
+    /// content:[{type:"text",...}], stop_reason, usage}`).
     #[tokio::test]
-    async fn non_anthropic_model_returns_400() {
+    async fn non_anthropic_model_dispatches_through_bridge_and_returns_anthropic_shape() {
+        use aisix_provider_openai::OpenAiBridge;
+
+        let upstream = MockServer::start().await;
+        // Mock an OpenAI /chat/completions response. The proxy will
+        // translate it back to Anthropic shape on the way out.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-XYZ",
+                "object": "chat.completion",
+                "created": 1_715_000_000_u64,
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Hello from GPT!"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+            })))
+            .mount(&upstream)
+            .await;
+
         let snap = AisixSnapshot::new();
-        snap.models.insert(openai_model("gpt-4o", "http://unused"));
+        snap.models
+            .insert(openai_model("my-claude-alias", &upstream.uri()));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
-        let app = build_app(snap);
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let app = crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache());
+
+        // Anthropic-shape inbound body.
         let body = serde_json::json!({
-            "model": "gpt-4o",
+            "model": "my-claude-alias",
             "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 10
+            "max_tokens": 100
         });
         let resp = app.oneshot(make_req(body)).await.unwrap();
-        // 400 Bad Request — model is not an Anthropic provider.
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // Anthropic-shape envelope.
+        assert_eq!(v["type"], "message");
+        assert_eq!(v["role"], "assistant");
+        assert_eq!(
+            v["model"], "my-claude-alias",
+            "echoes operator alias, not upstream id"
+        );
+        assert_eq!(v["content"][0]["type"], "text");
+        assert_eq!(v["content"][0]["text"], "Hello from GPT!");
+        assert_eq!(
+            v["stop_reason"], "end_turn",
+            "OpenAI 'stop' → Anthropic 'end_turn'"
+        );
+        assert_eq!(v["usage"]["input_tokens"], 7);
+        assert_eq!(v["usage"]["output_tokens"], 3);
+    }
+
+    /// Streaming variant: the client asks for SSE; we translate
+    /// OpenAI delta chunks to Anthropic message_start /
+    /// content_block_delta / message_stop events.
+    #[tokio::test]
+    async fn non_anthropic_model_streams_anthropic_sse_events() {
+        use aisix_provider_openai::OpenAiBridge;
+
+        let upstream = MockServer::start().await;
+        // OpenAI-style SSE stream with two content deltas + a done marker.
+        let sse = "\
+data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hel\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.models
+            .insert(openai_model("my-claude-alias", &upstream.uri()));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let app = crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache());
+
+        let body = serde_json::json!({
+            "model": "my-claude-alias",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+            "stream": true,
+        });
+        let resp = app.oneshot(make_req(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream"),
+        );
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // Anthropic-shape SSE event sequence.
+        assert!(
+            body.contains("event: message_start"),
+            "missing message_start in:\n{body}"
+        );
+        assert!(body.contains("event: content_block_start"));
+        assert!(body.contains("event: content_block_delta"));
+        assert!(body.contains("\"text\":\"hel\""));
+        assert!(body.contains("\"text\":\"lo\""));
+        assert!(body.contains("event: content_block_stop"));
+        assert!(body.contains("event: message_delta"));
+        assert!(body.contains("\"stop_reason\":\"end_turn\""));
+        assert!(body.contains("event: message_stop"));
     }
 
     #[tokio::test]

@@ -16,3 +16,19 @@ mod bridge;
 mod wire;
 
 pub use bridge::{AnthropicBridge, ANTHROPIC_DEFAULT_BASE, ANTHROPIC_VERSION};
+
+/// Inbound Anthropic-protocol translation surface — used by the
+/// proxy's `/v1/messages` handler when the targeted Model points at
+/// a non-Anthropic upstream. The flow is symmetric to the existing
+/// outbound path:
+///
+/// - [`parse_inbound_request`] turns the request body into
+///   `ChatFormat` so any Bridge can dispatch it.
+/// - [`chat_response_into_anthropic_json`] renders the bridge's
+///   `ChatResponse` back as Anthropic JSON.
+/// - [`AnthropicSseEncoder`] re-encodes the bridge's `ChatChunk`
+///   stream as Anthropic typed SSE events.
+pub use wire::{
+    chat_response_into_anthropic_json, parse_inbound_request, AnthropicInboundError,
+    AnthropicSseEncoder, AnthropicSseEvent,
+};

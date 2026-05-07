@@ -344,6 +344,407 @@ impl StreamState {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Inbound translation — Anthropic protocol  →  internal ChatFormat.
+//
+// Used by the proxy's /v1/messages handler when the Model targeted by
+// the request points at a non-Anthropic upstream: we accept the
+// Anthropic-shaped body, translate to ChatFormat, and dispatch through
+// the Hub. The reverse direction (ChatFormat → Anthropic wire request)
+// is handled by `split_system` + `build_request` for the
+// Anthropic-upstream case above.
+//
+// Pattern lifted from LiteLLM's experimental_pass_through adapter
+// (`transformation.py::translate_anthropic_to_openai`), trimmed to the
+// MVP fields aisix supports today (text content blocks; tool_use,
+// image, and thinking blocks land in a follow-up PR).
+
+#[derive(Debug, thiserror::Error)]
+pub enum AnthropicInboundError {
+    #[error("body is not a JSON object")]
+    NotAnObject,
+    #[error("missing or non-string `model` field")]
+    MissingModel,
+    #[error("missing or non-array `messages` field")]
+    MissingMessages,
+    #[error("messages[{idx}] missing `role`")]
+    MessageMissingRole { idx: usize },
+    #[error("messages[{idx}] role {role:?} is not 'user' or 'assistant'")]
+    UnsupportedRole { idx: usize, role: String },
+    #[error("messages[{idx}].content must be a string or an array of text blocks")]
+    UnsupportedContent { idx: usize },
+    #[error("`system` field must be a string or an array of text blocks")]
+    UnsupportedSystem,
+}
+
+/// Parse an Anthropic `POST /v1/messages` JSON body into the gateway's
+/// internal [`ChatFormat`]. The `system` field is folded into a leading
+/// system message; content blocks are concatenated text-only (non-text
+/// blocks are skipped). Unrecognized top-level keys (`metadata`,
+/// `tools`, `tool_choice`, etc.) flow into `ChatFormat::extra` so a
+/// future tools-aware bridge can read them.
+pub fn parse_inbound_request(
+    body: &serde_json::Value,
+) -> Result<ChatFormat, AnthropicInboundError> {
+    use serde_json::Value;
+    let obj = body.as_object().ok_or(AnthropicInboundError::NotAnObject)?;
+
+    let model = obj
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or(AnthropicInboundError::MissingModel)?
+        .to_string();
+
+    let raw_messages = obj
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or(AnthropicInboundError::MissingMessages)?;
+
+    let mut messages: Vec<ChatMessage> = Vec::with_capacity(raw_messages.len() + 1);
+
+    // `system`: prepend as leading system message. Anthropic accepts
+    // string OR array of text blocks; we accept both shapes.
+    if let Some(system) = obj.get("system") {
+        let system_text = match system {
+            Value::String(s) => s.clone(),
+            Value::Array(blocks) => {
+                let mut parts = Vec::new();
+                for block in blocks {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        parts.push(text);
+                    }
+                }
+                parts.join("\n")
+            }
+            Value::Null => String::new(),
+            _ => return Err(AnthropicInboundError::UnsupportedSystem),
+        };
+        if !system_text.is_empty() {
+            messages.push(ChatMessage::system(system_text));
+        }
+    }
+
+    for (idx, m) in raw_messages.iter().enumerate() {
+        let role = m
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or(AnthropicInboundError::MessageMissingRole { idx })?;
+
+        let content = match m.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(blocks)) => {
+                let mut parts = Vec::new();
+                for block in blocks {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        parts.push(text);
+                    }
+                }
+                parts.join("")
+            }
+            _ => return Err(AnthropicInboundError::UnsupportedContent { idx }),
+        };
+
+        match role {
+            "user" => messages.push(ChatMessage::user(content)),
+            "assistant" => messages.push(ChatMessage::assistant(content)),
+            other => {
+                return Err(AnthropicInboundError::UnsupportedRole {
+                    idx,
+                    role: other.to_string(),
+                })
+            }
+        }
+    }
+
+    let mut chat = ChatFormat::new(model, messages);
+
+    if let Some(t) = obj.get("temperature").and_then(Value::as_f64) {
+        chat.temperature = Some(t as f32);
+    }
+    if let Some(t) = obj.get("top_p").and_then(Value::as_f64) {
+        chat.top_p = Some(t as f32);
+    }
+    if let Some(t) = obj.get("max_tokens").and_then(Value::as_u64) {
+        chat.max_tokens = Some(t as u32);
+    }
+    if let Some(s) = obj.get("stream").and_then(Value::as_bool) {
+        chat.stream = Some(s);
+    }
+
+    // Pass remaining keys through `extra` so future bridges can use
+    // them. We deliberately don't whitelist — bridges that don't
+    // understand a key just ignore it.
+    for (key, value) in obj {
+        if !matches!(
+            key.as_str(),
+            "model" | "messages" | "system" | "temperature" | "top_p" | "max_tokens" | "stream"
+        ) {
+            chat.extra.insert(key.clone(), value.clone());
+        }
+    }
+
+    Ok(chat)
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Outbound translation — internal ChatResponse  →  Anthropic JSON.
+
+/// Render an internal [`ChatResponse`] as the JSON an Anthropic
+/// `/v1/messages` client expects. The reverse of
+/// `response_into_chat_response`. `model_display_name` is the
+/// operator-facing model name the client requested — we echo it back
+/// rather than leaking the actual upstream id (e.g. `gpt-4o`) when
+/// the underlying provider isn't Anthropic.
+pub fn chat_response_into_anthropic_json(
+    resp: &ChatResponse,
+    model_display_name: &str,
+) -> serde_json::Value {
+    let stop_reason = match &resp.finish_reason {
+        FinishReason::Stop => "end_turn",
+        FinishReason::Length => "max_tokens",
+        FinishReason::ContentFilter => "stop_sequence",
+        FinishReason::ToolCalls => "tool_use",
+        FinishReason::Other(_) => "end_turn",
+    };
+    serde_json::json!({
+        "id": resp.id,
+        "type": "message",
+        "role": "assistant",
+        "model": model_display_name,
+        "content": [{"type": "text", "text": resp.message.content}],
+        "stop_reason": stop_reason,
+        "stop_sequence": serde_json::Value::Null,
+        "usage": {
+            "input_tokens": resp.usage.prompt_tokens,
+            "output_tokens": resp.usage.completion_tokens,
+        },
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Streaming SSE encoder — internal ChatChunk stream  →  Anthropic
+// SSE events.
+//
+// State machine (mirrors LiteLLM's `AnthropicStreamWrapper`):
+//   1. First chunk that carries content or a finish_reason → emit
+//      `message_start`. If it carries content, also emit
+//      `content_block_start` + `content_block_delta`.
+//   2. Mid-stream chunks with content → `content_block_delta`.
+//   3. Chunk carrying `finish_reason` → emit `content_block_stop`
+//      (only if a content block was opened), `message_delta` (with
+//      stop_reason + final usage), then `message_stop`. After
+//      `finished` flips true the encoder is silent.
+//
+// Reference: https://docs.anthropic.com/en/api/streaming
+
+/// One Anthropic SSE event, ready to be written to the wire as
+/// `event: {event}\ndata: {data}\n\n`.
+#[derive(Debug, Clone)]
+pub struct AnthropicSseEvent {
+    pub event: &'static str,
+    pub data: serde_json::Value,
+}
+
+impl AnthropicSseEvent {
+    pub fn to_sse_string(&self) -> String {
+        format!(
+            "event: {}\ndata: {}\n\n",
+            self.event,
+            serde_json::to_string(&self.data).expect("serde_json::Value always serializes"),
+        )
+    }
+}
+
+/// State machine for re-encoding a stream of internal `ChatChunk`s as
+/// Anthropic SSE events.
+#[derive(Debug)]
+pub struct AnthropicSseEncoder {
+    message_id: String,
+    model_display_name: String,
+    initial_input_tokens: u32,
+    sent_message_start: bool,
+    sent_content_block_start: bool,
+    finished: bool,
+}
+
+impl AnthropicSseEncoder {
+    /// `message_id` is echoed in `message_start.message.id`.
+    /// `model_display_name` is the operator-facing model name the
+    /// client originally sent in `req.model`.
+    /// `initial_input_tokens` is the best-known-at-stream-open input
+    /// token count; pass 0 if unknown.
+    pub fn new(
+        message_id: impl Into<String>,
+        model_display_name: impl Into<String>,
+        initial_input_tokens: u32,
+    ) -> Self {
+        Self {
+            message_id: message_id.into(),
+            model_display_name: model_display_name.into(),
+            initial_input_tokens,
+            sent_message_start: false,
+            sent_content_block_start: false,
+            finished: false,
+        }
+    }
+
+    /// Translate one chunk into the Anthropic SSE events to emit.
+    /// Returns an empty Vec on no-op chunks (e.g. usage-only).
+    pub fn next_events(&mut self, chunk: &ChatChunk) -> Vec<AnthropicSseEvent> {
+        if self.finished {
+            return Vec::new();
+        }
+
+        let mut events = Vec::new();
+
+        let has_content = chunk
+            .delta
+            .content
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
+        let has_finish = chunk.finish_reason.is_some();
+
+        if !self.sent_message_start && (has_content || has_finish) {
+            events.push(self.message_start_event());
+            self.sent_message_start = true;
+        }
+
+        if !self.sent_content_block_start && has_content {
+            events.push(content_block_start_event());
+            self.sent_content_block_start = true;
+        }
+
+        if has_content {
+            events.push(AnthropicSseEvent {
+                event: "content_block_delta",
+                data: serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "text_delta",
+                        "text": chunk.delta.content.clone().unwrap_or_default(),
+                    },
+                }),
+            });
+        }
+
+        if let Some(fr) = &chunk.finish_reason {
+            if self.sent_content_block_start {
+                events.push(content_block_stop_event());
+            }
+            let stop_reason = match fr {
+                FinishReason::Stop => "end_turn",
+                FinishReason::Length => "max_tokens",
+                FinishReason::ContentFilter => "stop_sequence",
+                FinishReason::ToolCalls => "tool_use",
+                FinishReason::Other(_) => "end_turn",
+            };
+            let output_tokens = chunk
+                .usage
+                .as_ref()
+                .map(|u| u.completion_tokens)
+                .unwrap_or(0);
+            events.push(AnthropicSseEvent {
+                event: "message_delta",
+                data: serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": stop_reason,
+                        "stop_sequence": serde_json::Value::Null,
+                    },
+                    "usage": {"output_tokens": output_tokens},
+                }),
+            });
+            events.push(AnthropicSseEvent {
+                event: "message_stop",
+                data: serde_json::json!({"type": "message_stop"}),
+            });
+            self.finished = true;
+        }
+
+        events
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Force-close the stream when the upstream ended without
+    /// emitting a chunk with `finish_reason`. Emits the closing trio
+    /// with `stop_reason: "end_turn"` and `output_tokens: 0`.
+    /// Idempotent.
+    pub fn force_finish(&mut self) -> Vec<AnthropicSseEvent> {
+        if self.finished {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        if !self.sent_message_start {
+            events.push(self.message_start_event());
+            self.sent_message_start = true;
+        }
+        if self.sent_content_block_start {
+            events.push(content_block_stop_event());
+        }
+        events.push(AnthropicSseEvent {
+            event: "message_delta",
+            data: serde_json::json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": "end_turn",
+                    "stop_sequence": serde_json::Value::Null,
+                },
+                "usage": {"output_tokens": 0},
+            }),
+        });
+        events.push(AnthropicSseEvent {
+            event: "message_stop",
+            data: serde_json::json!({"type": "message_stop"}),
+        });
+        self.finished = true;
+        events
+    }
+
+    fn message_start_event(&self) -> AnthropicSseEvent {
+        AnthropicSseEvent {
+            event: "message_start",
+            data: serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": self.model_display_name,
+                    "stop_reason": serde_json::Value::Null,
+                    "stop_sequence": serde_json::Value::Null,
+                    "usage": {
+                        "input_tokens": self.initial_input_tokens,
+                        "output_tokens": 0,
+                    },
+                },
+            }),
+        }
+    }
+}
+
+fn content_block_start_event() -> AnthropicSseEvent {
+    AnthropicSseEvent {
+        event: "content_block_start",
+        data: serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }),
+    }
+}
+
+fn content_block_stop_event() -> AnthropicSseEvent {
+    AnthropicSseEvent {
+        event: "content_block_stop",
+        data: serde_json::json!({"type": "content_block_stop", "index": 0}),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,5 +964,270 @@ mod tests {
         let chunk = state.to_chunk(&end).unwrap();
         assert_eq!(chunk.finish_reason, Some(FinishReason::Stop));
         assert_eq!(chunk.usage.unwrap().completion_tokens, 3);
+    }
+
+    // ─── parse_inbound_request ────────────────────────────────────
+
+    #[test]
+    fn parse_inbound_minimal_user_only() {
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+        });
+        let chat = parse_inbound_request(&body).unwrap();
+        assert_eq!(chat.model, "claude-sonnet-4-5");
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, Role::User);
+        assert_eq!(chat.messages[0].content, "hi");
+        assert_eq!(chat.max_tokens, Some(100));
+    }
+
+    #[test]
+    fn parse_inbound_system_string_folds_to_leading_message() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "system": "you are helpful",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let chat = parse_inbound_request(&body).unwrap();
+        assert_eq!(chat.messages.len(), 2);
+        assert_eq!(chat.messages[0].role, Role::System);
+        assert_eq!(chat.messages[0].content, "you are helpful");
+        assert_eq!(chat.messages[1].role, Role::User);
+    }
+
+    #[test]
+    fn parse_inbound_system_block_array_concatenates_with_newline() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "system": [
+                {"type": "text", "text": "line1"},
+                {"type": "text", "text": "line2"},
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let chat = parse_inbound_request(&body).unwrap();
+        assert_eq!(chat.messages[0].role, Role::System);
+        assert_eq!(chat.messages[0].content, "line1\nline2");
+    }
+
+    #[test]
+    fn parse_inbound_content_block_array_concatenates_text_only() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello "},
+                    {"type": "image", "source": {"type": "base64", "data": "xx"}},
+                    {"type": "text", "text": "world"},
+                ],
+            }],
+        });
+        let chat = parse_inbound_request(&body).unwrap();
+        // Image block silently skipped; text concatenates.
+        assert_eq!(chat.messages[0].content, "hello world");
+    }
+
+    #[test]
+    fn parse_inbound_unknown_top_level_keys_flow_to_extra() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "metadata": {"user_id": "abc"},
+            "tools": [{"name": "get_weather"}],
+        });
+        let chat = parse_inbound_request(&body).unwrap();
+        assert!(chat.extra.contains_key("metadata"));
+        assert!(chat.extra.contains_key("tools"));
+        assert!(!chat.extra.contains_key("model"));
+        assert!(!chat.extra.contains_key("messages"));
+    }
+
+    #[test]
+    fn parse_inbound_rejects_unknown_role() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [{"role": "tool", "content": "x"}],
+        });
+        let err = parse_inbound_request(&body).unwrap_err();
+        assert!(matches!(err, AnthropicInboundError::UnsupportedRole { .. }));
+    }
+
+    #[test]
+    fn parse_inbound_rejects_missing_model() {
+        let body = serde_json::json!({"messages": []});
+        assert!(matches!(
+            parse_inbound_request(&body).unwrap_err(),
+            AnthropicInboundError::MissingModel,
+        ));
+    }
+
+    // ─── chat_response_into_anthropic_json ────────────────────────
+
+    #[test]
+    fn render_anthropic_response_basic_shape() {
+        let resp = ChatResponse {
+            id: "cmpl-1".into(),
+            model: "gpt-4o".into(), // upstream — should NOT leak into output
+            message: ChatMessage::assistant("hello"),
+            finish_reason: FinishReason::Stop,
+            usage: UsageStats::new(7, 3),
+        };
+        let json = chat_response_into_anthropic_json(&resp, "my-claude-alias");
+        assert_eq!(json["id"], "cmpl-1");
+        assert_eq!(json["type"], "message");
+        assert_eq!(json["role"], "assistant");
+        assert_eq!(json["model"], "my-claude-alias");
+        assert_eq!(json["content"][0]["type"], "text");
+        assert_eq!(json["content"][0]["text"], "hello");
+        assert_eq!(json["stop_reason"], "end_turn");
+        assert!(json["stop_sequence"].is_null());
+        assert_eq!(json["usage"]["input_tokens"], 7);
+        assert_eq!(json["usage"]["output_tokens"], 3);
+    }
+
+    #[test]
+    fn render_anthropic_response_finish_reason_mappings() {
+        let mk = |fr: FinishReason| {
+            let resp = ChatResponse {
+                id: "x".into(),
+                model: "u".into(),
+                message: ChatMessage::assistant(""),
+                finish_reason: fr,
+                usage: UsageStats::new(0, 0),
+            };
+            chat_response_into_anthropic_json(&resp, "m")["stop_reason"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(mk(FinishReason::Stop), "end_turn");
+        assert_eq!(mk(FinishReason::Length), "max_tokens");
+        assert_eq!(mk(FinishReason::ContentFilter), "stop_sequence");
+        assert_eq!(mk(FinishReason::ToolCalls), "tool_use");
+        assert_eq!(mk(FinishReason::Other("vendor".into())), "end_turn");
+    }
+
+    // ─── AnthropicSseEncoder ──────────────────────────────────────
+
+    fn delta_chunk(text: &str) -> ChatChunk {
+        ChatChunk {
+            id: "cmpl-1".into(),
+            model: "u".into(),
+            delta: ChatDelta {
+                role: None,
+                content: Some(text.into()),
+            },
+            finish_reason: None,
+            usage: None,
+        }
+    }
+
+    fn finish_chunk(out_tokens: u32) -> ChatChunk {
+        ChatChunk {
+            id: "cmpl-1".into(),
+            model: "u".into(),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::Stop),
+            usage: Some(UsageStats::new(0, out_tokens)),
+        }
+    }
+
+    #[test]
+    fn sse_encoder_first_content_chunk_emits_message_start_then_block_start_then_delta() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "claude-alias", 5);
+        let events = enc.next_events(&delta_chunk("hello"));
+        let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta"
+            ]
+        );
+        assert_eq!(
+            events[0].data["message"]["usage"]["input_tokens"], 5,
+            "initial input_tokens echoed in message_start"
+        );
+        assert_eq!(events[0].data["message"]["model"], "claude-alias");
+        assert_eq!(events[2].data["delta"]["text"], "hello");
+    }
+
+    #[test]
+    fn sse_encoder_subsequent_chunks_only_emit_deltas() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
+        let _ = enc.next_events(&delta_chunk("hel"));
+        let events = enc.next_events(&delta_chunk("lo"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "content_block_delta");
+        assert_eq!(events[0].data["delta"]["text"], "lo");
+    }
+
+    #[test]
+    fn sse_encoder_finish_chunk_after_content_emits_stop_trio() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
+        let _ = enc.next_events(&delta_chunk("hi"));
+        let events = enc.next_events(&finish_chunk(2));
+        let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
+        assert_eq!(
+            kinds,
+            vec!["content_block_stop", "message_delta", "message_stop"]
+        );
+        assert_eq!(events[1].data["delta"]["stop_reason"], "end_turn");
+        assert_eq!(events[1].data["usage"]["output_tokens"], 2);
+        assert!(enc.is_finished());
+        // Subsequent chunks are silent.
+        assert!(enc.next_events(&delta_chunk("ignored")).is_empty());
+    }
+
+    #[test]
+    fn sse_encoder_finish_only_chunk_skips_content_block_stop() {
+        // Finish without prior content (e.g. blocked by guardrail) —
+        // we still emit message_start + message_delta + message_stop
+        // but NOT content_block_start/stop.
+        let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
+        let events = enc.next_events(&finish_chunk(0));
+        let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
+        assert_eq!(
+            kinds,
+            vec!["message_start", "message_delta", "message_stop"]
+        );
+    }
+
+    #[test]
+    fn sse_encoder_force_finish_after_content_emits_full_close() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 3);
+        let _ = enc.next_events(&delta_chunk("hi"));
+        let events = enc.force_finish();
+        let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
+        assert_eq!(
+            kinds,
+            vec!["content_block_stop", "message_delta", "message_stop"]
+        );
+        assert!(enc.is_finished());
+    }
+
+    #[test]
+    fn sse_encoder_force_finish_on_empty_stream_emits_message_start_then_close() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
+        let events = enc.force_finish();
+        let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
+        assert_eq!(
+            kinds,
+            vec!["message_start", "message_delta", "message_stop"]
+        );
+    }
+
+    #[test]
+    fn sse_event_renders_as_event_data_pair() {
+        let ev = AnthropicSseEvent {
+            event: "content_block_delta",
+            data: serde_json::json!({"x": 1}),
+        };
+        let s = ev.to_sse_string();
+        assert_eq!(s, "event: content_block_delta\ndata: {\"x\":1}\n\n");
     }
 }
