@@ -39,6 +39,11 @@ pub(crate) struct StoredMessageHistory {
     pub metadata: HashMap<String, Value>,
 }
 
+/// In-memory message history storage intended for tests and short-lived local runs.
+///
+/// This implementation keeps every stored history entry for the lifetime of the
+/// process. It has no eviction policy, no size limits, and no persistence, so
+/// sustained use can grow without bound and eventually OOM the process.
 #[derive(Debug, Default)]
 pub(crate) struct InMemoryMessageHistoryStorage {
     histories: RwLock<HashMap<String, StoredMessageHistory>>,

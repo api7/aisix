@@ -379,66 +379,78 @@ fn request_input_messages(request: &ResponsesApiRequest) -> Result<Vec<ChatMessa
             tool_calls: None,
             tool_call_id: None,
         }]),
-        ResponsesInput::Items(items) => items
-            .iter()
-            .map(request_input_item_to_chat_message)
-            .collect(),
+        ResponsesInput::Items(items) => items.iter().try_fold(vec![], |mut messages, item| {
+            if let Some(message) = request_input_item_to_chat_message(item)? {
+                messages.push(message);
+            }
+            Ok(messages)
+        }),
     }
 }
 
-fn request_input_item_to_chat_message(item: &ResponsesInputItem) -> Result<ChatMessage> {
+fn request_input_item_to_chat_message(item: &ResponsesInputItem) -> Result<Option<ChatMessage>> {
     match item {
-        ResponsesInputItem::Message { role, content } => Ok(ChatMessage {
-            role: role.clone(),
-            content: Some(request_content_to_message_content(content)?),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-        }),
-        ResponsesInputItem::FunctionCallOutput { call_id, output } => Ok(ChatMessage {
+        ResponsesInputItem::Message { role, content } => {
+            let Some(content) = request_content_to_message_content(content)? else {
+                return Ok(None);
+            };
+
+            Ok(Some(ChatMessage {
+                role: role.clone(),
+                content: Some(content),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }))
+        }
+        ResponsesInputItem::FunctionCallOutput { call_id, output } => Ok(Some(ChatMessage {
             role: "tool".into(),
             content: Some(MessageContent::Text(output.clone())),
             name: None,
             tool_calls: None,
             tool_call_id: Some(call_id.clone()),
-        }),
+        })),
     }
 }
 
-fn request_content_to_message_content(content: &ResponsesContent) -> Result<MessageContent> {
+fn request_content_to_message_content(
+    content: &ResponsesContent,
+) -> Result<Option<MessageContent>> {
     match content {
-        ResponsesContent::Text(text) => Ok(MessageContent::Text(text.clone())),
-        ResponsesContent::Parts(parts) => Ok(MessageContent::Parts(
-            parts
+        ResponsesContent::Text(text) => Ok(Some(MessageContent::Text(text.clone()))),
+        ResponsesContent::Parts(parts) => {
+            let parts = parts
                 .iter()
                 .map(request_content_part_to_content_part)
-                .collect::<Result<Vec<_>>>()?,
-        )),
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+
+            if parts.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(MessageContent::Parts(parts)))
+            }
+        }
     }
 }
 
-fn request_content_part_to_content_part(part: &ResponsesContentPart) -> Result<ContentPart> {
+fn request_content_part_to_content_part(
+    part: &ResponsesContentPart,
+) -> Result<Option<ContentPart>> {
     match part {
-        ResponsesContentPart::InputText { text } => Ok(ContentPart::Text { text: text.clone() }),
-        ResponsesContentPart::InputImage {
-            image_url,
-            file_id,
-            detail,
-        } => {
-            let Some(url) = image_url.as_ref() else {
-                return Err(GatewayError::Validation(format!(
-                    "responses session history cannot persist input_image file reference {}",
-                    file_id.as_deref().unwrap_or("<unknown>")
-                )));
-            };
-
-            Ok(ContentPart::ImageUrl {
-                image_url: crate::gateway::types::openai::ImageUrl {
-                    url: url.clone(),
-                    detail: detail.clone(),
-                },
-            })
+        ResponsesContentPart::InputText { text } => {
+            Ok(Some(ContentPart::Text { text: text.clone() }))
         }
+        ResponsesContentPart::InputImage {
+            image_url, detail, ..
+        } => Ok(image_url.as_ref().map(|url| ContentPart::ImageUrl {
+            image_url: crate::gateway::types::openai::ImageUrl {
+                url: url.clone(),
+                detail: detail.clone(),
+            },
+        })),
     }
 }
 
@@ -574,8 +586,8 @@ mod tests {
                 ChatMessage, MessageContent,
                 responses::{
                     ResponsesApiRequest, ResponsesApiResponse, ResponsesApiStreamEvent,
-                    ResponsesContent, ResponsesInput, ResponsesInputItem, ResponsesOutputContent,
-                    ResponsesOutputItem, ResponsesUsage,
+                    ResponsesContent, ResponsesContentPart, ResponsesInput, ResponsesInputItem,
+                    ResponsesOutputContent, ResponsesOutputItem, ResponsesUsage,
                 },
             },
         },
@@ -910,5 +922,23 @@ mod tests {
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[1].role, "tool");
         assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn request_input_messages_skip_non_persistable_input_image_file_references() {
+        let request = ResponsesApiRequest {
+            input: ResponsesInput::Items(vec![ResponsesInputItem::Message {
+                role: "user".into(),
+                content: ResponsesContent::Parts(vec![ResponsesContentPart::InputImage {
+                    image_url: None,
+                    file_id: Some("file_123".into()),
+                    detail: Some("high".into()),
+                }]),
+            }]),
+            ..text_request("ignored")
+        };
+
+        let messages = super::request_input_messages(&request).unwrap();
+        assert!(messages.is_empty());
     }
 }

@@ -170,6 +170,12 @@ impl FormatHandlerAdapter for ResponsesAdapter {
             message: error.to_string(),
         }))
     }
+
+    fn lifecycle_error_event(error: &Self::Error) -> Option<SseEvent> {
+        Some(serialize_stream_event(&ResponsesApiStreamEvent::Error {
+            message: error.to_string(),
+        }))
+    }
 }
 
 fn rewrite_response_ids(response: &mut ResponsesApiResponse, response_id: &str) {

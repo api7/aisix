@@ -143,6 +143,10 @@ pub(crate) trait FormatHandlerAdapter: Send + Sync + 'static {
         None
     }
 
+    fn lifecycle_error_event(_error: &Self::Error) -> Option<SseEvent> {
+        None
+    }
+
     fn end_of_stream_event(_saw_item: bool) -> Option<SseEvent> {
         None
     }
@@ -282,50 +286,6 @@ fn spawn_stream_usage_observer(request_ctx: RequestContext, usage_rx: oneshot::R
     });
 }
 
-fn spawn_stream_success_observer<A>(
-    state: AppState,
-    request_ctx: RequestContext,
-    usage_rx: oneshot::Receiver<Usage>,
-    lifecycle_state: A::LifecycleState,
-) where
-    A: FormatHandlerAdapter,
-{
-    tokio::spawn(async move {
-        let mut request_ctx = request_ctx;
-
-        match usage_rx.await {
-            Ok(usage) => {
-                if let Err(err) =
-                    hooks::rate_limit::post_check_streaming(&mut request_ctx, &usage).await
-                {
-                    error!("Rate limit post_check_streaming error: {}", err);
-                }
-                hooks::observability::record_streaming_usage(&mut request_ctx, &usage).await;
-
-                if let Err(err) = A::handle_stream_success(
-                    &state,
-                    &mut request_ctx,
-                    lifecycle_state,
-                    Some(&usage),
-                )
-                .await
-                {
-                    error!("Stream success lifecycle error: {}", err);
-                }
-            }
-            Err(err) => {
-                error!("Failed to receive streaming usage from gateway: {}", err);
-
-                if let Err(lifecycle_err) =
-                    A::handle_stream_success(&state, &mut request_ctx, lifecycle_state, None).await
-                {
-                    error!("Stream success lifecycle error: {}", lifecycle_err);
-                }
-            }
-        }
-    });
-}
-
 async fn finalize_stream_usage_observation(
     request_ctx: &mut RequestContext,
     usage_rx: &mut Option<oneshot::Receiver<Usage>>,
@@ -358,14 +318,15 @@ async fn finalize_stream_success<A>(
     span: &Span,
     output_message_properties: Vec<(String, String)>,
     lifecycle_state: &mut Option<A::LifecycleState>,
-) where
+) -> Result<(), A::Error>
+where
     A: FormatHandlerAdapter,
 {
     span.add_properties(|| output_message_properties);
 
     let Some(lifecycle_state) = lifecycle_state.take() else {
         finalize_stream_usage_observation(request_ctx, usage_rx, span).await;
-        return;
+        return Ok(());
     };
 
     if let Some(mut usage_rx) = usage_rx.take() {
@@ -378,37 +339,35 @@ async fn finalize_stream_success<A>(
                 hooks::observability::record_streaming_usage(request_ctx, &usage).await;
                 span.add_properties(|| usage_span_properties(&usage));
 
-                if let Err(err) =
+                A::handle_stream_success(state, request_ctx, lifecycle_state, Some(&usage)).await?;
+            }
+            Err(TryRecvError::Empty) => match usage_rx.await {
+                Ok(usage) => {
+                    if let Err(err) =
+                        hooks::rate_limit::post_check_streaming(request_ctx, &usage).await
+                    {
+                        error!("Rate limit post_check_streaming error: {}", err);
+                    }
+                    hooks::observability::record_streaming_usage(request_ctx, &usage).await;
+                    span.add_properties(|| usage_span_properties(&usage));
+
                     A::handle_stream_success(state, request_ctx, lifecycle_state, Some(&usage))
-                        .await
-                {
-                    error!("Stream success lifecycle error: {}", err);
+                        .await?;
                 }
-            }
-            Err(TryRecvError::Empty) => {
-                spawn_stream_success_observer::<A>(
-                    state.clone(),
-                    request_ctx.clone(),
-                    usage_rx,
-                    lifecycle_state,
-                );
-            }
+                Err(err) => {
+                    error!("Failed to receive streaming usage from gateway: {}", err);
+                    A::handle_stream_success(state, request_ctx, lifecycle_state, None).await?;
+                }
+            },
             Err(TryRecvError::Closed) => {
                 error!("Failed to receive streaming usage from gateway: channel closed");
-
-                if let Err(err) =
-                    A::handle_stream_success(state, request_ctx, lifecycle_state, None).await
-                {
-                    error!("Stream success lifecycle error: {}", err);
-                }
+                A::handle_stream_success(state, request_ctx, lifecycle_state, None).await?;
             }
         }
-        return;
+        return Ok(());
     }
 
-    if let Err(err) = A::handle_stream_success(state, request_ctx, lifecycle_state, None).await {
-        error!("Stream success lifecycle error: {}", err);
-    }
+    A::handle_stream_success(state, request_ctx, lifecycle_state, None).await
 }
 
 async fn handle_stream_response<A>(
@@ -535,7 +494,7 @@ where
                     }
                 }
                 None => {
-                    finalize_stream_success::<A>(
+                    match finalize_stream_success::<A>(
                         &state,
                         &mut request_ctx,
                         &mut usage_rx,
@@ -543,7 +502,35 @@ where
                         A::output_message_span_properties(&output_collector),
                         &mut lifecycle_state,
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(err) => {
+                            error!("Stream success lifecycle error: {}", err);
+                            span.add_property(|| ("error.type", "stream_success_lifecycle_error"));
+
+                            if let Some(event) = A::lifecycle_error_event(&err) {
+                                return Some((
+                                    Ok(event),
+                                    (
+                                        state,
+                                        stream,
+                                        span,
+                                        request_ctx,
+                                        true,
+                                        saw_item,
+                                        usage_rx,
+                                        output_collector,
+                                        first_output_arrived,
+                                        lifecycle_state,
+                                    ),
+                                ));
+                            }
+
+                            drop(span);
+                            return None;
+                        }
+                    }
 
                     if let Some(event) = A::end_of_stream_event(saw_item) {
                         Some((
