@@ -47,7 +47,7 @@ Surfaces and capabilities currently in main:
 
 - **Observability** — Prometheus `/metrics`; per-request structured access log; per-env `ObservabilityExporter` (`kind=otlp_http`) fan-out emitting one OTLP/HTTP-JSON GenAI span per chat completion to each enabled exporter (Langfuse, Honeycomb, Grafana Cloud, any OTLP receiver). Platform-level OTLP tracing of internal request-pipeline spans is scaffold ([#49]).
 
-- **Telemetry events** — DP-side `UsageEvent` per request with cache_status, reasoning, provider-id detail, guardrail bypass reason. Posted to cp-api in managed mode; consumed by `/admin/v1/spend` in standalone.
+- **Telemetry events** — DP-side `UsageEvent` per request with cache_status, reasoning, provider-id detail, guardrail bypass reason, and `inbound_protocol` (`"openai"` / `"anthropic"`) so dashboard Logs disambiguate the SDK from the upstream `provider` label. Emitted by `/v1/chat/completions` and `/v1/messages` (passthrough-streaming and other endpoints land in a follow-up). Posted to cp-api in managed mode; consumed by `/admin/v1/spend` in standalone.
 
 - **Managed-mode bootstrap** — cert-bundle path (no `/dp/register` round-trip): cp-api signs the mTLS leaf at mint time and ships PEMs as env vars at `docker run`. Snapshot persisted to `config_cache.json` so the proxy survives CP outages and restarts (offline resilience per PRD-09 §9.7.2).
 

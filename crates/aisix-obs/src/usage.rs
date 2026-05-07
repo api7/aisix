@@ -165,6 +165,21 @@ pub struct UsageEvent {
     /// for the full pricing-derivation story.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cache_hit_saved_output_tokens: u32,
+
+    /// Which client-facing protocol the request used:
+    ///
+    /// - `"openai"` — `/v1/chat/completions` / `/v1/responses` /
+    ///   `/v1/embeddings` / `/v1/audio/*` / `/v1/images/*` / `/v1/rerank`
+    ///   (every OpenAI-shape endpoint family)
+    /// - `"anthropic"` — `/v1/messages` (Anthropic SDK)
+    ///
+    /// Disambiguates the `provider` label which today reflects the
+    /// **upstream** provider only — an Anthropic-SDK call routed at a
+    /// non-Anthropic Model used to log `provider=openai` with no
+    /// indication the inbound protocol was Anthropic. Empty string on
+    /// the wire = legacy DP image; cp-api stores empty as NULL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub inbound_protocol: String,
 }
 
 #[inline]

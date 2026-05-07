@@ -759,6 +759,11 @@ fn emit_usage_event(
         cache_status: extras.cache_status,
         cache_hit_saved_input_tokens: extras.cache_hit_saved_input_tokens,
         cache_hit_saved_output_tokens: extras.cache_hit_saved_output_tokens,
+        // chat.rs is the OpenAI-shape /v1/chat/completions handler.
+        // /v1/responses / /v1/embeddings / /v1/audio* / /v1/images* /
+        // /v1/rerank don't emit UsageEvents today; when they do they
+        // also pass `"openai"` here.
+        inbound_protocol: "openai".to_string(),
     };
     state.usage_sink.try_emit(event.clone());
     // Per-env OTLP/HTTP fan-out. The snapshot's exporter table is

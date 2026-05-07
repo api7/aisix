@@ -27,7 +27,7 @@
 //! side can handle them consistently regardless of which endpoint was used.
 
 use aisix_core::models::Provider;
-use aisix_obs::{AccessLog, RequestOutcome};
+use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -60,26 +60,47 @@ pub async fn messages(
         .unwrap_or("")
         .to_string();
 
+    let snapshot = state.snapshot.load();
+    let model_id = snapshot
+        .models
+        .get_by_name(&model_name)
+        .map(|e| e.id.clone())
+        .unwrap_or_default();
+    drop(snapshot);
+
     match dispatch(&state, &auth, &mut body, &request_id).await {
-        Ok((resp, provider)) => {
+        Ok(DispatchOutcome {
+            response,
+            provider_label,
+            metrics,
+        }) => {
             let elapsed = started.elapsed();
-            let status = resp.status().as_u16();
+            let status = response.status().as_u16();
             emit_access_log(
                 &model_name,
-                &provider,
+                &provider_label,
                 &api_key_id,
                 status,
                 elapsed,
                 &request_id,
             );
             state.metrics.record_request(
-                &provider,
+                &provider_label,
                 &model_name,
                 status,
                 RequestOutcome::from_status(status),
                 elapsed,
             );
-            resp
+            emit_anthropic_usage_event(
+                &state,
+                &request_id,
+                &model_id,
+                &api_key_id,
+                status,
+                elapsed,
+                metrics,
+            );
+            response
         }
         Err(err) => {
             let status = err.status().as_u16();
@@ -99,6 +120,19 @@ pub async fn messages(
                 RequestOutcome::from_status(status),
                 elapsed,
             );
+            // Emit a token-less UsageEvent so the dashboard's Logs tab
+            // surfaces the failed Anthropic-SDK request alongside its
+            // openai-shape siblings. status_code carries the failure
+            // class; tokens stay zero.
+            emit_anthropic_usage_event(
+                &state,
+                &request_id,
+                &model_id,
+                &api_key_id,
+                status,
+                elapsed,
+                AnthropicUsageMetrics::default(),
+            );
             err.into_response()
         }
     }
@@ -109,7 +143,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     body: &mut Value,
     request_id: &str,
-) -> Result<(Response, String), ProxyError> {
+) -> Result<DispatchOutcome, ProxyError> {
     let snapshot = state.snapshot.load();
 
     // Extract and resolve model.
@@ -239,7 +273,18 @@ async fn dispatch(
                 .insert(HeaderName::from_static("x-aisix-request-id"), hv);
         }
 
-        Ok((response, provider_label))
+        // Streaming passthrough: the upstream byte stream isn't
+        // parsed in-flight, so token counts aren't available here.
+        // Emit a UsageEvent without token detail; the
+        // `inbound_protocol="anthropic"` label still lets dashboard
+        // Logs surface the request alongside non-streaming siblings.
+        // Real token counts on this path land with the parsing
+        // wrapper in a follow-up.
+        Ok(DispatchOutcome {
+            response,
+            provider_label,
+            metrics: AnthropicUsageMetrics::default(),
+        })
     } else {
         // Non-streaming: deserialise and re-serialise as JSON.
         let json_body: Value = upstream_resp
@@ -247,6 +292,8 @@ async fn dispatch(
             .await
             .map_err(|e| aisix_gateway::BridgeError::UpstreamDecode(e.to_string()))
             .map_err(ProxyError::Bridge)?;
+
+        let metrics = anthropic_metrics_from_response_json(&json_body);
 
         // Restore the gateway-facing model name so callers see what they asked for.
         let mut json_body = json_body;
@@ -257,7 +304,52 @@ async fn dispatch(
             }
         }
 
-        Ok((Json(json_body).into_response(), provider_label))
+        Ok(DispatchOutcome {
+            response: Json(json_body).into_response(),
+            provider_label,
+            metrics,
+        })
+    }
+}
+
+/// Pull `usage.input_tokens` / `output_tokens` / `cache_creation_input_tokens`
+/// / `cache_read_input_tokens`, plus `id`, `model`, `stop_reason` from
+/// an Anthropic non-streaming response body. Best-effort: missing
+/// fields land as zero / empty string.
+fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
+    let usage = body.get("usage");
+    AnthropicUsageMetrics {
+        prompt_tokens: usage
+            .and_then(|u| u.get("input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
+        completion_tokens: usage
+            .and_then(|u| u.get("output_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
+        cache_creation_tokens: usage
+            .and_then(|u| u.get("cache_creation_input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
+        cache_read_tokens: usage
+            .and_then(|u| u.get("cache_read_input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
+        provider_request_id: body
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        provider_model_version: body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        finish_reason: body
+            .get("stop_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
     }
 }
 
@@ -279,7 +371,7 @@ async fn cross_provider_dispatch(
     model: &aisix_core::Model,
     model_name: &str,
     request_id: &str,
-) -> Result<(Response, String), ProxyError> {
+) -> Result<DispatchOutcome, ProxyError> {
     use aisix_gateway::{Bridge, BridgeContext};
     use aisix_provider_anthropic::{
         chat_response_into_anthropic_json, parse_inbound_request, AnthropicSseEncoder,
@@ -334,15 +426,38 @@ async fn cross_provider_dispatch(
                 .headers_mut()
                 .insert(HeaderName::from_static("x-aisix-request-id"), hv);
         }
-        return Ok((response, provider_label));
+        // Streaming cross-provider: token usage is only known once
+        // the bridge stream finishes. The encoder pumps chunks but
+        // we don't keep a handle into it; emitting tokens for this
+        // path requires plumbing a sink through `build_anthropic_sse_stream`.
+        // Punted to follow-up: token-less event so dashboard Logs
+        // sees the request, finish_reason / token counts come later.
+        return Ok(DispatchOutcome {
+            response,
+            provider_label,
+            metrics: AnthropicUsageMetrics::default(),
+        });
     }
 
     // Non-streaming.
     let resp = bridge.chat(&chat, &ctx).await.map_err(ProxyError::Bridge)?;
     state.health.record_success(model_name);
 
+    let metrics = AnthropicUsageMetrics {
+        prompt_tokens: resp.usage.prompt_tokens,
+        completion_tokens: resp.usage.completion_tokens,
+        cache_creation_tokens: resp.usage.cache_creation_tokens,
+        cache_read_tokens: resp.usage.cache_read_tokens,
+        provider_request_id: resp.id.clone(),
+        provider_model_version: resp.model.clone(),
+        finish_reason: format!("{:?}", resp.finish_reason).to_lowercase(),
+    };
     let json = chat_response_into_anthropic_json(&resp, model_name);
-    Ok((Json(json).into_response(), provider_label))
+    Ok(DispatchOutcome {
+        response: Json(json).into_response(),
+        provider_label,
+        metrics,
+    })
 }
 
 /// Pump `ChatChunk`s through an `AnthropicSseEncoder` and emit each
@@ -387,6 +502,73 @@ fn build_anthropic_sse_stream(
         }
     };
     axum::body::Body::from_stream(stream)
+}
+
+/// What `dispatch` produces alongside the wire response: enough
+/// metadata for the outer wrapper to emit a UsageEvent with the
+/// proper token counts and provider-detail fields.
+struct DispatchOutcome {
+    response: Response,
+    provider_label: String,
+    metrics: AnthropicUsageMetrics,
+}
+
+/// Bundle of optional fields a UsageEvent emit-call wants when the
+/// upstream actually returned tokens. All-defaults when called from
+/// the error path or before token info is available.
+#[derive(Default)]
+struct AnthropicUsageMetrics {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cache_creation_tokens: u32,
+    cache_read_tokens: u32,
+    provider_request_id: String,
+    provider_model_version: String,
+    finish_reason: String,
+}
+
+/// Emit a UsageEvent for a `/v1/messages` request. Mirrors
+/// `chat::emit_usage_event` but tagged `inbound_protocol = "anthropic"`
+/// so the dashboard's Logs view can disambiguate the inbound SDK
+/// from the upstream provider label.
+///
+/// Called from `messages()` once dispatch has produced a Response and
+/// (for non-streaming) we know the token counts. Streaming passthrough
+/// to an Anthropic upstream skips the call — the upstream byte stream
+/// isn't parsed in-flight, so token counts aren't available; that
+/// path's UsageEvent emission is tracked as follow-up work.
+fn emit_anthropic_usage_event(
+    state: &ProxyState,
+    request_id: &str,
+    model_id: &str,
+    api_key_id: &str,
+    status_code: u16,
+    elapsed: Duration,
+    metrics: AnthropicUsageMetrics,
+) {
+    let event = UsageEvent {
+        request_id: request_id.to_string(),
+        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        model_id: model_id.to_string(),
+        api_key_id: api_key_id.to_string(),
+        prompt_tokens: metrics.prompt_tokens,
+        completion_tokens: metrics.completion_tokens,
+        cache_creation_tokens: metrics.cache_creation_tokens,
+        cache_read_tokens: metrics.cache_read_tokens,
+        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        status_code,
+        provider_request_id: metrics.provider_request_id,
+        provider_model_version: metrics.provider_model_version,
+        finish_reason: metrics.finish_reason,
+        inbound_protocol: "anthropic".to_string(),
+        ..Default::default()
+    };
+    state.usage_sink.try_emit(event.clone());
+    let snap = state.snapshot.load();
+    let exporters = snap.observability_exporters.entries();
+    state
+        .otlp_fan_out
+        .fan_out(&event, exporters.iter().map(|e| &e.value));
 }
 
 fn emit_access_log(
