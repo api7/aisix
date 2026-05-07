@@ -68,11 +68,18 @@ describe("smoke: admin write → proxy read", () => {
       allowed_models: ["smoke-gpt"],
     });
 
-    await waitConfigPropagation();
-
     const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
-    const { status, body } = await proxy.listModels();
+    // Poll /v1/models until the freshly-written model is visible — the
+    // supervisor's watch pipeline normally catches up within ~50ms but
+    // CI runners occasionally lag behind a fixed sleep.
+    await waitConfigPropagation(async () => {
+      const res = await proxy.listModels();
+      if (res.status !== 200) return false;
+      const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
+      return data.some((m) => m.id === "smoke-gpt");
+    });
 
+    const { status, body } = await proxy.listModels();
     expect(status).toBe(200);
     expect(body).toMatchObject({
       object: "list",
@@ -87,6 +94,20 @@ describe("smoke: admin write → proxy read", () => {
     }
 
     const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    // The Model + ProviderKey writes from the previous test propagate
+    // independently. /v1/models confirms the Model row but not the
+    // referenced ProviderKey — poll the chat path itself until the
+    // dispatcher stops returning `unknown provider_key_id`, the only
+    // signal that captures the snapshot's complete state.
+    await waitConfigPropagation(async () => {
+      const probe = await proxy.chat({
+        model: "smoke-gpt",
+        messages: [{ role: "user", content: "ping" }],
+      });
+      if (probe.status === 200) return true;
+      const msg = JSON.stringify(probe.body);
+      return !msg.includes("unknown provider_key_id");
+    });
     const { status, body } = await proxy.chat({
       model: "smoke-gpt",
       messages: [{ role: "user", content: "hello" }],

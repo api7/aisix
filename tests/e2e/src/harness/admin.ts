@@ -59,7 +59,31 @@ export class AdminClient {
   }
 }
 
-/** Convenience: wait the spec-mandated 500ms for snapshot propagation. */
-export function waitConfigPropagation(): Promise<void> {
-  return new Promise((r) => setTimeout(r, 500));
+/**
+ * Wait for the gateway's in-memory snapshot to catch up with admin
+ * writes. The spec mandates a ≤500ms propagation budget, but CI
+ * runners with slower etcd/disk can occasionally exceed that — when
+ * one of those runners only partially propagates a multi-resource
+ * write batch, downstream tests see a snapshot with the Model but not
+ * its referenced ProviderKey, and dispatch fails with `unknown
+ * provider_key_id`.
+ *
+ * `condition` lets the caller provide a positive readiness probe; if
+ * omitted, the helper falls back to the historical fixed-time wait.
+ * The poll interval is 50ms and the deadline 5s — plenty of headroom
+ * for any healthy runner without masking a genuine bug.
+ */
+export async function waitConfigPropagation(
+  condition?: () => Promise<boolean>,
+): Promise<void> {
+  if (!condition) {
+    await new Promise((r) => setTimeout(r, 500));
+    return;
+  }
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (await condition()) return;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new Error("waitConfigPropagation: condition not met within 5s");
 }
