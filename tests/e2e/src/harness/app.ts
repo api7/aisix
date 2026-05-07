@@ -68,7 +68,6 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
         otlp: { enabled: false, endpoint: "http://127.0.0.1:4317" },
       },
       tracing: { otlp: { enabled: false, endpoint: "http://127.0.0.1:4317", sample_ratio: 1 } },
-      langfuse: { enabled: false },
     },
     cache: { backend: "memory" },
     ...(overrides.extra ?? {}),
