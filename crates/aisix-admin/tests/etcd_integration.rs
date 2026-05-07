@@ -154,9 +154,10 @@ async fn models_round_trip_through_real_etcd() {
         state,
         "/admin/v1/models",
         json!({
-            "name": "it-gpt4",
-            "model": "openai/gpt-4o",
-            "provider_config": {"api_key": "sk-it"}
+            "display_name": "it-gpt4",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111"
         }),
     )
     .await;
@@ -282,9 +283,10 @@ async fn loader_picks_up_every_admin_write() {
         (
             "/admin/v1/models",
             json!({
-                "name": "loader-gpt4",
-                "model": "openai/gpt-4o",
-                "provider_config": {"api_key": "sk-x"}
+                "display_name": "loader-gpt4",
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "11111111-1111-1111-1111-111111111111"
             }),
         ),
         (

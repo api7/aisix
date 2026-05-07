@@ -22,6 +22,12 @@ export class AdminClient {
     return this.json("POST", "/admin/v1/apikeys", key);
   }
 
+  async createProviderKey(
+    pk: Record<string, unknown>,
+  ): Promise<{ id: string; value: Record<string, unknown> }> {
+    return this.json("POST", "/admin/v1/provider_keys", pk);
+  }
+
   async listModels(): Promise<Array<Record<string, unknown>>> {
     const res = await this.json<{ items?: Array<{ value: Record<string, unknown> }> }>(
       "GET",

@@ -48,12 +48,20 @@ describe("smoke: admin write → proxy read", () => {
       return;
     }
 
-    await admin.createModel({
-      name: "smoke-gpt",
-      model: "openai/gpt-4o-mini",
+    // Phase B Model shape: ProviderKey carries the upstream secret +
+    // optional api_base override; Model references it by id.
+    const pk = await admin.createProviderKey({
+      display_name: "smoke-openai",
+      secret: "sk-mock",
       // The OpenAI bridge appends `/chat/completions`, so the api_base
       // already needs the `/v1` segment to land on `/v1/chat/completions`.
-      provider_config: { api_key: "sk-mock", api_base: `${upstream.baseUrl}/v1` },
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await admin.createModel({
+      display_name: "smoke-gpt",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
     });
     await admin.createApiKey({
       key_hash: CALLER_KEY_HASH,
