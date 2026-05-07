@@ -51,7 +51,7 @@ API surface see [`api-proxy.md`](./api-proxy.md) and
                 │       │  • HealthTracker       │             │
                 │       │  • Cache               │             │
                 │       │  • GuardrailChain      │             │
-                │       │  • LangfuseSender?     │             │
+                │       │  • OtlpHttpFanOut      │             │
                 │       └────────────────────────┘             │
                 │           ▲                                  │
                 │           │                                  │
@@ -189,8 +189,8 @@ For streaming requests:
 3. Each chunk is rendered via the `OpenAiChunkRenderer` so the wire
    format is byte-identical to OpenAI's reference client.
 4. End-of-stream telemetry (token totals, first-token latency) is
-   computed from accumulated deltas and emitted to metrics + access
-   log + (optionally) Langfuse.
+   computed from accumulated deltas and emitted to metrics, the
+   access log, and the per-env OTLP/HTTP fan-out exporter.
 
 If the client disconnects mid-stream, post-processing still runs
 inside `tokio::spawn` so usage is not lost.
@@ -215,7 +215,7 @@ trace      → DefaultBodyLimit(10 MB) → Auth (ApiKey)
                   • Retry-After (rate-limit only)
                   • x-aisix-call-id (request UUID)
                   • x-aisix-cache: hit|miss
-              → emit access log + metrics + langfuse event
+              → emit access log + metrics + per-env OTLP/HTTP fan-out
 ```
 
 The two-phase rate limit is intentional. RPM is committed *before*
@@ -278,10 +278,12 @@ durability across replicas.
 - **OTLP** — opt-in tracer/meter/log providers exported to an OTLP
   collector. Pin set in `Cargo.toml` to avoid the well-known
   ecosystem version-skew traps.
-- **Langfuse** — opt-in custom HTTP exporter that batches generation
-  events (50 / s flush window) and POSTs them to
-  `{host}/api/public/ingestion`. Designed to never block the request
-  hot path; full queues drop the event with a debug log.
+- **Per-env OTLP/HTTP fan-out** — every enabled `ObservabilityExporter`
+  (`kind=otlp_http`) row in the AisixSnapshot receives one
+  GenAI-conventions span per chat completion. Fire-and-forget tokio
+  task per `(event, exporter)` pair so the request hot path never
+  blocks on a slow customer receiver. See
+  `aisix-obs::OtlpHttpFanOut`.
 
 Five canonical metrics:
 
@@ -301,7 +303,7 @@ Five canonical metrics:
 4. Connect to etcd (5 s × 5 retry).
 5. Load initial AisixSnapshot.
 6. Spawn watch Supervisor.
-7. Build Hub + Limiter + Metrics + Cache + (optional Langfuse).
+7. Build Hub + Limiter + Metrics + Cache + OtlpHttpFanOut.
 8. Build proxy router; build admin router (sharing snapshot + metrics).
 9. Bind both TCP listeners; tokio::join! the two services with a
    common graceful-shutdown signal.
@@ -340,7 +342,7 @@ See [`testing.md`](./testing.md) for the full test layout.
 | `aisix-provider-{openai,anthropic,gemini,deepseek}` | Per-provider Bridge impls. |
 | `aisix-proxy` | `/v1/*` handlers, middleware, ProxyState, request rendering. |
 | `aisix-admin` | Admin CRUD, playground, OpenAPI Scalar. |
-| `aisix-obs` | `tracing` init, metrics, access log, OTLP, Langfuse. |
+| `aisix-obs` | `tracing` init, metrics, access log, OTLP scaffold, per-env OTLP/HTTP fan-out. |
 | `aisix-ratelimit` | Fixed-window limiter + concurrency semaphore. |
 | `aisix-cache` | `Cache` trait, MemoryCache, RedisCache. |
 | `aisix-guardrails` | Pre/during/post-call content policy hooks. |

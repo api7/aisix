@@ -54,11 +54,6 @@ observability:
       enabled: false
       endpoint: "http://127.0.0.1:4317"
       sample_ratio: 1.0
-  langfuse:
-    enabled: false
-    # public_key_env: "LANGFUSE_PUBLIC_KEY"
-    # secret_key_env: "LANGFUSE_SECRET_KEY"
-    # host: "https://cloud.langfuse.com"
 
 # Managed-mode switch. Uncomment when running as an aisix.cloud
 # tenant: the admin API and Playground will NOT be bound — all

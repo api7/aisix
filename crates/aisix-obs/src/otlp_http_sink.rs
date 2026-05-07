@@ -22,8 +22,7 @@
 //!
 //! - **No batching** — one HTTP POST per request per exporter. Phase 2
 //!   will move to a worker-task model with a bounded mpsc + 1s flush
-//!   interval, mirroring the existing `langfuse::LangfuseSender`
-//!   architecture once the patterns are exercised by real load.
+//!   interval once the patterns are exercised by real load.
 //! - **No retry / backoff** — best-effort fire-and-forget. If the
 //!   user's OTLP receiver is unreachable the span is lost. Phase 2
 //!   adds a tiny exponential-backoff wrapper.

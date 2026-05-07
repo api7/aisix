@@ -47,7 +47,7 @@ Surfaces and capabilities currently in main:
 
 - **Rate limiting** — fixed-window RPM/RPD + post-deduct TPM/TPD + concurrency semaphore. Two-phase commit so token cost is known before the counter advances. Per-ApiKey scope today.
 
-- **Observability** — Prometheus `/metrics`, OTLP traces/metrics/logs export, per-request structured access log, Langfuse sender, per-env OTLP/HTTP fan-out exporter (managed-mode supports multi-vendor sinks driven by etcd config).
+- **Observability** — Prometheus `/metrics`; per-request structured access log; per-env `ObservabilityExporter` (`kind=otlp_http`) fan-out emitting one OTLP/HTTP-JSON GenAI span per chat completion to each enabled exporter (Langfuse, Honeycomb, Grafana Cloud, any OTLP receiver). Platform-level OTLP tracing of internal request-pipeline spans is scaffold ([#49]).
 
 - **Telemetry events** — DP-side `UsageEvent` per request with cache_status, reasoning, provider-id detail, guardrail bypass reason. Posted to cp-api in managed mode; consumed by `/admin/v1/spend` in standalone.
 

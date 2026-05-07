@@ -58,8 +58,6 @@ observability:
     otlp:
       enabled: false
       sample_ratio: 1.0
-  langfuse:
-    enabled: false
 
 managed:
   enabled: true

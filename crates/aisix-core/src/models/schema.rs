@@ -335,9 +335,8 @@ fn observability_exporter_schema() -> Value {
     // MVP: single discriminator value `otlp_http` whose fields land
     // flat at the top level (matches the Guardrail wire shape — see
     // `models/observability_exporter.rs` doc comment). Phase 2 adds
-    // `helicone` / `langfuse` / `datadog_logs` / `s3_ndjson` as
-    // additional discriminator values with their own `if`/`then`
-    // branches below.
+    // `helicone` / `datadog_logs` / `s3_ndjson` as additional
+    // discriminator values with their own `if`/`then` branches below.
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",

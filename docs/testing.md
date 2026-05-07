@@ -39,7 +39,7 @@ locally with:
 cargo test --workspace                          # everything
 cargo test --workspace --all-features           # incl. redis-feature paths
 cargo test -p aisix-cache                       # one crate
-cargo test -p aisix-obs langfuse::tests         # one module
+cargo test -p aisix-obs otlp_http_sink::tests   # one module
 ```
 
 Coverage:
@@ -83,9 +83,8 @@ CI exposes the env vars these tests need:
 |---|---|---|
 | `redis_integration` | `redis:7-alpine` | `CACHE_TEST_REDIS_URL=redis://127.0.0.1:6379` |
 
-Future suites that need etcd, an OTLP collector, or a Langfuse mock
-will follow the same pattern: a service container in CI, a no-op
-guard for local dev.
+Future suites that need etcd or an OTLP collector will follow the
+same pattern: a service container in CI, a no-op guard for local dev.
 
 ## 4. Vitest E2E harness
 

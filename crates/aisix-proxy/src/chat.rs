@@ -19,7 +19,7 @@
 use aisix_cache::CacheKey;
 use aisix_gateway::{BridgeContext, BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
-use aisix_obs::{AccessLog, LangfuseEvent, Metrics, RequestOutcome, UsageEvent};
+use aisix_obs::{AccessLog, Metrics, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -110,21 +110,6 @@ pub async fn chat_completions(
                 success.cost_usd,
                 /* guardrail_blocked */ false,
             );
-            if let Some(lf) = state.langfuse.as_ref() {
-                lf.emit(LangfuseEvent {
-                    trace_id: request_id.clone(),
-                    model: model_name.clone(),
-                    provider: success.provider.clone(),
-                    input: None,
-                    output: None,
-                    prompt_tokens: success.prompt_tokens,
-                    completion_tokens: success.completion_tokens,
-                    total_tokens: success.total_tokens,
-                    status_code: status,
-                    latency: elapsed,
-                    api_key_id: Some(api_key_id.clone()),
-                });
-            }
             // Inject x-ratelimit-* headers so OpenAI SDK clients see the
             // current window state. We peek *after* the commit so
             // remaining-requests reflects the post-dispatch tally.
@@ -181,21 +166,6 @@ pub async fn chat_completions(
                 /* cost_usd */ 0.0,
                 guardrail_blocked,
             );
-            if let Some(lf) = state.langfuse.as_ref() {
-                lf.emit(LangfuseEvent {
-                    trace_id: request_id.clone(),
-                    model: model_name.clone(),
-                    provider: "unknown".to_string(),
-                    input: None,
-                    output: None,
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                    total_tokens: None,
-                    status_code: status,
-                    latency: elapsed,
-                    api_key_id: Some(api_key_id.clone()),
-                });
-            }
             err.into_response()
         }
     }

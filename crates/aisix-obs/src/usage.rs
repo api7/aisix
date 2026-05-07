@@ -20,8 +20,8 @@
 //!   mTLS reqwest client, and graceful-shutdown wiring naturally live
 //!   alongside `register::register_and_persist` and `heartbeat::spawn`.
 //! - This module sits in `aisix-obs` (proxy already depends on it for
-//!   metrics + access_log + langfuse), exposes the data type and the
-//!   sink wrapper, and lets server-side wire up the consumer.
+//!   metrics + access_log + otlp_http_sink), exposes the data type and
+//!   the sink wrapper, and lets server-side wire up the consumer.
 //!
 //! See prd-09a §9A.7B Phase 1 for the upstream protocol; the DP-side
 //! batch contract (5s interval / 100-event ceiling) lives in the worker

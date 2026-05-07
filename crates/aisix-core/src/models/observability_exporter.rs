@@ -34,9 +34,9 @@ use serde::{Deserialize, Serialize};
 use crate::resource::Resource;
 
 /// Discriminated union of exporter back-ends. MVP ships only
-/// `otlp_http`; Helicone / Langfuse-native / Datadog / S3 land in
-/// follow-ups, each as a new variant whose serde tag matches the
-/// wire-side `kind` discriminator.
+/// `otlp_http`; Helicone / Datadog / S3 land in follow-ups, each as a
+/// new variant whose serde tag matches the wire-side `kind`
+/// discriminator.
 ///
 /// `tag = "kind"` puts the variant tag inline with the inner struct's
 /// fields — same shape as `GuardrailKind` so the kine wire stays

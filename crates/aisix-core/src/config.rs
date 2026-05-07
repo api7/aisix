@@ -382,7 +382,6 @@ pub struct ObservabilityConfig {
     pub access_log: bool,
     pub metrics: MetricsConfig,
     pub tracing: TracingConfig,
-    pub langfuse: LangfuseConfig,
 }
 
 impl ObservabilityConfig {
@@ -449,15 +448,6 @@ impl Default for OtlpTracingConfig {
             sample_ratio: 1.0,
         }
     }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct LangfuseConfig {
-    pub enabled: bool,
-    pub host: Option<String>,
-    pub public_key_env: Option<String>,
-    pub secret_key_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
