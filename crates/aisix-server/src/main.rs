@@ -151,9 +151,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 .clone()
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "managed.cp_base_url required when cert bundle is provided",
-                    )
+                    anyhow::anyhow!("managed.cp_base_url required when cert bundle is provided",)
                 })?;
             let cp_etcd = cfg
                 .managed

@@ -488,7 +488,7 @@ mod tests {
             mtls_dir: mtls_dir.to_string_lossy().into_owned(),
             dp_id_file: dp_id_file.to_string_lossy().into_owned(),
             snapshot_cache_path: String::new(),
-        ..ManagedConfig::default()
+            ..ManagedConfig::default()
         };
 
         let out = register_and_persist(&cfg).await.expect("register");
@@ -584,7 +584,7 @@ mod tests {
             mtls_dir: dir.path().join("mtls").to_string_lossy().into_owned(),
             dp_id_file: dir.path().join("dp_id").to_string_lossy().into_owned(),
             snapshot_cache_path: String::new(),
-        ..ManagedConfig::default()
+            ..ManagedConfig::default()
         };
         register_and_persist(&cfg).await.expect("register");
     }
@@ -614,7 +614,7 @@ mod tests {
             mtls_dir: dir.path().join("mtls").to_string_lossy().into_owned(),
             dp_id_file: dir.path().join("dp_id").to_string_lossy().into_owned(),
             snapshot_cache_path: String::new(),
-        ..ManagedConfig::default()
+            ..ManagedConfig::default()
         };
         register_and_persist(&cfg).await.expect("register");
 
@@ -653,7 +653,7 @@ mod tests {
             mtls_dir: dir.path().join("mtls").to_string_lossy().into_owned(),
             dp_id_file: dir.path().join("dp_id").to_string_lossy().into_owned(),
             snapshot_cache_path: String::new(),
-        ..ManagedConfig::default()
+            ..ManagedConfig::default()
         };
         let err = register_and_persist(&cfg).await.unwrap_err();
         let s = format!("{err:#}");
@@ -686,7 +686,7 @@ mod tests {
             mtls_dir: dir.path().join("mtls").to_string_lossy().into_owned(),
             dp_id_file: dir.path().join("dp_id").to_string_lossy().into_owned(),
             snapshot_cache_path: String::new(),
-        ..ManagedConfig::default()
+            ..ManagedConfig::default()
         };
         let err = register_and_persist(&cfg).await.unwrap_err();
         let s = format!("{err:#}");

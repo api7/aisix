@@ -69,7 +69,12 @@ pub struct Provisioned {
 /// `mtls_dir` is safe; the atomic-write helper truncates+rewrites
 /// the targets.
 pub async fn provision(cfg: &ManagedConfig) -> anyhow::Result<Provisioned> {
-    let cert_pem = load_pem("cert", cfg.cp_cert_pem.as_deref(), cfg.cp_cert_file.as_deref()).await?;
+    let cert_pem = load_pem(
+        "cert",
+        cfg.cp_cert_pem.as_deref(),
+        cfg.cp_cert_file.as_deref(),
+    )
+    .await?;
     let key_pem = load_pem("key", cfg.cp_key_pem.as_deref(), cfg.cp_key_file.as_deref()).await?;
     let ca_pem = load_pem("ca", cfg.cp_ca_pem.as_deref(), cfg.cp_ca_file.as_deref()).await?;
 
@@ -143,10 +148,9 @@ async fn load_pem(
 ///   x-aisix://env/<env_id>
 ///   x-aisix://dp/<dp_id>
 fn parse_san_uris(pem: &str) -> anyhow::Result<(String, String)> {
-    let (_, p) = parse_x509_pem(pem.as_bytes())
-        .map_err(|e| anyhow!("decode PEM: {e:?}"))?;
-    let (_, cert) = X509Certificate::from_der(&p.contents)
-        .map_err(|e| anyhow!("parse X.509: {e:?}"))?;
+    let (_, p) = parse_x509_pem(pem.as_bytes()).map_err(|e| anyhow!("decode PEM: {e:?}"))?;
+    let (_, cert) =
+        X509Certificate::from_der(&p.contents).map_err(|e| anyhow!("parse X.509: {e:?}"))?;
     let san = cert
         .subject_alternative_name()
         .map_err(|e| anyhow!("read SAN ext: {e:?}"))?
