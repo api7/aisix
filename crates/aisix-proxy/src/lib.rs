@@ -104,7 +104,7 @@ mod tests {
     use futures::StreamExt;
     use std::sync::Arc;
     use tower::ServiceExt;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn cfg() -> ProxyConfig {
@@ -1494,5 +1494,284 @@ data: [DONE]\n\n";
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "billing_error");
         assert_eq!(v["error"]["code"], "budget_exceeded");
+    }
+
+    // ─── Cross-protocol × upstream matrix ─────────────────────────
+    //
+    // Closes the gap noted in earlier review: the per-bridge wiremock
+    // tests prove each Bridge translates ChatFormat ↔ its wire shape,
+    // and the proxy lib tests above prove `/v1/chat/completions` end-
+    // to-end against an OpenAi upstream — but the *integration* of an
+    // OpenAI-protocol inbound request hitting an Anthropic / Gemini /
+    // DeepSeek upstream had zero coverage. These tests pin the full
+    // path: client body parser → Hub.get(provider) → Bridge.chat[_stream]
+    // → upstream → Bridge response decoder → renderer → wire bytes.
+
+    fn anthropic_model_entry(name: &str, api_base: &str) -> ResourceEntry<Model> {
+        let cfg = format!(
+            r#"{{
+                "name": "{name}",
+                "model": "anthropic/claude-3-5-haiku-20241022",
+                "provider_config": {{"api_key": "sk-ant-test", "api_base": "{api_base}"}}
+            }}"#
+        );
+        ResourceEntry::new("model-anthropic-1", serde_json::from_str(&cfg).unwrap(), 1)
+    }
+
+    fn gemini_model_entry(name: &str, api_base: &str) -> ResourceEntry<Model> {
+        let cfg = format!(
+            r#"{{
+                "name": "{name}",
+                "model": "gemini/gemini-2.0-flash",
+                "provider_config": {{"api_key": "ya29-test", "api_base": "{api_base}"}}
+            }}"#
+        );
+        ResourceEntry::new("model-gemini-1", serde_json::from_str(&cfg).unwrap(), 1)
+    }
+
+    fn deepseek_model_entry(name: &str, api_base: &str) -> ResourceEntry<Model> {
+        let cfg = format!(
+            r#"{{
+                "name": "{name}",
+                "model": "deepseek/deepseek-chat",
+                "provider_config": {{"api_key": "sk-deepseek", "api_base": "{api_base}"}}
+            }}"#
+        );
+        ResourceEntry::new("model-deepseek-1", serde_json::from_str(&cfg).unwrap(), 1)
+    }
+
+    /// (OpenAI inbound) × (Anthropic upstream) × (non-streaming).
+    /// The most valuable cross-protocol cell — exercises real wire-shape
+    /// translation in both directions inside `AnthropicBridge::chat`.
+    #[tokio::test]
+    async fn matrix_openai_in_anthropic_upstream_non_streaming() {
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "sk-ant-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_01",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Hello from Claude!"}],
+                "model": "claude-3-5-haiku-20241022",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 5, "output_tokens": 4}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.models
+            .insert(anthropic_model_entry("my-claude", &upstream.uri()));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-claude"]));
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "my-claude",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+        // OpenAI-shape wire on the way out.
+        assert_eq!(v["object"], "chat.completion");
+        assert_eq!(v["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(v["choices"][0]["message"]["content"], "Hello from Claude!");
+        assert_eq!(v["choices"][0]["finish_reason"], "stop");
+        assert_eq!(v["usage"]["prompt_tokens"], 5);
+        assert_eq!(v["usage"]["completion_tokens"], 4);
+    }
+
+    /// (OpenAI inbound) × (Anthropic upstream) × (streaming).
+    /// Pin the SSE event-stream translation: AnthropicBridge ingests
+    /// typed Anthropic events (message_start / content_block_delta /
+    /// message_delta / message_stop) and emits flat OpenAI deltas.
+    #[tokio::test]
+    async fn matrix_openai_in_anthropic_upstream_streaming() {
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n\
+event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.models
+            .insert(anthropic_model_entry("my-claude", &upstream.uri()));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-claude"]));
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "my-claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream"),
+        );
+        let body =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        // OpenAI-shape SSE deltas on the way out.
+        assert!(
+            body.contains("\"object\":\"chat.completion.chunk\""),
+            "missing OpenAI chunk envelope in:\n{body}"
+        );
+        assert!(body.contains("\"content\":\"hel\""));
+        assert!(body.contains("\"content\":\"lo\""));
+        assert!(body.contains("\"finish_reason\":\"stop\""));
+        assert!(body.contains("data: [DONE]"));
+    }
+
+    /// (OpenAI inbound) × (Gemini upstream). Gemini's bridge is a
+    /// thin wrapper around the OpenAi-compat `/chat/completions`
+    /// endpoint, so the upstream wire is OpenAI-shape — but the
+    /// `Hub.get(Provider::Gemini)` lookup must still resolve to the
+    /// Gemini-specific bridge instance (different metrics label,
+    /// different default base URL behavior).
+    #[tokio::test]
+    async fn matrix_openai_in_gemini_upstream_non_streaming() {
+        use aisix_provider_gemini::gemini_bridge;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-gemini",
+                "model": "gemini-2.0-flash",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Hello from Gemini!"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 5, "total_tokens": 9}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.models
+            .insert(gemini_model_entry("my-gemini", &upstream.uri()));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-gemini"]));
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Gemini, Arc::new(gemini_bridge()));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "my-gemini",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "Hello from Gemini!");
+        assert_eq!(v["usage"]["total_tokens"], 9);
+    }
+
+    /// (OpenAI inbound) × (DeepSeek upstream). Mirrors the Gemini
+    /// case: DeepSeek's bridge is OpenAi-compat with Bearer auth +
+    /// a different `name()` for metrics. The integration test pins
+    /// that `Provider::Deepseek` resolves correctly.
+    #[tokio::test]
+    async fn matrix_openai_in_deepseek_upstream_non_streaming() {
+        use aisix_provider_deepseek::deepseek_bridge;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer sk-deepseek"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-deepseek",
+                "model": "deepseek-chat",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Hello from DeepSeek!"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 6, "completion_tokens": 7, "total_tokens": 13}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.models
+            .insert(deepseek_model_entry("my-deepseek", &upstream.uri()));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-deepseek"]));
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Deepseek, Arc::new(deepseek_bridge()));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "my-deepseek",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(
+            v["choices"][0]["message"]["content"],
+            "Hello from DeepSeek!"
+        );
+        assert_eq!(v["usage"]["total_tokens"], 13);
     }
 }
