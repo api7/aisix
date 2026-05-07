@@ -1536,37 +1536,68 @@ data: [DONE]\n\n";
     // path: client body parser → Hub.get(provider) → Bridge.chat[_stream]
     // → upstream → Bridge response decoder → renderer → wire bytes.
 
-    fn anthropic_model_entry(name: &str, api_base: &str) -> ResourceEntry<Model> {
+    const MATRIX_ANTHROPIC_PK_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const MATRIX_GEMINI_PK_ID: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    const MATRIX_DEEPSEEK_PK_ID: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+
+    fn anthropic_model_entry(name: &str) -> ResourceEntry<Model> {
         let cfg = format!(
             r#"{{
-                "name": "{name}",
-                "model": "anthropic/claude-3-5-haiku-20241022",
-                "provider_config": {{"api_key": "sk-ant-test", "api_base": "{api_base}"}}
+                "display_name": "{name}",
+                "provider": "anthropic",
+                "model_name": "claude-3-5-haiku-20241022",
+                "provider_key_id": "{MATRIX_ANTHROPIC_PK_ID}"
             }}"#
         );
         ResourceEntry::new("model-anthropic-1", serde_json::from_str(&cfg).unwrap(), 1)
     }
 
-    fn gemini_model_entry(name: &str, api_base: &str) -> ResourceEntry<Model> {
+    fn gemini_model_entry(name: &str) -> ResourceEntry<Model> {
         let cfg = format!(
             r#"{{
-                "name": "{name}",
-                "model": "gemini/gemini-2.0-flash",
-                "provider_config": {{"api_key": "ya29-test", "api_base": "{api_base}"}}
+                "display_name": "{name}",
+                "provider": "gemini",
+                "model_name": "gemini-2.0-flash",
+                "provider_key_id": "{MATRIX_GEMINI_PK_ID}"
             }}"#
         );
         ResourceEntry::new("model-gemini-1", serde_json::from_str(&cfg).unwrap(), 1)
     }
 
-    fn deepseek_model_entry(name: &str, api_base: &str) -> ResourceEntry<Model> {
+    fn deepseek_model_entry(name: &str) -> ResourceEntry<Model> {
         let cfg = format!(
             r#"{{
-                "name": "{name}",
-                "model": "deepseek/deepseek-chat",
-                "provider_config": {{"api_key": "sk-deepseek", "api_base": "{api_base}"}}
+                "display_name": "{name}",
+                "provider": "deepseek",
+                "model_name": "deepseek-chat",
+                "provider_key_id": "{MATRIX_DEEPSEEK_PK_ID}"
             }}"#
         );
         ResourceEntry::new("model-deepseek-1", serde_json::from_str(&cfg).unwrap(), 1)
+    }
+
+    fn matrix_pk_entry(
+        id: &'static str,
+        secret: &str,
+        api_base: &str,
+    ) -> ResourceEntry<aisix_core::ProviderKey> {
+        let cfg = format!(
+            r#"{{"display_name":"matrix-up","secret":"{secret}","api_base":"{api_base}"}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&cfg).unwrap();
+        ResourceEntry::new(id, pk, 1)
+    }
+
+    fn matrix_anthropic_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        matrix_pk_entry(MATRIX_ANTHROPIC_PK_ID, "sk-ant-test", api_base)
+    }
+
+    fn matrix_gemini_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        matrix_pk_entry(MATRIX_GEMINI_PK_ID, "ya29-test", api_base)
+    }
+
+    fn matrix_deepseek_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        matrix_pk_entry(MATRIX_DEEPSEEK_PK_ID, "sk-deepseek", api_base)
     }
 
     /// (OpenAI inbound) × (Anthropic upstream) × (non-streaming).
@@ -1593,8 +1624,9 @@ data: [DONE]\n\n";
             .await;
 
         let snap = AisixSnapshot::new();
-        snap.models
-            .insert(anthropic_model_entry("my-claude", &upstream.uri()));
+        snap.provider_keys
+            .insert(matrix_anthropic_pk(&upstream.uri()));
+        snap.models.insert(anthropic_model_entry("my-claude"));
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-claude"]));
         let hub = Arc::new(Hub::new());
@@ -1653,8 +1685,9 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             .await;
 
         let snap = AisixSnapshot::new();
-        snap.models
-            .insert(anthropic_model_entry("my-claude", &upstream.uri()));
+        snap.provider_keys
+            .insert(matrix_anthropic_pk(&upstream.uri()));
+        snap.models.insert(anthropic_model_entry("my-claude"));
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-claude"]));
         let hub = Arc::new(Hub::new());
@@ -1721,8 +1754,8 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             .await;
 
         let snap = AisixSnapshot::new();
-        snap.models
-            .insert(gemini_model_entry("my-gemini", &upstream.uri()));
+        snap.provider_keys.insert(matrix_gemini_pk(&upstream.uri()));
+        snap.models.insert(gemini_model_entry("my-gemini"));
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-gemini"]));
         let hub = Arc::new(Hub::new());
@@ -1774,8 +1807,9 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             .await;
 
         let snap = AisixSnapshot::new();
-        snap.models
-            .insert(deepseek_model_entry("my-deepseek", &upstream.uri()));
+        snap.provider_keys
+            .insert(matrix_deepseek_pk(&upstream.uri()));
+        snap.models.insert(deepseek_model_entry("my-deepseek"));
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-deepseek"]));
         let hub = Arc::new(Hub::new());

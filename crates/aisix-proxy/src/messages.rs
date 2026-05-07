@@ -127,6 +127,7 @@ async fn dispatch(
     }
 
     let model = &model_entry.value;
+    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
 
     // Cross-provider path: when the resolved Model points at a non-
     // Anthropic upstream, parse the Anthropic-shape body into the
@@ -136,10 +137,17 @@ async fn dispatch(
     // passthrough to preserve features (cache_control, thinking
     // blocks, …) the cross-provider path can't lossily round-trip.
     if model.provider != Some(Provider::Anthropic) {
-        return cross_provider_dispatch(state, body, model, &model_name, request_id).await;
+        return cross_provider_dispatch(
+            state,
+            body,
+            model,
+            &pk_entry.value,
+            &model_name,
+            request_id,
+        )
+        .await;
     }
 
-    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
     let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?;
 
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
@@ -263,6 +271,7 @@ async fn cross_provider_dispatch(
     state: &ProxyState,
     body: &Value,
     model: &aisix_core::Model,
+    provider_key: &aisix_core::ProviderKey,
     model_name: &str,
     request_id: &str,
 ) -> Result<(Response, String), ProxyError> {
@@ -272,7 +281,7 @@ async fn cross_provider_dispatch(
     };
     use std::sync::Arc;
 
-    let provider = model.provider().ok_or_else(|| {
+    let provider = model.provider.ok_or_else(|| {
         ProxyError::InvalidRequest(format!("model `{model_name}` has no provider prefix"))
     })?;
     let bridge: Arc<dyn Bridge> = state
@@ -292,7 +301,8 @@ async fn cross_provider_dispatch(
 
     let is_stream = chat.is_streaming();
     let model_arc = Arc::new(model.clone());
-    let ctx = BridgeContext::new(request_id, model_arc);
+    let pk_arc = Arc::new(provider_key.clone());
+    let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
     let provider_label = format!("{provider:?}").to_lowercase();
 
     if is_stream {
@@ -428,6 +438,8 @@ mod tests {
 
     const ANTHROPIC_PK_ID: &str = "11111111-1111-1111-1111-111111111111";
     const OPENAI_PK_ID: &str = "22222222-2222-2222-2222-222222222222";
+    const GEMINI_PK_ID: &str = "33333333-3333-3333-3333-333333333333";
+    const DEEPSEEK_PK_ID: &str = "44444444-4444-4444-4444-444444444444";
 
     fn anthropic_model(name: &str) -> ResourceEntry<Model> {
         let json = format!(
@@ -721,9 +733,8 @@ data: [DONE]\n\n";
             .mount(&upstream)
             .await;
 
-        let snap = AisixSnapshot::new();
-        snap.models
-            .insert(openai_model("my-claude-alias", &upstream.uri()));
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("my-claude-alias"));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let hub = Arc::new(Hub::new());
@@ -804,26 +815,56 @@ data: [DONE]\n\n";
 
     // ─── Cross-protocol matrix (Anthropic inbound × non-Anthropic) ─
 
-    fn gemini_model(name: &str, api_base: &str) -> ResourceEntry<Model> {
+    fn gemini_model(name: &str) -> ResourceEntry<Model> {
         let cfg = format!(
             r#"{{
-                "name": "{name}",
-                "model": "gemini/gemini-2.0-flash",
-                "provider_config": {{"api_key": "ya29-test", "api_base": "{api_base}"}}
+                "display_name": "{name}",
+                "provider": "gemini",
+                "model_name": "gemini-2.0-flash",
+                "provider_key_id": "{GEMINI_PK_ID}"
             }}"#
         );
         ResourceEntry::new("m-3", serde_json::from_str(&cfg).unwrap(), 1)
     }
 
-    fn deepseek_model(name: &str, api_base: &str) -> ResourceEntry<Model> {
+    fn deepseek_model(name: &str) -> ResourceEntry<Model> {
         let cfg = format!(
             r#"{{
-                "name": "{name}",
-                "model": "deepseek/deepseek-chat",
-                "provider_config": {{"api_key": "sk-deepseek", "api_base": "{api_base}"}}
+                "display_name": "{name}",
+                "provider": "deepseek",
+                "model_name": "deepseek-chat",
+                "provider_key_id": "{DEEPSEEK_PK_ID}"
             }}"#
         );
         ResourceEntry::new("m-4", serde_json::from_str(&cfg).unwrap(), 1)
+    }
+
+    fn gemini_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"gemini-up","secret":"ya29-test","api_base":"{api_base}"}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(GEMINI_PK_ID, pk, 1)
+    }
+
+    fn deepseek_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"deepseek-up","secret":"sk-deepseek","api_base":"{api_base}"}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(DEEPSEEK_PK_ID, pk, 1)
+    }
+
+    fn new_snap_gemini(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(gemini_pk(api_base));
+        snap
+    }
+
+    fn new_snap_deepseek(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(deepseek_pk(api_base));
+        snap
     }
 
     /// (Anthropic inbound) × (Gemini upstream). Anthropic body comes
@@ -854,9 +895,8 @@ data: [DONE]\n\n";
             .mount(&upstream)
             .await;
 
-        let snap = AisixSnapshot::new();
-        snap.models
-            .insert(gemini_model("my-claude-via-gemini", &upstream.uri()));
+        let snap = new_snap_gemini(&upstream.uri());
+        snap.models.insert(gemini_model("my-claude-via-gemini"));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let hub = Arc::new(Hub::new());
@@ -903,9 +943,8 @@ data: [DONE]\n\n";
             .mount(&upstream)
             .await;
 
-        let snap = AisixSnapshot::new();
-        snap.models
-            .insert(deepseek_model("my-claude-via-ds", &upstream.uri()));
+        let snap = new_snap_deepseek(&upstream.uri());
+        snap.models.insert(deepseek_model("my-claude-via-ds"));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let hub = Arc::new(Hub::new());
@@ -949,9 +988,8 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             .mount(&upstream)
             .await;
 
-        let snap = AisixSnapshot::new();
-        snap.models
-            .insert(anthropic_model("my-claude", &upstream.uri()));
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);
@@ -998,18 +1036,23 @@ data: [DONE]\n\n";
             .mount(&upstream)
             .await;
 
+        // Build a fresh ProviderKey pointing at the wiremock URI; the
+        // model_entry passed in carries the right `provider_key_id` to
+        // bind it to that PK.
+        let pk_id = model_entry
+            .value
+            .provider_key_id
+            .clone()
+            .expect("matrix fixtures must reference a provider_key_id");
+        let pk_json = format!(
+            r#"{{"display_name":"matrix-up","secret":"k","api_base":"{}"}}"#,
+            upstream.uri()
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
+
         let snap = AisixSnapshot::new();
-        // model_entry's api_base was set at fixture creation time but
-        // we want it to point at the wiremock; rebuild with the
-        // upstream uri instead.
-        let cfg_json = serde_json::json!({
-            "name": model_name,
-            "model": format!("{}/x", format!("{bridge_provider:?}").to_lowercase()),
-            "provider_config": {"api_key": "k", "api_base": upstream.uri()},
-        });
-        let m: Model = serde_json::from_value(cfg_json).unwrap();
-        let _ = model_entry; // explicit shadow; built fresh from upstream.uri()
-        snap.models.insert(ResourceEntry::new("m-stream", m, 1));
+        snap.provider_keys.insert(ResourceEntry::new(pk_id, pk, 1));
+        snap.models.insert(model_entry);
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let hub = Arc::new(Hub::new());
@@ -1052,7 +1095,7 @@ data: [DONE]\n\n";
             Provider::Gemini,
             Arc::new(gemini_bridge()),
             // Placeholder; helper rebuilds with the wiremock uri.
-            gemini_model("my-claude-via-gemini", "http://placeholder"),
+            gemini_model("my-claude-via-gemini"),
             "my-claude-via-gemini",
         )
         .await;
@@ -1064,7 +1107,7 @@ data: [DONE]\n\n";
         assert_anthropic_streams_through_openai_compat_upstream(
             Provider::Deepseek,
             Arc::new(deepseek_bridge()),
-            deepseek_model("my-claude-via-ds", "http://placeholder"),
+            deepseek_model("my-claude-via-ds"),
             "my-claude-via-ds",
         )
         .await;
