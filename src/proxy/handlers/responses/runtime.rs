@@ -700,7 +700,7 @@ mod tests {
         assert_eq!(state.previous_response_id.as_deref(), Some("resp_prev"));
         assert_eq!(previous_messages.len(), 2);
         assert_eq!(merged_input_messages.len(), 3);
-        assert!(state.response_id.starts_with("resp_"));
+        assert!(state.response_id.starts_with("aresp_"));
         assert_ne!(state.response_id, "resp_prev");
         assert_eq!(state.metadata.get("trace"), Some(&json!("abc")));
     }

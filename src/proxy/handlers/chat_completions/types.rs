@@ -1,14 +1,15 @@
-use axum::{
-    Json,
-    response::{IntoResponse, Response},
-};
-use http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use thiserror::Error;
 use tokio::time::error::Elapsed;
 
 use crate::{
     gateway::error::GatewayError,
-    proxy::hooks::{authorization::AuthorizationError, rate_limit::RateLimitError},
+    proxy::{
+        handlers::openai_error::{
+            gateway_error_response, missing_model_response, timeout_response,
+        },
+        hooks::{authorization::AuthorizationError, rate_limit::RateLimitError},
+    },
 };
 
 #[derive(Debug, Error)]
@@ -31,65 +32,12 @@ impl IntoResponse for ChatCompletionError {
             ChatCompletionError::AuthorizationError(err) => err.into_response(),
             ChatCompletionError::RateLimitError(RateLimitError::Raw(resp)) => resp,
             ChatCompletionError::GatewayError(err) => {
-                let status = err.status_code();
-                let (message, error_type, code) = match err {
-                    GatewayError::Provider { .. }
-                    | GatewayError::Http(_)
-                    | GatewayError::Stream(_) => (
-                        "Provider error".to_string(),
-                        "server_error",
-                        "provider_error",
-                    ),
-                    GatewayError::Internal(_) => (
-                        "Gateway internal error".to_string(),
-                        "server_error",
-                        "internal_error",
-                    ),
-                    _ => (
-                        err.to_string(),
-                        if status.is_client_error() {
-                            "invalid_request_error"
-                        } else {
-                            "server_error"
-                        },
-                        "gateway_error",
-                    ),
-                };
-
-                (
-                    status,
-                    Json(serde_json::json!({
-                        "error": {
-                            "message": message,
-                            "type": error_type,
-                            "code": code
-                        }
-                    })),
-                )
-                    .into_response()
+                gateway_error_response("Chat Completions", &err, err.status_code())
             }
-            ChatCompletionError::Timeout(_) => (
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": "Provider request timed out",
-                        "type": "server_error",
-                        "code": "request_timeout"
-                    }
-                })),
-            )
-                .into_response(),
-            ChatCompletionError::MissingModelInContext => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": "model missing in request context",
-                        "type": "server_error",
-                        "code": "internal_error"
-                    }
-                })),
-            )
-                .into_response(),
+            ChatCompletionError::Timeout(_) => timeout_response("Chat Completions"),
+            ChatCompletionError::MissingModelInContext => {
+                missing_model_response("Chat Completions")
+            }
         }
     }
 }
