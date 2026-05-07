@@ -49,7 +49,9 @@ pub async fn transcriptions(
         &state,
         &auth,
         multipart,
-        "/v1/audio/transcriptions",
+        // Version-independent path — multipart_dispatch's URL builder
+        // (build_v1_url) owns the `/v1` prefix.
+        "/audio/transcriptions",
         &request_id,
     )
     .await
@@ -117,7 +119,9 @@ pub async fn translations(
         &state,
         &auth,
         multipart,
-        "/v1/audio/translations",
+        // Version-independent path — multipart_dispatch's URL builder
+        // (build_v1_url) owns the `/v1` prefix.
+        "/audio/translations",
         &request_id,
     )
     .await
@@ -290,7 +294,10 @@ async fn multipart_dispatch(
     let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?;
 
     let base = crate::dispatch::resolve_base_url(provider, &pk_entry.value);
-    let url = format!("{base}{upstream_path}");
+    // build_v1_url owns the /v1 prefix; callers pass the suffix
+    // (e.g. `/audio/transcriptions`) so this code is agnostic to
+    // whether the customer's api_base ends in /v1 or not.
+    let url = crate::dispatch::build_v1_url(&base, upstream_path);
     let provider_label = format!("{provider:?}").to_lowercase();
 
     // Rebuild the multipart form with `model` rewritten.
@@ -393,7 +400,7 @@ async fn speech_dispatch(
 
     let client = crate::http_client::client();
     let resp = client
-        .post(format!("{base}/v1/audio/speech"))
+        .post(crate::dispatch::build_v1_url(&base, "/audio/speech"))
         .header(header::AUTHORIZATION, format!("Bearer {api_key}"))
         .header(header::CONTENT_TYPE, "application/json")
         .header("x-aisix-request-id", request_id)

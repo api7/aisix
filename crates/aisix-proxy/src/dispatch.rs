@@ -76,6 +76,45 @@ pub(crate) fn resolve_base_url(provider: Provider, provider_key: &ProviderKey) -
     }
 }
 
+/// Build a `/v1`-prefixed upstream URL while tolerating either
+/// convention for the configured `api_base`:
+///
+/// * `https://api.openai.com` builds `…/v1/<path>` — the provider
+///   default convention used by `Provider::Openai.default_base_url()`
+///   and `aisix-proxy`'s pre-existing handlers.
+/// * `https://api.openai.com/v1` also builds `…/v1/<path>` — the
+///   OpenAI SDK convention every published example uses, and the
+///   exact placeholder the dashboard's provider-keys form pre-fills.
+///
+/// Without this normalization, a customer who follows OpenAI SDK
+/// docs (api_base = `…/v1`) hits `…/v1/v1/responses` upstream — the
+/// upstream 404s, the DP wraps it as 502 upstream_error, and the
+/// failure surfaces as "intermittent SDK-incompatible behaviour"
+/// (chat works because aisix-provider-openai/src/bridge.rs uses
+/// the OpenAI-SDK convention; the proxy crate handlers — responses,
+/// rerank, audio — follow the provider-default convention, so the
+/// customer's api_base satisfies one but not the other).
+///
+/// `path` MUST start with `/` and SHOULD start with the version-
+/// independent route (e.g. `/responses`, not `/v1/responses`); this
+/// helper owns the `/v1` prefix.
+pub(crate) fn build_v1_url(base: &str, path: &str) -> String {
+    // assert!, not debug_assert! — the cost of a single bounds check
+    // per upstream dispatch is negligible compared to the network
+    // round-trip, and a release-mode caller passing a malformed path
+    // would silently produce a wrong URL (e.g. `…/v1responses`).
+    assert!(
+        path.starts_with('/'),
+        "build_v1_url path must start with /, got {path:?}",
+    );
+    let trimmed = base.trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        format!("{trimmed}{path}")
+    } else {
+        format!("{trimmed}/v1{path}")
+    }
+}
+
 /// The upstream API key — `provider_key.secret`. Empty string is
 /// treated as a config error (ProviderKey rows shouldn't be empty,
 /// but a hand-edited kine row could surface one).
@@ -189,5 +228,65 @@ mod tests {
         let pk: ProviderKey = serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
         let base = resolve_base_url(Provider::Anthropic, &pk);
         assert_eq!(base, Provider::Anthropic.default_base_url());
+    }
+
+    // ---------------------------------------------------------------
+    // build_v1_url — the path-doubling regression fixture.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn build_v1_url_appends_v1_when_base_lacks_it() {
+        // Provider-default convention (Provider::Openai.default_base_url()
+        // returns `https://api.openai.com`, no /v1).
+        assert_eq!(
+            build_v1_url("https://api.openai.com", "/responses"),
+            "https://api.openai.com/v1/responses",
+        );
+    }
+
+    #[test]
+    fn build_v1_url_skips_v1_when_base_already_has_it() {
+        // Customer follows the OpenAI SDK convention + the dashboard's
+        // provider-keys form pre-fill (`https://api.openai.com/v1`).
+        // A naive `format!("{base}/v1/responses")` would produce
+        // `https://api.openai.com/v1/v1/responses` and 404 upstream.
+        assert_eq!(
+            build_v1_url("https://api.openai.com/v1", "/responses"),
+            "https://api.openai.com/v1/responses",
+        );
+    }
+
+    #[test]
+    fn build_v1_url_strips_trailing_slash() {
+        assert_eq!(
+            build_v1_url("https://api.openai.com/", "/rerank"),
+            "https://api.openai.com/v1/rerank",
+        );
+        assert_eq!(
+            build_v1_url("https://api.openai.com/v1/", "/rerank"),
+            "https://api.openai.com/v1/rerank",
+        );
+    }
+
+    #[test]
+    fn build_v1_url_handles_nested_paths() {
+        // /audio/speech, /audio/transcriptions, /audio/translations all
+        // pass nested paths — make sure the helper doesn't try to be
+        // clever about them.
+        assert_eq!(
+            build_v1_url("https://api.openai.com", "/audio/speech"),
+            "https://api.openai.com/v1/audio/speech",
+        );
+        assert_eq!(
+            build_v1_url("https://api.openai.com/v1", "/audio/transcriptions"),
+            "https://api.openai.com/v1/audio/transcriptions",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "build_v1_url path must start with /")]
+    fn build_v1_url_rejects_path_without_leading_slash() {
+        // Misuse — handlers should always pass a `/`-prefixed path.
+        let _ = build_v1_url("https://api.openai.com", "responses");
     }
 }

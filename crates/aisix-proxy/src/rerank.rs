@@ -118,7 +118,10 @@ async fn dispatch(
         *m = Value::String(upstream_model.clone());
     }
 
-    // Build upstream URL: {base}/v1/rerank
+    // Build upstream URL. build_v1_url tolerates either base form —
+    // `https://api.cohere.ai` (Cohere convention, no /v1) and
+    // `https://api.openai.com/v1` (OpenAI-SDK convention, with /v1)
+    // both end up at `…/v1/rerank` instead of `…/v1/v1/rerank`.
     let base = match pk_entry.value.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
         _ => {
@@ -129,7 +132,7 @@ async fn dispatch(
                 .unwrap_or_else(|| "https://api.cohere.ai".to_string())
         }
     };
-    let url = format!("{base}/v1/rerank");
+    let url = crate::dispatch::build_v1_url(&base, "/rerank");
 
     let client = crate::http_client::client();
     let upstream_resp = client
