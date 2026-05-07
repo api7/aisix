@@ -139,8 +139,8 @@ every CRUD test.
 ### 3.3 Why etcd
 
 aisix lifts a pattern from Envoy / Higress / xDS: configuration is a
-distributed state machine, not a file. etcd was chosen over PostgreSQL
-(LiteLLM's choice) because it gives us:
+distributed state machine, not a file. etcd was chosen over a
+relational store for the data plane because it gives us:
 
 - Native long-poll watch streams.
 - A linearizable, transactional KV with leases.

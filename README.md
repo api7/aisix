@@ -3,7 +3,7 @@
 > A single-binary, Rust-native AI gateway. OpenAI-compatible proxy + Admin API.
 > Config lives in etcd. Lock-free reads. First-class streaming. >90% E2E coverage gate.
 
-`aisix` is an AI inference gateway in the spirit of [LiteLLM](https://github.com/BerriAI/litellm) / [Portkey](https://github.com/Portkey-AI/gateway), rewritten in Rust for low cold-start, native streaming, and a single static binary.
+`aisix` is a Rust-native AI inference gateway: low cold-start, native streaming, single static binary.
 
 It runs in two modes from the same binary:
 
@@ -131,9 +131,9 @@ Tracked as parent issues on this repo. P0 = pre-1.0 must-have, P1 = first follow
 
 **P2 (long-tail)**
 
-- [#60] ~95 LiteLLM provider integrations (Together, Fireworks, Replicate, …)
-- [#61] ~25 LiteLLM guardrail integrations
-- [#62] ~30 LiteLLM observability sinks
+- [#60] ~95 long-tail provider integrations (Together, Fireworks, Replicate, …)
+- [#61] ~25 long-tail guardrail integrations
+- [#62] ~30 long-tail observability sinks
 - [#63] Enterprise-tier features (SCIM, customer portal, prompt management, batch / files / fine-tune passthrough)
 
 The full live tracker: [github.com/api7/ai-gateway/issues](https://github.com/api7/ai-gateway/issues).
