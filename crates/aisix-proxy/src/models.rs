@@ -64,11 +64,12 @@ pub async fn list_models(
         .entries()
         .into_iter()
         .filter(|e| !e.value.is_routing())
-        .map(|e| e.value.name.clone())
+        .map(|e| e.value.display_name.clone())
         .collect();
 
     let api_key = auth.key();
-    let permitted: Vec<&str> = api_key.accessible_models(all_names.iter().map(|s| s.as_str()));
+    let permitted: Vec<&str> =
+        api_key.accessible_models(all_names.iter().map(|s: &String| s.as_str()));
 
     let mut data: Vec<ModelObject> = permitted
         .into_iter()
@@ -77,7 +78,7 @@ pub async fn list_models(
             let owned_by = snapshot
                 .models
                 .get_by_name(name)
-                .and_then(|e| e.value.provider())
+                .and_then(|e| e.value.provider)
                 .map(|p| p.as_str().to_string())
                 .unwrap_or_else(|| "aisix".to_string());
 
@@ -127,16 +128,31 @@ mod tests {
         crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache())
     }
 
+    const PK_ID: &str = "11111111-1111-1111-1111-111111111111";
+
     fn model_entry(id: &str, name: &str) -> ResourceEntry<Model> {
         let cfg = format!(
             r#"{{
-                "name": "{name}",
-                "model": "openai/gpt-4o",
-                "provider_config": {{"api_key": "sk-up"}}
+                "display_name": "{name}",
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "{PK_ID}"
             }}"#
         );
         let m: Model = serde_json::from_str(&cfg).unwrap();
         ResourceEntry::new(id, m, 1)
+    }
+
+    fn provider_key_entry() -> ResourceEntry<aisix_core::ProviderKey> {
+        let pk: aisix_core::ProviderKey =
+            serde_json::from_str(r#"{"display_name":"openai-up","secret":"sk-up"}"#).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
+    fn new_snap() -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(provider_key_entry());
+        snap
     }
 
     fn apikey_entry(key: &str, allowed: &[&str]) -> ResourceEntry<ApiKey> {
@@ -152,7 +168,7 @@ mod tests {
 
     #[tokio::test]
     async fn unauthenticated_request_is_401() {
-        let snap = AisixSnapshot::new();
+        let snap = new_snap();
         snap.models.insert(model_entry("m1", "gpt4"));
         snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
 
@@ -169,7 +185,7 @@ mod tests {
 
     #[tokio::test]
     async fn wildcard_key_sees_all_non_routing_models() {
-        let snap = AisixSnapshot::new();
+        let snap = new_snap();
         snap.models.insert(model_entry("m1", "gpt4"));
         snap.models.insert(model_entry("m2", "claude"));
         snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
@@ -196,7 +212,7 @@ mod tests {
 
     #[tokio::test]
     async fn restricted_key_sees_only_allowed_models() {
-        let snap = AisixSnapshot::new();
+        let snap = new_snap();
         snap.models.insert(model_entry("m1", "gpt4"));
         snap.models.insert(model_entry("m2", "claude"));
         snap.apikeys.insert(apikey_entry("sk-caller", &["gpt4"]));
@@ -220,7 +236,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_allowed_models_returns_empty_list() {
-        let snap = AisixSnapshot::new();
+        let snap = new_snap();
         snap.models.insert(model_entry("m1", "gpt4"));
         snap.apikeys.insert(apikey_entry("sk-caller", &[]));
 
@@ -242,13 +258,11 @@ mod tests {
 
     #[tokio::test]
     async fn routing_models_are_excluded_from_list() {
-        let snap = AisixSnapshot::new();
+        let snap = new_snap();
         snap.models.insert(model_entry("m1", "gpt4"));
         // Insert a routing model.
         let routing_cfg = serde_json::json!({
-            "name": "smart-router",
-            "model": "router/smart",
-            "provider_config": {"api_key": "ignored"},
+            "display_name": "smart-router",
             "routing": {
                 "strategy": "failover",
                 "targets": [{"model": "gpt4"}]
@@ -278,7 +292,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_shape_matches_openai_contract() {
-        let snap = AisixSnapshot::new();
+        let snap = new_snap();
         snap.models.insert(model_entry("m1", "gpt4"));
         snap.apikeys.insert(apikey_entry("sk-caller", &["*"]));
 

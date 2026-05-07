@@ -105,25 +105,15 @@ fn model_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
-        "required": ["name", "model", "provider_config"],
+        "required": ["display_name"],
         "additionalProperties": false,
         "properties": {
-            "name": { "type": "string", "minLength": 1 },
-            "model": {
-                "type": "string",
-                "pattern": "^(anthropic|deepseek|gemini|openai|router)/.+$"
-            },
-            "provider_config": {
-                "type": "object",
-                "required": ["api_key"],
-                "additionalProperties": false,
-                "properties": {
-                    "api_key": { "type": "string", "minLength": 1 },
-                    "api_base": { "type": "string" }
-                }
-            },
-            "timeout": { "type": "integer", "minimum": 0 },
-            "rate_limit": { "$ref": "#/$defs/rate_limit" },
+            "display_name":    { "type": "string", "minLength": 1 },
+            "provider":        { "type": "string", "enum": ["openai","anthropic","gemini","deepseek"] },
+            "model_name":      { "type": "string", "minLength": 1 },
+            "provider_key_id": { "type": "string", "minLength": 1 },
+            "timeout":         { "type": "integer", "minimum": 0 },
+            "rate_limit":      { "$ref": "#/$defs/rate_limit" },
             "routing": {
                 "type": "object",
                 "required": ["targets"],
@@ -148,8 +138,35 @@ fn model_schema() -> Value {
                     },
                     "retry_budget": { "type": "integer", "minimum": 0 }
                 }
+            },
+            "cost": {
+                "type": "object",
+                "required": ["input_per_1k", "output_per_1k"],
+                "additionalProperties": false,
+                "properties": {
+                    "input_per_1k":  { "type": "number", "minimum": 0 },
+                    "output_per_1k": { "type": "number", "minimum": 0 }
+                }
             }
         },
+        // Direct vs routing model: a model EITHER ships a `routing`
+        // block (virtual router — provider/model_name/provider_key_id
+        // forbidden) OR ships those three required fields together
+        // (direct upstream — routing forbidden).
+        "oneOf": [
+            {
+                "required": ["routing"],
+                "not": { "anyOf": [
+                    { "required": ["provider"] },
+                    { "required": ["model_name"] },
+                    { "required": ["provider_key_id"] }
+                ]}
+            },
+            {
+                "required": ["provider", "model_name", "provider_key_id"],
+                "not": { "required": ["routing"] }
+            }
+        ],
         "$defs": {
             "rate_limit": {
                 "type": "object",
@@ -377,9 +394,10 @@ mod tests {
     #[test]
     fn model_happy_path_passes() {
         let v = json!({
-            "name": "my-gpt4",
-            "model": "openai/gpt-4o",
-            "provider_config": {"api_key": "sk-x"},
+            "display_name": "my-gpt4",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111",
             "timeout": 30000,
             "rate_limit": {"rpm": 100}
         });
@@ -387,30 +405,80 @@ mod tests {
     }
 
     #[test]
-    fn model_missing_name_fails_with_useful_path() {
+    fn model_routing_form_passes() {
         let v = json!({
-            "model": "openai/gpt-4o",
-            "provider_config": {"api_key": "sk-x"}
+            "display_name": "router-1",
+            "routing": {
+                "strategy": "round_robin",
+                "targets": [{"model": "my-gpt4"}, {"model": "my-claude"}]
+            }
         });
-        let err = validate_model(&v).unwrap_err();
-        assert!(err.message.contains("name"));
+        validate_model(&v).unwrap();
     }
 
     #[test]
-    fn model_bad_provider_prefix_fails() {
+    fn model_missing_display_name_fails() {
         let v = json!({
-            "name": "x",
-            "model": "mistral/large",
-            "provider_config": {"api_key": "k"}
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk-1"
         });
         let err = validate_model(&v).unwrap_err();
-        assert!(err.path.contains("/model") || err.message.to_lowercase().contains("pattern"));
+        assert!(err.message.to_lowercase().contains("display_name"));
+    }
+
+    #[test]
+    fn model_unknown_provider_value_fails() {
+        let v = json!({
+            "display_name": "x",
+            "provider": "mistral",
+            "model_name": "large",
+            "provider_key_id": "pk-1"
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn model_direct_with_routing_block_fails() {
+        // Direct + routing both present violates the oneOf XOR.
+        let v = json!({
+            "display_name": "x",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk-1",
+            "routing": {"targets": [{"model": "y"}]}
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn model_routing_with_provider_key_id_fails() {
+        // Router can't carry provider_key_id — that lives on the
+        // target Models the router fans out to.
+        let v = json!({
+            "display_name": "router-1",
+            "provider_key_id": "pk-1",
+            "routing": {"targets": [{"model": "y"}]}
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn model_direct_missing_provider_key_id_fails() {
+        // Direct model needs all three of provider / model_name /
+        // provider_key_id.
+        let v = json!({
+            "display_name": "x",
+            "provider": "openai",
+            "model_name": "gpt-4o"
+        });
+        assert!(validate_model(&v).is_err());
     }
 
     #[test]
     fn model_rejects_additional_top_level() {
         let v = json!({
-            "name":"x","model":"openai/g","provider_config":{"api_key":"k"},
+            "display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1",
             "rogue": 1
         });
         assert!(validate_model(&v).is_err());
@@ -440,7 +508,7 @@ mod tests {
     #[test]
     fn rate_limit_negative_value_rejected() {
         let v = json!({
-            "name":"x","model":"openai/g","provider_config":{"api_key":"k"},
+            "display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1",
             "rate_limit": {"rpm": -1}
         });
         assert!(validate_model(&v).is_err());

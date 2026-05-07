@@ -346,11 +346,7 @@ async fn dispatch(
     // single bad provider doesn't take down the whole request.
     if attempt_models.len() == 1 {
         let only = &attempt_models[0];
-        let provider = only.provider().ok_or_else(|| {
-            with_model(ProxyError::InvalidRequest(
-                "model has no provider prefix".into(),
-            ))
-        })?;
+        let provider = crate::dispatch::require_provider(only).map_err(with_model)?;
         if state.hub.get(provider).is_none() {
             return Err(with_model(ProxyError::ProviderUnavailable));
         }
@@ -370,17 +366,16 @@ async fn dispatch(
     // failure mid-flight) and not worth the complexity for V1.
     if req.is_streaming() {
         let model = &attempt_models[0];
-        let provider = model.provider().ok_or_else(|| {
-            with_model(ProxyError::InvalidRequest(
-                "model has no provider prefix".into(),
-            ))
-        })?;
+        let provider = crate::dispatch::require_provider(model).map_err(with_model)?;
+        let pk_entry =
+            crate::dispatch::resolve_provider_key(&snapshot, model).map_err(with_model)?;
         let bridge = state
             .hub
             .get(provider)
             .ok_or_else(|| with_model(ProxyError::ProviderUnavailable))?;
         let model_arc = Arc::new(model.clone());
-        let ctx = BridgeContext::new(request_id, model_arc);
+        let pk_arc = Arc::new(pk_entry.value.clone());
+        let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
         let upstream = bridge
             .chat_stream(req, &ctx)
             .await
@@ -492,7 +487,7 @@ async fn dispatch(
                 // cache hit we don't know (or care) which target ran the
                 // original call; the fingerprint identified the answer.
                 let provider_label = attempt_models[0]
-                    .provider()
+                    .provider
                     .map(|p| format!("{p:?}").to_lowercase())
                     .unwrap_or_else(|| "unknown".into());
                 let mut response = Json(render_response(now, cached)).into_response();
@@ -546,9 +541,18 @@ async fn dispatch(
     let mut upstream: Option<aisix_gateway::ChatResponse> = None;
 
     for model in &attempt_models {
-        let Some(provider) = model.provider() else {
-            last_err = Some(BridgeError::Config("model has no provider prefix".into()));
+        let Some(provider) = model.provider else {
+            last_err = Some(BridgeError::Config("model has no provider".into()));
             continue;
+        };
+        let pk_entry = match crate::dispatch::resolve_provider_key(&snapshot, model) {
+            Ok(pk) => pk,
+            Err(_) => {
+                last_err = Some(BridgeError::Config(
+                    "model references unknown provider_key_id".into(),
+                ));
+                continue;
+            }
         };
         let Some(bridge) = state.hub.get(provider) else {
             last_err = Some(BridgeError::Config(
@@ -557,18 +561,19 @@ async fn dispatch(
             continue;
         };
         let model_arc = Arc::new(model.clone());
-        let ctx = BridgeContext::new(request_id, model_arc);
+        let pk_arc = Arc::new(pk_entry.value.clone());
+        let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
 
         match bridge.chat(req, &ctx).await {
             Ok(resp) => {
-                state.health.record_success(&model.name);
+                state.health.record_success(&model.display_name);
                 chosen_provider = Some(format!("{provider:?}").to_lowercase());
                 upstream = Some(resp);
                 break;
             }
             Err(err) => {
                 tracing::warn!(
-                    target_model = %model.name,
+                    target_model = %model.display_name,
                     error = %err,
                     retryable = is_retryable(&err),
                     "routing target attempt failed",
@@ -576,7 +581,7 @@ async fn dispatch(
                 // Only retryable (server-side) errors indicate deployment
                 // health deterioration; 4xx are caller mistakes.
                 if is_retryable(&err) {
-                    state.health.record_failure(&model.name);
+                    state.health.record_failure(&model.display_name);
                 }
                 if !is_retryable(&err) {
                     last_err = Some(err);

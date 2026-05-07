@@ -188,9 +188,10 @@ mod tests {
     }
 
     const VALID_MODEL: &[u8] = br#"{
-        "name": "my-gpt4",
-        "model": "openai/gpt-4o",
-        "provider_config": {"api_key": "sk-x"}
+        "display_name": "my-gpt4",
+        "provider": "openai",
+        "model_name": "gpt-4o",
+        "provider_key_id": "11111111-1111-1111-1111-111111111111"
     }"#;
 
     const VALID_APIKEY: &[u8] = br#"{
@@ -236,7 +237,7 @@ mod tests {
     fn schema_failure_is_counted() {
         let entries = vec![raw(
             "/aisix/models/bad-provider",
-            br#"{"name":"x","model":"mistral/large","provider_config":{"api_key":"k"}}"#,
+            br#"{"display_name":"x","provider":"mistral","model_name":"large","provider_key_id":"pk-1"}"#,
             1,
         )];
         let (_snap, stats) = build_snapshot("/aisix", &entries);

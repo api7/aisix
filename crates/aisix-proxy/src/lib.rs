@@ -29,6 +29,7 @@ mod auth;
 pub mod budget;
 mod chat;
 mod completions;
+mod dispatch;
 mod embeddings;
 mod error;
 pub mod health;
@@ -129,16 +130,33 @@ mod tests {
         ProxyState::new(handle, hub, &cfg())
     }
 
-    fn model_entry(name: &str, api_base: &str) -> ResourceEntry<Model> {
+    const PK_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+    fn model_entry(name: &str) -> ResourceEntry<Model> {
         let cfg = format!(
             r#"{{
-                "name": "{name}",
-                "model": "openai/gpt-4o",
-                "provider_config": {{"api_key": "sk-upstream", "api_base": "{api_base}"}}
+                "display_name": "{name}",
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "{PK_ID}"
             }}"#
         );
         let model: Model = serde_json::from_str(&cfg).unwrap();
         ResourceEntry::new("model-id-1", model, 1)
+    }
+
+    fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let cfg = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-upstream","api_base":"{api_base}"}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&cfg).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
+    fn new_snap(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(provider_key_entry(api_base));
+        snap
     }
 
     fn apikey_entry(key: &str, allowed: &[&str]) -> ResourceEntry<ApiKey> {
@@ -167,8 +185,8 @@ mod tests {
     }
 
     fn seed_snapshot(model: &str, allowed: &[&str], api_base: &str) -> AisixSnapshot {
-        let snap = AisixSnapshot::new();
-        snap.models.insert(model_entry(model, api_base));
+        let snap = new_snap(api_base);
+        snap.models.insert(model_entry(model));
         snap.apikeys.insert(apikey_entry("sk-caller", allowed));
         snap
     }
@@ -200,8 +218,8 @@ mod tests {
         api_base: &str,
         rate_limit: serde_json::Value,
     ) -> AisixSnapshot {
-        let snap = AisixSnapshot::new();
-        snap.models.insert(model_entry(model, api_base));
+        let snap = new_snap(api_base);
+        snap.models.insert(model_entry(model));
         snap.apikeys.insert(apikey_entry_with_limits(
             "sk-caller",
             allowed,
@@ -1015,32 +1033,39 @@ data: [DONE]\n\n";
     }
 
     /// Build a `ResourceEntry<Model>` with a non-default id so the test
-    /// can mount multiple Models in one snapshot.
-    fn model_entry_with_id(id: &str, name: &str, api_base: &str) -> ResourceEntry<Model> {
+    /// can mount multiple Models in one snapshot. `pk_id` lets each
+    /// model point at its own ProviderKey row — useful for routing
+    /// tests that use multiple upstream MockServers.
+    fn model_entry_with_id(id: &str, name: &str, pk_id: &str) -> ResourceEntry<Model> {
         let cfg = format!(
             r#"{{
-                "name": "{name}",
-                "model": "openai/gpt-4o",
-                "provider_config": {{"api_key": "sk-upstream", "api_base": "{api_base}"}}
+                "display_name": "{name}",
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "{pk_id}"
             }}"#
         );
         let model: Model = serde_json::from_str(&cfg).unwrap();
         ResourceEntry::new(id, model, 1)
     }
 
+    fn pk_entry_with_id(pk_id: &str, api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let cfg = format!(
+            r#"{{"display_name":"openai-{pk_id}","secret":"sk-upstream","api_base":"{api_base}"}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&cfg).unwrap();
+        ResourceEntry::new(pk_id, pk, 1)
+    }
+
     /// Build a virtual routing Model that points at `targets` (other
-    /// Model.name values) using the given strategy.
+    /// Model.display_name values) using the given strategy.
     fn routing_entry(name: &str, strategy: &str, targets: &[&str]) -> ResourceEntry<Model> {
         let target_objs: Vec<serde_json::Value> = targets
             .iter()
             .map(|t| serde_json::json!({"model": t}))
             .collect();
         let cfg = serde_json::json!({
-            "name": name,
-            "model": format!("router/{name}"),
-            // The provider_config is required by the schema but unused
-            // by the proxy because routing.is_some() short-circuits.
-            "provider_config": {"api_key": "ignored"},
+            "display_name": name,
             "routing": {
                 "strategy": strategy,
                 "targets": target_objs,
@@ -1079,13 +1104,14 @@ data: [DONE]\n\n";
         hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
 
         let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-bad", &bad_upstream.uri()));
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-good", &good_upstream.uri()));
         snap.models
-            .insert(model_entry_with_id("m-bad", "primary", &bad_upstream.uri()));
-        snap.models.insert(model_entry_with_id(
-            "m-good",
-            "secondary",
-            &good_upstream.uri(),
-        ));
+            .insert(model_entry_with_id("m-bad", "primary", "pk-bad"));
+        snap.models
+            .insert(model_entry_with_id("m-good", "secondary", "pk-good"));
         snap.models.insert(routing_entry(
             "smart",
             "failover",
@@ -1139,13 +1165,14 @@ data: [DONE]\n\n";
         hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
 
         let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-bad", &bad_upstream.uri()));
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-standby", &standby_upstream.uri()));
         snap.models
-            .insert(model_entry_with_id("m-bad", "primary", &bad_upstream.uri()));
-        snap.models.insert(model_entry_with_id(
-            "m-standby",
-            "secondary",
-            &standby_upstream.uri(),
-        ));
+            .insert(model_entry_with_id("m-bad", "primary", "pk-bad"));
+        snap.models
+            .insert(model_entry_with_id("m-standby", "secondary", "pk-standby"));
         snap.models.insert(routing_entry(
             "smart",
             "failover",
@@ -1181,6 +1208,8 @@ data: [DONE]\n\n";
         snap.models
             .insert(routing_entry("smart", "failover", &["nonexistent"]));
         snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+        // No upstream provider_key needed — the routing target itself
+        // is missing so dispatch fails before any provider lookup.
 
         let app = build_router(build_state(snap, hub));
         let body = serde_json::json!({
@@ -1507,37 +1536,68 @@ data: [DONE]\n\n";
     // path: client body parser → Hub.get(provider) → Bridge.chat[_stream]
     // → upstream → Bridge response decoder → renderer → wire bytes.
 
-    fn anthropic_model_entry(name: &str, api_base: &str) -> ResourceEntry<Model> {
+    const MATRIX_ANTHROPIC_PK_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const MATRIX_GEMINI_PK_ID: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    const MATRIX_DEEPSEEK_PK_ID: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+
+    fn anthropic_model_entry(name: &str) -> ResourceEntry<Model> {
         let cfg = format!(
             r#"{{
-                "name": "{name}",
-                "model": "anthropic/claude-3-5-haiku-20241022",
-                "provider_config": {{"api_key": "sk-ant-test", "api_base": "{api_base}"}}
+                "display_name": "{name}",
+                "provider": "anthropic",
+                "model_name": "claude-3-5-haiku-20241022",
+                "provider_key_id": "{MATRIX_ANTHROPIC_PK_ID}"
             }}"#
         );
         ResourceEntry::new("model-anthropic-1", serde_json::from_str(&cfg).unwrap(), 1)
     }
 
-    fn gemini_model_entry(name: &str, api_base: &str) -> ResourceEntry<Model> {
+    fn gemini_model_entry(name: &str) -> ResourceEntry<Model> {
         let cfg = format!(
             r#"{{
-                "name": "{name}",
-                "model": "gemini/gemini-2.0-flash",
-                "provider_config": {{"api_key": "ya29-test", "api_base": "{api_base}"}}
+                "display_name": "{name}",
+                "provider": "gemini",
+                "model_name": "gemini-2.0-flash",
+                "provider_key_id": "{MATRIX_GEMINI_PK_ID}"
             }}"#
         );
         ResourceEntry::new("model-gemini-1", serde_json::from_str(&cfg).unwrap(), 1)
     }
 
-    fn deepseek_model_entry(name: &str, api_base: &str) -> ResourceEntry<Model> {
+    fn deepseek_model_entry(name: &str) -> ResourceEntry<Model> {
         let cfg = format!(
             r#"{{
-                "name": "{name}",
-                "model": "deepseek/deepseek-chat",
-                "provider_config": {{"api_key": "sk-deepseek", "api_base": "{api_base}"}}
+                "display_name": "{name}",
+                "provider": "deepseek",
+                "model_name": "deepseek-chat",
+                "provider_key_id": "{MATRIX_DEEPSEEK_PK_ID}"
             }}"#
         );
         ResourceEntry::new("model-deepseek-1", serde_json::from_str(&cfg).unwrap(), 1)
+    }
+
+    fn matrix_pk_entry(
+        id: &'static str,
+        secret: &str,
+        api_base: &str,
+    ) -> ResourceEntry<aisix_core::ProviderKey> {
+        let cfg = format!(
+            r#"{{"display_name":"matrix-up","secret":"{secret}","api_base":"{api_base}"}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&cfg).unwrap();
+        ResourceEntry::new(id, pk, 1)
+    }
+
+    fn matrix_anthropic_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        matrix_pk_entry(MATRIX_ANTHROPIC_PK_ID, "sk-ant-test", api_base)
+    }
+
+    fn matrix_gemini_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        matrix_pk_entry(MATRIX_GEMINI_PK_ID, "ya29-test", api_base)
+    }
+
+    fn matrix_deepseek_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        matrix_pk_entry(MATRIX_DEEPSEEK_PK_ID, "sk-deepseek", api_base)
     }
 
     /// (OpenAI inbound) × (Anthropic upstream) × (non-streaming).
@@ -1564,8 +1624,9 @@ data: [DONE]\n\n";
             .await;
 
         let snap = AisixSnapshot::new();
-        snap.models
-            .insert(anthropic_model_entry("my-claude", &upstream.uri()));
+        snap.provider_keys
+            .insert(matrix_anthropic_pk(&upstream.uri()));
+        snap.models.insert(anthropic_model_entry("my-claude"));
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-claude"]));
         let hub = Arc::new(Hub::new());
@@ -1624,8 +1685,9 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             .await;
 
         let snap = AisixSnapshot::new();
-        snap.models
-            .insert(anthropic_model_entry("my-claude", &upstream.uri()));
+        snap.provider_keys
+            .insert(matrix_anthropic_pk(&upstream.uri()));
+        snap.models.insert(anthropic_model_entry("my-claude"));
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-claude"]));
         let hub = Arc::new(Hub::new());
@@ -1692,8 +1754,8 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             .await;
 
         let snap = AisixSnapshot::new();
-        snap.models
-            .insert(gemini_model_entry("my-gemini", &upstream.uri()));
+        snap.provider_keys.insert(matrix_gemini_pk(&upstream.uri()));
+        snap.models.insert(gemini_model_entry("my-gemini"));
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-gemini"]));
         let hub = Arc::new(Hub::new());
@@ -1745,8 +1807,9 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             .await;
 
         let snap = AisixSnapshot::new();
-        snap.models
-            .insert(deepseek_model_entry("my-deepseek", &upstream.uri()));
+        snap.provider_keys
+            .insert(matrix_deepseek_pk(&upstream.uri()));
+        snap.models.insert(deepseek_model_entry("my-deepseek"));
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-deepseek"]));
         let hub = Arc::new(Hub::new());

@@ -105,21 +105,11 @@ async fn dispatch(
     }
 
     let model = &model_entry.value;
-
-    let api_key = model.provider_config.api_key.as_str().to_string();
-    if api_key.is_empty() {
-        return Err(ProxyError::Bridge(aisix_gateway::BridgeError::Config(
-            "provider_config.api_key is empty".into(),
-        )));
-    }
-
-    let upstream_model = model
-        .upstream_model()
-        .ok_or_else(|| ProxyError::InvalidRequest("model field missing provider/ prefix".into()))?
-        .to_string();
-
+    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?.to_string();
+    let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
     let provider_label = model
-        .provider()
+        .provider
         .map(|p| format!("{p:?}").to_lowercase())
         .unwrap_or_else(|| "unknown".to_string());
 
@@ -129,12 +119,12 @@ async fn dispatch(
     }
 
     // Build upstream URL: {base}/v1/rerank
-    let base = match model.base_url() {
+    let base = match pk_entry.value.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
         _ => {
             // Derive a sensible default base from the provider.
             model
-                .provider()
+                .provider
                 .and_then(default_base_for_provider)
                 .unwrap_or_else(|| "https://api.cohere.ai".to_string())
         }
@@ -246,12 +236,27 @@ mod tests {
         }
     }
 
-    fn openai_model(name: &str, api_base: &str) -> ResourceEntry<Model> {
+    const PK_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+    fn openai_model(name: &str) -> ResourceEntry<Model> {
         let json = format!(
-            r#"{{"name":"{name}","model":"openai/text-embedding-3-small","provider_config":{{"api_key":"sk-test","api_base":"{api_base}"}}}}"#
+            r#"{{"display_name":"{name}","provider":"openai","model_name":"text-embedding-3-small","provider_key_id":"{PK_ID}"}}"#
         );
         let m: Model = serde_json::from_str(&json).unwrap();
         ResourceEntry::new("m-1", m, 1)
+    }
+
+    fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json =
+            format!(r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}"}}"#);
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
+    fn new_snap(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(provider_key_entry(api_base));
+        snap
     }
 
     fn apikey_entry(allowed: &[&str]) -> ResourceEntry<ApiKey> {
@@ -281,7 +286,7 @@ mod tests {
 
     #[tokio::test]
     async fn unauthenticated_returns_401() {
-        let snap = AisixSnapshot::new();
+        let snap = new_snap("http://unused");
         let app = build_app(snap);
 
         let req = Request::builder()
@@ -299,7 +304,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_model_returns_404() {
-        let snap = AisixSnapshot::new();
+        let snap = new_snap("http://unused");
         snap.apikeys.insert(apikey_entry(&["*"]));
         let app = build_app(snap);
 
@@ -316,9 +321,8 @@ mod tests {
 
     #[tokio::test]
     async fn forbidden_model_returns_403() {
-        let snap = AisixSnapshot::new();
-        snap.models
-            .insert(openai_model("rerank-model", "https://api.openai.com"));
+        let snap = new_snap("https://api.openai.com");
+        snap.models.insert(openai_model("rerank-model"));
         snap.apikeys.insert(apikey_entry(&["other-model"]));
         let app = build_app(snap);
 
@@ -344,9 +348,8 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let snap = AisixSnapshot::new();
-        snap.models
-            .insert(openai_model("my-reranker", &upstream.uri()));
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(openai_model("my-reranker"));
         snap.apikeys.insert(apikey_entry(&["*"]));
         let app = build_app(snap);
 

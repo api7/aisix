@@ -1,25 +1,23 @@
-//! `Model` entity — the routing target users reference from API requests
-//! (spec §3).
+//! `Model` entity — the routing target users reference from API requests.
 //!
-//! A Model has a user-chosen unique `name`, a canonical `model` id of the
-//! form `<provider>/<model_name>`, a `provider_config` block with the
-//! upstream API key, an optional `timeout`, and an optional `rate_limit`.
+//! A Model has a user-chosen unique `display_name`, an explicit
+//! `provider` enum, an upstream `model_name` (e.g. "gpt-4o"), and a
+//! `provider_key_id` referencing a [`ProviderKey`] entry that supplies
+//! the secret + optional `api_base` override.
 //!
-//! etcd path: `{prefix}/models/{uuid}`. Secondary index on `name`.
+//! Routing models — virtual routers that pick a target Model per request
+//! — set `routing` instead of `provider`/`model_name`/`provider_key_id`.
+//! See [`Model::is_routing`].
+//!
+//! etcd path: `{prefix}/models/{uuid}`. Secondary index on `display_name`.
 
-use once_cell::sync::Lazy;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use super::rate_limit::RateLimit;
 use super::routing::Routing;
 use crate::resource::Resource;
 
-static MODEL_ID_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^(anthropic|deepseek|gemini|openai|router)/.+$").unwrap());
-
-/// Supported provider prefixes. The `model` field must start with one of these
-/// followed by `/<upstream-model-id>`.
+/// Supported upstream providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
@@ -49,18 +47,6 @@ impl Provider {
     }
 }
 
-/// Upstream provider credentials and endpoint override.
-///
-/// Per spec §3, ProviderConfig is *untagged* — the provider type is derived
-/// from the `model` field's prefix, not from a discriminator in this struct.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderConfig {
-    pub api_key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_base: Option<String>,
-}
-
 /// Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -83,9 +69,27 @@ impl ModelCost {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Model {
-    pub name: String,
-    pub model: String,
-    pub provider_config: ProviderConfig,
+    /// Operator-facing unique label. Surfaces on `/v1/models`,
+    /// `req.model` on chat completions, ApiKey.allowed_models, and
+    /// the dashboard model list. `Resource::name()` returns this.
+    pub display_name: String,
+
+    /// Upstream provider. None for routing models (the router picks
+    /// a target whose own `provider` is used at dispatch time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Provider>,
+
+    /// Upstream model id sent to the provider (e.g. "gpt-4o",
+    /// "claude-sonnet-4-5"). None for routing models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+
+    /// References a `ProviderKey` row by id. The bridge resolves this
+    /// against `AisixSnapshot::provider_keys` at dispatch time to
+    /// fetch the upstream secret + optional `api_base`. None for
+    /// routing models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_key_id: Option<String>,
 
     /// Request timeout in ms. 0 or absent = no timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,12 +98,10 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
 
-    /// Optional routing config. When present, the proxy treats this Model
-    /// as a *virtual* router: it picks one of the listed targets per the
-    /// strategy and dispatches through that target's bridge instead of
-    /// using `model` / `provider_config` on this entity. The base `model`
-    /// field is still required (use the `router/<name>` prefix to make
-    /// the intent obvious to operators).
+    /// Virtual-router config. When set, the proxy walks `routing.targets`
+    /// to pick a downstream Model and dispatches against THAT model's
+    /// `provider` / `model_name` / `provider_key_id`. The fields on
+    /// this entity are intentionally absent in that case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<Routing>,
 
@@ -115,45 +117,16 @@ pub struct Model {
 }
 
 impl Model {
-    /// Parse the `<provider>/<model_name>` prefix. Returns `None` for
-    /// the `router/...` virtual-routing form (which intentionally has
-    /// no upstream provider) and for malformed values.
-    pub fn provider(&self) -> Option<Provider> {
-        let (prefix, _) = self.model.split_once('/')?;
-        match prefix {
-            "openai" => Some(Provider::Openai),
-            "anthropic" => Some(Provider::Anthropic),
-            "gemini" => Some(Provider::Gemini),
-            "deepseek" => Some(Provider::Deepseek),
-            _ => None,
-        }
-    }
-
     /// Whether this Model is a virtual router (proxy walks `routing.targets`
-    /// instead of dispatching its own provider config).
+    /// instead of dispatching its own upstream config).
     pub fn is_routing(&self) -> bool {
         self.routing.is_some()
     }
 
-    /// Returns the upstream-facing model id (everything after the first `/`).
+    /// Convenience: borrow the upstream model id if this Model is a
+    /// direct (non-routing) entry.
     pub fn upstream_model(&self) -> Option<&str> {
-        self.model.split_once('/').map(|(_, m)| m)
-    }
-
-    /// The base URL reqwest should use — provider default or the explicit
-    /// `api_base` override.
-    pub fn base_url(&self) -> Option<String> {
-        let base = self
-            .provider_config
-            .api_base
-            .clone()
-            .or_else(|| self.provider().map(|p| p.default_base_url().to_string()))?;
-        Some(base)
-    }
-
-    /// True if the model id matches the spec regex.
-    pub fn has_valid_model_id(&self) -> bool {
-        MODEL_ID_RE.is_match(&self.model)
+        self.model_name.as_deref()
     }
 }
 
@@ -163,7 +136,7 @@ impl Resource for Model {
     }
 
     fn name(&self) -> &str {
-        &self.name
+        &self.display_name
     }
 
     fn kind() -> &'static str {
@@ -177,12 +150,10 @@ mod tests {
 
     fn sample_json() -> &'static str {
         r#"{
-          "name": "my-gpt4",
-          "model": "openai/gpt-4o",
-          "provider_config": {
-            "api_key": "sk-redacted",
-            "api_base": "https://api.openai.com/v1"
-          },
+          "display_name": "my-gpt4",
+          "provider": "openai",
+          "model_name": "gpt-4o",
+          "provider_key_id": "11111111-1111-1111-1111-111111111111",
           "timeout": 30000,
           "rate_limit": {"rpm": 100, "tpm": 100000}
         }"#
@@ -191,32 +162,23 @@ mod tests {
     #[test]
     fn deserialises_spec_sample() {
         let m: Model = serde_json::from_str(sample_json()).unwrap();
-        assert_eq!(m.name, "my-gpt4");
-        assert_eq!(m.provider(), Some(Provider::Openai));
-        assert_eq!(m.upstream_model(), Some("gpt-4o"));
-        assert_eq!(m.base_url().as_deref(), Some("https://api.openai.com/v1"));
+        assert_eq!(m.display_name, "my-gpt4");
+        assert_eq!(m.provider, Some(Provider::Openai));
+        assert_eq!(m.model_name.as_deref(), Some("gpt-4o"));
+        assert_eq!(
+            m.provider_key_id.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
         assert_eq!(m.timeout, Some(30_000));
         assert_eq!(m.rate_limit.as_ref().unwrap().rpm, Some(100));
-    }
-
-    #[test]
-    fn base_url_falls_back_to_provider_default() {
-        let m: Model = serde_json::from_str(
-            r#"{
-              "name": "x",
-              "model": "anthropic/claude-3",
-              "provider_config": {"api_key": "k"}
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(m.base_url().as_deref(), Some("https://api.anthropic.com"));
     }
 
     #[test]
     fn rejects_unknown_top_level_fields() {
         let r: Result<Model, _> = serde_json::from_str(
             r#"{
-              "name":"x","model":"openai/gpt-4","provider_config":{"api_key":"k"},
+              "display_name":"x","provider":"openai","model_name":"g",
+              "provider_key_id":"pk-1",
               "foo": 1
             }"#,
         );
@@ -224,32 +186,25 @@ mod tests {
     }
 
     #[test]
-    fn has_valid_model_id_matches_spec_regex() {
-        let mk = |s: &str| Model {
-            name: "x".into(),
-            model: s.into(),
-            provider_config: ProviderConfig {
-                api_key: "k".into(),
-                api_base: None,
-            },
-            timeout: None,
-            rate_limit: None,
-            routing: None,
-            cost: None,
-            runtime_id: String::new(),
-        };
-
-        assert!(mk("openai/gpt-4").has_valid_model_id());
-        assert!(mk("anthropic/claude-3.5").has_valid_model_id());
-        assert!(mk("deepseek/dsv3").has_valid_model_id());
-        assert!(mk("gemini/gemini-1.5-pro").has_valid_model_id());
-        assert!(!mk("mistral/large").has_valid_model_id());
-        assert!(!mk("openai").has_valid_model_id());
-        assert!(!mk("openai/").has_valid_model_id());
+    fn routing_form_has_no_provider_or_provider_key_id() {
+        let m: Model = serde_json::from_str(
+            r#"{
+              "display_name": "router-1",
+              "routing": {
+                "strategy": "round_robin",
+                "targets": [{"model": "my-gpt4"}, {"model": "my-claude"}]
+              }
+            }"#,
+        )
+        .unwrap();
+        assert!(m.is_routing());
+        assert!(m.provider.is_none());
+        assert!(m.model_name.is_none());
+        assert!(m.provider_key_id.is_none());
     }
 
     #[test]
-    fn resource_trait_routes_through_name() {
+    fn resource_trait_routes_through_display_name() {
         let mut m: Model = serde_json::from_str(sample_json()).unwrap();
         m.runtime_id = "uuid-1".into();
         assert_eq!(<Model as Resource>::kind(), "models");

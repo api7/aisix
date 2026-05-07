@@ -133,19 +133,15 @@ async fn dispatch(
     }
 
     let model = &model_entry.value;
-    let provider = model
-        .provider()
-        .ok_or_else(|| ProxyError::InvalidRequest("model has no provider prefix".into()))?;
+    let provider = crate::dispatch::require_provider(model)?;
+    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
 
     let bridge = state
         .hub
         .get(provider)
         .ok_or(ProxyError::ProviderUnavailable)?;
 
-    let upstream_model_id = model
-        .upstream_model()
-        .ok_or_else(|| ProxyError::InvalidRequest("model missing provider/ prefix".into()))?
-        .to_string();
+    let upstream_model_id = crate::dispatch::require_upstream_model(model)?.to_string();
 
     let req = EmbeddingRequest {
         model: upstream_model_id,
@@ -155,7 +151,8 @@ async fn dispatch(
     };
 
     let model_arc = Arc::new(model.clone());
-    let ctx = BridgeContext::new(request_id, model_arc);
+    let pk_arc = Arc::new(pk_entry.value.clone());
+    let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
 
     match bridge.embed(&req, &ctx).await {
         Ok(embed_resp) => {
@@ -225,16 +222,32 @@ mod tests {
         }
     }
 
-    fn model_entry(name: &str, api_base: &str) -> ResourceEntry<Model> {
+    const PK_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+    fn model_entry(name: &str) -> ResourceEntry<Model> {
         let json = format!(
             r#"{{
-                "name": "{name}",
-                "model": "openai/text-embedding-3-small",
-                "provider_config": {{"api_key": "sk-up", "api_base": "{api_base}"}}
+                "display_name": "{name}",
+                "provider": "openai",
+                "model_name": "text-embedding-3-small",
+                "provider_key_id": "{PK_ID}"
             }}"#
         );
         let m: Model = serde_json::from_str(&json).unwrap();
         ResourceEntry::new("m-1", m, 1)
+    }
+
+    fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json =
+            format!(r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}"}}"#);
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
+    fn new_snap(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(provider_key_entry(api_base));
+        snap
     }
 
     fn apikey_entry(allowed: &[&str]) -> ResourceEntry<ApiKey> {
@@ -285,8 +298,8 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let snap = AisixSnapshot::new();
-        snap.models.insert(model_entry("my-embed", &upstream.uri()));
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);
@@ -313,8 +326,8 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let snap = AisixSnapshot::new();
-        snap.models.insert(model_entry("my-embed", &upstream.uri()));
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);
@@ -327,8 +340,8 @@ mod tests {
 
     #[tokio::test]
     async fn unauthenticated_request_returns_401() {
-        let snap = AisixSnapshot::new();
-        snap.models.insert(model_entry("my-embed", "http://unused"));
+        let snap = new_snap("http://unused");
+        snap.models.insert(model_entry("my-embed"));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);
@@ -346,8 +359,8 @@ mod tests {
 
     #[tokio::test]
     async fn forbidden_model_returns_403() {
-        let snap = AisixSnapshot::new();
-        snap.models.insert(model_entry("my-embed", "http://unused"));
+        let snap = new_snap("http://unused");
+        snap.models.insert(model_entry("my-embed"));
         snap.apikeys.insert(apikey_entry(&["other-model"]));
 
         let app = build_app(snap);
@@ -360,7 +373,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_model_returns_404() {
-        let snap = AisixSnapshot::new();
+        let snap = new_snap("http://unused");
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);
@@ -380,8 +393,8 @@ mod tests {
             .mount(&upstream)
             .await;
 
-        let snap = AisixSnapshot::new();
-        snap.models.insert(model_entry("my-embed", &upstream.uri()));
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);

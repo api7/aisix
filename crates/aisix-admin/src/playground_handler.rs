@@ -81,16 +81,26 @@ mod tests {
         }
     }
 
-    fn model_entry(name: &str, api_base: &str) -> ResourceEntry<Model> {
+    const PK_ID: &str = "pk-up-1";
+
+    fn model_entry(name: &str) -> ResourceEntry<Model> {
         let json = format!(
             r#"{{
-                "name": "{name}",
-                "model": "openai/gpt-4o",
-                "provider_config": {{"api_key": "sk-up", "api_base": "{api_base}"}}
+                "display_name": "{name}",
+                "provider": "openai",
+                "model_name": "gpt-4o",
+                "provider_key_id": "{PK_ID}"
             }}"#
         );
         let m: Model = serde_json::from_str(&json).unwrap();
         ResourceEntry::new("m-1", m, 1)
+    }
+
+    fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json =
+            format!(r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}"}}"#);
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
     }
 
     fn apikey_entry() -> ResourceEntry<ApiKey> {
@@ -103,7 +113,8 @@ mod tests {
 
     fn build_test_app(upstream_uri: &str) -> Router {
         let snap = AisixSnapshot::new();
-        snap.models.insert(model_entry("gpt4", upstream_uri));
+        snap.models.insert(model_entry("gpt4"));
+        snap.provider_keys.insert(provider_key_entry(upstream_uri));
         snap.apikeys.insert(apikey_entry());
 
         let snapshot = SnapshotHandle::new(snap);

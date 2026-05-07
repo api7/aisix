@@ -81,28 +81,27 @@ fn default_client() -> Client {
         .unwrap_or_else(|_| Client::new())
 }
 
-fn resolve_base(model: &aisix_core::Model) -> String {
-    match model.base_url() {
+fn resolve_base(ctx: &BridgeContext) -> String {
+    match ctx.provider_key.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
         _ => ANTHROPIC_DEFAULT_BASE.to_string(),
     }
 }
 
-fn api_key(model: &aisix_core::Model) -> Result<&str, BridgeError> {
-    let k = &model.provider_config.api_key;
+fn api_key(ctx: &BridgeContext) -> Result<&str, BridgeError> {
+    let k = &ctx.provider_key.secret;
     if k.is_empty() {
-        Err(BridgeError::Config(
-            "provider_config.api_key is empty".into(),
-        ))
+        Err(BridgeError::Config("provider_key.secret is empty".into()))
     } else {
         Ok(k.as_str())
     }
 }
 
-fn upstream_model(model: &aisix_core::Model) -> Result<&str, BridgeError> {
-    model
-        .upstream_model()
-        .ok_or_else(|| BridgeError::Config("model field missing `provider/` prefix".into()))
+fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
+    ctx.model
+        .model_name
+        .as_deref()
+        .ok_or_else(|| BridgeError::Config("model.model_name missing".into()))
 }
 
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
@@ -151,10 +150,9 @@ impl Bridge for AnthropicBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
-        let model = ctx.model.as_ref();
-        let base = resolve_base(model);
-        let key = api_key(model)?;
-        let upstream = upstream_model(model)?;
+        let base = resolve_base(ctx);
+        let key = api_key(ctx)?;
+        let upstream = upstream_model(ctx)?;
 
         let (system, messages) =
             split_system(req).map_err(|e| BridgeError::Config(e.to_string()))?;
@@ -196,10 +194,9 @@ impl Bridge for AnthropicBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
-        let model = ctx.model.as_ref();
-        let base = resolve_base(model);
-        let key = api_key(model)?;
-        let upstream = upstream_model(model)?;
+        let base = resolve_base(ctx);
+        let key = api_key(ctx)?;
+        let upstream = upstream_model(ctx)?;
 
         let (system, messages) =
             split_system(req).map_err(|e| BridgeError::Config(e.to_string()))?;
@@ -268,21 +265,35 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aisix_core::Model;
+    use aisix_core::{Model, ProviderKey};
     use aisix_gateway::{ChatMessage, FinishReason, Role};
     use std::sync::Arc;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn sample_model(base: &str) -> Arc<Model> {
+    fn sample_model() -> Arc<Model> {
+        Arc::new(
+            serde_json::from_str(
+                r#"{
+                    "display_name": "my-claude",
+                    "provider": "anthropic",
+                    "model_name": "claude-sonnet-4-5",
+                    "provider_key_id": "11111111-1111-1111-1111-111111111111"
+                }"#,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn sample_provider_key(base: &str) -> Arc<ProviderKey> {
         let cfg = format!(
-            r#"{{
-                "name": "my-claude",
-                "model": "anthropic/claude-sonnet-4-5",
-                "provider_config": {{"api_key": "sk-ant-test", "api_base": "{base}"}}
-            }}"#
+            r#"{{"display_name":"anthropic-prod","secret":"sk-ant-test","api_base":"{base}"}}"#
         );
         Arc::new(serde_json::from_str(&cfg).unwrap())
+    }
+
+    fn sample_ctx(base: &str) -> BridgeContext {
+        BridgeContext::new("req-1", sample_model(), sample_provider_key(base))
     }
 
     fn req() -> ChatFormat {
@@ -315,7 +326,7 @@ mod tests {
             .await;
 
         let bridge = AnthropicBridge::new();
-        let ctx = BridgeContext::new("req-1", sample_model(&server.uri()));
+        let ctx = sample_ctx(&server.uri());
         let resp = bridge.chat(&req(), &ctx).await.unwrap();
 
         assert_eq!(resp.id, "msg_01");
@@ -340,7 +351,7 @@ mod tests {
             .await;
 
         let bridge = AnthropicBridge::new();
-        let ctx = BridgeContext::new("req-1", sample_model(&server.uri()));
+        let ctx = sample_ctx(&server.uri());
         let err = bridge.chat(&req(), &ctx).await.unwrap_err();
         match err {
             BridgeError::UpstreamStatus { status, message } => {
@@ -361,7 +372,7 @@ mod tests {
             .await;
 
         let bridge = AnthropicBridge::new();
-        let ctx = BridgeContext::new("req-1", sample_model(&server.uri()));
+        let ctx = sample_ctx(&server.uri());
         let err = bridge.chat(&req(), &ctx).await.unwrap_err();
         assert!(matches!(err, BridgeError::UpstreamDecode(_)));
     }
@@ -386,26 +397,19 @@ mod tests {
             .await;
 
         let bridge = AnthropicBridge::new();
-        let ctx = BridgeContext::new("req-1", sample_model(&server.uri()))
-            .with_deadline(Duration::from_millis(50));
+        let ctx = sample_ctx(&server.uri()).with_deadline(Duration::from_millis(50));
         let err = bridge.chat(&req(), &ctx).await.unwrap_err();
         assert!(matches!(err, BridgeError::Timeout { .. }));
     }
 
     #[tokio::test]
     async fn missing_api_key_is_a_config_error() {
-        let mut model: Model = serde_json::from_str(
-            r#"{
-                "name": "bad",
-                "model": "anthropic/claude-sonnet-4-5",
-                "provider_config": {"api_key": "placeholder"}
-            }"#,
-        )
-        .unwrap();
-        model.provider_config.api_key.clear();
+        let mut pk: ProviderKey =
+            serde_json::from_str(r#"{"display_name":"empty","secret":"placeholder"}"#).unwrap();
+        pk.secret.clear();
 
         let bridge = AnthropicBridge::new();
-        let ctx = BridgeContext::new("req-1", Arc::new(model));
+        let ctx = BridgeContext::new("req-1", sample_model(), Arc::new(pk));
         let err = bridge.chat(&req(), &ctx).await.unwrap_err();
         assert!(matches!(err, BridgeError::Config(_)));
     }
@@ -414,7 +418,7 @@ mod tests {
     async fn tool_role_is_rejected_as_config_error() {
         let server = MockServer::start().await;
         let bridge = AnthropicBridge::new();
-        let ctx = BridgeContext::new("req-1", sample_model(&server.uri()));
+        let ctx = sample_ctx(&server.uri());
         let req = ChatFormat::new(
             "my-claude",
             vec![ChatMessage {
@@ -457,7 +461,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             .await;
 
         let bridge = AnthropicBridge::new();
-        let ctx = BridgeContext::new("req-1", sample_model(&server.uri()));
+        let ctx = sample_ctx(&server.uri());
         let mut stream = bridge.chat_stream(&req(), &ctx).await.unwrap();
 
         let mut chunks = Vec::new();
@@ -483,7 +487,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             .await;
 
         let bridge = AnthropicBridge::new();
-        let ctx = BridgeContext::new("req-1", sample_model(&server.uri()));
+        let ctx = sample_ctx(&server.uri());
         match bridge.chat_stream(&req(), &ctx).await {
             Ok(_) => panic!("expected upstream error"),
             Err(BridgeError::UpstreamStatus { status: 500, .. }) => {}
@@ -493,20 +497,19 @@ data: {\"type\":\"message_stop\"}\n\n";
 
     #[test]
     fn resolve_base_honours_override() {
-        let mut m: Model = serde_json::from_str(
-            r#"{
-                "name": "x",
-                "model": "anthropic/claude-sonnet-4-5",
-                "provider_config": {"api_key": "k"}
-            }"#,
+        // Default path: ProviderKey has no api_base → falls back to
+        // ANTHROPIC_DEFAULT_BASE.
+        let pk_default: ProviderKey =
+            serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
+        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_default));
+        assert!(!resolve_base(&ctx).is_empty());
+
+        // api_base override: trailing slash stripped.
+        let pk_override: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"x","secret":"k","api_base":"https://proxy.example.com/"}"#,
         )
         .unwrap();
-        // Default path: Provider::Anthropic.default_base_url() comes
-        // from aisix-core, so just assert that *some* non-empty host
-        // is picked up.
-        assert!(!resolve_base(&m).is_empty());
-
-        m.provider_config.api_base = Some("https://proxy.example.com/".into());
-        assert_eq!(resolve_base(&m), "https://proxy.example.com");
+        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_override));
+        assert_eq!(resolve_base(&ctx), "https://proxy.example.com");
     }
 }

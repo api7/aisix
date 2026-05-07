@@ -61,14 +61,14 @@ pub async fn get_health(
                 .health_tracker
                 .as_ref()
                 .map(|t| {
-                    let level = t.level(&entry.value.name);
+                    let level = t.level(&entry.value.display_name);
                     u8::from(level)
                 })
                 .unwrap_or(0); // no tracker → assume Healthy
 
             ModelHealth {
                 id: entry.id.clone(),
-                name: entry.value.name.clone(),
+                name: entry.value.display_name.clone(),
                 health: health_level,
             }
         })

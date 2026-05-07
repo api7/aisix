@@ -67,16 +67,21 @@ mod tests {
             .mount(&server)
             .await;
 
-        let cfg = format!(
-            r#"{{
-                "name": "my-deepseek",
-                "model": "deepseek/deepseek-chat",
-                "provider_config": {{"api_key": "ds-test", "api_base": "{uri}"}}
-            }}"#,
+        let model: aisix_core::Model = serde_json::from_str(
+            r#"{
+                "display_name": "my-deepseek",
+                "provider": "deepseek",
+                "model_name": "deepseek-chat",
+                "provider_key_id": "11111111-1111-1111-1111-111111111111"
+            }"#,
+        )
+        .unwrap();
+        let pk_cfg = format!(
+            r#"{{"display_name":"ds-prod","secret":"ds-test","api_base":"{uri}"}}"#,
             uri = server.uri()
         );
-        let model: aisix_core::Model = serde_json::from_str(&cfg).unwrap();
-        let ctx = BridgeContext::new("req-1", Arc::new(model));
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_cfg).unwrap();
+        let ctx = BridgeContext::new("req-1", Arc::new(model), Arc::new(pk));
         let req = ChatFormat::new("my-deepseek", vec![ChatMessage::user("ping")]);
 
         let resp = deepseek_bridge().chat(&req, &ctx).await.unwrap();
