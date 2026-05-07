@@ -19,7 +19,7 @@
 //! deterministic behaviour continue to use [`crate::InMemoryStore`].
 
 use aisix_core::resource::ResourceEntry;
-use aisix_core::{ApiKey, Model, ProviderKey};
+use aisix_core::{ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter, ProviderKey};
 use etcd_client::{Client, DeleteOptions, GetOptions};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -32,6 +32,9 @@ use crate::store::{ConfigStore, StoreError};
 pub const MODELS_SUBKEY: &str = "models";
 pub const APIKEYS_SUBKEY: &str = "api_keys";
 pub const PROVIDER_KEYS_SUBKEY: &str = "provider_keys";
+pub const GUARDRAILS_SUBKEY: &str = "guardrails";
+pub const CACHE_POLICIES_SUBKEY: &str = "cache_policies";
+pub const OBSERVABILITY_EXPORTERS_SUBKEY: &str = "observability_exporters";
 
 pub struct EtcdConfigStore {
     client: Mutex<Client>,
@@ -234,6 +237,100 @@ impl ConfigStore for EtcdConfigStore {
 
     async fn delete_provider_key(&self, id: &str) -> Result<bool, StoreError> {
         self.delete_one(&self.key_for(PROVIDER_KEYS_SUBKEY, id))
+            .await
+    }
+
+    async fn put_guardrail(&self, entry: ResourceEntry<Guardrail>) -> Result<(), StoreError> {
+        let key = self.key_for(GUARDRAILS_SUBKEY, &entry.id);
+        self.put_json(&key, &entry.value).await
+    }
+
+    async fn get_guardrail(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<Guardrail>>, StoreError> {
+        let key = self.key_for(GUARDRAILS_SUBKEY, id);
+        Ok(self
+            .get_one::<Guardrail>(&key)
+            .await?
+            .map(|(v, rev)| ResourceEntry::new(id, v, rev)))
+    }
+
+    async fn list_guardrails(&self) -> Result<Vec<ResourceEntry<Guardrail>>, StoreError> {
+        Ok(self
+            .list_range::<Guardrail>(GUARDRAILS_SUBKEY)
+            .await?
+            .into_iter()
+            .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
+            .collect())
+    }
+
+    async fn delete_guardrail(&self, id: &str) -> Result<bool, StoreError> {
+        self.delete_one(&self.key_for(GUARDRAILS_SUBKEY, id)).await
+    }
+
+    async fn put_cache_policy(&self, entry: ResourceEntry<CachePolicy>) -> Result<(), StoreError> {
+        let key = self.key_for(CACHE_POLICIES_SUBKEY, &entry.id);
+        self.put_json(&key, &entry.value).await
+    }
+
+    async fn get_cache_policy(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<CachePolicy>>, StoreError> {
+        let key = self.key_for(CACHE_POLICIES_SUBKEY, id);
+        Ok(self
+            .get_one::<CachePolicy>(&key)
+            .await?
+            .map(|(v, rev)| ResourceEntry::new(id, v, rev)))
+    }
+
+    async fn list_cache_policies(&self) -> Result<Vec<ResourceEntry<CachePolicy>>, StoreError> {
+        Ok(self
+            .list_range::<CachePolicy>(CACHE_POLICIES_SUBKEY)
+            .await?
+            .into_iter()
+            .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
+            .collect())
+    }
+
+    async fn delete_cache_policy(&self, id: &str) -> Result<bool, StoreError> {
+        self.delete_one(&self.key_for(CACHE_POLICIES_SUBKEY, id))
+            .await
+    }
+
+    async fn put_observability_exporter(
+        &self,
+        entry: ResourceEntry<ObservabilityExporter>,
+    ) -> Result<(), StoreError> {
+        let key = self.key_for(OBSERVABILITY_EXPORTERS_SUBKEY, &entry.id);
+        self.put_json(&key, &entry.value).await
+    }
+
+    async fn get_observability_exporter(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<ObservabilityExporter>>, StoreError> {
+        let key = self.key_for(OBSERVABILITY_EXPORTERS_SUBKEY, id);
+        Ok(self
+            .get_one::<ObservabilityExporter>(&key)
+            .await?
+            .map(|(v, rev)| ResourceEntry::new(id, v, rev)))
+    }
+
+    async fn list_observability_exporters(
+        &self,
+    ) -> Result<Vec<ResourceEntry<ObservabilityExporter>>, StoreError> {
+        Ok(self
+            .list_range::<ObservabilityExporter>(OBSERVABILITY_EXPORTERS_SUBKEY)
+            .await?
+            .into_iter()
+            .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
+            .collect())
+    }
+
+    async fn delete_observability_exporter(&self, id: &str) -> Result<bool, StoreError> {
+        self.delete_one(&self.key_for(OBSERVABILITY_EXPORTERS_SUBKEY, id))
             .await
     }
 }

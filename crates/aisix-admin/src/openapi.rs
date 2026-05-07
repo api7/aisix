@@ -140,6 +140,60 @@ const OPENAPI_JSON: &str = r##"{
       },
       "delete": { "summary": "delete provider key", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
     },
+    "/admin/v1/guardrails": {
+      "get":  { "summary": "list guardrails", "responses": {"200": {"description": "OK"}} },
+      "post": {
+        "summary": "create guardrail",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Guardrail"}}}},
+        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "409": {"description": "duplicate name"}}
+      }
+    },
+    "/admin/v1/guardrails/{id}": {
+      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+      "get":    { "summary": "get guardrail",    "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} },
+      "put":    {
+        "summary": "update guardrail",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Guardrail"}}}},
+        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "404": {"description": "not found"}, "409": {"description": "duplicate name"}}
+      },
+      "delete": { "summary": "delete guardrail", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
+    },
+    "/admin/v1/cache_policies": {
+      "get":  { "summary": "list cache policies", "responses": {"200": {"description": "OK"}} },
+      "post": {
+        "summary": "create cache policy",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CachePolicy"}}}},
+        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "409": {"description": "duplicate name"}}
+      }
+    },
+    "/admin/v1/cache_policies/{id}": {
+      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+      "get":    { "summary": "get cache policy",    "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} },
+      "put":    {
+        "summary": "update cache policy",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CachePolicy"}}}},
+        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "404": {"description": "not found"}, "409": {"description": "duplicate name"}}
+      },
+      "delete": { "summary": "delete cache policy", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
+    },
+    "/admin/v1/observability_exporters": {
+      "get":  { "summary": "list observability exporters", "responses": {"200": {"description": "OK"}} },
+      "post": {
+        "summary": "create observability exporter",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ObservabilityExporter"}}}},
+        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "409": {"description": "duplicate name"}}
+      }
+    },
+    "/admin/v1/observability_exporters/{id}": {
+      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+      "get":    { "summary": "get observability exporter",    "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} },
+      "put":    {
+        "summary": "update observability exporter",
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ObservabilityExporter"}}}},
+        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "404": {"description": "not found"}, "409": {"description": "duplicate name"}}
+      },
+      "delete": { "summary": "delete observability exporter", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
+    },
     "/admin/v1/health": {
       "get": {
         "summary": "per-Model upstream health",
@@ -260,6 +314,43 @@ const OPENAPI_JSON: &str = r##"{
           "output_per_1k": {"type": "number", "minimum": 0, "description": "USD per 1,000 output (completion) tokens"}
         }
       },
+      "Guardrail": {
+        "type": "object",
+        "required": ["name", "kind"],
+        "properties": {
+          "name":       {"type": "string", "example": "block-pii"},
+          "enabled":    {"type": "boolean", "default": true},
+          "hook_point": {"type": "string", "enum": ["input", "output", "both"], "description": "Where in the request lifecycle the guardrail fires."},
+          "fail_open":  {"type": "boolean", "description": "Only honoured for kind=bedrock. true → request through on remote-API failure (with telemetry annotation); false → 422."},
+          "kind":       {"type": "string", "enum": ["keyword", "bedrock"]}
+        },
+        "description": "Discriminated by `kind`. `keyword` carries a `patterns` array of literal/regex blocklist entries. `bedrock` carries `guardrail_id`, `guardrail_version`, `region`, `aws_credentials`, `latency_mode`. See `aisix-core::Guardrail` for the per-kind shape.",
+        "additionalProperties": true
+      },
+      "CachePolicy": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name":                 {"type": "string", "minLength": 1, "maxLength": 120, "example": "expensive-prompts"},
+          "enabled":              {"type": "boolean", "default": true, "description": "Soft kill switch. Disabled policies stay in the snapshot but the cache gate skips them."},
+          "backend":              {"type": "string", "enum": ["memory", "redis", "redis_semantic", "qdrant"], "default": "memory"},
+          "ttl_seconds":          {"type": "integer", "minimum": 1, "maximum": 604800, "default": 3600},
+          "applies_to":           {"type": "string", "minLength": 1, "maxLength": 255, "description": "Optional scope filter (e.g. `model:my-gpt4`, `api_key:k-1`). Absent = all chat completions."},
+          "similarity_threshold": {"type": "number", "minimum": 0, "maximum": 1, "description": "redis_semantic / qdrant only."},
+          "embedding_model":      {"type": "string", "minLength": 1, "maxLength": 120, "description": "redis_semantic / qdrant only."}
+        }
+      },
+      "ObservabilityExporter": {
+        "type": "object",
+        "required": ["name", "kind"],
+        "properties": {
+          "name":     {"type": "string", "minLength": 1, "maxLength": 120, "example": "honeycomb"},
+          "enabled":  {"type": "boolean", "default": true},
+          "kind":     {"type": "string", "enum": ["otlp_http"]},
+          "endpoint": {"type": "string", "description": "Full URL of the OTLP/HTTP traces endpoint, including the `/v1/traces` path. Required when kind=otlp_http."},
+          "headers":  {"type": "object", "additionalProperties": {"type": "string"}, "description": "Static headers attached to every export. Plaintext at MVP — kine wire is mTLS-only."}
+        }
+      },
       "AdminError": {
         "type": "object",
         "required": ["error_msg"],
@@ -319,6 +410,12 @@ mod tests {
             "/admin/v1/apikeys/{id}/rotate",
             "/admin/v1/provider_keys",
             "/admin/v1/provider_keys/{id}",
+            "/admin/v1/guardrails",
+            "/admin/v1/guardrails/{id}",
+            "/admin/v1/cache_policies",
+            "/admin/v1/cache_policies/{id}",
+            "/admin/v1/observability_exporters",
+            "/admin/v1/observability_exporters/{id}",
             "/admin/v1/health",
             "/playground/chat/completions",
         ] {
@@ -334,6 +431,9 @@ mod tests {
             "ApiKey",
             "ApiKeyEntry",
             "ProviderKey",
+            "Guardrail",
+            "CachePolicy",
+            "ObservabilityExporter",
             "RateLimit",
             "Routing",
             "ModelCost",

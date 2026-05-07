@@ -8,6 +8,12 @@
 //! - `GET|PUT|DELETE      /admin/v1/apikeys/:id`
 //! - `GET|POST            /admin/v1/provider_keys`
 //! - `GET|PUT|DELETE      /admin/v1/provider_keys/:id`
+//! - `GET|POST            /admin/v1/guardrails`
+//! - `GET|PUT|DELETE      /admin/v1/guardrails/:id`
+//! - `GET|POST            /admin/v1/cache_policies`
+//! - `GET|PUT|DELETE      /admin/v1/cache_policies/:id`
+//! - `GET|POST            /admin/v1/observability_exporters`
+//! - `GET|PUT|DELETE      /admin/v1/observability_exporters/:id`
 //!
 //! Writes validate against the JSON Schemas from `aisix-core` and reject
 //! duplicate names (409). The storage layer is pluggable via the
@@ -22,10 +28,13 @@
 
 mod apikeys_handlers;
 mod auth;
+mod cache_policies_handlers;
 mod error;
 pub mod etcd_store;
+mod guardrails_handlers;
 mod health_handler;
 mod models_handlers;
+mod observability_exporters_handlers;
 mod openapi;
 mod playground_handler;
 mod provider_keys_handlers;
@@ -84,6 +93,39 @@ pub fn build_router(state: AdminState) -> Router {
             get(provider_keys_handlers::get_provider_key)
                 .put(provider_keys_handlers::update_provider_key)
                 .delete(provider_keys_handlers::delete_provider_key),
+        )
+        .route(
+            "/admin/v1/guardrails",
+            get(guardrails_handlers::list_guardrails)
+                .post(guardrails_handlers::create_guardrail),
+        )
+        .route(
+            "/admin/v1/guardrails/:id",
+            get(guardrails_handlers::get_guardrail)
+                .put(guardrails_handlers::update_guardrail)
+                .delete(guardrails_handlers::delete_guardrail),
+        )
+        .route(
+            "/admin/v1/cache_policies",
+            get(cache_policies_handlers::list_cache_policies)
+                .post(cache_policies_handlers::create_cache_policy),
+        )
+        .route(
+            "/admin/v1/cache_policies/:id",
+            get(cache_policies_handlers::get_cache_policy)
+                .put(cache_policies_handlers::update_cache_policy)
+                .delete(cache_policies_handlers::delete_cache_policy),
+        )
+        .route(
+            "/admin/v1/observability_exporters",
+            get(observability_exporters_handlers::list_observability_exporters)
+                .post(observability_exporters_handlers::create_observability_exporter),
+        )
+        .route(
+            "/admin/v1/observability_exporters/:id",
+            get(observability_exporters_handlers::get_observability_exporter)
+                .put(observability_exporters_handlers::update_observability_exporter)
+                .delete(observability_exporters_handlers::delete_observability_exporter),
         )
         // Health — per-model upstream health levels (0/1/2).
         .route("/admin/v1/health", get(health_handler::get_health))
@@ -669,6 +711,220 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ──────────────────── Guardrails CRUD ────────────────────
+
+    fn guardrail_payload(name: &str) -> Value {
+        json!({
+            "name": name,
+            "kind": "keyword",
+            "patterns": [{"kind": "literal", "value": "secret"}]
+        })
+    }
+
+    #[tokio::test]
+    async fn guardrail_crud_create_list_get_update_delete() {
+        let state = build_state();
+
+        // Create.
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req(
+                "POST",
+                "/admin/v1/guardrails",
+                Some(guardrail_payload("g-1")),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        // Duplicate name → 409.
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req(
+                "POST",
+                "/admin/v1/guardrails",
+                Some(guardrail_payload("g-1")),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // List sees one.
+        let app = build_router(state.clone());
+        let resp = run(app, auth_req("GET", "/admin/v1/guardrails", None)).await;
+        assert_eq!(body_json(resp).await.as_array().unwrap().len(), 1);
+
+        // Update bumps revision.
+        let app = build_router(state.clone());
+        let updated = json!({
+            "name": "g-1",
+            "kind": "keyword",
+            "patterns": [{"kind": "literal", "value": "topsecret"}]
+        });
+        let resp = run(
+            app,
+            auth_req("PUT", &format!("/admin/v1/guardrails/{id}"), Some(updated)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["revision"], 2);
+
+        // Delete + 404.
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req("DELETE", &format!("/admin/v1/guardrails/{id}"), None),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let app = build_router(state);
+        let resp = run(
+            app,
+            auth_req("GET", &format!("/admin/v1/guardrails/{id}"), None),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn guardrail_create_with_invalid_schema_returns_400() {
+        let app = build_router(build_state());
+        // Missing required `kind` field.
+        let resp = run(
+            app,
+            auth_req("POST", "/admin/v1/guardrails", Some(json!({"name": "g-1"}))),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ──────────────────── CachePolicy CRUD ────────────────────
+
+    fn cache_policy_payload(name: &str) -> Value {
+        json!({
+            "name": name,
+            "enabled": true,
+            "ttl_seconds": 600
+        })
+    }
+
+    #[tokio::test]
+    async fn cache_policy_crud_create_list_delete() {
+        let state = build_state();
+
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req(
+                "POST",
+                "/admin/v1/cache_policies",
+                Some(cache_policy_payload("p-1")),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        // Duplicate → 409.
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req(
+                "POST",
+                "/admin/v1/cache_policies",
+                Some(cache_policy_payload("p-1")),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // Get round-trip.
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req("GET", &format!("/admin/v1/cache_policies/{id}"), None),
+        )
+        .await;
+        assert_eq!(body_json(resp).await["value"]["name"], "p-1");
+
+        // Delete.
+        let app = build_router(state);
+        let resp = run(
+            app,
+            auth_req("DELETE", &format!("/admin/v1/cache_policies/{id}"), None),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ──────────────────── ObservabilityExporter CRUD ────────────────────
+
+    fn exporter_payload(name: &str) -> Value {
+        json!({
+            "name": name,
+            "kind": "otlp_http",
+            "endpoint": "https://otel.example.com/v1/traces"
+        })
+    }
+
+    #[tokio::test]
+    async fn observability_exporter_crud_create_list_delete() {
+        let state = build_state();
+
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req(
+                "POST",
+                "/admin/v1/observability_exporters",
+                Some(exporter_payload("oe-1")),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req("GET", "/admin/v1/observability_exporters", None),
+        )
+        .await;
+        assert_eq!(body_json(resp).await.as_array().unwrap().len(), 1);
+
+        let app = build_router(state);
+        let resp = run(
+            app,
+            auth_req(
+                "DELETE",
+                &format!("/admin/v1/observability_exporters/{id}"),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn observability_exporter_rejects_http_endpoint_unless_loopback() {
+        let app = build_router(build_state());
+        let bad = json!({
+            "name": "oe-1",
+            "kind": "otlp_http",
+            "endpoint": "http://attacker.example.com/v1/traces"
+        });
+        let resp = run(
+            app,
+            auth_req("POST", "/admin/v1/observability_exporters", Some(bad)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     // ──────────────────── Health endpoint ────────────────────

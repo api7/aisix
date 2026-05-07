@@ -7,7 +7,7 @@
 //! in the handler layer so the store stays dumb and fast.
 
 use aisix_core::resource::ResourceEntry;
-use aisix_core::{ApiKey, Model, ProviderKey};
+use aisix_core::{ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter, ProviderKey};
 use dashmap::DashMap;
 use std::sync::Arc;
 
@@ -38,6 +38,33 @@ pub trait ConfigStore: Send + Sync + 'static {
     ) -> Result<Option<ResourceEntry<ProviderKey>>, StoreError>;
     async fn list_provider_keys(&self) -> Result<Vec<ResourceEntry<ProviderKey>>, StoreError>;
     async fn delete_provider_key(&self, id: &str) -> Result<bool, StoreError>;
+
+    async fn put_guardrail(&self, entry: ResourceEntry<Guardrail>) -> Result<(), StoreError>;
+    async fn get_guardrail(&self, id: &str)
+        -> Result<Option<ResourceEntry<Guardrail>>, StoreError>;
+    async fn list_guardrails(&self) -> Result<Vec<ResourceEntry<Guardrail>>, StoreError>;
+    async fn delete_guardrail(&self, id: &str) -> Result<bool, StoreError>;
+
+    async fn put_cache_policy(&self, entry: ResourceEntry<CachePolicy>) -> Result<(), StoreError>;
+    async fn get_cache_policy(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<CachePolicy>>, StoreError>;
+    async fn list_cache_policies(&self) -> Result<Vec<ResourceEntry<CachePolicy>>, StoreError>;
+    async fn delete_cache_policy(&self, id: &str) -> Result<bool, StoreError>;
+
+    async fn put_observability_exporter(
+        &self,
+        entry: ResourceEntry<ObservabilityExporter>,
+    ) -> Result<(), StoreError>;
+    async fn get_observability_exporter(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<ObservabilityExporter>>, StoreError>;
+    async fn list_observability_exporters(
+        &self,
+    ) -> Result<Vec<ResourceEntry<ObservabilityExporter>>, StoreError>;
+    async fn delete_observability_exporter(&self, id: &str) -> Result<bool, StoreError>;
 }
 
 /// In-memory store. Thread-safe via DashMap; mainly used by tests, but
@@ -47,6 +74,9 @@ pub struct InMemoryStore {
     models: DashMap<String, ResourceEntry<Model>>,
     apikeys: DashMap<String, ResourceEntry<ApiKey>>,
     provider_keys: DashMap<String, ResourceEntry<ProviderKey>>,
+    guardrails: DashMap<String, ResourceEntry<Guardrail>>,
+    cache_policies: DashMap<String, ResourceEntry<CachePolicy>>,
+    observability_exporters: DashMap<String, ResourceEntry<ObservabilityExporter>>,
 }
 
 impl InMemoryStore {
@@ -109,6 +139,75 @@ impl ConfigStore for InMemoryStore {
 
     async fn delete_provider_key(&self, id: &str) -> Result<bool, StoreError> {
         Ok(self.provider_keys.remove(id).is_some())
+    }
+
+    async fn put_guardrail(&self, entry: ResourceEntry<Guardrail>) -> Result<(), StoreError> {
+        self.guardrails.insert(entry.id.clone(), entry);
+        Ok(())
+    }
+
+    async fn get_guardrail(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<Guardrail>>, StoreError> {
+        Ok(self.guardrails.get(id).map(|r| r.clone()))
+    }
+
+    async fn list_guardrails(&self) -> Result<Vec<ResourceEntry<Guardrail>>, StoreError> {
+        Ok(self.guardrails.iter().map(|r| r.clone()).collect())
+    }
+
+    async fn delete_guardrail(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.guardrails.remove(id).is_some())
+    }
+
+    async fn put_cache_policy(&self, entry: ResourceEntry<CachePolicy>) -> Result<(), StoreError> {
+        self.cache_policies.insert(entry.id.clone(), entry);
+        Ok(())
+    }
+
+    async fn get_cache_policy(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<CachePolicy>>, StoreError> {
+        Ok(self.cache_policies.get(id).map(|r| r.clone()))
+    }
+
+    async fn list_cache_policies(&self) -> Result<Vec<ResourceEntry<CachePolicy>>, StoreError> {
+        Ok(self.cache_policies.iter().map(|r| r.clone()).collect())
+    }
+
+    async fn delete_cache_policy(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.cache_policies.remove(id).is_some())
+    }
+
+    async fn put_observability_exporter(
+        &self,
+        entry: ResourceEntry<ObservabilityExporter>,
+    ) -> Result<(), StoreError> {
+        self.observability_exporters.insert(entry.id.clone(), entry);
+        Ok(())
+    }
+
+    async fn get_observability_exporter(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<ObservabilityExporter>>, StoreError> {
+        Ok(self.observability_exporters.get(id).map(|r| r.clone()))
+    }
+
+    async fn list_observability_exporters(
+        &self,
+    ) -> Result<Vec<ResourceEntry<ObservabilityExporter>>, StoreError> {
+        Ok(self
+            .observability_exporters
+            .iter()
+            .map(|r| r.clone())
+            .collect())
+    }
+
+    async fn delete_observability_exporter(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.observability_exporters.remove(id).is_some())
     }
 }
 

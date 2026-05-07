@@ -30,10 +30,11 @@ pub use error::{
     AdminError, AdminErrorEnvelope, BootstrapError, ProxyError, ProxyErrorEnvelope, RateLimitScope,
 };
 pub use models::{
-    validate_apikey, validate_guardrail, validate_model, validate_provider_key, AisixSnapshot,
-    ApiKey, Guardrail, GuardrailHookPoint, GuardrailKind, KeywordConfig, KeywordPattern, Model,
-    Provider, ProviderConfig, ProviderKey, RateLimit, Routing, RoutingStrategy, RoutingTarget,
-    SchemaError,
+    validate_apikey, validate_cache_policy, validate_guardrail, validate_model,
+    validate_observability_exporter, validate_provider_key, AisixSnapshot, ApiKey, CachePolicy,
+    ExporterKind, Guardrail, GuardrailHookPoint, GuardrailKind, KeywordConfig, KeywordPattern,
+    Model, ObservabilityExporter, Provider, ProviderConfig, ProviderKey, RateLimit, Routing,
+    RoutingStrategy, RoutingTarget, SchemaError,
 };
 pub use resource::{Resource, ResourceEntry};
 pub use snapshot::{ResourceTable, SnapshotHandle};
