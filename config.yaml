@@ -26,7 +26,7 @@ server:
       allowed_methods: [ "GET", "POST" ]
       allowed_headers: [ "Authorization", "Content-Type" ]
       exposed_headers: []
-      allow_credentials: true
+      allow_credentials: false
   admin:
     listen: 127.0.0.1:3001
     tls:
