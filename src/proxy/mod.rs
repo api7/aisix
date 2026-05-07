@@ -1,5 +1,6 @@
 mod handlers;
 mod hooks;
+pub(crate) mod message_history;
 mod middlewares;
 mod provider;
 mod utils;
@@ -13,6 +14,7 @@ use axum::{
     routing::{get, post},
 };
 
+use self::message_history::MessageHistoryStorage;
 use crate::{
     config::{Config, entities::ResourceRegistry},
     gateway::Gateway,
@@ -24,6 +26,7 @@ pub struct AppState {
     config: Arc<Config>,
     resources: Arc<ResourceRegistry>,
     gateway: Arc<Gateway>,
+    message_history_storage: Arc<dyn MessageHistoryStorage>,
 }
 
 impl AppState {
@@ -31,11 +34,13 @@ impl AppState {
         config: Arc<Config>,
         resources: Arc<ResourceRegistry>,
         gateway: Arc<Gateway>,
+        message_history_storage: Arc<dyn MessageHistoryStorage>,
     ) -> Self {
         Self {
             config,
             resources,
             gateway,
+            message_history_storage,
         }
     }
 
@@ -45,6 +50,10 @@ impl AppState {
 
     pub fn gateway(&self) -> Arc<Gateway> {
         self.gateway.clone()
+    }
+
+    pub fn message_history_storage(&self) -> Arc<dyn MessageHistoryStorage> {
+        self.message_history_storage.clone()
     }
 }
 

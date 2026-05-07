@@ -61,6 +61,7 @@ impl FormatHandlerAdapter for MessagesAdapter {
     type StreamChunk = AnthropicStreamEvent;
     type Error = MessagesError;
     type Collector = StreamOutputCollector;
+    type LifecycleState = ();
 
     fn span_name() -> &'static str {
         "aisix.llm.messages"

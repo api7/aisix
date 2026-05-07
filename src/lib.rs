@@ -86,19 +86,19 @@ pub async fn run_with_provider(
 ) -> Result<()> {
     let resources =
         Arc::new(config::entities::ResourceRegistry::new(config_provider.clone()).await);
+    let message_history_storage: Arc<dyn proxy::message_history::MessageHistoryStorage> =
+        Arc::new(proxy::message_history::InMemoryMessageHistoryStorage::default());
 
-    let gateway = Arc::new(
-        gateway::Gateway::new(
-            gateway::providers::default_provider_registry()
-                .context("failed to build default gateway provider registry")?,
-        )
-        .with_session_store(Arc::new(gateway::session::InMemorySessionStore::default())),
-    );
+    let gateway = Arc::new(gateway::Gateway::new(
+        gateway::providers::default_provider_registry()
+            .context("failed to build default gateway provider registry")?,
+    ));
 
     let proxy_router = proxy::create_router(proxy::AppState::new(
         config.clone(),
         resources.clone(),
         gateway,
+        message_history_storage,
     ));
 
     let res = select! {

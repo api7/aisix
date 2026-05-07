@@ -14,6 +14,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::ChatMessage;
+
 // ── Request types ──
 
 /// Responses API request.
@@ -100,6 +102,10 @@ pub struct ResponsesApiRequest {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncation: Option<Truncation>,
+
+    /// Internal replay history injected by the proxy before bridge conversion.
+    #[serde(skip)]
+    pub replay_messages: Vec<ChatMessage>,
 }
 
 /// Context management configuration for Responses requests.

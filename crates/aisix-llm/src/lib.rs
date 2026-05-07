@@ -3,7 +3,6 @@ pub mod formats;
 pub mod gateway;
 pub mod provider_instance;
 pub mod providers;
-pub mod session;
 pub mod streams;
 pub mod traits;
 pub mod types;

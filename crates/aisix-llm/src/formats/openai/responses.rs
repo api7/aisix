@@ -84,6 +84,8 @@ impl ChatFormat for ResponsesApiFormat {
             });
         }
 
+        messages.extend(req.replay_messages.iter().cloned());
+
         match &req.input {
             ResponsesInput::Text(text) => messages.push(ChatMessage {
                 role: "user".into(),
@@ -910,7 +912,7 @@ mod tests {
         types::{
             common::{BridgeContext, OpenAIResponsesExtras},
             openai::{
-                ChatCompletionChunk, ChatCompletionResponse,
+                ChatCompletionChunk, ChatCompletionResponse, ChatMessage, MessageContent,
                 responses::{
                     ResponsesApiRequest, ResponsesApiResponse, ResponsesApiStreamEvent,
                     ResponsesOutputItem,
@@ -1030,6 +1032,52 @@ mod tests {
         assert_eq!(extras.previous_response_id.as_deref(), Some("resp_prev"));
         assert_eq!(extras.store, Some(true));
         assert_eq!(extras.metadata.as_ref().unwrap()["request_id"], "req_1");
+    }
+
+    #[test]
+    fn to_hub_prepends_replay_messages_after_system_instructions() {
+        let mut request: ResponsesApiRequest = serde_json::from_value(json!({
+            "model": "gpt-4.1",
+            "input": "current turn",
+            "instructions": "Be concise"
+        }))
+        .unwrap();
+        request.replay_messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: Some(MessageContent::Text("previous user".into())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some(MessageContent::Text("previous assistant".into())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+
+        let (hub, _) = ResponsesApiFormat::to_hub(&request).unwrap();
+
+        assert_eq!(hub.messages.len(), 4);
+        assert_eq!(hub.messages[0].role, "system");
+        assert_eq!(hub.messages[1].role, "user");
+        assert_eq!(hub.messages[2].role, "assistant");
+        assert_eq!(hub.messages[3].role, "user");
+        assert_matches!(
+            hub.messages[1].content.as_ref(),
+            Some(MessageContent::Text(text)) if text == "previous user"
+        );
+        assert_matches!(
+            hub.messages[2].content.as_ref(),
+            Some(MessageContent::Text(text)) if text == "previous assistant"
+        );
+        assert_matches!(
+            hub.messages[3].content.as_ref(),
+            Some(MessageContent::Text(text)) if text == "current turn"
+        );
     }
 
     #[test]

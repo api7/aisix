@@ -31,6 +31,7 @@ impl FormatHandlerAdapter for ChatCompletionsAdapter {
     type StreamChunk = ChatCompletionChunk;
     type Error = ChatCompletionError;
     type Collector = StreamOutputCollector;
+    type LifecycleState = ();
 
     fn span_name() -> &'static str {
         "aisix.llm.chat_completions"

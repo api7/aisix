@@ -1,4 +1,4 @@
-use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
+use std::{pin::Pin, time::Duration};
 
 use bytes::Bytes;
 use futures::Stream;
@@ -8,19 +8,15 @@ use tokio::sync::oneshot;
 
 use crate::{
     error::{GatewayError, Result},
-    formats::{AnthropicMessagesFormat, OpenAIChatFormat, ResponsesApiFormat},
+    formats::{AnthropicMessagesFormat, OpenAIChatFormat},
     provider_instance::{ProviderInstance, ProviderRegistry},
-    session::{SessionStore, StoredSession},
     streams::{BridgedStream, HubChunkStream, NativeStream, aws_event_stream_reader, sse_reader},
     traits::{ChatFormat, NativeHandler, PreparedRequest, StreamReaderKind},
     types::{
         anthropic::AnthropicMessagesRequest,
-        common::{BridgeContext, OpenAIResponsesExtras, Usage},
+        common::{BridgeContext, Usage},
         embed::{EmbedRequestBody, EmbedResponseBody, EmbeddingRequest, EmbeddingResponse},
-        openai::{
-            ChatCompletionRequest, ChatCompletionResponse, ChatMessage,
-            responses::ConversationReference,
-        },
+        openai::{ChatCompletionRequest, ChatCompletionResponse},
         response::ChatResponse,
     },
 };
@@ -34,7 +30,6 @@ enum HttpResponseBody {
 pub struct Gateway {
     registry: ProviderRegistry,
     http_client: reqwest::Client,
-    session_store: Option<Arc<dyn SessionStore>>,
 }
 
 impl Gateway {
@@ -51,15 +46,7 @@ impl Gateway {
         Self {
             registry,
             http_client,
-            session_store: None,
         }
-    }
-
-    /// Enables server-side session state for formats that need it.
-    #[allow(dead_code)]
-    pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
-        self.session_store = Some(store);
-        self
     }
 
     /// Returns the immutable provider registry backing this gateway.
@@ -82,12 +69,19 @@ impl Gateway {
                 .await;
         }
 
-        let (mut hub_request, ctx) = F::to_hub(request)?;
-        if F::name() == ResponsesApiFormat::name() {
-            self.resolve_session(&mut hub_request, &ctx).await?;
-        }
+        let (hub_request, ctx) = F::to_hub(request)?;
+        self.chat_from_hub::<F>(hub_request, ctx, instance).await
+    }
 
-        if stream {
+    /// Executes a bridged hub request without any gateway-owned session state.
+    #[fastrace::trace]
+    async fn chat_from_hub<F: ChatFormat>(
+        &self,
+        hub_request: ChatCompletionRequest,
+        ctx: BridgeContext,
+        instance: &ProviderInstance,
+    ) -> Result<ChatResponse<F>> {
+        if hub_request.stream.unwrap_or(false) {
             let hub_stream = self.call_chat_hub_stream(instance, &hub_request).await?;
             let (usage_tx, usage_rx) = oneshot::channel();
             let bridged_stream = BridgedStream::<F>::new(hub_stream, ctx, usage_tx);
@@ -99,9 +93,6 @@ impl Gateway {
         }
 
         let hub_response = self.call_chat_hub(instance, &hub_request).await?;
-        if F::name() == ResponsesApiFormat::name() {
-            self.save_session(&ctx, &hub_request, &hub_response).await?;
-        }
         let usage = extract_chat_usage_from_response(&hub_response).unwrap_or_default();
         let response = F::from_hub(&hub_response, &ctx)?;
 
@@ -177,61 +168,6 @@ impl Gateway {
         };
 
         transform.transform_embeddings_response(response_body)
-    }
-
-    async fn resolve_session(
-        &self,
-        hub_request: &mut ChatCompletionRequest,
-        ctx: &BridgeContext,
-    ) -> Result<()> {
-        let Some(store) = self.session_store.as_deref() else {
-            return Ok(());
-        };
-        let Some(history) = load_responses_session_messages(store, ctx).await? else {
-            return Ok(());
-        };
-
-        let insert_at = usize::from(responses_instructions_present(ctx));
-        hub_request.messages.splice(insert_at..insert_at, history);
-        Ok(())
-    }
-
-    async fn save_session(
-        &self,
-        ctx: &BridgeContext,
-        hub_request: &ChatCompletionRequest,
-        hub_response: &ChatCompletionResponse,
-    ) -> Result<()> {
-        let Some(store) = self.session_store.as_deref() else {
-            return Ok(());
-        };
-        if matches!(
-            ctx.openai_responses_extras
-                .as_ref()
-                .and_then(|extras| extras.store),
-            Some(false)
-        ) {
-            return Ok(());
-        }
-
-        let mut messages = session_messages_from_hub_request(hub_request, ctx);
-        messages.extend(
-            hub_response
-                .choices
-                .iter()
-                .map(|choice| choice.message.clone()),
-        );
-
-        let session = StoredSession {
-            response_id: hub_response.id.clone(),
-            conversation_id: responses_conversation_id(ctx.openai_responses_extras.as_ref()),
-            messages,
-            model: hub_response.model.clone(),
-            created_at: hub_response.created,
-            insertion_index: 0,
-            metadata: responses_metadata(ctx.openai_responses_extras.as_ref()),
-        };
-        store.put_session(&session).await
     }
 
     fn prepare_json_request(
@@ -381,64 +317,6 @@ impl Gateway {
     }
 }
 
-async fn load_responses_session_messages(
-    store: &dyn SessionStore,
-    ctx: &BridgeContext,
-) -> Result<Option<Vec<ChatMessage>>> {
-    let extras = ctx.openai_responses_extras.as_ref();
-
-    if let Some(previous_response_id) =
-        extras.and_then(|extras| extras.previous_response_id.as_deref())
-    {
-        let session = store
-            .get_by_response_id(previous_response_id)
-            .await?
-            .ok_or_else(|| {
-                GatewayError::Validation(format!(
-                    "previous_response_not_found: {}",
-                    previous_response_id
-                ))
-            })?;
-        return Ok(Some(session.messages));
-    }
-
-    let Some(conversation_id) = responses_conversation_id(extras) else {
-        return Ok(None);
-    };
-    let sessions = store.get_by_conversation_id(&conversation_id).await?;
-    Ok(sessions.last().map(|session| session.messages.clone()))
-}
-
-fn session_messages_from_hub_request(
-    hub_request: &ChatCompletionRequest,
-    ctx: &BridgeContext,
-) -> Vec<ChatMessage> {
-    let skip = usize::from(responses_instructions_present(ctx));
-    hub_request.messages.iter().skip(skip).cloned().collect()
-}
-
-fn responses_instructions_present(ctx: &BridgeContext) -> bool {
-    ctx.openai_responses_extras
-        .as_ref()
-        .and_then(|extras| extras.instructions.as_ref())
-        .is_some_and(|instructions| !instructions.is_empty())
-}
-
-fn responses_conversation_id(extras: Option<&OpenAIResponsesExtras>) -> Option<String> {
-    match extras?.conversation.as_ref()? {
-        ConversationReference::Id(id) => Some(id.clone()),
-        ConversationReference::Descriptor { id } => Some(id.clone()),
-    }
-}
-
-fn responses_metadata(extras: Option<&OpenAIResponsesExtras>) -> HashMap<String, Value> {
-    extras
-        .and_then(|extras| extras.metadata.as_ref())
-        .and_then(Value::as_object)
-        .map(|metadata| metadata.clone().into_iter().collect())
-        .unwrap_or_default()
-}
-
 fn ensure_chat_stream_reader_supported(kind: StreamReaderKind) -> Result<()> {
     match kind {
         StreamReaderKind::Sse | StreamReaderKind::AwsEventStream => Ok(()),
@@ -560,12 +438,10 @@ mod tests {
     use super::Gateway;
     use crate::{
         error::{GatewayError, Result},
-        formats::ResponsesApiFormat,
         provider_instance::{
             AwsStaticCredentials, ProviderAuth, ProviderInstance, ProviderRegistry,
         },
         providers::{AnthropicDef, BedrockDef},
-        session::InMemorySessionStore,
         traits::{
             ChatFormat, ChatTransform, EmbedTransform, NativeHandler, NativeOpenAIResponsesSupport,
             OpenAIResponsesNativeStreamState, PreparedRequest, ProviderCapabilities, ProviderMeta,
@@ -573,7 +449,7 @@ mod tests {
         },
         types::{
             anthropic::{AnthropicContentBlock, AnthropicMessagesRequest},
-            common::{BridgeContext, OpenAIResponsesExtras, Usage},
+            common::{BridgeContext, Usage},
             embed::EmbeddingRequest,
             openai::{
                 ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
@@ -1060,175 +936,6 @@ mod tests {
         assert_eq!(observed.1["messages"][0]["content"], "hello");
 
         server.abort();
-    }
-
-    #[tokio::test]
-    async fn responses_requests_save_and_resolve_previous_response_id_sessions() {
-        let observed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
-        let observed_clone = Arc::clone(&observed);
-        let router = Router::new().route(
-            "/v1/chat/completions",
-            post(move |Json(body): Json<Value>| {
-                let observed = Arc::clone(&observed_clone);
-                async move {
-                    let mut observed = observed.lock().await;
-                    observed.push(body);
-                    let request_number = observed.len();
-                    let reply = if request_number == 1 {
-                        "first reply"
-                    } else {
-                        "second reply"
-                    };
-
-                    Json(json!({
-                        "id": format!("chatcmpl-{}", request_number),
-                        "object": "chat.completion",
-                        "created": request_number,
-                        "model": "gpt-test",
-                        "choices": [{
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": reply
-                            },
-                            "finish_reason": "stop"
-                        }]
-                    }))
-                }
-            }),
-        );
-        let (base_url, server) = spawn_server(router).await;
-
-        let gateway = Gateway::new(ProviderRegistry::builder().build())
-            .with_session_store(Arc::new(InMemorySessionStore::default()));
-        let instance = ProviderInstance {
-            def: Arc::new(HubTestProvider),
-            auth: ProviderAuth::ApiKey("hub-secret".into()),
-            base_url_override: Some(base_url),
-            custom_headers: HeaderMap::new(),
-        };
-
-        let first_request: ResponsesApiRequest = serde_json::from_value(json!({
-            "model": "gpt-test",
-            "input": "hello"
-        }))
-        .unwrap();
-        let first_response = gateway
-            .chat::<ResponsesApiFormat>(&first_request, &instance)
-            .await
-            .unwrap();
-        let ChatResponse::Complete {
-            response: first_response,
-            ..
-        } = first_response
-        else {
-            panic!("expected complete responses response")
-        };
-        assert_eq!(first_response.id, "chatcmpl-1");
-
-        let second_request: ResponsesApiRequest = serde_json::from_value(json!({
-            "model": "gpt-test",
-            "input": "how are you?",
-            "previous_response_id": "chatcmpl-1"
-        }))
-        .unwrap();
-        let second_response = gateway
-            .chat::<ResponsesApiFormat>(&second_request, &instance)
-            .await
-            .unwrap();
-        let ChatResponse::Complete {
-            response: second_response,
-            ..
-        } = second_response
-        else {
-            panic!("expected complete responses response")
-        };
-        assert_eq!(second_response.id, "chatcmpl-2");
-
-        let observed = observed.lock().await;
-        assert_eq!(observed.len(), 2);
-        assert_eq!(observed[0]["messages"][0]["content"], "hello");
-        assert_eq!(observed[1]["messages"][0]["role"], "user");
-        assert_eq!(observed[1]["messages"][0]["content"], "hello");
-        assert_eq!(observed[1]["messages"][1]["role"], "assistant");
-        assert_eq!(observed[1]["messages"][1]["content"], "first reply");
-        assert_eq!(observed[1]["messages"][2]["role"], "user");
-        assert_eq!(observed[1]["messages"][2]["content"], "how are you?");
-
-        server.abort();
-    }
-
-    #[test]
-    fn session_messages_from_hub_request_drops_synthetic_responses_instructions() {
-        let hub_request: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": "gpt-test",
-            "messages": [
-                {"role": "system", "content": "be terse"},
-                {"role": "user", "content": "hello"}
-            ]
-        }))
-        .unwrap();
-        let ctx = BridgeContext {
-            openai_responses_extras: Some(OpenAIResponsesExtras {
-                previous_response_id: None,
-                instructions: Some("be terse".into()),
-                store: None,
-                metadata: None,
-                background: None,
-                context_management: None,
-                conversation: None,
-                include: None,
-                max_tool_calls: None,
-                prompt: None,
-                prompt_cache_key: None,
-                prompt_cache_retention: None,
-                reasoning: None,
-                safety_identifier: None,
-                service_tier: None,
-                stream_options: None,
-                text: None,
-                top_logprobs: None,
-                truncation: None,
-            }),
-            ..Default::default()
-        };
-
-        let session_messages = super::session_messages_from_hub_request(&hub_request, &ctx);
-
-        assert_eq!(session_messages.len(), 1);
-        assert_eq!(session_messages[0].role, "user");
-        assert_matches!(
-            session_messages[0].content.as_ref(),
-            Some(crate::types::openai::MessageContent::Text(text)) if text == "hello"
-        );
-    }
-
-    #[tokio::test]
-    async fn responses_previous_response_id_not_found_returns_validation() {
-        let gateway = Gateway::new(ProviderRegistry::builder().build())
-            .with_session_store(Arc::new(InMemorySessionStore::default()));
-        let instance = ProviderInstance {
-            def: Arc::new(HubTestProvider),
-            auth: ProviderAuth::ApiKey("hub-secret".into()),
-            base_url_override: Some(Url::parse("http://127.0.0.1:1").unwrap()),
-            custom_headers: HeaderMap::new(),
-        };
-        let request: ResponsesApiRequest = serde_json::from_value(json!({
-            "model": "gpt-test",
-            "input": "hello",
-            "previous_response_id": "resp_missing"
-        }))
-        .unwrap();
-
-        let result = gateway
-            .chat::<ResponsesApiFormat>(&request, &instance)
-            .await;
-
-        assert_matches!(
-            result.map(|_| ()),
-            Err(GatewayError::Validation(message))
-                if message.contains("previous_response_not_found")
-        );
     }
 
     #[tokio::test]
