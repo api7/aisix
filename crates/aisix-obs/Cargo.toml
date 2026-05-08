@@ -27,6 +27,7 @@ serde_json.workspace = true
 reqwest.workspace = true
 uuid.workspace = true
 base64.workspace = true
+parking_lot.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true
