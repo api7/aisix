@@ -189,16 +189,16 @@ impl<C: Clock> Limiter<C> {
         }
         if let Some(max) = limits.rpd {
             if let WindowCheck::Full { retry_after_secs } = s.rpd.check_and_increment(now, 1, max) {
-                // Compensate: we already incremented RPM above. Decrement
-                // it so the caller's retry on a different day still
-                // counts correctly. RPM would have rolled by then, so
-                // this is primarily defensive.
-                if s.rpm.current(now) > 0 {
-                    // Roll back the increment we just made.
-                    s.rpm = FixedWindowCounter::new(MINUTE_SECS);
-                    if let Some(max) = limits.rpm {
-                        let _ = s.rpm.check_and_increment(now, 0, max);
-                    }
+                // Compensate: we already incremented RPM above by 1.
+                // Roll back EXACTLY that one increment so concurrent
+                // requests' counts survive. The previous implementation
+                // re-initialised the entire counter (`s.rpm =
+                // FixedWindowCounter::new(...)`) which wiped sibling
+                // increments and silently granted a fresh RPM window —
+                // a hard rate-limit bypass exploitable by tripping RPD.
+                // See issue #109.
+                if limits.rpm.is_some() {
+                    s.rpm.decrement(now, 1);
                 }
                 return Err(RateLimitError::Requests {
                     scope: RateLimitScope::Requests,
@@ -430,5 +430,87 @@ mod tests {
             let r = limiter.pre_commit("k1", &l).unwrap();
             r.commit_tokens(1_000);
         }
+    }
+
+    // ---- regression coverage for issue #109 -------------------------
+    // The previous compensation path overwrote `s.rpm` with a fresh
+    // FixedWindowCounter, wiping concurrent siblings' increments. The
+    // fix replaces the reset with a precise -1 decrement; these tests
+    // pin both the "siblings are preserved" and the "fresh window is
+    // not granted" properties at the same level the exploit happens.
+
+    #[test]
+    fn rpd_rejection_does_not_grant_fresh_rpm_window() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::with_clock(clock.clone());
+        // RPM=10, RPD=20. Drive both close to their caps so the next
+        // request trips RPD, the buggy reset would have masked the
+        // RPM cap on the *very next* call, and the test exercises
+        // that follow-up.
+        let l = RateLimit {
+            rpm: Some(10),
+            rpd: Some(20),
+            tpm: None,
+            tpd: None,
+            concurrency: None,
+        };
+        // Soak up 19 RPM = 19 RPD across two minutes so RPD is at 19.
+        for i in 0..19 {
+            if i == 10 {
+                clock.advance(61); // roll RPM, keep RPD
+            }
+            let _r = limiter.pre_commit("k1", &l).unwrap();
+        }
+        // Now RPM in current minute = 9 (after the rollover), RPD = 19.
+        // One more goes through (RPM 10/10, RPD 20/20).
+        let _r = limiter.pre_commit("k1", &l).unwrap();
+        // The 21st request must fail — RPD is full. Crucially, the
+        // pre-fix bug here resets RPM, so the assertion below would
+        // have falsely succeeded on a buggy build.
+        let err = limiter.pre_commit("k1", &l).unwrap_err();
+        assert!(
+            matches!(err, RateLimitError::Requests { .. }),
+            "expected RPD rejection, got {err:?}"
+        );
+        // The next request must STILL fail RPM — proving RPM wasn't
+        // wiped by the rejected request. With the pre-fix reset, this
+        // would have succeeded (silent rate-limit bypass).
+        let err2 = limiter.pre_commit("k1", &l).unwrap_err();
+        assert!(
+            matches!(err2, RateLimitError::Requests { .. }),
+            "RPM should still be capped after RPD rejection; got {err2:?}"
+        );
+        // RPM still reads 10 (the cap), not 0 (a wiped counter).
+        let status = limiter.peek("k1", &l).unwrap();
+        assert_eq!(status.rpm_used, 10, "RPM should not have been reset");
+    }
+
+    #[test]
+    fn rpd_rejection_preserves_concurrent_rpm_increments() {
+        // Same shape, but exercises the "sibling increments survive"
+        // angle directly: drive RPM up to 5 with five accepted
+        // requests, then trip RPD on the sixth. The accepted five
+        // must remain counted.
+        let clock = TestClock::new(100);
+        let limiter = Limiter::with_clock(clock.clone());
+        let l = RateLimit {
+            rpm: Some(100), // very high — RPM never trips here
+            rpd: Some(5),
+            tpm: None,
+            tpd: None,
+            concurrency: None,
+        };
+        for _ in 0..5 {
+            let _r = limiter.pre_commit("k1", &l).unwrap();
+        }
+        // RPM=5, RPD=5/5. Sixth request fails RPD.
+        let err = limiter.pre_commit("k1", &l).unwrap_err();
+        assert!(matches!(err, RateLimitError::Requests { .. }));
+        // RPM still reflects the FIVE accepted requests, not zero.
+        let status = limiter.peek("k1", &l).unwrap();
+        assert_eq!(
+            status.rpm_used, 5,
+            "rpd rejection wiped concurrent rpm increments"
+        );
     }
 }

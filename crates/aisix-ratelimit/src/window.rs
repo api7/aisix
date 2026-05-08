@@ -70,6 +70,21 @@ impl FixedWindowCounter {
         self.count = self.count.saturating_add(delta);
     }
 
+    /// Decrement the current window's count by `delta`, saturating at
+    /// zero. No-op when `now_secs` falls outside the current window —
+    /// the increment we want to undo has already been wiped by the
+    /// roll-over, and applying the decrement to the fresh window would
+    /// destroy unrelated counts. Used by the limiter to compensate for
+    /// the RPM increment when a sibling RPD cap rejects the same
+    /// request: only that one increment must roll back, not any
+    /// concurrent ones from other in-flight reservations.
+    pub fn decrement(&mut self, now_secs: u64, delta: u64) {
+        let bucket_start = (now_secs / self.window_secs) * self.window_secs;
+        if bucket_start == self.window_start {
+            self.count = self.count.saturating_sub(delta);
+        }
+    }
+
     pub fn current(&mut self, now_secs: u64) -> u64 {
         self.roll_if_stale(now_secs);
         self.count
@@ -154,6 +169,40 @@ mod tests {
         let mut w = FixedWindowCounter::new(60);
         assert_eq!(w.check_and_increment(100, 0, 5), WindowCheck::Ok);
         assert_eq!(w.current(100), 0);
+    }
+
+    #[test]
+    fn decrement_reduces_current_window_count_only() {
+        let mut w = FixedWindowCounter::new(60);
+        // Window is [60, 120). Two increments at second 100.
+        w.check_and_increment(100, 1, 100);
+        w.check_and_increment(100, 1, 100);
+        assert_eq!(w.current(100), 2);
+
+        // Roll back one. Concurrent siblings' counts should survive.
+        w.decrement(100, 1);
+        assert_eq!(w.current(100), 1);
+
+        // Saturating: undoing more than was counted goes to zero,
+        // never wraps.
+        w.decrement(100, 100);
+        assert_eq!(w.current(100), 0);
+    }
+
+    #[test]
+    fn decrement_is_noop_after_window_rollover() {
+        let mut w = FixedWindowCounter::new(60);
+        // Counter is at 5 in window [60, 120).
+        for _ in 0..5 {
+            w.check_and_increment(100, 1, 100);
+        }
+        // Caller observed at second 100 then tries to roll back at
+        // second 200 (window [180, 240)). The increment they'd undo
+        // is in the *previous* window, which has already rolled. We
+        // must NOT subtract from the new window — that would corrupt
+        // unrelated counts.
+        w.decrement(200, 1);
+        assert_eq!(w.current(200), 0); // fresh window untouched
     }
 
     #[test]
