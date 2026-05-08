@@ -44,20 +44,6 @@ use aws_smithy_runtime_api::http::Response;
 
 use crate::{Guardrail, GuardrailVerdict};
 
-/// Deployment-wide override for the Bedrock endpoint URL. Read by
-/// `BedrockGuardrail::new` (production code path); unset means the
-/// SDK default (real AWS) is used.
-///
-/// Set this in `e2e/compose.yml` to point the DP at a local
-/// fakecloud / LocalStack instance. Operators of self-hosted
-/// stacks behind an outbound HTTP proxy can also use this to route
-/// through their proxy.
-///
-/// Scoped to the env var name (not a per-guardrail config field)
-/// because endpoint overrides are a deployment concern, not a
-/// per-row configuration that a tenant should be able to set.
-pub const BEDROCK_ENDPOINT_URL_ENV_VAR: &str = "AISIX_BEDROCK_ENDPOINT_URL";
-
 /// One Bedrock guardrail row, materialised into a request-time
 /// dispatcher. Built once per snapshot from
 /// [`aisix_core::models::Guardrail`] + plaintext credentials.
@@ -80,7 +66,14 @@ pub struct BedrockGuardrail {
 impl BedrockGuardrail {
     /// Build the dispatcher from a parsed [`BedrockConfig`]. Caller
     /// owns the row's `name`, `hook_point`, and `fail_open` (they
-    /// live on the outer Guardrail struct, not on the kind config).
+    /// live on the outer Guardrail struct, not on the kind config),
+    /// plus the optional deployment-wide `endpoint_url` override
+    /// (sourced from `aisix_core::Config::bedrock_endpoint_url` —
+    /// `None` means the SDK default, i.e. real AWS Bedrock).
+    ///
+    /// Empty-string overrides are treated as unset by the caller so
+    /// a `docker run -e AISIX_BEDROCK_ENDPOINT_URL=` doesn't
+    /// accidentally redirect; this constructor doesn't filter again.
     ///
     /// Synchronous on purpose: the snapshot rebuild path is sync (a
     /// blocking call from inside the etcd-watch supervisor's
@@ -93,16 +86,8 @@ impl BedrockGuardrail {
         cfg: &BedrockConfig,
         hook_point: GuardrailHookPoint,
         fail_open: bool,
+        endpoint_url: Option<String>,
     ) -> Self {
-        // Honor the deployment-wide endpoint override. This lets the
-        // e2e suite point at fakecloud (or any AWS-compatible local
-        // mock) without changing the cp-api wire shape, and lets a
-        // self-hosted operator route Bedrock through a proxy. Empty
-        // string is treated as unset so a `docker run -e
-        // AISIX_BEDROCK_ENDPOINT_URL=` doesn't accidentally redirect.
-        let endpoint_url = std::env::var(BEDROCK_ENDPOINT_URL_ENV_VAR)
-            .ok()
-            .filter(|s| !s.is_empty());
         if let Some(url) = endpoint_url.as_ref() {
             // Visible at INFO so an operator inspecting DP logs sees
             // "Bedrock isn't talking to AWS" without having to grep
@@ -111,17 +96,16 @@ impl BedrockGuardrail {
             tracing::info!(
                 endpoint = %url,
                 guardrail_id = %cfg.guardrail_id,
-                "BedrockGuardrail using endpoint URL override (AISIX_BEDROCK_ENDPOINT_URL)",
+                "BedrockGuardrail using endpoint URL override (Config.bedrock_endpoint_url)",
             );
         }
         Self::with_endpoint(row_name, cfg, hook_point, fail_open, endpoint_url)
     }
 
     /// Internal constructor that accepts an optional `endpoint_url`
-    /// override. Production calls `new()` (None → real AWS Bedrock);
-    /// tests pass a wiremock URL to point the SDK at a local
-    /// canned-response server. Also used by anyone wiring Bedrock
-    /// against a self-hosted gateway / proxy.
+    /// override. Production calls `new()` with the value forwarded
+    /// from `Config::bedrock_endpoint_url`; tests pass a wiremock
+    /// URL to point the SDK at a local canned-response server.
     fn with_endpoint(
         row_name: impl Into<String>,
         cfg: &BedrockConfig,
@@ -414,7 +398,16 @@ mod tests {
     }
 
     fn build_test(fail_open: bool) -> BedrockGuardrail {
-        BedrockGuardrail::new("test-row", &cfg(), GuardrailHookPoint::Both, fail_open)
+        // None → SDK default endpoint (we never call .apply() in
+        // these tests, so it doesn't matter that it would point at
+        // real AWS).
+        BedrockGuardrail::new(
+            "test-row",
+            &cfg(),
+            GuardrailHookPoint::Both,
+            fail_open,
+            None,
+        )
     }
 
     // --- wiremock integration tests --------------------------------
@@ -592,21 +585,15 @@ mod tests {
         }
     }
 
-    // The env-var path (`new()` reads `AISIX_BEDROCK_ENDPOINT_URL`)
-    // isn't unit-tested here because:
-    //   1. `aisix-guardrails` declares `#![forbid(unsafe_code)]` and
-    //      `std::env::set_var` is unsafe in modern Rust; the
-    //      forbidden lint can't be relaxed for a single test without
-    //      moving it to a separate `tests/` integration binary.
-    //   2. The override logic is two lines of trivial mapping
-    //      (`env::var().ok().filter(non-empty)`) → `with_endpoint`,
-    //      which the wiremock tests above already exercise
-    //      thoroughly.
-    //   3. The deployment-wide override is verified end-to-end by
-    //      `dashboard/tests/e2e/bedrock-live.spec.ts` against a real
-    //      fakecloud sidecar — see PRD-09c §6.7 + the e2e compose
-    //      file. That's the contract test that catches a regression
-    //      where the env var stops being read.
+    // The endpoint-override pass-through (Config field →
+    // BedrockGuardrail::new → with_endpoint) is exercised by the
+    // wiremock tests above, which thread the URL in via the public
+    // `new()` constructor. The Config-loading side (env var
+    // `AISIX_BEDROCK_ENDPOINT_URL` → `Config::bedrock_endpoint_url`)
+    // is covered by `aisix-core`'s config tests. The end-to-end
+    // contract — operator sets env var, DP redirects Bedrock calls —
+    // is verified by the downstream e2e suite against a real
+    // fakecloud sidecar.
 
     /// `latency_mode=timed` + Bedrock takes longer than the timeout
     /// → tagged `bedrock_timeout`. wiremock's `set_delay` makes the

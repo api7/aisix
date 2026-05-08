@@ -462,8 +462,15 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // adding the wrapper costs one mutex + ptr-compare per chat,
     // never a regex compile on the hot path. See
     // `aisix_guardrails::LiveGuardrailChain`.
+    //
+    // `bedrock_endpoint_url` is the deployment-wide override for
+    // kind=bedrock guardrails; empty string is normalized to
+    // `None` so a `docker run -e AISIX_BEDROCK_ENDPOINT_URL=`
+    // doesn't accidentally redirect Bedrock calls into thin air.
+    let bedrock_endpoint_url = cfg.bedrock_endpoint_url.clone().filter(|s| !s.is_empty());
     proxy_state = proxy_state.with_guardrails(aisix_guardrails::LiveGuardrailChain::new(
         snapshot_handle.clone(),
+        bedrock_endpoint_url,
     ));
     // Clone shared trackers before consuming proxy_state in build_router.
     let health_tracker = proxy_state.health.clone();

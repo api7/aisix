@@ -30,7 +30,16 @@ use crate::{Guardrail, GuardrailChain, GuardrailVerdict};
 /// row produces at most one runtime `dyn Guardrail`. Failures
 /// (invalid regex, etc.) are logged and the row is skipped — same
 /// contract the loader uses for malformed etcd rows.
-pub fn build_chain_from_snapshot(table: &ResourceTable<DomainGuardrail>) -> GuardrailChain {
+///
+/// `bedrock_endpoint_url` is the deployment-wide override for the
+/// AWS Bedrock endpoint URL (sourced from
+/// `aisix_core::Config::bedrock_endpoint_url`). `None` → SDK
+/// default (real AWS Bedrock); `Some(url)` → every kind=bedrock
+/// dispatcher built from this snapshot is pointed at `url`.
+pub fn build_chain_from_snapshot(
+    table: &ResourceTable<DomainGuardrail>,
+    bedrock_endpoint_url: Option<&str>,
+) -> GuardrailChain {
     let mut chain: Vec<Arc<dyn Guardrail>> = Vec::new();
 
     let entries = table.entries();
@@ -39,7 +48,7 @@ pub fn build_chain_from_snapshot(table: &ResourceTable<DomainGuardrail>) -> Guar
         if !row.enabled {
             continue;
         }
-        match build_one(row) {
+        match build_one(row, bedrock_endpoint_url) {
             Ok(Some(g)) => chain.push(g),
             Ok(None) => {
                 // Rule was technically valid but inert (e.g. empty
@@ -60,7 +69,10 @@ pub fn build_chain_from_snapshot(table: &ResourceTable<DomainGuardrail>) -> Guar
     GuardrailChain::new(chain)
 }
 
-fn build_one(row: &DomainGuardrail) -> Result<Option<Arc<dyn Guardrail>>, BuildError> {
+fn build_one(
+    row: &DomainGuardrail,
+    bedrock_endpoint_url: Option<&str>,
+) -> Result<Option<Arc<dyn Guardrail>>, BuildError> {
     match &row.config {
         GuardrailKind::Keyword(cfg) => {
             if cfg.patterns.is_empty() {
@@ -95,12 +107,14 @@ fn build_one(row: &DomainGuardrail) -> Result<Option<Arc<dyn Guardrail>>, BuildE
             // Phase 2: build the AWS-SDK-backed dispatcher. cp-api
             // already decrypted the secret at projection time, so
             // the BedrockConfig in the snapshot carries plaintext
-            // credentials.
+            // credentials. The endpoint URL is forwarded from
+            // bootstrap config (Config.bedrock_endpoint_url).
             let g = crate::bedrock::BedrockGuardrail::new(
                 row.name.clone(),
                 cfg,
                 row.hook_point,
                 row.fail_open,
+                bedrock_endpoint_url.map(str::to_owned),
             );
             Ok(Some(Arc::new(g)))
         }
@@ -143,8 +157,14 @@ enum BuildError {
 /// Compilation only happens on the first call after each snapshot
 /// store from the etcd supervisor — typical run is one or zero
 /// rebuilds per minute even on a chatty configuration.
+///
+/// `bedrock_endpoint_url` is captured at construct time and reused
+/// on every rebuild; this is a deployment-wide setting (sourced
+/// from `aisix_core::Config::bedrock_endpoint_url`) and doesn't
+/// change while the DP is running.
 pub struct LiveGuardrailChain {
     snapshot: SnapshotHandle<AisixSnapshot>,
+    bedrock_endpoint_url: Option<String>,
     cache: Mutex<Cache>,
 }
 
@@ -160,17 +180,24 @@ struct Cache {
 }
 
 impl LiveGuardrailChain {
-    pub fn new(snapshot: SnapshotHandle<AisixSnapshot>) -> Arc<Self> {
+    pub fn new(
+        snapshot: SnapshotHandle<AisixSnapshot>,
+        bedrock_endpoint_url: Option<String>,
+    ) -> Arc<Self> {
         // Eager-build at construct time so the very first chat
         // doesn't pay the rebuild cost. The pointer recorded here
         // is the snapshot at construct time — a subsequent store
         // from the supervisor flips the cache miss bit on next
         // check.
         let snap = snapshot.load();
-        let chain = Arc::new(build_chain_from_snapshot(&snap.guardrails));
+        let chain = Arc::new(build_chain_from_snapshot(
+            &snap.guardrails,
+            bedrock_endpoint_url.as_deref(),
+        ));
         let last_snapshot_addr = Arc::as_ptr(&snap) as usize;
         Arc::new(Self {
             snapshot,
+            bedrock_endpoint_url,
             cache: Mutex::new(Cache {
                 last_snapshot_addr,
                 chain,
@@ -186,7 +213,10 @@ impl LiveGuardrailChain {
             .lock()
             .expect("LiveGuardrailChain mutex poisoned");
         if cache.last_snapshot_addr != cur_ptr {
-            cache.chain = Arc::new(build_chain_from_snapshot(&snap.guardrails));
+            cache.chain = Arc::new(build_chain_from_snapshot(
+                &snap.guardrails,
+                self.bedrock_endpoint_url.as_deref(),
+            ));
             cache.last_snapshot_addr = cur_ptr;
         }
         Arc::clone(&cache.chain)
@@ -245,7 +275,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table);
+        let chain = build_chain_from_snapshot(&table, None);
         assert_eq!(chain.len(), 1);
         let v = chain.check_input(&req("here is AKIAEXAMPLE")).await;
         assert!(v.is_block());
@@ -268,7 +298,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table);
+        let chain = build_chain_from_snapshot(&table, None);
         assert_eq!(chain.len(), 0);
     }
 
@@ -286,7 +316,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table);
+        let chain = build_chain_from_snapshot(&table, None);
         assert_eq!(chain.len(), 0, "empty list adds nothing to the chain");
     }
 
@@ -320,7 +350,7 @@ mod tests {
             ),
         ));
 
-        let chain = build_chain_from_snapshot(&table);
+        let chain = build_chain_from_snapshot(&table, None);
         // Only the good row makes it in.
         assert_eq!(chain.len(), 1);
         let v = chain.check_input(&req("ok")).await;
@@ -366,7 +396,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table);
+        let chain = build_chain_from_snapshot(&table, None);
         // Both rows compose. We don't probe the bedrock arm — its
         // own tests cover the dispatch path; this one only pins the
         // chain composition contract.
@@ -377,7 +407,7 @@ mod tests {
     async fn live_chain_rebuilds_on_snapshot_swap() {
         let initial = AisixSnapshot::new();
         let handle = SnapshotHandle::new(initial);
-        let live = LiveGuardrailChain::new(handle.clone());
+        let live = LiveGuardrailChain::new(handle.clone(), None);
 
         // Empty snapshot → no rules → input passes.
         assert!(!live.check_input(&req("AKIA-EXAMPLE")).await.is_block());
@@ -419,7 +449,7 @@ mod tests {
                 }"#,
             ),
         ));
-        let chain = build_chain_from_snapshot(&table);
+        let chain = build_chain_from_snapshot(&table, None);
         // input check fires...
         assert!(chain.check_input(&req("secret")).await.is_block());
         // ...but output check is a noop on this rule.

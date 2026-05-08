@@ -49,6 +49,23 @@ pub struct Config {
     /// Missing or `enabled = false` runs standalone.
     #[serde(default)]
     pub managed: ManagedConfig,
+    /// Deployment-wide override for the AWS Bedrock endpoint URL,
+    /// applied to every kind=bedrock guardrail dispatcher built from
+    /// the snapshot. Unset (the default) → SDK default (real AWS).
+    ///
+    /// Set this when pointing the DP at a local Bedrock-compatible
+    /// service (LocalStack, a fakecloud / WireMock sidecar in e2e),
+    /// or when an outbound HTTP proxy needs to terminate the call.
+    /// Empty string is treated as unset so a `docker run -e
+    /// AISIX_BEDROCK_ENDPOINT_URL=` doesn't accidentally redirect.
+    ///
+    /// Top-level on purpose — overriding the Bedrock endpoint is a
+    /// deployment concern, not a per-guardrail-row configuration that
+    /// a tenant should be able to set. The matching env var
+    /// `AISIX_BEDROCK_ENDPOINT_URL` is what gets picked up by
+    /// config-rs via the `AISIX_` prefix.
+    #[serde(default)]
+    pub bedrock_endpoint_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -789,6 +806,49 @@ managed:
     // need std::env::set_var (forbidden by the crate-level
     // #![forbid(unsafe_code)]) or an extra dev-dep for a guarded
     // env helper; the downstream integration coverage is enough.
+
+    #[test]
+    fn bedrock_endpoint_url_defaults_to_none_when_unset() {
+        // Minimal config without bedrock_endpoint_url → field should
+        // be `None`, matching "real AWS Bedrock" semantics.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(cfg.bedrock_endpoint_url.is_none());
+    }
+
+    #[test]
+    fn bedrock_endpoint_url_round_trips_through_yaml() {
+        // Operators set this when pointing the DP at LocalStack /
+        // fakecloud / a Bedrock-compatible mock; pin that the field
+        // makes it through `deny_unknown_fields` and back out.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+bedrock_endpoint_url: "http://fakecloud:8000"
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(
+            cfg.bedrock_endpoint_url.as_deref(),
+            Some("http://fakecloud:8000"),
+        );
+    }
 
     #[test]
     fn parses_etcd_tls_block() {
