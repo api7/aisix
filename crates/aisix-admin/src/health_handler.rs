@@ -12,7 +12,11 @@
 //!   "models": [
 //!     {"id": "m-uuid", "name": "my-gpt4", "health": 0},
 //!     {"id": "m-uuid-2", "name": "claude", "health": 1}
-//!   ]
+//!   ],
+//!   "config": {
+//!     "snapshot_revision": 1234567,
+//!     "snapshot_age_seconds": 5
+//!   }
 //! }
 //! ```
 //!
@@ -20,6 +24,12 @@
 //! - `0` — Healthy (no recent failures)
 //! - `1` — Degraded (4–7 consecutive upstream failures)
 //! - `2` — Down (8+ consecutive upstream failures)
+//!
+//! The `config` block surfaces the etcd watch supervisor's freshness
+//! state — without it a wedged watch can let the gateway serve a
+//! frozen snapshot for hours while still reporting healthy. See
+//! issue #114. The block is omitted when the supervisor isn't wired
+//! (legacy / test deployments).
 
 use axum::extract::State;
 use axum::Json;
@@ -37,12 +47,32 @@ pub struct ModelHealth {
     pub health: u8,
 }
 
+/// Etcd watch supervisor freshness, surfaced so operators can detect
+/// a wedged config stream. `snapshot_age_seconds` is `None` before the
+/// supervisor's first apply (boot) — the JSON serialises that as
+/// `null`, distinct from `0` (just-applied).
+#[derive(Debug, Serialize)]
+pub struct ConfigStatus {
+    /// Highest etcd revision currently reflected in the snapshot. Zero
+    /// before first apply.
+    pub snapshot_revision: i64,
+    /// Wall-clock seconds since the supervisor last applied an event.
+    /// `null` when the supervisor has not yet completed its first
+    /// cycle — a fresh boot before etcd is reachable. A large value
+    /// (e.g. > 300) suggests a stalled watch.
+    pub snapshot_age_seconds: Option<u64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     /// Overall gateway status — always "ok" at the protocol level; operators
     /// should look at individual model health levels for actionable signal.
     pub status: &'static str,
     pub models: Vec<ModelHealth>,
+    /// Etcd watch supervisor freshness. Omitted when the supervisor
+    /// isn't wired into AdminState.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<ConfigStatus>,
 }
 
 pub async fn get_health(
@@ -74,9 +104,18 @@ pub async fn get_health(
         })
         .collect();
 
+    let config = state.watch_status.as_ref().map(|ws| {
+        let snap = ws.snapshot();
+        ConfigStatus {
+            snapshot_revision: snap.revision,
+            snapshot_age_seconds: snap.last_apply_age.map(|d| d.as_secs()),
+        }
+    });
+
     Ok(Json(HealthResponse {
         status: "ok",
         models,
+        config,
     }))
 }
 
@@ -98,6 +137,61 @@ mod tests {
         assert_eq!(d, 1);
         let down: u8 = u8::from(HealthLevel::Down);
         assert_eq!(down, 2);
+    }
+
+    /// Regression for issue #114: HealthResponse with no watch_status
+    /// wired must not include a "config" key at all (older clients
+    /// that use the legacy schema must keep parsing). With watch_status,
+    /// "config.snapshot_revision" + "config.snapshot_age_seconds" must
+    /// appear with the right values.
+    #[test]
+    fn response_serialisation_omits_config_when_watch_status_unwired() {
+        use super::HealthResponse;
+        let r = HealthResponse {
+            status: "ok",
+            models: vec![],
+            config: None,
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json.get("config").is_none());
+    }
+
+    #[test]
+    fn response_serialisation_carries_config_when_watch_status_wired() {
+        use super::{ConfigStatus, HealthResponse};
+        let r = HealthResponse {
+            status: "ok",
+            models: vec![],
+            config: Some(ConfigStatus {
+                snapshot_revision: 1234567,
+                snapshot_age_seconds: Some(5),
+            }),
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(json["config"]["snapshot_revision"], 1234567);
+        assert_eq!(json["config"]["snapshot_age_seconds"], 5);
+    }
+
+    #[test]
+    fn response_serialises_age_as_null_pre_first_apply() {
+        // The supervisor hasn't applied anything yet → age is None →
+        // JSON null, distinct from `0` (just-applied). Operators can
+        // distinguish "boot, etcd unreached" from "fresh, healthy".
+        use super::{ConfigStatus, HealthResponse};
+        let r = HealthResponse {
+            status: "ok",
+            models: vec![],
+            config: Some(ConfigStatus {
+                snapshot_revision: 0,
+                snapshot_age_seconds: None,
+            }),
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(
+            json["config"]["snapshot_age_seconds"].is_null(),
+            "pre-first-apply age should serialise as null, got {}",
+            json["config"]["snapshot_age_seconds"]
+        );
     }
 
     #[test]

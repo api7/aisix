@@ -483,6 +483,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // Share the health tracker so /admin/v1/health reflects live
             // per-model upstream failure counts.
             .with_health_tracker(health_tracker)
+            // Share the supervisor's freshness state so /admin/v1/health
+            // exposes etcd watch staleness — without this, a wedged
+            // watch lets the gateway serve stale config indefinitely
+            // while reporting healthy. See issue #114.
+            .with_watch_status(supervisor.watch_status())
             // Share the proxy router so the playground endpoint can forward
             // requests in-process without an extra network hop.
             .with_proxy_router(proxy_router.clone());

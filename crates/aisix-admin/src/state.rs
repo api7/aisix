@@ -13,6 +13,7 @@
 
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AdminConfig, AisixSnapshot};
+use aisix_etcd::WatchStatus;
 use aisix_obs::Metrics;
 use aisix_proxy::HealthTracker;
 use axum::Router;
@@ -29,6 +30,12 @@ pub struct AdminState {
     /// Shared in-process health tracker from the proxy. Used by the
     /// `/admin/v1/health` endpoint to report per-model health status.
     pub health_tracker: Option<Arc<HealthTracker>>,
+    /// Watch supervisor's freshness state. When wired, the
+    /// `/admin/v1/health` endpoint includes etcd revision +
+    /// snapshot age so operators can detect a frozen / wedged config
+    /// stream that would otherwise let the gateway serve a stale
+    /// snapshot indefinitely. See issue #114.
+    pub watch_status: Option<WatchStatus>,
     /// Proxy router shared for the `/playground/chat/completions` endpoint.
     /// The playground handler calls `router.oneshot(req)` so the request
     /// goes through the full proxy middleware stack (auth, rate-limit, bridge)
@@ -48,8 +55,17 @@ impl AdminState {
             store,
             metrics: None,
             health_tracker: None,
+            watch_status: None,
             proxy_router: None,
         }
+    }
+
+    /// Attach the watch supervisor's freshness status. When set, the
+    /// `/admin/v1/health` response includes etcd revision + snapshot
+    /// age so operators can spot a wedged config stream.
+    pub fn with_watch_status(mut self, status: WatchStatus) -> Self {
+        self.watch_status = Some(status);
+        self
     }
 
     /// Attach a metrics handle. Production wires the same handle that
