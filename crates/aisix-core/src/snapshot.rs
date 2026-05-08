@@ -147,6 +147,25 @@ impl<S> SnapshotHandle<S> {
     pub fn store(&self, new: S) {
         self.inner.store(Arc::new(new));
     }
+
+    /// Read-copy-update. Runs `f(current)` to produce a new snapshot,
+    /// then commits the result with a CAS. If a concurrent `store` /
+    /// `rcu` ran between the load and the CAS, the closure runs again
+    /// against the latest snapshot. This is the only safe way to do a
+    /// load-mutate-store on `ArcSwap`: the bare load + store sequence
+    /// silently loses concurrent updates (see arc-swap::ArcSwap::rcu
+    /// docs).
+    ///
+    /// `f` may be called more than once under contention, so it must
+    /// be idempotent w.r.t. its input — clone the current snapshot and
+    /// apply the same delta each time, do not pull side data from
+    /// outside the closure that depends on a single observation.
+    pub fn rcu<F>(&self, mut f: F)
+    where
+        F: FnMut(&S) -> S,
+    {
+        self.inner.rcu(|current| f(current.as_ref()));
+    }
 }
 
 #[cfg(test)]
