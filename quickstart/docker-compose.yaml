@@ -1,6 +1,6 @@
 services:
   aisix:
-    image: ${AISIX_IMAGE:-ghcr.io/api7/aisix:latest}
+    image: ${AISIX_IMAGE:-api7/aisix:latest}
     restart: unless-stopped
     ports:
       - "127.0.0.1:3000:3000"
