@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 
 use crate::backoff::ExpBackoff;
 use crate::key;
-use crate::loader::{self, BuildStats};
+use crate::loader::{self, BuildStats, RejectedEntry};
 use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 use crate::snapshot_cache::SnapshotCache;
 
@@ -117,6 +117,12 @@ pub struct WatchStatusSnapshot {
     pub last_apply_age: Option<Duration>,
 }
 
+/// Maximum rejected entries the supervisor retains in memory. The
+/// heartbeat path drains and re-fills this on each tick, but if the
+/// CP is unreachable for a while we don't want to leak unbounded
+/// memory. Newest rejection wins on overflow (drops the oldest).
+const MAX_RETAINED_REJECTIONS: usize = 256;
+
 /// One supervisor instance. Consumers call [`Supervisor::run`] once and
 /// drop the returned handle on shutdown.
 pub struct Supervisor<P: ConfigProvider> {
@@ -136,6 +142,16 @@ pub struct Supervisor<P: ConfigProvider> {
     /// apply_resync). `Clone` produces a cheap read handle for the
     /// admin handler.
     status: WatchStatus,
+
+    /// Most recent loader rejections, capped at
+    /// [`MAX_RETAINED_REJECTIONS`]. Read by the heartbeat path so the
+    /// CP can surface "your DP rejected these resources" in the
+    /// dashboard. Newest at the back; on overflow the oldest entries
+    /// are dropped — see issue #115. The buffer is replaced (not
+    /// appended-to) on every load_once / apply_resync because those
+    /// re-process the full entry set; apply_put / apply_delete append
+    /// per-event because they only see one row.
+    rejections: Mutex<Vec<RejectedEntry>>,
 
     // JoinHandles for in-flight `flush_cache` writes. Tests use
     // [`Self::await_pending_cache_writes`] to deterministically wait
@@ -168,6 +184,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             revision: Mutex::new(0),
             cache,
             status: WatchStatus::new(),
+            rejections: Mutex::new(Vec::new()),
             pending_writes: Mutex::new(Vec::new()),
         }
     }
@@ -177,6 +194,36 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// "snapshot age" metrics. See [`WatchStatus`].
     pub fn watch_status(&self) -> WatchStatus {
         self.status.clone()
+    }
+
+    /// Snapshot of the most recent loader rejections (capped). Used by
+    /// the heartbeat path to forward "DP rejected these resources" to
+    /// cp-api. Returns a clone so the caller doesn't hold the lock
+    /// across the heartbeat HTTP call.
+    pub fn recent_rejections(&self) -> Vec<RejectedEntry> {
+        self.rejections.lock().unwrap().clone()
+    }
+
+    /// Replace the retained rejection buffer wholesale. Called by the
+    /// resync paths (load_once / apply_resync) which re-process every
+    /// entry — old per-key rejections are no longer accurate.
+    fn set_rejections(&self, mut new: Vec<RejectedEntry>) {
+        if new.len() > MAX_RETAINED_REJECTIONS {
+            // Keep the *newest* entries; tail of the vec is freshest.
+            new.drain(..new.len() - MAX_RETAINED_REJECTIONS);
+        }
+        *self.rejections.lock().unwrap() = new;
+    }
+
+    /// Append one rejection from a per-event apply path (apply_put).
+    /// Drops the oldest on overflow. apply_delete doesn't reject —
+    /// it's not represented here.
+    fn push_rejection(&self, r: RejectedEntry) {
+        let mut guard = self.rejections.lock().unwrap();
+        if guard.len() >= MAX_RETAINED_REJECTIONS {
+            guard.remove(0);
+        }
+        guard.push(r);
     }
 
     /// Drain the JoinHandles for any in-flight cache writes spawned
@@ -264,8 +311,15 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// Returns `true` if the apply succeeded (schema + parse passed).
     pub fn apply_put(&self, entry: &RawEntry) -> bool {
         // Build a tiny snapshot out of just the new entry, then merge.
-        let (tiny, stats) = loader::build_snapshot(&self.prefix, std::slice::from_ref(entry));
+        let (tiny, mut stats) = loader::build_snapshot(&self.prefix, std::slice::from_ref(entry));
         if stats.accepted == 0 {
+            // The loader already attached a RejectedEntry for whatever
+            // path failed (bad key / non-JSON / schema / parse). Move
+            // them into the supervisor's retained buffer so the next
+            // heartbeat surfaces the failure to cp-api. See issue #115.
+            for r in stats.rejections.drain(..) {
+                self.push_rejection(r);
+            }
             return false;
         }
 
@@ -432,6 +486,10 @@ impl<P: ConfigProvider> Supervisor<P> {
         // revision floor so the operator sees recent activity).
         let cur_rev = *self.revision.lock().unwrap();
         self.status.record_apply(cur_rev);
+        // Resync re-processes the entire entry set so the prior
+        // per-key rejection list is no longer accurate — replace it
+        // wholesale with what this build produced (issue #115).
+        self.set_rejections(stats.rejections.clone());
         self.flush_cache();
         stats
     }
@@ -1033,6 +1091,71 @@ mod tests {
             later > first,
             "last_apply_age should monotonically grow without new events; \
              first={first:?} later={later:?}",
+        );
+    }
+
+    // ---- regression coverage for issue #115 -------------------------
+    // The supervisor now retains the loader's rejected-entry list so
+    // the heartbeat path can forward "DP rejected these resources" to
+    // cp-api. Tests pin (1) apply_resync replaces the buffer wholesale,
+    // (2) apply_put with a bad row appends to the buffer, (3) the
+    // buffer survives a successful apply_put after a rejection so the
+    // heartbeat doesn't lose signal.
+
+    const BAD_PROVIDER_MODEL: &[u8] = br#"{
+        "display_name":"x",
+        "provider":"mistral",
+        "model_name":"l",
+        "provider_key_id":"pk"
+    }"#;
+
+    #[tokio::test]
+    async fn recent_rejections_replaced_by_apply_resync() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+
+        // Seed the buffer with a bad apply_put.
+        assert!(!sup.apply_put(&entry("/aisix/models/m-bad", BAD_PROVIDER_MODEL, 1)));
+        assert_eq!(sup.recent_rejections().len(), 1);
+
+        // A clean apply_resync should wipe the buffer.
+        sup.apply_resync(&[entry("/aisix/models/m-good", VALID_MODEL, 2)]);
+        assert!(
+            sup.recent_rejections().is_empty(),
+            "apply_resync with a clean entry set must reset the rejection buffer",
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_rejections_accumulates_across_apply_puts() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+
+        assert!(!sup.apply_put(&entry("/aisix/models/m-bad-1", BAD_PROVIDER_MODEL, 1)));
+        assert!(!sup.apply_put(&entry("/aisix/models/m-bad-2", b"not-json", 2)));
+        let rejections = sup.recent_rejections();
+        assert_eq!(rejections.len(), 2);
+        assert_eq!(rejections[0].kind, loader::RejectionKind::SchemaFailed);
+        assert_eq!(rejections[1].kind, loader::RejectionKind::NonJson);
+    }
+
+    #[tokio::test]
+    async fn recent_rejections_survives_a_successful_subsequent_put() {
+        // The buffer is the heartbeat's only signal; a successful put
+        // *after* a rejection must NOT clear it (the dashboard banner
+        // would race the user — we leave clearing to the next resync,
+        // which is what cp-api triggers when the user fixes the row).
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        assert!(!sup.apply_put(&entry("/aisix/models/m-bad", BAD_PROVIDER_MODEL, 1)));
+        assert_eq!(sup.recent_rejections().len(), 1);
+
+        // A different model succeeds.
+        assert!(sup.apply_put(&entry("/aisix/models/m-good", VALID_MODEL, 2)));
+        assert_eq!(
+            sup.recent_rejections().len(),
+            1,
+            "successful put must not silently drop earlier rejections",
         );
     }
 }
