@@ -1,0 +1,44 @@
+name: Publish quickstart script
+
+on:
+  push:
+    branches: [ "main" ]
+    paths: [ "quickstart/**" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish-quickstart:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # 6.0.2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # 6.0.0
+        with:
+          role-to-assume: ${{ secrets.AWS_QUICKSTART_ROLE }}
+          aws-region: us-west-2
+
+      - name: Upload quickstart files to S3
+        run: |
+          aws s3 cp quickstart/quickstart.sh \
+            s3://api7ai-docs-resources/aisix/quickstart \
+            --content-type "text/x-shellscript"
+          aws s3 cp quickstart/docker-compose.yaml \
+            s3://api7ai-docs-resources/aisix/docker-compose.yaml \
+            --content-type "text/yaml"
+          aws s3 cp quickstart/config.yaml \
+            s3://api7ai-docs-resources/aisix/config.yaml \
+            --content-type "text/yaml"
+
+      - name: Invalidate CloudFront
+        uses: chetan/invalidate-cloudfront-action@6adb1f613f4102ad81cd08a7ba83b8abe490cb8d # 2.4.2
+        env:
+          DISTRIBUTION: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+          PATHS: /aisix/quickstart /aisix/docker-compose.yaml /aisix/config.yaml
