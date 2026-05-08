@@ -12,7 +12,7 @@
 //! that don't map cleanly to a specific upstream become the provider's
 //! responsibility to drop or translate.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Role of a chat message. Matches OpenAI's taxonomy; providers that only
 /// support system/user/assistant are expected to reject `Tool` at their
@@ -26,15 +26,52 @@ pub enum Role {
     Tool,
 }
 
+/// One element of the OpenAI-shape `messages` array.
+///
+/// `deny_unknown_fields` is intentionally NOT applied here — OpenAI ships
+/// new message-level fields regularly (`tool_calls` on assistant messages,
+/// `refusal` since 2024-08, `audio` for the realtime/4o audio models) and
+/// the standard OpenAI SDKs include them whenever they replay
+/// conversation history. Rejecting them at the gateway breaks every user
+/// that has had a tool round-trip in the conversation. Unknown fields
+/// land in [`Self::extra`] via `flatten` so providers that care
+/// (currently the OpenAI bridge) can forward them verbatim.
+///
+/// `content` accepts JSON `null` in addition to a string. OpenAI's
+/// assistant-with-tool_calls shape uses `"content": null`; we collapse
+/// that to an empty string for the gateway's internal representation,
+/// which preserves serialisability for downstreams that don't accept
+/// `null` (Anthropic, Gemini). Information loss is bounded — if the
+/// upstream behaves differently for `""` vs `null`, the OpenAI bridge
+/// can synthesise `null` from an empty string + a `tool_calls` entry in
+/// `extra` at request-build time. See issue #110.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ChatMessage {
     pub role: Role,
+    #[serde(default, deserialize_with = "deserialize_content_string")]
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Forward-compatible bag for OpenAI message fields the gateway
+    /// doesn't model directly: `tool_calls`, `refusal`, `audio`, plus
+    /// any future additions. Round-tripped verbatim so OpenAI
+    /// conversation history replay works through the proxy without a
+    /// schema bump every time OpenAI ships a new field.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty", flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Deserialize a `content` field that may be a string OR JSON `null`.
+/// `null` collapses to `""`. The type stays `String` (not `Option<String>`)
+/// so every existing caller — and every cross-provider bridge — keeps
+/// working without an Option dance. The `null` case only matters for
+/// OpenAI assistant-with-tool_calls history replay, where empty content
+/// is also accepted by the upstream API; see
+/// <https://platform.openai.com/docs/api-reference/chat/create>.
+fn deserialize_content_string<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 impl ChatMessage {
@@ -44,6 +81,7 @@ impl ChatMessage {
             content: content.into(),
             name: None,
             tool_call_id: None,
+            extra: serde_json::Map::new(),
         }
     }
 
@@ -53,6 +91,7 @@ impl ChatMessage {
             content: content.into(),
             name: None,
             tool_call_id: None,
+            extra: serde_json::Map::new(),
         }
     }
 
@@ -62,6 +101,7 @@ impl ChatMessage {
             content: content.into(),
             name: None,
             tool_call_id: None,
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -329,6 +369,93 @@ mod tests {
         assert_eq!(ChatMessage::system("x").role, Role::System);
         assert_eq!(ChatMessage::user("x").role, Role::User);
         assert_eq!(ChatMessage::assistant("x").role, Role::Assistant);
+    }
+
+    // ---- regression coverage for issue #110 -------------------------
+    // Standard OpenAI / LangChain SDKs replay full conversation history
+    // including assistant tool_calls / refusal / audio fields. Until
+    // this fix the gateway answered such requests with HTTP 422 because
+    // ChatMessage was deny_unknown_fields. The tests below pin the new
+    // contract: deserialise, round-trip on serialise, and accept null
+    // content.
+
+    #[test]
+    fn chat_message_accepts_assistant_with_tool_calls() {
+        let json = r#"{
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "get_weather", "arguments": "{}"}}
+            ]
+        }"#;
+        let m: ChatMessage = serde_json::from_str(json).expect("must accept tool_calls");
+        assert_eq!(m.role, Role::Assistant);
+        assert_eq!(m.content, ""); // null collapses to empty string
+        assert!(m.extra.contains_key("tool_calls"));
+    }
+
+    #[test]
+    fn chat_message_accepts_refusal_field() {
+        // OpenAI added `refusal` 2024-08 for safety-refused completions.
+        let json = r#"{
+            "role": "assistant",
+            "content": "",
+            "refusal": "I can't help with that."
+        }"#;
+        let m: ChatMessage = serde_json::from_str(json).expect("must accept refusal");
+        assert_eq!(
+            m.extra.get("refusal").and_then(|v| v.as_str()),
+            Some("I can't help with that.")
+        );
+    }
+
+    #[test]
+    fn chat_message_accepts_audio_field() {
+        // 4o-audio outputs include an `audio` block on assistant messages.
+        let json = r#"{
+            "role": "assistant",
+            "content": "",
+            "audio": {"id": "audio_1", "data": "...", "transcript": "hi"}
+        }"#;
+        let m: ChatMessage = serde_json::from_str(json).expect("must accept audio");
+        assert!(m.extra.get("audio").and_then(|v| v.as_object()).is_some());
+    }
+
+    #[test]
+    fn chat_message_accepts_null_content() {
+        // The OpenAI assistant-with-tool_calls shape uses content: null;
+        // we collapse to "" so downstream Bridges that don't accept null
+        // (Anthropic, Gemini) still get a string.
+        let json = r#"{"role": "assistant", "content": null}"#;
+        let m: ChatMessage = serde_json::from_str(json).expect("must accept null content");
+        assert_eq!(m.content, "");
+    }
+
+    #[test]
+    fn chat_message_round_trips_full_openai_history_with_tool_calls() {
+        // Full history shape the OpenAI SDK replays after a tool round.
+        let json = r#"[
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": null,
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "w", "arguments": "{}"}}]},
+            {"role": "tool", "content": "75F", "tool_call_id": "c1"},
+            {"role": "user", "content": "tomorrow?"}
+        ]"#;
+        let msgs: Vec<ChatMessage> =
+            serde_json::from_str(json).expect("OpenAI replay history must parse");
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[1].role, Role::Assistant);
+        assert!(msgs[1].extra.contains_key("tool_calls"));
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("c1"));
+
+        // Re-serialise; tool_calls survives via the flatten extra map.
+        let back = serde_json::to_string(&msgs).unwrap();
+        assert!(
+            back.contains("\"tool_calls\""),
+            "tool_calls must round-trip through Serialize: {back}"
+        );
     }
 
     #[test]

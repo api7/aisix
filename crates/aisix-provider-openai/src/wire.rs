@@ -39,6 +39,13 @@ pub(crate) struct OpenAiMessage<'a> {
     pub name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<&'a str>,
+    /// Pass-through for OpenAI message-level fields the gateway
+    /// doesn't model (`tool_calls`, `refusal`, `audio`, …). Mirrors
+    /// `OpenAiRequest::extra` at the message level so conversation
+    /// history with tool_call rounds round-trips to the upstream
+    /// without the gateway having to model every OpenAI field.
+    #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: &'a serde_json::Map<String, serde_json::Value>,
 }
 
 /// Build the upstream request from the gateway's normalised format.
@@ -70,6 +77,7 @@ pub(crate) fn messages_from(req: &ChatFormat) -> Vec<OpenAiMessage<'_>> {
             content: &m.content,
             name: m.name.as_deref(),
             tool_call_id: m.tool_call_id.as_deref(),
+            extra: &m.extra,
         })
         .collect()
 }
@@ -156,6 +164,7 @@ pub(crate) fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatRespon
                 content: c.message.content.unwrap_or_default(),
                 name: None,
                 tool_call_id: None,
+                extra: serde_json::Map::new(),
             },
             finish_reason(c.finish_reason.as_deref()),
         ),
@@ -495,5 +504,48 @@ mod tests {
         let json = serde_json::to_value(&built).unwrap();
         assert_eq!(json["seed"], 42);
         assert_eq!(json["presence_penalty"], 0.1);
+    }
+
+    /// Regression for issue #110: assistant tool_calls / refusal /
+    /// audio fields on incoming messages must round-trip verbatim into
+    /// the upstream OpenAI request, otherwise conversation-history
+    /// replay reaches OpenAI without the previous tool round and the
+    /// response is wrong.
+    #[test]
+    fn assistant_tool_calls_round_trip_into_upstream_request() {
+        let history_json = r#"[
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": null,
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "w", "arguments": "{}"}}]},
+            {"role": "tool", "content": "75F", "tool_call_id": "c1"},
+            {"role": "user", "content": "tomorrow?"}
+        ]"#;
+        let messages: Vec<ChatMessage> = serde_json::from_str(history_json).unwrap();
+        let req = ChatFormat {
+            model: "my-model".into(),
+            messages,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stream: None,
+            extra: serde_json::Map::new(),
+        };
+        let msgs = messages_from(&req);
+        let built = build_request(&req, "gpt-4o", &msgs, false);
+        let json = serde_json::to_value(&built).unwrap();
+        let assistant = &json["messages"][1];
+        // tool_calls preserved verbatim from input → upstream.
+        let tool_calls = assistant["tool_calls"].as_array().expect(
+            "assistant message to upstream OpenAI is missing tool_calls — \
+             history replay would silently lose the previous tool round",
+        );
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], "c1");
+        assert_eq!(tool_calls[0]["function"]["name"], "w");
+        // tool message's tool_call_id reaches upstream.
+        let tool_msg = &json["messages"][2];
+        assert_eq!(tool_msg["tool_call_id"], "c1");
+        assert_eq!(tool_msg["role"], "tool");
     }
 }
