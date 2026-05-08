@@ -38,6 +38,7 @@ mod images;
 mod messages;
 mod models;
 mod passthrough;
+mod quota;
 mod render;
 mod rerank;
 mod responses;
@@ -488,6 +489,69 @@ data: [DONE]\n\n";
             data_count >= 2,
             "expected at least two chat chunks, got {data_count}"
         );
+    }
+
+    // ---- regression coverage for issue #107 -------------------------
+    // Pre-fix only /v1/chat/completions enforced rate-limit / budget;
+    // every other LLM endpoint silently bypassed both. The test below
+    // pins /v1/embeddings — representative of the class — to ensure
+    // the gate fires after this PR. Adding the same coverage to every
+    // endpoint would multiply the test surface without buying signal,
+    // since the gate is centralised in `crate::quota::enforce`. If
+    // any individual handler ever stops calling it, that handler's
+    // own tests would still catch the breakage on the budget path
+    // (BudgetExceeded surfaces as a 4xx the existing tests assert on).
+
+    #[tokio::test]
+    async fn rate_limit_rpm_applies_to_embeddings_endpoint_issue_107() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "model": "text-embedding-3-small",
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}],
+                "usage": {"prompt_tokens": 5, "total_tokens": 5}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot_with_limits(
+            "my-gpt4",
+            &["my-gpt4"],
+            &upstream.uri(),
+            serde_json::json!({"rpm": 1}),
+        );
+        let state = build_state(snap, hub);
+        let body = serde_json::json!({"model": "my-gpt4", "input": "hello"});
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // First request consumes the only RPM slot.
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Pre-fix: this would also return 200 (the gate didn't run on
+        // /v1/embeddings). Post-fix: 429 because the rpm=1 cap is now
+        // enforced uniformly via crate::quota::enforce.
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "/v1/embeddings must enforce rate limits (issue #107); pre-fix it bypassed",
+        );
+        let body_bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(v["error"]["type"], "rate_limit_exceeded");
     }
 
     #[tokio::test]

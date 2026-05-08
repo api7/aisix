@@ -108,6 +108,12 @@ async fn dispatch(
         return Err(ProxyError::ModelForbidden(model_name.to_string()));
     }
 
+    // Budget + rate-limit gate (issue #107). Reservation drops at
+    // end of dispatch — RPM counts on pre_commit, concurrency
+    // releases on drop, TPM is left at 0 (this handler doesn't
+    // surface a uniform token count today).
+    let _reservation = crate::quota::enforce(state, auth).await?;
+
     let model = &model_entry.value;
     let provider = crate::dispatch::require_provider(model)?;
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;

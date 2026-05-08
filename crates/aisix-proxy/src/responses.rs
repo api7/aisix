@@ -108,6 +108,10 @@ async fn dispatch(
         return Err(ProxyError::ModelForbidden(model_name.clone()));
     }
 
+    // Budget + rate-limit gate (issue #107). RPM counts on
+    // pre_commit; concurrency releases on Drop at function end.
+    let _reservation = crate::quota::enforce(state, auth).await?;
+
     let model = &model_entry.value;
 
     // Responses API is only available for OpenAI.

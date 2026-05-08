@@ -110,12 +110,19 @@ pub async fn passthrough(
 
 async fn dispatch(
     state: ProxyState,
-    _auth: &AuthenticatedKey,
+    auth: &AuthenticatedKey,
     provider: &str,
     rest: &str,
     req: Request,
     request_id: &str,
 ) -> Result<(Response, String), ProxyError> {
+    // Budget + rate-limit gate (issue #107). The previous _auth
+    // binding ignored the AuthenticatedKey entirely — passthrough
+    // ran completely unmetered, with no per-key budget cap and no
+    // RPM/TPM limit. This was the most exploitable gap because the
+    // /passthrough/* family covers everything OpenAI ships *plus*
+    // every provider's own API. Held for the dispatch lifetime.
+    let _reservation = crate::quota::enforce(&state, auth).await?;
     let snapshot = state.snapshot.load();
 
     // Find a model for this provider so we can borrow its provider_key.

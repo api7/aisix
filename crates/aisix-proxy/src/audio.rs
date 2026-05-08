@@ -287,6 +287,10 @@ async fn multipart_dispatch(
         return Err(ProxyError::ModelForbidden(model_name.clone()));
     }
 
+    // Budget + rate-limit gate (issue #107). Audio transcriptions /
+    // translations bypassed both — Whisper customers ran unmetered.
+    let _reservation = crate::quota::enforce(state, auth).await?;
+
     let model = &model_entry.value;
     let provider = crate::dispatch::require_provider(model)?;
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
@@ -383,6 +387,10 @@ async fn speech_dispatch(
     if !auth.key().can_access(&model_name) {
         return Err(ProxyError::ModelForbidden(model_name.clone()));
     }
+
+    // Budget + rate-limit gate (issue #107). TTS/speech bypassed
+    // both pre-fix.
+    let _reservation = crate::quota::enforce(state, auth).await?;
 
     let model = &model_entry.value;
     let provider = crate::dispatch::require_provider(model)?;

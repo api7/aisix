@@ -160,6 +160,15 @@ async fn dispatch(
         return Err(ProxyError::ModelForbidden(model_name.clone()));
     }
 
+    // Budget + rate-limit gate (issue #107). Pre-fix this endpoint
+    // bypassed both — Anthropic-API customers ran unmetered. Held
+    // until end of dispatch via Drop, which releases the concurrency
+    // permit. RPM is recorded immediately on pre_commit; TPM stays
+    // 0 for now (the streaming + cross-provider paths emit token
+    // counts in different shapes — plumbing them uniformly is a
+    // follow-up).
+    let _reservation = crate::quota::enforce(state, auth).await?;
+
     let model = &model_entry.value;
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
 

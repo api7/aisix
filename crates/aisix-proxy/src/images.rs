@@ -104,6 +104,9 @@ async fn dispatch(
         return Err(ProxyError::ModelForbidden(model_name.to_string()));
     }
 
+    // Budget + rate-limit gate (issue #107).
+    let _reservation = crate::quota::enforce(state, auth).await?;
+
     let model = &model_entry.value;
     let provider = crate::dispatch::require_provider(model)?;
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;

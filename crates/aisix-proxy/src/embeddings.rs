@@ -141,6 +141,14 @@ async fn dispatch(
         .get(provider)
         .ok_or(ProxyError::ProviderUnavailable)?;
 
+    // Budget + rate-limit gate (issue #107). Pre-fix this endpoint
+    // bypassed both. The reservation is held until commit_tokens at
+    // the end of dispatch — embeddings don't surface a stable token
+    // count across providers, so we commit 0 for now (RPM counts,
+    // TPM doesn't). Plumbing per-provider token totals through is a
+    // follow-up.
+    let reservation = crate::quota::enforce(state, auth).await?;
+
     let upstream_model_id = crate::dispatch::require_upstream_model(model)?.to_string();
 
     let req = EmbeddingRequest {
@@ -156,18 +164,29 @@ async fn dispatch(
 
     match bridge.embed(&req, &ctx).await {
         Ok(embed_resp) => {
+            // Commit the reservation — release the concurrency permit
+            // and finalise RPM. Embeddings do report prompt_tokens via
+            // EmbeddingResponse.usage; thread it through so TPM works
+            // here even though other handlers commit 0.
+            reservation.commit_tokens(embed_resp.usage.total_tokens as u64);
             let provider_label = format!("{provider:?}").to_lowercase();
             Ok((Json(embed_resp).into_response(), provider_label))
         }
         Err(BridgeError::Config(msg)) if msg.contains("does not support embeddings") => {
             // Provider doesn't implement embed → 501 Not Implemented.
+            // Drop the reservation without committing — the request
+            // didn't hit the upstream.
+            reservation.commit_tokens(0);
             let env = ErrorEnvelope::new(msg, "not_implemented");
             Ok((
                 (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
                 format!("{provider:?}").to_lowercase(),
             ))
         }
-        Err(e) => Err(ProxyError::Bridge(e)),
+        Err(e) => {
+            reservation.commit_tokens(0);
+            Err(ProxyError::Bridge(e))
+        }
     }
 }
 
