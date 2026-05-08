@@ -380,8 +380,19 @@ async fn dispatch(
             .chat_stream(req, &ctx)
             .await
             .map_err(|e| with_model(ProxyError::Bridge(e)))?;
-        reservation.commit_tokens(0);
-        let sse_stream = build_sse_stream(upstream, now);
+        // Drop the reservation now: concurrency releases (the SSE
+        // stream that follows is driven by the client, not by the
+        // proxy holding open an upstream-bound future), and RPM was
+        // already counted by pre_commit. TPM is updated retroactively
+        // on stream-end by `add_tokens_post_stream` — see issue #108.
+        // Pre-fix this path called commit_tokens(0) and never came
+        // back, leaving TPM caps blind for all streaming traffic.
+        drop(reservation);
+        let limiter = Arc::clone(&state.limiter);
+        let post_stream_key = rl_key.clone();
+        let sse_stream = build_sse_stream(upstream, now, move |total_tokens| {
+            limiter.add_tokens_post_stream(&post_stream_key, total_tokens);
+        });
         let response =
             Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
         return Ok(Success {
@@ -859,15 +870,49 @@ fn created_ts() -> i64 {
         .unwrap_or(0)
 }
 
-fn build_sse_stream(
+/// Build the SSE stream for a streaming chat response.
+///
+/// As chunks flow through, we observe each chunk's `usage` field. The
+/// upstream typically emits the final usage block on the *last* chunk
+/// (OpenAI when `stream_options.include_usage=true`; Anthropic on the
+/// `message_delta` carrying `output_tokens`). We carry forward the
+/// most recently seen `total_tokens` and, on stream end, hand it to
+/// `on_complete` so the caller can post-account it against TPM/TPD.
+///
+/// Pre-fix the streaming path called `reservation.commit_tokens(0)`
+/// up front and never revisited the counter, leaving TPM caps silently
+/// bypassed for all streaming traffic and the cost/usage telemetry
+/// reporting `$0`. See issue #108.
+///
+/// `on_complete` runs **once** at end-of-stream. It also runs on the
+/// disconnect path (the Drop of the upstream Stream returning `None`
+/// — the same loop exit). Errors mid-stream still terminate the loop
+/// normally, so partial-response cases commit whatever tokens were
+/// observed.
+fn build_sse_stream<F>(
     upstream: aisix_gateway::ChatChunkStream,
     created: i64,
-) -> impl Stream<Item = Result<Event, Infallible>> {
+    on_complete: F,
+) -> impl Stream<Item = Result<Event, Infallible>>
+where
+    F: FnOnce(u64) + Send + 'static,
+{
     async_stream::stream! {
         futures::pin_mut!(upstream);
+        // Track the largest `total_tokens` we've seen on any chunk's
+        // usage block. Providers typically populate this on the
+        // terminal chunk only; using "max" rather than "last" makes
+        // the bookkeeping robust to a provider that double-emits.
+        let mut total_tokens: u64 = 0;
         while let Some(item) = upstream.next().await {
             let ev = match item {
                 Ok(chunk) => {
+                    if let Some(u) = chunk.usage.as_ref() {
+                        let t = u.total_tokens as u64;
+                        if t > total_tokens {
+                            total_tokens = t;
+                        }
+                    }
                     let rendered = render_chunk(created, chunk);
                     match serde_json::to_string(&rendered) {
                         Ok(json) => Event::default().data(json),
@@ -882,6 +927,10 @@ fn build_sse_stream(
             };
             yield Ok::<_, Infallible>(ev);
         }
+        // Stream done — account for the upstream's reported tokens.
+        // For providers that don't emit usage in the stream this stays
+        // 0; on_complete is responsible for treating 0 as "no signal".
+        on_complete(total_tokens);
         yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
     }
 }

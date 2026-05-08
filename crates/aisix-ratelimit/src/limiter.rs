@@ -130,6 +130,31 @@ impl<C: Clock> Limiter<C> {
         })
     }
 
+    /// Add `tokens` to the post-deduct TPM/TPD counters for `key`
+    /// without going through a [`Reservation`]. Used by the streaming
+    /// chat path: at `pre_commit` time we don't yet know how many
+    /// tokens the upstream will return, so the Reservation is dropped
+    /// (releasing the concurrency permit + leaving TPM at 0). When the
+    /// SSE stream finishes, the proxy parses the upstream's terminal
+    /// usage frame and calls this method to retroactively account for
+    /// the tokens. Without it, TPM caps are silently bypassed for all
+    /// streaming traffic — issue #108.
+    ///
+    /// No-op when `tokens == 0` (avoids creating an empty per-key
+    /// counter for keys that never streamed). Otherwise, lazily
+    /// initialises the per-key state via [`Self::state_for`] so the
+    /// first streamed-after-restart request still gets accounted for.
+    pub fn add_tokens_post_stream(&self, key: &str, tokens: u64) {
+        if tokens == 0 {
+            return;
+        }
+        let now = self.clock.unix_secs();
+        let state = self.state_for(key);
+        let mut s = state.lock();
+        s.tpm.add(now, tokens);
+        s.tpd.add(now, tokens);
+    }
+
     fn state_for(&self, key: &str) -> Arc<Mutex<KeyState>> {
         if let Some(entry) = self.states.get(key) {
             return entry.clone();
@@ -511,6 +536,83 @@ mod tests {
         assert_eq!(
             status.rpm_used, 5,
             "rpd rejection wiped concurrent rpm increments"
+        );
+    }
+
+    // ---- regression coverage for issue #108 -------------------------
+    // Streaming chat commits 0 tokens up front because total_tokens
+    // isn't known until the upstream's terminal usage frame. The fix
+    // exposes `Limiter::add_tokens_post_stream` so the SSE driver can
+    // retroactively account for tokens at end-of-stream. The tests
+    // below pin (1) the post-stream add bumps TPM, (2) zero-token
+    // calls don't create empty per-key state, (3) once enough tokens
+    // accumulate the next pre_commit fails on TPM.
+
+    #[test]
+    fn add_tokens_post_stream_increments_tpm() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::with_clock(clock);
+        let l = limits(Some(10), Some(1_000), None);
+
+        // Pre-commit + drop (mirrors the streaming chat path: rpm
+        // counted, concurrency released, tpm = 0 at this point).
+        {
+            let _r = limiter.pre_commit("k1", &l).unwrap();
+        }
+        assert_eq!(
+            limiter.peek("k1", &l).unwrap().tpm_used,
+            0,
+            "TPM should be 0 right after pre_commit + drop",
+        );
+
+        // Streaming reports 750 tokens at end-of-stream.
+        limiter.add_tokens_post_stream("k1", 750);
+        assert_eq!(
+            limiter.peek("k1", &l).unwrap().tpm_used,
+            750,
+            "TPM should reflect the post-stream commit",
+        );
+    }
+
+    #[test]
+    fn add_tokens_post_stream_zero_is_a_noop() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::with_clock(clock);
+        // No pre_commit — peek would otherwise return None for an
+        // unknown key. add_tokens_post_stream(0) must NOT create an
+        // empty state entry.
+        limiter.add_tokens_post_stream("never-seen", 0);
+        assert!(
+            limiter.peek("never-seen", &RateLimit::default()).is_none(),
+            "add_tokens_post_stream(0) should not lazily-create state",
+        );
+    }
+
+    #[test]
+    fn streaming_path_tpm_cap_blocks_next_request_after_post_stream_commit() {
+        // Drives the issue #108 exploit shape end-to-end at the
+        // limiter level: streaming "looks free" pre-fix because
+        // commit_tokens(0) skipped TPM. With the fix, the post-
+        // stream add should exhaust TPM and the next pre_commit
+        // must refuse on TPM.
+        let clock = TestClock::new(100);
+        let limiter = Limiter::with_clock(clock);
+        let l = limits(Some(100), Some(1_000), None);
+
+        // Mimic a successful streaming round: pre_commit + drop, then
+        // post-stream add that overshoots the cap. The "overshoot is
+        // allowed for the in-flight request" rule is the same as
+        // commit_tokens — see tpm_blocks_next_request_once_previous_exhausted_the_window.
+        {
+            let _r = limiter.pre_commit("k1", &l).unwrap();
+        }
+        limiter.add_tokens_post_stream("k1", 1_500);
+
+        // Next request sees tpm > 1000 and refuses.
+        let err = limiter.pre_commit("k1", &l).unwrap_err();
+        assert!(
+            matches!(err, RateLimitError::Tokens { .. }),
+            "TPM cap should block the next request after streaming over-shoot; got {err:?}",
         );
     }
 }
