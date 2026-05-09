@@ -13,7 +13,7 @@ env:
 jobs:
   lint:
     name: lint (fmt + clippy)
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -30,7 +30,7 @@ jobs:
 
   rust-unit:
     name: rust unit + coverage
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     services:
       redis:
         image: redis:7-alpine
@@ -87,7 +87,7 @@ jobs:
 
   build-bin:
     name: build aisix (instrumented)
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     env:
       RUSTFLAGS: "-C instrument-coverage"
       LLVM_PROFILE_FILE: "coverage/aisix-%p-%m.profraw"
@@ -113,7 +113,7 @@ jobs:
   e2e:
     name: e2e (vitest) + coverage
     needs: [build-bin]
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     # Soft gate while the harness stabilises across CI runners (etcd
     # service startup, port detection, undici quirks). Flip to `false`
     # once we have ~5 consecutive green runs on main.
@@ -169,7 +169,7 @@ jobs:
   coverage-gate:
     name: coverage >= 90%
     needs: [rust-unit, e2e]
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
