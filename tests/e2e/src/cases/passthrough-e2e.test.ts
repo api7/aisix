@@ -179,10 +179,28 @@ describe("passthrough e2e: /passthrough/anthropic/*rest auth-shape switching + v
     // mock — pinning the exact header set is the only line of
     // defence.
     expect(testCalls[0]?.headers["x-api-key"]).toBe("sk-ant-mock");
-    expect(typeof testCalls[0]?.headers["anthropic-version"]).toBe("string");
-    expect(
-      (testCalls[0]?.headers["anthropic-version"] as string).length,
-    ).toBeGreaterThan(0);
+    // Anthropic's documented current API version is `2023-06-01`
+    // per <https://docs.anthropic.com/en/api/getting-started>. A
+    // regression that injected a malformed-but-non-empty version
+    // (e.g. "v1", "latest") would 400 against real Anthropic but
+    // pass against the permissive mock without this exact pin.
+    expect(testCalls[0]?.headers["anthropic-version"]).toBe("2023-06-01");
+
+    // Caller's `Authorization: Bearer sk-pt-e2e-caller` is
+    // gateway-internal (validates against the ApiKey table) and
+    // MUST NOT leak upstream — that would put a gateway-side
+    // ApiKey credential into upstream provider logs. Pin: if the
+    // upstream's Authorization header is present at all, its value
+    // must NOT contain the caller's plaintext bearer.
+    //
+    // (Whether the gateway should inject ANY Authorization header
+    // when forwarding to Anthropic is a separate question — docs
+    // §4.10 implies only x-api-key + anthropic-version for the
+    // Anthropic auth shape. Tracked as follow-up.)
+    const upstreamAuth = testCalls[0]?.headers["authorization"];
+    if (upstreamAuth !== undefined) {
+      expect(upstreamAuth as string).not.toContain(CALLER_PLAINTEXT);
+    }
 
     // Body verbatim — same contract as the OpenAI case.
     expect(testCalls[0]?.body).toBe(requestBody);
