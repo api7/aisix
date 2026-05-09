@@ -12,18 +12,15 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: per-model RPM=1 rate limit. The first chat completion in a
+// E2E: per-ApiKey RPM=1 rate limit. The first chat completion in a
 // minute window succeeds; the second surfaces to the OpenAI SDK as
-// `APIError` with `.status === 429`. Pinned end-to-end (real binary,
-// real etcd watch, real OpenAI SDK with auto-retry disabled) — the
-// existing in-process `rate_limit_rpm_returns_429_with_retry_after_header`
-// covers the unit-level path; this case ensures the wire contract
-// holds for a real SDK client.
+// `APIError` with `.status === 429` and a populated `Retry-After`
+// header (the load-bearing contract for SDK exponential back-off).
 //
 // Reference: OpenAI Chat Completions API spec
-// (https://platform.openai.com/docs/api-reference/chat/create); the
-// gateway's RateLimit schema lives at
-// `crates/aisix-core/src/models/rate_limit.rs`.
+// (https://platform.openai.com/docs/api-reference/chat/create) and
+// RFC 7231 §7.1.3 for the `Retry-After` header semantics
+// (https://datatracker.ietf.org/doc/html/rfc7231#section-7.1.3).
 
 const CALLER_PLAINTEXT = "sk-rl-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -104,11 +101,10 @@ describe("rate limit e2e: RPM=1 second call gets 429", () => {
 
     // Second call within the minute → APIError with status 429 AND a
     // populated `Retry-After` header. The header is the load-bearing
-    // contract for SDK back-off (in-process counterpart is named
-    // `rate_limit_rpm_returns_429_with_retry_after_header` for a
-    // reason — drop the assertion and the test would still pass on a
-    // gateway that returned 429 with no `Retry-After`, breaking every
-    // SDK that relies on it for exponential back-off.
+    // contract for SDK back-off — drop the assertion and the test
+    // would still pass on a gateway that returned 429 with no
+    // `Retry-After`, breaking every SDK that relies on it for
+    // exponential back-off.
     let caught: unknown;
     try {
       await client.chat.completions.create({
@@ -129,6 +125,11 @@ describe("rate limit e2e: RPM=1 second call gets 429", () => {
     // is the canonical access path.
     const retryAfter = caught.headers?.["retry-after"];
     expect(retryAfter).toBeDefined();
-    expect(Number.parseInt(String(retryAfter), 10)).toBeGreaterThan(0);
+    const retryAfterSeconds = Number.parseInt(String(retryAfter), 10);
+    // RPM=1 means the window is at most 60 seconds; a value above
+    // that is either a unit confusion or a wall-clock leak. Below 1
+    // would tell the SDK to retry immediately, defeating the limit.
+    expect(retryAfterSeconds).toBeGreaterThan(0);
+    expect(retryAfterSeconds).toBeLessThanOrEqual(60);
   });
 });

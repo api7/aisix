@@ -108,6 +108,10 @@ describe("smoke: admin write → proxy read", () => {
       const msg = JSON.stringify(probe.body);
       return !msg.includes("unknown provider_key_id");
     });
+
+    // Baseline-isolate the readiness probe so the assertion below
+    // measures only the test call's effect on the upstream.
+    const baseline = upstream.receivedRequests.length;
     const { status, body } = await proxy.chat({
       model: "smoke-gpt",
       messages: [{ role: "user", content: "hello" }],
@@ -127,13 +131,14 @@ describe("smoke: admin write → proxy read", () => {
       ]),
     });
 
-    const seen = upstream.receivedRequests.some((r) =>
-      r.path.startsWith("/v1/chat/completions"),
-    );
-    if (!seen) {
-      throw new Error(
-        `upstream did not receive /v1/chat/completions; saw paths: ${JSON.stringify(upstream.receivedRequests.map((r) => `${r.method} ${r.path}`))}`,
-      );
-    }
+    // Test call hit the upstream exactly once at the OpenAI Chat
+    // Completions path. `some()` would let a regression that double-
+    // fires (or short-circuits and leaks through a stray route)
+    // silently pass.
+    const testCalls = upstream.receivedRequests
+      .slice(baseline)
+      .filter((r) => r.path === "/v1/chat/completions");
+    expect(testCalls).toHaveLength(1);
+    expect(testCalls[0]?.method).toBe("POST");
   });
 });

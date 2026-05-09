@@ -13,16 +13,14 @@ import {
 
 // E2E: keyword guardrail blocks an input that contains the literal
 // pattern, and 422-rejects the request without ever calling the
-// upstream. The unit-level
-// `input_guardrail_block_returns_422_and_skips_upstream` covers this
-// in process; this case proves the wire contract end-to-end (real
-// binary, real etcd watch, real OpenAI SDK surfacing the 422 as
-// APIError).
+// upstream. The OpenAI SDK surfaces the 422 as APIError; the
+// gateway emits an OpenAI-shape error envelope with
+// `error.type: "content_filter"`.
 //
 // Reference: OpenAI Chat Completions API spec
-// (https://platform.openai.com/docs/api-reference/chat/create); the
-// Guardrail schema lives at `crates/aisix-core/src/models/guardrail.rs`
-// and the keyword runtime at `crates/aisix-guardrails/src/keyword.rs`.
+// (https://platform.openai.com/docs/api-reference/chat/create) and
+// OpenAI / Azure OpenAI content-filter error type
+// (https://learn.microsoft.com/azure/ai-services/openai/concepts/content-filter).
 
 const CALLER_PLAINTEXT = "sk-gr-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -128,8 +126,8 @@ describe("guardrail e2e: keyword block returns 422 and skips upstream", () => {
     // the `content_filter` envelope before dispatch. Status alone is
     // not enough — a regression that 422'd via a different path (e.g.
     // generic input validation) would still match `status: 422`. The
-    // type field pins the contract to the guardrail specifically (see
-    // `crates/aisix-proxy/src/error.rs::ProxyError::ContentFiltered`).
+    // type field pins the contract to the guardrail specifically per
+    // the OpenAI / Azure content-filter convention.
     await expect(
       client.chat.completions.create({
         model: "gr-e2e",

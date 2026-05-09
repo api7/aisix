@@ -140,11 +140,9 @@ describe("openai SDK compat: drive gateway through real client", () => {
     // path. The absolute-count form rejects regressions that double-fire
     // or short-circuit and silently fall through to a stray route.
     expect(nonStreamUpstream.receivedRequests.length - baseline).toBe(1);
-    expect(
-      nonStreamUpstream.receivedRequests[baseline]?.path.startsWith(
-        "/v1/chat/completions",
-      ),
-    ).toBe(true);
+    expect(nonStreamUpstream.receivedRequests[baseline]?.path).toBe(
+      "/v1/chat/completions",
+    );
   });
 
   test("openai.chat.completions.create({stream:true}) — streaming", async (ctx) => {
@@ -174,30 +172,40 @@ describe("openai SDK compat: drive gateway through real client", () => {
       }
     });
 
+    // Baseline-isolate the readiness probe so the count + path
+    // assertions below measure only the test call's effect.
+    const baseline = streamUpstream.receivedRequests.length;
     const stream = await client.chat.completions.create({
       model: "sdk-compat-stream",
       messages: [{ role: "user", content: "say hello" }],
       stream: true,
     });
 
-    let collected = "";
-    let finishReason: string | null | undefined;
+    // Capture chunks in arrival order so a regression that reordered
+    // SSE events (e.g. finish_reason landing mid-stream) is visible.
+    const chunks: Array<{ content: string; finish: string | null }> = [];
     for await (const chunk of stream) {
-      const delta = chunk.choices[0]?.delta;
-      if (delta?.content) collected += delta.content;
-      finishReason ??= chunk.choices[0]?.finish_reason ?? undefined;
+      const choice = chunk.choices[0];
+      chunks.push({
+        content: choice?.delta?.content ?? "",
+        finish: choice?.finish_reason ?? null,
+      });
     }
 
     // The SDK must reconstruct the streamed text correctly — wire
     // mismatches (chunked encoding, content-type, SSE framing, [DONE]
-    // sentinel handling) would surface here with truncated `collected`
-    // or a missing finish_reason.
+    // sentinel handling) would surface here with truncated content
+    // or a missing / mid-stream finish_reason.
+    const collected = chunks.map((c) => c.content).join("");
     expect(collected).toBe("hello world");
-    expect(finishReason).toBe("stop");
-    expect(
-      streamUpstream.receivedRequests.some((r) =>
-        r.path.startsWith("/v1/chat/completions"),
-      ),
-    ).toBe(true);
+    const finishIdx = chunks.findIndex((c) => c.finish === "stop");
+    expect(finishIdx).toBeGreaterThanOrEqual(0);
+    expect(finishIdx).toBe(chunks.length - 1);
+
+    const testCalls = streamUpstream.receivedRequests
+      .slice(baseline)
+      .filter((r) => r.path === "/v1/chat/completions");
+    expect(testCalls).toHaveLength(1);
+    expect(testCalls[0]?.method).toBe("POST");
   });
 });

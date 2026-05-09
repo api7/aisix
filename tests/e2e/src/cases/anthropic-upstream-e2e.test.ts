@@ -20,10 +20,7 @@ import {
 // `choices[0].message.content`, `choices[0].finish_reason`,
 // `usage: {prompt_tokens, completion_tokens, total_tokens}`).
 //
-// The unit-level matrix_openai_in_anthropic_upstream_non_streaming
-// covers this in process; this case proves the wire contract holds
-// against a real binary, etcd watch, and the official OpenAI SDK
-// client. The mock-upstream harness's body is path-agnostic so
+// The mock-upstream harness's body is path-agnostic so
 // `startOpenAiUpstream` doubles as the Anthropic mock when fed an
 // Anthropic-shaped `nonStreamBody`. The Anthropic bridge appends
 // `/v1/messages` to the api_base on its own, so we still reach the
@@ -34,8 +31,6 @@ import {
 //   <https://platform.openai.com/docs/api-reference/chat/create>
 // - Anthropic Messages API spec:
 //   <https://docs.anthropic.com/en/api/messages>
-// - In-process counterpart:
-//   `crates/aisix-proxy/src/lib.rs::matrix_openai_in_anthropic_upstream_non_streaming`
 
 const CALLER_PLAINTEXT = "sk-an-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")

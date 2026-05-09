@@ -15,14 +15,11 @@ import {
 // with two targets — `fb-bad` (returns 502) and `fb-good` (returns
 // 200). The default `failover` strategy starts at the first target;
 // when `fb-bad` returns a retryable upstream error, dispatch falls
-// back to `fb-good` and the caller never sees the failure. This
-// pins the same contract the in-process
-// `routing_failover_retries_to_second_target_when_first_5xxs` covers,
-// but end-to-end through a real binary, etcd watch, and OpenAI SDK.
+// back to `fb-good` and the caller never sees the failure.
 //
 // Reference: OpenAI Chat Completions API spec
-// (https://platform.openai.com/docs/api-reference/chat/create); the
-// Routing schema lives at `crates/aisix-core/src/models/routing.rs`.
+// (https://platform.openai.com/docs/api-reference/chat/create) for
+// the request/response shape the caller sees.
 
 const CALLER_PLAINTEXT = "sk-fb-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
