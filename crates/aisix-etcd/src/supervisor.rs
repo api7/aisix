@@ -19,9 +19,10 @@ use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::AisixSnapshot;
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 use crate::backoff::ExpBackoff;
@@ -29,6 +30,92 @@ use crate::key;
 use crate::loader::{self, BuildStats};
 use crate::provider::{ConfigProvider, ProviderError, RawEntry, WatchEvent};
 use crate::snapshot_cache::SnapshotCache;
+
+/// Cheap clonable handle for the watch supervisor's freshness state —
+/// the etcd revision the snapshot reflects, and how long ago the
+/// supervisor last applied an event. Read by `/admin/v1/health` so
+/// operators can tell at a glance whether the gateway is serving from
+/// a frozen snapshot (etcd partition or watch supervisor wedged) vs
+/// from a live config stream. See issue #114.
+///
+/// The previous health endpoint only reported per-model upstream
+/// connectivity; it was silent on the gateway's own freshness, so a
+/// dead etcd watch could go unnoticed for hours while the proxy kept
+/// serving the last-known config.
+#[derive(Debug, Default, Clone)]
+pub struct WatchStatus {
+    inner: Arc<WatchStatusInner>,
+}
+
+#[derive(Debug)]
+struct WatchStatusInner {
+    /// Highest revision the supervisor has applied to its snapshot.
+    /// Atomically updated on every load_once / apply_put / apply_delete /
+    /// apply_resync. Zero before first apply.
+    revision: AtomicI64,
+    /// Wall-clock instant of the most recent apply. `None` means the
+    /// supervisor has not yet completed its first cycle — boot state.
+    /// `Mutex<Option<Instant>>` over `parking_lot` would be marginally
+    /// cheaper, but std::sync::Mutex is uncontended here (one writer,
+    /// multiple readers) so the overhead is irrelevant.
+    last_apply_at: Mutex<Option<Instant>>,
+}
+
+impl Default for WatchStatusInner {
+    fn default() -> Self {
+        Self {
+            revision: AtomicI64::new(0),
+            last_apply_at: Mutex::new(None),
+        }
+    }
+}
+
+impl WatchStatus {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that the supervisor just applied an event at `revision`.
+    /// `revision` is the etcd revision the resulting snapshot reflects;
+    /// caller stamps the highest revision it's seen so concurrent /
+    /// out-of-order updates don't downgrade the published view.
+    pub(crate) fn record_apply(&self, revision: i64) {
+        let prev = self.inner.revision.load(Ordering::Relaxed);
+        if revision > prev {
+            self.inner.revision.store(revision, Ordering::Relaxed);
+        }
+        *self.inner.last_apply_at.lock().unwrap() = Some(Instant::now());
+    }
+
+    /// Snapshot the current freshness state. Returns the revision and
+    /// the age (wall-clock duration since last apply); `None` for age
+    /// means the supervisor has not yet successfully completed a cycle.
+    pub fn snapshot(&self) -> WatchStatusSnapshot {
+        let revision = self.inner.revision.load(Ordering::Relaxed);
+        let last_apply_age = self
+            .inner
+            .last_apply_at
+            .lock()
+            .unwrap()
+            .map(|t| t.elapsed());
+        WatchStatusSnapshot {
+            revision,
+            last_apply_age,
+        }
+    }
+}
+
+/// Point-in-time read of [`WatchStatus`].
+#[derive(Debug, Clone, Copy)]
+pub struct WatchStatusSnapshot {
+    /// Highest etcd revision currently reflected in the snapshot. Zero
+    /// before first apply.
+    pub revision: i64,
+    /// How long ago the supervisor last applied an event. `None` means
+    /// no apply has happened yet (boot, or DP started in disconnected
+    /// mode without a usable snapshot cache).
+    pub last_apply_age: Option<Duration>,
+}
 
 /// One supervisor instance. Consumers call [`Supervisor::run`] once and
 /// drop the returned handle on shutdown.
@@ -43,6 +130,12 @@ pub struct Supervisor<P: ConfigProvider> {
     state: Mutex<HashMap<String, RawEntry>>,
     revision: Mutex<i64>,
     cache: SnapshotCache,
+
+    /// Freshness signal exposed to /admin/v1/health. Updated on every
+    /// successful apply path (load_once / apply_put / apply_delete /
+    /// apply_resync). `Clone` produces a cheap read handle for the
+    /// admin handler.
+    status: WatchStatus,
 
     // JoinHandles for in-flight `flush_cache` writes. Tests use
     // [`Self::await_pending_cache_writes`] to deterministically wait
@@ -74,8 +167,16 @@ impl<P: ConfigProvider> Supervisor<P> {
             state: Mutex::new(HashMap::new()),
             revision: Mutex::new(0),
             cache,
+            status: WatchStatus::new(),
             pending_writes: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Cheap clonable handle to the supervisor's freshness state.
+    /// Read by /admin/v1/health to surface "etcd watch alive" /
+    /// "snapshot age" metrics. See [`WatchStatus`].
+    pub fn watch_status(&self) -> WatchStatus {
+        self.status.clone()
     }
 
     /// Drain the JoinHandles for any in-flight cache writes spawned
@@ -148,12 +249,15 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// Bump the recorded revision floor. Used by the cycle path to
     /// stamp the cache with the etcd `load_all` revision even when the
     /// resulting entry set is empty (so the file still reflects when
-    /// the DP last successfully reached the CP).
+    /// the DP last successfully reached the CP). Also stamps
+    /// `WatchStatus.last_apply_at` so `/health` reflects the
+    /// successful round-trip with etcd even on an empty config.
     fn set_revision_floor(&self, revision: i64) {
         let mut rev = self.revision.lock().unwrap();
         if revision > *rev {
             *rev = revision;
         }
+        self.status.record_apply(revision);
     }
 
     /// Apply a single Put event on top of the current snapshot.
@@ -215,6 +319,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                 *rev = entry.revision;
             }
         }
+        // /health reads this — record the apply so `last_apply_age`
+        // resets on every event we successfully process.
+        self.status.record_apply(entry.revision);
         self.flush_cache();
         true
     }
@@ -286,6 +393,13 @@ impl<P: ConfigProvider> Supervisor<P> {
             new
         });
         self.state.lock().unwrap().remove(key_str);
+        // Stamp /health freshness on a successful delete. We
+        // don't have a per-event revision on the wire delete
+        // (the etcd watch revision is held at the cycle level);
+        // call record_apply with the current revision so age
+        // resets even if the revision number doesn't move.
+        let cur_rev = *self.revision.lock().unwrap();
+        self.status.record_apply(cur_rev);
         self.flush_cache();
         true
     }
@@ -306,12 +420,18 @@ impl<P: ConfigProvider> Supervisor<P> {
         // Resync revision is the max of any entry; if the caller has a
         // separate "load_all revision" they pass it via the cycle path
         // (see `cycle`), this branch just covers the watch Resync event.
-        if let Some(max_rev) = entries.iter().map(|e| e.revision).max() {
+        let max_rev = entries.iter().map(|e| e.revision).max();
+        if let Some(rev_val) = max_rev {
             let mut rev = self.revision.lock().unwrap();
-            if max_rev > *rev {
-                *rev = max_rev;
+            if rev_val > *rev {
+                *rev = rev_val;
             }
         }
+        // /health: stamp freshness on every resync, even when the
+        // resulting entry set is empty (record_apply with the current
+        // revision floor so the operator sees recent activity).
+        let cur_rev = *self.revision.lock().unwrap();
+        self.status.record_apply(cur_rev);
         self.flush_cache();
         stats
     }
@@ -845,5 +965,74 @@ mod tests {
         let (entries, _) = cache.load().expect("cache file present");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, "/aisix/models/m-2");
+    }
+
+    // ---- regression coverage for issue #114 -------------------------
+    // /admin/v1/health needs to surface "etcd watch staleness". The
+    // tests below pin: (1) WatchStatus reflects each apply path, and
+    // (2) without an apply, last_apply_age stays None so the handler
+    // can mark the supervisor as not-yet-warmed-up rather than
+    // reporting age 0.
+
+    #[tokio::test]
+    async fn watch_status_starts_as_unset_before_any_apply() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+        let snap = sup.watch_status().snapshot();
+        assert_eq!(snap.revision, 0);
+        assert!(
+            snap.last_apply_age.is_none(),
+            "last_apply_age should be None pre-first-apply; got {:?}",
+            snap.last_apply_age,
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_status_records_apply_on_load_and_put_and_delete() {
+        let provider = Arc::new(FakeProvider::new(
+            vec![entry("/aisix/models/m-init", VALID_MODEL, 4)],
+            7,
+        ));
+        let sup = Supervisor::new(provider, "/aisix");
+
+        // load_once → set_revision_floor(7) → record_apply(7)
+        sup.load_once().await.unwrap();
+        let snap = sup.watch_status().snapshot();
+        assert_eq!(
+            snap.revision, 7,
+            "load_once should advance revision to load_all's revision",
+        );
+        assert!(snap.last_apply_age.is_some());
+
+        // apply_put with a higher revision advances the recorded one.
+        assert!(sup.apply_put(&entry("/aisix/models/m-2", VALID_MODEL, 12)));
+        let snap = sup.watch_status().snapshot();
+        assert_eq!(snap.revision, 12);
+
+        // apply_delete keeps the revision (no per-event revision on
+        // the wire) but resets the apply timestamp.
+        assert!(sup.apply_delete("/aisix/models/m-2"));
+        let snap = sup.watch_status().snapshot();
+        assert!(snap.last_apply_age.is_some());
+        assert_eq!(snap.revision, 12);
+    }
+
+    #[tokio::test]
+    async fn watch_status_age_grows_when_no_events_arrive() {
+        // Pin the freshness signal: after an apply, the age is small;
+        // wait briefly and observe it has grown. This is what the
+        // /health handler reads to detect a wedged watch — without
+        // this signal the proxy could serve stale config indefinitely.
+        let provider = Arc::new(FakeProvider::new(vec![], 5));
+        let sup = Supervisor::new(provider, "/aisix");
+        sup.load_once().await.unwrap();
+        let first = sup.watch_status().snapshot().last_apply_age.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let later = sup.watch_status().snapshot().last_apply_age.unwrap();
+        assert!(
+            later > first,
+            "last_apply_age should monotonically grow without new events; \
+             first={first:?} later={later:?}",
+        );
     }
 }
