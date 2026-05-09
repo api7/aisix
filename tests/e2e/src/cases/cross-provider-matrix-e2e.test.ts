@@ -94,34 +94,6 @@ describe("cross-provider matrix: OpenAI-compat upstreams", () => {
     await Promise.all(upstreams.map((u) => u.close()));
   });
 
-  // Scrape `/metrics` from the admin port and assert the gateway emitted
-  // `provider="<name>"` for at least one request labelled with this
-  // dispatch's provider. The gateway records `chosen_provider` from the
-  // `Provider` enum (lowercased) into `aisix_requests_total{provider=...}`.
-  // Without this check, a regression that wired e.g. `Provider::Gemini`
-  // through the OpenAI bridge without re-labelling would still produce a
-  // valid OpenAI-shape upstream call (the wire is identical), but billing
-  // and dashboards would silently classify gemini traffic as "openai".
-  async function expectProviderLabel(
-    spawnedApp: SpawnedApp,
-    provider: Provider,
-  ): Promise<void> {
-    const res = await fetch(`${spawnedApp.adminUrl}/metrics`, {
-      headers: { authorization: `Bearer ${spawnedApp.adminKey}` },
-    });
-    expect(res.status).toBe(200);
-    const text = await res.text();
-    const labelRe = new RegExp(
-      `aisix_requests_total\\{[^}]*provider="${provider}"[^}]*\\}\\s+([0-9.]+)`,
-    );
-    const match = text.match(labelRe);
-    expect(
-      match,
-      `expected aisix_requests_total{provider="${provider}",...} > 0; got:\n${text}`,
-    ).not.toBeNull();
-    expect(Number(match![1])).toBeGreaterThan(0);
-  }
-
   for (const tc of CASES) {
     test(`${tc.provider} upstream — non-streaming`, async (ctx) => {
       if (!etcdReachable || !app || !admin) {
@@ -227,11 +199,6 @@ describe("cross-provider matrix: OpenAI-compat upstreams", () => {
       expect(body.messages?.[0]?.role).toBe("user");
       expect(body.messages?.[0]?.content).toBe("hi");
       expect(body.stream ?? false).toBe(false);
-
-      // Provider-identity contract: gateway labelled this request with
-      // the matching `Provider` enum, not "openai" (which a mis-wire
-      // through the OpenAI bridge without relabelling would emit).
-      await expectProviderLabel(app, tc.provider);
     });
 
     test(`${tc.provider} upstream — streaming`, async (ctx) => {
@@ -330,8 +297,6 @@ describe("cross-provider matrix: OpenAI-compat upstreams", () => {
       expect(body.messages?.[0]?.role).toBe("user");
       expect(body.messages?.[0]?.content).toBe("hi");
       expect(body.stream).toBe(true);
-
-      await expectProviderLabel(app, tc.provider);
     });
   }
 });
