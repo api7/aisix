@@ -40,7 +40,7 @@ API surface see [`api-proxy.md`](./api-proxy.md) and
                 │           ▼                                  │
                 │       Hub  ──►  Bridge (per provider)  ──►   │── upstream
                 │           │     (OpenAI, Anthropic, Gemini,  │   provider
-                │           │      DeepSeek, Cohere…)          │
+                │           │      DeepSeek)                   │
                 │           │                                  │
                 │       ┌───┴────────────────────┐             │
                 │       │     ProxyState         │             │
@@ -285,14 +285,16 @@ durability across replicas.
   blocks on a slow customer receiver. See
   `aisix-obs::OtlpHttpFanOut`.
 
-Five canonical metrics:
+Four canonical metrics (defined in `aisix-obs::metrics`):
 
-- `aisix_request_count` — labelled by provider, model, status, outcome.
-- `aisix_request_latency` — histogram, end-to-end including body drain.
-- `aisix_llm_latency` — histogram, upstream-only (excludes our own work).
-- `aisix_token_count` — by direction (input / output) and model.
-- `aisix_first_token_latency` — histogram, populated only for streaming
-  requests (recorded at `idx == 0`).
+- `aisix_requests_total{provider,model,status,outcome}` — counter,
+  every completed request.
+- `aisix_request_duration_seconds{provider,model,status}` — histogram,
+  end-to-end including body drain.
+- `aisix_ratelimit_rejections_total{scope}` — counter, every 429
+  rejection labelled by which quota engaged (`requests` or `tokens`).
+- `aisix_tokens_consumed_total{provider,model}` — counter, post-deduct
+  token usage from the upstream `usage` field.
 
 ## 9. Bootstrap & shutdown
 
