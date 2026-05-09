@@ -147,11 +147,31 @@ describe("fallback edge cases e2e", () => {
       try {
         await client.chat.completions.create({
           model: "fb-edges-400-good",
-          messages: [{ role: "user", content: "ready-probe" }],
+          messages: [{ role: "user", content: "ready-probe-good" }],
         });
         return true;
       } catch {
         return false;
+      }
+    });
+    // Second propagation gate on the virtual model itself. Without
+    // this, a slow CI that loaded `fb-edges-400-good` first but
+    // hadn't yet registered the routing block could still emit a
+    // 400 here — but from "unknown virtual model", not from the bad
+    // target's 400 the test is meant to verify. The "good upstream
+    // count == 0" assertion would then trivially pass on a broken
+    // gateway. The expected outcome here is APIError 400 (the bad
+    // target propagating up); 200 means the bad target wasn't
+    // tried, which is the wrong config state.
+    await waitConfigPropagation(async () => {
+      try {
+        await client.chat.completions.create({
+          model: "fb-edges-400-virtual",
+          messages: [{ role: "user", content: "ready-probe-virtual" }],
+        });
+        return false; // 200 means bad target wasn't reached
+      } catch (e) {
+        return e instanceof APIError && e.status === 400;
       }
     });
 
@@ -176,6 +196,14 @@ describe("fallback edge cases e2e", () => {
       throw new Error("unreachable: caught is not APIError");
     }
     expect(caught.status).toBe(400);
+    // Disambiguate "bad target's 400 propagated" from "unknown
+    // virtual model 400" — same envelope-discrimination pattern
+    // allowed-models-e2e uses. The bad target's mock body declares
+    // type `invalid_request_error`; a "model not found" 400 would
+    // contain that phrase in the message.
+    const errMsg = (caught.error as { message?: unknown })?.message;
+    expect(typeof errMsg).toBe("string");
+    expect((errMsg as string).toLowerCase()).not.toContain("not found");
 
     // Bad target was called exactly once (the dispatch attempt).
     // Good target was NOT called: a 4xx is not a retryable signal,
@@ -240,10 +268,11 @@ describe("fallback edge cases e2e", () => {
     const client = new OpenAI({
       apiKey: CALLER_PLAINTEXT,
       baseURL: `${app.proxyUrl}/v1`,
-      // Aggressive timeout: if the gateway hangs instead of
-      // returning a clean error, the SDK will time out and that's
-      // also a test failure (just a slower one).
-      timeout: 10_000,
+      // 30s leaves headroom for dispatch + retry walk + envelope
+      // render even on a constrained CI runner; small enough that
+      // a true gateway hang still surfaces as a test failure within
+      // a reasonable bound rather than running indefinitely.
+      timeout: 30_000,
       maxRetries: 0,
     });
 

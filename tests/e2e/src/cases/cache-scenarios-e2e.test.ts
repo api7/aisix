@@ -123,14 +123,16 @@ describe("cache scenarios e2e: different prompt → miss", () => {
     // Caller-observable header signal: each MISS must be marked as
     // such. A stale-cache regression that hit on every prompt would
     // emit `hit` here while still using the wrong cached answer.
+    // Pin upstream count too — a regression that served from cache
+    // but reported `miss` in the header would slip past a header-
+    // only check.
+    const headerCheckBaseline = upstream.receivedRequests.length;
     const headerCheckHeaders = {
       authorization: `Bearer ${CALLER_PLAINTEXT}`,
       "content-type": "application/json",
     };
-    for (const prompt of [
-      "header-prompt-A",
-      "header-prompt-B",
-    ]) {
+    const headerPrompts = ["header-prompt-A", "header-prompt-B"];
+    for (const prompt of headerPrompts) {
       const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
         method: "POST",
         headers: headerCheckHeaders,
@@ -143,6 +145,9 @@ describe("cache scenarios e2e: different prompt → miss", () => {
       expect(res.headers.get("x-aisix-cache")).toBe("miss");
       await res.text();
     }
+    expect(upstream.receivedRequests.length - headerCheckBaseline).toBe(
+      headerPrompts.length,
+    );
   });
 
 });

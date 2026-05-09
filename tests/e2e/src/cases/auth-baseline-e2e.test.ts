@@ -197,8 +197,20 @@ describe("auth baseline e2e: missing/malformed/unknown bearer all fail closed", 
     // can't use this model" — misleading and would mask key-rotation
     // mistakes during incident response.
     expect(res.status).toBe(401);
-    const body = (await res.json()) as { error?: { type?: unknown } };
+    const body = (await res.json()) as {
+      error?: { type?: unknown; message?: unknown };
+    };
     expect(typeof body.error?.type).toBe("string");
+    // Discriminate auth-layer 401 from a snapshot-not-loaded 401 or
+    // a model-resolution 401. Same envelope-discrimination pattern
+    // allowed-models-e2e uses. The error message must NOT read like
+    // "model not found" — that would mean the test passed because
+    // the gateway couldn't even resolve the model, not because the
+    // auth layer rejected the unregistered token.
+    expect(typeof body.error?.message).toBe("string");
+    expect((body.error?.message as string).toLowerCase()).not.toContain(
+      "not found",
+    );
 
     expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore);
   });
