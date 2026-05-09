@@ -144,8 +144,15 @@ describe("body edges e2e: multi-turn, empty messages", () => {
       .filter((r) => r.path === "/v1/chat/completions");
     expect(testCalls).toHaveLength(1);
     const sentBody = JSON.parse(testCalls[0]!.body) as {
+      model?: string;
       messages?: Array<{ role?: string; content?: string }>;
     };
+    // Gateway must translate the caller's display name into the
+    // upstream-supplied model_name. A regression that forwarded the
+    // caller's name to the upstream would 4xx in production
+    // (upstream doesn't recognise "body-edges") but pass against a
+    // permissive mock — pinning this catches that wire-shape gap.
+    expect(sentBody.model).toBe("gpt-4o-mini");
     expect(sentBody.messages).toHaveLength(history.length);
     for (let i = 0; i < history.length; i++) {
       expect(sentBody.messages?.[i]?.role).toBe(history[i]!.role);
@@ -165,7 +172,13 @@ describe("body edges e2e: multi-turn, empty messages", () => {
       maxRetries: 0,
     });
 
-    const upstreamHitsBefore = upstream.receivedRequests.length;
+    // Path-filtered baseline (matches the convention used across
+    // the suite): a regression that triggered an unrelated upstream
+    // call would not falsely inflate this counter.
+    const upstreamChatHitsBefore = upstream.receivedRequests.filter(
+      (r) => r.path === "/v1/chat/completions",
+    ).length;
+
     let caught: unknown;
     try {
       await client.chat.completions.create({
@@ -183,20 +196,25 @@ describe("body edges e2e: multi-turn, empty messages", () => {
     if (!(caught instanceof APIError)) {
       throw new Error("unreachable: caught is not APIError");
     }
-    // Validation failures land in the 4xx family; 5xx would mean
-    // the gateway crashed or panicked on the empty input.
-    expect(caught.status).toBeGreaterThanOrEqual(400);
-    expect(caught.status).toBeLessThan(500);
-    // OpenAI envelope: error.type / error.message non-empty
-    // strings. A regression that returned an empty body or a
-    // non-OpenAI shape would fail here.
+    // OpenAI Chat Completions request schema declares
+    // `messages: minItems: 1` — a schema-violation 400 is the only
+    // spec-conformant outcome. 401/403/404/422 here would all
+    // signal a different bug (auth ordering, model resolution,
+    // schema choice).
+    expect(caught.status).toBe(400);
+    // Pin the OpenAI error vocabulary: the gateway is rejecting
+    // on OpenAI's behalf, so it must use OpenAI's published value
+    // for schema violations rather than a gateway-internal string
+    // <https://platform.openai.com/docs/guides/error-codes/api-errors>.
     const err = caught.error as { type?: unknown; message?: unknown };
-    expect(typeof err.type).toBe("string");
-    expect((err.type as string).length).toBeGreaterThan(0);
+    expect(err.type).toBe("invalid_request_error");
     expect(typeof err.message).toBe("string");
     expect((err.message as string).length).toBeGreaterThan(0);
 
     // Validation must short-circuit before dispatch.
-    expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore);
+    const upstreamChatHitsAfter = upstream.receivedRequests.filter(
+      (r) => r.path === "/v1/chat/completions",
+    ).length;
+    expect(upstreamChatHitsAfter).toBe(upstreamChatHitsBefore);
   });
 });
