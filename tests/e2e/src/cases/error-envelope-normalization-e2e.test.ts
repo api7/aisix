@@ -30,15 +30,22 @@ import {
 //
 //   - Anthropic: `{ type: "error", error: { type, message } }`
 //     <https://docs.anthropic.com/en/api/errors>
-//   - Gemini (Google API standard):
-//     `{ error: { code, message, status } }`
-//     <https://ai.google.dev/api/rest/v1/Code>
+//   - Gemini via OpenAI-compat endpoint (the wire the gateway's
+//     gemini bridge actually talks to per Google's published
+//     compatibility doc) returns OpenAI-shape errors:
+//     `{ error: { message, type, code } }`
+//     <https://ai.google.dev/gemini-api/docs/openai>
 //   - DeepSeek (OpenAI-compat): `{ error: { message, type, code } }`
 //     <https://api-docs.deepseek.com>
 //
 // Target shape (OpenAI Chat Completions error envelope):
 //   `{ error: { message: string, type: string, code?: string|null } }`
 //   <https://platform.openai.com/docs/guides/error-codes/api-errors>
+//
+// Two of the three providers (gemini, deepseek) speak OpenAI-shape
+// upstream → the gateway's job is faithful pass-through; a regression
+// that mangled the envelope would fail those cases. Anthropic is the
+// one true translation case (Anthropic-shape in, OpenAI-shape out).
 
 const CALLER_PLAINTEXT = "sk-err-norm-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -57,9 +64,12 @@ interface ProviderCase {
   // shape, but the underlying reason must be preserved so the
   // caller knows what actually went wrong).
   readonly upstreamMessageSubstr: string;
-  // Some provider bridges use `${baseUrl}/v1`, others use the bare
-  // host (Anthropic appends `/v1/messages` itself). Mirrors the
-  // convention established in anthropic-upstream-e2e.test.ts.
+  // Anthropic's documented endpoint is
+  // `https://api.anthropic.com/v1/messages` so api_base is the bare
+  // host (the bridge composes `/v1/messages` on its own).
+  // OpenAI-compat providers expose at `<host>/v1/chat/completions`
+  // — `/v1` belongs to api_base; cf. `docs/api-admin.md` example
+  // `"api_base": "https://api.openai.com/v1"`.
   readonly apiBaseSuffix: "" | "/v1";
 }
 
@@ -86,18 +96,17 @@ const CASES: ReadonlyArray<ProviderCase> = [
     provider: "gemini",
     upstreamModelId: "gemini-2.0-flash",
     displayName: "err-norm-gemini",
-    // Google API standard error shape per
-    // <https://cloud.google.com/apis/design/errors#error_model>:
-    //   {"error":{"code":400,"message":"...","status":"INVALID_ARGUMENT"}}
-    // The gemini-via-openai-compat path proxies the OpenAI-compat
-    // endpoint, so the upstream envelope follows OpenAI-compat too;
-    // for the e2e we only care that the gateway preserves status
-    // and produces an OpenAI-shape body.
+    // The gemini bridge talks to Google's OpenAI-compatibility
+    // endpoint per <https://ai.google.dev/gemini-api/docs/openai>,
+    // which returns errors in OpenAI envelope shape. The
+    // "normalization" the gateway performs for gemini is therefore
+    // trivial pass-through — but pinning it catches a regression
+    // that mangles or drops the envelope on the way through.
     nativeErrorBody: {
       error: {
-        code: 400,
         message: "Gemini upstream rejected: invalid temperature",
-        status: "INVALID_ARGUMENT",
+        type: "invalid_request_error",
+        code: "invalid_temperature",
       },
     },
     upstreamMessageSubstr: "invalid temperature",
@@ -182,10 +191,13 @@ describe("error envelope normalization e2e: provider-native 4xx → OpenAI-shape
         maxRetries: 0,
       });
 
-      // Readiness gate: poll until the call surfaces a 400 (the
-      // upstream's mocked behavior). A 200 means snapshot isn't
-      // loaded; a 5xx means the gateway couldn't reach the
-      // upstream yet.
+      // Readiness gate: poll until the gateway returns the
+      // *upstream's* 400, not a snapshot-lag "model not found"
+      // 400. The latter would prove the gateway returns 400 but
+      // not that the upstream was actually reached — a regression
+      // that broke envelope normalization could pass on the wrong
+      // 400 path. Same disambiguation pattern fallback-edges-e2e
+      // uses: pin the upstream's distinctive substring.
       await waitConfigPropagation(async () => {
         try {
           await client.chat.completions.create({
@@ -194,7 +206,11 @@ describe("error envelope normalization e2e: provider-native 4xx → OpenAI-shape
           });
           return false; // unexpected 200 — keep polling
         } catch (e) {
-          return e instanceof APIError && e.status === 400;
+          if (!(e instanceof APIError) || e.status !== 400) return false;
+          const msg = (e.error as { message?: unknown })?.message;
+          return (
+            typeof msg === "string" && msg.includes(tc.upstreamMessageSubstr)
+          );
         }
       });
 
