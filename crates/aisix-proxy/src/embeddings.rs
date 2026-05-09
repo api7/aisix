@@ -426,4 +426,98 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "upstream_error");
     }
+
+    #[tokio::test]
+    async fn response_contains_usage_tokens_from_upstream() {
+        // The existing `happy_path_*` tests assert response.data shape but
+        // never pin the usage envelope; cp-api depends on it for billing.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.1_f32, 0.2_f32]}],
+                "model": "text-embedding-3-small",
+                "usage": {"prompt_tokens": 7, "total_tokens": 7}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({"model": "my-embed", "input": "hello world"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["usage"]["prompt_tokens"], 7);
+        assert_eq!(v["usage"]["total_tokens"], 7);
+    }
+
+    #[tokio::test]
+    async fn upstream_request_uses_provider_model_name_not_display_name() {
+        // Model-alias resolution: the gateway's public display_name
+        // (`my-embed`) must be rewritten to the upstream provider's
+        // model id (`text-embedding-3-small`) before forwarding.
+        // wiremock's body_partial_json matcher only fires on the
+        // rewritten body; a 200 OK proves the alias was resolved.
+        use wiremock::matchers::body_partial_json;
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .and(body_partial_json(serde_json::json!({
+                "model": "text-embedding-3-small"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({"model": "my-embed", "input": "hello"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "model alias was not rewritten to upstream provider model name"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_429_propagates_status_to_client() {
+        // ai-gateway's `BridgeError::UpstreamStatus` already maps 4xx
+        // through (see crates/aisix-proxy/src/error.rs); this test pins
+        // the contract for the embeddings path so a refactor can't
+        // silently turn upstream 429 into a generic 502.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(429).set_body_string(
+                r#"{"error":{"message":"rate limited","type":"rate_limit_error"}}"#,
+            ))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({"model": "my-embed", "input": "hi"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
 }
