@@ -39,7 +39,8 @@ docker run --rm \
   -e AISIX_MANAGED__CP_CERT_PEM="$(cat leaf.crt)" \
   -e AISIX_MANAGED__CP_KEY_PEM="$(cat leaf.key)" \
   -e AISIX_MANAGED__CP_CA_PEM="$(cat ca.crt)" \
-  -e AISIX_MANAGED__CP_ETCD_ENDPOINT=https://dp-manager.aisix.cloud:7943 \
+  -e AISIX_MANAGED__CP_BASE_URL=https://api.us.aisix.cloud \
+  -e AISIX_MANAGED__CP_ETCD_ENDPOINT=dp-manager.aisix.cloud:7943 \
   -v aisix-mtls:/var/lib/aisix \
   -p 3000:3000 \
   ghcr.io/api7/ai-gateway:main
@@ -64,9 +65,13 @@ What each flag does:
   paired with the leaf.
 - `AISIX_MANAGED__CP_CA_{PEM,FILE}` — the CA the DP installs as the
   trust anchor for outbound dp-manager mTLS.
-- `AISIX_MANAGED__CP_ETCD_ENDPOINT` — the dp-manager mTLS-fronted
-  etcd endpoint. There is no `CP_BASE_URL` step in this path; the
-  DP talks straight to dp-manager.
+- `AISIX_MANAGED__CP_BASE_URL` — the CP HTTPS origin used by the
+  heartbeat worker (`<base>/dp/heartbeat`). The cert-bundle path
+  skips `/dp/register` but still needs this for periodic heartbeats.
+- `AISIX_MANAGED__CP_ETCD_ENDPOINT` — bare `host:port` of the
+  dp-manager mTLS-fronted etcd endpoint (no scheme — the DP attaches
+  `https://` itself). Optional in the cert-bundle path: when unset
+  the DP falls back to `cp_base_url`'s host:port.
 - `-v aisix-mtls:/var/lib/aisix` — persist the materialised bundle.
   Re-running with the same inputs over an existing volume is safe;
   the atomic-write helper truncates+rewrites the targets.
@@ -115,7 +120,7 @@ Every config field is reachable via `AISIX_<UPPER>__<UPPER>` (the
 | `AISIX_MANAGED__MTLS_DIR` | `managed.mtls_dir` | `/var/lib/aisix/mtls` |
 | `AISIX_MANAGED__DP_ID_FILE` | `managed.dp_id_file` | `/var/lib/aisix/dp_id` |
 | `AISIX_MANAGED__SNAPSHOT_CACHE_PATH` | `managed.snapshot_cache_path` | `/var/lib/aisix/config_cache.json` (set `""` to disable) |
-| `AISIX_MANAGED__CP_ETCD_ENDPOINT` | `managed.cp_etcd_endpoint` | unset; required for cert-bundle path |
+| `AISIX_MANAGED__CP_ETCD_ENDPOINT` | `managed.cp_etcd_endpoint` | bare `host:port`, no scheme. **Required** for the register path; in the cert-bundle path falls back to `cp_base_url`'s host:port if unset |
 | `AISIX_MANAGED__CP_CA_CERT_FILE` | `managed.cp_ca_cert_file` | unset; optional override for the dp-manager trust anchor |
 | `AISIX_MANAGED__CP_CERT_PEM` / `_FILE` | `managed.cp_cert_pem` / `cp_cert_file` | unset (cert-bundle path; one of the two must be set) |
 | `AISIX_MANAGED__CP_KEY_PEM` / `_FILE` | `managed.cp_key_pem` / `cp_key_file` | unset (cert-bundle path; one of the two must be set) |
@@ -123,12 +128,16 @@ Every config field is reachable via `AISIX_<UPPER>__<UPPER>` (the
 
 ## Restart semantics
 
-1. **First boot, cert-bundle env vars set** → materialise the bundle
-   into `mtls_dir` (atomic `write-tmp + fsync + rename`); parse
-   `env_id` + `dp_id` from the leaf cert's URI SAN; connect dp-manager
-   etcd via mTLS; spawn heartbeat worker.
-2. **First boot, registration token + `CP_BASE_URL` set, no bundle on
-   disk** → register; write `ca.crt`, `client.crt`, `client.key`,
+The bootstrap branch is selected in this order (see
+`crates/aisix-server/src/main.rs`):
+
+1. **No bundle on disk yet, cert-bundle env vars set** → materialise
+   the bundle into `mtls_dir` (atomic `write-tmp + fsync + rename`);
+   parse `env_id` + `dp_id` from the leaf cert's URI SAN; connect
+   dp-manager etcd via mTLS; spawn heartbeat worker against
+   `cp_base_url`.
+2. **No bundle on disk, registration token + `CP_BASE_URL` set** →
+   `POST /dp/register`; write `ca.crt`, `client.crt`, `client.key`,
    `dp_id`, `env_id`; connect etcd via mTLS; spawn heartbeat worker.
 3. **Restart, bundle on disk** → skip register / cert-bundle
    provisioning; reload bundle; load `dp_id` and `env_id` for
@@ -170,11 +179,21 @@ Caveats:
 
 ## Verifying
 
-After `docker run`, you should see:
+After `docker run`, you should see one of two boot branches.
+
+Cert-bundle path:
+
+```
+INFO managed mode: provisioning from supplied cert bundle (api7ee parity)
+INFO provisioned with dashboard-issued cert bundle dp_id=dp_xxx env_id=11111111-... etcd=dp-manager.aisix.cloud:7943
+INFO heartbeat started url=https://api.us.aisix.cloud/dp/heartbeat dp_id=dp_xxx interval_secs=15
+```
+
+Register path:
 
 ```
 INFO managed mode: registering with aisix.cloud CP
-INFO registered with control plane dp_id=dp_xxx gateway_id=aigg_xxx etcd=dp-manager:7943
+INFO registered with control plane dp_id=dp_xxx env_id=11111111-... etcd=dp-manager.aisix.cloud:7943
 INFO heartbeat started url=https://api.us.aisix.cloud/dp/heartbeat dp_id=dp_xxx interval_secs=15
 ```
 
