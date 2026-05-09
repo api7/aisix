@@ -177,7 +177,10 @@ describe("responses endpoint e2e: /v1/responses dispatch + provider mismatch", (
     // would return `object: "chat.completion"` here.
     expect(body.object).toBe("response");
     expect(body.status).toBe("completed");
-    expect(typeof body.id).toBe("string");
+    // `id` round-trips byte-for-byte. A regression that re-issued
+    // ids during gateway-side normalization would silently break
+    // SDK paginators and webhook callbacks that key off response id.
+    expect(body.id).toBe("resp_e2e_01");
     expect(body.output).toHaveLength(1);
     expect(body.output?.[0]?.type).toBe("message");
     expect(body.output?.[0]?.role).toBe("assistant");
@@ -215,95 +218,132 @@ describe("responses endpoint e2e: /v1/responses dispatch + provider mismatch", (
     expect(sentBody.input).toBe("Say hello");
   });
 
-  test("non-OpenAI provider (anthropic): caller sees 400, upstream untouched (per docs §4.6)", async (ctx) => {
-    if (!etcdReachable || !app || !admin) {
-      ctx.skip();
-      return;
-    }
-
-    // Set up a Model with provider=anthropic. Per gateway docs
-    // §4.6, /v1/responses is OpenAI-only and non-OpenAI providers
-    // return 400. The mock upstream is registered but should
-    // never be hit.
-    const upstream = await startOpenAiUpstream();
-    upstreams.push(upstream);
-
-    const pk = await admin.createProviderKey({
-      display_name: "resp-anthropic-pk",
+  // All three non-OpenAI providers per docs §6 (anthropic, gemini,
+  // deepseek). Per docs §4.6, /v1/responses on any of them must
+  // return 400. Parametrizing across all three catches a regression
+  // that special-cased one provider but mis-handled others — gemini
+  // and deepseek's bridges *do* speak OpenAI wire shape upstream, so
+  // a regression that "just dispatched anyway" would actually return
+  // 200 from the upstream-compat layer, billing the caller and
+  // silently violating the published contract.
+  const NON_OPENAI_PROVIDERS = [
+    {
+      provider: "anthropic" as const,
+      modelName: "claude-3-5-haiku-20241022",
       secret: "sk-ant-mock",
-      api_base: upstream.baseUrl,
-    });
-    await admin.createModel({
-      display_name: "resp-anthropic",
-      provider: "anthropic",
-      model_name: "claude-3-5-haiku-20241022",
-      provider_key_id: pk.id,
-    });
+      // Anthropic's documented endpoint is `https://api.anthropic.com/v1/messages`
+      // → api_base is the bare host.
+      apiBaseSuffix: "" as const,
+    },
+    {
+      provider: "gemini" as const,
+      modelName: "gemini-2.0-flash",
+      secret: "sk-mock",
+      apiBaseSuffix: "/v1" as const,
+    },
+    {
+      provider: "deepseek" as const,
+      modelName: "deepseek-chat",
+      secret: "sk-mock",
+      apiBaseSuffix: "/v1" as const,
+    },
+  ];
 
-    const headers = {
-      authorization: `Bearer ${CALLER_PLAINTEXT}`,
-      "content-type": "application/json",
-    };
+  for (const tc of NON_OPENAI_PROVIDERS) {
+    test(`non-OpenAI provider (${tc.provider}): caller sees 400 invalid_request_error, upstream untouched (per docs §4.6)`, async (ctx) => {
+      if (!etcdReachable || !app || !admin) {
+        ctx.skip();
+        return;
+      }
 
-    // Readiness gate: poll until the gateway returns the
-    // documented 400, not a model-not-found 400 from snapshot lag.
-    // Disambiguate by checking the error envelope is fully formed
-    // (a snapshot-lag 400 might have a different message style).
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await fetch(`${app!.proxyUrl}/v1/responses`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({
-            model: "resp-anthropic",
-            input: "ready-probe",
-          }),
-        });
-        if (r.status !== 400) {
-          await r.text();
+      const upstream = await startOpenAiUpstream();
+      upstreams.push(upstream);
+
+      const pk = await admin.createProviderKey({
+        display_name: `resp-${tc.provider}-pk`,
+        secret: tc.secret,
+        api_base: `${upstream.baseUrl}${tc.apiBaseSuffix}`,
+      });
+      const modelDisplayName = `resp-${tc.provider}`;
+      await admin.createModel({
+        display_name: modelDisplayName,
+        provider: tc.provider,
+        model_name: tc.modelName,
+        provider_key_id: pk.id,
+      });
+
+      const headers = {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      };
+
+      // Readiness gate: poll until the gateway returns the
+      // documented 400 with `error.type: "invalid_request_error"`
+      // per docs §2 status→type table. A 404 here would be the
+      // snapshot-lag "model not found" case (model_not_found is
+      // mapped to 404, NOT 400, per the docs), so probing on
+      // 400 + invalid_request_error specifically gates on the
+      // gateway resolving the model AND refusing per §4.6.
+      await waitConfigPropagation(async () => {
+        try {
+          const r = await fetch(`${app!.proxyUrl}/v1/responses`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              model: modelDisplayName,
+              input: "ready-probe",
+            }),
+          });
+          if (r.status !== 400) {
+            await r.text();
+            return false;
+          }
+          const j = (await r.json()) as {
+            error?: { type?: unknown };
+          };
+          return j.error?.type === "invalid_request_error";
+        } catch {
           return false;
         }
-        const j = (await r.json()) as {
-          error?: { type?: unknown; message?: unknown };
-        };
-        // Per OpenAI error envelope spec, error.type is a non-empty
-        // string discriminator. Both "model not found" and "wrong
-        // provider" 400s would have this; we're just gating on the
-        // gateway being up enough to return SOME 400 with a body.
-        return typeof j.error?.type === "string";
-      } catch {
-        return false;
-      }
+      });
+
+      const upstreamHitsBefore = upstream.receivedRequests.length;
+
+      const res = await fetch(`${app.proxyUrl}/v1/responses`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: modelDisplayName,
+          input: "Say hello",
+        }),
+      });
+
+      // Per docs §4.6: non-OpenAI providers return 400. Status
+      // family 5xx would mean the gateway crashed (it should
+      // refuse cleanly, not panic).
+      expect(res.status).toBe(400);
+
+      const body = (await res.json()) as {
+        error?: { type?: unknown; message?: unknown };
+      };
+      // Per docs §2 status→type table: 400 → invalid_request_error.
+      // Pinning the exact value catches a regression where the
+      // gateway's refusal vocabulary drifts from the published
+      // contract (e.g. emits "service_unavailable" or
+      // "model_not_found"). Same convention body-edges-e2e and
+      // error-envelope-normalization-e2e use.
+      expect(body.error?.type).toBe("invalid_request_error");
+      expect(typeof body.error?.message).toBe("string");
+      expect((body.error?.message as string).length).toBeGreaterThan(0);
+
+      // Hard contract: upstream must never be hit when the gateway
+      // refuses for provider mismatch — otherwise the gateway is
+      // billing the caller's quota on a request it claims to reject.
+      // Critical for gemini and deepseek specifically, whose bridges
+      // DO speak OpenAI wire shape upstream — a regression that
+      // dispatched anyway would silently 200 from the upstream-
+      // compat layer.
+      expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore);
     });
-
-    const upstreamHitsBefore = upstream.receivedRequests.length;
-
-    const res = await fetch(`${app.proxyUrl}/v1/responses`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: "resp-anthropic",
-        input: "Say hello",
-      }),
-    });
-
-    // Per docs §4.6: non-OpenAI providers return 400. Status family
-    // 5xx would mean the gateway crashed (it should refuse cleanly,
-    // not panic).
-    expect(res.status).toBe(400);
-
-    const body = (await res.json()) as {
-      error?: { type?: unknown; message?: unknown };
-    };
-    // OpenAI error envelope per spec: type and message non-empty.
-    expect(typeof body.error?.type).toBe("string");
-    expect((body.error?.type as string).length).toBeGreaterThan(0);
-    expect(typeof body.error?.message).toBe("string");
-    expect((body.error?.message as string).length).toBeGreaterThan(0);
-
-    // Hard contract: upstream must never be hit when the gateway
-    // refuses for provider mismatch — otherwise the gateway is
-    // billing the caller's quota on a request it claims to reject.
-    expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore);
-  });
+  }
 });
