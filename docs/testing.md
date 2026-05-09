@@ -74,17 +74,21 @@ Used when a test needs a real external service.
 Current integration suites:
 
 - `crates/aisix-cache/tests/redis_integration.rs` — runs against a
-  real Redis. Requires `CACHE_TEST_REDIS_URL`; tests no-op silently if the
-  env var is unset, so local `cargo test` stays hermetic.
+  real Redis. Requires `CACHE_TEST_REDIS_URL`; tests no-op silently
+  if the env var is unset, so local `cargo test` stays hermetic.
+- `crates/aisix-admin/tests/etcd_integration.rs` — runs the admin
+  CRUD path against a real etcd. Requires `ADMIN_TEST_ETCD_URL`;
+  same no-op-when-unset guard as the redis suite.
 
 CI exposes the env vars these tests need:
 
 | Test | Service | Env var |
 |---|---|---|
 | `redis_integration` | `redis:7-alpine` | `CACHE_TEST_REDIS_URL=redis://127.0.0.1:6379` |
+| `etcd_integration` | `quay.io/coreos/etcd:v3.5.18` | `ADMIN_TEST_ETCD_URL=http://127.0.0.1:2379` |
 
-Future suites that need etcd or an OTLP collector will follow the
-same pattern: a service container in CI, a no-op guard for local dev.
+Future suites that need an OTLP collector will follow the same
+pattern: a service container in CI, a no-op guard for local dev.
 
 ## 4. Vitest E2E harness
 
@@ -127,7 +131,8 @@ tests/e2e/
 ```bash
 cd tests/e2e
 pnpm install --no-frozen-lockfile
-# Bring up etcd (one-time, leave running):
+# Bring up etcd (one-time, leave running). The CI e2e job pins
+# v3.5.15; the rust-unit job pins v3.5.18. Either works locally.
 docker run --rm -d -p 2379:2379 quay.io/coreos/etcd:v3.5.15 \
   etcd --listen-client-urls http://0.0.0.0:2379 \
        --advertise-client-urls http://0.0.0.0:2379
@@ -228,7 +233,7 @@ Job descriptions:
 | Job | Purpose |
 |---|---|
 | `lint` | `cargo fmt --check`, `cargo clippy -D warnings` |
-| `rust-unit` | `cargo llvm-cov --workspace --all-features` → uploads `lcov-unit.info`. Spins a `redis:7-alpine` service so `CACHE_TEST_REDIS_URL` integration tests can run |
+| `rust-unit` | `cargo llvm-cov --workspace --all-features` → uploads `lcov-unit.info`. Spins `redis:7-alpine` and `quay.io/coreos/etcd:v3.5.18` services so `CACHE_TEST_REDIS_URL` and `ADMIN_TEST_ETCD_URL` integration suites can run |
 | `build-bin` | `cargo build` of `aisix-server` with `RUSTFLAGS=-C instrument-coverage` → uploads the binary artifact for the e2e job |
 | `e2e` | Spins etcd + redis services, downloads the binary artifact, runs Vitest. Currently `continue-on-error: true` while the harness stabilises across CI runners |
 | `coverage-gate` | Merges `lcov-unit.info` + `lcov-e2e.info` → fails if below threshold |
