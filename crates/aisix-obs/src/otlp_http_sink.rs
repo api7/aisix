@@ -35,12 +35,14 @@
 //!   user content because it never accepts content fields in the
 //!   first place.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_core::models::{ExporterKind, ObservabilityExporter};
+use parking_lot::Mutex;
 use serde_json::{json, Value};
+use tokio::sync::Semaphore;
 
 use crate::usage::UsageEvent;
 
@@ -48,6 +50,16 @@ use crate::usage::UsageEvent;
 /// Tight on purpose — we never want a slow exporter to backlog tokio
 /// tasks for a wedged user receiver.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum concurrent in-flight POSTs per exporter. Past this point we
+/// drop further events on the request hot path rather than queueing
+/// them — the queue would just grow unbounded behind a slow receiver,
+/// hold the per-event JSON body in memory, and eventually OOM the DP.
+/// 64 is generous enough that a healthy receiver never trips the cap
+/// (even at a sustained 100 RPS, a 200 ms p50 keeps in-flight under
+/// 20) but still bounds the worst case to ~64 × payload-size bytes.
+/// See issue #113.
+const MAX_INFLIGHT_PER_EXPORTER: usize = 64;
 
 /// `User-Agent` header so vendor receivers can attribute traces back
 /// to AISIX in their own analytics. Not a contract; informational.
@@ -58,9 +70,27 @@ const USER_AGENT: &str = concat!("aisix-dp/", env!("CARGO_PKG_VERSION"));
 /// requests — even with per-event POSTs the kept-alive socket
 /// amortises TLS for the common case where one DP exports to one
 /// vendor.
+///
+/// Per-exporter concurrency is bounded: a [`Semaphore`] with
+/// [`MAX_INFLIGHT_PER_EXPORTER`] permits is created lazily on first
+/// sighting of each exporter name. When the cap is hit, further events
+/// for that exporter are *dropped* on the hot path (logged at debug)
+/// rather than queued. This is intentional — the alternative is letting
+/// task count + memory grow unbounded behind a slow receiver, which
+/// caused real OOMs in production. See issue #113.
 #[derive(Debug, Clone)]
 pub struct OtlpHttpFanOut {
+    inner: Arc<FanOutInner>,
+}
+
+#[derive(Debug)]
+struct FanOutInner {
     client: reqwest::Client,
+    /// Per-exporter semaphores keyed by name. Created lazily; never
+    /// pruned (a Semaphore is small and the operator's exporter set
+    /// is bounded by configuration). The Mutex is parking_lot so
+    /// uncontended lookups are basically a single atomic load.
+    permits: Mutex<HashMap<String, Arc<Semaphore>>>,
 }
 
 impl OtlpHttpFanOut {
@@ -72,12 +102,48 @@ impl OtlpHttpFanOut {
             // The client builder only fails on illegal TLS roots; the
             // default config is always valid.
             .expect("reqwest::Client default config is valid");
-        Self { client }
+        Self {
+            inner: Arc::new(FanOutInner {
+                client,
+                permits: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// Look up (or lazily insert) the per-exporter permit semaphore.
+    /// Returning `Arc<Semaphore>` lets the spawned task hold the permit
+    /// past `fan_out`'s lifetime — the permit drops with the task.
+    fn permits_for(&self, exporter_name: &str) -> Arc<Semaphore> {
+        let mut guard = self.inner.permits.lock();
+        if let Some(sem) = guard.get(exporter_name) {
+            return Arc::clone(sem);
+        }
+        let sem = Arc::new(Semaphore::new(MAX_INFLIGHT_PER_EXPORTER));
+        guard.insert(exporter_name.to_string(), Arc::clone(&sem));
+        sem
+    }
+
+    /// Test-only: how many in-flight slots are currently held for
+    /// `exporter_name`. Used by tests to assert the bounded-fan-out
+    /// invariant. Returns 0 if the exporter has never been seen.
+    #[doc(hidden)]
+    pub fn in_flight_for(&self, exporter_name: &str) -> usize {
+        let guard = self.inner.permits.lock();
+        match guard.get(exporter_name) {
+            Some(sem) => MAX_INFLIGHT_PER_EXPORTER.saturating_sub(sem.available_permits()),
+            None => 0,
+        }
     }
 
     /// Fan out one event to every enabled `otlp_http` exporter in the
     /// supplied list. Returns immediately — the actual POSTs run on
     /// detached tokio tasks and never block the caller.
+    ///
+    /// Per-exporter concurrency is capped at
+    /// [`MAX_INFLIGHT_PER_EXPORTER`]. Past the cap, further events for
+    /// that exporter are dropped (logged at `debug`) — the alternative
+    /// is unbounded queueing behind a slow / down receiver, which OOMs
+    /// the DP. See issue #113.
     ///
     /// The `exporters` slice is what the proxy's snapshot lookup
     /// returns. Empty slice = no-op (the common case for envs that
@@ -96,15 +162,35 @@ impl OtlpHttpFanOut {
             // type tag spelled out so adding a new variant in Phase 2
             // forces a compile error here.
             let ExporterKind::OtlpHttp(cfg) = &exp.kind;
+
+            // Try to claim a permit BEFORE building the payload — if
+            // we're at the cap, drop early so we don't even pay the
+            // JSON-serialisation cost.
+            let sem = self.permits_for(&exp.name);
+            let permit = match sem.try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::debug!(
+                        exporter = %exp.name,
+                        cap = MAX_INFLIGHT_PER_EXPORTER,
+                        "otlp_http fan-out: exporter at concurrency cap; dropping span",
+                    );
+                    continue;
+                }
+            };
+
             // Build the wire body once per exporter (cheap — small
             // JSON) so the spawned task only owns the bytes.
             let body = build_otlp_traces_payload(event, &exp.name);
             let endpoint = cfg.endpoint.clone();
             let headers = cfg.headers.clone();
-            let client = self.client.clone();
+            let client = self.inner.client.clone();
             let exporter_name = exp.name.clone();
 
             tokio::spawn(async move {
+                // Permit released when the task ends. `_permit` keeps
+                // it alive across the await point.
+                let _permit = permit;
                 if let Err(err) = post_one(client, endpoint, headers, body).await {
                     tracing::warn!(
                         exporter = %exporter_name,
@@ -509,5 +595,106 @@ mod tests {
         exp.enabled = false;
         let f = OtlpHttpFanOut::new();
         f.fan_out(&sample_event(), std::iter::once(&exp));
+    }
+
+    // ---- regression coverage for issue #113 -------------------------
+    // Pre-fix, fan_out spawned one detached tokio::spawn per (event,
+    // exporter) with no concurrency cap. A slow / down OTLP receiver
+    // would let task count + per-task payload memory grow unbounded
+    // until OOM. The fix bounds in-flight POSTs per exporter to
+    // MAX_INFLIGHT_PER_EXPORTER via a Semaphore; past the cap, events
+    // are dropped on the request hot path rather than queued.
+
+    /// A receiver that hangs forever — simulates a wedged OTLP backend.
+    /// We point exporters at it to wedge the spawned tasks past the
+    /// cap so we can observe the bound.
+    fn wedged_endpoint(server: &wiremock::MockServer) -> ObservabilityExporter {
+        // wiremock without registering any Mock returns 404 — that's
+        // fast (not the wedged behaviour we want). Instead point at a
+        // path that has a long delay registered.
+        let exp_json = serde_json::json!({
+            "name": "wedged-exporter",
+            "enabled": true,
+            "kind": "otlp_http",
+            "endpoint": format!("{}/v1/traces", server.uri()),
+            "headers": {}
+        });
+        serde_json::from_value(exp_json).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fan_out_caps_in_flight_when_exporter_is_slow() {
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Each POST hangs for 5 minutes; production REQUEST_TIMEOUT
+        // is 5s so in steady state these all time out, but for the
+        // test window we drive the cap deterministically.
+        Mock::given(method("POST"))
+            .and(path("/v1/traces"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(300)))
+            .mount(&server)
+            .await;
+
+        let exp = wedged_endpoint(&server);
+        let f = OtlpHttpFanOut::new();
+        // Push more events than the cap; tasks block on the wedged
+        // receiver, so in_flight must saturate at MAX_INFLIGHT_PER_EXPORTER
+        // and further calls must be dropped at the hot path.
+        let pushes = MAX_INFLIGHT_PER_EXPORTER + 50;
+        for _ in 0..pushes {
+            f.fan_out(&sample_event(), std::iter::once(&exp));
+        }
+        // Yield so spawned tasks get a chance to acquire their
+        // permits before we sample. Multi-thread runtime + a couple
+        // of yields is plenty for try_acquire to settle.
+        for _ in 0..5 {
+            tokio::task::yield_now().await;
+        }
+        let inflight = f.in_flight_for(&exp.name);
+        assert_eq!(
+            inflight, MAX_INFLIGHT_PER_EXPORTER,
+            "in-flight should saturate exactly at the cap; got {inflight}",
+        );
+        // Pre-fix (no cap), inflight would equal `pushes` here —
+        // i.e. ~114, growing unboundedly. The assertion above pins
+        // the bound.
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fan_out_recovers_after_permits_release() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Fast 200 — every permit released quickly.
+        Mock::given(method("POST"))
+            .and(path("/v1/traces"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let exp = wedged_endpoint(&server);
+        let f = OtlpHttpFanOut::new();
+        // Drive a burst that exceeds the cap; under fast-receiver
+        // conditions the permits cycle through quickly.
+        for _ in 0..(MAX_INFLIGHT_PER_EXPORTER * 2) {
+            f.fan_out(&sample_event(), std::iter::once(&exp));
+        }
+        // Generous wait — wiremock + reqwest + tokio handshake is
+        // hundreds of ms in CI. The point: in-flight should drop back
+        // to (close to) zero after the burst clears.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let inflight = f.in_flight_for(&exp.name);
+        assert!(
+            inflight < MAX_INFLIGHT_PER_EXPORTER,
+            "permits should release as POSTs complete; in_flight stuck at {inflight}",
+        );
     }
 }
