@@ -1,5 +1,7 @@
 export {
+  buildOpenAiTrailingContentAfterFinishReasonStreamEvents,
   buildOpenAiToolCallStreamEvents,
+  type OpenAiMockSseFrame,
   OpenAiMockUpstream,
   startOpenAiMockUpstream,
   type OpenAiMockUpstreamOptions,

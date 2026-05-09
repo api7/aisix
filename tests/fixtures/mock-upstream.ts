@@ -10,7 +10,16 @@ export interface RecordedRequest {
   bodyJson: unknown;
 }
 
-export type OpenAiMockStreamEvent = Record<string, unknown> | '[DONE]';
+export type OpenAiMockStreamData = Record<string, unknown> | string;
+
+export interface OpenAiMockSseFrame {
+  data: OpenAiMockStreamData;
+  event?: string;
+  delayMs?: number;
+  disconnectAfterWrite?: boolean;
+}
+
+export type OpenAiMockStreamEvent = OpenAiMockStreamData | OpenAiMockSseFrame;
 
 export interface OpenAiMockUpstreamOptions {
   model?: string;
@@ -46,6 +55,25 @@ const readBody = async (req: NodeJS.ReadableStream) => {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
   return Buffer.concat(chunks).toString('utf8');
+};
+
+const isSseFrame = (
+  event: OpenAiMockStreamEvent,
+): event is OpenAiMockSseFrame =>
+  typeof event === 'object' && event !== null && 'data' in event;
+
+const renderSseFrame = (frame: OpenAiMockSseFrame) => {
+  const lines: string[] = [];
+
+  if (frame.event) {
+    lines.push(`event: ${frame.event}`);
+  }
+
+  const payload =
+    typeof frame.data === 'string' ? frame.data : JSON.stringify(frame.data);
+  lines.push(`data: ${payload}`);
+
+  return `${lines.join('\n')}\n\n`;
 };
 
 const defaultNonStreamBody = (model: string) => ({
@@ -112,6 +140,63 @@ const defaultStreamEvents = (model: string) => [
   },
   {
     id: 'chatcmpl-e2e-mock',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model,
+    choices: [],
+    usage: {
+      prompt_tokens: 10,
+      completion_tokens: 8,
+      total_tokens: 18,
+    },
+  },
+  '[DONE]' as const,
+];
+
+export const buildOpenAiTrailingContentAfterFinishReasonStreamEvents = (
+  model: string,
+): OpenAiMockStreamEvent[] => [
+  {
+    id: 'chatcmpl-late-delta-e2e-mock',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: { role: 'assistant', content: 'hello ' },
+        finish_reason: null,
+      },
+    ],
+  },
+  {
+    id: 'chatcmpl-late-delta-e2e-mock',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: {},
+        finish_reason: 'stop',
+      },
+    ],
+  },
+  {
+    id: 'chatcmpl-late-delta-e2e-mock',
+    object: 'chat.completion.chunk',
+    created: 1,
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: { content: 'from trailing delta' },
+        finish_reason: null,
+      },
+    ],
+  },
+  {
+    id: 'chatcmpl-late-delta-e2e-mock',
     object: 'chat.completion.chunk',
     created: 1,
     model,
@@ -474,13 +559,19 @@ export const startOpenAiMockUpstream = async (
 
       let sentEvents = 0;
       for (const event of current.streamEvents ?? defaultStreamEvents(model)) {
-        if (typeof event === 'string') {
-          res.write(`data: ${event}\n\n`);
-        } else {
-          res.write(`data: ${JSON.stringify(event)}\n\n`);
-        }
+        const frame: OpenAiMockSseFrame = isSseFrame(event)
+          ? event
+          : { data: event };
+
+        res.write(renderSseFrame(frame));
 
         sentEvents += 1;
+
+        if (frame.disconnectAfterWrite) {
+          await new Promise((resolve) => setImmediate(resolve));
+          res.socket?.destroy();
+          return;
+        }
 
         if (
           current.disconnectAfterEvents !== undefined &&
@@ -491,8 +582,9 @@ export const startOpenAiMockUpstream = async (
           return;
         }
 
-        if (current.eventDelayMs) {
-          await sleep(current.eventDelayMs);
+        const delayMs = frame.delayMs ?? current.eventDelayMs;
+        if (delayMs) {
+          await sleep(delayMs);
         }
       }
 
