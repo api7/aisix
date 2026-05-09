@@ -71,6 +71,8 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - If a test case itself appears unreasonable or incorrect, do **not** silently delete or rewrite it. Flag it and ask a human to confirm before changing it.
 - Do **not** use mock data in E2E tests — they must run against real data and real services. If real data is genuinely unavailable and mocking is unavoidable, stop and get human confirmation before introducing any mock.
 - Every frontend E2E test **must** issue requests to a real backend API. No stubbed network layers, no fixture servers, no intercepted responses — the test must exercise the real backend end-to-end.
+- E2E tests must be **source-blind**. Design test cases from scenario reasonableness and combinations alone — what a real user would do, what edge cases their journey produces, what state combinations the product must handle. Do **not** read product source code to design assertions or pick expected values. The test verifies the externally observable contract, not the implementation.
+- **If an E2E test fails, the default conclusion is a bug in the code — not a flaw in the test.** Investigate and fix the product behavior. Do not weaken the assertion, relax the expected value, change the scenario, or read the source to "explain away" the failure. The only legitimate reason to change a failing test is if a human confirms the scenario itself is invalid.
 
 ## 6. Research Discipline
 
