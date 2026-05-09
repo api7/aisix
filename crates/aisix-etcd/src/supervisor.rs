@@ -165,33 +165,42 @@ impl<P: ConfigProvider> Supervisor<P> {
             return false;
         }
 
-        let new = clone_snapshot(&self.handle.load());
+        // RCU: load → clone → mutate → CAS, retrying the closure if a
+        // concurrent apply_put / apply_delete / apply_resync raced our
+        // CAS. The previous implementation used a bare load-mutate-
+        // store sequence which silently dropped events under
+        // concurrency (see issue #112). The closure body must be
+        // idempotent w.r.t. its input — `tiny` is captured by reference
+        // and the same delta is applied each retry, which is fine
+        // because the operation is "merge tiny into current".
+        self.handle.rcu(|current| {
+            let new = clone_snapshot(current);
 
-        // Move any entries from `tiny` into `new`. Must cover every
-        // ResourceTable on AisixSnapshot — a missing kind here means
-        // a watch event silently drops on the floor and the snapshot
-        // never sees the new entry, even though the loader and the
-        // proxy both know about it.
-        for e in tiny.models.entries() {
-            new.models.insert(clone_entry(&e));
-        }
-        for e in tiny.apikeys.entries() {
-            new.apikeys.insert(clone_entry(&e));
-        }
-        for e in tiny.provider_keys.entries() {
-            new.provider_keys.insert(clone_entry(&e));
-        }
-        for e in tiny.guardrails.entries() {
-            new.guardrails.insert(clone_entry(&e));
-        }
-        for e in tiny.cache_policies.entries() {
-            new.cache_policies.insert(clone_entry(&e));
-        }
-        for e in tiny.observability_exporters.entries() {
-            new.observability_exporters.insert(clone_entry(&e));
-        }
-
-        self.handle.store(new);
+            // Move any entries from `tiny` into `new`. Must cover every
+            // ResourceTable on AisixSnapshot — a missing kind here
+            // means a watch event silently drops on the floor and the
+            // snapshot never sees the new entry, even though the loader
+            // and the proxy both know about it.
+            for e in tiny.models.entries() {
+                new.models.insert(clone_entry(&e));
+            }
+            for e in tiny.apikeys.entries() {
+                new.apikeys.insert(clone_entry(&e));
+            }
+            for e in tiny.provider_keys.entries() {
+                new.provider_keys.insert(clone_entry(&e));
+            }
+            for e in tiny.guardrails.entries() {
+                new.guardrails.insert(clone_entry(&e));
+            }
+            for e in tiny.cache_policies.entries() {
+                new.cache_policies.insert(clone_entry(&e));
+            }
+            for e in tiny.observability_exporters.entries() {
+                new.observability_exporters.insert(clone_entry(&e));
+            }
+            new
+        });
 
         // Mirror the put into the cache-tracking map and flush.
         // Track the highest revision we've observed so the cache file
@@ -221,22 +230,64 @@ impl<P: ConfigProvider> Supervisor<P> {
             }
         };
 
-        let new = clone_snapshot(&self.handle.load());
-        let removed = match parsed.kind {
-            "models" => new.models.remove(parsed.id).is_some(),
-            "api_keys" => new.apikeys.remove(parsed.id).is_some(),
-            "provider_keys" => new.provider_keys.remove(parsed.id).is_some(),
-            "guardrails" => new.guardrails.remove(parsed.id).is_some(),
-            "cache_policies" => new.cache_policies.remove(parsed.id).is_some(),
-            "observability_exporters" => new.observability_exporters.remove(parsed.id).is_some(),
+        // Probe first — if the key isn't present in the current
+        // snapshot we have nothing to do and don't want to take the
+        // RCU CAS path (which would still publish a no-op clone and
+        // race against concurrent applies). The probe + RCU cycle
+        // produces an idempotent "removed" return value: a parallel
+        // delete that wins the race observes the same key already
+        // gone, so this caller returns false (nothing left to remove).
+        let snap = self.handle.load();
+        let present = match parsed.kind {
+            "models" => snap.models.get_by_id(parsed.id).is_some(),
+            "api_keys" => snap.apikeys.get_by_id(parsed.id).is_some(),
+            "provider_keys" => snap.provider_keys.get_by_id(parsed.id).is_some(),
+            "guardrails" => snap.guardrails.get_by_id(parsed.id).is_some(),
+            "cache_policies" => snap.cache_policies.get_by_id(parsed.id).is_some(),
+            "observability_exporters" => {
+                snap.observability_exporters.get_by_id(parsed.id).is_some()
+            }
             _ => false,
         };
-        if removed {
-            self.handle.store(new);
-            self.state.lock().unwrap().remove(key_str);
-            self.flush_cache();
+        drop(snap);
+        if !present {
+            return false;
         }
-        removed
+
+        // RCU: load → clone → remove → CAS, retrying under contention.
+        // The closure body re-checks `removed` from its own clone so
+        // the eventual CAS reflects the latest snapshot's state — if a
+        // sibling apply_delete won the race, the kind.remove on our
+        // clone returns None and we still publish a coherent (no-op)
+        // result.
+        self.handle.rcu(|current| {
+            let new = clone_snapshot(current);
+            match parsed.kind {
+                "models" => {
+                    new.models.remove(parsed.id);
+                }
+                "api_keys" => {
+                    new.apikeys.remove(parsed.id);
+                }
+                "provider_keys" => {
+                    new.provider_keys.remove(parsed.id);
+                }
+                "guardrails" => {
+                    new.guardrails.remove(parsed.id);
+                }
+                "cache_policies" => {
+                    new.cache_policies.remove(parsed.id);
+                }
+                "observability_exporters" => {
+                    new.observability_exporters.remove(parsed.id);
+                }
+                _ => {}
+            }
+            new
+        });
+        self.state.lock().unwrap().remove(key_str);
+        self.flush_cache();
+        true
     }
 
     /// Replace the current snapshot with a freshly loaded set (resync).
@@ -693,6 +744,81 @@ mod tests {
                 "restore_from_cache should re-publish the cached entry",
             );
         }
+    }
+
+    /// Regression for issue #112: concurrent `apply_put` calls used to
+    /// race on the bare load-mutate-store sequence inside the
+    /// supervisor, silently losing entries when both calls loaded the
+    /// same Arc<Snapshot> and the second `store` overwrote the first.
+    /// The fix replaces it with `SnapshotHandle::rcu`, which retries
+    /// the closure until the CAS succeeds. With N=200 concurrent puts
+    /// across distinct keys, every entry must end up in the snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn apply_put_concurrent_does_not_lose_events() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Arc::new(Supervisor::new(provider, "/aisix"));
+        sup.load_once().await.unwrap();
+
+        const N: usize = 200;
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..N {
+            let sup = Arc::clone(&sup);
+            tasks.spawn(async move {
+                let key = format!("/aisix/models/m-{i}");
+                assert!(
+                    sup.apply_put(&entry(&key, VALID_MODEL, (i + 1) as i64)),
+                    "apply_put returned false for {key}"
+                );
+            });
+        }
+        while let Some(res) = tasks.join_next().await {
+            res.unwrap();
+        }
+        let snap = sup.handle().load();
+        assert_eq!(
+            snap.models.len(),
+            N,
+            "concurrent apply_put lost entries (got {} of {})",
+            snap.models.len(),
+            N,
+        );
+    }
+
+    /// Same regression shape for `apply_delete`: under concurrency the
+    /// previous load-mutate-store path would have lost a sibling
+    /// delete by overwriting it with a stale clone. With RCU, deleting
+    /// every entry concurrently must leave the snapshot empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn apply_delete_concurrent_drains_snapshot() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Arc::new(Supervisor::new(provider, "/aisix"));
+        sup.load_once().await.unwrap();
+
+        const N: usize = 200;
+        for i in 0..N {
+            sup.apply_put(&entry(
+                &format!("/aisix/models/m-{i}"),
+                VALID_MODEL,
+                (i + 1) as i64,
+            ));
+        }
+        assert_eq!(sup.handle().load().models.len(), N);
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for i in 0..N {
+            let sup = Arc::clone(&sup);
+            tasks.spawn(async move {
+                sup.apply_delete(&format!("/aisix/models/m-{i}"));
+            });
+        }
+        while let Some(res) = tasks.join_next().await {
+            res.unwrap();
+        }
+        assert_eq!(
+            sup.handle().load().models.len(),
+            0,
+            "concurrent apply_delete left orphaned entries",
+        );
     }
 
     #[tokio::test]
