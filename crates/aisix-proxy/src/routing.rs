@@ -241,6 +241,36 @@ mod tests {
         assert_eq!(weighted_pick(&targets), 0);
     }
 
+    /// Soft property: across many trials, a 99/1 weight bias must
+    /// measurably favor the heavy target. The existing
+    /// `weighted_picks_from_targets_and_falls_back_in_order` only
+    /// checks order *shape* (both targets present) — it cannot tell
+    /// a weighted impl from a uniform-random one. This test pins the
+    /// *intent* of `Weighted`: weight actually steers the picks.
+    ///
+    /// Tolerance is intentionally loose: `entropy()` is sub-second
+    /// wall-clock + `Instant::now().elapsed()` (see comment in
+    /// `entropy`), so short-loop nanos can cluster. We assert "weight
+    /// 99 dominates uniform 50/50" with a ≥ 60 % lower bound, which
+    /// is robust to the weak entropy source while still failing on a
+    /// weight-blind implementation (uniform RNG → ~50 %).
+    #[test]
+    fn weighted_pick_aggregate_distribution_favors_heavier_weight() {
+        let targets = vec![
+            RoutingTarget::new("a").with_weight(99),
+            RoutingTarget::new("b").with_weight(1),
+        ];
+        let n = 5_000;
+        let a_count = (0..n).filter(|_| weighted_pick(&targets) == 0).count();
+        // Uniform 50/50 → ~2500. Weighted 99/1 → ~4950 in theory.
+        // 60 % threshold (3000) is a wide safety margin against weak
+        // entropy while still rejecting weight-blind implementations.
+        assert!(
+            a_count * 100 / n >= 60,
+            "weight=99 target should dominate aggregate picks; got {a_count}/{n}",
+        );
+    }
+
     #[test]
     fn budget_one_disables_fallback() {
         let reg = RoutingRegistry::new();
