@@ -354,10 +354,8 @@ impl StreamState {
 // is handled by `split_system` + `build_request` for the
 // Anthropic-upstream case above.
 //
-// Pattern lifted from LiteLLM's experimental_pass_through adapter
-// (`transformation.py::translate_anthropic_to_openai`), trimmed to the
-// MVP fields aisix supports today (text content blocks; tool_use,
-// image, and thinking blocks land in a follow-up PR).
+// Trimmed to the MVP fields aisix supports today (text content blocks;
+// tool_use, image, and thinking blocks land in a follow-up PR).
 
 #[derive(Debug, thiserror::Error)]
 pub enum AnthropicInboundError {
@@ -525,7 +523,7 @@ pub fn chat_response_into_anthropic_json(
 // Streaming SSE encoder — internal ChatChunk stream  →  Anthropic
 // SSE events.
 //
-// State machine (mirrors LiteLLM's `AnthropicStreamWrapper`):
+// State machine:
 //   1. First chunk that carries content or a finish_reason → emit
 //      `message_start`. If it carries content, also emit
 //      `content_block_start` + `content_block_delta`.

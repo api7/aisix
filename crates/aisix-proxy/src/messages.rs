@@ -16,8 +16,7 @@
 //!   stream as Anthropic JSON or Anthropic SSE events
 //!   (`message_start` / `content_block_*` / `message_delta` /
 //!   `message_stop`). The translation helpers live in
-//!   `aisix-provider-anthropic::wire`. Pattern lifted from LiteLLM's
-//!   experimental_pass_through adapter, scoped to text content blocks
+//!   `aisix-provider-anthropic::wire`. Scoped to text content blocks
 //!   today (tool_use / thinking / image blocks land in a follow-up).
 //!
 //! Both paths share the same auth, model lookup, allowed_models check,

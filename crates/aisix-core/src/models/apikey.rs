@@ -57,9 +57,8 @@ impl ApiKey {
 
     /// True if this key is allowed to call the given Model.
     ///
-    /// A wildcard entry `"*"` grants access to every model, matching
-    /// LiteLLM's convention.  An empty `allowed_models` list denies
-    /// everything (spec §3 authz rule).
+    /// A wildcard entry `"*"` grants access to every model. An empty
+    /// `allowed_models` list denies everything (spec §3 authz rule).
     pub fn can_access(&self, model_name: &str) -> bool {
         self.allowed_models
             .iter()
