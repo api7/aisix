@@ -119,6 +119,12 @@ describe("openai SDK compat: drive gateway through real client", () => {
       }
     });
 
+    // Baseline-isolate the propagation probe so the assertion below
+    // measures only the effect of the actual test call. Without this,
+    // tightening to an absolute count (e.g. `length === 1`) would
+    // silently break — the probe consumes one slot in receivedRequests.
+    const baseline = nonStreamUpstream.receivedRequests.length;
+
     const completion = await client.chat.completions.create({
       model: "sdk-compat-sync",
       messages: [{ role: "user", content: "hello" }],
@@ -129,13 +135,14 @@ describe("openai SDK compat: drive gateway through real client", () => {
     expect(typeof completion.choices[0]?.message.content).toBe("string");
     expect(completion.usage?.total_tokens).toBeGreaterThan(0);
 
-    // Belt-and-suspenders: prove the SDK actually hit our mock and not
-    // some other route. Without this, an environment with a stray
-    // proxy could pass the response-shape assertions while never
-    // exercising the gateway.
+    // Belt-and-suspenders: the test call hit the upstream exactly once
+    // (delta from baseline) and that hit landed on the chat-completions
+    // path. The absolute-count form rejects regressions that double-fire
+    // or short-circuit and silently fall through to a stray route.
+    expect(nonStreamUpstream.receivedRequests.length - baseline).toBe(1);
     expect(
-      nonStreamUpstream.receivedRequests.some((r) =>
-        r.path.startsWith("/v1/chat/completions"),
+      nonStreamUpstream.receivedRequests[baseline]?.path.startsWith(
+        "/v1/chat/completions",
       ),
     ).toBe(true);
   });

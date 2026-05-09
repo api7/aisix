@@ -139,10 +139,37 @@ describe("anthropic upstream e2e: OpenAI in, Anthropic out, OpenAI back to calle
     // (not /v1/chat/completions). A regression that mis-routed an
     // anthropic-provider Model through the OpenAI bridge would never
     // land on /v1/messages.
-    expect(
-      upstream.receivedRequests.some((r) =>
-        r.path.startsWith("/v1/messages"),
-      ),
-    ).toBe(true);
+    const messagesReq = upstream.receivedRequests.find((r) =>
+      r.path.startsWith("/v1/messages"),
+    );
+    expect(messagesReq).toBeDefined();
+
+    // Wire-shape on the request side: the gateway must speak Anthropic
+    // Messages, not OpenAI Chat Completions. Without these assertions
+    // the mock would happily 200 even on an OpenAI-shaped body, so
+    // the response-side translation could pass while the request-side
+    // translation was completely broken (the regression that prompted
+    // this audit pass).
+    const sentBody = JSON.parse(messagesReq!.body) as {
+      model?: string;
+      max_tokens?: unknown;
+      messages?: Array<{ role?: string; content?: unknown }>;
+    };
+    // model_name from the Model resource (Anthropic's id), not the
+    // gateway's display_name "an-e2e".
+    expect(sentBody.model).toBe("claude-3-5-haiku-20241022");
+    // Anthropic's API requires `max_tokens`; OpenAI's doesn't. The
+    // gateway must inject a value when crossing the boundary.
+    expect(typeof sentBody.max_tokens).toBe("number");
+    // Caller's user message must reach the upstream, role intact.
+    expect(sentBody.messages?.[0]?.role).toBe("user");
+
+    // Auth shape: Anthropic uses `x-api-key` + `anthropic-version`,
+    // not `Authorization: Bearer`. A regression that forwarded the
+    // OpenAI auth shape to the Anthropic upstream would 401 in
+    // production but pass against the permissive mock here without
+    // these explicit header assertions.
+    expect(messagesReq!.headers["x-api-key"]).toBe("sk-ant-mock");
+    expect(messagesReq!.headers["anthropic-version"]).toBeDefined();
   });
 });

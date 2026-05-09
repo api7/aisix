@@ -98,9 +98,13 @@ describe("fallback e2e: virtual routing fails over from 5xx to next target", () 
         targets: [{ model: "fb-bad" }, { model: "fb-good" }],
       },
     });
+    // Permit the caller for `fb-good` too so the readiness probe can
+    // hit a single-target Model directly, instead of probing through
+    // `fb-virtual` (which fires the bad→good fallback on every retry
+    // and risks off-by-one when an iteration partially succeeds).
     await admin.createApiKey({
       key_hash: CALLER_KEY_HASH,
-      allowed_models: ["fb-virtual"],
+      allowed_models: ["fb-virtual", "fb-good"],
     });
   });
 
@@ -122,15 +126,16 @@ describe("fallback e2e: virtual routing fails over from 5xx to next target", () 
       maxRetries: 0,
     });
 
-    // Routing models don't surface on /v1/models (they're an
-    // implementation detail per `crates/aisix-proxy/src/models.rs`),
-    // so probe with a chat call to fb-virtual itself. A 200 with the
-    // good upstream's content means the full path is ready: admin →
-    // etcd → DP snapshot → routing dispatcher → bad fallback to good.
+    // Probe via `fb-good` directly (single-target, no fallback path)
+    // so the readiness check doesn't pre-warm the bad→good route or
+    // risk inflating either upstream's baseline. A 200 means
+    // Model + ProviderKey + ApiKey are all loaded; routing-block
+    // propagation for `fb-virtual` is on the same etcd watch loop, so
+    // by the time `fb-good` is callable, `fb-virtual` is too.
     await waitConfigPropagation(async () => {
       try {
         const probe = await client.chat.completions.create({
-          model: "fb-virtual",
+          model: "fb-good",
           messages: [{ role: "user", content: "ready-probe" }],
         });
         return probe.choices[0]?.message.content === "fallback worked";

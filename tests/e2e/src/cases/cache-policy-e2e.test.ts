@@ -122,5 +122,37 @@ describe("cache policy e2e: identical request hits cache", () => {
       first.choices[0]?.message.content,
     );
     expect(second.choices[0]?.message.role).toBe("assistant");
+
+    // Caller-observable cache signaling — the gateway emits an
+    // `x-aisix-cache: hit|miss|disabled` header that cp-api and the
+    // dashboard's /logs view depend on. The OpenAI SDK swallows
+    // response headers, so drop down to fetch directly to verify.
+    // Use a fresh prompt so this header check doesn't reuse the cache
+    // entry built up by the SDK calls above.
+    const headerCheckHeaders = {
+      authorization: `Bearer ${CALLER_PLAINTEXT}`,
+      "content-type": "application/json",
+    };
+    const headerCheckBody = JSON.stringify({
+      model: "cache-e2e",
+      messages: [{ role: "user", content: "header-check-prompt" }],
+    });
+    const missResp = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: headerCheckHeaders,
+      body: headerCheckBody,
+    });
+    expect(missResp.status).toBe(200);
+    expect(missResp.headers.get("x-aisix-cache")).toBe("miss");
+    await missResp.text();
+
+    const hitResp = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: headerCheckHeaders,
+      body: headerCheckBody,
+    });
+    expect(hitResp.status).toBe(200);
+    expect(hitResp.headers.get("x-aisix-cache")).toBe("hit");
+    await hitResp.text();
   });
 });

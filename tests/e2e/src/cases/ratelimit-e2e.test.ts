@@ -102,18 +102,34 @@ describe("rate limit e2e: RPM=1 second call gets 429", () => {
     });
     expect(ok.choices[0]?.message.role).toBe("assistant");
 
-    // Second call within the minute → APIError with status 429.
-    await expect(
-      client.chat.completions.create({
+    // Second call within the minute → APIError with status 429 AND a
+    // populated `Retry-After` header. The header is the load-bearing
+    // contract for SDK back-off (in-process counterpart is named
+    // `rate_limit_rpm_returns_429_with_retry_after_header` for a
+    // reason — drop the assertion and the test would still pass on a
+    // gateway that returned 429 with no `Retry-After`, breaking every
+    // SDK that relies on it for exponential back-off.
+    let caught: unknown;
+    try {
+      await client.chat.completions.create({
         model: "rl-e2e",
         messages: [{ role: "user", content: "second" }],
-      }),
-    ).rejects.toBeInstanceOf(APIError);
-    await expect(
-      client.chat.completions.create({
-        model: "rl-e2e",
-        messages: [{ role: "user", content: "third" }],
-      }),
-    ).rejects.toMatchObject({ status: 429 });
+      });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(APIError);
+    if (!(caught instanceof APIError)) {
+      // Narrows TS; the expect above already failed if this hits.
+      throw new Error("unreachable: caught is not APIError");
+    }
+    expect(caught.status).toBe(429);
+    // OpenAI Node SDK exposes the response headers via `.headers`.
+    // HTTP header lookup is case-insensitive but the SDK surfaces them
+    // lowercased; cover both just in case.
+    const retryAfter =
+      caught.headers?.["retry-after"] ?? caught.headers?.["Retry-After"];
+    expect(retryAfter).toBeDefined();
+    expect(Number.parseInt(String(retryAfter), 10)).toBeGreaterThan(0);
   });
 });
