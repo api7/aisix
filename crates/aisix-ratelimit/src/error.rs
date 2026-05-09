@@ -26,7 +26,7 @@ impl RateLimitError {
         match self {
             RateLimitError::Requests { scope, .. } => *scope,
             RateLimitError::Tokens { scope, .. } => *scope,
-            RateLimitError::Concurrency => RateLimitScope::Concurrency,
+            RateLimitError::Concurrency => RateLimitScope::Requests,
         }
     }
 
@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn concurrency_has_no_retry_after_hint() {
         let e = RateLimitError::Concurrency;
-        assert_eq!(e.scope(), RateLimitScope::Concurrency);
+        assert_eq!(e.scope(), RateLimitScope::Requests);
         assert!(e.retry_after_secs().is_none());
     }
 }

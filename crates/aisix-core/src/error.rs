@@ -39,9 +39,6 @@ pub enum ProxyError {
         retry_after_secs: Option<u64>,
     },
 
-    #[error("concurrency limit exceeded")]
-    ConcurrencyLimitExceeded,
-
     #[error("budget exceeded")]
     BudgetExceeded,
 
@@ -64,7 +61,6 @@ pub enum ProxyError {
 pub enum RateLimitScope {
     Requests,
     Tokens,
-    Concurrency,
 }
 
 impl std::fmt::Display for RateLimitScope {
@@ -72,7 +68,6 @@ impl std::fmt::Display for RateLimitScope {
         f.write_str(match self {
             Self::Requests => "requests",
             Self::Tokens => "tokens",
-            Self::Concurrency => "concurrency",
         })
     }
 }
@@ -85,9 +80,7 @@ impl ProxyError {
             Self::ModelNotFound(_) | Self::InvalidRequest(_) => 400,
             Self::ModelAccessForbidden(_) | Self::ContentPolicyViolation => 403,
             Self::PayloadTooLarge => 413,
-            Self::RateLimitExceeded { .. }
-            | Self::ConcurrencyLimitExceeded
-            | Self::BudgetExceeded => 429,
+            Self::RateLimitExceeded { .. } | Self::BudgetExceeded => 429,
             Self::RequestTimeout(_) => 504,
             Self::ProviderError(_) => 502,
             Self::Internal(_) => 500,
@@ -103,7 +96,6 @@ impl ProxyError {
             Self::PayloadTooLarge => "invalid_request_error",
             Self::InvalidRequest(_) => "invalid_request_error",
             Self::RateLimitExceeded { .. } => "rate_limit_error",
-            Self::ConcurrencyLimitExceeded => "rate_limit_error",
             Self::BudgetExceeded => "billing_error",
             Self::RequestTimeout(_) => "api_error",
             Self::ProviderError(_) => "api_error",
@@ -123,9 +115,7 @@ impl ProxyError {
             Self::RateLimitExceeded { scope, .. } => match scope {
                 RateLimitScope::Requests => "rate_limit_exceeded",
                 RateLimitScope::Tokens => "token_limit_exceeded",
-                RateLimitScope::Concurrency => "concurrency_limit_exceeded",
             },
-            Self::ConcurrencyLimitExceeded => "concurrency_limit_exceeded",
             Self::BudgetExceeded => "budget_exceeded",
             Self::RequestTimeout(_) => "request_timeout",
             Self::ProviderError(_) => "provider_error",
@@ -281,15 +271,4 @@ mod tests {
         assert!(body.get("error").is_none());
     }
 
-    #[test]
-    fn retry_after_only_set_for_rpm_tpm_not_concurrency() {
-        let rpm = ProxyError::RateLimitExceeded {
-            scope: RateLimitScope::Requests,
-            retry_after_secs: Some(12),
-        };
-        assert_eq!(rpm.retry_after_secs(), Some(12));
-
-        let conc = ProxyError::ConcurrencyLimitExceeded;
-        assert_eq!(conc.retry_after_secs(), None);
-    }
 }
