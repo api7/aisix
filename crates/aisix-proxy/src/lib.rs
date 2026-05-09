@@ -405,6 +405,131 @@ mod tests {
         assert_eq!(v["error"]["type"], "upstream_error");
     }
 
+    /// Cross-provider contract: Anthropic upstream 5xx → client sees an
+    /// OpenAI-shape envelope `{error:{type:"upstream_error",...}}` with
+    /// status 502 (collapsed per `BridgeError::http_status`, see
+    /// crates/aisix-gateway/src/bridge.rs).
+    #[tokio::test]
+    async fn upstream_anthropic_5xx_collapses_to_502_with_openai_envelope() {
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(503).set_body_string(
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"upstream busy"}}"#,
+            ))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(matrix_anthropic_pk(&upstream.uri()));
+        snap.models.insert(anthropic_model_entry("my-claude"));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-claude"]));
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "my-claude",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
+        // Anthropic-shape leaks must not bleed through to the client.
+        assert_eq!(v["error"]["type"], "upstream_error");
+        assert!(v["error"]["message"].is_string());
+    }
+
+    /// Cross-provider 4xx pass-through: Anthropic upstream 400 reaches
+    /// the client as 400 + OpenAI-shape envelope (status flows from
+    /// `BridgeError::UpstreamStatus.http_status()` 4xx branch).
+    #[tokio::test]
+    async fn upstream_anthropic_400_passes_through_with_openai_envelope() {
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad input"}}"#,
+            ))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(matrix_anthropic_pk(&upstream.uri()));
+        snap.models.insert(anthropic_model_entry("my-claude"));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-claude"]));
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "my-claude",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
+        assert_eq!(v["error"]["type"], "upstream_error");
+    }
+
+    /// Garbage upstream body (200 + non-JSON) must surface as 502 with
+    /// `error.type = "upstream_decode_error"` — distinct from the 4xx/5xx
+    /// `upstream_error` token so dashboards can tell parsing failures
+    /// apart from upstream errors.
+    #[tokio::test]
+    async fn upstream_unparseable_body_returns_502_decode_error_envelope() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{not valid json"))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let app = build_router(build_state(snap, hub));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"my-gpt4","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
+        assert_eq!(v["error"]["type"], "upstream_decode_error");
+    }
+
     #[tokio::test]
     async fn provider_without_registered_bridge_returns_503() {
         // Snapshot has a Model targeting openai, but the Hub is empty.
