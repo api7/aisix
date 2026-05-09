@@ -126,13 +126,13 @@ tests/e2e/
 
 ```bash
 cd tests/e2e
-npm install
+pnpm install --no-frozen-lockfile
 # Bring up etcd (one-time, leave running):
-docker run --rm -d -p 2379:2379 quay.io/coreos/etcd:v3.6.1 \
+docker run --rm -d -p 2379:2379 quay.io/coreos/etcd:v3.5.15 \
   etcd --listen-client-urls http://0.0.0.0:2379 \
        --advertise-client-urls http://0.0.0.0:2379
 # Then:
-npm test
+pnpm test
 ```
 
 Tests skip silently if etcd is not reachable, so the suite can also
@@ -212,15 +212,15 @@ plus content-block / tool_use builders.
 
 ## 6. CI workflow
 
-`.github/workflows/ci.yml` defines six jobs that fan out from an
+`.github/workflows/ci.yml` defines five jobs that fan out from an
 initial commit:
 
 ```
-lint ─┬─ rust-unit (with redis service)
+lint ─┬─ rust-unit (with redis + etcd services)
       │
-      ├─ build-ui ─┬─ build-bin ─ e2e (with etcd + redis services)
+      ├─ build-bin ─ e2e (with etcd + redis services)
       │
-      └─ … ─────────────────────────────── coverage-gate
+      └─ ─────────────────────────────────── coverage-gate
 ```
 
 Job descriptions:
