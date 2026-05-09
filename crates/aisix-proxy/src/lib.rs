@@ -679,6 +679,92 @@ data: [DONE]\n\n";
         assert_eq!(v["error"]["type"], "rate_limit_exceeded");
     }
 
+    /// Regression for issue #108: streaming chat used to commit
+    /// `0` tokens up front and never look at the upstream's terminal
+    /// usage frame. TPM caps were silently bypassed for all streaming
+    /// traffic. The fix: build_sse_stream now passes the largest
+    /// `total_tokens` seen on any chunk to a callback that calls
+    /// `Limiter::add_tokens_post_stream`, after the SSE stream
+    /// completes. This test exercises that path end-to-end:
+    ///
+    /// 1. Issue one streaming request whose terminal SSE chunk
+    ///    carries `usage.total_tokens = 1500`. Pre-fix this would
+    ///    leave TPM at 0; post-fix TPM should be 1500.
+    /// 2. Issue a second streaming request with the same key.
+    ///    With TPM cap at 1000, this must 429 (not 200) — the
+    ///    pre-emptive `tpm.is_exceeded` check on pre_commit catches
+    ///    the over-shoot left by the previous request.
+    #[tokio::test]
+    async fn streaming_chat_tpm_cap_enforced_after_post_stream_commit_issue_108() {
+        let upstream = MockServer::start().await;
+        // Final SSE chunk carries usage. OpenAI emits this when the
+        // client sets `stream_options.include_usage=true`; the proxy
+        // doesn't yet add that on the streamed leg, but the OpenAI
+        // bridge does parse `usage` off any chunk that has one — so
+        // our mock can include it on the terminal chunk and the
+        // bridge will surface it.
+        let sse = "\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":500,\"completion_tokens\":1000,\"total_tokens\":1500}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot_with_limits(
+            "my-gpt4",
+            &["my-gpt4"],
+            &upstream.uri(),
+            serde_json::json!({"tpm": 1000}),
+        );
+        let state = build_state(snap, hub);
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // First streaming request succeeds. Drive the body to
+        // completion so build_sse_stream's on_complete fires.
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body_stream = resp.into_body().into_data_stream();
+        while let Some(chunk) = body_stream.next().await {
+            let _ = chunk.unwrap();
+        }
+
+        // Second request must 429 — TPM is now over-shot at 1500/1000.
+        // Pre-fix TPM stayed at 0 and this would have been a 200.
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "streaming chat must commit upstream tokens to TPM (issue #108); \
+             pre-fix this returned 200 and the cap was bypassed",
+        );
+        let body_bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(v["error"]["type"], "rate_limit_exceeded");
+    }
+
     #[tokio::test]
     async fn rate_limit_rpm_returns_429_with_retry_after_header() {
         let upstream = MockServer::start().await;
