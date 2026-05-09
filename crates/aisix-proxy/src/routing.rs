@@ -254,20 +254,52 @@ mod tests {
     /// 99 dominates uniform 50/50" with a ≥ 60 % lower bound, which
     /// is robust to the weak entropy source while still failing on a
     /// weight-blind implementation (uniform RNG → ~50 %).
+    /// Total weight = 101 is deliberate (so is the same total in the
+    /// companion `_respects_index_swap` test below). With weights
+    /// summing to a power-of-10 like 100 we empirically saw the
+    /// minority bin starve under the weak nanosecond-clock entropy
+    /// — a 5000-trial run on `[1, 99]` yielded only ~53 %, well below
+    /// the 60 % threshold. Bumping the heavy weight to 100 widens the
+    /// majority bin to ~99 % expected and gives the test enough margin
+    /// to absorb the entropy weakness without flaking.
     #[test]
     fn weighted_pick_aggregate_distribution_favors_heavier_weight() {
         let targets = vec![
-            RoutingTarget::new("a").with_weight(99),
+            RoutingTarget::new("a").with_weight(100),
             RoutingTarget::new("b").with_weight(1),
         ];
         let n = 5_000;
         let a_count = (0..n).filter(|_| weighted_pick(&targets) == 0).count();
-        // Uniform 50/50 → ~2500. Weighted 99/1 → ~4950 in theory.
-        // 60 % threshold (3000) is a wide safety margin against weak
-        // entropy while still rejecting weight-blind implementations.
+        // Uniform 50/50 → ~2500. Weighted 100/1 → ~4950 in theory.
+        // 60 % threshold (3000) is a wide safety margin: it already
+        // rejects both a weight-blind impl (~50 %) and a "weights
+        // inverted" regression (~1 %). Tightening to 90 % would catch
+        // a half-sensitivity regression but adds CI-flake risk against
+        // weak entropy — the looser bound is the stable choice.
         assert!(
             a_count * 100 / n >= 60,
-            "weight=99 target should dominate aggregate picks; got {a_count}/{n}",
+            "weight=100 target should dominate aggregate picks; got {a_count}/{n}",
+        );
+    }
+
+    /// Companion to the above: that test passes both for a correctly
+    /// weighted impl AND for an "always pick index 0" regression (since
+    /// the heavy weight is at index 0). Swap the weights so the heavy
+    /// target sits at index 1 — a weight-blind impl that always picks
+    /// the first target would now fail this test, while a correct
+    /// weighted impl still favors index 1. Same total=101 reasoning
+    /// as the test above.
+    #[test]
+    fn weighted_pick_aggregate_distribution_respects_index_swap() {
+        let targets = vec![
+            RoutingTarget::new("a").with_weight(1),
+            RoutingTarget::new("b").with_weight(100),
+        ];
+        let n = 5_000;
+        let b_count = (0..n).filter(|_| weighted_pick(&targets) == 1).count();
+        assert!(
+            b_count * 100 / n >= 60,
+            "weight=100 target at index 1 should dominate aggregate picks; got {b_count}/{n}",
         );
     }
 

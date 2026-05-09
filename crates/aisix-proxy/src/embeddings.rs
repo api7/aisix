@@ -469,12 +469,21 @@ mod tests {
         // rewritten body; a 200 OK proves the alias was resolved.
         use wiremock::matchers::body_partial_json;
         let upstream = MockServer::start().await;
+        // `.expect(1)` forces wiremock to assert on Drop that the mock
+        // fired exactly once. The 200-status check below already catches
+        // the wiremock-default-404 fallthrough path; the additional value
+        // of `.expect(1)` is catching a regression class the status
+        // check cannot — a future refactor that returns success WITHOUT
+        // ever reaching the upstream (cached response, synthetic 200,
+        // dry-run path). Status would still be 200, but the mock count
+        // would be 0 and `.expect(1)` would fail on Drop.
         Mock::given(method("POST"))
             .and(path("/embeddings"))
             .and(body_partial_json(serde_json::json!({
                 "model": "text-embedding-3-small"
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(1)
             .mount(&upstream)
             .await;
 
