@@ -24,19 +24,17 @@ import {
 //
 // Reference: OpenAI Chat Completions API spec
 // (https://platform.openai.com/docs/api-reference/chat/create) for
-// the `usage` object shape; ai-gateway's response renderer at
-// `crates/aisix-proxy/src/render.rs` passes prompt_tokens /
-// completion_tokens / total_tokens straight through from the
-// upstream's ChatResponse.
+// the `usage` object shape (prompt_tokens / completion_tokens /
+// total_tokens).
 
 const CALLER_PLAINTEXT = "sk-tu-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
 
-// These match the mock upstream's default `nonStreamBody` in
-// `harness/upstream-openai.ts`. If that default ever changes, this
-// test will fail loudly — which is the point.
+// Test owns its fixture: explicit `nonStreamBody` below pins the
+// numbers the upstream emits, so any silent change to the harness
+// default cannot make this test pass on a regressed gateway.
 const EXPECTED_PROMPT_TOKENS = 5;
 const EXPECTED_COMPLETION_TOKENS = 3;
 const EXPECTED_TOTAL_TOKENS = 8;
@@ -51,7 +49,26 @@ describe("token usage e2e: upstream usage block reaches client byte-for-byte", (
     etcdReachable = await new EtcdClient().ping();
     if (!etcdReachable) return;
 
-    upstream = await startOpenAiUpstream();
+    upstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "cmpl-tu-e2e",
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: "gpt-4o-mini",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "ok" },
+            finish_reason: "stop",
+          },
+        ],
+        usage: {
+          prompt_tokens: EXPECTED_PROMPT_TOKENS,
+          completion_tokens: EXPECTED_COMPLETION_TOKENS,
+          total_tokens: EXPECTED_TOTAL_TOKENS,
+        },
+      },
+    });
     app = await spawnApp();
     admin = new AdminClient(app.adminUrl, app.adminKey);
 

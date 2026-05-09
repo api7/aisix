@@ -14,15 +14,14 @@ import {
 // E2E: prompt-response cache policy, identical-request short-circuit.
 // With a `CachePolicy{applies_to: "all", enabled: true}` in scope, two
 // identical chat completions must result in the upstream being hit only
-// once — the second response is served from cache. The unit-level
-// `cache_hit_short_circuits_upstream_and_sets_header` test covers the
-// in-process path; this case proves the wire-level contract end-to-end
-// (real binary, real etcd watch propagation, real client SDK).
+// once — the second response is served from cache. The gateway also
+// emits a public `x-aisix-cache: hit|miss|disabled` response header
+// (depended on by cp-api and the dashboard's /logs view) which the
+// caller must observe.
 //
 // Reference: OpenAI Chat Completions API spec
-// (https://platform.openai.com/docs/api-reference/chat/create); the
-// gateway's CachePolicy schema lives in
-// `crates/aisix-core/src/models/cache_policy.rs`.
+// (https://platform.openai.com/docs/api-reference/chat/create) for
+// the request/response shape.
 
 const CALLER_PLAINTEXT = "sk-cache-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -59,8 +58,8 @@ describe("cache policy e2e: identical request hits cache", () => {
       allowed_models: ["cache-e2e"],
     });
     // CachePolicy is not exposed on AdminClient yet — call the JSON
-    // helper directly. Schema mirrors `aisix-core::CachePolicy`:
-    // name + enabled + applies_to is enough to enable the policy.
+    // helper directly. The admin API requires `name`, `enabled`, and
+    // `applies_to` to enable a policy.
     await admin.json("POST", "/admin/v1/cache_policies", {
       name: "cache-e2e-policy",
       enabled: true,
