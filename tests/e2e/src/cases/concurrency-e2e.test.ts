@@ -15,8 +15,8 @@ import {
 // E2E: concurrency / inter-caller isolation. Per docs
 // `docs/api-proxy.md` §2 status→error.type table:
 //
-//   | 429 | rate_limit_exceeded / concurrency_limit_exceeded /
-//   |     | budget_exceeded | RPM/TPM/concurrency/budget cap |
+//   | 429 | rate_limit_exceeded / budget_exceeded |
+//   |     | RPM/TPM/concurrency/budget cap |
 //
 // One contract pinned here:
 //
@@ -26,11 +26,10 @@ import {
 //     noisy customer could exhaust the gateway's quota for
 //     everyone else.
 //
-// (The concurrency-cap case — second simultaneous request →
-// `429 concurrency_limit_exceeded` — is held back pending a
-// product fix. Today the gateway emits the wrong error.type for
-// concurrency rejections, conflating with RPM `rate_limit_exceeded`
-// per docs §2's distinct taxonomy. See follow-up issue.)
+// (Concurrency-cap rejections deliberately surface as the same
+// `429 rate_limit_exceeded` as RPM/TPM caps — the gateway does
+// not distinguish concurrency from request rate at the wire-error
+// level. See PR #178 / issue #173.)
 //
 // Prior to this file, the gateway had **zero** e2e coverage on
 // inter-caller isolation — the existing `ratelimit-e2e.test.ts`
