@@ -229,6 +229,345 @@ describe('proxy /v1/responses', () => {
     }
   });
 
+  test('stream response emits the exact text lifecycle with terminal usage and rewritten ids', async () => {
+    const resp = await proxyPost(
+      '/v1/responses',
+      {
+        model: mockModelName,
+        input: 'stream exact lifecycle once',
+        stream: true,
+      },
+      AUTHORIZED_KEY,
+      { responseType: 'text' },
+    );
+
+    expect(resp.status).toBe(200);
+
+    const events = parseResponsesSseEvents(String(resp.data));
+    expect(events.map((event) => event.event)).toEqual([
+      'response.created',
+      'response.in_progress',
+      'response.output_item.added',
+      'response.content_part.added',
+      'response.output_text.delta',
+      'response.output_text.delta',
+      'response.output_text.done',
+      'response.content_part.done',
+      'response.output_item.done',
+      'response.completed',
+    ]);
+
+    const completed = JSON.parse(events.at(-1)?.data ?? '{}') as {
+      response?: {
+        id?: string;
+        usage?: {
+          input_tokens?: number;
+          output_tokens?: number;
+          total_tokens?: number;
+        };
+        output?: Array<{ id?: string; type?: string }>;
+      };
+    };
+
+    expect(completed.response?.id).toMatch(/^aresp_/);
+    expect(completed.response?.usage).toEqual({
+      input_tokens: 10,
+      output_tokens: 8,
+      total_tokens: 18,
+    });
+    expect(completed.response?.output?.[0]?.type).toBe('message');
+    expect(completed.response?.output?.[0]?.id).toBe(
+      `${completed.response?.id}_message_0`,
+    );
+  });
+
+  test('store and metadata survive the first response and replay through previous_response_id', async () => {
+    const firstResp = await proxyPost(
+      '/v1/responses',
+      {
+        model: mockModelName,
+        input: 'hello with metadata',
+        store: true,
+        metadata: {
+          trace_id: 'trace-123',
+        },
+      },
+      AUTHORIZED_KEY,
+    );
+
+    expect(firstResp.status).toBe(200);
+    expect(firstResp.data.metadata.trace_id).toBe('trace-123');
+
+    const secondResp = await proxyPost(
+      '/v1/responses',
+      {
+        model: mockModelName,
+        input: 'follow up with replay',
+        previous_response_id: firstResp.data.id,
+        metadata: {
+          trace_id: 'trace-456',
+        },
+      },
+      AUTHORIZED_KEY,
+    );
+
+    expect(secondResp.status).toBe(200);
+    expect(secondResp.data.previous_response_id).toBe(firstResp.data.id);
+    expect(secondResp.data.metadata.trace_id).toBe('trace-456');
+
+    const recorded = upstream?.takeRecordedRequests() ?? [];
+    expect(recorded).toHaveLength(2);
+
+    const replayBody = recorded[1]?.bodyJson as {
+      messages: Array<{ role: string; content: string }>;
+    };
+
+    expect(replayBody.messages[0]?.content).toBe('hello with metadata');
+    expect(replayBody.messages[1]?.content).toBe('hello from mock upstream');
+    expect(replayBody.messages[2]?.content).toBe('follow up with replay');
+  });
+
+  test('store false prevents previous_response_id replay from being persisted', async () => {
+    const firstResp = await proxyPost(
+      '/v1/responses',
+      {
+        model: mockModelName,
+        input: 'do not store this response',
+        store: false,
+      },
+      AUTHORIZED_KEY,
+    );
+
+    expect(firstResp.status).toBe(200);
+
+    const secondResp = await proxyPost(
+      '/v1/responses',
+      {
+        model: mockModelName,
+        input: 'try replay after store false',
+        previous_response_id: firstResp.data.id,
+      },
+      AUTHORIZED_KEY,
+    );
+
+    expect(secondResp.status).toBe(400);
+    expect(secondResp.data.error.type).toBe('invalid_request_error');
+    expect(secondResp.data.error.message).toContain(
+      'previous_response_not_found',
+    );
+
+    const recorded = upstream?.takeRecordedRequests() ?? [];
+    expect(recorded).toHaveLength(1);
+  });
+
+  test('file-id-only input images are rejected before upstream dispatch on bridge mode', async () => {
+    const resp = await proxyPost(
+      '/v1/responses',
+      {
+        model: mockModelName,
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [
+              { type: 'input_text', text: 'Describe the uploaded file' },
+              {
+                type: 'input_image',
+                file_id: 'file_123',
+                detail: 'high',
+              },
+            ],
+          },
+        ],
+      },
+      AUTHORIZED_KEY,
+    );
+
+    expect(resp.status).toBe(400);
+    expect(resp.data.error.type).toBe('invalid_request_error');
+    expect(resp.data.error.message).toContain('file_id');
+    expect(upstream?.takeRecordedRequests() ?? []).toHaveLength(0);
+  });
+
+  test('stream response preserves mixed text and function call output items', async () => {
+    upstream?.configure({
+      streamEvents: [
+        {
+          id: 'chatcmpl-responses-mixed-e2e-mock',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: UPSTREAM_MODEL,
+          choices: [
+            {
+              index: 0,
+              delta: { role: 'assistant', content: 'Calling tool' },
+              finish_reason: null,
+            },
+          ],
+        },
+        {
+          id: 'chatcmpl-responses-mixed-e2e-mock',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: UPSTREAM_MODEL,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: 'call_weather_1',
+                    type: 'function',
+                    function: {
+                      name: 'get_weather',
+                      arguments: '{"city"',
+                    },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        },
+        {
+          id: 'chatcmpl-responses-mixed-e2e-mock',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: UPSTREAM_MODEL,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    function: {
+                      arguments: ':"SF"}',
+                    },
+                  },
+                ],
+              },
+              finish_reason: 'tool_calls',
+            },
+          ],
+        },
+        {
+          id: 'chatcmpl-responses-mixed-e2e-mock',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: UPSTREAM_MODEL,
+          choices: [],
+          usage: {
+            prompt_tokens: 12,
+            completion_tokens: 7,
+            total_tokens: 19,
+          },
+        },
+        '[DONE]',
+      ],
+    });
+
+    const resp = await proxyPost(
+      '/v1/responses',
+      {
+        model: mockModelName,
+        input: 'stream mixed output items',
+        stream: true,
+      },
+      AUTHORIZED_KEY,
+      { responseType: 'text' },
+    );
+
+    expect(resp.status).toBe(200);
+
+    const events = parseResponsesSseEvents(String(resp.data));
+    expect(
+      events.some((event) => event.event === 'response.output_text.delta'),
+    ).toBe(true);
+    expect(
+      events.some(
+        (event) => event.event === 'response.function_call_arguments.delta',
+      ),
+    ).toBe(true);
+
+    const addedItems = events
+      .filter((event) => event.event === 'response.output_item.added')
+      .map((event) => JSON.parse(event.data) as { item?: { type?: string } });
+    const completed = JSON.parse(events.at(-1)?.data ?? '{}') as {
+      response?: {
+        output?: Array<{
+          type?: string;
+          arguments?: string;
+          content?: Array<{ text?: string }>;
+        }>;
+      };
+    };
+
+    expect(addedItems.map((event) => event.item?.type)).toEqual([
+      'message',
+      'function_call',
+    ]);
+    expect(completed.response?.output?.map((item) => item.type)).toEqual([
+      'message',
+      'function_call',
+    ]);
+    expect(completed.response?.output?.[0]?.content?.[0]?.text).toBe(
+      'Calling tool',
+    );
+    expect(completed.response?.output?.[1]?.arguments).toBe('{"city":"SF"}');
+  });
+
+  test('stream response emits responses error events and stops before response.completed on bridge failure', async () => {
+    upstream?.configure({
+      streamEvents: [
+        {
+          id: 'chatcmpl-responses-error-e2e-mock',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: UPSTREAM_MODEL,
+          choices: [
+            {
+              index: 1,
+              delta: { role: 'assistant', content: 'invalid choice index' },
+              finish_reason: null,
+            },
+          ],
+        },
+        '[DONE]',
+      ],
+    });
+
+    const resp = await proxyPost(
+      '/v1/responses',
+      {
+        model: mockModelName,
+        input: 'emit invalid choice index stream',
+        stream: true,
+      },
+      AUTHORIZED_KEY,
+      { responseType: 'text' },
+    );
+
+    expect(resp.status).toBe(200);
+
+    const events = parseResponsesSseEvents(String(resp.data));
+    const errorEvent = events.find((event) => event.event === 'error');
+
+    expect(errorEvent).toBeDefined();
+    expect(events.some((event) => event.event === 'response.completed')).toBe(
+      false,
+    );
+
+    const errorPayload = JSON.parse(errorEvent?.data ?? '{}') as {
+      type?: string;
+      message?: string;
+    };
+
+    expect(errorPayload.type).toBe('error');
+    expect(errorPayload.message).toContain('choice index 0');
+  });
+
   test('previous_response_id replays session history through proxy gateway wiring', async () => {
     const firstResp = await proxyPost(
       '/v1/responses',
