@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   AdminClient,
   EtcdClient,
+  ProxyClient,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -195,6 +196,14 @@ describe("concurrency e2e: rate-limit isolation across callers", () => {
       throw new Error("unreachable: caughtB is not APIError");
     }
     expect(caughtB.status).toBe(429);
+    // Pin B's rejection type symmetrically with A. A regression
+    // where B's 429 came from a different rejection path (e.g.
+    // concurrency cap leaking into the RPM rejection codepath)
+    // would change the error.type even though the status stayed
+    // 429.
+    expect((caughtB.error as { type?: unknown })?.type).toBe(
+      "rate_limit_exceeded",
+    );
 
     // Bring up a third caller C with their own RPM=1. C has never
     // sent a request, so C's first call must succeed even though
@@ -206,23 +215,38 @@ describe("concurrency e2e: rate-limit isolation across callers", () => {
       allowed_models: ["conc-iso"],
       rate_limit: { rpm: 1 },
     });
+
+    // Use a slot-non-consuming probe (`/v1/models` does not burn
+    // the RPM=1 slot) to gate on C's snapshot propagation. This
+    // separates the propagation-readiness check from the load-
+    // bearing rate-limit-isolation assertion below — without
+    // this split, a real isolation regression (C wrongly 429s)
+    // would surface as a misleading "waitConfigPropagation:
+    // condition not met within 10s" rather than as a clean 429
+    // body the test can inspect.
+    const probeC = new ProxyClient(app.proxyUrl, CALLER_C_PLAINTEXT);
+    await waitConfigPropagation(async () => {
+      const r = await probeC.listModels();
+      if (r.status !== 200) return false;
+      const data = (r.body as { data?: Array<{ id?: string }> }).data ?? [];
+      return data.some((m) => m.id === "conc-iso");
+    });
+
+    // Load-bearing assertion: C's first chat-completion succeeds
+    // even while A and B are rate-limited. A regression that
+    // scoped the rate-limit counter incorrectly (per-Model or
+    // global instead of per-ApiKey) would 429 here, surfacing
+    // explicitly with the response body intact rather than as a
+    // generic propagation timeout.
     const clientC = new OpenAI({
       apiKey: CALLER_C_PLAINTEXT,
       baseURL: `${app.proxyUrl}/v1`,
       maxRetries: 0,
     });
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await clientC.chat.completions.create({
-          model: "conc-iso",
-          messages: [{ role: "user", content: "first-C" }],
-        });
-        return r.choices[0]?.message.role === "assistant";
-      } catch (e) {
-        // 401 = ApiKey not yet propagated; keep polling.
-        return false;
-      }
+    const okC = await clientC.chat.completions.create({
+      model: "conc-iso",
+      messages: [{ role: "user", content: "first-C" }],
     });
+    expect(okC.choices[0]?.message.role).toBe("assistant");
   });
-
 });
