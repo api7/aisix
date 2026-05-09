@@ -91,10 +91,36 @@ describe("cross-provider matrix: OpenAI-compat upstreams", () => {
 
   afterAll(async () => {
     await app?.exit();
-    for (const u of upstreams) {
-      await u.close();
-    }
+    await Promise.all(upstreams.map((u) => u.close()));
   });
+
+  // Scrape `/metrics` from the admin port and assert the gateway emitted
+  // `provider="<name>"` for at least one request labelled with this
+  // dispatch's provider. The gateway records `chosen_provider` from the
+  // `Provider` enum (lowercased) into `aisix_requests_total{provider=...}`.
+  // Without this check, a regression that wired e.g. `Provider::Gemini`
+  // through the OpenAI bridge without re-labelling would still produce a
+  // valid OpenAI-shape upstream call (the wire is identical), but billing
+  // and dashboards would silently classify gemini traffic as "openai".
+  async function expectProviderLabel(
+    spawnedApp: SpawnedApp,
+    provider: Provider,
+  ): Promise<void> {
+    const res = await fetch(`${spawnedApp.adminUrl}/metrics`, {
+      headers: { authorization: `Bearer ${spawnedApp.adminKey}` },
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    const labelRe = new RegExp(
+      `aisix_requests_total\\{[^}]*provider="${provider}"[^}]*\\}\\s+([0-9.]+)`,
+    );
+    const match = text.match(labelRe);
+    expect(
+      match,
+      `expected aisix_requests_total{provider="${provider}",...} > 0; got:\n${text}`,
+    ).not.toBeNull();
+    expect(Number(match![1])).toBeGreaterThan(0);
+  }
 
   for (const tc of CASES) {
     test(`${tc.provider} upstream — non-streaming`, async (ctx) => {
@@ -171,20 +197,28 @@ describe("cross-provider matrix: OpenAI-compat upstreams", () => {
       expect(completion.choices[0]?.finish_reason).toBe("stop");
       expect(completion.usage?.total_tokens).toBe(9);
 
-      // Dispatch contract: gateway hit `/v1/chat/completions` (the
-      // OpenAI-compat path the Gemini/DeepSeek bridges use). A
-      // regression that mis-routed through Anthropic bridge would
-      // hit `/v1/messages` instead.
-      const testCall = upstream.receivedRequests
+      // Dispatch contract: gateway hit `/v1/chat/completions` exactly
+      // once (the OpenAI-compat path the Gemini/DeepSeek bridges use).
+      // A regression that mis-routed through Anthropic bridge would
+      // hit `/v1/messages` instead; a regression that introduced a
+      // retry loop would land >1 matching call here.
+      const testCalls = upstream.receivedRequests
         .slice(baseline)
-        .find((r) => r.path.startsWith("/v1/chat/completions"));
-      expect(testCall).toBeDefined();
-      expect(testCall?.method).toBe("POST");
+        .filter((r) => r.path === "/v1/chat/completions");
+      expect(testCalls).toHaveLength(1);
+      const testCall = testCalls[0]!;
+      expect(testCall.method).toBe("POST");
+      // Auth header: gateway forwards the upstream's secret as
+      // `Authorization: Bearer <secret>`. The mock accepts any auth,
+      // so without this assertion an upstream-401 regression (header
+      // dropped, swapped, or rewritten with the caller's key) would
+      // pass against the mock but fail in production.
+      expect(testCall.headers["authorization"]).toBe("Bearer sk-mock");
       // Wire-shape contract: body reaches upstream as OpenAI Chat
       // Completions JSON. `model` is rewritten to the upstream's own
       // id (caller-visible name → `upstreamModelId`). `stream` is
       // absent or false on the non-stream path.
-      const body = JSON.parse(testCall?.body ?? "{}") as {
+      const body = JSON.parse(testCall.body) as {
         model?: string;
         messages?: Array<{ role: string; content: string }>;
         stream?: boolean;
@@ -193,6 +227,11 @@ describe("cross-provider matrix: OpenAI-compat upstreams", () => {
       expect(body.messages?.[0]?.role).toBe("user");
       expect(body.messages?.[0]?.content).toBe("hi");
       expect(body.stream ?? false).toBe(false);
+
+      // Provider-identity contract: gateway labelled this request with
+      // the matching `Provider` enum, not "openai" (which a mis-wire
+      // through the OpenAI bridge without relabelling would emit).
+      await expectProviderLabel(app, tc.provider);
     });
 
     test(`${tc.provider} upstream — streaming`, async (ctx) => {
@@ -255,23 +294,34 @@ describe("cross-provider matrix: OpenAI-compat upstreams", () => {
         stream: true,
       });
 
-      let collected = "";
-      let finishReason: string | null | undefined;
+      // Capture chunks in arrival order — a regression that reordered
+      // SSE events (finish_reason before content, or content split
+      // across the wrong chunks) needs the order to be visible, not
+      // just summed.
+      const chunks: Array<{ content: string; finish: string | null }> = [];
       for await (const chunk of stream) {
-        const delta = chunk.choices[0]?.delta;
-        if (delta?.content) collected += delta.content;
-        finishReason ??= chunk.choices[0]?.finish_reason ?? undefined;
+        const choice = chunk.choices[0];
+        chunks.push({
+          content: choice?.delta?.content ?? "",
+          finish: choice?.finish_reason ?? null,
+        });
       }
-
+      const collected = chunks.map((c) => c.content).join("");
       expect(collected).toBe(tc.expectedContent);
-      expect(finishReason).toBe("stop");
+      // finish_reason must arrive on the LAST chunk that carries it,
+      // never mid-stream.
+      const finishIdx = chunks.findIndex((c) => c.finish === "stop");
+      expect(finishIdx).toBeGreaterThanOrEqual(0);
+      expect(finishIdx).toBe(chunks.length - 1);
 
-      const testCall = upstream.receivedRequests
+      const testCalls = upstream.receivedRequests
         .slice(baseline)
-        .find((r) => r.path.startsWith("/v1/chat/completions"));
-      expect(testCall).toBeDefined();
-      expect(testCall?.method).toBe("POST");
-      const body = JSON.parse(testCall?.body ?? "{}") as {
+        .filter((r) => r.path === "/v1/chat/completions");
+      expect(testCalls).toHaveLength(1);
+      const testCall = testCalls[0]!;
+      expect(testCall.method).toBe("POST");
+      expect(testCall.headers["authorization"]).toBe("Bearer sk-mock");
+      const body = JSON.parse(testCall.body) as {
         model?: string;
         messages?: Array<{ role: string; content: string }>;
         stream?: boolean;
@@ -280,6 +330,8 @@ describe("cross-provider matrix: OpenAI-compat upstreams", () => {
       expect(body.messages?.[0]?.role).toBe("user");
       expect(body.messages?.[0]?.content).toBe("hi");
       expect(body.stream).toBe(true);
+
+      await expectProviderLabel(app, tc.provider);
     });
   }
 });
