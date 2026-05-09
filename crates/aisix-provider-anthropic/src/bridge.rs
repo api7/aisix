@@ -426,6 +426,7 @@ mod tests {
                 content: "tool output".into(),
                 name: None,
                 tool_call_id: Some("tc_1".into()),
+                extra: serde_json::Map::new(),
             }],
         );
         let err = bridge.chat(&req, &ctx).await.unwrap_err();

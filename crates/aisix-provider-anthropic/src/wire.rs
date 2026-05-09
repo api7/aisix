@@ -216,6 +216,7 @@ pub(crate) fn response_into_chat_response(raw: AnthropicResponse) -> ChatRespons
             content: text,
             name: None,
             tool_call_id: None,
+            extra: serde_json::Map::new(),
         },
         finish_reason: map_stop_reason(raw.stop_reason.as_deref()),
         usage,
@@ -793,6 +794,7 @@ mod tests {
                 content: "x".into(),
                 name: None,
                 tool_call_id: None,
+                extra: serde_json::Map::new(),
             }],
         );
         assert!(matches!(
