@@ -327,6 +327,10 @@ fn guardrail_schema() -> Value {
 // forward-compatible: cp-api can ship new optional fields ahead of a DP
 // rollout without locking the gateway out.
 fn cache_policy_schema() -> Value {
+    // Backends: memory + redis. Semantic backends were removed
+    // pending DP-side wiring — see ai-gateway issue #116. The schema
+    // stays `additionalProperties: true` so a newer cp-api can ship
+    // forward-compat fields without locking out an older DP.
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -335,15 +339,9 @@ fn cache_policy_schema() -> Value {
         "properties": {
             "name":        { "type": "string", "minLength": 1, "maxLength": 120 },
             "enabled":     { "type": "boolean" },
-            "backend":     {
-                "enum": ["memory", "redis", "redis_semantic", "qdrant"]
-            },
+            "backend":     { "enum": ["memory", "redis"] },
             "ttl_seconds": { "type": "integer", "minimum": 1, "maximum": 604800 },
-            "applies_to":  { "type": "string", "minLength": 1, "maxLength": 255 },
-            "similarity_threshold": {
-                "type": "number", "minimum": 0, "maximum": 1
-            },
-            "embedding_model": { "type": "string", "minLength": 1, "maxLength": 120 }
+            "applies_to":  { "type": "string", "minLength": 1, "maxLength": 255 }
         }
     })
 }

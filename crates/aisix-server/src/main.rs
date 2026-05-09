@@ -421,7 +421,6 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     let limiter = Arc::new(Limiter::new());
     let metrics = Arc::new(Metrics::new(true));
     // Cache backend selection. Memory by default; Redis when configured.
-    // Qdrant / semantic backends drop in here in a follow-up PR.
     let cache: Option<Arc<dyn Cache>> = match cfg.cache.backend {
         CacheBackend::Memory => Some(Arc::new(MemoryCache::with_defaults())),
         CacheBackend::Redis => {
@@ -436,10 +435,6 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("redis cache connect failed (url={url}): {e}"))?;
             Some(Arc::new(redis) as Arc<dyn Cache>)
-        }
-        CacheBackend::Qdrant => {
-            tracing::warn!(target: "aisix::cache", "qdrant cache not yet implemented — falling back to in-memory");
-            Some(Arc::new(MemoryCache::with_defaults()))
         }
     };
 

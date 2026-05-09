@@ -11,8 +11,7 @@
 //! - Redis backend lands in a follow-up PR behind the `redis` feature.
 //!
 //! Streaming responses aren't cached at this layer — the upstream stream
-//! has no terminal value to store. A separate semantic-cache PR may add
-//! a "first chunk" cache later.
+//! has no terminal value to store.
 
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]

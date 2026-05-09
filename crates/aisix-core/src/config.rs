@@ -472,7 +472,6 @@ impl Default for OtlpTracingConfig {
 pub struct CacheConfig {
     pub backend: CacheBackend,
     pub redis: Option<RedisCacheConfig>,
-    pub qdrant: Option<QdrantCacheConfig>,
 }
 
 impl Default for CacheConfig {
@@ -480,7 +479,6 @@ impl Default for CacheConfig {
         Self {
             backend: CacheBackend::Memory,
             redis: None,
-            qdrant: None,
         }
     }
 }
@@ -490,7 +488,6 @@ impl Default for CacheConfig {
 pub enum CacheBackend {
     Memory,
     Redis,
-    Qdrant,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -505,13 +502,6 @@ impl RedisCacheConfig {
     fn default_mode() -> String {
         "single".into()
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct QdrantCacheConfig {
-    pub url: String,
-    pub collection: String,
 }
 
 impl Config {

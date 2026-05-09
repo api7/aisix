@@ -420,8 +420,7 @@ async fn dispatch(
     // the policy CRUD surface (`/api/environments/:env/cache_policies`,
     // see Stage 1); kine fans out the rows; the loader populates
     // `snapshot.cache_policies` (see aisix-etcd). Stage 4 will add
-    // per-policy `ttl_seconds` propagation into the cache backend
-    // and the semantic backends.
+    // per-policy `ttl_seconds` propagation into the cache backend.
     //
     // Match order: first enabled policy whose `parsed_applies_to()`
     // accepts (req.model, auth.entry.id) wins. We grab the WHOLE
