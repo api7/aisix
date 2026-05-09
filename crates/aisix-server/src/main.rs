@@ -407,7 +407,18 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             }
         }
     });
-    let heartbeat_task = heartbeat_cfg.map(|h| heartbeat::spawn(h, cancel_rx.clone()));
+    // Issue #115: supply the supervisor's rejection callback so each
+    // heartbeat carries the loader's most recent failures up to cp-api.
+    // Pre-fix the loader logged a warning and silently moved on —
+    // dashboard customers saw "Saved successfully" but the DP had
+    // dropped the row.
+    let heartbeat_task = heartbeat_cfg.map(|mut h| {
+        let supervisor_for_heartbeat = Arc::clone(&supervisor);
+        h = h.with_rejection_fetcher(Arc::new(move || {
+            supervisor_for_heartbeat.recent_rejections()
+        }));
+        heartbeat::spawn(h, cancel_rx.clone())
+    });
     let (usage_sink, telemetry_task) = match telemetry_cfg {
         Some(cfg) => {
             let (sink, handle) = telemetry::spawn(cfg, cancel_rx.clone());

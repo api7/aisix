@@ -20,18 +20,94 @@ use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::key::{self, ResourceKey};
 use crate::provider::RawEntry;
 
-/// Counts of rejected entries during a build, useful for metrics.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// Why the loader skipped an entry. Surfaced in [`RejectedEntry`] so
+/// the heartbeat / health surface can tell operators what kind of
+/// problem hit each row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectionKind {
+    /// Key didn't match the `<prefix>/<kind>/<id>` shape.
+    BadKey,
+    /// Value bytes didn't parse as JSON.
+    NonJson,
+    /// JSON parsed but failed the kind's JSON Schema.
+    SchemaFailed,
+    /// JSON Schema passed but `serde_json::from_value` refused — usually
+    /// a `deny_unknown_fields` mismatch between schema and Rust struct.
+    ParseFailed,
+    /// Key referenced a `kind` segment we don't know about. Logged at
+    /// debug normally but counted here so unknown kinds show up too.
+    UnknownKind,
+}
+
+impl RejectionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BadKey => "bad_key",
+            Self::NonJson => "non_json",
+            Self::SchemaFailed => "schema_failed",
+            Self::ParseFailed => "parse_failed",
+            Self::UnknownKind => "unknown_kind",
+        }
+    }
+}
+
+/// One rejected etcd entry. Captured by the loader on every skip path
+/// so the data plane can report back to the control plane via heartbeat
+/// — without this signal a user who saved an invalid row in the
+/// dashboard sees "Saved successfully" but has no way to learn the DP
+/// dropped it. See issue #115.
+///
+/// `timestamp_unix_secs` is wall-clock seconds-since-epoch so the
+/// heartbeat / dashboard can age-out old rejections without parsing
+/// a [`SystemTime`] across the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedEntry {
+    pub key: String,
+    pub kind: RejectionKind,
+    pub error: String,
+    pub timestamp_unix_secs: u64,
+}
+
+impl RejectedEntry {
+    fn new(key: impl Into<String>, kind: RejectionKind, error: impl Into<String>) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self {
+            key: key.into(),
+            kind,
+            error: error.into(),
+            timestamp_unix_secs: now,
+        }
+    }
+}
+
+/// Counts of rejected entries during a build, plus the rejection
+/// list itself. The counts stay handy for metrics; the list is what
+/// the heartbeat sends upstream so the dashboard can show "your DP
+/// rejected these resources, here's why."
+///
+/// `Copy` is dropped because the rejections vec can be large; existing
+/// call sites that took `BuildStats` by value continue to work via
+/// the auto-derived `Clone` (only invoked explicitly when needed).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BuildStats {
     pub accepted: usize,
     pub schema_rejected: usize,
     pub parse_rejected: usize,
     pub unknown_kind: usize,
     pub key_rejected: usize,
+    /// Detailed reject list. One entry per skipped row, in the order
+    /// the loader processed them. Capacity is whatever the caller's
+    /// upstream provider feeds in; the supervisor caps its retained
+    /// buffer separately.
+    pub rejections: Vec<RejectedEntry>,
 }
 
 /// Build a fresh snapshot from raw entries. Never fails — bad rows are
@@ -47,6 +123,11 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
             Err(err) => {
                 tracing::warn!(key = %raw.key, error = %err, "skipping etcd entry with bad key");
                 stats.key_rejected += 1;
+                stats.rejections.push(RejectedEntry::new(
+                    raw.key.clone(),
+                    RejectionKind::BadKey,
+                    err.to_string(),
+                ));
                 continue;
             }
         };
@@ -56,6 +137,11 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
             Err(err) => {
                 tracing::warn!(key = %raw.key, error = %err, "skipping non-JSON etcd entry");
                 stats.parse_rejected += 1;
+                stats.rejections.push(RejectedEntry::new(
+                    raw.key.clone(),
+                    RejectionKind::NonJson,
+                    err.to_string(),
+                ));
                 continue;
             }
         };
@@ -136,6 +222,11 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
             other => {
                 tracing::debug!(key = %raw.key, kind = %other, "unknown etcd kind; skipping");
                 stats.unknown_kind += 1;
+                stats.rejections.push(RejectedEntry::new(
+                    raw.key.clone(),
+                    RejectionKind::UnknownKind,
+                    format!("unknown kind {other:?}"),
+                ));
             }
         }
     }
@@ -157,6 +248,11 @@ where
     if let Err(err) = validate(value) {
         tracing::warn!(key = %key, error = %err, "schema validation failed; skipping");
         stats.schema_rejected += 1;
+        stats.rejections.push(RejectedEntry::new(
+            key,
+            RejectionKind::SchemaFailed,
+            err.to_string(),
+        ));
         return None;
     }
 
@@ -170,6 +266,11 @@ where
             // mismatch. Treat as schema-rejected for stats purposes.
             tracing::warn!(key = %key, error = %err, "serde parse failed after schema pass");
             stats.parse_rejected += 1;
+            stats.rejections.push(RejectedEntry::new(
+                key,
+                RejectionKind::ParseFailed,
+                err.to_string(),
+            ));
             None
         }
     }
@@ -259,6 +360,58 @@ mod tests {
         let entries = vec![raw("/other/models/a", VALID_MODEL, 1)];
         let (_snap, stats) = build_snapshot("/aisix", &entries);
         assert_eq!(stats.key_rejected, 1);
+    }
+
+    // ---- regression coverage for issue #115 -------------------------
+    // The loader used to log a warning and silently skip invalid rows.
+    // Customers who saved an invalid resource in the dashboard saw
+    // "Saved" but the DP dropped the row — no signal back. The fix
+    // attaches a `RejectedEntry` per skip path so the heartbeat can
+    // surface the failure to cp-api.
+
+    #[test]
+    fn rejection_records_bad_key_with_kind_and_error_message() {
+        let entries = vec![raw("/wrong/models/x", VALID_MODEL, 1)];
+        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.rejections.len(), 1);
+        assert_eq!(stats.rejections[0].kind, RejectionKind::BadKey);
+        assert_eq!(stats.rejections[0].key, "/wrong/models/x");
+        assert!(!stats.rejections[0].error.is_empty());
+    }
+
+    #[test]
+    fn rejection_records_non_json_payload() {
+        let entries = vec![raw("/aisix/models/m1", b"not-json", 1)];
+        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.rejections.len(), 1);
+        assert_eq!(stats.rejections[0].kind, RejectionKind::NonJson);
+    }
+
+    #[test]
+    fn rejection_records_schema_failure() {
+        let entries = vec![raw(
+            "/aisix/models/bad",
+            br#"{"display_name":"x","provider":"mistral","model_name":"l","provider_key_id":"pk"}"#,
+            1,
+        )];
+        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.rejections.len(), 1);
+        assert_eq!(stats.rejections[0].kind, RejectionKind::SchemaFailed);
+    }
+
+    #[test]
+    fn rejection_records_unknown_kind() {
+        let entries = vec![raw("/aisix/unknown_kind/x-1", b"{}", 1)];
+        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.rejections.len(), 1);
+        assert_eq!(stats.rejections[0].kind, RejectionKind::UnknownKind);
+    }
+
+    #[test]
+    fn happy_entries_have_no_rejections() {
+        let entries = vec![raw("/aisix/models/m-1", VALID_MODEL, 1)];
+        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        assert!(stats.rejections.is_empty());
     }
 
     #[test]

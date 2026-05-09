@@ -22,9 +22,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aisix_etcd::loader::RejectedEntry;
 use anyhow::{anyhow, Context};
 use serde::Serialize;
 use tokio::sync::watch;
+
+/// Cheap clonable callback the heartbeat invokes once per tick to pull
+/// the supervisor's most recent loader rejections. Returning a clone
+/// (not borrowing) lets the heartbeat send the list over the wire
+/// without holding the supervisor's lock across the HTTP call.
+///
+/// Pre-fix the loader logged a warning and silently moved on. Customers
+/// who saved an invalid resource in the dashboard saw "Saved" but the
+/// DP dropped the row — no signal back. See issue #115.
+pub type RejectionFetcher = Arc<dyn Fn() -> Vec<RejectedEntry> + Send + Sync>;
 
 /// File paths to the on-disk mTLS bundle the heartbeat client presents
 /// to cp-api. Same three files written by `register::register_and_persist`
@@ -50,12 +61,34 @@ pub struct MtlsBundle {
 /// Configuration captured at register time. `url`, `dp_id`, `interval`
 /// come from the register response (or are synthesised on bundle-on-disk
 /// boots); `mtls` points at the persisted bundle.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HeartbeatConfig {
     pub url: String,
     pub dp_id: String,
     pub interval: Duration,
     pub mtls: MtlsBundle,
+    /// Optional source of supervisor-reported loader rejections. When
+    /// set, every heartbeat includes a `rejected_resources` array so
+    /// cp-api can surface "your DP rejected these resources" in the
+    /// dashboard. None means the legacy schema (no rejection field) —
+    /// kept for tests / managed-mode configs that don't have a
+    /// supervisor wired in. See issue #115.
+    pub rejection_fetcher: Option<RejectionFetcher>,
+}
+
+impl std::fmt::Debug for HeartbeatConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeartbeatConfig")
+            .field("url", &self.url)
+            .field("dp_id", &self.dp_id)
+            .field("interval", &self.interval)
+            .field("mtls", &self.mtls)
+            .field(
+                "rejection_fetcher",
+                &self.rejection_fetcher.as_ref().map(|_| "<fn>"),
+            )
+            .finish()
+    }
 }
 
 impl HeartbeatConfig {
@@ -70,7 +103,15 @@ impl HeartbeatConfig {
             dp_id,
             interval,
             mtls,
+            rejection_fetcher: None,
         }
+    }
+
+    /// Wire a supervisor's rejection callback. The closure is cloned
+    /// per-heartbeat call (cheap — it's an Arc).
+    pub fn with_rejection_fetcher(mut self, fetcher: RejectionFetcher) -> Self {
+        self.rejection_fetcher = Some(fetcher);
+        self
     }
 }
 
@@ -133,9 +174,46 @@ struct HeartbeatBody<'a> {
     dp_id: &'a str,
     uptime_seconds: i64,
     version: &'a str,
+    /// Loader rejections the supervisor has accumulated since last
+    /// drain. Omitted from the wire when empty so legacy / managed-mode
+    /// CP endpoints (which don't yet parse this field) still see the
+    /// historical body shape. See issue #115.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    rejected_resources: Vec<RejectedResourceWire>,
+}
+
+/// On-the-wire shape for one rejection. Kept as a separate type from
+/// `aisix_etcd::loader::RejectedEntry` so the loader's internal
+/// representation can evolve without forcing a wire bump. The two
+/// converge today; `kind` is serialised as a string ("bad_key",
+/// "non_json", "schema_failed", "parse_failed", "unknown_kind") so
+/// cp-api can match without depending on Rust enum repr.
+#[derive(Debug, Serialize)]
+struct RejectedResourceWire {
+    key: String,
+    kind: &'static str,
+    error: String,
+    timestamp_unix_secs: u64,
+}
+
+impl From<&RejectedEntry> for RejectedResourceWire {
+    fn from(r: &RejectedEntry) -> Self {
+        Self {
+            key: r.key.clone(),
+            kind: r.kind.as_str(),
+            error: r.error.clone(),
+            timestamp_unix_secs: r.timestamp_unix_secs,
+        }
+    }
 }
 
 async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> anyhow::Result<()> {
+    let rejections: Vec<RejectedResourceWire> = cfg
+        .rejection_fetcher
+        .as_ref()
+        .map(|fetcher| fetcher().iter().map(RejectedResourceWire::from).collect())
+        .unwrap_or_default();
+
     let resp = client
         .post(&cfg.url)
         // No bearer header — cp-api authenticates via the peer
@@ -144,6 +222,7 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
             dp_id: &cfg.dp_id,
             uptime_seconds: uptime,
             version: env!("CARGO_PKG_VERSION"),
+            rejected_resources: rejections,
         })
         .send()
         .await
