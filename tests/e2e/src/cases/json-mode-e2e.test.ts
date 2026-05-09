@@ -227,6 +227,8 @@ describe("json mode e2e: response_format passthrough on /v1/chat/completions", (
       .filter((r) => r.path === "/v1/chat/completions");
     expect(testCalls).toHaveLength(1);
     const sentBody = JSON.parse(testCalls[0]!.body) as {
+      model?: string;
+      messages?: Array<{ role?: string; content?: string }>;
       response_format?: {
         type?: unknown;
         json_schema?: { name?: unknown; schema?: unknown; strict?: unknown };
@@ -239,5 +241,17 @@ describe("json mode e2e: response_format passthrough on /v1/chat/completions", (
     // simplified or stripped sub-fields would break strict-mode
     // validation upstream.
     expect(sentBody.response_format?.json_schema?.schema).toEqual(schema);
+
+    // Cross-check: a regression that mangled the rest of the
+    // request body while preserving response_format would not
+    // surface above. Pin model translation + caller's message
+    // verbatim — same defense the case-1 byte-for-byte content
+    // assertion provides on the response side, applied to the
+    // request side.
+    expect(sentBody.model).toBe("gpt-4o-mini");
+    expect(sentBody.messages?.[0]?.role).toBe("user");
+    expect(sentBody.messages?.[0]?.content).toBe(
+      "Return facts about SF as JSON.",
+    );
   });
 });
