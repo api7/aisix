@@ -15,6 +15,7 @@ import {
   type OpenAiMockUpstream,
   buildOpenAiProviderConfig,
   buildOpenAiProviderModel,
+  buildOpenAiToolCallStreamEvents,
   startOpenAiMockUpstream,
 } from '../utils/mock-upstream.js';
 import { proxyAuthHeader, proxyPost } from '../utils/proxy.js';
@@ -360,5 +361,581 @@ describe('proxy /v1/messages', () => {
     for (const event of parsed) {
       expect(event.data.type).toBe(event.event);
     }
+  });
+
+  test('stream response emits the exact anthropic text lifecycle and terminal usage semantics', async () => {
+    const resp = await proxyPost(
+      '/v1/messages',
+      {
+        model: mockModelName,
+        max_tokens: 256,
+        stream: true,
+        messages: [{ role: 'user', content: 'stream exact lifecycle check' }],
+      },
+      AUTHORIZED_KEY,
+      { responseType: 'text' },
+    );
+
+    expect(resp.status).toBe(200);
+
+    const events = parseAnthropicSseEvents(String(resp.data));
+    expect(events.map((event) => event.event)).toEqual([
+      'message_start',
+      'content_block_start',
+      'content_block_delta',
+      'content_block_delta',
+      'content_block_stop',
+      'message_delta',
+      'message_stop',
+    ]);
+
+    const messageStart = JSON.parse(events[0]?.data ?? '{}') as {
+      message?: {
+        usage?: {
+          input_tokens?: number;
+          output_tokens?: number;
+        };
+      };
+    };
+    const messageDelta = JSON.parse(
+      events.find((event) => event.event === 'message_delta')?.data ?? '{}',
+    ) as {
+      delta?: { stop_reason?: string | null };
+      usage?: {
+        input_tokens?: number;
+        output_tokens?: number;
+        cache_creation_input_tokens?: number;
+        cache_read_input_tokens?: number;
+      };
+    };
+
+    expect(messageStart.message?.usage?.input_tokens).toBeUndefined();
+    expect(messageStart.message?.usage?.output_tokens).toBeUndefined();
+    expect(messageDelta.delta?.stop_reason).toBe('end_turn');
+    expect(messageDelta.usage?.input_tokens).toBe(10);
+    expect(messageDelta.usage?.output_tokens).toBe(8);
+    expect(messageDelta.usage?.cache_creation_input_tokens).toBe(0);
+    expect(messageDelta.usage?.cache_read_input_tokens).toBe(0);
+  });
+
+  test('stream response emits anthropic error events when bridge conversion fails mid-stream', async () => {
+    upstream?.configure({
+      streamEvents: [
+        {
+          id: 'chatcmpl-messages-error-e2e-mock',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: UPSTREAM_MODEL,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                role: 'assistant',
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: 'call_missing_type_1',
+                    function: {
+                      name: 'get_weather',
+                      arguments: '{}',
+                    },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        },
+        '[DONE]',
+      ],
+    });
+
+    const resp = await proxyPost(
+      '/v1/messages',
+      {
+        model: mockModelName,
+        max_tokens: 256,
+        stream: true,
+        messages: [{ role: 'user', content: 'emit malformed tool stream' }],
+      },
+      AUTHORIZED_KEY,
+      { responseType: 'text' },
+    );
+
+    expect(resp.status).toBe(200);
+
+    const events = parseAnthropicSseEvents(String(resp.data));
+    const errorEvent = events.find((event) => event.event === 'error');
+
+    expect(errorEvent).toBeDefined();
+    expect(events.some((event) => event.event === 'message_stop')).toBe(false);
+
+    const errorPayload = JSON.parse(errorEvent?.data ?? '{}') as {
+      type?: string;
+      error?: { type?: string; message?: string };
+    };
+
+    expect(errorPayload.type).toBe('error');
+    expect(errorPayload.error?.type).toBe('api_error');
+    expect(errorPayload.error?.message).toContain('tool call types');
+  });
+
+  test('non-stream response maps tool calls into anthropic tool_use blocks', async () => {
+    upstream?.configure({
+      nonStreamBody: {
+        id: 'chatcmpl-messages-tool-use-e2e-mock',
+        object: 'chat.completion',
+        created: 1,
+        model: UPSTREAM_MODEL,
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: 'Calling tool',
+              tool_calls: [
+                {
+                  id: 'call_weather_1',
+                  type: 'function',
+                  function: {
+                    name: 'get_weather',
+                    arguments: '{"city":"SF"}',
+                  },
+                },
+              ],
+            },
+            finish_reason: 'tool_calls',
+          },
+        ],
+        usage: {
+          prompt_tokens: 12,
+          completion_tokens: 7,
+          total_tokens: 19,
+          prompt_tokens_details: {
+            cached_tokens: 2,
+          },
+        },
+      },
+    });
+
+    const resp = await proxyPost(
+      '/v1/messages',
+      {
+        model: mockModelName,
+        max_tokens: 256,
+        messages: [{ role: 'user', content: 'call a tool' }],
+      },
+      AUTHORIZED_KEY,
+    );
+
+    expect(resp.status).toBe(200);
+    expect(resp.data.stop_reason).toBe('tool_use');
+    expect(resp.data.usage.input_tokens).toBe(10);
+    expect(resp.data.usage.cache_read_input_tokens).toBe(2);
+    expect(resp.data.content[0]?.type).toBe('text');
+    expect(resp.data.content[0]?.text).toBe('Calling tool');
+    expect(resp.data.content[1]?.type).toBe('tool_use');
+    expect(resp.data.content[1]?.name).toBe('get_weather');
+    expect(resp.data.content[1]?.input).toEqual({ city: 'SF' });
+  });
+
+  test('request bridge maps anthropic tool_result blocks into upstream tool messages', async () => {
+    const resp = await proxyPost(
+      '/v1/messages',
+      {
+        model: mockModelName,
+        max_tokens: 256,
+        messages: [
+          {
+            role: 'assistant',
+            content: [
+              {
+                type: 'tool_use',
+                id: 'tool_1',
+                name: 'get_weather',
+                input: { city: 'SF' },
+              },
+            ],
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'tool_1',
+                content: 'sunny',
+              },
+            ],
+          },
+        ],
+        tools: [
+          {
+            name: 'get_weather',
+            description: 'Get weather',
+            input_schema: {
+              type: 'object',
+              properties: { city: { type: 'string' } },
+            },
+          },
+        ],
+        tool_choice: { type: 'auto' },
+      },
+      AUTHORIZED_KEY,
+    );
+
+    expect(resp.status).toBe(200);
+
+    const recorded = upstream?.takeRecordedRequests() ?? [];
+    expect(recorded).toHaveLength(1);
+
+    const bodyJson = recorded[0]?.bodyJson as {
+      messages: Array<{
+        role: string;
+        content?: string;
+        tool_calls?: Array<{ id?: string; function?: { name?: string } }>;
+        tool_call_id?: string;
+      }>;
+      tools?: Array<{ function?: { name?: string } }>;
+      tool_choice?: string;
+    };
+
+    expect(bodyJson.messages[0]?.role).toBe('assistant');
+    expect(bodyJson.messages[0]?.tool_calls?.[0]?.id).toBe('tool_1');
+    expect(bodyJson.messages[0]?.tool_calls?.[0]?.function?.name).toBe(
+      'get_weather',
+    );
+    expect(bodyJson.messages[1]?.role).toBe('tool');
+    expect(bodyJson.messages[1]?.tool_call_id).toBe('tool_1');
+    expect(bodyJson.messages[1]?.content).toBe('sunny');
+    expect(bodyJson.tools?.[0]?.function?.name).toBe('get_weather');
+    expect(bodyJson.tool_choice).toBe('auto');
+  });
+
+  test('request bridge maps anthropic image blocks into upstream data url image parts', async () => {
+    const resp = await proxyPost(
+      '/v1/messages',
+      {
+        model: mockModelName,
+        max_tokens: 256,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'image',
+                source: {
+                  type: 'base64',
+                  media_type: 'image/png',
+                  data: 'aGVsbG8=',
+                },
+              },
+              {
+                type: 'text',
+                text: 'describe this image',
+              },
+            ],
+          },
+        ],
+      },
+      AUTHORIZED_KEY,
+    );
+
+    expect(resp.status).toBe(200);
+
+    const recorded = upstream?.takeRecordedRequests() ?? [];
+    expect(recorded).toHaveLength(1);
+
+    const contentParts = (
+      recorded[0]?.bodyJson as {
+        messages: Array<{
+          content: Array<
+            | { type: 'text'; text: string }
+            | {
+                type: 'image_url';
+                image_url: { url: string; detail?: string };
+              }
+          >;
+        }>;
+      }
+    ).messages[0]?.content;
+
+    expect(contentParts).toContainEqual({
+      type: 'text',
+      text: 'describe this image',
+    });
+    expect(contentParts).toContainEqual({
+      type: 'image_url',
+      image_url: {
+        url: 'data:image/png;base64,aGVsbG8=',
+      },
+    });
+  });
+
+  test('request bridge maps tool_choice any to upstream required mode', async () => {
+    const resp = await proxyPost(
+      '/v1/messages',
+      {
+        model: mockModelName,
+        max_tokens: 256,
+        messages: [{ role: 'user', content: 'you must choose a tool' }],
+        tools: [
+          {
+            name: 'get_weather',
+            input_schema: {
+              type: 'object',
+              properties: { city: { type: 'string' } },
+            },
+          },
+        ],
+        tool_choice: { type: 'any' },
+      },
+      AUTHORIZED_KEY,
+    );
+
+    expect(resp.status).toBe(200);
+
+    const recorded = upstream?.takeRecordedRequests() ?? [];
+    expect(recorded).toHaveLength(1);
+    expect(
+      (recorded[0]?.bodyJson as { tool_choice?: string }).tool_choice,
+    ).toBe('required');
+  });
+
+  test('request bridge maps named anthropic tool_choice to upstream function selection', async () => {
+    const resp = await proxyPost(
+      '/v1/messages',
+      {
+        model: mockModelName,
+        max_tokens: 256,
+        messages: [{ role: 'user', content: 'call the weather tool only' }],
+        tools: [
+          {
+            name: 'get_weather',
+            input_schema: {
+              type: 'object',
+              properties: { city: { type: 'string' } },
+            },
+          },
+        ],
+        tool_choice: { type: 'tool', name: 'get_weather' },
+      },
+      AUTHORIZED_KEY,
+    );
+
+    expect(resp.status).toBe(200);
+
+    const recorded = upstream?.takeRecordedRequests() ?? [];
+    expect(recorded).toHaveLength(1);
+    expect(
+      (
+        recorded[0]?.bodyJson as {
+          tool_choice?: { type?: string; function?: { name?: string } };
+        }
+      ).tool_choice,
+    ).toEqual({
+      type: 'function',
+      function: { name: 'get_weather' },
+    });
+  });
+
+  test('request bridge forwards system blocks metadata top_k and stop_sequences upstream', async () => {
+    const resp = await proxyPost(
+      '/v1/messages',
+      {
+        model: mockModelName,
+        max_tokens: 256,
+        system: [
+          {
+            type: 'text',
+            text: 'You are helpful.',
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+        messages: [{ role: 'user', content: 'hello with anthropic extras' }],
+        metadata: { user_id: 'user-123' },
+        top_k: 5,
+        stop_sequences: ['DONE', 'HALT'],
+      },
+      AUTHORIZED_KEY,
+    );
+
+    expect(resp.status).toBe(200);
+
+    const recorded = upstream?.takeRecordedRequests() ?? [];
+    expect(recorded).toHaveLength(1);
+
+    const bodyJson = recorded[0]?.bodyJson as {
+      messages: Array<{ role: string; content: string }>;
+      user?: string;
+      top_k?: number;
+      stop?: string[];
+    };
+
+    expect(bodyJson.messages[0]).toEqual({
+      role: 'system',
+      content: 'You are helpful.',
+    });
+    expect(bodyJson.user).toBe('user-123');
+    expect(bodyJson.top_k).toBe(5);
+    expect(bodyJson.stop).toEqual(['DONE', 'HALT']);
+  });
+
+  test('request bridge rejects unsupported top-level cache_control', async () => {
+    const resp = await proxyPost(
+      '/v1/messages',
+      {
+        model: mockModelName,
+        max_tokens: 256,
+        cache_control: { type: 'ephemeral' },
+        messages: [
+          { role: 'user', content: 'this should fail before upstream' },
+        ],
+      },
+      AUTHORIZED_KEY,
+    );
+
+    expect(resp.status).toBe(400);
+    expect(resp.data.type).toBe('error');
+    expect(resp.data.error.type).toBe('invalid_request_error');
+    expect(upstream?.takeRecordedRequests() ?? []).toHaveLength(0);
+  });
+
+  test('request bridge rejects unsupported user content block cache_control', async () => {
+    const resp = await proxyPost(
+      '/v1/messages',
+      {
+        model: mockModelName,
+        max_tokens: 256,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: 'cached user block',
+                cache_control: { type: 'ephemeral' },
+              },
+            ],
+          },
+        ],
+      },
+      AUTHORIZED_KEY,
+    );
+
+    expect(resp.status).toBe(400);
+    expect(resp.data.type).toBe('error');
+    expect(resp.data.error.type).toBe('invalid_request_error');
+    expect(upstream?.takeRecordedRequests() ?? []).toHaveLength(0);
+  });
+
+  test('stream bridge preserves text then tool_use lifecycle ordering', async () => {
+    upstream?.configure({
+      streamEvents: [
+        {
+          id: 'chatcmpl-messages-mixed-tool-e2e-mock',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: UPSTREAM_MODEL,
+          choices: [
+            {
+              index: 0,
+              delta: { role: 'assistant', content: 'Calling tool' },
+              finish_reason: null,
+            },
+          ],
+        },
+        {
+          id: 'chatcmpl-messages-mixed-tool-e2e-mock',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: UPSTREAM_MODEL,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: 'call_weather_1',
+                    type: 'function',
+                    function: {
+                      name: 'get_weather',
+                      arguments: '{"city"',
+                    },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        },
+        {
+          id: 'chatcmpl-messages-mixed-tool-e2e-mock',
+          object: 'chat.completion.chunk',
+          created: 1,
+          model: UPSTREAM_MODEL,
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    function: {
+                      arguments: ':"SF"}',
+                    },
+                  },
+                ],
+              },
+              finish_reason: 'tool_calls',
+            },
+          ],
+        },
+        '[DONE]',
+      ],
+    });
+
+    const resp = await proxyPost(
+      '/v1/messages',
+      {
+        model: mockModelName,
+        max_tokens: 256,
+        stream: true,
+        messages: [{ role: 'user', content: 'call a tool after text' }],
+      },
+      AUTHORIZED_KEY,
+      { responseType: 'text' },
+    );
+
+    expect(resp.status).toBe(200);
+
+    const events = parseAnthropicSseEvents(String(resp.data));
+    expect(events.map((event) => event.event)).toEqual([
+      'message_start',
+      'content_block_start',
+      'content_block_delta',
+      'content_block_stop',
+      'content_block_start',
+      'content_block_delta',
+      'content_block_delta',
+      'content_block_stop',
+      'message_delta',
+      'message_stop',
+    ]);
+
+    const firstStart = JSON.parse(events[1]?.data ?? '{}') as {
+      content_block?: { type?: string; text?: string };
+    };
+    const secondStart = JSON.parse(events[4]?.data ?? '{}') as {
+      content_block?: { type?: string; name?: string };
+    };
+    const messageDelta = JSON.parse(events[8]?.data ?? '{}') as {
+      delta?: { stop_reason?: string | null };
+    };
+
+    expect(firstStart.content_block?.type).toBe('text');
+    expect(secondStart.content_block?.type).toBe('tool_use');
+    expect(secondStart.content_block?.name).toBe('get_weather');
+    expect(messageDelta.delta?.stop_reason).toBe('tool_use');
   });
 });
