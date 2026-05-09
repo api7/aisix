@@ -116,6 +116,15 @@ describe("anthropic upstream e2e: OpenAI in, Anthropic out, OpenAI back to calle
       }
     });
 
+    // Baseline-isolate the readiness probe so the request-shape
+    // assertions below match the test call's request, not the probe's.
+    // The probe also targets `an-e2e` and so also lands on
+    // `/v1/messages`; without slicing from baseline, `find()` over
+    // `receivedRequests` would return the probe and the assertions
+    // would verify the wrong request — a regression that broke ONLY
+    // the test call's translation would slip through.
+    const baseline = upstream.receivedRequests.length;
+
     const completion = await client.chat.completions.create({
       model: "an-e2e",
       messages: [{ role: "user", content: "hi" }],
@@ -135,13 +144,11 @@ describe("anthropic upstream e2e: OpenAI in, Anthropic out, OpenAI back to calle
     expect(completion.usage?.completion_tokens).toBe(4);
     expect(completion.usage?.total_tokens).toBe(9);
 
-    // Confirm the gateway actually hit the Anthropic Messages endpoint
-    // (not /v1/chat/completions). A regression that mis-routed an
-    // anthropic-provider Model through the OpenAI bridge would never
-    // land on /v1/messages.
-    const messagesReq = upstream.receivedRequests.find((r) =>
-      r.path.startsWith("/v1/messages"),
-    );
+    // Confirm the gateway hit /v1/messages on the test call (slice
+    // from baseline so the probe's earlier hit cannot stand in).
+    const messagesReq = upstream.receivedRequests
+      .slice(baseline)
+      .find((r) => r.path.startsWith("/v1/messages"));
     expect(messagesReq).toBeDefined();
 
     // Wire-shape on the request side: the gateway must speak Anthropic
@@ -161,8 +168,20 @@ describe("anthropic upstream e2e: OpenAI in, Anthropic out, OpenAI back to calle
     // Anthropic's API requires `max_tokens`; OpenAI's doesn't. The
     // gateway must inject a value when crossing the boundary.
     expect(typeof sentBody.max_tokens).toBe("number");
-    // Caller's user message must reach the upstream, role intact.
+    // Caller's user message must reach the upstream, role + content
+    // intact — pin to the test call's content (`"hi"`), not the probe's
+    // (`"ready-probe"`). This doubles as a baseline-isolation check.
     expect(sentBody.messages?.[0]?.role).toBe("user");
+    // Anthropic API serialises content as an array of typed blocks
+    // (`[{type:"text", text:"hi"}]`), not a bare string — gateway
+    // converts on the way out. The OpenAI-side input was a string,
+    // so a regression that dropped the content (or sent the wrong
+    // text) would no longer match.
+    expect(sentBody.messages?.[0]?.content).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "text", text: "hi" }),
+      ]),
+    );
 
     // Auth shape: Anthropic uses `x-api-key` + `anthropic-version`,
     // not `Authorization: Bearer`. A regression that forwarded the

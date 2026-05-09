@@ -126,23 +126,45 @@ describe("fallback e2e: virtual routing fails over from 5xx to next target", () 
       maxRetries: 0,
     });
 
-    // Probe via `fb-good` directly (single-target, no fallback path)
-    // so the readiness check doesn't pre-warm the bad→good route or
-    // risk inflating either upstream's baseline. A 200 means
-    // Model + ProviderKey + ApiKey are all loaded; routing-block
-    // propagation for `fb-virtual` is on the same etcd watch loop, so
-    // by the time `fb-good` is callable, `fb-virtual` is too.
+    // Two-stage readiness gate. The previous version probed only
+    // `fb-good` and assumed the routing block for `fb-virtual` would
+    // be loaded by the time `fb-good` was callable — that's plausible
+    // (single etcd watch loop) but unverified by the test itself. The
+    // second probe explicitly gates on `fb-virtual` so the test call
+    // cannot fire while the routing dispatcher is still missing the
+    // virtual model. The probe traffic is folded into the baseline
+    // captured below it.
     await waitConfigPropagation(async () => {
       try {
         const probe = await client.chat.completions.create({
           model: "fb-good",
-          messages: [{ role: "user", content: "ready-probe" }],
+          messages: [{ role: "user", content: "ready-probe-good" }],
         });
         return probe.choices[0]?.message.content === "fallback worked";
       } catch {
         return false;
       }
     });
+    await waitConfigPropagation(async () => {
+      try {
+        const probe = await client.chat.completions.create({
+          model: "fb-virtual",
+          messages: [{ role: "user", content: "ready-probe-virtual" }],
+        });
+        return probe.choices[0]?.message.content === "fallback worked";
+      } catch {
+        return false;
+      }
+    });
+
+    // The fb-virtual probe stage above DOES exercise the bad→good
+    // fallback path, so the bad upstream MUST have received at least
+    // one request during probing. Surface this as an explicit
+    // assertion (rather than letting it hide inside the baseline)
+    // so a regression that silently routes fb-virtual past the bad
+    // target — making the entire test trivially pass on the good
+    // upstream — is caught here.
+    expect(badUpstream.receivedRequests.length).toBeGreaterThanOrEqual(1);
 
     // Snapshot upstream counts AFTER the probe so the assertions below
     // measure only the effect of the actual test call, not the probe.

@@ -129,6 +129,27 @@ the customer tries.
   upstream doc URL or SDK file/line. Don't invent field names that
   "feel right" — the ecosystem has already chosen one.
 
+## 8. Independent Audit Before Merge
+
+**Every PR pushed must be reviewed by an independent third-party audit agent. Merge is blocked until all HIGH/MEDIUM findings are resolved or explicitly justified.**
+
+After every `gh pr create` or force-push that updates an existing PR, immediately spawn an `Agent` (`general-purpose` subagent) with no shared context. Brief it cold with the PR URL and the contract the PR claims to pin. The agent must review from these angles, each treated as a blocking concern:
+
+- **Correctness** — does the change actually do what the description claims? Are assertions strong enough that a real regression would fail?
+- **Reliability** — race conditions, error handling, retry/timeout behavior, propagation timing on slow CI runners
+- **Security** — auth/authz checks, input validation at boundaries, injection vectors, header forwarding (and what's deliberately *not* forwarded)
+- **Sensitive-information leakage** — secrets in logs/error messages, internal taxonomy bleeding into client-visible output, upstream-provider details in user-facing fields, tokens/PII in test fixtures
+- **Breaking changes** — public API shape, on-disk format, wire protocol, default-behavior shifts; if the change is breaking, is it gated/versioned?
+- **E2E test coverage** — does the change have e2e coverage of the user-visible contract, not just unit-level happy-path? Are mocks tight enough that a regression on the unverified side (request body, headers) couldn't sneak through?
+
+Audit agent output: HIGH / MEDIUM / LOW per finding, with **concrete suggested code** (the actual line to add), not vague "consider".
+
+**Merge gate:** every HIGH and MEDIUM must be either (a) addressed by a code change, or (b) explicitly justified in the PR — e.g. "this exposes a feature gap, filed as #N for separate work, agreed not to block merge". "Looks fine" or silent merge is not enough.
+
+For findings that surface gateway/product behavior gaps (not test-author oversight), file separate feature/bug issues and link from the PR.
+
+This rule exists because the author cannot see their own blind spots — self-review without an independent agent has shipped real gaps (e.g. a cross-provider e2e PR that verified response translation while never asserting the gateway sent a request in the upstream's wire shape).
+
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.

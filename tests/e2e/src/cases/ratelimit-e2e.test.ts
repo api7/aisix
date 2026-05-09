@@ -124,11 +124,10 @@ describe("rate limit e2e: RPM=1 second call gets 429", () => {
       throw new Error("unreachable: caught is not APIError");
     }
     expect(caught.status).toBe(429);
-    // OpenAI Node SDK exposes the response headers via `.headers`.
-    // HTTP header lookup is case-insensitive but the SDK surfaces them
-    // lowercased; cover both just in case.
-    const retryAfter =
-      caught.headers?.["retry-after"] ?? caught.headers?.["Retry-After"];
+    // OpenAI Node SDK 4.x's APIError.headers is a Proxy that lowercases
+    // lookups (createResponseHeaders in core.js), so the lowercase form
+    // is the canonical access path.
+    const retryAfter = caught.headers?.["retry-after"];
     expect(retryAfter).toBeDefined();
     expect(Number.parseInt(String(retryAfter), 10)).toBeGreaterThan(0);
   });
