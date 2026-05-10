@@ -109,18 +109,24 @@ async fn dispatch(
 
     let model = &model_entry.value;
 
-    // Per #168: only OpenAI's API exposes the documented `/v1/rerank`
-    // route + body shape. Anthropic has no rerank API; Gemini's
-    // OpenAI-compat surface does not implement `/v1/rerank`;
-    // DeepSeek's does not either. Routing a non-OpenAI Model here
-    // would silently dispatch to an upstream that 404s — a confusing
-    // failure for callers who follow `docs/api-proxy.md` §4.7
-    // configuration verbatim. Reject explicitly with 400 (parallel
-    // to /v1/responses §4.6) so the configuration error is visible
-    // at the gateway boundary rather than masked by an upstream 404.
-    if model.provider != Some(aisix_core::models::Provider::Openai) {
+    // Per #168 + #213 Phase 1: `/v1/rerank` accepts OpenAI- and
+    // Cohere-shape upstreams. Both speak the same body shape
+    // (`{model, query, documents, top_n, ...}`) at `…/v1/rerank`
+    // with `Authorization: Bearer …` auth, so the gateway can
+    // forward verbatim with only the `model` field rewritten.
+    // Anthropic, Gemini, and DeepSeek do not expose this surface —
+    // routing a Model with one of those providers here would
+    // silently 404 upstream, so reject explicitly at the gateway
+    // boundary (parallel to `/v1/responses` §4.6's pattern).
+    use aisix_core::models::Provider;
+    let provider_allowed = matches!(
+        model.provider,
+        Some(Provider::Openai) | Some(Provider::Cohere)
+    );
+    if !provider_allowed {
         return Err(ProxyError::InvalidRequest(format!(
-            "model `{model_name}` is not an OpenAI provider; /v1/rerank requires OpenAI"
+            "model `{model_name}` is not an OpenAI or Cohere provider; \
+             /v1/rerank requires OpenAI or Cohere"
         )));
     }
 
@@ -208,6 +214,12 @@ fn default_base_for_provider(provider: aisix_core::models::Provider) -> Option<S
     use aisix_core::models::Provider;
     match provider {
         Provider::Openai => Some("https://api.openai.com".to_string()),
+        // Cohere v1 path (deprecated by Cohere but still functional)
+        // is what the gateway's `build_v1_url` produces from this
+        // base. Operators who want the Cohere v2 path can override
+        // `api_base` to `https://api.cohere.com/v2` — see #213's v2
+        // follow-up for the version-routing extension if needed.
+        Provider::Cohere => Some("https://api.cohere.com".to_string()),
         Provider::Anthropic => None, // Anthropic doesn't expose a rerank API
         Provider::Gemini => None,    // Gemini doesn't expose a rerank API
         Provider::Deepseek => None,
@@ -271,6 +283,14 @@ mod tests {
     fn anthropic_model(name: &str) -> ResourceEntry<Model> {
         let json = format!(
             r#"{{"display_name":"{name}","provider":"anthropic","model_name":"claude-3-5-haiku-20241022","provider_key_id":"{PK_ID}"}}"#
+        );
+        let m: Model = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("m-1", m, 1)
+    }
+
+    fn cohere_model(name: &str) -> ResourceEntry<Model> {
+        let json = format!(
+            r#"{{"display_name":"{name}","provider":"cohere","model_name":"rerank-english-v3.0","provider_key_id":"{PK_ID}"}}"#
         );
         let m: Model = serde_json::from_str(&json).unwrap();
         ResourceEntry::new("m-1", m, 1)
@@ -392,10 +412,93 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "invalid_request_error");
         let message = v["error"]["message"].as_str().unwrap();
+        // Per #213 Phase 1: Cohere is now also a valid provider for
+        // /v1/rerank, so the rejection message must enumerate BOTH
+        // accepted shapes — `OpenAI or Cohere` — not just OpenAI.
+        // Pin the new wording so a regression that drops Cohere
+        // would fail this assertion.
         assert!(
-            message.contains("requires OpenAI"),
-            "rejection should reference OpenAI restriction; got {message:?}"
+            message.contains("OpenAI or Cohere"),
+            "rejection should reference OpenAI/Cohere restriction; got {message:?}"
         );
+    }
+
+    /// Issue #213 Phase 1: a Model with `provider: "cohere"` MUST
+    /// dispatch successfully on `/v1/rerank` (Cohere natively
+    /// implements the same body shape OpenAI-compat servers use).
+    /// Pre-#213 the gate only accepted OpenAI; this test pins the
+    /// expansion at the unit level.
+    #[tokio::test]
+    async fn cohere_provider_dispatches_to_upstream_with_bearer_auth() {
+        use wiremock::matchers::header;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .and(header("authorization", "Bearer sk-cohere-mock"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "rerank-resp-cohere-01",
+                "results": [
+                    {"index": 1, "relevance_score": 0.95},
+                    {"index": 0, "relevance_score": 0.42},
+                ],
+                "meta": {
+                    "api_version": {"version": "1"},
+                    "billed_units": {"search_units": 1}
+                }
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        // Cohere's API base form: bare host, no /v1 suffix. The
+        // gateway's `build_v1_url` appends /v1/rerank correctly for
+        // both `https://api.cohere.com` and `https://api.cohere.com/v1`.
+        let pk_json = format!(
+            r#"{{"display_name":"cohere-up","secret":"sk-cohere-mock","api_base":"{}"}}"#,
+            upstream.uri()
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+        snap.models.insert(cohere_model("cohere-rerank"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "cohere-rerank",
+                "query": "search query",
+                "documents": ["doc one", "doc two"],
+                "top_n": 2
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Cohere provider must dispatch successfully on /v1/rerank per #213 Phase 1"
+        );
+
+        // Verify the upstream-side body: model rewritten to the
+        // `model_name` from the Cohere Model entry; everything else
+        // verbatim. wiremock's `matchers::header` already pinned the
+        // Bearer auth on the upstream request matcher.
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1, "exactly one upstream call expected");
+        let upstream_body: serde_json::Value =
+            serde_json::from_slice(&received[0].body).expect("upstream body is valid JSON");
+        assert_eq!(
+            upstream_body["model"], "rerank-english-v3.0",
+            "model field MUST be rewritten to upstream model_name; got {}",
+            upstream_body["model"]
+        );
+        assert_eq!(upstream_body["query"], "search query");
+        assert_eq!(
+            upstream_body["documents"],
+            serde_json::json!(["doc one", "doc two"])
+        );
+        assert_eq!(upstream_body["top_n"], 2);
     }
 
     #[tokio::test]

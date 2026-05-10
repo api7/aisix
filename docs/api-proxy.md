@@ -188,13 +188,21 @@ return 400.
 
 ### 4.7 `POST /v1/rerank`
 
-OpenAI-style rerank. Routed to `{base}/v1/rerank`. The Model's
-provider supplies the API key; the request body is forwarded
-verbatim after rewriting the `model` field. **OpenAI Models only —
-non-OpenAI providers return 400** (parallel to §4.6). Anthropic has
-no rerank API; Gemini's and DeepSeek's OpenAI-compat surfaces do
-not implement `/v1/rerank`, so routing to those would silently
-dispatch to an upstream that 404s.
+Cohere-style rerank (also implemented by some OpenAI-compat
+servers under the same body shape). Routed to `{base}/v1/rerank`.
+The Model's provider supplies the API key; the request body is
+forwarded verbatim after rewriting the `model` field.
+
+**Supported providers**: `openai`, `cohere`. Anthropic, Gemini,
+and DeepSeek do not expose a rerank API at this URL — Models with
+those providers return 400 (parallel to §4.6).
+
+For `provider: "cohere"`, the default `api_base` is
+`https://api.cohere.com`, which the gateway expands to
+`https://api.cohere.com/v1/rerank` upstream. Cohere's body shape
+(`{model, query, documents, top_n, ...}`) and Bearer-auth
+convention are identical to the OpenAI-compat shape, so the
+gateway forwards verbatim with no transform.
 
 ### 4.8 `POST /v1/audio/transcriptions` / `translations` / `speech`
 

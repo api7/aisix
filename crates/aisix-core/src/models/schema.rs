@@ -109,7 +109,7 @@ fn model_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "display_name":    { "type": "string", "minLength": 1 },
-            "provider":        { "type": "string", "enum": ["openai","anthropic","gemini","deepseek"] },
+            "provider":        { "type": "string", "enum": ["openai","anthropic","gemini","deepseek","cohere"] },
             "model_name":      { "type": "string", "minLength": 1 },
             "provider_key_id": { "type": "string", "minLength": 1 },
             "timeout":         { "type": "integer", "minimum": 0 },

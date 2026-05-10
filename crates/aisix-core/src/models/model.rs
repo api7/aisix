@@ -25,6 +25,10 @@ pub enum Provider {
     Anthropic,
     Gemini,
     Deepseek,
+    /// Cohere — currently exposed for `/v1/rerank` only (#213 Phase 1).
+    /// Cohere's chat / generate APIs are not OpenAI-compatible; a
+    /// future bridge implementation can extend coverage.
+    Cohere,
 }
 
 impl Provider {
@@ -34,6 +38,7 @@ impl Provider {
             Self::Anthropic => "https://api.anthropic.com",
             Self::Gemini => "https://generativelanguage.googleapis.com/v1beta/openai",
             Self::Deepseek => "https://api.deepseek.com",
+            Self::Cohere => "https://api.cohere.com",
         }
     }
 
@@ -43,6 +48,7 @@ impl Provider {
             Self::Anthropic => "anthropic",
             Self::Gemini => "gemini",
             Self::Deepseek => "deepseek",
+            Self::Cohere => "cohere",
         }
     }
 }

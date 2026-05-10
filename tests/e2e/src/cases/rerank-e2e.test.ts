@@ -24,12 +24,21 @@ import {
 // Without e2e coverage, regressions on this path would silently
 // corrupt RAG quality.
 //
-// One user journey pinned:
+// User journeys pinned:
 //
-//   - Caller POSTs Cohere-shape rerank request to /v1/rerank.
-//     Gateway forwards verbatim to upstream's /v1/rerank with only
-//     the `model` field rewritten to the upstream model_name.
-//     Caller receives upstream's response back unchanged.
+//   1. OpenAI provider — caller POSTs Cohere-shape rerank request
+//      to /v1/rerank against an OpenAI-provider Model. Gateway
+//      forwards verbatim to upstream's /v1/rerank with only the
+//      `model` field rewritten.
+//   2. Cohere provider (#213 Phase 1) — caller POSTs against a
+//      Cohere-provider Model. Gateway dispatches to Cohere's
+//      `/v1/rerank` (or any operator-configured api_base) with
+//      Bearer auth + the rewritten model. Cohere natively
+//      implements this exact body shape, so the gateway forwards
+//      verbatim with no transform.
+//   3. Non-{OpenAI, Cohere} provider — gateway rejects at the
+//      boundary with 400 + `error.type: "invalid_request_error"`,
+//      upstream NOT hit (#212 / #168).
 //
 // References:
 // - Gateway's own /v1/rerank contract: `docs/api-proxy.md` §4.7
@@ -180,6 +189,115 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
     // rewriting the `model` field. Verify:
     //   - `model` rewritten to upstream model_name
     //   - everything else byte-for-byte (query, documents, top_n)
+    const sentBody = JSON.parse(testCalls[0]!.body) as {
+      model?: string;
+      query?: string;
+      documents?: string[];
+      top_n?: number;
+    };
+    expect(sentBody.model).toBe("rerank-english-v3.0");
+    expect(sentBody.query).toBe(requestPayload.query);
+    expect(sentBody.documents).toEqual(requestPayload.documents);
+    expect(sentBody.top_n).toBe(requestPayload.top_n);
+  });
+
+  test("Cohere provider: gateway dispatches with Bearer auth + rewritten model (#213 Phase 1)", async (ctx) => {
+    if (!etcdReachable || !app || !admin || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    // Per #213 Phase 1: a Model with `provider: "cohere"` is now a
+    // valid configuration on /v1/rerank (parallel to OpenAI). Cohere
+    // natively implements the same body shape (`{model, query,
+    // documents, top_n}`) at `…/v1/rerank` with `Authorization:
+    // Bearer <key>` auth, so the gateway forwards verbatim with the
+    // `model` field rewritten — no transform required.
+    const cohereSecret = "sk-cohere-mock-e2e";
+    const coherePk = await admin.createProviderKey({
+      display_name: "rerank-cohere-pk",
+      secret: cohereSecret,
+      // Operator can also set this to `https://api.cohere.com`; the
+      // gateway's `build_v1_url` produces `…/v1/rerank` from either
+      // form.
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await admin.createModel({
+      display_name: "rerank-cohere",
+      provider: "cohere",
+      model_name: "rerank-english-v3.0",
+      provider_key_id: coherePk.id,
+    });
+    const cohereCallerPlaintext = `${CALLER_PLAINTEXT}-cohere`;
+    await admin.createApiKey({
+      key_hash: createHash("sha256")
+        .update(cohereCallerPlaintext)
+        .digest("hex"),
+      allowed_models: ["rerank-cohere"],
+    });
+
+    const headers = {
+      authorization: `Bearer ${cohereCallerPlaintext}`,
+      "content-type": "application/json",
+    };
+
+    // Readiness gate: poll /v1/rerank with the Cohere Model until
+    // the gateway returns 200 (Cohere is now allowed). A 400 here
+    // would mean the gate is still rejecting Cohere (regression);
+    // a 404 would be snapshot-lag.
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await fetch(`${app!.proxyUrl}/v1/rerank`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            model: "rerank-cohere",
+            query: "ready-probe",
+            documents: ["doc"],
+          }),
+        });
+        if (r.status !== 200) {
+          await r.text();
+          return false;
+        }
+        await r.json();
+        return true;
+      } catch {
+        return false;
+      }
+    });
+
+    const baseline = upstream.receivedRequests.length;
+    const requestPayload = {
+      model: "rerank-cohere",
+      query: "search query",
+      documents: ["doc one", "doc two", "doc three"],
+      top_n: 2,
+    };
+    const res = await fetch(`${app.proxyUrl}/v1/rerank`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(requestPayload),
+    });
+
+    expect(res.status).toBe(200);
+    await res.json();
+
+    // Upstream wire-shape contract:
+    //   - path is `/v1/rerank`
+    //   - `Authorization: Bearer <Cohere secret>` (NOT the caller's
+    //     plaintext bearer — that would leak the gateway's caller
+    //     credential to the upstream provider)
+    //   - body: `model` rewritten to upstream model_name; everything
+    //     else byte-for-byte
+    const testCalls = upstream.receivedRequests
+      .slice(baseline)
+      .filter((r) => r.path === "/v1/rerank");
+    expect(testCalls).toHaveLength(1);
+    expect(testCalls[0]?.method).toBe("POST");
+    expect(testCalls[0]?.headers["authorization"]).toBe(`Bearer ${cohereSecret}`);
+    expect(testCalls[0]?.headers["authorization"]).not.toContain(cohereCallerPlaintext);
+
     const sentBody = JSON.parse(testCalls[0]!.body) as {
       model?: string;
       query?: string;
