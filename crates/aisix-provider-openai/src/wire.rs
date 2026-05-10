@@ -292,11 +292,29 @@ pub(crate) fn stream_chunk_into_chat_chunk(mut raw: OpenAiStreamChunk) -> ChatCh
 
 // ─── Embeddings wire types ────────────────────────────────────────────────────
 
+/// `input` field shape on the OpenAI `/v1/embeddings` request. Per
+/// OpenAI's spec (<https://platform.openai.com/docs/api-reference/embeddings/create>)
+/// the field accepts either a single string or an array — the gateway
+/// preserves whichever the caller sent, per `docs/api-proxy.md` §4.4
+/// "both pass through" and #162.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub(crate) enum OpenAiEmbedInput<'a> {
+    /// Single-string form. Used when the caller's request body had
+    /// `input: "..."` (string), preserving the wire shape on the
+    /// upstream side.
+    Single(&'a str),
+    /// Array form. Used when the caller's request body had
+    /// `input: ["...", ...]` (array) OR when the `input_was_single`
+    /// signal is missing (round-tripped requests).
+    Multi(&'a [String]),
+}
+
 /// Request body forwarded to OpenAI `/v1/embeddings`.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct OpenAiEmbedRequest<'a> {
     pub model: &'a str,
-    pub input: &'a [String],
+    pub input: OpenAiEmbedInput<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encoding_format: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -332,9 +350,25 @@ pub(crate) fn embed_request_body<'a>(
     req: &'a EmbeddingRequest,
     upstream_model: &'a str,
 ) -> OpenAiEmbedRequest<'a> {
+    // Per #162: the upstream wire shape mirrors what the caller sent
+    // when feasible. Single-string callers get `input: "text"`;
+    // array-form callers get `input: ["text", ...]`. The
+    // `input_was_single` flag from EmbeddingRequest is the load-
+    // bearing signal — without it, callers reading docs §4.4 ("both
+    // pass through") got always-array on the upstream wire,
+    // contradicting the published contract.
+    //
+    // Defensive fallback: if `input_was_single` is true but the vec
+    // is empty or has more than one element, drop back to array
+    // form (the single-string shape is undefined for those cases).
+    let input = if req.input_was_single && req.input.len() == 1 {
+        OpenAiEmbedInput::Single(&req.input[0])
+    } else {
+        OpenAiEmbedInput::Multi(&req.input)
+    };
     OpenAiEmbedRequest {
         model: upstream_model,
-        input: &req.input,
+        input,
         encoding_format: req.encoding_format.as_deref(),
         dimensions: req.dimensions,
     }

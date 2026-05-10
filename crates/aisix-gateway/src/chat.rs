@@ -369,14 +369,28 @@ pub struct EmbeddingObject {
 /// The `input` is either a single string or a list of strings. We
 /// represent both as `Vec<String>` — single-string inputs are wrapped in
 /// a one-element vec by the proxy handler before passing to a Bridge.
+/// Per #162 / `docs/api-proxy.md` §4.4 ("both pass through"), the
+/// original wire shape is preserved through `input_was_single` so the
+/// bridge can serialise back to a single string when that's what the
+/// caller sent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingRequest {
     /// The public-facing model name (resolved to an upstream model by the
     /// proxy before the Bridge sees it).
     pub model: String,
     /// Texts to embed. A single-string input is normalised to
-    /// `vec![text]` by the proxy handler.
+    /// `vec![text]` by the proxy handler; bridges consult
+    /// `input_was_single` to decide the upstream wire shape.
     pub input: Vec<String>,
+    /// `true` iff the caller originally sent `input` as a single
+    /// string (not an array). Bridges that forward to upstreams
+    /// supporting both shapes (OpenAI does) MUST preserve this on
+    /// the wire, per docs §4.4 "both pass through". Defaults to
+    /// `false` when missing on round-trip deserialisation so older
+    /// callers / round-tripped requests that always wrote arrays
+    /// don't change behaviour silently.
+    #[serde(default)]
+    pub input_was_single: bool,
     /// Optional encoding hint forwarded verbatim (`float` / `base64`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding_format: Option<String>,

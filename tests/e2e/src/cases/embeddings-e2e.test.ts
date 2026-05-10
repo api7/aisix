@@ -17,18 +17,21 @@ import {
 // endpoint thousands of times per request batch. Prior to this
 // file, the gateway had **zero** e2e coverage on /v1/embeddings.
 //
-// One user journey pinned:
+// Two user journeys pinned:
 //
-//   - Array input — `client.embeddings.create({input: [s1, s2, s3]})`
-//     returns N embeddings in the SAME order as the input array.
-//     A regression that re-ordered, deduplicated, or truncated the
-//     array would break every batched embedding caller.
+//   1. Array input — `client.embeddings.create({input: [s1, s2, s3]})`
+//      returns N embeddings in the SAME order as the input array.
+//      A regression that re-ordered, deduplicated, or truncated the
+//      array would break every batched embedding caller.
 //
-// (The "single-string input" case is held back pending a product
-// fix — the gateway currently normalises single-string `input` into
-// a single-element array on the upstream wire, contradicting the
-// gateway's own published contract in `docs/api-proxy.md` §4.4
-// ("both pass through"). See follow-up issue.)
+//   2. Single-string input — `client.embeddings.create({input: "hi"})`
+//      reaches the upstream as `input: "hi"` (string) per docs §4.4
+//      "both pass through" — NOT silently coerced to `["hi"]`. The
+//      pre-#162-fix gateway always normalised to an array on the
+//      upstream wire, contradicting the published contract. The
+//      caller-side response shape is identical for both forms; the
+//      contract violation is operator-visible via packet captures
+//      / billing reconciliation.
 //
 // The case pins the upstream-side wire shape: the gateway hits
 // `/v1/embeddings` (not `/v1/chat/completions`), the body is
@@ -178,5 +181,78 @@ describe("embeddings e2e: /v1/embeddings dispatch + response passthrough", () =>
     };
     expect(sentBody.model).toBe("text-embedding-3-small");
     expect(sentBody.input).toEqual(inputs);
+  });
+
+  test("single-string input reaches upstream as a string (#162: docs §4.4 'both pass through')", async (ctx) => {
+    if (!etcdReachable || !app || !admin) {
+      ctx.skip();
+      return;
+    }
+
+    const upstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        object: "list",
+        data: [{ object: "embedding", index: 0, embedding: VEC_HELLO }],
+        model: "text-embedding-3-small",
+        usage: { prompt_tokens: 1, total_tokens: 1 },
+      },
+    });
+    upstreams.push(upstream);
+
+    const pk = await admin.createProviderKey({
+      display_name: "emb-single-pk",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await admin.createModel({
+      display_name: "emb-single",
+      provider: "openai",
+      model_name: "text-embedding-3-small",
+      provider_key_id: pk.id,
+    });
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await client.embeddings.create({
+          model: "emb-single",
+          input: "ready-probe",
+        });
+        return r.object === "list" && Array.isArray(r.data) && r.data.length > 0;
+      } catch {
+        return false;
+      }
+    });
+
+    // Caller-side assertion: response shape is identical regardless
+    // of input form (the OpenAI SDK uses the same Embeddings
+    // resource). Pre-fix this passed cleanly; the bug was upstream-
+    // side wire shape only, invisible to the caller via the SDK.
+    const baseline = upstream.receivedRequests.length;
+    const response = await client.embeddings.create({
+      model: "emb-single",
+      input: "hello",
+    });
+    expect(response.data).toHaveLength(1);
+    expect(response.data[0]?.object).toBe("embedding");
+
+    // Upstream-side assertion: the gateway forwarded `input: "hello"`
+    // as a STRING, not `["hello"]` as an array. Per docs §4.4 the
+    // gateway promises "both pass through" — the caller's wire
+    // shape is preserved on the upstream side. A regression that
+    // re-introduces the always-array normalisation would fail the
+    // `typeof === "string"` assertion here.
+    const testCalls = upstream.receivedRequests
+      .slice(baseline)
+      .filter((r) => r.path === "/v1/embeddings");
+    expect(testCalls).toHaveLength(1);
+    const sentBody = JSON.parse(testCalls[0]!.body) as { input?: unknown };
+    expect(typeof sentBody.input).toBe("string");
+    expect(sentBody.input).toBe("hello");
   });
 });

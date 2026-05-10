@@ -151,9 +151,18 @@ async fn dispatch(
 
     let upstream_model_id = crate::dispatch::require_upstream_model(model)?.to_string();
 
+    // Preserve the caller's original `input` shape per #162 /
+    // `docs/api-proxy.md` §4.4 "both pass through". The bridge will
+    // use this flag to serialise the upstream wire body as either a
+    // single string or an array — without it, the gateway always
+    // forwarded `["text"]` even when the caller sent `"text"`,
+    // which contradicts the docs and confuses operator-side packet
+    // captures during billing reconciliation / debugging.
+    let input_was_single = matches!(body.input, InputField::Single(_));
     let req = EmbeddingRequest {
         model: upstream_model_id,
         input: body.input.into_vec(),
+        input_was_single,
         encoding_format: body.encoding_format,
         dimensions: body.dimensions,
     };
@@ -355,6 +364,88 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Issue #162 regression: when the caller's `input` is a single
+    /// string, the upstream wire body MUST be a single string (NOT a
+    /// one-element array). Per `docs/api-proxy.md` §4.4, both shapes
+    /// pass through; pre-fix the gateway always sent `["text"]` to
+    /// the upstream regardless of the caller's shape.
+    #[tokio::test]
+    async fn single_string_input_preserves_string_shape_on_upstream_wire() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({"model": "my-embed", "input": "hello"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Drain the upstream's recorded request body and inspect the
+        // `input` field on the upstream wire. A regression that
+        // re-introduced the always-array normalisation would write
+        // `["hello"]` here.
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1, "exactly one upstream call expected");
+        let upstream_body: serde_json::Value =
+            serde_json::from_slice(&received[0].body).expect("upstream body is valid JSON");
+        assert!(
+            upstream_body["input"].is_string(),
+            "single-string caller input must reach upstream as a string, not an array; got {:?}",
+            upstream_body["input"]
+        );
+        assert_eq!(upstream_body["input"], "hello");
+    }
+
+    /// Counterpart to the above: when the caller's `input` is an
+    /// array (even single-element), the upstream wire body is also
+    /// an array. Without this companion test, a regression that
+    /// over-corrected to "always single-string when len==1" would
+    /// silently rewrite the caller's explicit array.
+    #[tokio::test]
+    async fn array_input_preserves_array_shape_on_upstream_wire() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        // Caller uses array form even though there's only one
+        // element. Gateway must NOT silently rewrite to a string.
+        let body = serde_json::json!({"model": "my-embed", "input": ["only-one"]});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let upstream_body: serde_json::Value =
+            serde_json::from_slice(&received[0].body).expect("upstream body is valid JSON");
+        assert!(
+            upstream_body["input"].is_array(),
+            "array-form caller input must reach upstream as an array, not coerced to a string; got {:?}",
+            upstream_body["input"]
+        );
+        let arr = upstream_body["input"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0], "only-one");
     }
 
     #[tokio::test]
