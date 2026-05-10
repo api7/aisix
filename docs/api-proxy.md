@@ -193,16 +193,24 @@ servers under the same body shape). Routed to `{base}/v1/rerank`.
 The Model's provider supplies the API key; the request body is
 forwarded verbatim after rewriting the `model` field.
 
-**Supported providers**: `openai`, `cohere`. Anthropic, Gemini,
-and DeepSeek do not expose a rerank API at this URL — Models with
-those providers return 400 (parallel to §4.6).
+**Supported providers**: `openai`, `cohere`, `jina`. Anthropic,
+Gemini, and DeepSeek do not expose a rerank API at this URL —
+Models with those providers return 400 (parallel to §4.6).
+Voyage AI's rerank also lives at `/v1/rerank` but uses different
+field names (`top_k` instead of `top_n` on request, `data`
+instead of `results` on response) so it requires a small
+request/response adapter that's not yet implemented; track that
+in the #213 follow-ups.
 
 For `provider: "cohere"`, the default `api_base` is
 `https://api.cohere.com`, which the gateway expands to
-`https://api.cohere.com/v1/rerank` upstream. Cohere's body shape
-(`{model, query, documents, top_n, ...}`) and Bearer-auth
-convention are identical to the OpenAI-compat shape, so the
-gateway forwards verbatim with no transform.
+`https://api.cohere.com/v1/rerank` upstream.
+
+For `provider: "jina"`, the default `api_base` is
+`https://api.jina.ai`, which the gateway expands to
+`https://api.jina.ai/v1/rerank`. Jina's body shape, Bearer-auth
+convention, and `results: [...]` response shape are identical to
+Cohere's, so the gateway forwards verbatim with no transform.
 
 > **Cohere v1 → v2 migration**: Cohere has deprecated its v1
 > endpoints in favour of v2 (`/v2/rerank`); v1 still functions

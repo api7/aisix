@@ -32,12 +32,16 @@ import {
 //      `model` field rewritten.
 //   2. Cohere provider (#213 Phase 1) — caller POSTs against a
 //      Cohere-provider Model. Gateway dispatches to Cohere's
-//      `/v1/rerank` (or any operator-configured api_base) with
-//      Bearer auth + the rewritten model. Cohere natively
-//      implements this exact body shape, so the gateway forwards
-//      verbatim with no transform.
-//   3. Non-{OpenAI, Cohere} provider — gateway rejects at the
-//      boundary with 400 + `error.type: "invalid_request_error"`,
+//      `/v1/rerank` with Bearer auth + the rewritten model.
+//   3. Jina provider (#213 Phase 2) — caller POSTs against a
+//      Jina-provider Model. Gateway dispatches to Jina's
+//      `/v1/rerank` (https://api.jina.ai/v1/rerank). Jina's wire
+//      shape is identity-mapped to Cohere's (same body fields,
+//      same Bearer auth, same `results: [...]` response), so the
+//      gateway forwards verbatim with only the `model` field
+//      rewritten.
+//   4. Non-{OpenAI, Cohere, Jina} provider — gateway rejects at
+//      the boundary with 400 + `error.type: "invalid_request_error"`,
 //      upstream NOT hit (#212 / #168).
 //
 // References:
@@ -319,6 +323,117 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
     // (e.g. `dimensions` from embeddings, `stream` from chat)
     // would break Cohere without failing a "happy-path 200"
     // assertion alone.
+    const sentKeys = Object.keys(
+      sentBody as Record<string, unknown>,
+    ).sort();
+    expect(sentKeys).toEqual(["documents", "model", "query", "top_n"]);
+  });
+
+  test("Jina provider: gateway dispatches with Bearer auth + rewritten model (#213 Phase 2)", async (ctx) => {
+    if (!etcdReachable || !app || !admin || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    // Per #213 Phase 2: a Model with `provider: "jina"` is now a
+    // valid configuration on /v1/rerank. Jina's rerank
+    // (https://api.jina.ai/v1/rerank) implements the same body
+    // shape (`{model, query, documents, top_n, ...}`) at
+    // `…/v1/rerank` with Bearer auth — identity-mapped to Cohere /
+    // OpenAI-compat. The gateway forwards verbatim with only the
+    // `model` field rewritten.
+    const jinaSecret = "jina_mock_secret_e2e";
+    const jinaPk = await admin.createProviderKey({
+      display_name: "rerank-jina-pk",
+      secret: jinaSecret,
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await admin.createModel({
+      display_name: "rerank-jina",
+      provider: "jina",
+      model_name: "jina-reranker-v2-base-multilingual",
+      provider_key_id: jinaPk.id,
+    });
+    const jinaCallerPlaintext = `${CALLER_PLAINTEXT}-jina`;
+    await admin.createApiKey({
+      key_hash: createHash("sha256")
+        .update(jinaCallerPlaintext)
+        .digest("hex"),
+      allowed_models: ["rerank-jina"],
+    });
+
+    const headers = {
+      authorization: `Bearer ${jinaCallerPlaintext}`,
+      "content-type": "application/json",
+    };
+
+    // Readiness gate: poll until 200 from the gateway. A 400 here
+    // would mean the gate is rejecting Jina (regression); 404 is
+    // snapshot-lag.
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await fetch(`${app!.proxyUrl}/v1/rerank`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            model: "rerank-jina",
+            query: "ready-probe",
+            documents: ["doc"],
+          }),
+        });
+        if (r.status !== 200) {
+          await r.text();
+          return false;
+        }
+        await r.json();
+        return true;
+      } catch {
+        return false;
+      }
+    });
+
+    const baseline = upstream.receivedRequests.length;
+    const requestPayload = {
+      model: "rerank-jina",
+      query: "search query",
+      documents: ["doc one", "doc two", "doc three"],
+      top_n: 2,
+    };
+    const res = await fetch(`${app.proxyUrl}/v1/rerank`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(requestPayload),
+    });
+
+    expect(res.status).toBe(200);
+    await res.json();
+
+    // Upstream wire-shape contract:
+    //   - path is `/v1/rerank`
+    //   - `Authorization: Bearer <Jina secret>` (NOT caller's bearer)
+    //   - body: `model` rewritten to upstream model_name; everything
+    //     else byte-for-byte
+    const testCalls = upstream.receivedRequests
+      .slice(baseline)
+      .filter((r) => r.path === "/v1/rerank");
+    expect(testCalls).toHaveLength(1);
+    expect(testCalls[0]?.method).toBe("POST");
+    expect(testCalls[0]?.headers["authorization"]).toBe(`Bearer ${jinaSecret}`);
+    expect(testCalls[0]?.headers["authorization"]).not.toContain(jinaCallerPlaintext);
+
+    const sentBody = JSON.parse(testCalls[0]!.body) as {
+      model?: string;
+      query?: string;
+      documents?: string[];
+      top_n?: number;
+    };
+    expect(sentBody.model).toBe("jina-reranker-v2-base-multilingual");
+    expect(sentBody.query).toBe(requestPayload.query);
+    expect(sentBody.documents).toEqual(requestPayload.documents);
+    expect(sentBody.top_n).toBe(requestPayload.top_n);
+
+    // Same exact-field-set pin as the Cohere case (#213 audit
+    // MEDIUM-2 contract): no gateway-injected extras.
     const sentKeys = Object.keys(
       sentBody as Record<string, unknown>,
     ).sort();
