@@ -1034,6 +1034,7 @@ mod tests {
                 ChatMessage {
                     role: Role::Tool,
                     content: "72F, sunny".into(),
+                    content_blocks: None,
                     name: None,
                     tool_call_id: Some("toolu_abc".into()),
                     extra: serde_json::Map::new(),
