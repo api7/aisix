@@ -191,4 +191,98 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
     expect(sentBody.documents).toEqual(requestPayload.documents);
     expect(sentBody.top_n).toBe(requestPayload.top_n);
   });
+
+  test("non-OpenAI provider returns 400 invalid_request_error, upstream untouched (#212 / docs §4.7)", async (ctx) => {
+    if (!etcdReachable || !app || !admin || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    // Per docs §4.7 + #168 (closed by #211): /v1/rerank only works
+    // with OpenAI providers; non-OpenAI Models reject at the gateway
+    // boundary with 400. Pre-#211 the gateway dispatched silently
+    // and the upstream returned 404 (Anthropic / DeepSeek have no
+    // rerank API; Gemini's OpenAI-compat surface doesn't expose
+    // /v1/rerank). #212 covers the e2e gap on this contract.
+    const nonOaPk = await admin.createProviderKey({
+      display_name: "rerank-anthropic-pk",
+      secret: "sk-ant-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await admin.createModel({
+      display_name: "rerank-anthropic",
+      provider: "anthropic",
+      model_name: "claude-3-5-haiku-20241022",
+      provider_key_id: nonOaPk.id,
+    });
+    const nonOaCaller = `${CALLER_PLAINTEXT}-non-oa`;
+    await admin.createApiKey({
+      key_hash: createHash("sha256").update(nonOaCaller).digest("hex"),
+      allowed_models: ["rerank-anthropic"],
+    });
+
+    const headers = {
+      authorization: `Bearer ${nonOaCaller}`,
+      "content-type": "application/json",
+    };
+
+    // Readiness gate: poll until the gateway returns the documented
+    // 400 with `error.type: "invalid_request_error"` per docs §2
+    // status→type table. A 404 here would be the snapshot-lag
+    // "model_not_found" case (which is mapped to 404, NOT 400);
+    // probing on 400 + invalid_request_error gates on the model
+    // resolving AND the gateway refusing per §4.7.
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await fetch(`${app!.proxyUrl}/v1/rerank`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            model: "rerank-anthropic",
+            query: "ready-probe",
+            documents: ["doc"],
+          }),
+        });
+        if (r.status !== 400) {
+          await r.text();
+          return false;
+        }
+        const j = (await r.json()) as { error?: { type?: unknown } };
+        return j.error?.type === "invalid_request_error";
+      } catch {
+        return false;
+      }
+    });
+
+    const upstreamHitsBefore = upstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/rerank`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "rerank-anthropic",
+        query: "search",
+        documents: ["doc1", "doc2"],
+      }),
+    });
+
+    // Per docs §4.7: non-OpenAI providers return 400. 5xx would mean
+    // the gateway crashed; 404 would mean snapshot-lag (caught by
+    // the readiness gate above).
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as {
+      error?: { type?: unknown; message?: unknown };
+    };
+    expect(body.error?.type).toBe("invalid_request_error");
+    // Per #168/#211 wording: the rejection message names the
+    // OpenAI-only restriction. The "requires OpenAI" substring is
+    // a stable marker (vs the OpenAI taxonomy enum string, which
+    // a generic invalid-request failure would also carry).
+    expect(typeof body.error?.message).toBe("string");
+    expect(body.error?.message as string).toMatch(/requires OpenAI/i);
+
+    // Hard contract: upstream must NEVER be hit when the gateway
+    // refuses for provider mismatch — otherwise the gateway is
+    // billing the caller's quota on a request it claims to reject.
+    expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore);
+  });
 });

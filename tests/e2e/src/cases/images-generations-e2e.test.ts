@@ -173,4 +173,87 @@ describe("images generations e2e: /v1/images/generations verbatim forward + mode
     expect(sentBody.size).toBe(requestPayload.size);
     expect(sentBody.response_format).toBe(requestPayload.response_format);
   });
+
+  test("non-OpenAI provider returns 400 invalid_request_error, upstream untouched (#212 / docs §4.9)", async (ctx) => {
+    if (!etcdReachable || !app || !admin || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    // Per docs §4.9 + #168 (closed by #211): /v1/images/generations
+    // only works with OpenAI providers; non-OpenAI Models reject at
+    // the gateway boundary with 400. Pre-#211 the gateway dispatched
+    // silently and the upstream returned 404 (Anthropic has no image
+    // API; Gemini's image generation uses a different URL + body
+    // shape; DeepSeek doesn't expose image generation). #212 covers
+    // the e2e gap on this contract.
+    const nonOaPk = await admin.createProviderKey({
+      display_name: "img-anthropic-pk",
+      secret: "sk-ant-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await admin.createModel({
+      display_name: "img-anthropic",
+      provider: "anthropic",
+      model_name: "claude-3-5-haiku-20241022",
+      provider_key_id: nonOaPk.id,
+    });
+    const nonOaCaller = `${CALLER_PLAINTEXT}-non-oa`;
+    await admin.createApiKey({
+      key_hash: createHash("sha256").update(nonOaCaller).digest("hex"),
+      allowed_models: ["img-anthropic"],
+    });
+
+    const headers = {
+      authorization: `Bearer ${nonOaCaller}`,
+      "content-type": "application/json",
+    };
+
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await fetch(`${app!.proxyUrl}/v1/images/generations`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            model: "img-anthropic",
+            prompt: "ready-probe",
+          }),
+        });
+        if (r.status !== 400) {
+          await r.text();
+          return false;
+        }
+        const j = (await r.json()) as { error?: { type?: unknown } };
+        return j.error?.type === "invalid_request_error";
+      } catch {
+        return false;
+      }
+    });
+
+    const upstreamHitsBefore = upstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/images/generations`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "img-anthropic",
+        prompt: "A sunset over mountains",
+        n: 1,
+        size: "1024x1024",
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as {
+      error?: { type?: unknown; message?: unknown };
+    };
+    expect(body.error?.type).toBe("invalid_request_error");
+    // Per #168/#211: rejection message names the OpenAI-only
+    // restriction. "requires OpenAI" is the stable marker.
+    expect(typeof body.error?.message).toBe("string");
+    expect(body.error?.message as string).toMatch(/requires OpenAI/i);
+
+    // Hard contract: upstream must NEVER be hit when the gateway
+    // refuses for provider mismatch.
+    expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore);
+  });
 });

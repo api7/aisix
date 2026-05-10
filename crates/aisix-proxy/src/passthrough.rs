@@ -46,8 +46,11 @@ fn default_base(provider_prefix: &str) -> Option<&'static str> {
     }
 }
 
-/// `true` if `seg` looks like an api-version path component
-/// (`v0`, `v1`, `v2alpha` is rejected — strictly `v\d+`).
+/// `true` if `seg` is a strict api-version path component matching
+/// `v\d+`: `v1`, `v2`, `v10` are accepted; `v2alpha`, `V1`, `v`,
+/// non-ASCII digits are rejected. Used by [`strip_redundant_version_segment`]
+/// to decide whether to dedup the leading version of `rest` against
+/// the trailing version of `api_base`.
 fn is_api_version_segment(seg: &str) -> bool {
     seg.starts_with('v') && seg.len() > 1 && seg[1..].chars().all(|c| c.is_ascii_digit())
 }
