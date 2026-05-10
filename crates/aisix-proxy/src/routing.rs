@@ -17,6 +17,7 @@
 use aisix_core::{Routing, RoutingStrategy, RoutingTarget};
 use aisix_gateway::BridgeError;
 use dashmap::DashMap;
+use rand::Rng;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Whether a Bridge error is retryable across routing targets.
@@ -118,7 +119,6 @@ fn weighted_pick(targets: &[RoutingTarget]) -> usize {
     if total == 0 {
         return 0;
     }
-    use rand::Rng;
     let pick = rand::thread_rng().gen_range(0..total);
     let mut acc: u64 = 0;
     for (i, t) in targets.iter().enumerate() {
@@ -226,10 +226,10 @@ mod tests {
             ],
             Some(0),
         );
-        // Across many trials, "a" should dominate as the starting pick.
-        // We don't assert exact distribution (entropy is sub-second
-        // wall-clock); we just assert correctness of the *order* shape:
+        // We just assert correctness of the *order* shape:
         // exactly two attempts, distinct targets, both targets covered.
+        // (Aggregate distribution is pinned by the dedicated tests
+        // below.)
         let order = reg.pick_order("v", &routing);
         assert_eq!(order.len(), 2);
         assert!(order.iter().any(|t| t == "a"));
@@ -298,10 +298,10 @@ mod tests {
     /// 200/0 in e2e on a configured 70/30); a proper PRNG converges
     /// to the analytic distribution.
     ///
-    /// Tolerance: n=1000 with p=0.7 has σ=√(np(1-p))=√210≈14.5. A ±5%
-    /// window (50 absolute counts) is ~3.5σ → P(false positive)<0.1%.
-    /// The pre-fix collapse-to-one-bin failure produces 1000/0 which
-    /// is ~33σ outside the window — caught with overwhelming margin.
+    /// Tolerance: n=1000 with p=0.7 has σ=√(np(1-p))=√210≈14.49. A ±50
+    /// absolute window is ~3.45σ → P(false positive) ≈ 0.056%. The
+    /// pre-fix collapse-to-one-bin failure produces 1000/0 which is
+    /// ~33σ outside the window — caught with overwhelming margin.
     #[test]
     fn weighted_pick_70_30_split_converges_to_configured_ratio() {
         let targets = vec![
@@ -310,10 +310,69 @@ mod tests {
         ];
         let n = 1_000;
         let a_count = (0..n).filter(|_| weighted_pick(&targets) == 0).count();
-        // Expected ~700; tolerance window [650, 750] (≈±3.5σ).
+        // Expected ~700; tolerance window [650, 750] (≈±3.45σ).
         assert!(
             (650..=750).contains(&a_count),
             "70/30 weighted split must land near 700/1000; got {a_count}/{n} on heavy target",
+        );
+    }
+
+    /// 3-target coverage: a weight-blind impl that only ever picks
+    /// `targets[0]` if `pick < sum/n` (and `targets[1]` otherwise)
+    /// would pass every 2-target test in this module but fail with
+    /// 3+ targets — the third bin would starve. Pin a 50/30/20 split
+    /// and assert each bin lands within a generous tolerance window.
+    ///
+    /// n=2000 chosen so the smallest bin (20% → ~400) has σ ≈ 17.9;
+    /// ±100 window ≈ 5.6σ for that bin, larger margins for the other
+    /// two.
+    #[test]
+    fn weighted_pick_50_30_20_split_distributes_to_all_three_bins() {
+        let targets = vec![
+            RoutingTarget::new("a").with_weight(50),
+            RoutingTarget::new("b").with_weight(30),
+            RoutingTarget::new("c").with_weight(20),
+        ];
+        let n = 2_000;
+        let mut counts = [0_usize; 3];
+        for _ in 0..n {
+            counts[weighted_pick(&targets)] += 1;
+        }
+        // Expected 1000/600/400. ±100 window catches a weight-blind
+        // 2-target collapse (where the 3rd bin would be 0) AND
+        // sample noise.
+        assert!(
+            (900..=1100).contains(&counts[0]),
+            "50%-weighted bin should land near 1000/2000; got {counts:?}",
+        );
+        assert!(
+            (500..=700).contains(&counts[1]),
+            "30%-weighted bin should land near 600/2000; got {counts:?}",
+        );
+        assert!(
+            (300..=500).contains(&counts[2]),
+            "20%-weighted bin should land near 400/2000; got {counts:?}",
+        );
+    }
+
+    /// Zero-weight-in-the-middle: a weight=0 target between two
+    /// non-zero targets must NEVER be picked. The CDF predicate
+    /// `pick < acc` (strict less-than) is what enforces this — a
+    /// weight-0 segment doesn't widen `acc` so the predicate skips
+    /// past it. A regression that used `<=` would incidentally pick
+    /// the zero-weight bin on the boundary value of `pick`.
+    #[test]
+    fn weighted_pick_zero_weight_target_in_middle_is_never_picked() {
+        let targets = vec![
+            RoutingTarget::new("a").with_weight(10),
+            RoutingTarget::new("b").with_weight(0),
+            RoutingTarget::new("c").with_weight(10),
+        ];
+        let n = 2_000;
+        let b_count = (0..n).filter(|_| weighted_pick(&targets) == 1).count();
+        assert_eq!(
+            b_count, 0,
+            "weight=0 target must never be picked; got {b_count}/{n}",
         );
     }
 
