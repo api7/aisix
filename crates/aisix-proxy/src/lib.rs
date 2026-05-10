@@ -1806,6 +1806,87 @@ data: [DONE]\n\n";
         assert_eq!(event.provider_request_id, "cmpl-blocked-1");
         assert_eq!(event.provider_model_version, "gpt-4o-2024-08-06");
         assert_eq!(event.finish_reason, "stop");
+        // cache_status reflects the per-policy gate the request went
+        // through; "disabled" here because the test seeds no
+        // cache_policy. A regression that drops cache_status on the
+        // output-block path would surface as empty-string here.
+        assert_eq!(event.cache_status, "disabled");
+    }
+
+    /// Regression for ai-gateway#196 audit HIGH-1: streaming chat
+    /// telemetry must fire even when the client disconnects mid-
+    /// stream. Pre-fix, on_complete lived in a `yield`-following
+    /// branch of the async_stream! body that only ran when the
+    /// consumer pulled — a dropped consumer (axum aborting the
+    /// response future) skipped it entirely, so the customer's
+    /// upstream call billed but the gateway recorded zero events.
+    /// Post-fix, on_complete fires from a Drop guard so cancellation
+    /// still produces a usage_event (with whatever counts were
+    /// captured up to disconnect, typically 0 if disconnect beat
+    /// the upstream's `usage` chunk).
+    #[tokio::test]
+    async fn streaming_chat_telemetry_fires_on_client_disconnect() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // Use a slow drip so we can disconnect before [DONE] arrives.
+        let sse = "\
+data: {\"id\":\"cmpl-cancel-1\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-cancel-1\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-cancel-1\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Read ONE chunk then drop the response body — simulates a
+        // client that hung up before the upstream's terminal chunk.
+        // The Drop guard inside build_sse_stream must still fire
+        // on_complete for this disconnected request.
+        let mut body_stream = resp.into_body().into_data_stream();
+        let _first = body_stream.next().await;
+        drop(body_stream);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("usage event was never emitted (Drop guard regression)")
+            .expect("sender dropped without sending");
+        // The exact token counts depend on how many chunks reached
+        // the guard before disconnect — could be 0 (disconnect beat
+        // the upstream emission entirely) or more. The contract is
+        // simply that an event fires; counts are best-effort. Pin
+        // the structural fields to confirm we didn't grab some
+        // unrelated event.
+        assert_eq!(event.status_code, 200);
+        assert!(!event.guardrail_blocked);
     }
 
     /// Regression for #225: streaming chat must read the terminal SSE

@@ -190,8 +190,8 @@ pub async fn chat_completions(
                         provider_request_id: c.provider_request_id,
                         provider_model_version: c.provider_model_version,
                         finish_reason: c.finish_reason,
-                        bypass_reason: String::new(),
-                        cache_status: String::new(),
+                        bypass_reason: c.bypass_reason,
+                        cache_status: c.cache_status.as_str().to_string(),
                         cache_hit_saved_input_tokens: 0,
                         cache_hit_saved_output_tokens: 0,
                     },
@@ -334,6 +334,19 @@ struct UpstreamCharge {
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
+    /// First bypass reason observed on this request (input or output
+    /// guardrail returned `Bypass` because a remote-API guardrail was
+    /// unreachable + `fail_open=true`). Empty string = no bypass.
+    /// Carried so the output-block telemetry surfaces "this blocked
+    /// request had a degraded input check" — without this, an operator
+    /// auditing a guardrail bypass would only see the bypass on
+    /// successfully-served requests, never on output-blocked ones.
+    bypass_reason: String,
+    /// Cache outcome decided BEFORE the output guardrail ran. The
+    /// dashboard's cache-status filter counts misses vs disabled vs
+    /// hits — without forwarding it on the output-block path the
+    /// blocked-but-billed request is mis-bucketed as "no cache decision".
+    cache_status: CacheStatus,
 }
 
 async fn dispatch(
@@ -507,6 +520,12 @@ async fn dispatch(
                     provider_model_version: comp.provider_model_version,
                     finish_reason: comp.finish_reason,
                     bypass_reason: bypass_reason_for_telem,
+                    // TODO(streaming-cache): when streaming responses
+                    // become cacheable, this constant `Disabled` will
+                    // silently mis-bucket cached streamed responses.
+                    // Propagate the dispatch path's `cache_status`
+                    // local at that point. Tracking issue to be filed
+                    // alongside the streaming-cache implementation.
                     cache_status: CacheStatus::Disabled.as_str().to_string(),
                     cache_hit_saved_input_tokens: 0,
                     cache_hit_saved_output_tokens: 0,
@@ -766,6 +785,13 @@ async fn dispatch(
             // `usage_events` reflects the bill — silently zeroing
             // them would let the customer's dashboard underreport
             // tokens they paid the provider for.
+            //
+            // `bypass_reason` and `cache_status` are also forwarded
+            // so an output-blocked request stays comparable to a
+            // succeeded-but-billed one in the dashboard's bypass /
+            // cache-status filters. Without these, an operator
+            // auditing input-bypass would never see them on
+            // output-blocked requests.
             let charge = UpstreamCharge {
                 prompt_tokens: upstream.usage.prompt_tokens,
                 completion_tokens: upstream.usage.completion_tokens,
@@ -776,6 +802,8 @@ async fn dispatch(
                 provider_request_id: provider_request_id.clone(),
                 provider_model_version: provider_model_version.clone(),
                 finish_reason: finish_reason.clone(),
+                bypass_reason: bypass_reason.clone().unwrap_or_default(),
+                cache_status,
             };
             return Err((
                 Some(model_id.clone()),
@@ -1061,6 +1089,46 @@ struct StreamCompletion {
     finish_reason: String,
 }
 
+/// Fires `on_complete` with whatever `StreamCompletion` has been
+/// accumulated when the guard is dropped. The async_stream body holds
+/// this guard for the whole stream lifetime so on_complete fires
+/// reliably on BOTH normal completion AND mid-stream cancellation.
+///
+/// Why this is necessary: code AFTER a `yield` in `async_stream::stream!{}`
+/// only runs when the consumer pulls. If axum drops the response
+/// future (client disconnect, request timeout, etc.), the generator
+/// is dropped at its last suspension point and post-yield code never
+/// runs. Pre-Drop-guard, that meant a streaming chat with a client
+/// disconnect emitted ZERO telemetry events — the customer was billed
+/// upstream, the gateway recorded nothing. Drop runs on cancellation,
+/// so the captured `StreamCompletion` (potentially zeros if the
+/// disconnect beat the upstream's `usage` chunk) is always shipped.
+struct CompleteOnDrop<F: FnOnce(StreamCompletion)> {
+    /// `Option<(closure, accumulator)>` — Drop calls the closure
+    /// exactly once via `.take()`, so manual disarm before the
+    /// natural drop is also safe (we don't currently use that, but
+    /// it leaves the door open).
+    slot: Option<(F, StreamCompletion)>,
+}
+
+impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
+    fn comp(&mut self) -> &mut StreamCompletion {
+        &mut self
+            .slot
+            .as_mut()
+            .expect("CompleteOnDrop guard accessed after take")
+            .1
+    }
+}
+
+impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
+    fn drop(&mut self) {
+        if let Some((f, c)) = self.slot.take() {
+            f(c);
+        }
+    }
+}
+
 fn build_sse_stream<F>(
     upstream: aisix_gateway::ChatChunkStream,
     created: i64,
@@ -1070,6 +1138,14 @@ where
     F: FnOnce(StreamCompletion) + Send + 'static,
 {
     async_stream::stream! {
+        // Hold on_complete + the running StreamCompletion accumulator
+        // inside a Drop guard so on_complete fires even on client-
+        // disconnect cancellation. See `CompleteOnDrop` above for the
+        // why; tl;dr without this, async_stream! body code after a
+        // yield only runs on consumer pulls.
+        let mut guard = CompleteOnDrop {
+            slot: Some((on_complete, StreamCompletion::default())),
+        };
         futures::pin_mut!(upstream);
         // Accumulate the upstream's `usage` block + per-chunk metadata
         // across the stream. Providers typically populate `usage` on
@@ -1077,10 +1153,10 @@ where
         // the bookkeeping robust to a provider that double-emits.
         // `chunk.id` / `chunk.model` / `chunk.finish_reason` use
         // last-seen-wins because those are stable per stream.
-        let mut comp = StreamCompletion::default();
         while let Some(item) = upstream.next().await {
             let ev = match item {
                 Ok(chunk) => {
+                    let comp = guard.comp();
                     if !chunk.id.is_empty() {
                         comp.provider_request_id = chunk.id.clone();
                     }
@@ -1128,12 +1204,20 @@ where
             };
             yield Ok::<_, Infallible>(ev);
         }
-        // Stream done — fire on_complete with whatever we accumulated.
+        // Stream completed normally. Yield [DONE] BEFORE the guard
+        // drops at end-of-scope so the SSE sentinel reaches the
+        // client before the on_complete telemetry fan-out. (Any
+        // ordering relationship between the two is non-causal — both
+        // are independent side effects on this thread — but matching
+        // the prior "on_complete then [DONE]" intent feels right.)
         // For providers that don't emit `usage` in the stream the
-        // numeric fields stay 0; on_complete callers must treat 0 as
-        // "no signal" (cp-api does — its pricing catalog falls back
-        // to the standard rate when these are absent).
-        on_complete(comp);
+        // accumulator's numeric fields stay 0; on_complete callers
+        // must treat 0 as "no signal" (cp-api does — its pricing
+        // catalog falls back to the standard rate when absent).
         yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
+        // `guard` drops here. On client disconnect, the generator
+        // drops at the suspension point inside the loop; Drop fires
+        // there with whatever StreamCompletion has been captured up
+        // to that point.
     }
 }
