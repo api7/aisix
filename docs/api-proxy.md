@@ -35,12 +35,13 @@ Errors follow the OpenAI shape so SDK error handlers light up:
 {
   "error": {
     "message": "model 'mygpt' not found",
-    "type": "model_not_found",
-    "param": null,
-    "code": null
+    "type": "model_not_found"
   }
 }
 ```
+
+The `param` and `code` fields are present on the wire only when set —
+unset values are omitted from the envelope.
 
 | Status | `type` | `code` | When |
 |---|---|---|---|
@@ -48,12 +49,13 @@ Errors follow the OpenAI shape so SDK error handlers light up:
 | 401 | `invalid_api_key` | — | Missing, malformed, or unknown bearer/`x-api-key` |
 | 403 | `permission_denied` | — | Key valid but Model not in `allowed_models` |
 | 404 | `model_not_found` | — | `req.model` does not resolve in the snapshot |
-| 413 | (axum default) | — | Body exceeds `proxy.request_body_limit_bytes` (default 10 MB) — produced by the body-limit middleware, not the OpenAI envelope |
+| 413 | (axum default) | — | Body exceeds axum's built-in `Json<…>` extractor limit (2 MiB). The `proxy.request_body_limit_bytes` config field is reserved for future use and not yet wired — track this in the follow-up product issue. |
 | 422 | `content_filter` | — | Guardrail rejected request or response content |
 | 429 | `rate_limit_exceeded` | — | RPM/TPM/concurrency cap engaged (all three quotas surface here — the gateway does not split concurrency into a separate code) |
 | 429 | `billing_error` | `budget_exceeded` | Per-key USD budget exhausted |
 | 502 | (per-bridge) | — | Upstream returned 5xx or invalid wire format; `type` comes from the bridge — see [§6](#6-provider-specific-notes) |
 | 503 | `provider_unavailable` | — | No bridge registered for the resolved Model's provider |
+| 504 | `timeout` | — | Upstream call exceeded its deadline. Surfaced by `BridgeError::Timeout` and mapped through the bridge's `error_type()`. |
 
 Rate-limit rejections carry a `Retry-After: <seconds>` header. Budget
 rejections do not — the operator is the one who lifts the cap, so
@@ -62,16 +64,25 @@ there is no deterministic retry interval to advertise.
 The `code` field is populated only where listed above; otherwise it
 is omitted from the envelope.
 
-## 3. Response headers (every endpoint)
+## 3. Response headers
 
-| Header | Meaning |
-|---|---|
-| `x-aisix-request-id` | Server-issued request UUID. Echo this when filing support tickets. (`/v1/chat/completions` currently emits this as `x-aisix-call-id` instead — known wart, will converge in a follow-up code change.) |
-| `x-aisix-cache` | `hit` if the response came from cache, `miss` otherwise. Absent for streaming responses. |
-| `x-ratelimit-limit-{requests,tokens,concurrent}` | Configured caps. |
-| `x-ratelimit-remaining-{requests,tokens,concurrent}` | Live counters at end of request. |
-| `x-ratelimit-reset-{requests,tokens}` | Unix timestamp when the window resets. |
-| `Retry-After` | On 429 rate-limit responses only. |
+Header coverage today is uneven across endpoints — converging on a
+single canonical request-id header is tracked as a follow-up code
+change.
+
+| Header | Meaning | Where emitted today |
+|---|---|---|
+| `x-aisix-request-id` | Server-issued request UUID. Echo this when filing support tickets. | `/v1/messages`, `/v1/responses`, `/v1/rerank`, `/v1/audio/*`, `/passthrough/*` |
+| `x-aisix-call-id` | Same intent as `x-aisix-request-id`; will be retired in favour of it. | `/v1/chat/completions` only |
+| `x-aisix-cache` | `hit` if the response came from cache, `miss` otherwise. Absent for streaming responses. | every endpoint that goes through the cache layer |
+| `x-ratelimit-limit-{requests,tokens,concurrent}` | Configured caps. | every endpoint that ran the rate-limit middleware |
+| `x-ratelimit-remaining-{requests,tokens,concurrent}` | Live counters at end of request. | same as above |
+| `x-ratelimit-reset-{requests,tokens}` | Unix timestamp when the window resets. | same as above |
+| `Retry-After` | On 429 rate-limit responses only. | proxy 429 path |
+
+`/v1/completions`, `/v1/embeddings`, `/v1/images/generations`, and
+`/v1/models` do not currently emit any request-id header. Treat the
+absence as a known gap rather than a contract.
 
 ## 4. Endpoints
 
@@ -215,7 +226,9 @@ possible:
 
 - One `data:` line per chunk, terminated by `\n\n`.
 - A keepalive comment (`: ping`) is emitted every 15 s of idle time
-  to prevent intermediate proxies from dropping the connection.
+  on `/v1/chat/completions` streams to prevent intermediate proxies
+  from dropping the connection. `/v1/messages` and `/v1/responses`
+  do not currently emit keepalives.
 - The terminal `data: [DONE]` is always sent on a clean upstream
   finish, even if the upstream omitted it.
 - If the upstream stream terminates abnormally, aisix sends a final
