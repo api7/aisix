@@ -175,13 +175,49 @@ curl -X POST http://localhost:3001/admin/v1/provider_keys \
 
 ### 4.4 Budgets
 
-Per-ApiKey USD spend caps live inline on the ApiKey resource
-(`max_budget_usd` field) — there is no separate `/admin/v1/budgets`
-collection. The proxy reads the budget at request start (pre-check)
-and adds the cost at end of request.
+Per-ApiKey USD spend caps are expressed via `max_budget_usd` on the
+ApiKey resource — there is no separate `/admin/v1/budgets`
+collection. **Enforcement is a SaaS-tier feature**: the data-plane
+proxy never reads `max_budget_usd` from the etcd snapshot. The
+field is populated by the SaaS control plane for parity with its
+own `api_keys` table and is informational on the DP side.
 
-Team-level budgets are a SaaS-tier feature; standalone deployments
-do per-key budgeting only.
+#### SaaS / Managed mode
+
+Two flows run in parallel between the DP and cp-api:
+
+- **Pre-check (pull)** — every request triggers
+  `BudgetClient::check` (`crates/aisix-proxy/src/budget.rs`), which
+  calls cp-api over mTLS at `GET /dp/budget_check?api_key_id=<uuid>`
+  with a 5 s LRU cache per api_key. `allow=false` becomes a 429
+  `BudgetExceeded` before upstream dispatch.
+- **Usage push** — each completion enqueues a `UsageEvent`; a
+  worker (`crates/aisix-server/src/telemetry.rs`) batches up to
+  100 events or flushes every 5 s and POSTs them to
+  `/dp/telemetry`. cp-api consumes this stream to update the
+  authoritative spend, which feeds subsequent budget-check calls.
+
+Worst-case propagation between an over-cap completion and a
+follow-up 429 is therefore ≈ 10 s (5 s telemetry flush + 5 s
+budget-check cache). When cp-api is unreachable, the last good
+decision sticks for up to `AISIX_DP_BUDGET_STALE_MAX_SECONDS`
+(default 600 s); past that the proxy applies the `fail_mode`
+(`open` / `closed` / `sticky`) the most recent successful response
+carried.
+
+Because spend lives on cp-api, multiple DP instances behind the
+same cp-api stay consistent without DP-side coordination.
+
+#### Standalone mode
+
+Budget enforcement is **not implemented**. The admin API still
+accepts `max_budget_usd` on POST/PUT (the field passes through
+schema validation and persists to etcd) so the wire shape stays
+compatible with managed mode, but no part of the proxy reads it.
+Operators who need per-key spend caps must run in managed mode.
+
+Team-level budgets are SaaS-tier (cp-api owns cross-key
+aggregation) and have no standalone counterpart.
 
 ### 4.5 Health — `GET /admin/v1/health`
 
