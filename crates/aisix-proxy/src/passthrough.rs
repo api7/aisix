@@ -46,6 +46,40 @@ fn default_base(provider_prefix: &str) -> Option<&'static str> {
     }
 }
 
+/// `true` if `seg` looks like an api-version path component
+/// (`v0`, `v1`, `v2alpha` is rejected — strictly `v\d+`).
+fn is_api_version_segment(seg: &str) -> bool {
+    seg.starts_with('v') && seg.len() > 1 && seg[1..].chars().all(|c| c.is_ascii_digit())
+}
+
+/// Strip one leading api-version segment from `rest` when it
+/// matches the trailing version segment of `base`. Returns `rest`
+/// unchanged when no dedup applies.
+///
+/// See #164: the published examples in `docs/api-admin.md` §4.3
+/// (api_base `https://api.openai.com/v1`) and `docs/api-proxy.md`
+/// §4.10 (call `/passthrough/openai/v1/batches`) when followed
+/// verbatim produce the malformed URL `.../v1/v1/batches`.
+fn strip_redundant_version_segment<'a>(base: &str, rest: &'a str) -> &'a str {
+    let base_tail = base.rsplit('/').next().unwrap_or("");
+    if !is_api_version_segment(base_tail) {
+        return rest;
+    }
+    // Only dedup when `rest`'s leading segment EXACTLY matches
+    // `base_tail`. So `/v2` + `v1/foo` does NOT trigger (caller
+    // asked for v1 explicitly); `/v1` + `v1/foo` does (the
+    // duplicated `/v1` is the docs-example bug).
+    if let Some(remainder) = rest.strip_prefix(base_tail) {
+        if remainder.is_empty() {
+            return remainder;
+        }
+        if let Some(after_slash) = remainder.strip_prefix('/') {
+            return after_slash;
+        }
+    }
+    rest
+}
+
 /// Wildcard handler mounted at `/passthrough/:provider/*rest`.
 ///
 /// `method` is not a path parameter — axum merges all HTTP methods for wildcard
@@ -155,11 +189,27 @@ async fn dispatch(
             })?,
     };
 
-    // Build the target URL: {base}/{rest}
-    let url = if rest.is_empty() {
+    // Build the target URL: {base}/{rest}.
+    //
+    // Per #164: when the configured `api_base` ends with an
+    // api-version segment (e.g. `/v1`) AND the passthrough rest
+    // path starts with the same segment, naive concatenation
+    // produces a doubled prefix like `/v1/v1/files`. The published
+    // examples in `docs/api-admin.md` §4.3 (api_base with `/v1`)
+    // and `docs/api-proxy.md` §4.10 (rest with `/v1/...`)
+    // together hit this case.
+    //
+    // Strip the redundant leading version segment from `rest` ONLY
+    // when it exactly matches `api_base`'s trailing version
+    // segment. Constraining the dedup to api-version-shaped
+    // segments (`v\d+`) prevents false dedups on paths like
+    // `/v1/files/v1/foo` where the trailing `v1` is a genuine
+    // path component, not a version prefix.
+    let rest_after_dedup = strip_redundant_version_segment(&base, rest);
+    let url = if rest_after_dedup.is_empty() {
         base.clone()
     } else {
-        format!("{base}/{rest}")
+        format!("{base}/{rest_after_dedup}")
     };
 
     // Preserve the query string.
@@ -304,6 +354,7 @@ fn emit_access_log(
 
 #[cfg(test)]
 mod tests {
+    use super::{is_api_version_segment, strip_redundant_version_segment};
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ApiKey, Model, ProxyConfig};
@@ -314,6 +365,93 @@ mod tests {
     use tower::ServiceExt;
     use wiremock::matchers::{method as wm_method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn is_api_version_segment_recognises_canonical_v_prefix_versions() {
+        assert!(is_api_version_segment("v1"));
+        assert!(is_api_version_segment("v2"));
+        assert!(is_api_version_segment("v10"));
+        // Reject look-alikes that would be unsafe to dedup on.
+        assert!(!is_api_version_segment("v")); // bare 'v'
+        assert!(!is_api_version_segment("v1alpha")); // mixed
+        assert!(!is_api_version_segment("V1")); // case-sensitive: gateway sees lowercased URLs
+        assert!(!is_api_version_segment("messages")); // ordinary path component
+        assert!(!is_api_version_segment("")); // empty
+    }
+
+    /// Issue #164: api_base ending in /v1 plus rest starting with v1/
+    /// must dedup to a single /v1 prefix. The published examples in
+    /// docs/api-admin.md §4.3 (api_base with /v1) and docs/api-proxy.md
+    /// §4.10 (call /passthrough/openai/v1/batches) follow this exact
+    /// pattern; pre-fix the gateway concatenated to /v1/v1/batches
+    /// which the real OpenAI API would 404.
+    #[test]
+    fn strip_redundant_version_segment_dedups_canonical_docs_example() {
+        // The exact docs-example case.
+        assert_eq!(
+            strip_redundant_version_segment("https://api.openai.com/v1", "v1/batches"),
+            "batches"
+        );
+        // Trailing-slash on `rest` (axum sometimes preserves it).
+        assert_eq!(
+            strip_redundant_version_segment("https://api.openai.com/v1", "v1/files/"),
+            "files/"
+        );
+        // `rest` exactly equals the trailing version.
+        assert_eq!(
+            strip_redundant_version_segment("https://api.openai.com/v1", "v1"),
+            ""
+        );
+    }
+
+    #[test]
+    fn strip_redundant_version_segment_does_not_touch_non_version_tails() {
+        // No version on api_base → no dedup.
+        assert_eq!(
+            strip_redundant_version_segment("https://api.openai.com", "v1/files"),
+            "v1/files"
+        );
+        // Tail isn't a version segment → no dedup.
+        assert_eq!(
+            strip_redundant_version_segment("https://api.openai.com/api", "v1/files"),
+            "v1/files"
+        );
+    }
+
+    #[test]
+    fn strip_redundant_version_segment_only_strips_leading_match() {
+        // Trailing /v1 in `rest` is a genuine path component
+        // (not a version prefix), MUST NOT be touched.
+        assert_eq!(
+            strip_redundant_version_segment("https://api.openai.com/v1", "v1/files/v1/foo"),
+            "files/v1/foo"
+        );
+    }
+
+    #[test]
+    fn strip_redundant_version_segment_only_dedups_exact_version_match() {
+        // api_base /v2 + rest v1/foo → caller asked for v1
+        // explicitly; do NOT dedup (would silently rewrite the call
+        // to a different version).
+        assert_eq!(
+            strip_redundant_version_segment("https://api.openai.com/v2", "v1/foo"),
+            "v1/foo"
+        );
+        // api_base /v1 + rest v2/foo → caller asked for v2, do NOT
+        // dedup.
+        assert_eq!(
+            strip_redundant_version_segment("https://api.openai.com/v1", "v2/foo"),
+            "v2/foo"
+        );
+    }
+
+    #[test]
+    fn strip_redundant_version_segment_handles_empty_rest() {
+        assert_eq!(
+            strip_redundant_version_segment("https://api.openai.com/v1", ""),
+            ""
+        );
+    }
 
     fn cfg() -> ProxyConfig {
         ProxyConfig {

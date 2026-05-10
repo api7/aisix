@@ -30,10 +30,19 @@ import {
 // /passthrough — meaning every customer using batches, files, or
 // fine-tuning APIs had no regression protection on the wire.
 //
-// One user journey pinned:
+// Two user journeys pinned:
 //
-//   - Anthropic passthrough — caller hits a custom Anthropic
-//     endpoint (e.g. /v1/messages/batches). Gateway must:
+//   1. OpenAI passthrough — caller follows the published examples
+//      verbatim: `api_base: "https://api.openai.com/v1"` per
+//      `docs/api-admin.md` §4.3, and a call to
+//      `/passthrough/openai/v1/files` per `docs/api-proxy.md` §4.10.
+//      The gateway must dedup the duplicated `/v1` prefix and hit
+//      the upstream at `/v1/files` — a naive concatenation would
+//      hit `/v1/v1/files` which the real OpenAI API would 404.
+//      Pre-fix this was bug #164.
+//
+//   2. Anthropic passthrough — caller hits a custom Anthropic
+//      endpoint (e.g. /v1/messages/batches). Gateway must:
 //       * strip the /passthrough/anthropic prefix and forward
 //         path + body + method verbatim
 //       * inject Anthropic's auth shape (`x-api-key` +
@@ -41,15 +50,10 @@ import {
 //         (a regression that forwarded Bearer to Anthropic would
 //         401 in production)
 //
-// (The "OpenAI passthrough" case is held back pending a product /
-// docs reconciliation — `docs/api-admin.md` §4.3 publishes
-// `api_base: "https://api.openai.com/v1"` (with /v1), and
-// `docs/api-proxy.md` §4.10 example uses
-// `/passthrough/openai/v1/batches` (also with /v1). Together
-// these produce a double-/v1 upstream URL. See follow-up issue.)
-//
 // References:
 // - Gateway's own /passthrough contract: `docs/api-proxy.md` §4.10
+// - OpenAI Files API
+//   <https://platform.openai.com/docs/api-reference/files>
 // - Anthropic auth headers spec
 //   <https://docs.anthropic.com/en/api/getting-started>
 
@@ -58,7 +62,7 @@ const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
 
-describe("passthrough e2e: /passthrough/anthropic/*rest auth-shape switching + verbatim forward", () => {
+describe("passthrough e2e: /passthrough/{provider}/*rest verbatim forwarding with auth injection + double-/v1 dedup", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
   let etcdReachable = false;
@@ -79,6 +83,135 @@ describe("passthrough e2e: /passthrough/anthropic/*rest auth-shape switching + v
   afterAll(async () => {
     await app?.exit();
     await Promise.all(upstreams.map((u) => u.close()));
+  });
+
+  test("OpenAI passthrough: gateway dedups doubled /v1, forwards verbatim, injects Bearer auth", async (ctx) => {
+    if (!etcdReachable || !app || !admin) {
+      ctx.skip();
+      return;
+    }
+
+    // Mock upstream returns a distinctive body the caller will
+    // see. The body shape is intentionally NOT chat-completions —
+    // passthrough is for endpoints the gateway doesn't natively
+    // wrap (batches/files/fine-tuning), so the gateway must NOT
+    // try to parse or normalize the response.
+    const upstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        // Shaped like an OpenAI Files API response per
+        // <https://platform.openai.com/docs/api-reference/files/object>.
+        id: "file-pt-openai-01",
+        object: "file",
+        bytes: 12345,
+        created_at: Math.floor(Date.now() / 1000),
+        filename: "passthrough-test.jsonl",
+        purpose: "batch",
+        status: "uploaded",
+      },
+    });
+    upstreams.push(upstream);
+
+    // Configure exactly per docs/api-admin.md §4.3 example:
+    // `api_base: "https://api.openai.com/v1"` (with /v1).
+    const pk = await admin.createProviderKey({
+      display_name: "pt-openai-pk",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    // The Model's provider field is what the passthrough route
+    // matches on (per docs §4.10 "first Model with that prefix").
+    await admin.createModel({
+      display_name: "pt-openai-model",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+    });
+
+    const headers = {
+      authorization: `Bearer ${CALLER_PLAINTEXT}`,
+      "content-type": "application/json",
+    };
+
+    // Readiness gate: poll passthrough until it returns 200 with
+    // the upstream's distinctive body. A 404 means either the
+    // snapshot hasn't propagated yet OR the gateway is hitting
+    // `/v1/v1/files` upstream (#164 pre-fix behavior — the mock
+    // doesn't have a route there, so it 404s).
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await fetch(`${app!.proxyUrl}/passthrough/openai/v1/files`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ purpose: "batch", filename: "ready-probe.jsonl" }),
+        });
+        if (r.status !== 200) {
+          await r.text();
+          return false;
+        }
+        const j = (await r.json()) as { object?: unknown };
+        return j.object === "file";
+      } catch {
+        return false;
+      }
+    });
+
+    const baseline = upstream.receivedRequests.length;
+    const requestBody = JSON.stringify({
+      purpose: "batch",
+      filename: "real-call.jsonl",
+      // Distinctive marker so the body-verbatim assertion can
+      // confirm the gateway didn't strip or rewrite anything.
+      arbitrary_unknown_field: "must-pass-through-untouched",
+    });
+    // Call exactly per docs/api-proxy.md §4.10 example:
+    // `/passthrough/openai/v1/files` (with /v1).
+    const res = await fetch(`${app.proxyUrl}/passthrough/openai/v1/files`, {
+      method: "POST",
+      headers,
+      body: requestBody,
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { id?: unknown; object?: unknown };
+    // Caller sees the upstream's body byte-for-byte. Passthrough
+    // explicitly disclaims body normalisation per docs §4.10
+    // ("forwards the request verbatim").
+    expect(body.id).toBe("file-pt-openai-01");
+    expect(body.object).toBe("file");
+
+    // Upstream-side: the gateway hit `/v1/files`, NOT `/v1/v1/files`.
+    // The dedup is the load-bearing #164 contract: api_base ending
+    // in `/v1` plus rest starting with `v1/` must produce a single
+    // `/v1` prefix. A regression that re-introduces the doubled
+    // prefix would land at `/v1/v1/files` and fail this filter.
+    const testCalls = upstream.receivedRequests
+      .slice(baseline)
+      .filter((r) => r.path === "/v1/files");
+    expect(testCalls).toHaveLength(1);
+    expect(testCalls[0]?.method).toBe("POST");
+
+    // Verify there were NO requests to the doubled-prefix path.
+    // A regression that reintroduces the bug would still emit a
+    // request — pinning that no such request exists is the strict
+    // form of the dedup contract.
+    const doubledCalls = upstream.receivedRequests
+      .slice(baseline)
+      .filter((r) => r.path === "/v1/v1/files");
+    expect(doubledCalls).toHaveLength(0);
+
+    // Auth injection: per docs §4.10, the gateway injects the
+    // configured provider API key. For OpenAI that's
+    // `Authorization: Bearer <secret>`. The caller's own bearer
+    // MUST NOT reach the upstream — that would leak the proxy key
+    // into upstream provider logs.
+    expect(testCalls[0]?.headers["authorization"]).toBe("Bearer sk-mock");
+
+    // Body verbatim: every field the caller sent reaches the
+    // upstream unchanged, including unknown fields the gateway
+    // doesn't recognise. A regression that JSON-round-tripped or
+    // schema-validated the body would silently drop unknown
+    // fields like `arbitrary_unknown_field`.
+    expect(testCalls[0]?.body).toBe(requestBody);
   });
 
   test("Anthropic passthrough: gateway uses x-api-key + anthropic-version, NOT Bearer", async (ctx) => {
