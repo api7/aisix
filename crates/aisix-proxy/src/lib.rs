@@ -61,6 +61,7 @@ use serde_json::json;
 /// Build the proxy router. Mounts `/health` plus the
 /// OpenAI-compatible proxy surface.
 pub fn build_router(state: ProxyState) -> Router {
+    let body_limit = state.request_body_limit_bytes;
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models::list_models))
@@ -78,6 +79,16 @@ pub fn build_router(state: ProxyState) -> Router {
             "/passthrough/:provider/*rest",
             any(passthrough::passthrough),
         )
+        // Wire the configured cap into axum's request-body extractor
+        // chain (`Json<T>` defers to `Bytes` which honors this layer).
+        // Without this, axum 0.7's `DefaultBodyLimit` falls back to
+        // its built-in 2 MiB default, which silently rejects bodies
+        // in the 2 MiB-to-cap band with a stock `BytesRejection`
+        // response (NOT the OpenAI envelope). The middleware below
+        // catches the Content-Length-known case ahead of the
+        // extractor; this layer catches chunked / size-mismatched
+        // bodies once their actual byte count exceeds the cap.
+        .layer(axum::extract::DefaultBodyLimit::max(body_limit))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             enforce_request_body_limit,
@@ -106,9 +117,19 @@ async fn enforce_request_body_limit(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    if let Some(declared) = request
+    // RFC 9110 §8.6 — a server SHOULD reject a request that carries
+    // duplicate or conflicting `Content-Length` values rather than
+    // act on the first one (which is a request-smuggling vector).
+    let mut content_lengths = request
         .headers()
-        .get(axum::http::header::CONTENT_LENGTH)
+        .get_all(axum::http::header::CONTENT_LENGTH)
+        .iter();
+    let first = content_lengths.next();
+    if content_lengths.next().is_some() {
+        return ProxyError::InvalidRequest("conflicting Content-Length headers".into())
+            .into_response();
+    }
+    if let Some(declared) = first
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok())
     {
@@ -463,6 +484,50 @@ mod tests {
         assert!(
             message.contains("limit"),
             "413 message should reference the limit; got {message:?}"
+        );
+    }
+
+    /// Issue #159 audit MEDIUM-3: duplicate `Content-Length` headers
+    /// are a classic request-smuggling vector — a server that acts on
+    /// the first value while a downstream peer acts on the second can
+    /// be tricked into framing the body wrongly. Per RFC 9110 §8.6 a
+    /// server SHOULD reject the request rather than disambiguate.
+    #[tokio::test]
+    async fn duplicate_content_length_headers_return_400_invalid_request() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let body = r#"{"model":"my-gpt4","messages":[{"role":"user","content":"hi"}]}"#;
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        // Inject TWO Content-Length headers (simulating a smuggling
+        // attempt). axum's HeaderMap supports `append` for duplicate
+        // names; the middleware must reject rather than read the
+        // first value.
+        req.headers_mut().append(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(body.len()),
+        );
+        req.headers_mut().append(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(body.len() + 1),
+        );
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("Content-Length"),
+            "smuggling-rejection message should mention Content-Length; got {message:?}"
         );
     }
 

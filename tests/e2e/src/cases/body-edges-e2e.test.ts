@@ -202,14 +202,15 @@ describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
     // OpenAI envelope shape: `{ "error": { "message": ..., "type": ... } }`.
     // A regression that returned a non-OpenAI shape (e.g. axum's
     // default `"Failed to buffer the request body: ..."`) would
-    // fail the type/message assertions below.
+    // fail the type/message assertions below. Pin `error.type` to
+    // the exact OpenAI taxonomy value so a regression that emitted
+    // any other non-empty string would fail.
     const body = (await res.json()) as {
       error?: { type?: unknown; message?: unknown };
     };
-    expect(typeof body.error?.type).toBe("string");
-    expect((body.error?.type as string).length).toBeGreaterThan(0);
+    expect(body.error?.type).toBe("invalid_request_error");
     expect(typeof body.error?.message).toBe("string");
-    expect((body.error?.message as string).length).toBeGreaterThan(0);
+    expect(body.error?.message as string).toMatch(/limit/i);
 
     // Hard contract: an over-limit request must never reach the
     // upstream — the gateway's own body-size cap is meant to
