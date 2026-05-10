@@ -424,6 +424,7 @@ mod tests {
             vec![ChatMessage {
                 role: Role::Tool,
                 content: "tool output".into(),
+                content_blocks: None,
                 name: None,
                 tool_call_id: Some("tc_1".into()),
                 extra: serde_json::Map::new(),

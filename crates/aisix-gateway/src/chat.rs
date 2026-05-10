@@ -12,7 +12,8 @@
 //! that don't map cleanly to a specific upstream become the provider's
 //! responsibility to drop or translate.
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Role of a chat message. Matches OpenAI's taxonomy; providers that only
 /// support system/user/assistant are expected to reject `Tool` at their
@@ -37,19 +38,41 @@ pub enum Role {
 /// land in [`Self::extra`] via `flatten` so providers that care
 /// (currently the OpenAI bridge) can forward them verbatim.
 ///
-/// `content` accepts JSON `null` in addition to a string. OpenAI's
-/// assistant-with-tool_calls shape uses `"content": null`; we collapse
-/// that to an empty string for the gateway's internal representation,
-/// which preserves serialisability for downstreams that don't accept
-/// `null` (Anthropic, Gemini). Information loss is bounded — if the
-/// upstream behaves differently for `""` vs `null`, the OpenAI bridge
-/// can synthesise `null` from an empty string + a `tool_calls` entry in
-/// `extra` at request-build time. See issue #110.
+/// `content` accepts three wire shapes per
+/// <https://platform.openai.com/docs/api-reference/chat/create>:
+///   * a string (the common case);
+///   * JSON `null` (OpenAI's assistant-with-tool_calls history shape);
+///   * an array of typed content blocks
+///     (`[{type: "text", text}, {type: "image_url", image_url: {url}}]` —
+///     used by vision/multimodal callers).
+///
+/// We split the array form across two fields so existing call sites
+/// keep their `&str` access path:
+///   * [`Self::content`] holds the concatenated **text** of any text
+///     blocks. For non-array shapes this is the original string (or
+///     `""` for `null`). Bridges that don't speak content blocks
+///     (Anthropic / Gemini cross-provider translation today) read this
+///     and silently skip non-text blocks per docs §4.5.
+///   * [`Self::content_blocks`] holds the **raw array** verbatim when
+///     the caller sent the typed-block form. Bridges that DO support
+///     content blocks (the OpenAI-compat bridge) forward this verbatim
+///     to the upstream so vision input reaches OpenAI / Gemini /
+///     DeepSeek upstreams unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "ChatMessageRaw")]
 pub struct ChatMessage {
     pub role: Role,
-    #[serde(default, deserialize_with = "deserialize_content_string")]
     pub content: String,
+    /// Raw content-block array when the caller sent
+    /// `content: [{type, ...}, ...]`. `None` for the bare-string and
+    /// `null` content shapes. Bridges that support content blocks
+    /// (the OpenAI-compat bridge) forward this verbatim to upstream;
+    /// bridges that don't (Anthropic / Gemini cross-provider
+    /// translation today) consult only `content` (concatenated text)
+    /// per docs §4.5 ("skip non-text blocks silently on the inbound
+    /// parse").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_blocks: Option<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -63,15 +86,70 @@ pub struct ChatMessage {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Deserialize a `content` field that may be a string OR JSON `null`.
-/// `null` collapses to `""`. The type stays `String` (not `Option<String>`)
-/// so every existing caller — and every cross-provider bridge — keeps
-/// working without an Option dance. The `null` case only matters for
-/// OpenAI assistant-with-tool_calls history replay, where empty content
-/// is also accepted by the upstream API; see
-/// <https://platform.openai.com/docs/api-reference/chat/create>.
-fn deserialize_content_string<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+/// Wire-shape mirror for [`ChatMessage`]. The `content` field accepts
+/// string OR null OR array per OpenAI's documented shape; we
+/// deserialize through this struct and split into the `(text, blocks)`
+/// pair on the way to [`ChatMessage`].
+#[derive(Debug, Deserialize)]
+struct ChatMessageRaw {
+    role: Role,
+    #[serde(default)]
+    content: Value,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default, flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl From<ChatMessageRaw> for ChatMessage {
+    fn from(raw: ChatMessageRaw) -> Self {
+        let (content, content_blocks) = split_content(raw.content);
+        Self {
+            role: raw.role,
+            content,
+            content_blocks,
+            name: raw.name,
+            tool_call_id: raw.tool_call_id,
+            extra: raw.extra,
+        }
+    }
+}
+
+/// Split a wire-form `content` value into the gateway's
+/// `(extracted_text, raw_blocks)` representation:
+///   * String → (string, None)
+///   * null → ("", None) — OpenAI's assistant-with-tool_calls history
+///     shape per <https://platform.openai.com/docs/api-reference/chat/create>
+///   * Array → (concatenated text from `{type:"text", text}` blocks,
+///     Some(raw array)) — vision / multimodal input. Non-text blocks
+///     (e.g. `image_url`) are skipped on the text-extraction path but
+///     preserved verbatim in the raw array for forwarding.
+///   * Anything else → ("", None) — defensive default; unexpected
+///     shapes don't fail the request, they degrade to an empty text
+///     so the bridge can still dispatch.
+fn split_content(v: Value) -> (String, Option<Vec<Value>>) {
+    match v {
+        Value::String(s) => (s, None),
+        Value::Null => (String::new(), None),
+        Value::Array(blocks) => {
+            let text = blocks
+                .iter()
+                .filter_map(|b| {
+                    let ty = b.get("type").and_then(Value::as_str)?;
+                    if ty == "text" {
+                        b.get("text").and_then(Value::as_str).map(str::to_owned)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            (text, Some(blocks))
+        }
+        _ => (String::new(), None),
+    }
 }
 
 impl ChatMessage {
@@ -79,6 +157,7 @@ impl ChatMessage {
         Self {
             role: Role::System,
             content: content.into(),
+            content_blocks: None,
             name: None,
             tool_call_id: None,
             extra: serde_json::Map::new(),
@@ -89,6 +168,7 @@ impl ChatMessage {
         Self {
             role: Role::User,
             content: content.into(),
+            content_blocks: None,
             name: None,
             tool_call_id: None,
             extra: serde_json::Map::new(),
@@ -99,6 +179,7 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            content_blocks: None,
             name: None,
             tool_call_id: None,
             extra: serde_json::Map::new(),
@@ -348,6 +429,75 @@ mod tests {
     fn is_streaming_defaults_to_false_when_unset() {
         let f = ChatFormat::new("m", vec![]);
         assert!(!f.is_streaming());
+    }
+
+    #[test]
+    fn content_accepts_string() {
+        let m: ChatMessage = serde_json::from_str(r#"{"role": "user", "content": "hi"}"#).unwrap();
+        assert_eq!(m.content, "hi");
+        assert!(m.content_blocks.is_none());
+    }
+
+    #[test]
+    fn content_accepts_null_collapsing_to_empty_string() {
+        let m: ChatMessage =
+            serde_json::from_str(r#"{"role": "assistant", "content": null}"#).unwrap();
+        assert_eq!(m.content, "");
+        assert!(m.content_blocks.is_none());
+    }
+
+    #[test]
+    fn content_accepts_typed_block_array_for_vision() {
+        // OpenAI vision request shape per
+        // <https://platform.openai.com/docs/guides/vision>.
+        let m: ChatMessage = serde_json::from_str(
+            r#"{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What's in this image?"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        // Concatenated text from text blocks (non-text blocks skipped).
+        assert_eq!(m.content, "What's in this image?");
+        // Raw blocks preserved verbatim for forwarding.
+        let blocks = m.content_blocks.expect("blocks should be Some");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image_url");
+        assert_eq!(blocks[1]["image_url"]["url"], "https://example.com/cat.jpg");
+    }
+
+    #[test]
+    fn content_array_with_only_image_blocks_yields_empty_text_but_keeps_blocks() {
+        let m: ChatMessage = serde_json::from_str(
+            r#"{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "https://example.com/x.jpg"}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(m.content, "");
+        assert!(m.content_blocks.is_some());
+    }
+
+    #[test]
+    fn content_array_concatenates_multiple_text_blocks() {
+        let m: ChatMessage = serde_json::from_str(
+            r#"{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "line one\n"},
+                    {"type": "text", "text": "line two"}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(m.content, "line one\nline two");
     }
 
     #[test]

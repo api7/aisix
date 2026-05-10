@@ -34,7 +34,12 @@ pub(crate) struct OpenAiRequest<'a> {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct OpenAiMessage<'a> {
     pub role: &'a str,
-    pub content: &'a str,
+    /// `content` accepts string OR typed-block array per OpenAI's
+    /// vision spec; we forward whichever the caller sent. The
+    /// `untagged` enum makes `OpenAiContent::Blocks([...])`
+    /// serialise as a bare array and `OpenAiContent::Text("...")`
+    /// as a bare string — matching the OpenAI wire shape.
+    pub content: OpenAiContent<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -46,6 +51,18 @@ pub(crate) struct OpenAiMessage<'a> {
     /// without the gateway having to model every OpenAI field.
     #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]
     pub extra: &'a serde_json::Map<String, serde_json::Value>,
+}
+
+/// Wire-shape of an OpenAI message's `content` field. OpenAI accepts
+/// either a string (text-only message) or an array of typed content
+/// blocks (vision / multimodal); we forward whichever the gateway's
+/// [`ChatMessage`] carried in. See
+/// <https://platform.openai.com/docs/guides/vision>.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub(crate) enum OpenAiContent<'a> {
+    Text(&'a str),
+    Blocks(&'a [serde_json::Value]),
 }
 
 /// Build the upstream request from the gateway's normalised format.
@@ -74,7 +91,16 @@ pub(crate) fn messages_from(req: &ChatFormat) -> Vec<OpenAiMessage<'_>> {
         .iter()
         .map(|m| OpenAiMessage {
             role: role_str(m.role),
-            content: &m.content,
+            // Vision / multimodal callers send `content` as an array
+            // of typed blocks; OpenAI accepts the array form natively
+            // (no translation needed for OpenAI / Gemini-OpenAI-compat /
+            // DeepSeek-OpenAI-compat upstreams). When present forward
+            // the raw blocks verbatim; otherwise forward the bare
+            // string. See `ChatMessage::content_blocks` doc.
+            content: match m.content_blocks.as_deref() {
+                Some(blocks) => OpenAiContent::Blocks(blocks),
+                None => OpenAiContent::Text(&m.content),
+            },
             name: m.name.as_deref(),
             tool_call_id: m.tool_call_id.as_deref(),
             extra: &m.extra,
@@ -162,6 +188,7 @@ pub(crate) fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatRespon
             ChatMessage {
                 role: role_from_str(&c.message.role),
                 content: c.message.content.unwrap_or_default(),
+                content_blocks: None,
                 name: None,
                 tool_call_id: None,
                 extra: serde_json::Map::new(),

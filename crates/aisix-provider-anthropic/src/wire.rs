@@ -214,6 +214,7 @@ pub(crate) fn response_into_chat_response(raw: AnthropicResponse) -> ChatRespons
         message: ChatMessage {
             role: Role::Assistant,
             content: text,
+            content_blocks: None,
             name: None,
             tool_call_id: None,
             extra: serde_json::Map::new(),
@@ -790,6 +791,7 @@ mod tests {
             vec![ChatMessage {
                 role: Role::Tool,
                 content: "x".into(),
+                content_blocks: None,
                 name: None,
                 tool_call_id: None,
                 extra: serde_json::Map::new(),
