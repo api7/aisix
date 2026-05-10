@@ -239,5 +239,9 @@ describe("weighted routing distribution e2e: 70/30 split lands inside [60,80] / 
     expect(aDelta).toBeLessThanOrEqual(HEAVY_HI);
     expect(bDelta).toBeGreaterThanOrEqual(LIGHT_LO);
     expect(bDelta).toBeLessThanOrEqual(LIGHT_HI);
-  });
+    // Per-test timeout lifted to 90s. The default suite timeout
+    // (60s, vitest.config.ts) is tight for 100 sequential round-trips
+    // when upstream latency drifts above ~50ms/call; 90s leaves
+    // headroom without changing the global cap for other cases.
+  }, 90_000);
 });
