@@ -193,12 +193,13 @@ describe("streaming edges e2e: client abort mid-stream", () => {
     // (`disconnectAfterEvents: 2`). No `finish_reason: "stop"`,
     // no `[DONE]` from the upstream — premature close per docs §5.
     //
-    // `eventDelayMs: 50` between writes ensures both chunks flush
+    // `eventDelayMs: 200` between writes ensures both chunks flush
     // to the gateway BEFORE `res.destroy()` aborts the connection.
     // Without the delay, write buffering on the mock side can
     // cause the destroy to land before the second chunk reaches
     // the wire, making the test flaky on which chunks the gateway
-    // actually receives.
+    // actually receives. Matches the peer client-abort case for
+    // consistency.
     const upstream = await startOpenAiUpstream({
       streamEvents: [
         '{"id":"disc","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
@@ -208,7 +209,7 @@ describe("streaming edges e2e: client abort mid-stream", () => {
         '{"id":"disc","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
         "[DONE]",
       ],
-      eventDelayMs: 50,
+      eventDelayMs: 200,
       disconnectAfterEvents: 2,
     });
     upstreams.push(upstream);

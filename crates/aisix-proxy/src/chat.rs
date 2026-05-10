@@ -1204,13 +1204,18 @@ where
                         Ok(json) => Event::default().data(json),
                         Err(err) => {
                             errored = true;
-                            Event::default().event("error").data(err.to_string())
+                            Event::default()
+                                .event("error")
+                                .data(error_frame_payload("internal_error", &err.to_string()))
                         }
                     }
                 }
                 Err(err) => {
                     errored = true;
-                    Event::default().event("error").data(err.to_string())
+                    let etype = err.error_type();
+                    Event::default()
+                        .event("error")
+                        .data(error_frame_payload(etype, &err.to_string()))
                 }
             };
             yield Ok::<_, Infallible>(ev);
@@ -1237,4 +1242,27 @@ where
         // there with whatever StreamCompletion has been captured up
         // to that point.
     }
+}
+
+/// Build the `data:` payload for an SSE `event: error` frame.
+/// The OpenAI Node SDK calls `JSON.parse(sse.data)` BEFORE checking
+/// `sse.event === "error"`, so a plain-string payload yields a
+/// `SyntaxError` ("Could not parse message into JSON: ...") on the
+/// SDK side rather than the typed `APIError` callers expect. Emit
+/// the OpenAI error envelope shape per
+/// <https://platform.openai.com/docs/guides/error-codes/api-errors>:
+/// `{"error": {"message": "...", "type": "..."}}`.
+fn error_frame_payload(error_type: &str, message: &str) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "error": {
+            "message": message,
+            "type": error_type,
+        }
+    }))
+    // unreachable in practice — `serde_json::to_string` of a
+    // `Value` cannot fail. The fallback emits a minimal valid
+    // envelope so SDK consumers' `JSON.parse` still succeeds.
+    .unwrap_or_else(|_| {
+        r#"{"error":{"message":"error","type":"internal_error"}}"#.into()
+    })
 }

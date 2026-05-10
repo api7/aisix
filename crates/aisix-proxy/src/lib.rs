@@ -616,6 +616,96 @@ data: [DONE]\n\n";
         );
     }
 
+    /// Issue #177: per docs/api-proxy.md §5, abnormal upstream
+    /// stream termination must close the response WITHOUT `[DONE]`
+    /// — SDK consumers that key off `[DONE]` for clean-completion
+    /// signal need to detect truncation. The previous behavior
+    /// emitted `[DONE]` after the SSE error event, masking
+    /// truncated responses as complete.
+    #[tokio::test]
+    async fn streaming_response_omits_done_when_upstream_returns_invalid_json_mid_stream() {
+        let upstream = MockServer::start().await;
+        // Upstream emits two valid SSE chunks then a malformed JSON
+        // payload. The malformed payload triggers `serde_json::from_str`
+        // to fail in the bridge's `build_chunk_stream`, surfacing as
+        // `BridgeError::UpstreamDecode` to `build_sse_stream`, which
+        // emits an SSE `event: error` frame. After that frame the
+        // proxy MUST NOT emit `[DONE]`.
+        let sse = "\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial \"},\"finish_reason\":null}]}\n\n\
+data: <not valid json>\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Drain the wire bytes — at this layer we want byte-level
+        // assertions, not just decoded SSE events, because the
+        // contract being verified is "did `[DONE]` appear at all
+        // on the wire".
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut wire = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            wire.extend_from_slice(chunk.unwrap().as_ref());
+        }
+        let wire_str = String::from_utf8(wire).expect("SSE bytes are utf8");
+
+        // Per docs §5: NO `[DONE]` after abnormal termination.
+        assert!(
+            !wire_str.contains("data: [DONE]"),
+            "abnormal termination MUST close without [DONE]; got wire:\n{wire_str}"
+        );
+        // The error event MUST be emitted so SDK consumers see a
+        // failure signal.
+        assert!(
+            wire_str.contains("event: error"),
+            "abnormal termination MUST emit `event: error`; got wire:\n{wire_str}"
+        );
+        // The error payload MUST be valid OpenAI-envelope JSON
+        // (the SDK does `JSON.parse(sse.data)` BEFORE checking
+        // event type, so plain-string payloads yield a SyntaxError
+        // instead of the typed APIError callers expect).
+        let err_event_idx = wire_str.find("event: error\n").unwrap();
+        let after_err = &wire_str[err_event_idx + "event: error\n".len()..];
+        let data_line = after_err
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .expect("error event followed by a data line");
+        let json_payload = &data_line["data: ".len()..];
+        let parsed: serde_json::Value = serde_json::from_str(json_payload)
+            .expect("error frame data must be valid OpenAI-envelope JSON");
+        assert!(
+            parsed.get("error").is_some(),
+            "error frame data must be `{{\"error\": {{...}}}}` shape; got {json_payload}"
+        );
+    }
+
     // ---- regression coverage for issue #107 -------------------------
     // Pre-fix only /v1/chat/completions enforced rate-limit / budget;
     // every other LLM endpoint silently bypassed both. The test below
