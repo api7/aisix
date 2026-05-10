@@ -109,24 +109,30 @@ async fn dispatch(
 
     let model = &model_entry.value;
 
-    // Per #168 + #213 Phase 1: `/v1/rerank` accepts OpenAI- and
-    // Cohere-shape upstreams. Both speak the same body shape
-    // (`{model, query, documents, top_n, ...}`) at `…/v1/rerank`
-    // with `Authorization: Bearer …` auth, so the gateway can
-    // forward verbatim with only the `model` field rewritten.
-    // Anthropic, Gemini, and DeepSeek do not expose this surface —
-    // routing a Model with one of those providers here would
-    // silently 404 upstream, so reject explicitly at the gateway
-    // boundary (parallel to `/v1/responses` §4.6's pattern).
+    // Per #168 + #213 Phases 1–2: `/v1/rerank` accepts OpenAI-,
+    // Cohere-, and Jina-shape upstreams. All three speak the same
+    // body shape (`{model, query, documents, top_n, ...}`) at
+    // `…/v1/rerank` with `Authorization: Bearer …` auth, so the
+    // gateway forwards verbatim with only the `model` field
+    // rewritten. Anthropic, Gemini, and DeepSeek do not expose
+    // this surface — routing a Model with one of those providers
+    // here would silently 404 upstream, so reject explicitly at
+    // the gateway boundary (parallel to `/v1/responses` §4.6).
+    //
+    // Voyage AI is intentionally NOT in this set despite also
+    // having `/v1/rerank` — Voyage uses `top_k` (not `top_n`) on
+    // request and `data` (not `results`) on response, so it
+    // requires a request/response adapter that's out of scope
+    // for this phase. Tracked in the #213 follow-up.
     use aisix_core::models::Provider;
     let provider_allowed = matches!(
         model.provider,
-        Some(Provider::Openai) | Some(Provider::Cohere)
+        Some(Provider::Openai) | Some(Provider::Cohere) | Some(Provider::Jina)
     );
     if !provider_allowed {
         return Err(ProxyError::InvalidRequest(format!(
-            "model `{model_name}` is not an OpenAI or Cohere provider; \
-             /v1/rerank requires OpenAI or Cohere"
+            "model `{model_name}` is not an OpenAI, Cohere, or Jina provider; \
+             /v1/rerank requires OpenAI, Cohere, or Jina"
         )));
     }
 
@@ -150,12 +156,12 @@ async fn dispatch(
     //
     // The provider arm of `default_base_for_provider` is guaranteed to
     // return `Some` here because the gate above already rejected any
-    // `model.provider` outside `{Openai, Cohere}` — both have explicit
-    // arms in the helper. The `unwrap_or_else` is defensive against a
-    // future enum variant that gets through the gate without an arm in
-    // the helper; the audit-trail-friendly default is OpenAI's host
-    // (it's a 4xx-from-OpenAI rather than dispatching to a stale
-    // Cohere legacy domain).
+    // `model.provider` outside `{Openai, Cohere, Jina}` — all three
+    // have explicit arms in the helper. The `unwrap_or_else` is
+    // defensive against a future enum variant that gets through the
+    // gate without an arm in the helper; the audit-trail-friendly
+    // default is OpenAI's host (it's a 4xx-from-OpenAI rather than
+    // dispatching to a stale legacy domain).
     let base = match pk_entry.value.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
         _ => model
@@ -226,6 +232,10 @@ fn default_base_for_provider(provider: aisix_core::models::Provider) -> Option<S
         // `api_base` to `https://api.cohere.com/v2` — see #213's v2
         // follow-up for the version-routing extension if needed.
         Provider::Cohere => Some("https://api.cohere.com".to_string()),
+        // Jina rerank is identity-mapped to the OpenAI-compat /
+        // Cohere wire shape on both request AND response — same
+        // body fields, same `results` array shape, Bearer auth.
+        Provider::Jina => Some("https://api.jina.ai".to_string()),
         Provider::Anthropic => None, // Anthropic doesn't expose a rerank API
         Provider::Gemini => None,    // Gemini doesn't expose a rerank API
         Provider::Deepseek => None,
@@ -297,6 +307,14 @@ mod tests {
     fn cohere_model(name: &str) -> ResourceEntry<Model> {
         let json = format!(
             r#"{{"display_name":"{name}","provider":"cohere","model_name":"rerank-english-v3.0","provider_key_id":"{PK_ID}"}}"#
+        );
+        let m: Model = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("m-1", m, 1)
+    }
+
+    fn jina_model(name: &str) -> ResourceEntry<Model> {
+        let json = format!(
+            r#"{{"display_name":"{name}","provider":"jina","model_name":"jina-reranker-v2-base-multilingual","provider_key_id":"{PK_ID}"}}"#
         );
         let m: Model = serde_json::from_str(&json).unwrap();
         ResourceEntry::new("m-1", m, 1)
@@ -418,15 +436,95 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "invalid_request_error");
         let message = v["error"]["message"].as_str().unwrap();
-        // Per #213 Phase 1: Cohere is now also a valid provider for
-        // /v1/rerank, so the rejection message must enumerate BOTH
-        // accepted shapes — `OpenAI or Cohere` — not just OpenAI.
-        // Pin the new wording so a regression that drops Cohere
-        // would fail this assertion.
-        assert!(
-            message.contains("OpenAI or Cohere"),
-            "rejection should reference OpenAI/Cohere restriction; got {message:?}"
+        // Per #213 Phases 1–2: the rejection message enumerates the
+        // accepted set `{OpenAI, Cohere, Jina}`. Pin each provider
+        // name individually so:
+        //   - a regression that drops a provider from the gate's
+        //     accepted set fails this assertion (the missing name
+        //     wouldn't appear in the error message);
+        //   - future Phase 2.5+ additions can reword the message
+        //     freely without breaking this test (substring-per-
+        //     provider is forward-compatible per audit LOW-2 on
+        //     PR #227).
+        assert!(message.contains("OpenAI"), "got {message:?}");
+        assert!(message.contains("Cohere"), "got {message:?}");
+        assert!(message.contains("Jina"), "got {message:?}");
+    }
+
+    /// Issue #213 Phase 2: a Model with `provider: "jina"` MUST
+    /// dispatch successfully on `/v1/rerank`. Jina's rerank
+    /// (https://api.jina.ai/v1/rerank) is identity-mapped to the
+    /// Cohere/OpenAI-compat wire shape — same body fields
+    /// (`{model, query, documents, top_n, ...}`), same Bearer
+    /// auth, same `results: [{index, relevance_score}]` response
+    /// shape — so the gateway forwards verbatim with only the
+    /// `model` field rewritten.
+    #[tokio::test]
+    async fn jina_provider_dispatches_to_upstream_with_bearer_auth() {
+        use wiremock::matchers::header;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .and(header("authorization", "Bearer jina_mock_secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "jina-reranker-v2-base-multilingual",
+                "usage": {"total_tokens": 42},
+                "results": [
+                    {"index": 0, "relevance_score": 0.91},
+                    {"index": 1, "relevance_score": 0.27}
+                ]
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        // Operator-style configuration: bare host, no /v1 suffix.
+        // The gateway's `build_v1_url` produces `/v1/rerank` correctly
+        // for both `https://api.jina.ai` and `https://api.jina.ai/v1`.
+        let pk_json = format!(
+            r#"{{"display_name":"jina-up","secret":"jina_mock_secret","api_base":"{}"}}"#,
+            upstream.uri()
         );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+        snap.models.insert(jina_model("jina-rerank"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "jina-rerank",
+                "query": "search query",
+                "documents": ["doc one", "doc two"],
+                "top_n": 2
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Jina provider must dispatch successfully on /v1/rerank per #213 Phase 2"
+        );
+
+        // Pin the EXACT field set forwarded to Jina (parallel to the
+        // Cohere case). Jina's documented body is
+        // `{model, query, documents, top_n, return_documents}`; the
+        // gateway forwards verbatim with only `model` rewritten. A
+        // regression injecting an OpenAI-only field would 400 against
+        // Jina without failing a happy-path 200 alone.
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let upstream_body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(
+            upstream_body["model"], "jina-reranker-v2-base-multilingual",
+            "model field MUST be rewritten to upstream model_name"
+        );
+        let upstream_obj = upstream_body.as_object().unwrap();
+        let mut keys: Vec<&str> = upstream_obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["documents", "model", "query", "top_n"]);
     }
 
     /// Issue #213 Phase 1: a Model with `provider: "cohere"` MUST

@@ -29,6 +29,13 @@ pub enum Provider {
     /// Cohere's chat / generate APIs are not OpenAI-compatible; a
     /// future bridge implementation can extend coverage.
     Cohere,
+    /// Jina AI — currently exposed for `/v1/rerank` only (#213 Phase 2).
+    /// Jina's rerank wire shape is identity-mapped to the OpenAI-compat
+    /// shape (`{model, query, documents, top_n}` with Bearer auth at
+    /// `https://api.jina.ai/v1/rerank`), so the gateway forwards
+    /// verbatim with no transform. Jina's chat / embeddings APIs are
+    /// out of scope for this phase.
+    Jina,
 }
 
 impl Provider {
@@ -39,6 +46,7 @@ impl Provider {
             Self::Gemini => "https://generativelanguage.googleapis.com/v1beta/openai",
             Self::Deepseek => "https://api.deepseek.com",
             Self::Cohere => "https://api.cohere.com",
+            Self::Jina => "https://api.jina.ai",
         }
     }
 
@@ -49,6 +57,7 @@ impl Provider {
             Self::Gemini => "gemini",
             Self::Deepseek => "deepseek",
             Self::Cohere => "cohere",
+            Self::Jina => "jina",
         }
     }
 }
@@ -236,5 +245,14 @@ mod tests {
             Provider::Deepseek.default_base_url(),
             "https://api.deepseek.com"
         );
+        // #213 Phase 1 / Phase 2: rerank-only providers. Per audit
+        // LOW-3 on PR #229 — pin these too so a regression that
+        // swaps the host (e.g. Jina's `https://api.jina.ai` →
+        // `https://api.jina.com`) fails at the unit level.
+        assert_eq!(
+            Provider::Cohere.default_base_url(),
+            "https://api.cohere.com"
+        );
+        assert_eq!(Provider::Jina.default_base_url(), "https://api.jina.ai");
     }
 }
