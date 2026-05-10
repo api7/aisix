@@ -11,7 +11,7 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: request body edge cases. Two user journeys that prior
+// E2E: request body edge cases. Three user journeys that prior
 // coverage skipped — every existing chat-completions test sends a
 // single one-message array, so the gateway's behavior on real-world
 // shapes was unverified:
@@ -22,27 +22,31 @@ import {
 //      reordered messages would silently lose context for every
 //      conversational caller.
 //
-//   2. Empty `messages: []` — OpenAI Chat Completions spec requires
+//   2. Body exceeds the configured size limit — caller must see
+//      RFC 9110 §15.5.14 `413 Content Too Large`, NOT a 500 or
+//      `ECONNRESET` from a mid-write socket close (which is
+//      indistinguishable from a network failure or a gateway
+//      crash). The gateway's `request_body_limit_bytes` is set to
+//      10 MiB by the harness (matching production default).
+//
+//   3. Empty `messages: []` — OpenAI Chat Completions spec requires
 //      a non-empty messages array. Gateway must reject with a
 //      4xx error envelope, NOT 500 / panic / hang.
-//
-// (The "body exceeds size limit → 413" case is tracked as a
-// separate test pending a product fix; the gateway currently
-// resets the connection rather than emitting 413. See follow-up
-// issue.)
 //
 // References:
 // - OpenAI Chat Completions API spec
 //   <https://platform.openai.com/docs/api-reference/chat/create>
 // - OpenAI error envelope spec
 //   <https://platform.openai.com/docs/guides/error-codes/api-errors>
+// - RFC 9110 §15.5.14 "413 Content Too Large"
+//   <https://datatracker.ietf.org/doc/html/rfc9110#section-15.5.14>
 
 const CALLER_PLAINTEXT = "sk-body-edges-caller";
 const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
 
-describe("body edges e2e: multi-turn, empty messages", () => {
+describe("body edges e2e: multi-turn, oversize body, empty messages", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
   let admin: AdminClient | undefined;
@@ -158,6 +162,61 @@ describe("body edges e2e: multi-turn, empty messages", () => {
       expect(sentBody.messages?.[i]?.role).toBe(history[i]!.role);
       expect(sentBody.messages?.[i]?.content).toBe(history[i]!.content);
     }
+  });
+
+  test("oversize body (> 10 MiB): caller sees 413, upstream untouched", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    // The harness configures `request_body_limit_bytes: 10485760`
+    // (10 MiB). Construct a body just over the limit by stuffing a
+    // 10.5 MiB filler into a single user message. `JSON.stringify`
+    // sets a Content-Length header on the fetch request, which the
+    // gateway's middleware uses to short-circuit before reading
+    // any body bytes.
+    const filler = "x".repeat(10 * 1024 * 1024 + 512 * 1024);
+    const oversizedBody = JSON.stringify({
+      model: "body-edges",
+      messages: [{ role: "user", content: filler }],
+    });
+
+    const upstreamHitsBefore = upstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: oversizedBody,
+    });
+
+    // RFC 9110 §15.5.14: `413 Content Too Large` is the standard
+    // status for a request body that exceeds a server-imposed
+    // limit. A 5xx here would mislead callers into retrying (the
+    // request will never succeed at this size); ECONNRESET (the
+    // pre-fix behavior) is indistinguishable from a network
+    // failure or a gateway crash.
+    expect(res.status).toBe(413);
+    // OpenAI envelope shape: `{ "error": { "message": ..., "type": ... } }`.
+    // A regression that returned a non-OpenAI shape (e.g. axum's
+    // default `"Failed to buffer the request body: ..."`) would
+    // fail the type/message assertions below. Pin `error.type` to
+    // the exact OpenAI taxonomy value so a regression that emitted
+    // any other non-empty string would fail.
+    const body = (await res.json()) as {
+      error?: { type?: unknown; message?: unknown };
+    };
+    expect(body.error?.type).toBe("invalid_request_error");
+    expect(typeof body.error?.message).toBe("string");
+    expect(body.error?.message as string).toMatch(/limit/i);
+
+    // Hard contract: an over-limit request must never reach the
+    // upstream — the gateway's own body-size cap is meant to
+    // protect the upstream from oversized payloads, not pre-route
+    // them.
+    expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore);
   });
 
   test("empty messages array: 4xx with OpenAI-shape error envelope, upstream untouched", async (ctx) => {

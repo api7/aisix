@@ -171,9 +171,22 @@ async fn dispatch(
 
     let method = req.method().clone();
     let incoming_headers = req.headers().clone();
-    let body_bytes: Bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
+    // Use the configured cap (not a hard-coded 10 MiB) so an
+    // operator who raises `request_body_limit_bytes` for, e.g.,
+    // audio passthrough actually gets the larger limit here too.
+    // Map an oversize-body read failure to the typed
+    // `RequestTooLarge` envelope so callers see a proper 413 rather
+    // than a misleading 400 "failed to read body". The
+    // `enforce_request_body_limit` middleware short-circuits the
+    // Content-Length-known case ahead of this; this map handles the
+    // chunked / no-Content-Length / Content-Length-lying case once
+    // the actual byte count exceeds the cap.
+    let body_limit = state.request_body_limit_bytes;
+    let body_bytes: Bytes = axum::body::to_bytes(req.into_body(), body_limit)
         .await
-        .map_err(|e| ProxyError::InvalidRequest(format!("failed to read body: {e}")))?;
+        .map_err(|_| ProxyError::RequestTooLarge {
+            limit_bytes: body_limit,
+        })?;
 
     let client = crate::http_client::client();
     let mut builder = client.request(method.clone(), &url);

@@ -50,6 +50,10 @@ pub use error::{ErrorEnvelope, ProxyError};
 pub use health::HealthTracker;
 pub use state::ProxyState;
 
+use axum::extract::State;
+use axum::http::Request;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{http::StatusCode, Json, Router};
 use serde_json::json;
@@ -57,6 +61,7 @@ use serde_json::json;
 /// Build the proxy router. Mounts `/health` plus the
 /// OpenAI-compatible proxy surface.
 pub fn build_router(state: ProxyState) -> Router {
+    let body_limit = state.request_body_limit_bytes;
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models::list_models))
@@ -74,7 +79,68 @@ pub fn build_router(state: ProxyState) -> Router {
             "/passthrough/:provider/*rest",
             any(passthrough::passthrough),
         )
+        // Wire the configured cap into axum's request-body extractor
+        // chain (`Json<T>` defers to `Bytes` which honors this layer).
+        // Without this, axum 0.7's `DefaultBodyLimit` falls back to
+        // its built-in 2 MiB default, which silently rejects bodies
+        // in the 2 MiB-to-cap band with a stock `BytesRejection`
+        // response (NOT the OpenAI envelope). The middleware below
+        // catches the Content-Length-known case ahead of the
+        // extractor; this layer catches chunked / size-mismatched
+        // bodies once their actual byte count exceeds the cap.
+        .layer(axum::extract::DefaultBodyLimit::max(body_limit))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_request_body_limit,
+        ))
         .with_state(state)
+}
+
+/// Per RFC 9110 §15.5.14, a request body that exceeds the gateway's
+/// configured `request_body_limit_bytes` must surface as a clean
+/// `413 Content Too Large` response — NOT an `ECONNRESET` from a
+/// mid-write socket close. This middleware inspects the inbound
+/// `Content-Length` header before any handler runs and short-circuits
+/// with the OpenAI-shape error envelope when the declared size
+/// exceeds the cap.
+///
+/// Bodies sent with chunked transfer encoding (no Content-Length)
+/// fall through to handler-level body extraction, which still
+/// enforces the limit but with the slower fail mode (the read errors
+/// once the cap is hit). Catching the Content-Length-known case here
+/// is the load-bearing user-visible win: the OpenAI Node SDK and
+/// `fetch` both set Content-Length for non-streamed POSTs, and
+/// without this middleware they see ECONNRESET (indistinguishable
+/// from a network failure or a gateway crash) instead of 413.
+async fn enforce_request_body_limit(
+    State(state): State<ProxyState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    // RFC 9110 §8.6 — a server SHOULD reject a request that carries
+    // duplicate or conflicting `Content-Length` values rather than
+    // act on the first one (which is a request-smuggling vector).
+    let mut content_lengths = request
+        .headers()
+        .get_all(axum::http::header::CONTENT_LENGTH)
+        .iter();
+    let first = content_lengths.next();
+    if content_lengths.next().is_some() {
+        return ProxyError::InvalidRequest("conflicting Content-Length headers".into())
+            .into_response();
+    }
+    if let Some(declared) = first
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        if declared > state.request_body_limit_bytes {
+            return ProxyError::RequestTooLarge {
+                limit_bytes: state.request_body_limit_bytes,
+            }
+            .into_response();
+        }
+    }
+    next.run(request).await
 }
 
 async fn health(
@@ -374,6 +440,137 @@ mod tests {
             .unwrap();
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Issue #159: a request body whose declared `Content-Length`
+    /// exceeds the configured cap must surface as `413 Content Too
+    /// Large` per RFC 9110 §15.5.14, NOT as `ECONNRESET` from a
+    /// mid-write socket close. Regression: the handler-level body
+    /// extractor's overflow path was racing the client write,
+    /// surfacing as a network failure indistinguishable from a
+    /// gateway crash. The new middleware short-circuits on the
+    /// declared size before any handler runs.
+    #[tokio::test]
+    async fn oversize_body_returns_413_envelope_with_content_length_check() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        // Declare a Content-Length well over the test cfg's 1 MiB cap
+        // but ship a tiny actual body — the middleware MUST reject
+        // based on the declared size alone, before reading the body.
+        // (A real caller's `JSON.stringify` would set Content-Length
+        // matching the body size; the assertion is "we trust the
+        // declared header for the early reject".)
+        let oversized = 2 * 1024 * 1024; // 2 MiB > 1 MiB cap
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .header("content-length", oversized.to_string())
+            .body(Body::from(
+                r#"{"model":"my-gpt4","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // OpenAI-shape envelope per docs/api-proxy.md §3:
+        // `{ "error": { "message": ..., "type": "..." } }`
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("limit"),
+            "413 message should reference the limit; got {message:?}"
+        );
+    }
+
+    /// Issue #159 audit MEDIUM-3: duplicate `Content-Length` headers
+    /// are a classic request-smuggling vector — a server that acts on
+    /// the first value while a downstream peer acts on the second can
+    /// be tricked into framing the body wrongly. Per RFC 9110 §8.6 a
+    /// server SHOULD reject the request rather than disambiguate.
+    #[tokio::test]
+    async fn duplicate_content_length_headers_return_400_invalid_request() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let body = r#"{"model":"my-gpt4","messages":[{"role":"user","content":"hi"}]}"#;
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        // Inject TWO Content-Length headers (simulating a smuggling
+        // attempt). axum's HeaderMap supports `append` for duplicate
+        // names; the middleware must reject rather than read the
+        // first value.
+        req.headers_mut().append(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(body.len()),
+        );
+        req.headers_mut().append(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(body.len() + 1),
+        );
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("Content-Length"),
+            "smuggling-rejection message should mention Content-Length; got {message:?}"
+        );
+    }
+
+    /// Issue #159 companion: a body within the cap must NOT be
+    /// rejected — the middleware short-circuits ONLY when the
+    /// Content-Length exceeds the cap, leaving normal traffic
+    /// untouched. Without this guard, a regression that always-
+    /// rejected (e.g. comparing the wrong field) would be invisible
+    /// since most existing tests don't set Content-Length.
+    #[tokio::test]
+    async fn within_limit_body_is_not_rejected_by_middleware() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-ok",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let app = build_router(build_state(snap, hub));
+
+        let body = r#"{"model":"my-gpt4","messages":[{"role":"user","content":"hi"}]}"#;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .header("content-length", body.len().to_string())
+            .body(Body::from(body))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
