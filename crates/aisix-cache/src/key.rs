@@ -124,7 +124,18 @@ fn canonicalise(value: &serde_json::Value) -> serde_json::Value {
 }
 
 fn message_pair(m: &ChatMessage) -> (String, String) {
-    (role_str(m.role).to_string(), m.content.clone())
+    // For text-only messages, fingerprint on the role + content string.
+    // For vision/multimodal messages (typed-block array form), the
+    // raw `content_blocks` value is what distinguishes the request —
+    // two messages with the same query text but different image URLs
+    // MUST produce distinct fingerprints. Canonicalise the blocks
+    // (sorted keys at every nesting level) so JSON-key-order
+    // differences don't cause spurious cache misses.
+    let content_repr = match m.content_blocks.as_ref() {
+        Some(blocks) => canonical_json_string(&serde_json::Value::Array(blocks.clone())),
+        None => m.content.clone(),
+    };
+    (role_str(m.role).to_string(), content_repr)
 }
 
 fn role_str(role: Role) -> &'static str {
@@ -178,6 +189,54 @@ mod tests {
         assert_ne!(
             CacheKey::from_request(&a).fingerprint(),
             CacheKey::from_request(&b).fingerprint(),
+        );
+    }
+
+    #[test]
+    fn vision_messages_with_different_image_urls_have_distinct_fingerprints() {
+        // Regression test for the cache-key collision found in PR #184
+        // audit (C1): with the typed-block array form of `content`,
+        // `m.content` only carries the concatenated TEXT (e.g.
+        // "What's in this image?"); the image URL lives in
+        // `content_blocks`. Two requests asking the same question
+        // about different images would produce the same `(role,
+        // content)` pair if `message_pair` didn't include the blocks.
+        // The cache would then return the cat-photo response when a
+        // user asks about a dog photo. message_pair must canonicalise
+        // and include the raw blocks.
+        let mk = |url: &str| {
+            let mut msg = ChatMessage::user("What's in this image?");
+            msg.content_blocks = Some(vec![
+                serde_json::json!({"type": "text", "text": "What's in this image?"}),
+                serde_json::json!({"type": "image_url", "image_url": {"url": url}}),
+            ]);
+            req("m", vec![msg], None)
+        };
+        let a = mk("https://example.com/cat.jpg");
+        let b = mk("https://example.com/dog.jpg");
+        assert_ne!(
+            CacheKey::from_request(&a).fingerprint(),
+            CacheKey::from_request(&b).fingerprint(),
+            "vision requests with different images must NOT share a cache slot",
+        );
+    }
+
+    #[test]
+    fn vision_messages_with_identical_blocks_share_a_fingerprint() {
+        // Sibling to the test above: same image, same question, same
+        // model — must hit the same cache slot. Sanity-check that the
+        // canonicalisation isn't introducing spurious cache misses.
+        let mk = || {
+            let mut msg = ChatMessage::user("describe");
+            msg.content_blocks = Some(vec![
+                serde_json::json!({"type": "text", "text": "describe"}),
+                serde_json::json!({"type": "image_url", "image_url": {"url": "https://example.com/x.jpg"}}),
+            ]);
+            req("m", vec![msg], None)
+        };
+        assert_eq!(
+            CacheKey::from_request(&mk()).fingerprint(),
+            CacheKey::from_request(&mk()).fingerprint(),
         );
     }
 

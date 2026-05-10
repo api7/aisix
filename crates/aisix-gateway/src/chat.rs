@@ -90,11 +90,21 @@ pub struct ChatMessage {
 /// string OR null OR array per OpenAI's documented shape; we
 /// deserialize through this struct and split into the `(text, blocks)`
 /// pair on the way to [`ChatMessage`].
+///
+/// `content_blocks` is also accepted on the wire for round-trip
+/// safety: the derived `Serialize` on [`ChatMessage`] emits both
+/// `content` and `content_blocks` as separate top-level fields, so
+/// re-deserialising must capture them both. (Without this, a cache
+/// store-then-load round-trip would silently drop the typed blocks
+/// into `extra` and the OpenAI bridge would forward only the
+/// concatenated text, defeating vision.)
 #[derive(Debug, Deserialize)]
 struct ChatMessageRaw {
     role: Role,
     #[serde(default)]
     content: Value,
+    #[serde(default)]
+    content_blocks: Option<Vec<Value>>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -105,7 +115,12 @@ struct ChatMessageRaw {
 
 impl From<ChatMessageRaw> for ChatMessage {
     fn from(raw: ChatMessageRaw) -> Self {
-        let (content, content_blocks) = split_content(raw.content);
+        let (content, derived_blocks) = split_content(raw.content);
+        // If the wire form supplied `content_blocks` explicitly
+        // (round-trip from a previous serialization), prefer it over
+        // anything we'd derive from `content`. Otherwise use the
+        // blocks extracted from the array-form of `content`.
+        let content_blocks = raw.content_blocks.or(derived_blocks);
         Self {
             role: raw.role,
             content,
@@ -498,6 +513,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(m.content, "line one\nline two");
+    }
+
+    #[test]
+    fn content_blocks_round_trip_through_serialization() {
+        // Regression test for PR #184 audit (C2): without this, a
+        // cache store-then-load (or any debug serialise→deserialise)
+        // would silently drop `content_blocks` into `extra` and the
+        // OpenAI bridge would forward only the concatenated text,
+        // defeating vision. ChatMessageRaw must accept
+        // `content_blocks` on the wire.
+        let original: ChatMessage = serde_json::from_str(
+            r#"{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/cat.jpg"}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert!(original.content_blocks.is_some());
+
+        // Serialise → string → deserialise. Blocks must survive.
+        let json = serde_json::to_string(&original).unwrap();
+        let round_tripped: ChatMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.content, original.content);
+        assert_eq!(round_tripped.content_blocks, original.content_blocks);
+        // `content_blocks` MUST NOT have leaked into `extra` (which
+        // would happen if ChatMessageRaw didn't capture the field).
+        assert!(!round_tripped.extra.contains_key("content_blocks"));
     }
 
     #[test]
