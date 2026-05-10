@@ -319,21 +319,15 @@ describe("passthrough e2e: /passthrough/{provider}/*rest verbatim forwarding wit
     // pass against the permissive mock without this exact pin.
     expect(testCalls[0]?.headers["anthropic-version"]).toBe("2023-06-01");
 
-    // Caller's `Authorization: Bearer sk-pt-e2e-caller` is
-    // gateway-internal (validates against the ApiKey table) and
-    // MUST NOT leak upstream — that would put a gateway-side
-    // ApiKey credential into upstream provider logs. Pin: if the
-    // upstream's Authorization header is present at all, its value
-    // must NOT contain the caller's plaintext bearer.
-    //
-    // (Whether the gateway should inject ANY Authorization header
-    // when forwarding to Anthropic is a separate question — docs
-    // §4.10 implies only x-api-key + anthropic-version for the
-    // Anthropic auth shape. Tracked as follow-up.)
-    const upstreamAuth = testCalls[0]?.headers["authorization"];
-    if (upstreamAuth !== undefined) {
-      expect(upstreamAuth as string).not.toContain(CALLER_PLAINTEXT);
-    }
+    // Per #166: Anthropic's documented auth shape is `x-api-key` +
+    // `anthropic-version` ONLY. The gateway MUST NOT inject an
+    // `Authorization: Bearer …` header alongside — that's
+    // non-spec wire shape that real Anthropic ignores today but a
+    // future stricter Anthropic gateway (or customer-side
+    // middleware) could reject. The pre-fix gateway emitted BOTH
+    // headers; the strict assertion is now that Authorization is
+    // absent entirely on the upstream side.
+    expect(testCalls[0]?.headers["authorization"]).toBeUndefined();
 
     // Body verbatim — same contract as the OpenAI case.
     expect(testCalls[0]?.body).toBe(requestBody);

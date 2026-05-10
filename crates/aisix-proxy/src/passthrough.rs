@@ -242,17 +242,28 @@ async fn dispatch(
     let mut builder = client.request(method.clone(), &url);
 
     // Inject upstream Authorization; strip the incoming proxy auth.
+    //
+    // Per #166: Anthropic's documented auth shape is `x-api-key` +
+    // `anthropic-version`, NOT `Authorization: Bearer`. Sending both
+    // is non-spec wire shape (real Anthropic ignores Bearer today,
+    // but operators inspecting upstream traffic captures generate
+    // "is this a leak?" tickets every time the redundant header
+    // surfaces). Per docs/api-proxy.md §4.10 the gateway is the
+    // entity choosing the auth shape per provider; pick exactly one
+    // shape per provider.
+    //
+    // - openai / gemini / deepseek (and any unknown provider that
+    //   reuses the OpenAI-compat shape): `Authorization: Bearer …`
+    // - anthropic: `x-api-key` + `anthropic-version` only
     if api_key.is_empty() {
-        // Some providers use special headers (anthropic uses x-api-key).
-        if provider_lower == "anthropic" {
-            builder = builder.header("x-api-key", &api_key);
-        }
+        // Provider key has no secret configured. Nothing to inject —
+        // explicit blank-Authorization rather than fall-through-to-
+        // Bearer-of-empty-string keeps the wire clean.
+    } else if provider_lower == "anthropic" {
+        builder = builder.header("x-api-key", &api_key);
+        builder = builder.header("anthropic-version", "2023-06-01");
     } else {
         builder = builder.header(header::AUTHORIZATION, format!("Bearer {api_key}"));
-        if provider_lower == "anthropic" {
-            builder = builder.header("x-api-key", &api_key);
-            builder = builder.header("anthropic-version", "2023-06-01");
-        }
     }
 
     // Forward safe incoming headers (drop hop-by-hop and auth).
@@ -471,9 +482,25 @@ mod tests {
         ResourceEntry::new("m-1", m, 1)
     }
 
+    fn anthropic_model(name: &str) -> ResourceEntry<Model> {
+        let json = format!(
+            r#"{{"display_name":"{name}","provider":"anthropic","model_name":"claude-3-5-haiku-20241022","provider_key_id":"{PK_ID}"}}"#
+        );
+        let m: Model = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("m-1", m, 1)
+    }
+
     fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json =
             format!(r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}"}}"#);
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
+    fn anthropic_provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"anthropic-up","secret":"sk-ant-test","api_base":"{api_base}"}}"#
+        );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
     }
@@ -561,6 +588,79 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["object"], "list");
+    }
+
+    /// Issue #166 regression: Anthropic passthrough must inject ONLY
+    /// `x-api-key` + `anthropic-version`, NEVER `Authorization:
+    /// Bearer …` alongside. Pre-fix the gateway emitted both — a
+    /// non-spec wire shape that real Anthropic ignores today but
+    /// stricter middleware (or future Anthropic gateways) could
+    /// reject. The wiremock matchers used here fail the request
+    /// match if the headers don't agree; an extra Authorization
+    /// header would not violate the matcher (matchers are subset),
+    /// so we additionally assert via `received_requests`.
+    #[tokio::test]
+    async fn anthropic_passthrough_does_not_inject_bearer_auth() {
+        use wiremock::matchers::header;
+
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(path("/v1/messages/batches"))
+            .and(header("x-api-key", "sk-ant-test"))
+            .and(header("anthropic-version", "2023-06-01"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msgbatch-1",
+                "type": "message_batch"
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(anthropic_provider_key_entry(&upstream.uri()));
+        snap.models.insert(anthropic_model("claude-3-5-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/passthrough/anthropic/v1/messages/batches")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"requests":[]}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Strict check on the upstream-side headers: NO Authorization
+        // header at all. wiremock's `matchers::header` only enforces
+        // a subset, so we also drain `received_requests` and assert
+        // the absence of the redundant header.
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1, "exactly one upstream call expected");
+        let upstream_headers = &received[0].headers;
+        assert!(
+            !upstream_headers.contains_key("authorization"),
+            "Anthropic passthrough must NOT inject Authorization (per #166); got headers: {:?}",
+            upstream_headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.to_str().unwrap_or("<binary>")))
+                .collect::<Vec<_>>()
+        );
+        // Sanity: the documented Anthropic auth shape is on the wire.
+        assert_eq!(
+            upstream_headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok()),
+            Some("sk-ant-test")
+        );
+        assert_eq!(
+            upstream_headers
+                .get("anthropic-version")
+                .and_then(|v| v.to_str().ok()),
+            Some("2023-06-01")
+        );
     }
 
     #[tokio::test]
