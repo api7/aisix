@@ -9,14 +9,78 @@ When `managed.enabled = true`, aisix runs as a tenant of an
   is read from etcd over an mTLS channel.
 
 This document covers running the official Docker image as a managed
-DP. Source-of-truth: `crates/aisix-server/src/{register,heartbeat}.rs`
+DP. Source-of-truth: `crates/aisix-server/src/{register,cert_bundle,heartbeat}.rs`
 and `crates/aisix-core/src/config.rs`.
 
-## First boot — register against the control plane
+Two bootstrap paths are supported. Pick whichever fits the target
+deployment surface:
+
+1. **Pre-provisioned cert bundle (recommended)** — operator mints
+   the mTLS leaf via the CP dashboard's `CertIssueCard` and pastes
+   the resulting PEMs into the DP's environment. No `/dp/register`
+   round-trip; `env_id` and `dp_id` are parsed out of the leaf cert's
+   URI SAN.
+2. **Self-register with a deployment token** — DP performs a one-shot
+   `POST /dp/register` on first boot to obtain its bundle. Token is
+   single-use; subsequent boots reuse the persisted bundle.
+
+## First boot — pre-provisioned cert bundle (recommended)
+
+Three PEMs are required: leaf certificate, the SEC1 EC private key
+paired with the leaf, and the CA cert that the DP installs as the
+trust anchor for dp-manager mTLS. Each is supplied either inline
+(`AISIX_MANAGED__CP_<NAME>_PEM`) or by file path
+(`AISIX_MANAGED__CP_<NAME>_FILE`). Inline and file variants are
+mutually exclusive per slot — mixing them is rejected at boot.
+
+```bash
+docker run --rm \
+  -e AISIX_CONFIG_PATH=/etc/aisix/config.managed.yaml \
+  -e AISIX_MANAGED__CP_CERT_PEM="$(cat leaf.crt)" \
+  -e AISIX_MANAGED__CP_KEY_PEM="$(cat leaf.key)" \
+  -e AISIX_MANAGED__CP_CA_PEM="$(cat ca.crt)" \
+  -e AISIX_MANAGED__CP_BASE_URL=https://api.us.aisix.cloud \
+  -e AISIX_MANAGED__CP_ETCD_ENDPOINT=dp-manager.aisix.cloud:7943 \
+  -v aisix-mtls:/var/lib/aisix \
+  -p 3000:3000 \
+  ghcr.io/api7/ai-gateway:main
+```
+
+For systemd or k8s Secret mounts where multi-line PEMs in env vars
+are awkward, use the file-path variants:
+
+```bash
+  -e AISIX_MANAGED__CP_CERT_FILE=/run/secrets/aisix-leaf.crt \
+  -e AISIX_MANAGED__CP_KEY_FILE=/run/secrets/aisix-leaf.key \
+  -e AISIX_MANAGED__CP_CA_FILE=/run/secrets/aisix-ca.crt \
+```
+
+What each flag does:
+
+- `AISIX_MANAGED__CP_CERT_{PEM,FILE}` — the operator-minted leaf
+  certificate. Its URI SAN encodes `x-aisix://env/<env_id>` and
+  `x-aisix://dp/<dp_id>`; the DP parses these out and uses `env_id`
+  to scope every etcd Range/Watch to `/aisix/<env_id>/`.
+- `AISIX_MANAGED__CP_KEY_{PEM,FILE}` — the SEC1 EC private key
+  paired with the leaf.
+- `AISIX_MANAGED__CP_CA_{PEM,FILE}` — the CA the DP installs as the
+  trust anchor for outbound dp-manager mTLS.
+- `AISIX_MANAGED__CP_BASE_URL` — the CP HTTPS origin used by the
+  heartbeat worker (`<base>/dp/heartbeat`). The cert-bundle path
+  skips `/dp/register` but still needs this for periodic heartbeats.
+- `AISIX_MANAGED__CP_ETCD_ENDPOINT` — bare `host:port` of the
+  dp-manager mTLS-fronted etcd endpoint (no scheme — the DP attaches
+  `https://` itself). Optional in the cert-bundle path: when unset
+  the DP falls back to `cp_base_url`'s host:port.
+- `-v aisix-mtls:/var/lib/aisix` — persist the materialised bundle.
+  Re-running with the same inputs over an existing volume is safe;
+  the atomic-write helper truncates+rewrites the targets.
+
+## Alternative: register against the control plane
 
 The DP performs a one-shot `POST /dp/register` with the deployment
-token and persists the returned mTLS bundle + `dp_id` to disk.
-Subsequent boots reuse the bundle and skip the round-trip.
+token and persists the returned mTLS bundle + `dp_id` + `env_id` to
+disk. Subsequent boots reuse the bundle and skip the round-trip.
 
 ```bash
 docker run --rm \
@@ -25,7 +89,7 @@ docker run --rm \
   -e AISIX_MANAGED__CP_BASE_URL=https://api.us.aisix.cloud \
   -v aisix-mtls:/var/lib/aisix \
   -p 3000:3000 \
-  ghcr.io/moonming/ai-gateway:main
+  ghcr.io/api7/ai-gateway:main
 ```
 
 What each flag does:
@@ -56,19 +120,33 @@ Every config field is reachable via `AISIX_<UPPER>__<UPPER>` (the
 | `AISIX_MANAGED__MTLS_DIR` | `managed.mtls_dir` | `/var/lib/aisix/mtls` |
 | `AISIX_MANAGED__DP_ID_FILE` | `managed.dp_id_file` | `/var/lib/aisix/dp_id` |
 | `AISIX_MANAGED__SNAPSHOT_CACHE_PATH` | `managed.snapshot_cache_path` | `/var/lib/aisix/config_cache.json` (set `""` to disable) |
+| `AISIX_MANAGED__CP_ETCD_ENDPOINT` | `managed.cp_etcd_endpoint` | bare `host:port`, no scheme. **Required** for the register path; in the cert-bundle path falls back to `cp_base_url`'s host:port if unset |
+| `AISIX_MANAGED__CP_CA_CERT_FILE` | `managed.cp_ca_cert_file` | unset; optional override for the dp-manager trust anchor |
+| `AISIX_MANAGED__CP_CERT_PEM` / `_FILE` | `managed.cp_cert_pem` / `cp_cert_file` | unset (cert-bundle path; one of the two must be set) |
+| `AISIX_MANAGED__CP_KEY_PEM` / `_FILE` | `managed.cp_key_pem` / `cp_key_file` | unset (cert-bundle path; one of the two must be set) |
+| `AISIX_MANAGED__CP_CA_PEM` / `_FILE` | `managed.cp_ca_pem` / `cp_ca_file` | unset (cert-bundle path; one of the two must be set) |
 
 ## Restart semantics
 
-1. **First boot, token + URL set, no bundle on disk** → register;
-   write `ca.crt`, `client.crt`, `client.key`, `dp_id`; connect etcd
-   via mTLS; spawn heartbeat worker.
-2. **Restart, bundle on disk** → skip register; reload bundle; load
-   `dp_id` for heartbeat payloads; restore the snapshot from the
-   on-disk cache so the proxy is ready before etcd is reached;
+The bootstrap branch is selected in this order (see
+`crates/aisix-server/src/main.rs`):
+
+1. **No bundle on disk yet, cert-bundle env vars set** → materialise
+   the bundle into `mtls_dir` (atomic `write-tmp + fsync + rename`);
+   parse `env_id` + `dp_id` from the leaf cert's URI SAN; connect
+   dp-manager etcd via mTLS; spawn heartbeat worker against
+   `cp_base_url`.
+2. **No bundle on disk, registration token + `CP_BASE_URL` set** →
+   `POST /dp/register`; write `ca.crt`, `client.crt`, `client.key`,
+   `dp_id`, `env_id`; connect etcd via mTLS; spawn heartbeat worker.
+3. **Restart, bundle on disk** → skip register / cert-bundle
+   provisioning; reload bundle; load `dp_id` and `env_id` for
+   heartbeat payloads + snapshot scoping; restore the snapshot from
+   the on-disk cache so the proxy is ready before etcd is reached;
    connect etcd; spawn heartbeat.
-3. **Bundle missing AND token missing** → log a warning; the etcd
-   connect will fail since the placeholder endpoint is unreachable.
-   This is the user-error path.
+4. **Bundle missing AND no cert-bundle env vars AND no registration
+   token** → boot fails with an explicit error listing the env-var
+   combinations that satisfy each path. This is the user-error path.
 
 ## Offline resilience (prd-09 §9.7.2)
 
@@ -101,11 +179,21 @@ Caveats:
 
 ## Verifying
 
-After `docker run`, you should see:
+After `docker run`, you should see one of two boot branches.
+
+Cert-bundle path:
+
+```
+INFO managed mode: provisioning from supplied cert bundle (api7ee parity)
+INFO provisioned with dashboard-issued cert bundle dp_id=dp_xxx env_id=11111111-... etcd=dp-manager.aisix.cloud:7943
+INFO heartbeat started url=https://api.us.aisix.cloud/dp/heartbeat dp_id=dp_xxx interval_secs=15
+```
+
+Register path:
 
 ```
 INFO managed mode: registering with aisix.cloud CP
-INFO registered with control plane dp_id=dp_xxx gateway_id=aigg_xxx etcd=dp-manager:7943
+INFO registered with control plane dp_id=dp_xxx env_id=11111111-... etcd=dp-manager.aisix.cloud:7943
 INFO heartbeat started url=https://api.us.aisix.cloud/dp/heartbeat dp_id=dp_xxx interval_secs=15
 ```
 
