@@ -58,7 +58,7 @@ pub async fn chat_completions(
     let api_key_id = auth.entry.id.clone();
     let model_name = req.model.clone();
 
-    let outcome = dispatch(&state, &auth, &req, &request_id).await;
+    let outcome = dispatch(&state, &auth, &req, &request_id, started).await;
 
     match outcome {
         Ok(mut success) => {
@@ -85,31 +85,39 @@ pub async fn chat_completions(
                 success.total_tokens,
                 &request_id,
             );
-            emit_usage_event(
-                &state,
-                &request_id,
-                &success.model_id,
-                &api_key_id,
-                status,
-                elapsed,
-                success.prompt_tokens.unwrap_or(0) as u32,
-                success.completion_tokens.unwrap_or(0) as u32,
-                UsageExtras {
-                    cached_prompt_tokens: success.cached_prompt_tokens,
-                    reasoning_tokens: success.reasoning_tokens,
-                    cache_creation_tokens: success.cache_creation_tokens,
-                    cache_read_tokens: success.cache_read_tokens,
-                    provider_request_id: success.provider_request_id.clone(),
-                    provider_model_version: success.provider_model_version.clone(),
-                    finish_reason: success.finish_reason.clone(),
-                    bypass_reason: success.bypass_reason.clone().unwrap_or_default(),
-                    cache_status: success.cache_status.as_str().to_string(),
-                    cache_hit_saved_input_tokens: success.cache_hit_saved_input_tokens,
-                    cache_hit_saved_output_tokens: success.cache_hit_saved_output_tokens,
-                },
-                success.cost_usd,
-                /* guardrail_blocked */ false,
-            );
+            // The streaming path wires telemetry into the SSE stream's
+            // on_complete callback (it has to wait for the terminal
+            // chunk to read the upstream's `usage` block). Calling
+            // `emit_usage_event` here for streaming would double-emit
+            // — once with all-zero tokens at handler return, then
+            // again with the real values at stream end.
+            if !success.telemetry_handled_by_stream {
+                emit_usage_event(
+                    &state,
+                    &request_id,
+                    &success.model_id,
+                    &api_key_id,
+                    status,
+                    elapsed,
+                    success.prompt_tokens.unwrap_or(0) as u32,
+                    success.completion_tokens.unwrap_or(0) as u32,
+                    UsageExtras {
+                        cached_prompt_tokens: success.cached_prompt_tokens,
+                        reasoning_tokens: success.reasoning_tokens,
+                        cache_creation_tokens: success.cache_creation_tokens,
+                        cache_read_tokens: success.cache_read_tokens,
+                        provider_request_id: success.provider_request_id.clone(),
+                        provider_model_version: success.provider_model_version.clone(),
+                        finish_reason: success.finish_reason.clone(),
+                        bypass_reason: success.bypass_reason.clone().unwrap_or_default(),
+                        cache_status: success.cache_status.as_str().to_string(),
+                        cache_hit_saved_input_tokens: success.cache_hit_saved_input_tokens,
+                        cache_hit_saved_output_tokens: success.cache_hit_saved_output_tokens,
+                    },
+                    success.cost_usd,
+                    /* guardrail_blocked */ false,
+                );
+            }
             // Inject x-ratelimit-* headers so OpenAI SDK clients see the
             // current window state. We peek *after* the commit so
             // remaining-requests reflects the post-dispatch tally.
@@ -123,10 +131,23 @@ pub async fn chat_completions(
             }
             success.response
         }
-        Err((resolved_model_id, err)) => {
+        Err((resolved_model_id, charge, err)) => {
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
             record_error(&state.metrics, &err, &model_name, status, elapsed);
+            // Access log: surface the upstream-billed counts when the
+            // error fired AFTER the upstream call (output-content-filter
+            // block). Pre-upstream errors (input filter, budget,
+            // model-not-found) carry no charge — log None there so the
+            // line reflects "request never reached the model".
+            let (al_prompt, al_completion, al_total) = match charge.as_ref() {
+                Some(c) => (
+                    Some(u64::from(c.prompt_tokens)),
+                    Some(u64::from(c.completion_tokens)),
+                    Some(u64::from(c.prompt_tokens) + u64::from(c.completion_tokens)),
+                ),
+                None => (None, None, None),
+            };
             emit_access_log(
                 method,
                 path,
@@ -135,9 +156,9 @@ pub async fn chat_completions(
                 None,
                 Some(&model_name),
                 Some(&api_key_id),
-                None,
-                None,
-                None,
+                al_prompt,
+                al_completion,
+                al_total,
                 &request_id,
             );
             // Telemetry for the failure path. `resolved_model_id` is
@@ -150,6 +171,33 @@ pub async fn chat_completions(
             // with the dedicated `guardrail_blocked` flag so the
             // dashboard can surface it on the Blocked tab.
             let guardrail_blocked = matches!(err, ProxyError::ContentFiltered(_));
+            // For output-content-filter blocks the upstream WAS called
+            // and the provider already billed for `prompt_tokens` +
+            // `completion_tokens`. The captured `charge` carries those
+            // counts forward so the customer's `usage_events` row
+            // reflects the bill. For all other error paths charge is
+            // None and tokens stay at 0 — those errors never reached
+            // the upstream.
+            let (prompt_tokens, completion_tokens, extras) = match charge {
+                Some(c) => (
+                    c.prompt_tokens,
+                    c.completion_tokens,
+                    UsageExtras {
+                        cached_prompt_tokens: c.cached_prompt_tokens,
+                        reasoning_tokens: c.reasoning_tokens,
+                        cache_creation_tokens: c.cache_creation_tokens,
+                        cache_read_tokens: c.cache_read_tokens,
+                        provider_request_id: c.provider_request_id,
+                        provider_model_version: c.provider_model_version,
+                        finish_reason: c.finish_reason,
+                        bypass_reason: String::new(),
+                        cache_status: String::new(),
+                        cache_hit_saved_input_tokens: 0,
+                        cache_hit_saved_output_tokens: 0,
+                    },
+                ),
+                None => (0, 0, UsageExtras::default()),
+            };
             emit_usage_event(
                 &state,
                 &request_id,
@@ -157,12 +205,9 @@ pub async fn chat_completions(
                 &api_key_id,
                 status,
                 elapsed,
-                /* prompt_tokens */ 0,
-                /* completion_tokens */ 0,
-                // Error path never reached the upstream — no provider
-                // id / model version / finish_reason to record, all
-                // zero / empty.
-                UsageExtras::default(),
+                prompt_tokens,
+                completion_tokens,
+                extras,
                 /* cost_usd */ 0.0,
                 guardrail_blocked,
             );
@@ -216,6 +261,13 @@ struct Success {
     /// the dashboard's /logs column. See `aisix-core::CachePolicy`
     /// (Stage 2) and `aisix-cache::Cache` for the source of truth.
     cache_status: CacheStatus,
+    /// True when telemetry emission is wired into the SSE stream's
+    /// on_complete callback (streaming path). The top-level handler
+    /// must NOT call `emit_usage_event` again — that would emit one
+    /// event with all-zero tokens at handler return on top of the real
+    /// one from stream completion. Always false for non-streaming
+    /// paths (handler emits inline with `success.prompt_tokens` etc.).
+    telemetry_handled_by_stream: bool,
     /// On a cache HIT, the prompt + completion tokens of the cached
     /// response — the work the upstream would have repeated had the
     /// cache not served the request. Both 0 on miss / disabled. cp-api
@@ -261,14 +313,39 @@ impl CacheStatus {
 /// surfaces this id on the failure-path telemetry event so the
 /// dashboard's `/logs` page can show the model that was targeted by a
 /// guardrail-blocked / budget-exceeded / bridge-failed request.
+/// Upstream-billed token counts attached to dispatch errors that fired
+/// AFTER the upstream call already responded. Today this is populated
+/// only on the output-content-filter block path: the gateway received a
+/// full upstream response (which the provider has already charged for),
+/// then the output guardrail decided to block delivery to the client.
+/// The customer is still on the hook for those tokens, so the charge
+/// flows up to the handler so its `usage_events` row reflects the bill.
+///
+/// `None` on every other error path — input-filter blocks, budget
+/// failures, rate-limit rejections, model-not-found, etc. all happen
+/// BEFORE any upstream call and the customer pays nothing.
+struct UpstreamCharge {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cached_prompt_tokens: u32,
+    reasoning_tokens: u32,
+    cache_creation_tokens: u32,
+    cache_read_tokens: u32,
+    provider_request_id: String,
+    provider_model_version: String,
+    finish_reason: String,
+}
+
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     req: &ChatFormat,
     request_id: &str,
-) -> Result<Success, (Option<String>, ProxyError)> {
+    started: Instant,
+) -> Result<Success, (Option<String>, Option<UpstreamCharge>, ProxyError)> {
     if req.messages.is_empty() {
         return Err((
+            None,
             None,
             ProxyError::InvalidRequest("messages array must not be empty".into()),
         ));
@@ -278,13 +355,17 @@ async fn dispatch(
     let virtual_entry = snapshot
         .models
         .get_by_name(&req.model)
-        .ok_or_else(|| (None, ProxyError::ModelNotFound(req.model.clone())))?;
+        .ok_or_else(|| (None, None, ProxyError::ModelNotFound(req.model.clone())))?;
     let model_id = virtual_entry.id.clone();
 
     // Every error from here on attaches the resolved model_id so the
     // failure-path telemetry event in `chat_completions` can surface
     // which model the request targeted.
-    let with_model = |e: ProxyError| (Some(model_id.clone()), e);
+    // Pre-upstream errors carry `None` for the charge — by definition
+    // they fire before any provider billing happens. The output-filter
+    // path below is the only site that builds a `Some(UpstreamCharge)`
+    // (manually, not via this helper).
+    let with_model = |e: ProxyError| (Some(model_id.clone()), None, e);
 
     if !auth.key().can_access(&req.model) {
         return Err(with_model(ProxyError::ModelForbidden(req.model.clone())));
@@ -388,10 +469,51 @@ async fn dispatch(
         // Pre-fix this path called commit_tokens(0) and never came
         // back, leaving TPM caps blind for all streaming traffic.
         drop(reservation);
+        // Capture everything the stream-completion callback needs so
+        // it can fire `emit_usage_event` once the terminal SSE chunk
+        // has yielded its `usage` block. Telemetry emission has to
+        // wait until end-of-stream because OpenAI / Anthropic only
+        // populate `usage` on the last chunk; emitting at handler
+        // return (the non-streaming path's spot) would record zeros.
         let limiter = Arc::clone(&state.limiter);
         let post_stream_key = rl_key.clone();
-        let sse_stream = build_sse_stream(upstream, now, move |total_tokens| {
-            limiter.add_tokens_post_stream(&post_stream_key, total_tokens);
+        let state_for_telem = state.clone();
+        let request_id_for_telem = request_id.to_string();
+        let model_id_for_telem = model_id.clone();
+        let api_key_id_for_telem = auth.entry.id.clone();
+        let bypass_reason_for_telem = bypass_reason.clone().unwrap_or_default();
+        let sse_stream = build_sse_stream(upstream, now, move |comp: StreamCompletion| {
+            // Existing: rate-limit accounting (TPM cap) — see #108.
+            limiter.add_tokens_post_stream(&post_stream_key, comp.total_tokens);
+            // Telemetry: emit with the actual upstream-reported counts.
+            // cost_usd stays 0.0; cp-api recomputes server-side from
+            // its model_pricing catalog (same pattern as the non-
+            // streaming path's cost_usd handling).
+            emit_usage_event(
+                &state_for_telem,
+                &request_id_for_telem,
+                &model_id_for_telem,
+                &api_key_id_for_telem,
+                /* status_code */ 200,
+                started.elapsed(),
+                comp.prompt_tokens,
+                comp.completion_tokens,
+                UsageExtras {
+                    cached_prompt_tokens: comp.cached_prompt_tokens,
+                    reasoning_tokens: comp.reasoning_tokens,
+                    cache_creation_tokens: comp.cache_creation_tokens,
+                    cache_read_tokens: comp.cache_read_tokens,
+                    provider_request_id: comp.provider_request_id,
+                    provider_model_version: comp.provider_model_version,
+                    finish_reason: comp.finish_reason,
+                    bypass_reason: bypass_reason_for_telem,
+                    cache_status: CacheStatus::Disabled.as_str().to_string(),
+                    cache_hit_saved_input_tokens: 0,
+                    cache_hit_saved_output_tokens: 0,
+                },
+                /* cost_usd */ 0.0,
+                /* guardrail_blocked */ false,
+            );
         });
         let response =
             Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
@@ -399,15 +521,14 @@ async fn dispatch(
             response: response.into_response(),
             provider: format!("{provider:?}").to_lowercase(),
             model_id: model_id.clone(),
+            // Token totals are populated on the SSE stream's terminal
+            // chunk and forwarded into telemetry from on_complete; the
+            // top-level handler skips its own `emit_usage_event` for
+            // streaming via `telemetry_handled_by_stream` below.
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
-            // Streaming path doesn't compute cost yet (no token totals
-            // until the stream completes upstream). Phase 2 wires
-            // mid-stream accumulation; for now telemetry records 0.
             cost_usd: 0.0,
-            // Cache / reasoning counters require parsing the terminal
-            // SSE chunk's usage block; not wired yet — Phase 2.
             cached_prompt_tokens: 0,
             reasoning_tokens: 0,
             cache_creation_tokens: 0,
@@ -417,11 +538,12 @@ async fn dispatch(
             finish_reason: String::new(),
             bypass_reason: bypass_reason.clone(),
             // Streaming responses aren't cached at this layer — see
-            // crates/aisix-cache/src/lib.rs and Phase 2 above. Always
-            // surface as `disabled` on the streaming path.
+            // crates/aisix-cache/src/lib.rs. Always surface as
+            // `disabled` on the streaming path.
             cache_status: CacheStatus::Disabled,
             cache_hit_saved_input_tokens: 0,
             cache_hit_saved_output_tokens: 0,
+            telemetry_handled_by_stream: true,
         });
     }
 
@@ -535,6 +657,7 @@ async fn dispatch(
                     // without joining on the status enum.
                     cache_hit_saved_input_tokens: prompt.try_into().unwrap_or(u32::MAX),
                     cache_hit_saved_output_tokens: completion.try_into().unwrap_or(u32::MAX),
+                    telemetry_handled_by_stream: false,
                 });
             }
             Ok(None) => {}
@@ -637,7 +760,28 @@ async fn dispatch(
     match state.guardrails.check_output(&upstream).await {
         GuardrailVerdict::Allow => {}
         GuardrailVerdict::Block { reason } => {
-            return Err(with_model(ProxyError::ContentFiltered(reason)));
+            // Output filter fires AFTER the upstream call, so the
+            // provider has already billed for these tokens. Surface
+            // the captured upstream `UsageStats` to the handler so
+            // `usage_events` reflects the bill — silently zeroing
+            // them would let the customer's dashboard underreport
+            // tokens they paid the provider for.
+            let charge = UpstreamCharge {
+                prompt_tokens: upstream.usage.prompt_tokens,
+                completion_tokens: upstream.usage.completion_tokens,
+                cached_prompt_tokens,
+                reasoning_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
+                provider_request_id: provider_request_id.clone(),
+                provider_model_version: provider_model_version.clone(),
+                finish_reason: finish_reason.clone(),
+            };
+            return Err((
+                Some(model_id.clone()),
+                Some(charge),
+                ProxyError::ContentFiltered(reason),
+            ));
         }
         GuardrailVerdict::Bypass { reason } => {
             // First bypass wins — input bypass already populated
@@ -698,6 +842,7 @@ async fn dispatch(
         // the request *did* hit the upstream, no work was saved.
         cache_hit_saved_input_tokens: 0,
         cache_hit_saved_output_tokens: 0,
+        telemetry_handled_by_stream: false,
     })
 }
 
@@ -889,28 +1034,84 @@ fn created_ts() -> i64 {
 /// — the same loop exit). Errors mid-stream still terminate the loop
 /// normally, so partial-response cases commit whatever tokens were
 /// observed.
+/// What `build_sse_stream` extracts from the upstream stream and hands
+/// to `on_complete` once the terminal chunk arrives. Sourced from the
+/// `usage` block on whichever chunk carried it (typically the last one
+/// before `[DONE]`) plus the most-recently-seen `chunk.id` /
+/// `chunk.model` / `chunk.finish_reason`. Each numeric field defaults
+/// to 0 (and string field to "") when the upstream never emits a
+/// `usage` block — for example, an OpenAI streaming request without
+/// `stream_options.include_usage=true`. Callers are responsible for
+/// treating 0 as "no signal" the same way the non-streaming path
+/// treats `prompt_tokens.unwrap_or(0)`.
+#[derive(Default)]
+struct StreamCompletion {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    /// `u64` because the rate-limit accounting consumer (TPM cap)
+    /// uses u64; cp-api's wire-shape `prompt_tokens` is u32 but
+    /// cumulative-tokens accounting can overflow u32 over a long key.
+    total_tokens: u64,
+    cached_prompt_tokens: u32,
+    reasoning_tokens: u32,
+    cache_creation_tokens: u32,
+    cache_read_tokens: u32,
+    provider_request_id: String,
+    provider_model_version: String,
+    finish_reason: String,
+}
+
 fn build_sse_stream<F>(
     upstream: aisix_gateway::ChatChunkStream,
     created: i64,
     on_complete: F,
 ) -> impl Stream<Item = Result<Event, Infallible>>
 where
-    F: FnOnce(u64) + Send + 'static,
+    F: FnOnce(StreamCompletion) + Send + 'static,
 {
     async_stream::stream! {
         futures::pin_mut!(upstream);
-        // Track the largest `total_tokens` we've seen on any chunk's
-        // usage block. Providers typically populate this on the
-        // terminal chunk only; using "max" rather than "last" makes
+        // Accumulate the upstream's `usage` block + per-chunk metadata
+        // across the stream. Providers typically populate `usage` on
+        // the terminal chunk only; using "max" rather than "last" makes
         // the bookkeeping robust to a provider that double-emits.
-        let mut total_tokens: u64 = 0;
+        // `chunk.id` / `chunk.model` / `chunk.finish_reason` use
+        // last-seen-wins because those are stable per stream.
+        let mut comp = StreamCompletion::default();
         while let Some(item) = upstream.next().await {
             let ev = match item {
                 Ok(chunk) => {
+                    if !chunk.id.is_empty() {
+                        comp.provider_request_id = chunk.id.clone();
+                    }
+                    if !chunk.model.is_empty() {
+                        comp.provider_model_version = chunk.model.clone();
+                    }
+                    if let Some(fr) = chunk.finish_reason.as_ref() {
+                        comp.finish_reason = finish_reason_label(fr);
+                    }
                     if let Some(u) = chunk.usage.as_ref() {
+                        if u.prompt_tokens > comp.prompt_tokens {
+                            comp.prompt_tokens = u.prompt_tokens;
+                        }
+                        if u.completion_tokens > comp.completion_tokens {
+                            comp.completion_tokens = u.completion_tokens;
+                        }
                         let t = u.total_tokens as u64;
-                        if t > total_tokens {
-                            total_tokens = t;
+                        if t > comp.total_tokens {
+                            comp.total_tokens = t;
+                        }
+                        if u.cached_prompt_tokens > comp.cached_prompt_tokens {
+                            comp.cached_prompt_tokens = u.cached_prompt_tokens;
+                        }
+                        if u.reasoning_tokens > comp.reasoning_tokens {
+                            comp.reasoning_tokens = u.reasoning_tokens;
+                        }
+                        if u.cache_creation_tokens > comp.cache_creation_tokens {
+                            comp.cache_creation_tokens = u.cache_creation_tokens;
+                        }
+                        if u.cache_read_tokens > comp.cache_read_tokens {
+                            comp.cache_read_tokens = u.cache_read_tokens;
                         }
                     }
                     let rendered = render_chunk(created, chunk);
@@ -927,10 +1128,12 @@ where
             };
             yield Ok::<_, Infallible>(ev);
         }
-        // Stream done — account for the upstream's reported tokens.
-        // For providers that don't emit usage in the stream this stays
-        // 0; on_complete is responsible for treating 0 as "no signal".
-        on_complete(total_tokens);
+        // Stream done — fire on_complete with whatever we accumulated.
+        // For providers that don't emit `usage` in the stream the
+        // numeric fields stay 0; on_complete callers must treat 0 as
+        // "no signal" (cp-api does — its pricing catalog falls back
+        // to the standard rate when these are absent).
+        on_complete(comp);
         yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
     }
 }
