@@ -87,6 +87,14 @@ pub enum ProxyError {
     ContentFiltered(String),
     #[error("budget exceeded for ApiKey {0:?}")]
     BudgetExceeded(String),
+    /// Per RFC 9110 §15.5.14, a request body that exceeds a server-
+    /// imposed limit gets a `413 Content Too Large`. The caller-visible
+    /// `message` is intentionally bare of the actual incoming size
+    /// (the limit is the only stable detail the caller needs). Set by
+    /// the body-limit middleware in `lib.rs::enforce_request_body_limit`
+    /// when the inbound `Content-Length` exceeds the configured cap.
+    #[error("request body exceeds {limit_bytes}-byte limit")]
+    RequestTooLarge { limit_bytes: usize },
     #[error(transparent)]
     RateLimit(#[from] RateLimitError),
     #[error(transparent)]
@@ -103,6 +111,7 @@ impl ProxyError {
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::ContentFiltered(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
+            ProxyError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::RateLimit(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::Bridge(b) => {
                 StatusCode::from_u16(b.http_status()).unwrap_or(StatusCode::BAD_GATEWAY)
@@ -116,6 +125,7 @@ impl ProxyError {
             ProxyError::ModelForbidden(_) => "permission_denied",
             ProxyError::ModelNotFound(_) => "model_not_found",
             ProxyError::InvalidRequest(_) => "invalid_request_error",
+            ProxyError::RequestTooLarge { .. } => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
             ProxyError::ContentFiltered(_) => "content_filter",
             ProxyError::BudgetExceeded(_) => "billing_error",
