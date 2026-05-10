@@ -125,9 +125,10 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 **Streaming** — set `"stream": true`. The response is `text/event-stream`
 with one `data: {chunk-json}` per delta and a final `data: [DONE]`.
 Set `"stream_options": {"include_usage": true}` to receive a final
-`usage` chunk before `[DONE]`. aisix injects this automatically when
-the request omits the field, so client SDKs get accurate token totals
-even in streaming mode.
+`usage` chunk before `[DONE]`. Callers that need accurate token
+totals on streamed completions should set this explicitly — the
+gateway forwards the request body to the upstream verbatim and does
+not auto-inject the field.
 
 **Tool calls**, **JSON mode**, **vision content blocks**, and
 **function-style tool definitions** all pass through unchanged.
@@ -240,8 +241,8 @@ possible:
 
 | Provider | Native endpoint | OpenAI-translated endpoint | Notes |
 |---|---|---|---|
-| OpenAI | `/v1/chat/completions`, `/v1/responses` | (no translation needed) | aisix auto-injects `stream_options.include_usage = true` |
-| Anthropic | `/v1/messages` | `/v1/chat/completions` (full translation) | The Hub maps content blocks ↔ messages, tool_use ↔ tool_calls, system extraction, cache_control passthrough, stop_reason normalisation |
+| OpenAI | `/v1/chat/completions`, `/v1/responses` | (no translation needed) | Request body forwarded verbatim |
+| Anthropic | `/v1/messages` | `/v1/chat/completions` (text content blocks) | Anthropic→Anthropic is a byte-for-byte passthrough that preserves `cache_control`, thinking, image, and tool_use blocks. Cross-provider translation today covers **text content blocks only** — tool_use, image, and thinking blocks are silently dropped on the inbound parse and are scheduled for a follow-up. See §4.5. |
 | Gemini | `/v1/chat/completions` (OpenAI-compat endpoint) | (same) | Uses Gemini's OpenAI-compatible base URL with `x-goog-api-key` auth |
 | DeepSeek | `/v1/chat/completions` (OpenAI-compat endpoint) | (same) | Uses Bearer auth, OpenAI-compatible payloads |
 
