@@ -95,16 +95,31 @@ fn attempt_order(targets: &[RoutingTarget], start_idx: usize, budget: usize) -> 
 
 /// Pick an index by weighted-random. Ignores zero weights; a fully-zero
 /// list falls back to index 0 deterministically.
+///
+/// Per #197: each call must draw an INDEPENDENT sample from the weight
+/// distribution. The prior implementation used
+/// `SystemTime::now().subsec_nanos() + Instant::now().elapsed().as_nanos()`
+/// as entropy, which has two correctness bugs that compound:
+///   1. `Instant::now().elapsed()` always returns ~0 (the Instant was
+///      just created), so the mix is effectively just subsec_nanos.
+///   2. Under rapid-fire requests (e2e fires N=100 in tight loop),
+///      consecutive subsec_nanos values differ by a near-constant
+///      step (≈1 µs of wall-clock per request). Modular reduction
+///      `entropy() % total_weight` against that step pattern aliases
+///      to a single bin — every request lands on the same target.
+///      Empirical observation: 200/0 split on a configured 70/30.
+///
+/// Use `rand::thread_rng()` instead. The thread-local PRNG is seeded
+/// from OS entropy on first use and is independent across calls; the
+/// distribution converges to the configured weights over a finite
+/// sample (per the spec the e2e pins).
 fn weighted_pick(targets: &[RoutingTarget]) -> usize {
     let total: u64 = targets.iter().map(|t| t.weight_or_default() as u64).sum();
     if total == 0 {
         return 0;
     }
-    // We don't need a strong PRNG here — just enough entropy to spread
-    // requests roughly per weights. Use the system clock's nanos as a
-    // cheap entropy source so we avoid pulling in `rand` crate just
-    // for one call site.
-    let pick = entropy() % total;
+    use rand::Rng;
+    let pick = rand::thread_rng().gen_range(0..total);
     let mut acc: u64 = 0;
     for (i, t) in targets.iter().enumerate() {
         acc += t.weight_or_default() as u64;
@@ -113,17 +128,6 @@ fn weighted_pick(targets: &[RoutingTarget]) -> usize {
         }
     }
     targets.len() - 1
-}
-
-fn entropy() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0)
-        // Mix in something monotonic so two calls in the same nanosecond
-        // diverge — `Instant` provides that without `unsafe`.
-        .wrapping_add(std::time::Instant::now().elapsed().as_nanos() as u64)
 }
 
 #[cfg(test)]
@@ -241,27 +245,14 @@ mod tests {
         assert_eq!(weighted_pick(&targets), 0);
     }
 
-    /// Soft property: across many trials, a 99/1 weight bias must
-    /// measurably favor the heavy target. The existing
-    /// `weighted_picks_from_targets_and_falls_back_in_order` only
-    /// checks order *shape* (both targets present) — it cannot tell
-    /// a weighted impl from a uniform-random one. This test pins the
-    /// *intent* of `Weighted`: weight actually steers the picks.
-    ///
-    /// Tolerance is intentionally loose: `entropy()` is sub-second
-    /// wall-clock + `Instant::now().elapsed()` (see comment in
-    /// `entropy`), so short-loop nanos can cluster. We assert "weight
-    /// 99 dominates uniform 50/50" with a ≥ 60 % lower bound, which
-    /// is robust to the weak entropy source while still failing on a
-    /// weight-blind implementation (uniform RNG → ~50 %).
-    /// Total weight = 101 is deliberate (so is the same total in the
-    /// companion `_respects_index_swap` test below). With weights
-    /// summing to a power-of-10 like 100 we empirically saw the
-    /// minority bin starve under the weak nanosecond-clock entropy
-    /// — a 5000-trial run on `[1, 99]` yielded only ~53 %, well below
-    /// the 60 % threshold. Bumping the heavy weight to 100 widens the
-    /// majority bin to ~99 % expected and gives the test enough margin
-    /// to absorb the entropy weakness without flaking.
+    /// Aggregate-distribution property: across many trials, a 100/1
+    /// weight bias must converge to ~99% on the heavy target. Pre-#197
+    /// the threshold sat at ≥ 60% to absorb the weak nanos-clock entropy
+    /// — that gate would also pass a weight-half-sensitivity regression
+    /// (~75% would slip through). With proper PRNG entropy in
+    /// `weighted_pick`, the empirical bin should land within ~1% of
+    /// the analytic 100/(100+1) = 99.0% expectation; we assert ≥ 95%
+    /// (≈4σ band for n=5000, rejects half-sensitivity AND weight-blind).
     #[test]
     fn weighted_pick_aggregate_distribution_favors_heavier_weight() {
         let targets = vec![
@@ -271,13 +262,12 @@ mod tests {
         let n = 5_000;
         let a_count = (0..n).filter(|_| weighted_pick(&targets) == 0).count();
         // Uniform 50/50 → ~2500. Weighted 100/1 → ~4950 in theory.
-        // 60 % threshold (3000) is a wide safety margin: it already
-        // rejects both a weight-blind impl (~50 %) and a "weights
-        // inverted" regression (~1 %). Tightening to 90 % would catch
-        // a half-sensitivity regression but adds CI-flake risk against
-        // weak entropy — the looser bound is the stable choice.
+        // 95% threshold (4750) rejects both a weight-blind impl
+        // (~50%) AND a half-sensitivity regression (~75% would also
+        // fail). With proper PRNG entropy this gate has ~5σ margin;
+        // CI-flake risk is negligible.
         assert!(
-            a_count * 100 / n >= 60,
+            a_count * 100 / n >= 95,
             "weight=100 target should dominate aggregate picks; got {a_count}/{n}",
         );
     }
@@ -287,8 +277,7 @@ mod tests {
     /// the heavy weight is at index 0). Swap the weights so the heavy
     /// target sits at index 1 — a weight-blind impl that always picks
     /// the first target would now fail this test, while a correct
-    /// weighted impl still favors index 1. Same total=101 reasoning
-    /// as the test above.
+    /// weighted impl still favors index 1.
     #[test]
     fn weighted_pick_aggregate_distribution_respects_index_swap() {
         let targets = vec![
@@ -298,8 +287,33 @@ mod tests {
         let n = 5_000;
         let b_count = (0..n).filter(|_| weighted_pick(&targets) == 1).count();
         assert!(
-            b_count * 100 / n >= 60,
+            b_count * 100 / n >= 95,
             "weight=100 target at index 1 should dominate aggregate picks; got {b_count}/{n}",
+        );
+    }
+
+    /// Issue #197 regression: a 70/30 weighted split must land near
+    /// 70/30 over a finite sample. The pre-fix nanos-clock entropy
+    /// collapsed to a single bin under rapid-fire calls (observed
+    /// 200/0 in e2e on a configured 70/30); a proper PRNG converges
+    /// to the analytic distribution.
+    ///
+    /// Tolerance: n=1000 with p=0.7 has σ=√(np(1-p))=√210≈14.5. A ±5%
+    /// window (50 absolute counts) is ~3.5σ → P(false positive)<0.1%.
+    /// The pre-fix collapse-to-one-bin failure produces 1000/0 which
+    /// is ~33σ outside the window — caught with overwhelming margin.
+    #[test]
+    fn weighted_pick_70_30_split_converges_to_configured_ratio() {
+        let targets = vec![
+            RoutingTarget::new("a").with_weight(70),
+            RoutingTarget::new("b").with_weight(30),
+        ];
+        let n = 1_000;
+        let a_count = (0..n).filter(|_| weighted_pick(&targets) == 0).count();
+        // Expected ~700; tolerance window [650, 750] (≈±3.5σ).
+        assert!(
+            (650..=750).contains(&a_count),
+            "70/30 weighted split must land near 700/1000; got {a_count}/{n} on heavy target",
         );
     }
 

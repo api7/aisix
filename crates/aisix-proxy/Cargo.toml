@@ -38,6 +38,13 @@ futures-util.workspace = true
 async-trait.workspace = true
 async-stream = "0.3"
 dashmap.workspace = true
+# Per-request weighted-random target selection in `routing::weighted_pick`.
+# `thread_rng()` gives proper per-request entropy that converges to the
+# configured weights over a finite sample (fix for #197 — the prior
+# nanos-clock-mod-total entropy collapsed to a single bin under
+# rapid-fire calls because consecutive subsec_nanos values differ by
+# a constant that aliases against the modulus).
+rand = { workspace = true }
 chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

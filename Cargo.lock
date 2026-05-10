@@ -287,6 +287,7 @@ dependencies = [
  "http 1.4.0",
  "http-body-util",
  "hyper 1.9.0",
+ "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",
