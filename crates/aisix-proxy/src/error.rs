@@ -72,7 +72,18 @@ pub enum ProxyError {
     InvalidRequest(String),
     #[error("no bridge registered for provider")]
     ProviderUnavailable,
-    #[error("content blocked by policy: {0}")]
+    /// Caller-visible message MUST NOT carry the matched-pattern detail.
+    /// Per #153, leaking the matched literal back to the caller defeats
+    /// the point of an output guardrail (the whole purpose is to keep the
+    /// forbidden content from reaching the caller; echoing it in the
+    /// error envelope is a partial bypass and lets anyone who can
+    /// trigger the guardrail enumerate the policy's blocklist).
+    /// Constructors at `chat.rs::route_chat_completions` and
+    /// `chat.rs::dispatch_and_render` build a redacted public message
+    /// (`"request blocked by content policy"` /
+    /// `"response blocked by content policy"`) and emit the rich detail
+    /// to `tracing` for operators.
+    #[error("{0}")]
     ContentFiltered(String),
     #[error("budget exceeded for ApiKey {0:?}")]
     BudgetExceeded(String),

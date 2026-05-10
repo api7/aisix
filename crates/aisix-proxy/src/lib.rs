@@ -1616,10 +1616,18 @@ data: [DONE]\n\n";
         let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "content_filter");
-        assert!(v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("forbidden-token"));
+        // Per #153, the wire-level `error.message` MUST NOT carry
+        // the matched-pattern detail. The previous assertion
+        // `.contains("forbidden-token")` pinned the leaky behavior
+        // (the literal value of the forbidden pattern showing up
+        // in the caller-visible message). Redaction keeps the
+        // matched literal in operator logs (`tracing`) only.
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            !message.contains("forbidden-token"),
+            "wire-level error.message must not leak the matched literal; got {message:?}"
+        );
+        assert_eq!(message, "request blocked by content policy");
     }
 
     /// Regression: a guardrail-blocked request must record the resolved
@@ -1729,6 +1737,28 @@ data: [DONE]\n\n";
         let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "content_filter");
+        // Per #153, the matched literal from the model's response
+        // ("secret-string" — what the upstream returned and the
+        // guardrail matched) MUST NOT appear in the caller-visible
+        // error envelope. Echoing it would defeat the entire point
+        // of an output guardrail: anyone who can trigger the rule
+        // could extract the model's forbidden output via the error
+        // message. This is the most security-critical assertion
+        // for the whole guardrail surface.
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            !message.contains("secret-string"),
+            "output guardrail leaked the matched literal back to the caller; got {message:?}"
+        );
+        // The full error envelope (any field) must also be clean —
+        // future regressions might leak via a different field
+        // (param/code) so check the whole serialized blob.
+        let blob = serde_json::to_string(&v).unwrap();
+        assert!(
+            !blob.contains("secret-string"),
+            "output guardrail leaked the matched literal in the envelope; got {blob}"
+        );
+        assert_eq!(message, "response blocked by content policy");
     }
 
     /// Regression for #226: when an output-content-filter blocks a

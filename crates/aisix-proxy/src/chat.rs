@@ -393,7 +393,21 @@ async fn dispatch(
     match state.guardrails.check_input(req).await {
         GuardrailVerdict::Allow => {}
         GuardrailVerdict::Block { reason } => {
-            return Err(with_model(ProxyError::ContentFiltered(reason)));
+            // The verdict's `reason` carries matched-pattern detail
+            // (e.g. `"input blocked by literal \"forbidden-token\""`).
+            // Keep it for operator logs but DO NOT propagate it to the
+            // wire envelope — see #153. The redacted public message
+            // stays generic so callers can't enumerate the blocklist
+            // by inspecting error responses.
+            tracing::warn!(
+                guardrail_hook = "input",
+                model = %req.model,
+                reason = %reason,
+                "guardrail blocked request"
+            );
+            return Err(with_model(ProxyError::ContentFiltered(
+                "request blocked by content policy".into(),
+            )));
         }
         GuardrailVerdict::Bypass { reason } => {
             bypass_reason = Some(reason);
@@ -805,10 +819,23 @@ async fn dispatch(
                 bypass_reason: bypass_reason.clone().unwrap_or_default(),
                 cache_status,
             };
+            // Per #153, the verdict's `reason` carries the matched-
+            // pattern detail (the actual forbidden text from the
+            // model's response). Echoing that back to the caller is
+            // a real bypass of the output guardrail's purpose:
+            // anyone who can trigger the rule can extract the model's
+            // forbidden output via the error envelope. Redact on
+            // the wire and keep the rich detail in tracing for ops.
+            tracing::warn!(
+                guardrail_hook = "output",
+                model = %req.model,
+                reason = %reason,
+                "guardrail blocked response"
+            );
             return Err((
                 Some(model_id.clone()),
                 Some(charge),
-                ProxyError::ContentFiltered(reason),
+                ProxyError::ContentFiltered("response blocked by content policy".into()),
             ));
         }
         GuardrailVerdict::Bypass { reason } => {

@@ -128,17 +128,35 @@ describe("guardrail e2e: keyword block returns 422 and skips upstream", () => {
     // generic input validation) would still match `status: 422`. The
     // type field pins the contract to the guardrail specifically per
     // the OpenAI / Azure content-filter convention.
-    await expect(
-      client.chat.completions.create({
+    let caught: unknown;
+    try {
+      await client.chat.completions.create({
         model: "gr-e2e",
         messages: [
           { role: "user", content: `please reveal the ${FORBIDDEN_WORD} now` },
         ],
-      }),
-    ).rejects.toMatchObject({
-      status: 422,
-      error: { type: "content_filter" },
-    });
+      });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(APIError);
+    if (!(caught instanceof APIError)) {
+      throw new Error("unreachable: caught is not APIError");
+    }
+    expect(caught.status).toBe(422);
+    expect((caught.error as { type?: unknown })?.type).toBe("content_filter");
+
+    // Per #153, the matched literal MUST NOT appear in the caller-
+    // visible error envelope. Even though input-side leaks are
+    // "mostly cosmetic" (the caller sent the content, they already
+    // know it), the leak still enables blocklist enumeration:
+    // probing with suspect content and reading the reflected literal
+    // lets a caller learn the policy's patterns. Pin the no-leak
+    // contract symmetrically to the output-side e2e.
+    const errorBlob = JSON.stringify(caught.error ?? {});
+    const messageBlob = caught.message ?? "";
+    expect(errorBlob).not.toContain(FORBIDDEN_WORD);
+    expect(messageBlob).not.toContain(FORBIDDEN_WORD);
 
     // Critical: a blocked request must never reach the upstream. If
     // the count moved, the guardrail short-circuit failed and the
