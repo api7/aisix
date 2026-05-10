@@ -1731,6 +1731,243 @@ data: [DONE]\n\n";
         assert_eq!(v["error"]["type"], "content_filter");
     }
 
+    /// Regression for #226: when an output-content-filter blocks a
+    /// response that the upstream already produced, the telemetry event
+    /// MUST carry the upstream-billed `prompt_tokens` /
+    /// `completion_tokens` instead of zeroing them. Pre-fix the error
+    /// path uniformly emitted zeros for every error variant — the
+    /// "request never reached the upstream" assumption baked into the
+    /// failure-path comment was wrong for the output-block case where
+    /// the upstream HAS run and the provider has already charged.
+    #[tokio::test]
+    async fn output_guardrail_block_records_upstream_usage_in_telemetry() {
+        use aisix_guardrails::{GuardrailChain, KeywordBlocklist, KeywordRule};
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-blocked-1",
+                "model": "gpt-4o-2024-08-06",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "leak the secret-string"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(
+            KeywordBlocklist::output_only(vec![KeywordRule::literal("secret-string")]),
+        )]));
+        let state = build_state(snap, hub)
+            .with_guardrails(guardrails)
+            .with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "anything"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("sender dropped without sending");
+        // The customer paid the provider for these tokens — telemetry
+        // must reflect that, not silently drop them to 0.
+        assert_eq!(
+            event.prompt_tokens, 11,
+            "output-block must preserve the upstream's prompt_tokens"
+        );
+        assert_eq!(
+            event.completion_tokens, 7,
+            "output-block must preserve the upstream's completion_tokens"
+        );
+        assert!(event.guardrail_blocked);
+        assert_eq!(event.status_code, 422);
+        assert_eq!(event.provider_request_id, "cmpl-blocked-1");
+        assert_eq!(event.provider_model_version, "gpt-4o-2024-08-06");
+        assert_eq!(event.finish_reason, "stop");
+        // cache_status reflects the per-policy gate the request went
+        // through; "disabled" here because the test seeds no
+        // cache_policy. A regression that drops cache_status on the
+        // output-block path would surface as empty-string here.
+        assert_eq!(event.cache_status, "disabled");
+    }
+
+    /// Regression for ai-gateway#196 audit HIGH-1: streaming chat
+    /// telemetry must fire even when the client disconnects mid-
+    /// stream. Pre-fix, on_complete lived in a `yield`-following
+    /// branch of the async_stream! body that only ran when the
+    /// consumer pulled — a dropped consumer (axum aborting the
+    /// response future) skipped it entirely, so the customer's
+    /// upstream call billed but the gateway recorded zero events.
+    /// Post-fix, on_complete fires from a Drop guard so cancellation
+    /// still produces a usage_event (with whatever counts were
+    /// captured up to disconnect, typically 0 if disconnect beat
+    /// the upstream's `usage` chunk).
+    #[tokio::test]
+    async fn streaming_chat_telemetry_fires_on_client_disconnect() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // Use a slow drip so we can disconnect before [DONE] arrives.
+        let sse = "\
+data: {\"id\":\"cmpl-cancel-1\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-cancel-1\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-cancel-1\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Read ONE chunk then drop the response body — simulates a
+        // client that hung up before the upstream's terminal chunk.
+        // The Drop guard inside build_sse_stream must still fire
+        // on_complete for this disconnected request.
+        let mut body_stream = resp.into_body().into_data_stream();
+        let _first = body_stream.next().await;
+        drop(body_stream);
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("usage event was never emitted (Drop guard regression)")
+            .expect("sender dropped without sending");
+        // The exact token counts depend on how many chunks reached
+        // the guard before disconnect — could be 0 (disconnect beat
+        // the upstream emission entirely) or more. The contract is
+        // simply that an event fires; counts are best-effort. Pin
+        // the structural fields to confirm we didn't grab some
+        // unrelated event.
+        assert_eq!(event.status_code, 200);
+        assert!(!event.guardrail_blocked);
+    }
+
+    /// Regression for #225: streaming chat must read the terminal SSE
+    /// chunk's `usage` block and forward those counts into the
+    /// telemetry event. Pre-fix the streaming path captured only
+    /// `total_tokens` (for rate-limit accounting) and dropped
+    /// `prompt_tokens` / `completion_tokens` — telemetry recorded zero
+    /// for every streamed request even though the DP had the real
+    /// counts in hand.
+    #[tokio::test]
+    async fn streaming_chat_telemetry_records_usage_from_terminal_chunk() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // OpenAI's stream_options.include_usage=true shape: the final
+        // delta chunk before [DONE] carries a `usage` block.
+        let sse = "\
+data: {\"id\":\"cmpl-stream-1\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-stream-1\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-stream-1\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":4,\"total_tokens\":17}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Drain the SSE body so build_sse_stream's on_complete fires.
+        // Telemetry emission is wired to that callback; the channel
+        // stays empty until the full stream has been consumed.
+        let mut body_stream = resp.into_body().into_data_stream();
+        while let Some(chunk) = body_stream.next().await {
+            let _ = chunk.unwrap();
+        }
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("sender dropped without sending");
+        assert_eq!(
+            event.prompt_tokens, 13,
+            "streaming telemetry must capture prompt_tokens from the terminal chunk's usage block"
+        );
+        assert_eq!(
+            event.completion_tokens, 4,
+            "streaming telemetry must capture completion_tokens from the terminal chunk"
+        );
+        assert_eq!(event.status_code, 200);
+        assert!(!event.guardrail_blocked);
+        assert_eq!(event.provider_request_id, "cmpl-stream-1");
+        assert_eq!(event.provider_model_version, "gpt-4o-2024-08-06");
+        assert_eq!(event.finish_reason, "stop");
+    }
+
     #[tokio::test]
     async fn budget_exceeded_returns_429() {
         use crate::budget::BudgetClient;
