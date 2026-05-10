@@ -144,18 +144,24 @@ async fn dispatch(
     }
 
     // Build upstream URL. build_v1_url tolerates either base form —
-    // `https://api.cohere.ai` (Cohere convention, no /v1) and
-    // `https://api.openai.com/v1` (OpenAI-SDK convention, with /v1)
-    // both end up at `…/v1/rerank` instead of `…/v1/v1/rerank`.
+    // `https://api.cohere.com` (bare host) and `https://api.openai.com/v1`
+    // (OpenAI-SDK convention, with /v1) both end up at `…/v1/rerank`
+    // instead of `…/v1/v1/rerank`.
+    //
+    // The provider arm of `default_base_for_provider` is guaranteed to
+    // return `Some` here because the gate above already rejected any
+    // `model.provider` outside `{Openai, Cohere}` — both have explicit
+    // arms in the helper. The `unwrap_or_else` is defensive against a
+    // future enum variant that gets through the gate without an arm in
+    // the helper; the audit-trail-friendly default is OpenAI's host
+    // (it's a 4xx-from-OpenAI rather than dispatching to a stale
+    // Cohere legacy domain).
     let base = match pk_entry.value.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
-        _ => {
-            // Derive a sensible default base from the provider.
-            model
-                .provider
-                .and_then(default_base_for_provider)
-                .unwrap_or_else(|| "https://api.cohere.ai".to_string())
-        }
+        _ => model
+            .provider
+            .and_then(default_base_for_provider)
+            .unwrap_or_else(|| "https://api.openai.com".to_string()),
     };
     let url = crate::dispatch::build_v1_url(&base, "/rerank");
 
@@ -499,6 +505,26 @@ mod tests {
             serde_json::json!(["doc one", "doc two"])
         );
         assert_eq!(upstream_body["top_n"], 2);
+
+        // Per #213 audit MEDIUM-2: pin the EXACT field set sent to
+        // Cohere. Cohere's `/v1/rerank` documents `{model, query,
+        // documents, top_n, return_documents, max_chunks_per_doc}`
+        // (https://docs.cohere.com/reference/rerank). The gateway
+        // forwards verbatim — but a future regression that injects
+        // an OpenAI-only field (e.g. `dimensions` from embeddings,
+        // or `stream` from chat) would break Cohere upstream
+        // without failing a "happy path 200" test. Pinning the
+        // exact key set catches that.
+        let upstream_obj = upstream_body
+            .as_object()
+            .expect("upstream body is a JSON object");
+        let mut keys: Vec<&str> = upstream_obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["documents", "model", "query", "top_n"],
+            "upstream body must contain ONLY the fields the caller sent (no gateway-injected extras)"
+        );
     }
 
     #[tokio::test]

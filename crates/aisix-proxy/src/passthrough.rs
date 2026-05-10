@@ -36,6 +36,14 @@ use crate::error::ProxyError;
 use crate::state::ProxyState;
 
 /// Provider defaults indexed by provider-prefix string.
+///
+/// NOTE: `"cohere"` is intentionally absent. #213 Phase 1 ships
+/// Cohere on `/v1/rerank` only; passthrough support is out of
+/// scope. Operators using `/passthrough/cohere/*` with a
+/// `provider: "cohere"` Model must set `api_base` explicitly on
+/// the ProviderKey. The fallback emits a 400
+/// `InvalidRequest("no api_base configured for provider 'cohere' and no default known")`
+/// — graceful, not a crash. Tracked alongside #213's later phases.
 fn default_base(provider_prefix: &str) -> Option<&'static str> {
     match provider_prefix {
         "openai" => Some("https://api.openai.com"),

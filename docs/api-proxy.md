@@ -204,6 +204,17 @@ For `provider: "cohere"`, the default `api_base` is
 convention are identical to the OpenAI-compat shape, so the
 gateway forwards verbatim with no transform.
 
+> **Cohere v1 → v2 migration**: Cohere has deprecated its v1
+> endpoints in favour of v2 (`/v2/rerank`); v1 still functions
+> today but operators should plan for the migration. Operators
+> wanting v2 should track the gateway's version-routing
+> follow-up (set under #213's later phases) — direct override
+> via `api_base: "https://api.cohere.com/v2"` does not work
+> with the gateway's current `build_v1_url` helper because it
+> would produce `…/v2/v1/rerank`. Cohere's v2 body shape also
+> differs (e.g. `documents` no longer accepts the object form),
+> so a future v2 path will need a small request-body adapter.
+
 ### 4.8 `POST /v1/audio/transcriptions` / `translations` / `speech`
 
 Multipart file upload + JSON pass-through. `audio/speech` returns a

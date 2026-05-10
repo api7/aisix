@@ -308,6 +308,21 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
     expect(sentBody.query).toBe(requestPayload.query);
     expect(sentBody.documents).toEqual(requestPayload.documents);
     expect(sentBody.top_n).toBe(requestPayload.top_n);
+
+    // Per #213 audit MEDIUM-2: pin the EXACT field set sent to
+    // Cohere. Cohere's `/v1/rerank` documents
+    // `{model, query, documents, top_n, return_documents, ...}`
+    // — https://docs.cohere.com/reference/rerank. The gateway
+    // forwards verbatim, so the upstream body MUST contain ONLY
+    // the keys the caller sent — no gateway-injected extras.
+    // A future regression that injects an OpenAI-only field
+    // (e.g. `dimensions` from embeddings, `stream` from chat)
+    // would break Cohere without failing a "happy-path 200"
+    // assertion alone.
+    const sentKeys = Object.keys(
+      sentBody as Record<string, unknown>,
+    ).sort();
+    expect(sentKeys).toEqual(["documents", "model", "query", "top_n"]);
   });
 
   test("non-OpenAI provider returns 400 invalid_request_error, upstream untouched (#212 / docs §4.7)", async (ctx) => {
