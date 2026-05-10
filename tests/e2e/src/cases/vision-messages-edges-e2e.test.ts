@@ -32,9 +32,21 @@ import {
 //      worse OCR.
 //
 //   3. Mixed remote URL + base64 in one message. Same caller, same
-//      request — one image hosted, one inlined. Both must reach the
-//      upstream verbatim so the upstream can resolve the remote
-//      reference itself.
+//      request — one image hosted, one inlined. The remote URL
+//      must reach the upstream verbatim (still as `http(s)://...`,
+//      not pre-fetched and inlined as `data:...`); the inlined
+//      base64 must reach upstream byte-intact.
+//
+//      Note: this test only verifies the upstream-side request
+//      shape. It does not (and the harness cannot) observe an
+//      out-of-band fetch the gateway might issue against the
+//      remote URL host — a regression that pre-fetched purely
+//      for caching/telemetry, without modifying the upstream
+//      payload, would slip through. Treat as a wire-shape pin,
+//      not a full SSRF guard. A full SSRF assertion needs a
+//      sentinel host that 404s loudly when hit and is observed
+//      via egress-network instrumentation; tracked as a
+//      follow-up.
 //
 // Reference:
 //   - OpenAI vision API
@@ -268,9 +280,11 @@ describe("vision messages edges e2e: multi-image, detail param, mixed-source", (
     const content = [
       { type: "text" as const, text: "What's the difference?" },
       // Remote http(s) URL: upstream resolves it itself; the
-      // gateway must NOT try to fetch + inline it (a regression
-      // that pre-fetched would change the wire shape upstream-side
-      // AND introduce SSRF risk).
+      // gateway must forward the URL as-is (not pre-fetch and
+      // re-inline as data:). This pin catches the in-payload
+      // mutation form of that regression — a side-channel pre-fetch
+      // that leaves the upstream payload intact would still slip
+      // through; see file header note.
       { type: "image_url" as const, image_url: { url: REMOTE_URL } },
       // Inlined base64: upstream receives bytes directly.
       { type: "image_url" as const, image_url: { url: DATA_URL_BLUE } },
@@ -295,10 +309,11 @@ describe("vision messages edges e2e: multi-image, detail param, mixed-source", (
       DATA_URL_BLUE,
     );
 
-    // (3.b) Remote URL was NOT inlined into a data: URI — would
-    // happen if the gateway tried to be clever and pre-fetch.
-    // Same check is the SSRF guard: confirm the gateway did not
-    // make an outbound network call resolving REMOTE_URL.
+    // (3.b) Remote URL was NOT inlined into a data: URI in the
+    // upstream payload — would happen if the gateway pre-fetched
+    // and re-encoded. This is an in-payload check only; a
+    // side-channel pre-fetch that left the payload alone would
+    // not be caught here (see file header note).
     const remoteSent = body.messages[0]?.content[1]?.image_url?.url;
     expect(remoteSent.startsWith("http")).toBe(true);
     expect(remoteSent.startsWith("data:")).toBe(false);
