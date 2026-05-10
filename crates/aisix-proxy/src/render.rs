@@ -30,6 +30,16 @@ pub struct NonStreamChoice {
 pub struct RenderedMessage {
     pub role: &'static str,
     pub content: String,
+    /// Forward-compatible bag for OpenAI message-level fields the
+    /// gateway doesn't model directly on `ChatMessage` (e.g.
+    /// `tool_calls` for cross-provider tool-use translation,
+    /// `refusal` for OpenAI's safety-classifier output, `audio` for
+    /// realtime/4o audio models). Bridges populate this on the way
+    /// back from the upstream; serde flatten emits each entry as a
+    /// top-level field on the wire so OpenAI SDK clients see the
+    /// standard shape.
+    #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -77,6 +87,9 @@ pub fn render_response(created_unix_ts: i64, resp: ChatResponse) -> ChatCompleti
             message: RenderedMessage {
                 role: role_to_str(resp.message.role),
                 content: resp.message.content,
+                // Forward bridge-populated fields (`tool_calls`,
+                // `refusal`, `audio`, …) through to the caller.
+                extra: resp.message.extra,
             },
             finish_reason: finish_to_str(&resp.finish_reason).to_string(),
         }],
