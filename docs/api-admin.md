@@ -47,7 +47,7 @@ Admin errors use a deliberately simpler envelope than the proxy:
 
 ## 3. Resource model
 
-Every CRUD endpoint shares the same response shape:
+Every single-entity CRUD endpoint shares the same response shape:
 
 ```json
 {
@@ -57,9 +57,10 @@ Every CRUD endpoint shares the same response shape:
 }
 ```
 
-Lists wrap items in `{"items": [...]}`. The `revision` field is the
-etcd mod-revision at write time — useful for optimistic concurrency
-in custom tooling.
+Lists return a **bare JSON array** of those entries — there is no
+`{"items": [...]}` envelope. The `revision` field on each entry is
+the etcd mod-revision at write time, useful for optimistic
+concurrency in custom tooling.
 
 ## 4. Endpoints
 
@@ -70,26 +71,33 @@ full schema.
 
 | Method | Path | Body | Response |
 |---|---|---|---|
-| GET | `/admin/v1/models` | — | `{items: [{id, value: Model, revision}]}` |
+| GET | `/admin/v1/models` | — | `[{id, value: Model, revision}, …]` (bare array) |
 | POST | `/admin/v1/models` | Model JSON | `{id, value, revision}` (id is server-assigned UUID v4) |
 | GET | `/admin/v1/models/{id}` | — | `{id, value, revision}` |
 | PUT | `/admin/v1/models/{id}` | Model JSON | `{id, value, revision}` (idempotent — first call 201, subsequent 200) |
 | DELETE | `/admin/v1/models/{id}` | — | `{deleted: true}` |
 
-POST + PUT both reject duplicate `name` with 409.
+POST + PUT both reject duplicate `display_name` with 409.
+
+The Model schema (see `crates/aisix-core/src/models/model.rs`) is
+`deny_unknown_fields` and accepts two mutually-exclusive shapes:
+
+- **Direct** — set `provider` + `model_name` + `provider_key_id`
+  (the secret lives on a separate ProviderKey resource — see §4.3).
+- **Routing** — omit those three; provide a `routing` block listing
+  weighted upstream targets.
 
 ```bash
-# Create a Model that wraps OpenAI's gpt-4o behind alias "my-gpt4"
+# Direct-mode Model: alias "my-gpt4" → openai/gpt-4o, with the
+# upstream credential resolved through ProviderKey id <pk-id>.
 curl -X POST http://localhost:3001/admin/v1/models \
   -H "Authorization: Bearer $ADMIN_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "my-gpt4",
-    "model": "openai/gpt-4o",
-    "provider_config": {
-      "api_key": "sk-real-openai-…",
-      "api_base": "https://api.openai.com/v1"
-    },
+    "display_name": "my-gpt4",
+    "provider": "openai",
+    "model_name": "gpt-4o",
+    "provider_key_id": "<pk-id-from-/admin/v1/provider_keys>",
     "rate_limit": {"rpm": 100, "tpm": 100000},
     "cost": {"input_per_1k": 0.005, "output_per_1k": 0.015}
   }'
@@ -107,18 +115,37 @@ Caller-facing keys. Empty `allowed_models` denies every model — it is
 | GET | `/admin/v1/apikeys/{id}` |
 | PUT | `/admin/v1/apikeys/{id}` |
 | DELETE | `/admin/v1/apikeys/{id}` |
-| POST | `/admin/v1/apikeys/{id}/rotate` — returns a new `key` value, invalidates the old |
+| POST | `/admin/v1/apikeys/{id}/rotate` — returns `{entry, plaintext}`; the new plaintext is shown **once** here and never again |
+
+The ApiKey schema (see `crates/aisix-core/src/models/apikey.rs`) is
+`deny_unknown_fields` and stores **only the SHA-256 hex digest** of
+the caller's plaintext (`key_hash`), not the plaintext itself. The
+operator (or `/rotate`) generates the plaintext, hashes it, and
+ships only the hash to the admin API.
 
 ```bash
+PLAINTEXT="sk-aisix-app-prod"
+KEY_HASH=$(printf "%s" "$PLAINTEXT" | shasum -a 256 | awk '{print $1}')
+
 curl -X POST http://localhost:3001/admin/v1/apikeys \
   -H "Authorization: Bearer $ADMIN_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "key": "sk-aisix-app-prod",
+    "key_hash": "'"$KEY_HASH"'",
     "allowed_models": ["my-gpt4"],
-    "rate_limit": {"rpm": 60, "concurrency": 10},
-    "max_budget_usd": 500.0
+    "rate_limit": {"rpm": 60, "concurrency": 10}
   }'
+```
+
+The `/rotate` endpoint replaces the stored hash and returns the new
+plaintext directly, so the operator does not need to compute the
+hash themselves on rotation:
+
+```json
+{
+  "entry": {"id": "uuid", "value": {"key_hash": "<new-hash>", …}, "revision": 43},
+  "plaintext": "sk-aisix-…"
+}
 ```
 
 ### 4.3 ProviderKeys — `/admin/v1/provider_keys`
@@ -148,16 +175,27 @@ curl -X POST http://localhost:3001/admin/v1/provider_keys \
 ### 4.4 Budgets
 
 Per-ApiKey USD spend caps live inline on the ApiKey resource
-(`max_budget_usd` field) — there is no separate `/admin/v1/budgets`
-collection. The proxy reads the budget at request start (pre-check)
-and adds the cost at end of request.
+(`max_budget_usd` field on the Rust struct) — there is no separate
+`/admin/v1/budgets` collection. The proxy reads the budget at
+request start (pre-check) and adds the cost at end of request.
+
+> ⚠️ **Known gap**: the JSON Schema in
+> `crates/aisix-core/src/models/schema.rs::apikey_schema()` does not
+> currently list `max_budget_usd` and is `additionalProperties: false`,
+> so admin POST/PUT will reject the field. In standalone mode the
+> field is therefore unreachable through the admin API today; in
+> managed mode the CP populates ApiKey rows in etcd directly and the
+> field flows through. Tracking issue covers adding the property to
+> the schema so standalone operators can set budgets via the admin
+> API as well.
 
 Team-level budgets are a SaaS-tier feature; standalone deployments
-do per-key budgeting only.
+do per-key budgeting only (subject to the gap noted above).
 
 ### 4.5 Health — `GET /admin/v1/health`
 
-Per-Model health from the in-process `HealthTracker`:
+Per-Model health from the in-process `HealthTracker`, plus a
+`config` block with the watch-supervisor's snapshot freshness:
 
 ```json
 {
@@ -165,28 +203,22 @@ Per-Model health from the in-process `HealthTracker`:
   "models": [
     {"id": "uuid", "name": "my-gpt4", "health": 0},
     {"id": "uuid", "name": "my-claude", "health": 1}
-  ]
+  ],
+  "config": {
+    "snapshot_revision": 1234567,
+    "snapshot_age_seconds": 5
+  }
 }
 ```
 
 `health` is `0` (Healthy), `1` (Degraded — 4–7 consecutive upstream
-failures), or `2` (Down — 8+).
+failures), or `2` (Down — 8+). The `config` block surfaces the etcd
+watch supervisor's freshness — a wedged watch can otherwise let the
+gateway serve a frozen snapshot for hours while still reporting
+every Model healthy. The block is omitted when the supervisor isn't
+wired (rare; e.g. a config-file-only test rig).
 
-### 4.6 Spend — `GET /admin/v1/spend`
-
-Current-month accumulated USD spend per ApiKey from the in-process
-`BudgetTracker`. Returns the period (`YYYY-MM`) plus per-key entries.
-
-```json
-{
-  "period": "2026-04",
-  "entries": [
-    {"api_key_id": "uuid", "spend_usd": 12.34}
-  ]
-}
-```
-
-### 4.7 Playground — `POST /playground/chat/completions`
+### 4.6 Playground — `POST /playground/chat/completions`
 
 Proxies a chat completion through the proxy router **in-process** —
 no extra network hop, but the request is fully audited as if it had
@@ -196,7 +228,7 @@ This endpoint expects a **proxy** API key (an `ApiKey` from the
 snapshot), not an admin key. The admin key only protects the rest
 of `/admin/v1/*`.
 
-### 4.8 OpenAPI
+### 4.7 OpenAPI
 
 - `GET /admin/openapi.json` — machine-readable OpenAPI 3 document
   generated by `utoipa` from the same handler signatures.
