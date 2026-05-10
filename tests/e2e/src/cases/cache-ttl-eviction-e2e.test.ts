@@ -12,11 +12,14 @@ import {
 
 // E2E: cache TTL expiry.
 //
-// CachePolicy carries a `ttl_seconds` field
-// (documented in `docs/api-admin.md` §4.5 cache_policies CRUD).
-// When set, an entry stored under that policy must be returned
-// from cache only while it is younger than `ttl_seconds`. After
-// expiry the gateway must miss and re-dispatch upstream.
+// CachePolicy carries a `ttl_seconds` field — defined in
+// `crates/aisix-core/src/models/cache_policy.rs` and accepted by
+// the admin API at `/admin/v1/cache_policies`. (CachePolicy CRUD
+// is not yet covered in `docs/api-admin.md`; tracked as a doc-gap
+// follow-up.) When `ttl_seconds` is set, an entry stored under
+// that policy must be returned from cache only while it is
+// younger than `ttl_seconds`. After expiry the gateway must miss
+// and re-dispatch upstream.
 //
 // One contract pinned here:
 //
@@ -106,6 +109,13 @@ describe("cache TTL eviction e2e: entry expires after ttl_seconds", () => {
         authorization: `Bearer ${CALLER_PLAINTEXT}`,
         "content-type": "application/json",
       };
+      // Probe waits not just for Model+ApiKey+ProviderKey readiness
+      // but also for the CachePolicy to land in the snapshot. Without
+      // a CachePolicy in scope the gateway emits `x-aisix-cache:
+      // disabled`; once the policy applies it emits `miss` (or `hit`
+      // for a repeat). Asserting `miss` on a fresh prompt confirms
+      // the policy is loaded — closes the propagation race the
+      // earlier G2 audit highlighted.
       await waitConfigPropagation(async () => {
         try {
           const r = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
@@ -114,7 +124,10 @@ describe("cache TTL eviction e2e: entry expires after ttl_seconds", () => {
             body: probeBody,
           });
           await r.text();
-          return r.status === 200;
+          return (
+            r.status === 200 &&
+            r.headers.get("x-aisix-cache") === "miss"
+          );
         } catch {
           return false;
         }
@@ -168,6 +181,18 @@ describe("cache TTL eviction e2e: entry expires after ttl_seconds", () => {
       expect(third.headers.get("x-aisix-cache")).toBe("miss");
       await third.text();
       expect(upstream.receivedRequests.length).toBe(baseline + 2);
+
+      // (5) Upstream wire-shape assertion: the third call's body
+      // actually carried the same prompt that drove the test, not
+      // an empty / wrong-body request whose receivedRequests count
+      // would still increment. Closes the same blind spot
+      // CLAUDE.md §8 calls out by name.
+      const lastSent = upstream.receivedRequests.at(-1);
+      expect(lastSent?.path).toBe("/v1/chat/completions");
+      expect(lastSent?.method).toBe("POST");
+      const lastBody = JSON.parse(lastSent?.body ?? "{}");
+      expect(lastBody.model).toBe("gpt-4o-mini");
+      expect(lastBody.messages?.[0]?.content).toBe("cache-ttl-prompt");
     },
     // Per-test timeout: TTL wait + headroom for the four round-trips
     // and snapshot propagation. Default 60s would also work but is
