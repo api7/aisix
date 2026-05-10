@@ -762,9 +762,16 @@ fn load_heartbeat_config_from_disk(
     ))
 }
 
-/// Register all four provider bridges on a fresh Hub. The Hub is
-/// created once at startup; future dynamic reload lands behind the
-/// same `register()` call.
+/// Register all bridge-backed provider implementations on a fresh
+/// Hub. The Hub is created once at startup; future dynamic reload
+/// lands behind the same `register()` call.
+///
+/// `Provider::Cohere` and `Provider::Jina` are intentionally NOT
+/// registered: per #213 Phases 1–2 they are exposed only via
+/// `/v1/rerank`, which is a verbatim HTTP forward (`aisix-proxy::
+/// rerank`) and bypasses the Bridge trait entirely. A bridge for
+/// either provider would be needed only when chat completions /
+/// embeddings on those providers are added.
 fn build_hub() -> Hub {
     let hub = Hub::new();
     hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));

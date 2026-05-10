@@ -245,5 +245,14 @@ mod tests {
             Provider::Deepseek.default_base_url(),
             "https://api.deepseek.com"
         );
+        // #213 Phase 1 / Phase 2: rerank-only providers. Per audit
+        // LOW-3 on PR #229 — pin these too so a regression that
+        // swaps the host (e.g. Jina's `https://api.jina.ai` →
+        // `https://api.jina.com`) fails at the unit level.
+        assert_eq!(
+            Provider::Cohere.default_base_url(),
+            "https://api.cohere.com"
+        );
+        assert_eq!(Provider::Jina.default_base_url(), "https://api.jina.ai");
     }
 }

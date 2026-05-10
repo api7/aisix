@@ -521,12 +521,20 @@ describe("rerank e2e: /v1/rerank verbatim forward + model translation", () => {
       error?: { type?: unknown; message?: unknown };
     };
     expect(body.error?.type).toBe("invalid_request_error");
-    // Per #168/#211 wording: the rejection message names the
-    // OpenAI-only restriction. The "requires OpenAI" substring is
-    // a stable marker (vs the OpenAI taxonomy enum string, which
-    // a generic invalid-request failure would also carry).
+    // Per #213 Phase 2 audit MEDIUM-1: the rejection message
+    // enumerates the accepted set `{OpenAI, Cohere, Jina}`. Pin
+    // each provider name individually so a regression that drops
+    // Cohere or Jina from the gate's error message (but still
+    // mentions OpenAI) fails this assertion. Mirrors the Rust
+    // unit test's per-substring check on
+    // `non_openai_provider_returns_400_invalid_request`. Phase
+    // 2.5+ additions can append "or Voyage" without breaking
+    // any of these three substring pins.
     expect(typeof body.error?.message).toBe("string");
-    expect(body.error?.message as string).toMatch(/requires OpenAI/i);
+    const errMsg = body.error?.message as string;
+    expect(errMsg).toMatch(/OpenAI/);
+    expect(errMsg).toMatch(/Cohere/);
+    expect(errMsg).toMatch(/Jina/);
 
     // Hard contract: upstream must NEVER be hit when the gateway
     // refuses for provider mismatch — otherwise the gateway is
