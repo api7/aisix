@@ -513,10 +513,22 @@ async fn dispatch(
         // streaming path can run output guardrails at end-of-stream
         // (buffer-then-check). Mirrors the non-streaming
         // `state.guardrails.check_output(...)` call site.
-        let stream_guardrail = Some(StreamGuardrailContext {
-            chain: Arc::clone(&state.guardrails),
-            model_name: req.model.clone(),
-        });
+        //
+        // Fast-path: skip the context entirely when no policies are
+        // configured. The Guardrail trait's `is_empty()` (audit
+        // PR #222 M2) lets `Arc<dyn Guardrail>` answer the question
+        // without a downcast. When `None`, `build_sse_stream` skips
+        // the per-chunk content accumulation and the post-loop
+        // synthesized-ChatResponse construction — both noise on
+        // the hot path for the dominant guardrail-free deployment.
+        let stream_guardrail = if state.guardrails.is_empty() {
+            None
+        } else {
+            Some(StreamGuardrailContext {
+                chain: Arc::clone(&state.guardrails),
+                model_name: req.model.clone(),
+            })
+        };
         let sse_stream = build_sse_stream(
             upstream,
             now,
@@ -545,7 +557,17 @@ async fn dispatch(
                         provider_request_id: comp.provider_request_id,
                         provider_model_version: comp.provider_model_version,
                         finish_reason: comp.finish_reason,
-                        bypass_reason: bypass_reason_for_telem,
+                        // Per #204 audit H1: merge input-side bypass
+                        // (`bypass_reason_for_telem` captured before
+                        // the upstream stream started) with the
+                        // output-side bypass observed at end-of-stream
+                        // (`comp.bypass_reason`). First-bypass-wins,
+                        // matching the non-streaming convention.
+                        bypass_reason: if !bypass_reason_for_telem.is_empty() {
+                            bypass_reason_for_telem
+                        } else {
+                            comp.bypass_reason
+                        },
                         // TODO(streaming-cache): when streaming responses
                         // become cacheable, this constant `Disabled` will
                         // silently mis-bucket cached streamed responses.
@@ -1133,6 +1155,12 @@ struct StreamCompletion {
     /// streaming-blocked path the same way the non-streaming path
     /// already does.
     guardrail_blocked: bool,
+    /// First Bypass reason observed at end-of-stream (per #204
+    /// audit H1). The non-streaming path captures Bypass into the
+    /// telemetry envelope so operators can audit which policy
+    /// fail-opened on a streamed response. Empty string = no bypass.
+    /// First-bypass-wins matches the non-streaming convention.
+    bypass_reason: String,
 }
 
 /// Parameters needed to run output-guardrail evaluation at
@@ -1331,30 +1359,47 @@ where
                         guard.comp().completion_tokens,
                     ),
                 };
-                if let aisix_guardrails::GuardrailVerdict::Block { reason } =
-                    ctx.chain.check_output(&synthesized).await
-                {
-                    // Mirror the non-streaming path's #153 redaction
-                    // contract: the wire-level message is generic
-                    // ("response blocked by content policy"), and the
-                    // rich verdict reason (which carries the matched
-                    // pattern detail) goes to operator logs only.
-                    tracing::warn!(
-                        guardrail_hook = "output",
-                        model = %ctx.model_name,
-                        reason = %reason,
-                        "guardrail blocked streaming response",
-                    );
-                    errored = true;
-                    guard.comp().guardrail_blocked = true;
-                    yield Ok::<_, Infallible>(
-                        Event::default()
-                            .event("error")
-                            .data(error_frame_payload(
-                                "content_filter",
-                                "response blocked by content policy",
-                            )),
-                    );
+                match ctx.chain.check_output(&synthesized).await {
+                    aisix_guardrails::GuardrailVerdict::Block { reason } => {
+                        // Mirror the non-streaming path's #153
+                        // redaction contract: the wire-level message
+                        // is generic ("response blocked by content
+                        // policy"), and the rich verdict reason
+                        // (which carries the matched-pattern detail)
+                        // goes to operator logs only.
+                        tracing::warn!(
+                            guardrail_hook = "output",
+                            model = %ctx.model_name,
+                            reason = %reason,
+                            "guardrail blocked streaming response",
+                        );
+                        errored = true;
+                        guard.comp().guardrail_blocked = true;
+                        yield Ok::<_, Infallible>(
+                            Event::default()
+                                .event("error")
+                                .data(error_frame_payload(
+                                    "content_filter",
+                                    "response blocked by content policy",
+                                )),
+                        );
+                    }
+                    aisix_guardrails::GuardrailVerdict::Bypass { reason } => {
+                        // Per #204 audit H1: capture an output
+                        // Bypass at end-of-stream so the post-stream
+                        // telemetry payload carries it (parallel to
+                        // the non-streaming path's first-bypass-wins
+                        // capture). An input-side bypass that fired
+                        // earlier already populated the closure's
+                        // `bypass_reason_for_telem` snapshot; only
+                        // record the output bypass when the slot is
+                        // still empty.
+                        let comp = guard.comp();
+                        if comp.bypass_reason.is_empty() {
+                            comp.bypass_reason = reason;
+                        }
+                    }
+                    aisix_guardrails::GuardrailVerdict::Allow => {}
                 }
             }
         }

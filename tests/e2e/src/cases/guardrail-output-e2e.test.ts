@@ -312,4 +312,98 @@ describe("output guardrail e2e: model-emitted forbidden text is blocked before r
     // move.
     expect(streamUpstream.receivedRequests.length - upstreamHitsBefore).toBeGreaterThan(0);
   });
+
+  test("streaming Allow path: clean content streams to caller with [DONE], no error event (#204 audit M3)", async (ctx) => {
+    if (!etcdReachable || !app || !admin) {
+      ctx.skip();
+      return;
+    }
+
+    // Per #204 audit M3: a regression that ALWAYS blocks streaming
+    // (e.g. an off-by-one `errored = true` after the guardrail
+    // check) would not fail the existing block-case test. The
+    // Allow companion below pins that the gate opens cleanly when
+    // the assistant content does NOT contain a forbidden literal:
+    // full content reaches the caller, terminal `[DONE]` appears,
+    // and there is no SSE error frame.
+    const cleanUpstream = await startOpenAiUpstream({
+      streamEvents: [
+        '{"id":"strm-clean","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
+        // Distinct phrase that does NOT contain FORBIDDEN_WORD —
+        // guardrail must Allow.
+        '{"id":"strm-clean","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"hello world clean response"},"finish_reason":null}]}',
+        '{"id":"strm-clean","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ],
+      eventDelayMs: 50,
+    });
+    const cleanPk = await admin.createProviderKey({
+      display_name: "gr-out-stream-clean-pk",
+      secret: "sk-mock",
+      api_base: `${cleanUpstream.baseUrl}/v1`,
+    });
+    await admin.createModel({
+      display_name: "gr-out-stream-clean-e2e",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: cleanPk.id,
+    });
+    const cleanCallerPlaintext = `${CALLER_PLAINTEXT}-stream-clean`;
+    await admin.createApiKey({
+      key_hash: createHash("sha256")
+        .update(cleanCallerPlaintext)
+        .digest("hex"),
+      allowed_models: ["gr-out-stream-clean-e2e"],
+    });
+
+    await waitConfigPropagation(async () => {
+      try {
+        const probe = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${cleanCallerPlaintext}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            model: "gr-out-stream-clean-e2e",
+            messages: [{ role: "user", content: "ready-probe" }],
+            stream: true,
+          }),
+        });
+        if (probe.status !== 200) {
+          await probe.text();
+          return false;
+        }
+        const text = await probe.text();
+        return text.includes("data: [DONE]") && !text.includes("event: error");
+      } catch {
+        return false;
+      }
+    });
+
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${cleanCallerPlaintext}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gr-out-stream-clean-e2e",
+        messages: [{ role: "user", content: "say hi" }],
+        stream: true,
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    const wire = await res.text();
+    // Allow path contracts:
+    expect(wire).toContain("data: [DONE]");
+    expect(wire).not.toContain("event: error");
+    // The full assistant content reaches the wire (proves the
+    // gateway didn't short-circuit pre-dispatch and didn't strip
+    // chunks on the way out).
+    expect(wire).toContain("hello world clean response");
+
+    await cleanUpstream.close();
+  });
 });

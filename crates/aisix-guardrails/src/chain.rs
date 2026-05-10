@@ -47,6 +47,10 @@ impl Guardrail for GuardrailChain {
         "chain"
     }
 
+    fn is_empty(&self) -> bool {
+        self.guardrails.is_empty()
+    }
+
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
         let mut bypass: Option<String> = None;
         for g in &self.guardrails {

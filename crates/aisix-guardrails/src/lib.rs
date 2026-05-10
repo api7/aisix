@@ -87,6 +87,15 @@ pub trait Guardrail: Send + Sync + 'static {
     async fn check_output(&self, _resp: &ChatResponse) -> GuardrailVerdict {
         GuardrailVerdict::Allow
     }
+
+    /// `true` when the guardrail will trivially `Allow` everything —
+    /// callers can skip set-up work (buffer allocations, fixture
+    /// synthesis) on the hot path. Default: `false` (assume work is
+    /// needed). Concrete impls that know they're a no-op (e.g. an
+    /// empty `GuardrailChain`) override to return `true`.
+    fn is_empty(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
