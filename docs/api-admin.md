@@ -133,8 +133,7 @@ curl -X POST http://localhost:3001/admin/v1/apikeys \
   -d '{
     "key_hash": "'"$KEY_HASH"'",
     "allowed_models": ["my-gpt4"],
-    "rate_limit": {"rpm": 60, "concurrency": 10},
-    "max_budget_usd": 500.0
+    "rate_limit": {"rpm": 60, "concurrency": 10}
   }'
 ```
 
@@ -176,16 +175,27 @@ curl -X POST http://localhost:3001/admin/v1/provider_keys \
 ### 4.4 Budgets
 
 Per-ApiKey USD spend caps live inline on the ApiKey resource
-(`max_budget_usd` field) — there is no separate `/admin/v1/budgets`
-collection. The proxy reads the budget at request start (pre-check)
-and adds the cost at end of request.
+(`max_budget_usd` field on the Rust struct) — there is no separate
+`/admin/v1/budgets` collection. The proxy reads the budget at
+request start (pre-check) and adds the cost at end of request.
+
+> ⚠️ **Known gap**: the JSON Schema in
+> `crates/aisix-core/src/models/schema.rs::apikey_schema()` does not
+> currently list `max_budget_usd` and is `additionalProperties: false`,
+> so admin POST/PUT will reject the field. In standalone mode the
+> field is therefore unreachable through the admin API today; in
+> managed mode the CP populates ApiKey rows in etcd directly and the
+> field flows through. Tracking issue covers adding the property to
+> the schema so standalone operators can set budgets via the admin
+> API as well.
 
 Team-level budgets are a SaaS-tier feature; standalone deployments
-do per-key budgeting only.
+do per-key budgeting only (subject to the gap noted above).
 
 ### 4.5 Health — `GET /admin/v1/health`
 
-Per-Model health from the in-process `HealthTracker`:
+Per-Model health from the in-process `HealthTracker`, plus a
+`config` block with the watch-supervisor's snapshot freshness:
 
 ```json
 {
@@ -193,12 +203,20 @@ Per-Model health from the in-process `HealthTracker`:
   "models": [
     {"id": "uuid", "name": "my-gpt4", "health": 0},
     {"id": "uuid", "name": "my-claude", "health": 1}
-  ]
+  ],
+  "config": {
+    "snapshot_revision": 1234567,
+    "snapshot_age_seconds": 5
+  }
 }
 ```
 
 `health` is `0` (Healthy), `1` (Degraded — 4–7 consecutive upstream
-failures), or `2` (Down — 8+).
+failures), or `2` (Down — 8+). The `config` block surfaces the etcd
+watch supervisor's freshness — a wedged watch can otherwise let the
+gateway serve a frozen snapshot for hours while still reporting
+every Model healthy. The block is omitted when the supervisor isn't
+wired (rare; e.g. a config-file-only test rig).
 
 ### 4.6 Playground — `POST /playground/chat/completions`
 
