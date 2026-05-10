@@ -49,7 +49,7 @@ Errors follow the OpenAI shape so SDK error handlers light up:
 | 404 | `model_not_found` | `req.model` does not resolve in the snapshot |
 | 413 | `request_too_large` | Body exceeds `proxy.request_body_limit_bytes` (default 10 MB) |
 | 422 | `invalid_request_error` | Schema-valid JSON but semantically wrong (e.g. empty `messages`) |
-| 429 | `rate_limit_exceeded` / `concurrency_limit_exceeded` / `budget_exceeded` | RPM/TPM/concurrency/budget cap |
+| 429 | `rate_limit_exceeded` / `budget_exceeded` | RPM/TPM/concurrency/budget cap |
 | 502 | `provider_error` | Upstream returned 5xx or invalid wire format |
 | 503 | `service_unavailable` | No bridge registered for the resolved Model's provider |
 | 504 | `request_timeout` | Upstream exceeded `Model.timeout` ms |
