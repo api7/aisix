@@ -259,6 +259,8 @@ describe("streaming edges e2e: client abort mid-stream", () => {
     const collected: string[] = [];
     let sawFinish = false;
     let surfacedError = false;
+    let errCtor = "";
+    let errMessage = "";
 
     const stream = await client.chat.completions.create({
       model: "stream-disc",
@@ -271,8 +273,11 @@ describe("streaming edges e2e: client abort mid-stream", () => {
         if (delta?.content) collected.push(delta.content);
         if (chunk.choices[0]?.finish_reason) sawFinish = true;
       }
-    } catch {
+    } catch (e) {
       surfacedError = true;
+      errCtor =
+        (e as { constructor?: { name?: string } })?.constructor?.name ?? "";
+      errMessage = (e as { message?: string })?.message ?? "";
     }
 
     // Partial chunks reached the caller. Chunk 2 carried the
@@ -284,5 +289,17 @@ describe("streaming edges e2e: client abort mid-stream", () => {
     // Iterator surfaced an error. The OpenAI Node SDK throws on
     // an SSE `event: error` chunk during stream iteration.
     expect(surfacedError).toBe(true);
+
+    // Tighten: distinguish typed `APIError` from `SyntaxError`.
+    // Without this, a regression that re-introduces a plain-string
+    // `data:` payload on the SSE error frame would still pass
+    // `surfacedError === true` because the SDK's `JSON.parse(sse.data)`
+    // (in `streaming.ts`, called BEFORE the `sse.event === "error"`
+    // check) would throw `SyntaxError("Could not parse message into
+    // JSON: ...")` instead of the typed `APIError` callers expect.
+    // See OpenAI Node SDK <https://github.com/openai/openai-node/blob/main/src/streaming.ts>
+    // for the parse-then-classify ordering.
+    expect(errCtor).not.toBe("SyntaxError");
+    expect(errMessage).not.toContain("Could not parse message into JSON");
   });
 });
