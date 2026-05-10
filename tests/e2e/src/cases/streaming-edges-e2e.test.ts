@@ -12,31 +12,30 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: streaming-edge case. One production failure mode pinned
-// here, derived from `docs/api-proxy.md` §5:
+// E2E: streaming-edge cases derived from `docs/api-proxy.md` §5:
 //
 //   - Client abort mid-stream — caller starts a streaming chat
 //     completion, then aborts the request via AbortSignal. After
 //     the abort the gateway must remain HEALTHY: subsequent
 //     streaming calls from the same caller run to completion.
-//     This pins the "no resource leak / no parser corruption"
-//     property that's externally observable from the client.
+//     Pins the "no resource leak / no parser corruption" property
+//     that's externally observable from the client.
 //
-// (The "upstream disconnect mid-stream" case — partial chunks
-// reach the caller, then iterator surfaces error per docs §5
-// "aisix sends a final error chunk and closes without [DONE]" —
-// is held back. The gateway today short-circuits to a request-
-// time 502 instead of forwarding partial chunks. See follow-up
-// issue.)
+//   - Upstream disconnects mid-stream — mock upstream emits N
+//     SSE chunks then closes the TCP connection without `[DONE]`.
+//     Per docs §5 ("If the upstream stream terminates abnormally,
+//     aisix sends a final error chunk and closes the response
+//     without `[DONE]`"), the caller MUST see partial chunks +
+//     iterator-time error + no synthetic `finish_reason:"stop"`.
 //
-// Note on scope: this case verifies gateway LIVENESS post-abort,
-// not upstream-side disconnect propagation. The harness has no
-// signal for "upstream observed the client disconnect", so a
-// regression where the gateway holds the upstream connection open
-// (silently consuming chunks after the client aborted) would
-// pass this test. Filing that as a separate harness-extension
-// task; today's coverage is "gateway stays alive", which is the
-// load-bearing user-visible contract.
+// Note on scope (client-abort case): verifies gateway LIVENESS
+// post-abort, not upstream-side disconnect propagation. The
+// harness has no signal for "upstream observed the client
+// disconnect", so a regression where the gateway holds the
+// upstream connection open (silently consuming chunks after the
+// client aborted) would pass this test. Filing that as a separate
+// harness-extension task; today's coverage is "gateway stays
+// alive", which is the load-bearing user-visible contract.
 //
 // References:
 // - Gateway's own streaming contract: `docs/api-proxy.md` §5
@@ -184,4 +183,105 @@ describe("streaming edges e2e: client abort mid-stream", () => {
     expect(followupFinishReason).toBe("stop");
   });
 
+  test("upstream disconnects mid-stream: partial chunks reach caller, iterator throws, no [DONE]", async (ctx) => {
+    if (!etcdReachable || !app || !admin) {
+      ctx.skip();
+      return;
+    }
+
+    // Mock upstream emits 2 SSE chunks then drops the connection
+    // (`disconnectAfterEvents: 2`). No `finish_reason: "stop"`,
+    // no `[DONE]` from the upstream — premature close per docs §5.
+    //
+    // `eventDelayMs: 50` between writes ensures both chunks flush
+    // to the gateway BEFORE `res.destroy()` aborts the connection.
+    // Without the delay, write buffering on the mock side can
+    // cause the destroy to land before the second chunk reaches
+    // the wire, making the test flaky on which chunks the gateway
+    // actually receives.
+    const upstream = await startOpenAiUpstream({
+      streamEvents: [
+        '{"id":"disc","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
+        '{"id":"disc","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"partial "},"finish_reason":null}]}',
+        // Never emitted (disconnect happens at i >= 2):
+        '{"id":"disc","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"never "},"finish_reason":null}]}',
+        '{"id":"disc","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ],
+      eventDelayMs: 50,
+      disconnectAfterEvents: 2,
+    });
+    upstreams.push(upstream);
+
+    const pk = await admin.createProviderKey({
+      display_name: "stream-disc-pk",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await admin.createModel({
+      display_name: "stream-disc",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+    });
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    // Use ProxyClient.listModels for snapshot-readiness gating —
+    // chat-completions probes don't work cleanly here because the
+    // mock upstream is configured for streaming with disconnects,
+    // so any chat-completions probe (with or without `stream:true`)
+    // would match the streaming-cutoff failure mode the test is
+    // meant to verify.
+    const probe = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => {
+      const r = await probe.listModels();
+      if (r.status !== 200) return false;
+      const data = (r.body as { data?: Array<{ id?: string }> }).data ?? [];
+      return data.some((m) => m.id === "stream-disc");
+    });
+
+    // Per docs §5 strict contract:
+    //   - 2 partial chunks reach the caller (the bytes the upstream
+    //     emitted before the close)
+    //   - Iterator THROWS during streaming (gateway emits SSE
+    //     `event: error` chunk, OpenAI SDK surfaces it as iteration
+    //     error)
+    //   - NO synthetic `finish_reason: "stop"` injection (would
+    //     turn truncated responses into apparently-complete ones)
+    //   - NO synthetic `[DONE]` after error (would make the SDK
+    //     treat the truncated stream as a clean completion)
+    const collected: string[] = [];
+    let sawFinish = false;
+    let surfacedError = false;
+
+    const stream = await client.chat.completions.create({
+      model: "stream-disc",
+      messages: [{ role: "user", content: "give me content" }],
+      stream: true,
+    });
+    try {
+      for await (const chunk of stream) {
+        const delta = chunk.choices[0]?.delta;
+        if (delta?.content) collected.push(delta.content);
+        if (chunk.choices[0]?.finish_reason) sawFinish = true;
+      }
+    } catch {
+      surfacedError = true;
+    }
+
+    // Partial chunks reached the caller. Chunk 2 carried the
+    // string "partial "; chunk 1 was role-only with no content.
+    expect(collected.join("")).toBe("partial ");
+    // No fake completion signal. The upstream's mid-stream close
+    // happened BEFORE the chunk that carries finish_reason:"stop".
+    expect(sawFinish).toBe(false);
+    // Iterator surfaced an error. The OpenAI Node SDK throws on
+    // an SSE `event: error` chunk during stream iteration.
+    expect(surfacedError).toBe(true);
+  });
 });
