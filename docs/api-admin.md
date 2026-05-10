@@ -133,7 +133,8 @@ curl -X POST http://localhost:3001/admin/v1/apikeys \
   -d '{
     "key_hash": "'"$KEY_HASH"'",
     "allowed_models": ["my-gpt4"],
-    "rate_limit": {"rpm": 60, "concurrency": 10}
+    "rate_limit": {"rpm": 60, "concurrency": 10},
+    "max_budget_usd": 500.0
   }'
 ```
 
@@ -175,22 +176,12 @@ curl -X POST http://localhost:3001/admin/v1/provider_keys \
 ### 4.4 Budgets
 
 Per-ApiKey USD spend caps live inline on the ApiKey resource
-(`max_budget_usd` field on the Rust struct) — there is no separate
-`/admin/v1/budgets` collection. The proxy reads the budget at
-request start (pre-check) and adds the cost at end of request.
-
-> ⚠️ **Known gap**: the JSON Schema in
-> `crates/aisix-core/src/models/schema.rs::apikey_schema()` does not
-> currently list `max_budget_usd` and is `additionalProperties: false`,
-> so admin POST/PUT will reject the field. In standalone mode the
-> field is therefore unreachable through the admin API today; in
-> managed mode the CP populates ApiKey rows in etcd directly and the
-> field flows through. Tracking issue covers adding the property to
-> the schema so standalone operators can set budgets via the admin
-> API as well.
+(`max_budget_usd` field) — there is no separate `/admin/v1/budgets`
+collection. The proxy reads the budget at request start (pre-check)
+and adds the cost at end of request.
 
 Team-level budgets are a SaaS-tier feature; standalone deployments
-do per-key budgeting only (subject to the gap noted above).
+do per-key budgeting only.
 
 ### 4.5 Health — `GET /admin/v1/health`
 

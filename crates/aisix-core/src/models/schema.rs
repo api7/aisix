@@ -195,7 +195,8 @@ fn apikey_schema() -> Value {
                 "type": "array",
                 "items": { "type": "string" }
             },
-            "rate_limit": { "$ref": "#/$defs/rate_limit" }
+            "rate_limit": { "$ref": "#/$defs/rate_limit" },
+            "max_budget_usd": { "type": "number", "minimum": 0 }
         },
         "$defs": {
             "rate_limit": {
@@ -501,6 +502,26 @@ mod tests {
         // Schema permits []; runtime ApiKey::can_access enforces deny-all.
         let v = json!({"key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20","allowed_models":[]});
         validate_apikey(&v).unwrap();
+    }
+
+    #[test]
+    fn apikey_with_max_budget_usd_passes() {
+        let v = json!({
+            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models":["a","b"],
+            "max_budget_usd": 500.0
+        });
+        validate_apikey(&v).unwrap();
+    }
+
+    #[test]
+    fn apikey_negative_max_budget_usd_rejected() {
+        let v = json!({
+            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models":["a"],
+            "max_budget_usd": -1.0
+        });
+        assert!(validate_apikey(&v).is_err());
     }
 
     #[test]
