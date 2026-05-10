@@ -14,10 +14,14 @@ import {
 // E2E: prompt-response cache policy, identical-request short-circuit.
 // With a `CachePolicy{applies_to: "all", enabled: true}` in scope, two
 // identical chat completions must result in the upstream being hit only
-// once — the second response is served from cache. The gateway also
-// emits a public `x-aisix-cache: hit|miss|disabled` response header
-// (depended on by cp-api and the dashboard's /logs view) which the
-// caller must observe.
+// once — the second response is served from cache. The gateway emits
+// a public `x-aisix-cache: hit|miss` response header (per
+// `docs/api-proxy.md` §3 — `hit` if served from cache, `miss`
+// otherwise; absent for streaming responses and absent when no
+// enabled cache_policy applies to the request). The header is
+// observed by cp-api and the dashboard's /logs view via the
+// telemetry path; both the header and the persisted
+// `usage_events.cache_status` field expose the cache outcome.
 //
 // Reference: OpenAI Chat Completions API spec
 // (https://platform.openai.com/docs/api-reference/chat/create) for
@@ -123,11 +127,15 @@ describe("cache policy e2e: identical request hits cache", () => {
     expect(second.choices[0]?.message.role).toBe("assistant");
 
     // Caller-observable cache signaling — the gateway emits an
-    // `x-aisix-cache: hit|miss|disabled` header that cp-api and the
-    // dashboard's /logs view depend on. The OpenAI SDK swallows
-    // response headers, so drop down to fetch directly to verify.
-    // Use a fresh prompt so this header check doesn't reuse the cache
-    // entry built up by the SDK calls above.
+    // `x-aisix-cache: hit|miss` header (`miss` on first call when
+    // an enabled policy applies, `hit` on identical follow-up).
+    // The header is absent when no enabled cache_policy matches
+    // the request — that "no header" outcome is pinned in the Rust
+    // unit `disabled_cache_policy_does_not_cache_and_emits_no_header`.
+    // The OpenAI SDK swallows response headers, so drop down to
+    // fetch directly to verify. Use a fresh prompt so this header
+    // check doesn't reuse the cache entry built up by the SDK calls
+    // above.
     const headerCheckHeaders = {
       authorization: `Bearer ${CALLER_PLAINTEXT}`,
       "content-type": "application/json",

@@ -279,6 +279,19 @@ mod tests {
             .insert(ResourceEntry::new(format!("cp-id-{name}"), policy, 1));
     }
 
+    /// Disabled-policy seeder for #154 regression coverage. Posts a
+    /// `CachePolicy{enabled: false, applies_to: "all"}` so the
+    /// cache-gate predicate at chat.rs (`entry.value.enabled && ...`)
+    /// must skip it.
+    fn seed_cache_policy_disabled(snap: &AisixSnapshot, name: &str) {
+        let cfg = format!(
+            r#"{{"name": "{name}", "backend": "memory", "applies_to": "all", "enabled": false}}"#,
+        );
+        let policy: aisix_core::models::CachePolicy = serde_json::from_str(&cfg).unwrap();
+        snap.cache_policies
+            .insert(ResourceEntry::new(format!("cp-id-{name}"), policy, 1));
+    }
+
     fn seed_snapshot_with_limits(
         model: &str,
         allowed: &[&str],
@@ -1530,6 +1543,69 @@ data: [DONE]\n\n";
             assert!(
                 resp.headers().get("x-aisix-cache").is_none(),
                 "policy-gate-closed responses must not carry x-aisix-cache",
+            );
+        }
+    }
+
+    /// Issue #154 regression: a CachePolicy with `enabled: false`
+    /// must NOT cache. The disabled policy must be filtered out by
+    /// the find-first-enabled predicate at the chat.rs cache gate;
+    /// every identical request must reach the upstream and the
+    /// response must NOT carry an `x-aisix-cache` header (per the
+    /// "policy-gate-closed = no header" contract pinned by the
+    /// `applies_to_filters_out_unmatched_model` test above).
+    #[tokio::test]
+    async fn disabled_cache_policy_does_not_cache_and_emits_no_header() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-uncached",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "always-fresh"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(3) // each call must reach the upstream
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        // The disabled policy applies_to="all" (would match every
+        // request), but `enabled: false` MUST cause the find-first-
+        // enabled predicate to skip it.
+        seed_cache_policy_disabled(&snap, "off-policy");
+        let state = build_state_with_cache(snap, hub);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        // All three calls: 200, no `x-aisix-cache` header (policy
+        // is disabled). wiremock's `.expect(3)` fails the test if
+        // any call short-circuited via cache (= the disable flag
+        // wasn't honored).
+        for _ in 0..3 {
+            let resp = run(build_router(state.clone()), make_req()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(
+                resp.headers().get("x-aisix-cache").is_none(),
+                "disabled cache_policy must not emit x-aisix-cache header"
             );
         }
     }
