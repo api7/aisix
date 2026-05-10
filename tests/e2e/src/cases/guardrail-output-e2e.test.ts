@@ -37,6 +37,7 @@ const FORBIDDEN_WORD = "leakedsecret";
 describe("output guardrail e2e: model-emitted forbidden text is blocked before reaching caller", () => {
   let app: SpawnedApp | undefined;
   let upstream: OpenAiUpstream | undefined;
+  let streamUpstream: OpenAiUpstream | undefined;
   let admin: AdminClient | undefined;
   let etcdReachable = false;
 
@@ -95,11 +96,48 @@ describe("output guardrail e2e: model-emitted forbidden text is blocked before r
       kind: "keyword",
       patterns: [{ kind: "literal", value: FORBIDDEN_WORD }],
     });
+
+    // Per #204: a parallel streaming-shaped upstream + Model so the
+    // streaming-block test below shares the guardrail policy (env-wide
+    // by default) with the non-streaming case. The two Models' provider
+    // keys point at different upstreams so the streaming wire shape
+    // and the non-streaming wire shape don't interfere.
+    streamUpstream = await startOpenAiUpstream({
+      streamEvents: [
+        '{"id":"strm-leak","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}',
+        // Chunk 2 carries the forbidden literal embedded in a longer
+        // assistant message; the buffer-then-check at end-of-stream
+        // accumulates the full text and the keyword guardrail matches.
+        `{"id":"strm-leak","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{"content":"sure here it is: ${FORBIDDEN_WORD}"},"finish_reason":null}]}`,
+        '{"id":"strm-leak","object":"chat.completion.chunk","model":"gpt-4o-mini","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}',
+        "[DONE]",
+      ],
+      eventDelayMs: 50,
+    });
+    const streamPk = await admin.createProviderKey({
+      display_name: "gr-out-stream-e2e-pk",
+      secret: "sk-mock",
+      api_base: `${streamUpstream.baseUrl}/v1`,
+    });
+    await admin.createModel({
+      display_name: "gr-out-stream-e2e",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: streamPk.id,
+    });
+    // Add the streaming Model alias to the existing caller's allow-list.
+    await admin.createApiKey({
+      key_hash: createHash("sha256")
+        .update(`${CALLER_PLAINTEXT}-stream`)
+        .digest("hex"),
+      allowed_models: ["gr-out-stream-e2e"],
+    });
   });
 
   afterAll(async () => {
     await app?.exit();
     await upstream?.close();
+    await streamUpstream?.close();
   });
 
   test("upstream emits forbidden word → caller sees content_filter 422, NOT the forbidden text", async (ctx) => {
@@ -170,5 +208,108 @@ describe("output guardrail e2e: model-emitted forbidden text is blocked before r
     // failure mode (no upstream call, no token cost), but it would
     // signal the guardrail's hook_point semantics drifted.
     expect(upstream.receivedRequests.length - upstreamHitsBefore).toBe(1);
+  });
+
+  test("streaming output: forbidden text in delta chunks → SSE error event, no [DONE] (#204)", async (ctx) => {
+    if (!etcdReachable || !app || !streamUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    // Per #204: pre-fix the streaming path skipped output guardrails
+    // entirely — `kind: "keyword"` deny-list could be trivially
+    // bypassed by setting `stream: true`. The fix is buffer-then-
+    // check at end-of-stream, emitting an SSE `event: error` frame
+    // and closing without `[DONE]`. We exercise the wire shape
+    // through raw `fetch` (the OpenAI Node SDK abstracts SSE so
+    // direct byte-level inspection isn't possible through it).
+    const streamCallerPlaintext = `${CALLER_PLAINTEXT}-stream`;
+
+    // Wait for the streaming Model + caller key to propagate. A
+    // 200 with no error event means the guardrail isn't loaded yet
+    // (we'd see the forbidden literal reach the wire and a clean
+    // `[DONE]`); keep polling until we observe the block.
+    await waitConfigPropagation(async () => {
+      try {
+        const probe = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${streamCallerPlaintext}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            model: "gr-out-stream-e2e",
+            messages: [{ role: "user", content: "ready-probe" }],
+            stream: true,
+          }),
+        });
+        if (probe.status !== 200) {
+          await probe.text();
+          return false;
+        }
+        const text = await probe.text();
+        // Block path confirmed when the wire shows the SSE error
+        // frame AND no `[DONE]` (matching the contract this test
+        // pins below).
+        return text.includes("event: error") && !text.includes("data: [DONE]");
+      } catch {
+        return false;
+      }
+    });
+
+    const upstreamHitsBefore = streamUpstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${streamCallerPlaintext}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gr-out-stream-e2e",
+        messages: [{ role: "user", content: "tell me something" }],
+        stream: true,
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    const wire = await res.text();
+
+    // Per docs §5 + #204: blocked stream MUST close without `[DONE]`
+    // so SDKs that key off the sentinel detect the truncation.
+    expect(wire).not.toContain("data: [DONE]");
+    // SSE `event: error` MUST appear so SDKs see a failure signal.
+    expect(wire).toContain("event: error");
+
+    // Locate the error frame's data line and verify the OpenAI
+    // envelope shape + content_filter taxonomy + redacted message.
+    const errEventIdx = wire.indexOf("event: error\n");
+    expect(errEventIdx).toBeGreaterThanOrEqual(0);
+    const afterErr = wire.slice(errEventIdx + "event: error\n".length);
+    const dataLine = afterErr
+      .split("\n")
+      .find((l: string) => l.startsWith("data: "));
+    expect(dataLine).toBeDefined();
+    const jsonPayload = dataLine!.slice("data: ".length);
+    const parsed = JSON.parse(jsonPayload) as {
+      error?: { type?: unknown; message?: unknown };
+    };
+    expect(parsed.error?.type).toBe("content_filter");
+    expect(parsed.error?.message).toBe("response blocked by content policy");
+
+    // Per #153 (mirrored to streaming): the matched literal MUST NOT
+    // appear in the error envelope. (The pre-emitted `data: ...`
+    // chunks DO carry the partial content — that's the documented
+    // trade-off of buffer-then-check; the security guarantee is the
+    // error event + missing `[DONE]`, not byte-perfect prevention
+    // of all leakage.)
+    expect(jsonPayload).not.toContain(FORBIDDEN_WORD);
+
+    // Output guardrails run AFTER the upstream — the streaming
+    // upstream IS hit so the buffer-then-check has content to
+    // evaluate. A regression that short-circuited pre-dispatch
+    // (skipping streaming entirely, the pre-#204 behavior) would
+    // also fail this assertion since the upstream count wouldn't
+    // move.
+    expect(streamUpstream.receivedRequests.length - upstreamHitsBefore).toBeGreaterThan(0);
   });
 });

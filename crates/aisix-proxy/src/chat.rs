@@ -509,45 +509,58 @@ async fn dispatch(
         let model_id_for_telem = model_id.clone();
         let api_key_id_for_telem = auth.entry.id.clone();
         let bypass_reason_for_telem = bypass_reason.clone().unwrap_or_default();
-        let sse_stream = build_sse_stream(upstream, now, move |comp: StreamCompletion| {
-            // Existing: rate-limit accounting (TPM cap) — see #108.
-            limiter.add_tokens_post_stream(&post_stream_key, comp.total_tokens);
-            // Telemetry: emit with the actual upstream-reported counts.
-            // cost_usd stays 0.0; cp-api recomputes server-side from
-            // its model_pricing catalog (same pattern as the non-
-            // streaming path's cost_usd handling).
-            emit_usage_event(
-                &state_for_telem,
-                &request_id_for_telem,
-                &model_id_for_telem,
-                &api_key_id_for_telem,
-                /* status_code */ 200,
-                started.elapsed(),
-                comp.prompt_tokens,
-                comp.completion_tokens,
-                UsageExtras {
-                    cached_prompt_tokens: comp.cached_prompt_tokens,
-                    reasoning_tokens: comp.reasoning_tokens,
-                    cache_creation_tokens: comp.cache_creation_tokens,
-                    cache_read_tokens: comp.cache_read_tokens,
-                    provider_request_id: comp.provider_request_id,
-                    provider_model_version: comp.provider_model_version,
-                    finish_reason: comp.finish_reason,
-                    bypass_reason: bypass_reason_for_telem,
-                    // TODO(streaming-cache): when streaming responses
-                    // become cacheable, this constant `Disabled` will
-                    // silently mis-bucket cached streamed responses.
-                    // Propagate the dispatch path's `cache_status`
-                    // local at that point. Tracking issue to be filed
-                    // alongside the streaming-cache implementation.
-                    cache_status: CacheStatus::Disabled.as_str().to_string(),
-                    cache_hit_saved_input_tokens: 0,
-                    cache_hit_saved_output_tokens: 0,
-                },
-                /* cost_usd */ 0.0,
-                /* guardrail_blocked */ false,
-            );
+        // Per #204: pass the gateway's guardrail chain so the
+        // streaming path can run output guardrails at end-of-stream
+        // (buffer-then-check). Mirrors the non-streaming
+        // `state.guardrails.check_output(...)` call site.
+        let stream_guardrail = Some(StreamGuardrailContext {
+            chain: Arc::clone(&state.guardrails),
+            model_name: req.model.clone(),
         });
+        let sse_stream = build_sse_stream(
+            upstream,
+            now,
+            stream_guardrail,
+            move |comp: StreamCompletion| {
+                // Existing: rate-limit accounting (TPM cap) — see #108.
+                limiter.add_tokens_post_stream(&post_stream_key, comp.total_tokens);
+                // Telemetry: emit with the actual upstream-reported counts.
+                // cost_usd stays 0.0; cp-api recomputes server-side from
+                // its model_pricing catalog (same pattern as the non-
+                // streaming path's cost_usd handling).
+                emit_usage_event(
+                    &state_for_telem,
+                    &request_id_for_telem,
+                    &model_id_for_telem,
+                    &api_key_id_for_telem,
+                    /* status_code */ 200,
+                    started.elapsed(),
+                    comp.prompt_tokens,
+                    comp.completion_tokens,
+                    UsageExtras {
+                        cached_prompt_tokens: comp.cached_prompt_tokens,
+                        reasoning_tokens: comp.reasoning_tokens,
+                        cache_creation_tokens: comp.cache_creation_tokens,
+                        cache_read_tokens: comp.cache_read_tokens,
+                        provider_request_id: comp.provider_request_id,
+                        provider_model_version: comp.provider_model_version,
+                        finish_reason: comp.finish_reason,
+                        bypass_reason: bypass_reason_for_telem,
+                        // TODO(streaming-cache): when streaming responses
+                        // become cacheable, this constant `Disabled` will
+                        // silently mis-bucket cached streamed responses.
+                        // Propagate the dispatch path's `cache_status`
+                        // local at that point. Tracking issue to be filed
+                        // alongside the streaming-cache implementation.
+                        cache_status: CacheStatus::Disabled.as_str().to_string(),
+                        cache_hit_saved_input_tokens: 0,
+                        cache_hit_saved_output_tokens: 0,
+                    },
+                    /* cost_usd */ 0.0,
+                    comp.guardrail_blocked,
+                );
+            },
+        );
         let response =
             Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
         return Ok(Success {
@@ -1114,6 +1127,25 @@ struct StreamCompletion {
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
+    /// `true` when an OUTPUT guardrail blocked the response at
+    /// end-of-stream (per #204). Read by the on_complete telemetry
+    /// closure so `usage_events.guardrail_blocked` reflects the
+    /// streaming-blocked path the same way the non-streaming path
+    /// already does.
+    guardrail_blocked: bool,
+}
+
+/// Parameters needed to run output-guardrail evaluation at
+/// end-of-stream. Per #204 the streaming path used to skip output
+/// guardrails entirely — a `kind: "keyword"` deny-list could be
+/// trivially bypassed by setting `stream: true`. Buffer-then-check
+/// is the right cadence for blocking guardrails (per-chunk evaluation
+/// would still leak prefix bytes 1..N-1 by the time chunk N matches).
+struct StreamGuardrailContext {
+    chain: Arc<dyn aisix_guardrails::Guardrail>,
+    /// Surface in tracing only; the wire envelope is intentionally
+    /// generic per #153 ("response blocked by content policy").
+    model_name: String,
 }
 
 /// Fires `on_complete` with whatever `StreamCompletion` has been
@@ -1159,6 +1191,7 @@ impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
 fn build_sse_stream<F>(
     upstream: aisix_gateway::ChatChunkStream,
     created: i64,
+    output_guardrail: Option<StreamGuardrailContext>,
     on_complete: F,
 ) -> impl Stream<Item = Result<Event, Infallible>>
 where
@@ -1174,6 +1207,17 @@ where
             slot: Some((on_complete, StreamCompletion::default())),
         };
         futures::pin_mut!(upstream);
+        // Per #204: accumulate the assistant's content across chunks
+        // so the output guardrail can evaluate the full response at
+        // end-of-stream. Allocates only when an output guardrail is
+        // configured AND the upstream actually emits content; for
+        // requests without an output guardrail this is a no-op
+        // borrow of the empty string.
+        let mut content_buffer = if output_guardrail.is_some() {
+            Some(String::new())
+        } else {
+            None
+        };
         // Accumulate the upstream's `usage` block + per-chunk metadata
         // across the stream. Providers typically populate `usage` on
         // the terminal chunk only; using "max" rather than "last" makes
@@ -1201,6 +1245,16 @@ where
                     }
                     if let Some(fr) = chunk.finish_reason.as_ref() {
                         comp.finish_reason = finish_reason_label(fr);
+                    }
+                    // Per #204: accumulate the assistant's content
+                    // when an output guardrail is configured. Skip
+                    // entirely when none is configured to avoid the
+                    // allocation on the hot path.
+                    if let (Some(buf), Some(text)) = (
+                        content_buffer.as_mut(),
+                        chunk.delta.content.as_deref(),
+                    ) {
+                        buf.push_str(text);
                     }
                     if let Some(u) = chunk.usage.as_ref() {
                         if u.prompt_tokens > comp.prompt_tokens {
@@ -1247,6 +1301,63 @@ where
             };
             yield Ok::<_, Infallible>(ev);
         }
+        // Per #204: run the output guardrail on the accumulated
+        // assistant content BEFORE emitting `[DONE]`. Buffer-then-
+        // check is the right cadence for a blocking guardrail:
+        // per-chunk evaluation would still leak prefix bytes
+        // 1..N-1 to the caller by the time chunk N matches the
+        // forbidden literal — the secret reaches the wire
+        // regardless. We accept the latency cost (whole completion
+        // buffered) in exchange for the security control.
+        //
+        // Skip the check entirely when:
+        //   - no output guardrail is configured (`content_buffer` is `None`)
+        //   - the upstream stream errored (already sending error frame; no `[DONE]`)
+        // The `errored` skip means a partially-streamed forbidden
+        // literal would have already reached the caller — but per
+        // docs §5 abnormal termination, the gateway has already
+        // signaled the failure via SSE error event. Running the
+        // guardrail on the partial would only add a second error
+        // frame, not retroactively redact the leak.
+        if !errored {
+            if let (Some(content), Some(ctx)) = (content_buffer.as_ref(), output_guardrail.as_ref()) {
+                let synthesized = aisix_gateway::ChatResponse {
+                    id: guard.comp().provider_request_id.clone(),
+                    model: guard.comp().provider_model_version.clone(),
+                    message: aisix_gateway::ChatMessage::assistant(content.clone()),
+                    finish_reason: aisix_gateway::FinishReason::Stop,
+                    usage: aisix_gateway::UsageStats::new(
+                        guard.comp().prompt_tokens,
+                        guard.comp().completion_tokens,
+                    ),
+                };
+                if let aisix_guardrails::GuardrailVerdict::Block { reason } =
+                    ctx.chain.check_output(&synthesized).await
+                {
+                    // Mirror the non-streaming path's #153 redaction
+                    // contract: the wire-level message is generic
+                    // ("response blocked by content policy"), and the
+                    // rich verdict reason (which carries the matched
+                    // pattern detail) goes to operator logs only.
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        model = %ctx.model_name,
+                        reason = %reason,
+                        "guardrail blocked streaming response",
+                    );
+                    errored = true;
+                    guard.comp().guardrail_blocked = true;
+                    yield Ok::<_, Infallible>(
+                        Event::default()
+                            .event("error")
+                            .data(error_frame_payload(
+                                "content_filter",
+                                "response blocked by content policy",
+                            )),
+                    );
+                }
+            }
+        }
         // Stream completed normally. Yield [DONE] BEFORE the guard
         // drops at end-of-scope so the SSE sentinel reaches the
         // client before the on_complete telemetry fan-out. (Any
@@ -1260,7 +1371,8 @@ where
         //
         // Per docs §5: skip `[DONE]` on abnormal termination so SDK
         // consumers can detect truncation. The `errored` flag is
-        // set by the loop above whenever an error event is yielded.
+        // set by the loop above whenever an error event is yielded
+        // OR by the output-guardrail check above on a Block verdict.
         if !errored {
             yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
         }

@@ -916,6 +916,132 @@ data: <not valid json>\n\n";
         );
     }
 
+    /// Issue #204: streaming responses MUST run output guardrails at
+    /// end-of-stream (buffer-then-check). Pre-fix the streaming path
+    /// skipped output guardrails entirely — a `kind: "keyword"`
+    /// deny-list could be trivially bypassed by setting `stream:
+    /// true`. This test pins:
+    ///
+    ///   - 200 OK + SSE wire shape (the request itself is well-formed)
+    ///   - upstream IS hit (output guardrails run AFTER the upstream call)
+    ///   - the response wire bytes contain an SSE `event: error` frame
+    ///     with the OpenAI envelope shape
+    ///   - the wire bytes contain NO terminal `[DONE]` (per docs §5
+    ///     pattern: a guardrail block is an abnormal termination)
+    ///   - the matched literal does NOT appear anywhere in the
+    ///     wire bytes that follow the error frame (the redaction
+    ///     mirrors #153's non-streaming contract)
+    ///
+    /// Note: the pre-emitted `data: ...` chunks DO contain "secret"
+    /// (the assistant's content reaching the caller's iterator
+    /// before the buffer-then-check completes). That's the
+    /// fundamental trade-off the issue's fix-shape discussion calls
+    /// out for buffer-then-check; preventing prefix bytes from
+    /// reaching the wire would require holding ALL chunks server-
+    /// side until the check fires, which negates streaming's
+    /// latency-to-first-token benefit. The buffer-then-check
+    /// guarantee is "no `[DONE]` and an error event signals the
+    /// block" — what we assert here.
+    #[tokio::test]
+    async fn streaming_output_guardrail_blocks_with_sse_error_event_and_no_done() {
+        use aisix_guardrails::{GuardrailChain, KeywordBlocklist, KeywordRule};
+
+        let upstream = MockServer::start().await;
+        // Upstream emits 3 SSE chunks: role, then content containing
+        // the forbidden literal, then the terminal stop. The full
+        // assistant content the guardrail evaluates is "leak: secret-string"
+        // which the keyword guardrail at "secret-string" must block.
+        let sse = "\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"leak: secret-string\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(
+            KeywordBlocklist::output_only(vec![KeywordRule::literal("secret-string")]),
+        )]));
+        let state = build_state(snap, hub).with_guardrails(guardrails);
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut wire = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            wire.extend_from_slice(chunk.unwrap().as_ref());
+        }
+        let wire_str = String::from_utf8(wire).expect("SSE bytes are utf8");
+
+        // Per docs §5 abnormal-termination contract (the guardrail
+        // block is the streaming-equivalent of an abnormal close):
+        // NO `[DONE]` after the error event. SDK consumers that key
+        // off `[DONE]` need to detect the truncation.
+        assert!(
+            !wire_str.contains("data: [DONE]"),
+            "blocked stream MUST close without [DONE]; got wire:\n{wire_str}"
+        );
+        // SSE `event: error` frame MUST appear so SDK consumers see
+        // a failure signal.
+        assert!(
+            wire_str.contains("event: error"),
+            "blocked stream MUST emit `event: error`; got wire:\n{wire_str}"
+        );
+        // The error frame's data MUST be valid OpenAI-envelope JSON
+        // with `error.type: "content_filter"` (parallel to #153's
+        // non-streaming contract).
+        let err_event_idx = wire_str.find("event: error\n").unwrap();
+        let after_err = &wire_str[err_event_idx + "event: error\n".len()..];
+        let data_line = after_err
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .expect("error event followed by a data line");
+        let json_payload = &data_line["data: ".len()..];
+        let parsed: serde_json::Value = serde_json::from_str(json_payload)
+            .expect("error frame data must be valid OpenAI-envelope JSON");
+        assert_eq!(
+            parsed["error"]["type"], "content_filter",
+            "error.type must mark the guardrail block; got {json_payload}"
+        );
+        // Per #153: the matched literal MUST NOT appear inside the
+        // error frame envelope (the *error*, not the pre-emitted
+        // chunks — those carry the partial content that buffer-
+        // then-check accepts as a known trade-off).
+        let error_message = parsed["error"]["message"].as_str().unwrap();
+        assert!(
+            !error_message.contains("secret-string"),
+            "guardrail leaked the matched literal in the error envelope; got {error_message:?}"
+        );
+        assert_eq!(
+            error_message, "response blocked by content policy",
+            "wire-level message must use the redacted static string per #153"
+        );
+    }
+
     // ---- regression coverage for issue #107 -------------------------
     // Pre-fix only /v1/chat/completions enforced rate-limit / budget;
     // every other LLM endpoint silently bypassed both. The test below
