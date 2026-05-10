@@ -49,7 +49,7 @@ unset values are omitted from the envelope.
 | 401 | `invalid_api_key` | — | Missing, malformed, or unknown bearer/`x-api-key` |
 | 403 | `permission_denied` | — | Key valid but Model not in `allowed_models` |
 | 404 | `model_not_found` | — | `req.model` does not resolve in the snapshot |
-| 413 | (axum default) | — | Body exceeds axum's built-in `Json<…>` extractor limit (2 MiB). The `proxy.request_body_limit_bytes` config field is reserved for future use and not yet wired — track this in the follow-up product issue. |
+| 413 | (axum default) | — | Body exceeds axum's built-in `Json<…>` extractor limit (2 MiB). The `proxy.request_body_limit_bytes` config field is currently unused — see [#193](https://github.com/api7/ai-gateway/issues/193) for the wiring follow-up. |
 | 422 | `content_filter` | — | Guardrail rejected request or response content |
 | 429 | `rate_limit_exceeded` | — | RPM/TPM/concurrency cap engaged (all three quotas surface here — the gateway does not split concurrency into a separate code) |
 | 429 | `billing_error` | `budget_exceeded` | Per-key USD budget exhausted |
