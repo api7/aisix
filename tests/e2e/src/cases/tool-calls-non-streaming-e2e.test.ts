@@ -75,6 +75,26 @@ const TOOL_DEFINITION = {
   },
 };
 
+// Second tool — exercised on the request-side wire-shape gate so a
+// regression that kept only `tools[0]` (e.g. `tools.slice(0, 1)`)
+// is caught. The model isn't expected to invoke this one in the
+// canned response below, but it MUST reach upstream so the model
+// sees the full tool catalogue.
+const SECOND_TOOL_DEFINITION = {
+  type: "function" as const,
+  function: {
+    name: "get_time",
+    description: "Get the current time in a timezone",
+    parameters: {
+      type: "object",
+      properties: {
+        timezone: { type: "string" },
+      },
+      required: ["timezone"],
+    },
+  },
+};
+
 const NON_STREAM_BODY = {
   id: "chatcmpl-tool-nonstream-1",
   object: "chat.completion",
@@ -179,7 +199,10 @@ describe("tool_calls non-streaming e2e: round-trip via OpenAI SDK", () => {
           content: "What's the weather in Beijing?",
         },
       ],
-      tools: [TOOL_DEFINITION],
+      // Two tools so a regression that kept only the first
+      // (e.g. tools.slice(0, 1) or "first-tool wins" dispatch)
+      // surfaces against the per-position equality below.
+      tools: [TOOL_DEFINITION, SECOND_TOOL_DEFINITION],
       tool_choice: "auto",
     });
 
@@ -228,7 +251,16 @@ describe("tool_calls non-streaming e2e: round-trip via OpenAI SDK", () => {
     // (4) tools array preserved in full — type, function name +
     // description, AND the JSON Schema parameters block (which
     // upstream needs verbatim to dispatch the right tool).
-    expect(sentBody.tools).toEqual([TOOL_DEFINITION]);
+    // toEqual is structural; that is the right contract on the
+    // request side because upstreams consume `tools` as a JSON
+    // tree, not a byte stream. The function.arguments byte-equal
+    // gate above is where strict serialization matters (downstream
+    // tool handlers DO consume the literal string).
+    expect(sentBody.tools).toHaveLength(2);
+    expect(sentBody.tools).toEqual([
+      TOOL_DEFINITION,
+      SECOND_TOOL_DEFINITION,
+    ]);
     // (5) tool_choice preserved. A regression that defaulted it
     // to a different value (e.g. "none" by accident) would change
     // upstream behavior even with the tools array intact.
