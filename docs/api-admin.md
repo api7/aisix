@@ -138,6 +138,9 @@ curl -X POST http://localhost:3001/admin/v1/apikeys \
   }'
 ```
 
+> `max_budget_usd` is enforced only in SaaS / managed mode. See
+> §4.4 for the standalone caveat and the SaaS propagation model.
+
 The `/rotate` endpoint replaces the stored hash and returns the new
 plaintext directly, so the operator does not need to compute the
 hash themselves on rotation:
@@ -191,11 +194,16 @@ Two flows run in parallel between the DP and cp-api:
   calls cp-api over mTLS at `GET /dp/budget_check?api_key_id=<uuid>`
   with a 5 s LRU cache per api_key. `allow=false` becomes a 429
   `BudgetExceeded` before upstream dispatch.
-- **Usage push** — each completion enqueues a `UsageEvent`; a
-  worker (`crates/aisix-server/src/telemetry.rs`) batches up to
-  100 events or flushes every 5 s and POSTs them to
-  `/dp/telemetry`. cp-api consumes this stream to update the
-  authoritative spend, which feeds subsequent budget-check calls.
+- **Usage push** — each `/v1/chat/completions` and `/v1/messages`
+  request enqueues a `UsageEvent`; a worker
+  (`crates/aisix-server/src/telemetry.rs`) batches up to 100
+  events or flushes every 5 s and POSTs them to `/dp/telemetry`.
+  cp-api consumes this stream to update the authoritative spend,
+  which feeds subsequent budget-check calls. **`/v1/responses`,
+  `/v1/embeddings`, `/v1/audio*`, `/v1/images*`, and `/v1/rerank`
+  do not emit usage events today** (see the comment in
+  `crates/aisix-proxy/src/chat.rs`), so spend on those endpoints
+  is not yet reflected in cp-api's ledger — tracked as #226.
 
 Worst-case propagation between an over-cap completion and a
 follow-up 429 is therefore ≈ 10 s (5 s telemetry flush + 5 s
