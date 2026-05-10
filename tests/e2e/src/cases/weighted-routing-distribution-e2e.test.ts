@@ -237,7 +237,7 @@ describe("weighted routing distribution e2e: 70/30 split lands inside [55,85] / 
     expect(aDelta + bDelta).toBe(TOTAL_REQUESTS);
 
     // Distribution assertion: heavy side ~70, light side ~30, both
-    // inside ±10. A round-robin regression (50/50) fails both gates;
+    // inside ±15. A round-robin regression (50/50) fails both gates;
     // a pin-to-one regression (100/0) fails both gates.
     expect(aDelta).toBeGreaterThanOrEqual(HEAVY_LO);
     expect(aDelta).toBeLessThanOrEqual(HEAVY_HI);
