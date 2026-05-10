@@ -415,7 +415,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_role_is_rejected_as_config_error() {
+    async fn tool_role_without_tool_call_id_is_rejected_as_config_error() {
+        // Tool role IS supported (translates to Anthropic
+        // `{role:"user", content:[{type:"tool_result", ...}]}`)
+        // when paired with a tool_call_id. Without one, there's no
+        // way to pair the result with its originating tool_use, so
+        // the gateway rejects with Config.
         let server = MockServer::start().await;
         let bridge = AnthropicBridge::new();
         let ctx = sample_ctx(&server.uri());
@@ -426,7 +431,7 @@ mod tests {
                 content: "tool output".into(),
                 content_blocks: None,
                 name: None,
-                tool_call_id: Some("tc_1".into()),
+                tool_call_id: None,
                 extra: serde_json::Map::new(),
             }],
         );

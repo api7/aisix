@@ -245,4 +245,106 @@ describe("tools cross-provider e2e: OpenAI tools → Anthropic upstream tool_use
     // Caller's user message reaches upstream intact.
     expect(sentBody.messages?.[0]?.role).toBe("user");
   });
+
+  test("agent-loop turn 2: caller posts {role:'tool', tool_call_id} → Anthropic gets tool_result", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    // After turn 1 (user → assistant tool_use), the OpenAI-shape
+    // agent loop posts the tool's output via {role:"tool",
+    // tool_call_id, content}. Without translation the Anthropic
+    // bridge would 400. With translation the upstream receives
+    // {role:"user", content:[{type:"tool_result", tool_use_id, content}]}
+    // and the conversation continues.
+    const baseline = upstream.receivedRequests.length;
+    await client.chat.completions.create({
+      model: "tools-xprov",
+      messages: [
+        { role: "user", content: "What's the weather in SF?" },
+        // (real callers would also include the assistant's
+        // tool_calls turn here; we skip it because Anthropic only
+        // requires the tool_use_id to be referenced in the next
+        // user-side tool_result.)
+        {
+          role: "tool",
+          tool_call_id: "toolu_xprov_01",
+          content: "72F, sunny",
+        },
+      ],
+    });
+
+    const messagesReq = upstream.receivedRequests
+      .slice(baseline)
+      .find((r) => r.path === "/v1/messages");
+    expect(messagesReq).toBeDefined();
+
+    const sentBody = JSON.parse(messagesReq!.body) as {
+      messages?: Array<{
+        role?: string;
+        content?: Array<{
+          type?: string;
+          tool_use_id?: string;
+          content?: string;
+        }>;
+      }>;
+    };
+    // Last message should be a user-role turn with a tool_result
+    // content block (Anthropic's shape per docs).
+    const lastMsg = sentBody.messages?.[sentBody.messages.length - 1];
+    expect(lastMsg?.role).toBe("user");
+    const block = lastMsg?.content?.[0];
+    expect(block?.type).toBe("tool_result");
+    expect(block?.tool_use_id).toBe("toolu_xprov_01");
+    expect(block?.content).toBe("72F, sunny");
+  });
+
+  test("tool_choice translates from OpenAI shape to Anthropic shape", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    const baseline = upstream.receivedRequests.length;
+    await client.chat.completions.create({
+      model: "tools-xprov",
+      messages: [{ role: "user", content: "Call something." }],
+      // OpenAI's most-common tool_choice value. Forwarded
+      // verbatim to Anthropic, this would 400 (Anthropic expects
+      // an object, not a string).
+      tool_choice: "auto",
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "noop",
+            parameters: { type: "object", properties: {} },
+          },
+        },
+      ],
+    });
+
+    const messagesReq = upstream.receivedRequests
+      .slice(baseline)
+      .find((r) => r.path === "/v1/messages");
+    expect(messagesReq).toBeDefined();
+
+    const sentBody = JSON.parse(messagesReq!.body) as {
+      tool_choice?: { type?: string };
+    };
+    expect(sentBody.tool_choice).toEqual({ type: "auto" });
+  });
 });
