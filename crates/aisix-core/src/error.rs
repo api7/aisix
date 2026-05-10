@@ -270,5 +270,4 @@ mod tests {
         assert!(body.get("error_msg").is_some());
         assert!(body.get("error").is_none());
     }
-
 }
