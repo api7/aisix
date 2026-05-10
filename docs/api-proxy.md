@@ -188,9 +188,13 @@ return 400.
 
 ### 4.7 `POST /v1/rerank`
 
-Cohere-style rerank. Routed to `{base}/v1/rerank`. The Model's
+OpenAI-style rerank. Routed to `{base}/v1/rerank`. The Model's
 provider supplies the API key; the request body is forwarded
-verbatim after rewriting the `model` field.
+verbatim after rewriting the `model` field. **OpenAI Models only —
+non-OpenAI providers return 400** (parallel to §4.6). Anthropic has
+no rerank API; Gemini's and DeepSeek's OpenAI-compat surfaces do
+not implement `/v1/rerank`, so routing to those would silently
+dispatch to an upstream that 404s.
 
 ### 4.8 `POST /v1/audio/transcriptions` / `translations` / `speech`
 
@@ -200,6 +204,10 @@ binary audio stream; the others return JSON with text + segments.
 ### 4.9 `POST /v1/images/generations`
 
 OpenAI Images API. Forwarded with the `model` field rewritten.
+**OpenAI Models only — non-OpenAI providers return 400** (parallel
+to §4.6). Anthropic has no image-generation API; Gemini's image
+generation lives at a different URL with a different body shape;
+DeepSeek doesn't expose image generation.
 
 ### 4.10 `ANY /passthrough/{provider}/*rest`
 

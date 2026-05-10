@@ -108,6 +108,22 @@ async fn dispatch(
     let _reservation = crate::quota::enforce(state, auth).await?;
 
     let model = &model_entry.value;
+
+    // Per #168: only OpenAI's API exposes the documented `/v1/rerank`
+    // route + body shape. Anthropic has no rerank API; Gemini's
+    // OpenAI-compat surface does not implement `/v1/rerank`;
+    // DeepSeek's does not either. Routing a non-OpenAI Model here
+    // would silently dispatch to an upstream that 404s — a confusing
+    // failure for callers who follow `docs/api-proxy.md` §4.7
+    // configuration verbatim. Reject explicitly with 400 (parallel
+    // to /v1/responses §4.6) so the configuration error is visible
+    // at the gateway boundary rather than masked by an upstream 404.
+    if model.provider != Some(aisix_core::models::Provider::Openai) {
+        return Err(ProxyError::InvalidRequest(format!(
+            "model `{model_name}` is not an OpenAI provider; /v1/rerank requires OpenAI"
+        )));
+    }
+
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
     let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?.to_string();
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
@@ -252,6 +268,14 @@ mod tests {
         ResourceEntry::new("m-1", m, 1)
     }
 
+    fn anthropic_model(name: &str) -> ResourceEntry<Model> {
+        let json = format!(
+            r#"{{"display_name":"{name}","provider":"anthropic","model_name":"claude-3-5-haiku-20241022","provider_key_id":"{PK_ID}"}}"#
+        );
+        let m: Model = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("m-1", m, 1)
+    }
+
     fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json =
             format!(r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}"}}"#);
@@ -341,6 +365,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Issue #168 regression: only OpenAI's API exposes the
+    /// documented `/v1/rerank` route + body shape. A non-OpenAI
+    /// Model configured here must be rejected at the gateway
+    /// boundary with 400 (parallel to /v1/responses §4.6) rather
+    /// than dispatched to an upstream that would 404.
+    #[tokio::test]
+    async fn non_openai_provider_returns_400_invalid_request() {
+        let snap = new_snap("https://api.anthropic.com");
+        snap.models.insert(anthropic_model("anthropic-rerank"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "anthropic-rerank",
+                "query": "search",
+                "documents": ["doc1"]
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("requires OpenAI"),
+            "rejection should reference OpenAI restriction; got {message:?}"
+        );
     }
 
     #[tokio::test]

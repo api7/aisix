@@ -108,6 +108,25 @@ async fn dispatch(
     let _reservation = crate::quota::enforce(state, auth).await?;
 
     let model = &model_entry.value;
+
+    // Per #168: only OpenAI's API has the documented
+    // `/v1/images/generations` route + body shape. Anthropic has no
+    // image-generation API at all; Gemini's image generation lives
+    // at a different URL (`/v1beta/models/...:generateContent`) with
+    // a different body shape; DeepSeek doesn't expose image
+    // generation. Routing a non-OpenAI Model here would silently
+    // dispatch to an upstream that 404s — a confusing failure for
+    // callers who follow `docs/api-proxy.md` §4.9 configuration
+    // verbatim. Reject explicitly with 400 (parallel to
+    // /v1/responses §4.6) so the configuration error is visible
+    // at the gateway boundary.
+    if model.provider != Some(aisix_core::models::Provider::Openai) {
+        return Err(ProxyError::InvalidRequest(format!(
+            "model `{model_name}` is not an OpenAI provider; \
+             /v1/images/generations requires OpenAI"
+        )));
+    }
+
     let provider = crate::dispatch::require_provider(model)?;
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
 
@@ -196,6 +215,19 @@ mod tests {
         ResourceEntry::new("m-1", m, 1)
     }
 
+    fn anthropic_model_entry(name: &str) -> ResourceEntry<Model> {
+        let json = format!(
+            r#"{{
+                "display_name": "{name}",
+                "provider": "anthropic",
+                "model_name": "claude-3-5-haiku-20241022",
+                "provider_key_id": "{PK_ID}"
+            }}"#
+        );
+        let m: Model = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("m-1", m, 1)
+    }
+
     fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json =
             format!(r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}"}}"#);
@@ -240,6 +272,37 @@ mod tests {
             "created": 1_700_000_000i64,
             "data": [{"url": "https://example.com/image.png"}]
         })
+    }
+
+    /// Issue #168 regression: only OpenAI's API has the documented
+    /// `/v1/images/generations` route + body shape. A non-OpenAI
+    /// Model configured here must be rejected at the gateway
+    /// boundary with 400 (parallel to /v1/responses §4.6) rather
+    /// than dispatched to an upstream that would 404 (or worse,
+    /// hit a different Gemini route shape).
+    #[tokio::test]
+    async fn non_openai_provider_returns_400_invalid_request() {
+        let snap = new_snap("https://api.anthropic.com");
+        snap.models.insert(anthropic_model_entry("anthropic-image"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({
+            "model": "anthropic-image",
+            "prompt": "A sunset over mountains"
+        });
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("requires OpenAI"),
+            "rejection should reference OpenAI restriction; got {message:?}"
+        );
     }
 
     #[tokio::test]
