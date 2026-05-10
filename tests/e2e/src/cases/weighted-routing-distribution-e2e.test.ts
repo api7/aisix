@@ -26,17 +26,20 @@ import {
 //     statistically reasonable tolerance window around the declared
 //     ratio. A regression that ignored `weight` and round-robined
 //     instead would fail (each side would land ~50%, well outside
-//     [60, 80] / [20, 40]).
+//     [55, 85] / [15, 45]).
 //
 // Reference: OpenAI Chat Completions API spec for the shape the
 // caller sees (https://platform.openai.com/docs/api-reference/chat).
 //
-// The 100-request count and the [60, 80] / [20, 40] tolerance are
-// chosen so that even a moderately uneven scheduler (drift of a few
-// percent within a 100-sample window) still passes, while a scheduler
-// that completely ignores weight (e.g. round-robins, or pins to one
-// target) cannot. Two independent binomial windows: 70±10 and 30±10
-// comfortably covers a 99% interval at p=0.7 over n=100 (σ≈4.6).
+// The 100-request count and the [55, 85] / [15, 45] tolerance are
+// chosen so a scheduler that completely ignores weight (e.g.
+// round-robins or pins to one target) cannot pass — round-robin
+// lands at 50/50, well outside [55, 85] for the heavy side — while
+// the legitimate 70/30 path stays comfortably inside. Two
+// independent binomial windows: 70±15 over n=100 with σ≈4.58 puts
+// the gate at ~3.3σ, P(false positive) ≈ 0.1%. The previous ±10
+// gate sat at ~2.2σ (≈2.8%) and tripped roughly once per ~36 CI
+// runs — wide enough to be a steady CI flake.
 
 const CALLER_PLAINTEXT = "sk-wr-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -46,13 +49,14 @@ const CALLER_KEY_HASH = createHash("sha256")
 const TOTAL_REQUESTS = 100;
 const HEAVY_WEIGHT = 70;
 const LIGHT_WEIGHT = 30;
-// Tolerance: weight ±10 absolute on a 100-sample window.
-const HEAVY_LO = 60;
-const HEAVY_HI = 80;
-const LIGHT_LO = 20;
-const LIGHT_HI = 40;
+// Tolerance: weight ±15 absolute on a 100-sample window. See header
+// comment for the statistical-power tradeoff vs the previous ±10.
+const HEAVY_LO = 55;
+const HEAVY_HI = 85;
+const LIGHT_LO = 15;
+const LIGHT_HI = 45;
 
-describe("weighted routing distribution e2e: 70/30 split lands inside [60,80] / [20,40]", () => {
+describe("weighted routing distribution e2e: 70/30 split lands inside [55,85] / [15,45]", () => {
   let app: SpawnedApp | undefined;
   let upstreamA: OpenAiUpstream | undefined;
   let upstreamB: OpenAiUpstream | undefined;
