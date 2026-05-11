@@ -66,6 +66,8 @@ jobs:
       # Picked up by crates/aisix-admin/tests/etcd_integration.rs.
       # Same skip-if-unset pattern as the Redis case above.
       ADMIN_TEST_ETCD_URL: http://127.0.0.1:2379
+      # Picked up by crates/aisix-etcd/tests/watch_integration.rs.
+      ETCD_TEST_URL: http://127.0.0.1:2379
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

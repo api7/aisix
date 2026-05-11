@@ -170,12 +170,15 @@ impl ConfigProvider for EtcdConfigProvider {
         let opts = WatchOptions::new()
             .with_prefix()
             .with_start_revision(start_revision);
-        let (_watcher, stream) = client
+        let (watcher, stream) = client
             .watch(self.prefix.as_bytes(), Some(opts))
             .await
             .map_err(|e| ProviderError::Watch(format_error_chain(&e)))?;
 
-        Ok(Box::new(EtcdWatchStream { inner: stream }))
+        Ok(Box::new(EtcdWatchStream {
+            inner: stream,
+            _watcher: watcher,
+        }))
     }
 }
 
@@ -186,6 +189,9 @@ impl ConfigProvider for EtcdConfigProvider {
 /// [`ProviderError::Compacted`] so the supervisor can resync.
 pub struct EtcdWatchStream {
     inner: etcd_client::WatchStream,
+    // Must outlive `inner` — dropping the Watcher closes the client→server
+    // half of the gRPC stream, causing the server to tear down the watch.
+    _watcher: etcd_client::Watcher,
 }
 
 impl Stream for EtcdWatchStream {
