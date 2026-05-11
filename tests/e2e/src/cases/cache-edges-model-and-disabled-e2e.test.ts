@@ -21,12 +21,17 @@ import {
 //      hashed only the prompt would have served a Model-A response
 //      to a Model-B caller.
 //
-//   2. `CachePolicy.enabled: false` truly disables caching for the
-//      matching scope. With a disabled policy in scope, every call
-//      hits upstream and the gateway emits `x-aisix-cache: disabled`
-//      (never `hit`). A regression that ignored the `enabled` flag
-//      would silently keep caching despite the operator having
-//      turned it off.
+//   2. A scope covered ONLY by a `CachePolicy { enabled: false }`
+//      sees no caching: every call re-hits the upstream and the
+//      `x-aisix-cache` response header is absent. Per
+//      `docs/api-proxy.md` §3 the header values are `hit` or
+//      `miss` only — when no enabled policy applies (whether
+//      because none exists or because the matching one is
+//      disabled), the header is omitted entirely. A regression
+//      that selected a disabled policy as the active one (and
+//      then cached anyway) would either still emit the header or
+//      still skip upstream on the second identical call; either
+//      surfaces here.
 //
 // References:
 //   - cache fingerprint contents: `docs/api-proxy.md` §4.2 (PR #191)
@@ -92,12 +97,21 @@ describe("cache edges: model in fingerprint + enabled:false bypass", () => {
         "cache-edges-disabled",
       ],
     });
-    // One enabled policy applying to A and B; one disabled policy
-    // narrowed to the third Model.
+    // Two enabled policies scoped narrowly to A and B respectively
+    // so test (1) has caching ON for those Models, plus one
+    // disabled policy scoped to the third Model. Crucially the
+    // enabled policies must NOT use `applies_to:"all"` — if they
+    // did, the third Model would also match an enabled rule and
+    // test (2) would observe caching despite the disabled policy.
     await admin.json("POST", "/admin/v1/cache_policies", {
-      name: "cache-edges-enabled-policy",
+      name: "cache-edges-policy-a",
       enabled: true,
-      applies_to: "all",
+      applies_to: "model:cache-edges-A",
+    });
+    await admin.json("POST", "/admin/v1/cache_policies", {
+      name: "cache-edges-policy-b",
+      enabled: true,
+      applies_to: "model:cache-edges-B",
     });
     await admin.json("POST", "/admin/v1/cache_policies", {
       name: "cache-edges-disabled-policy",
@@ -213,7 +227,7 @@ describe("cache edges: model in fingerprint + enabled:false bypass", () => {
   );
 
   test(
-    "(2) CachePolicy enabled:false → every call hits upstream, header is `disabled`",
+    "(2) scope covered only by enabled:false policy → no caching, no x-aisix-cache header",
     async (ctx) => {
       if (!etcdReachable || !app || !upstream) {
         ctx.skip();
@@ -225,15 +239,11 @@ describe("cache edges: model in fingerprint + enabled:false bypass", () => {
         "content-type": "application/json",
       };
 
-      // The disabled-policy Model has `enabled:false`. The gateway
-      // must emit `x-aisix-cache: disabled` and re-dispatch upstream
-      // on every call — never `miss` (which would mean a fresh
-      // fingerprint that would have been stored had policy been on)
-      // and never `hit`.
-      //
       // Readiness probe — wait until the gateway can dispatch
-      // through this Model. `disabled` is what we expect to see;
-      // status 200 alone is enough since the model is reachable.
+      // through this Model AND the disabled-policy state is in
+      // effect (no x-aisix-cache header). Asserting header-absent
+      // confirms the snapshot does not surface an enabled policy
+      // matching this Model.
       await waitConfigPropagation(async () => {
         try {
           const r = await fetch(`${app!.proxyUrl}/v1/chat/completions`, {
@@ -245,7 +255,10 @@ describe("cache edges: model in fingerprint + enabled:false bypass", () => {
             }),
           });
           await r.text();
-          return r.status === 200;
+          return (
+            r.status === 200 &&
+            r.headers.get("x-aisix-cache") === null
+          );
         } catch {
           return false;
         }
@@ -257,14 +270,16 @@ describe("cache edges: model in fingerprint + enabled:false bypass", () => {
         messages: [{ role: "user", content: SHARED_PROMPT }],
       });
 
-      // Fire two identical calls; both must miss-cache and both
-      // must re-hit upstream.
+      // Fire two identical calls; both must omit the cache header
+      // AND both must re-hit upstream. A regression that picked a
+      // disabled policy as if it were enabled would either emit
+      // the header on hit or skip upstream on the second call.
       const r1 = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
         method: "POST",
         headers: reqHeaders,
         body,
       });
-      expect(r1.headers.get("x-aisix-cache")).toBe("disabled");
+      expect(r1.headers.get("x-aisix-cache")).toBeNull();
       await r1.text();
       expect(upstream.receivedRequests.length).toBe(baseline + 1);
 
@@ -273,12 +288,7 @@ describe("cache edges: model in fingerprint + enabled:false bypass", () => {
         headers: reqHeaders,
         body,
       });
-      // Critical: the second identical call must STILL hit upstream
-      // when the policy is disabled. A regression that treated
-      // `enabled:false` as "use the cache but don't show it in the
-      // header" would emit `disabled` here but skip upstream — the
-      // count assertion below catches that.
-      expect(r2.headers.get("x-aisix-cache")).toBe("disabled");
+      expect(r2.headers.get("x-aisix-cache")).toBeNull();
       await r2.text();
       expect(upstream.receivedRequests.length).toBe(baseline + 2);
     },
