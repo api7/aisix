@@ -81,7 +81,7 @@ The current provider enum includes:
 - `gemini`
 - `deepseek`
 
-Provider support is not identical across every endpoint. The current high-level support summary is captured in the [Feature Matrix](feature-matrix.md), and a dedicated provider compatibility reference is part of the ongoing docs rebuild tracked in the [Roadmap](../roadmap.md).
+Provider support is not identical across every endpoint. The current high-level support summary is captured in the [Feature Matrix](feature-matrix.md), and the current provider-oriented reference lives in [Provider Compatibility](../reference/provider-compatibility.md).
 
 ## Deployment Modes
 
@@ -112,4 +112,5 @@ Main docs describe current, verified behavior. Planned capabilities are tracked 
 - [Deployment Modes](deployment-modes.md)
 - [Core Concepts](core-concepts.md)
 - [Feature Matrix](feature-matrix.md)
+- [Provider Compatibility](../reference/provider-compatibility.md)
 - [Self-Hosted Quickstart](../quickstart/self-hosted.md)

@@ -22,30 +22,35 @@ This documentation set is organized for two primary audiences:
 ### I want to get a gateway running quickly
 
 - Follow the [Self-Hosted Quickstart](quickstart/self-hosted.md).
-- Then continue with the first model and API key setup once the next quickstart pages land.
+- Continue with [First Model, First Key, First Request](quickstart/first-model-first-key-first-request.md).
 - If you are evaluating the managed control plane, use the [Deployment Modes](overview/deployment-modes.md) and [Roadmap](roadmap.md) pages first.
 
 ### I want to integrate an SDK or client
 
-- Start with [What Is AISIX AI Gateway](overview/what-is-aisix-ai-gateway.md) and the current gateway surface summary on this page.
-- Full integration guides are part of the upcoming docs expansion tracked in the [Roadmap](roadmap.md).
+- Start with the [OpenAI-Compatible API](integration/openai-compatible-api.md).
+- Use the quickstarts to configure a working model and caller key first.
 
 ### I want to operate the gateway in production
 
 - Start with the [Self-Hosted Quickstart](quickstart/self-hosted.md).
+- Review [Bootstrap Configuration](configuration/bootstrap-config.md).
+- Use [Admin API](configuration/admin-api.md) to manage dynamic resources.
+- Continue with the dedicated configuration pages for models, keys, routing, caching, and guardrails.
 - Use the [Feature Matrix](overview/feature-matrix.md) to understand current coverage.
-- Follow the [Roadmap](roadmap.md) for upcoming operations pages.
+- Use the operations, reference, cloud, and tutorial sections for the current docs set.
 
 ## Documentation Structure
 
 - [Overview](overview/what-is-aisix-ai-gateway.md)
 - [Quickstart](quickstart/self-hosted.md)
-- Client Integration
-- Gateway Configuration
-- AISIX Cloud
-- Operations
-- Reference
-- Tutorials
+- [Client Integration](integration/openai-compatible-api.md)
+- [Gateway Configuration](configuration/bootstrap-config.md)
+- [Models](configuration/models.md)
+- [API Keys](configuration/api-keys.md)
+- [AISIX Cloud](cloud/overview.md)
+- [Operations](operations/production-deployment.md)
+- [Reference](reference/proxy-api-reference.md)
+- [Tutorials](tutorials/build-a-virtual-model-with-failover.md)
 - [Roadmap](roadmap.md)
 
 ## Product Boundary
@@ -75,7 +80,7 @@ The gateway currently exposes these client-facing routes:
 - `POST /v1/images/generations`
 - `ANY /passthrough/:provider/*rest`
 
-Detailed integration and reference pages are part of the ongoing docs rebuild tracked in the [Roadmap](roadmap.md).
+Start with [OpenAI-Compatible API](integration/openai-compatible-api.md) and the [Reference](reference/proxy-api-reference.md) section.
 
 ## Current Admin Surface
 
@@ -92,7 +97,7 @@ The standalone gateway admin listener currently supports:
 - OpenAPI
 - in-process playground
 
-Detailed configuration and reference pages are part of the ongoing docs rebuild tracked in the [Roadmap](roadmap.md).
+Start with [Admin API](configuration/admin-api.md), [Bootstrap Configuration](configuration/bootstrap-config.md), and the dedicated configuration pages.
 
 ## Next Steps
 

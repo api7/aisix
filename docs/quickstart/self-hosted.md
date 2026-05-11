@@ -113,4 +113,5 @@ This quickstart only verifies gateway bootstrap. Dynamic resources such as model
 
 - Review [What Is AISIX AI Gateway](../overview/what-is-aisix-ai-gateway.md).
 - Compare [Deployment Modes](../overview/deployment-modes.md).
-- Track the next quickstart and integration pages in the [Roadmap](../roadmap.md).
+- Continue to [First Model, First Key, First Request](first-model-first-key-first-request.md).
+- Learn the current [OpenAI-Compatible API](../integration/openai-compatible-api.md).
