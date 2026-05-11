@@ -134,6 +134,11 @@ async fn enforce_request_body_limit(
         .and_then(|s| s.parse::<usize>().ok())
     {
         if declared > state.request_body_limit_bytes {
+            // Drain the inbound body so hyper can flush the 413 response
+            // on the same HTTP/1.1 connection. Without this, hyper closes
+            // the socket while the client is still writing, and the client
+            // sees EPIPE/ECONNRESET instead of the 413.
+            drain_body(request.into_body()).await;
             return ProxyError::RequestTooLarge {
                 limit_bytes: state.request_body_limit_bytes,
             }
@@ -141,6 +146,27 @@ async fn enforce_request_body_limit(
         }
     }
     next.run(request).await
+}
+
+/// Read and discard the inbound body up to [`DRAIN_CAP`] bytes.
+///
+/// Capped so a malicious `Content-Length: 999999999999` cannot pin
+/// the connection indefinitely.  32 MiB is 3× the default body limit
+/// (10 MiB) — well above any legitimate overshoot.
+async fn drain_body(body: axum::body::Body) {
+    use http_body_util::BodyExt;
+
+    const DRAIN_CAP: usize = 32 * 1024 * 1024;
+    let mut drained = 0usize;
+    let mut body = body;
+    while let Some(Ok(frame)) = body.frame().await {
+        if let Some(data) = frame.data_ref() {
+            drained += data.len();
+            if drained >= DRAIN_CAP {
+                break;
+            }
+        }
+    }
 }
 
 async fn health(

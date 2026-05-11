@@ -77,9 +77,17 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
   const cfgPath = join(dir, "config.yaml");
   await writeFile(cfgPath, yamlStringify(cfg), "utf8");
 
+  // Strip AISIX_* env vars so they don't leak into the binary's
+  // config loader (which treats AISIX_<KEY> as config overrides).
+  const childEnv: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined && !k.startsWith("AISIX_")) childEnv[k] = v;
+  }
+  childEnv.RUST_LOG = process.env.RUST_LOG ?? "warn";
+
   const child = spawn(BIN_PATH, ["--config", cfgPath], {
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, RUST_LOG: process.env.RUST_LOG ?? "warn" },
+    env: childEnv,
   });
 
   let stderrBuf = "";
