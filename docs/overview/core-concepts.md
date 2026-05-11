@@ -75,7 +75,7 @@ Current schema supports:
 Important current boundary:
 
 - `keyword` guardrails are the current in-process guardrail path.
-- `bedrock` appears in the schema, but should not be documented as generally available runtime behavior yet.
+- `bedrock` has runtime implementation behind the `bedrock` feature and should be treated as an advanced capability with support and deployment caveats rather than as a planned-only feature.
 
 ## Cache Policy
 
@@ -97,8 +97,8 @@ Current `applies_to` matching understands:
 
 Important current boundary:
 
-- `memory` is the current enforced cache backend.
-- `redis` is present in schema and planning shape, but should not be documented as fully available runtime behavior yet.
+- `memory` is the default cache backend.
+- `redis` has runtime connection and backend selection logic today, but should be treated as a limited capability until the broader cache documentation and support boundaries are fully written down.
 
 ## Observability Exporter
 

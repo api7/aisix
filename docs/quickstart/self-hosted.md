@@ -59,7 +59,7 @@ cache:
 ## Step 3: Start the gateway
 
 ```bash title="Build and run locally"
-cargo run -- --config config.yaml
+cargo run -p aisix-server --bin aisix -- --config config.yaml
 ```
 
 In another terminal, you should now have:
@@ -77,8 +77,10 @@ curl -s http://127.0.0.1:3000/health
 
 Verify the admin listener:
 
-```bash title="Check admin health"
-curl -s http://127.0.0.1:3001/health
+```bash title="Check operator health surface"
+curl -s \
+  -H "Authorization: Bearer YOUR_ADMIN_KEY" \
+  http://127.0.0.1:3001/admin/v1/health
 ```
 
 ## Expected Result
@@ -94,13 +96,12 @@ The proxy health response should include a JSON body like:
 }
 ```
 
-The admin health response should include a JSON body like:
+The operator health response should include a JSON body with a top-level `status` field and a `models` array. For example:
 
 ```json
 {
   "status": "ok",
-  "models": 0,
-  "apikeys": 0
+  "models": []
 }
 ```
 

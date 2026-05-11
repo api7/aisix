@@ -29,9 +29,9 @@ Use it as a navigation aid, not as a replacement for detailed feature pages.
 | Rate limits and concurrency limits | Available | Current docs should treat these as active gateway behavior. |
 | Routing models and failover | Available | Current model schema supports routing strategies and retry budget behavior. |
 | Keyword guardrails | Available | Current schema and runtime support keyword guardrails. |
-| Bedrock guardrails | Planned | Present in schema, but not documented as generally available runtime behavior. |
+| Bedrock guardrails | Limited | Current code includes feature-gated runtime wiring. Treat it as an advanced capability with deployment and support caveats rather than as a planned-only feature. |
 | Memory-backed response caching | Available | Current cache policy behavior centers on memory-backed caching. |
-| Redis-backed cache policy | Planned | Present in schema shape, but not yet documented as fully available runtime behavior. |
+| Redis-backed cache policy | Limited | Current code includes Redis backend selection and connection logic. Treat it as implemented with support caveats until the full cache docs land. |
 | Observability exporters | Available | Current admin surface and resource model include observability exporters. |
 
 ## AISIX Cloud

@@ -63,11 +63,11 @@ Do not assume that every Cloud feature is a gateway feature.
 
 For example, the current AISIX Cloud playground is a control-plane preview path and does **not** send traffic through the managed data plane. That means it does not exercise data-plane cache, guardrails, rate limiting, or routing behavior.
 
-See [AISIX Cloud Overview](../cloud/overview.md) and [Cloud Playground](../cloud/cloud-playground.md) for details.
+Dedicated Cloud pages are part of the ongoing docs rebuild tracked in the [Roadmap](../roadmap.md).
 
 ## Related Pages
 
 - [What Is AISIX AI Gateway](what-is-aisix-ai-gateway.md)
 - [Core Concepts](core-concepts.md)
-- [AISIX Cloud Overview](../cloud/overview.md)
-- [AISIX Cloud Managed Data Plane Quickstart](../quickstart/aisix-cloud-managed-dp.md)
+- [Feature Matrix](feature-matrix.md)
+- [Roadmap](../roadmap.md)
