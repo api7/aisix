@@ -39,13 +39,9 @@ async fn watch_stream_delivers_events_after_put() {
 
     let prefix = unique_prefix();
     let endpoints = vec![url.clone()];
-    let provider = EtcdConfigProvider::connect(
-        &endpoints,
-        prefix.clone(),
-        None,
-    )
-    .await
-    .expect("connect");
+    let provider = EtcdConfigProvider::connect(&endpoints, prefix.clone(), None)
+        .await
+        .expect("connect");
 
     let (_entries, revision) = provider.load_all().await.expect("load_all");
 
