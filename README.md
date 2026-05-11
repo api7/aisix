@@ -5,6 +5,12 @@
 
 `aisix` is a Rust-native AI inference gateway: low cold-start, native streaming, single static binary.
 
+Documentation lives under [`docs/`](docs/index.md). Start with:
+
+- [`docs/index.md`](docs/index.md)
+- [`docs/quickstart/self-hosted.md`](docs/quickstart/self-hosted.md)
+- [`docs/quickstart/first-model-first-key-first-request.md`](docs/quickstart/first-model-first-key-first-request.md)
+
 It runs in two modes from the same binary:
 
 - **Standalone** — operator drives configuration through the Admin API on `:3001`. Self-hosted; no control plane.
@@ -23,9 +29,9 @@ Surfaces and capabilities currently in main:
   - Audio: `POST /v1/audio/transcriptions`, `/translations`, `/speech`
   - Images: `POST /v1/images/generations`
   - Listing: `GET /v1/models`
-  - Provider passthrough escape hatch: `ANY /passthrough/{provider}/*rest`
+  - Provider passthrough escape hatch: `ANY /passthrough/:provider/*rest`
 
-- **Providers** — OpenAI, Anthropic, Gemini, DeepSeek (one bridge crate per vendor; OpenAI-shape `model: "<provider>/<id>"` selects the bridge)
+- **Providers** — OpenAI, Anthropic, Gemini, DeepSeek
 
 - **Admin API (`:3001`)** — CRUD on every routing entity, JSON-Schema validated, OpenAPI 3 + Scalar UI at `/admin/openapi-scalar`
   - `/admin/v1/models`
@@ -41,13 +47,13 @@ Surfaces and capabilities currently in main:
 
 - **Caching** — moka in-process exact-match cache + cost-saved telemetry (cache_hit_saved_input/output_tokens). Per-policy TTL. `applies_to` matcher on model + api_key scopes (Stage 3). Cache key includes `tools`, `response_format`, `seed`, `stop`. Backends: `memory`, `redis` (via feature flag).
 
-- **Guardrails** — input + output hooks, fail-open opt-in. Two kinds shipped: `keyword` (literal + regex blocklist), `bedrock` (AWS Bedrock Guardrails dispatch via `aws-sdk-bedrockruntime`). Live config from etcd; chain bypass recorded on telemetry for compliance audit.
+- **Guardrails** — input + output hooks, fail-open opt-in. `keyword` is the current in-process guardrail path. `bedrock` exists in the resource shape and runtime wiring, but should be treated conservatively until the broader customer-facing runtime boundary is fully documented.
 
 - **Rate limiting** — fixed-window RPM/RPD + post-deduct TPM/TPD + concurrency semaphore. Two-phase commit so token cost is known before the counter advances. Per-ApiKey scope today.
 
 - **Observability** — Prometheus `/metrics`; per-request structured access log; per-env `ObservabilityExporter` (`kind=otlp_http`) fan-out emitting one OTLP/HTTP-JSON GenAI span per chat completion to each enabled exporter (Langfuse, Honeycomb, Grafana Cloud, any OTLP receiver). Platform-level OTLP tracing of internal request-pipeline spans is scaffold ([#49]).
 
-- **Telemetry events** — DP-side `UsageEvent` per request with cache_status, reasoning, provider-id detail, guardrail bypass reason, and `inbound_protocol` (`"openai"` / `"anthropic"`) so dashboard Logs disambiguate the SDK from the upstream `provider` label. Emitted by `/v1/chat/completions` and `/v1/messages` (passthrough-streaming and other endpoints land in a follow-up). Posted to cp-api in managed mode; consumed by `/admin/v1/spend` in standalone.
+- **Telemetry events** — DP-side `UsageEvent` per request with cache_status, reasoning, provider-id detail, guardrail bypass reason, and `inbound_protocol` (`"openai"` / `"anthropic"`) so dashboard logs can disambiguate the client protocol from the upstream `provider` label. Emitted by `/v1/chat/completions` and `/v1/messages`; posted to cp-api in managed mode.
 
 - **Managed-mode bootstrap** — cert-bundle path (no `/dp/register` round-trip): cp-api signs the mTLS leaf at mint time and ships PEMs as env vars at `docker run`. Snapshot persisted to `config_cache.json` so the proxy survives CP outages and restarts (offline resilience per PRD-09 §9.7.2).
 
