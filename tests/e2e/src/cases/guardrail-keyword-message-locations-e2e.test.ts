@@ -223,6 +223,14 @@ describe("guardrail keyword e2e: blocks forbidden literal in any message role", 
       expect(upstream.receivedRequests.length).toBe(
         upstreamHitsBefore,
       );
+
+      // No-leak: same contract as C3.2 (and guardrail-keyword-e2e
+      // per #153) — the matched literal must NOT echo back in the
+      // envelope regardless of which message slot it lived in.
+      const errorBlob = JSON.stringify(caught.error ?? {});
+      const messageBlob = caught.message ?? "";
+      expect(errorBlob).not.toContain(FORBIDDEN_WORD);
+      expect(messageBlob).not.toContain(FORBIDDEN_WORD);
     },
     60_000,
   );
@@ -276,6 +284,12 @@ describe("guardrail keyword e2e: blocks forbidden literal in any message role", 
       expect(upstream.receivedRequests.length).toBe(
         upstreamHitsBefore,
       );
+
+      // No-leak (symmetric to C3.2 / C3.3 above).
+      const errorBlob = JSON.stringify(caught.error ?? {});
+      const messageBlob = caught.message ?? "";
+      expect(errorBlob).not.toContain(FORBIDDEN_WORD);
+      expect(messageBlob).not.toContain(FORBIDDEN_WORD);
     },
     60_000,
   );
