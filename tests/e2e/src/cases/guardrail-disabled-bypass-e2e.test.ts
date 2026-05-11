@@ -106,14 +106,31 @@ describe("guardrail disabled-bypass e2e: enabled:false → no block", () => {
         maxRetries: 0,
       });
 
-      // Readiness probe — a benign prompt confirms Model + ApiKey
-      // + ProviderKey are loaded. The disabled-guardrail state is
-      // verified by the asserted call below; if the guardrail
-      // landed BEFORE this probe but the snapshot watcher hadn't
-      // yet observed `enabled:false`, the asserted call would 422
-      // and we'd surface it as a real failure (not a flake).
+      // Readiness probe — two gates so the test cannot pass
+      // vacuously.
+      //
+      // Gate A: confirm the Guardrail row IS in the snapshot. Without
+      // this, the "forbidden literal arrives at upstream" assertion
+      // below would also pass if the rule simply hadn't propagated
+      // yet — indistinguishable from a real `enabled:false` bypass.
+      // Reading admin /v1/guardrails via the typed JSON helper is
+      // the cheapest way to verify the resource exists in the store
+      // the snapshot is built from.
+      //
+      // Gate B: confirm Model + ApiKey + ProviderKey are loaded by
+      // driving a benign chat completion through the proxy. A 200
+      // response means the dispatcher is ready.
       await waitConfigPropagation(async () => {
         try {
+          const list = (await admin!.json(
+            "GET",
+            "/admin/v1/guardrails",
+          )) as Array<{ value?: { name?: string } } | { name?: string }>;
+          const hasRule = list.some((entry) => {
+            const v = "value" in entry ? entry.value : entry;
+            return v?.name === "gr-disabled-keyword";
+          });
+          if (!hasRule) return false;
           await client.chat.completions.create({
             model: "gr-disabled-model",
             messages: [{ role: "user", content: "ready-probe" }],
