@@ -125,10 +125,15 @@ describe("guardrail disabled-bypass e2e: enabled:false → no block", () => {
           const list = (await admin!.json(
             "GET",
             "/admin/v1/guardrails",
-          )) as Array<{ value?: { name?: string } } | { name?: string }>;
+          )) as unknown as Array<Record<string, unknown>>;
           const hasRule = list.some((entry) => {
-            const v = "value" in entry ? entry.value : entry;
-            return v?.name === "gr-disabled-keyword";
+            // Admin list endpoints variably return bare values or
+            // {value: ...} wrappers; handle either shape generically.
+            const inner = (entry?.value ?? entry) as Record<
+              string,
+              unknown
+            >;
+            return inner?.name === "gr-disabled-keyword";
           });
           if (!hasRule) return false;
           await client.chat.completions.create({
