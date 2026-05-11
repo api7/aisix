@@ -148,25 +148,30 @@ async fn enforce_request_body_limit(
     next.run(request).await
 }
 
-/// Read and discard the inbound body up to [`DRAIN_CAP`] bytes.
+/// Read and discard the inbound body, bounded by both bytes and time.
 ///
-/// Capped so a malicious `Content-Length: 999999999999` cannot pin
-/// the connection indefinitely.  32 MiB is 3× the default body limit
-/// (10 MiB) — well above any legitimate overshoot.
+/// Byte cap (32 MiB) prevents a huge `Content-Length` from consuming
+/// unbounded memory.  Time cap (5 s) prevents a slowloris-style
+/// client from holding the task indefinitely by dribbling data.
 async fn drain_body(body: axum::body::Body) {
     use http_body_util::BodyExt;
 
     const DRAIN_CAP: usize = 32 * 1024 * 1024;
-    let mut drained = 0usize;
-    let mut body = body;
-    while let Some(Ok(frame)) = body.frame().await {
-        if let Some(data) = frame.data_ref() {
-            drained += data.len();
-            if drained >= DRAIN_CAP {
-                break;
+    const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
+        let mut drained = 0usize;
+        let mut body = body;
+        while let Some(Ok(frame)) = body.frame().await {
+            if let Some(data) = frame.data_ref() {
+                drained += data.len();
+                if drained >= DRAIN_CAP {
+                    break;
+                }
             }
         }
-    }
+    })
+    .await;
 }
 
 async fn health(
