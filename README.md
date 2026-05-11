@@ -97,7 +97,7 @@ The same binary runs both modes; the table is about **which surface owns the fea
 | etcd-side authz | N/A | env-prefix enforcement (etcdauth interceptor): each DP cert is scoped to `/aisix/<env>/`, can't read another tenant's keyspace |
 | Playground | `POST /playground/chat/completions` (admin API) | Per-env playground in dashboard, audited |
 
-The DP container image (`ghcr.io/api7/ai-gateway:main`) is the same in both modes. The `managed.enabled` flag in config selects the bootstrap path.
+The DP container image (`ghcr.io/api7/ai-gateway:dev`) is the same in both modes. The `managed.enabled` flag in config selects the bootstrap path.
 
 ## Roadmap
 

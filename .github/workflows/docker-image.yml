@@ -4,7 +4,7 @@ name: docker-image
 #
 # Tag strategy. Every push always carries a :sha-<shortsha> tag for
 # traceability; the other tags layer on top based on the trigger:
-#   - push to main              → :main + :sha-<shortsha>
+#   - push to main              → :dev + :sha-<shortsha>
 #   - push tag vX.Y.Z           → :X.Y.Z + :X.Y + :X + :latest
 #                                 + :sha-<shortsha>
 #   - pull request              → build-only (no push), sanity check
@@ -66,7 +66,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
+            type=raw,value=dev,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
             type=ref,event=pr
             type=sha,prefix=sha-,format=short
             type=semver,pattern={{version}}

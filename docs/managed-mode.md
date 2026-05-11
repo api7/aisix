@@ -43,7 +43,7 @@ docker run --rm \
   -e AISIX_MANAGED__CP_ETCD_ENDPOINT=dp-manager.aisix.cloud:7943 \
   -v aisix-mtls:/var/lib/aisix \
   -p 3000:3000 \
-  ghcr.io/api7/ai-gateway:main
+  ghcr.io/api7/ai-gateway:dev
 ```
 
 For systemd or k8s Secret mounts where multi-line PEMs in env vars
@@ -89,7 +89,7 @@ docker run --rm \
   -e AISIX_MANAGED__CP_BASE_URL=https://api.us.aisix.cloud \
   -v aisix-mtls:/var/lib/aisix \
   -p 3000:3000 \
-  ghcr.io/api7/ai-gateway:main
+  ghcr.io/api7/ai-gateway:dev
 ```
 
 What each flag does:
