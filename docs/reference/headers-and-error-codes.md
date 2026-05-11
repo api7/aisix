@@ -6,11 +6,12 @@ sidebar_position: 63
 
 ## Proxy Response Headers
 
-Current operational headers include:
+Current operational headers vary by endpoint:
 
-- `x-aisix-call-id`
-- `x-aisix-cache`
-- `Retry-After`
+- `x-aisix-call-id` on chat-completions responses
+- `x-aisix-request-id` on several direct passthrough-style endpoints such as messages, responses, rerank, audio, and passthrough
+- `x-aisix-cache` on chat cache hit or miss paths
+- `Retry-After` on rate-limit-style rejections when applicable
 
 `x-aisix-cache` is currently used on chat cache hit or miss paths.
 

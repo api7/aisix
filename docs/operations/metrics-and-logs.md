@@ -24,7 +24,7 @@ Current proxy behavior emits:
 
 Current response headers include:
 
-- `x-aisix-call-id` for request correlation
+- endpoint-specific correlation headers such as `x-aisix-call-id` or `x-aisix-request-id`
 - `x-aisix-cache` on chat cache hit or miss paths
 - `Retry-After` on rate-limit-style rejections when applicable
 

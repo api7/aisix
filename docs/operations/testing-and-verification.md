@@ -34,7 +34,7 @@ For each critical path, verify:
 - expected HTTP status
 - expected response shape
 - expected upstream hit behavior when relevant
-- operational headers such as `x-aisix-cache` or `x-aisix-call-id` when those are part of your workflow
+- operational headers such as `x-aisix-cache`, `x-aisix-call-id`, or `x-aisix-request-id` when those are part of your workflow
 
 ## Related Pages
 
