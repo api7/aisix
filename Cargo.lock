@@ -30,6 +30,7 @@ name = "aisix"
 version = "0.1.0"
 dependencies = [
  "aisix-admin-ui",
+ "aisix-guardrail",
  "aisix-llm",
  "anyhow",
  "arc-swap",
@@ -102,6 +103,15 @@ dependencies = [
  "mime_guess",
  "pretty_assertions",
  "rust-embed",
+]
+
+[[package]]
+name = "aisix-guardrail"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "utoipa",
 ]
 
 [[package]]

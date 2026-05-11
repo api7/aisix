@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/aisix-llm", "crates/admin-ui"]
+members = ["crates/aisix-llm", "crates/aisix-guardrail", "crates/admin-ui"]
 resolver = "3"
 
 [workspace.package]
@@ -56,6 +56,7 @@ build-ui = ["aisix-admin-ui/build-ui"]
 
 [dependencies]
 aisix-llm = { path = "crates/aisix-llm" }
+aisix-guardrail = { path = "crates/aisix-guardrail" }
 aisix-admin-ui = { path = "crates/admin-ui" }
 anyhow.workspace = true
 tokio.workspace = true
