@@ -175,16 +175,12 @@ async fn drain_body(body: axum::body::Body) {
 }
 
 async fn health(
-    axum::extract::State(state): axum::extract::State<ProxyState>,
+    _state: axum::extract::State<ProxyState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let snap = state.snapshot.load();
     (
         StatusCode::OK,
         Json(json!({
             "status": "ok",
-            "models": snap.models.len(),
-            "apikeys": snap.apikeys.len(),
-            "providers": state.hub.len(),
         })),
     )
 }
@@ -404,6 +400,25 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "invalid_api_key");
+    }
+
+    #[tokio::test]
+    async fn health_reports_only_minimal_status() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v, serde_json::json!({"status": "ok"}));
     }
 
     #[tokio::test]
