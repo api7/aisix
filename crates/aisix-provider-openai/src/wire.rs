@@ -277,6 +277,8 @@ pub(crate) struct OpenAiStreamDelta {
     pub role: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
 pub(crate) fn stream_chunk_into_chat_chunk(mut raw: OpenAiStreamChunk) -> ChatChunk {
@@ -286,6 +288,7 @@ pub(crate) fn stream_chunk_into_chat_chunk(mut raw: OpenAiStreamChunk) -> ChatCh
             ChatDelta {
                 role: c.delta.role.as_deref().map(role_from_str),
                 content: c.delta.content,
+                tool_calls: c.delta.tool_calls,
             },
             c.finish_reason
                 .as_deref()
@@ -567,6 +570,32 @@ mod tests {
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
         let chunk = stream_chunk_into_chat_chunk(raw);
         assert_eq!(chunk.finish_reason, Some(FinishReason::Stop));
+    }
+
+    #[test]
+    fn stream_chunk_with_tool_calls_propagates_to_delta() {
+        let body = r#"{
+            "id": "cmpl-t",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": { "name": "get_weather", "arguments": "" }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        }"#;
+        let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
+        let chunk = stream_chunk_into_chat_chunk(raw);
+        let tc = chunk.delta.tool_calls.expect("tool_calls in delta");
+        assert_eq!(tc.len(), 1);
+        assert_eq!(tc[0]["id"], "call_abc");
+        assert_eq!(tc[0]["function"]["name"], "get_weather");
     }
 
     #[test]

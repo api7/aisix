@@ -74,6 +74,8 @@ pub struct RenderedDelta {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
 pub fn render_response(created_unix_ts: i64, resp: ChatResponse) -> ChatCompletion {
@@ -112,6 +114,7 @@ pub fn render_chunk(created_unix_ts: i64, chunk: ChatChunk) -> ChatCompletionChu
             delta: RenderedDelta {
                 role: chunk.delta.role.map(role_to_str),
                 content: chunk.delta.content,
+                tool_calls: chunk.delta.tool_calls,
             },
             finish_reason: chunk
                 .finish_reason
@@ -232,6 +235,7 @@ mod tests {
             delta: aisix_gateway::ChatDelta {
                 role: None,
                 content: Some("hi".into()),
+                tool_calls: None,
             },
             finish_reason: None,
             usage: None,
