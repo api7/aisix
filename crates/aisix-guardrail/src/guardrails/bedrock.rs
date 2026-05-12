@@ -24,6 +24,8 @@ pub const IDENTIFIER: &str = "bedrock";
 const DEFAULT_OUTPUT_SCOPE: &str = "INTERVENTIONS";
 const DEFAULT_RUNTIME_HOST_PREFIX: &str = "https://bedrock-runtime.";
 const DEFAULT_RUNTIME_HOST_SUFFIX: &str = ".amazonaws.com";
+type EncodedApplyGuardrailRequest = (Vec<u8>, Vec<usize>);
+
 const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -124,7 +126,7 @@ impl BedrockGuardrailRuntime {
     fn build_request_body(
         &self,
         payload: &GuardrailCheckPayload,
-    ) -> Result<Option<(Vec<u8>, Vec<usize>)>, BedrockError> {
+    ) -> Result<Option<EncodedApplyGuardrailRequest>, BedrockError> {
         let (content, message_indexes) = text_blocks_from_payload(payload);
         if content.is_empty() {
             return Ok(None);
@@ -403,7 +405,7 @@ fn outcome_from_response(
                 GuardrailCheckPayload::Output(payload) => &mut payload.messages,
             };
 
-            for (index, output) in message_indexes.iter().zip(response.outputs.into_iter()) {
+            for (index, output) in message_indexes.iter().zip(response.outputs) {
                 messages[*index].content = Some(GuardrailMessageContent::Text(output.text));
             }
 
