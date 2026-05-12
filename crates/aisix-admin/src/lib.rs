@@ -341,6 +341,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_rejects_non_get_requests() {
+        let app = build_router(build_state());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
     async fn create_model_returns_entry_with_generated_id() {
         let app = build_router(build_state());
         let resp = run(
