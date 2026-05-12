@@ -16,6 +16,18 @@ export interface OpenAiUpstreamOptions {
   errorBody?: unknown;
   /** Drop the connection after writing this many SSE events. */
   disconnectAfterEvents?: number;
+  /** Per-request response script; used in order before static opts. */
+  scriptedResponses?: OpenAiUpstreamStep[];
+}
+
+export interface OpenAiUpstreamStep {
+  nonStreamBody?: unknown;
+  streamEvents?: string[];
+  responseDelayMs?: number;
+  eventDelayMs?: number;
+  status?: number;
+  errorBody?: unknown;
+  disconnectAfterEvents?: number;
 }
 
 export interface OpenAiUpstream {
@@ -42,11 +54,13 @@ export async function startOpenAiUpstream(
   opts: OpenAiUpstreamOptions = {},
 ): Promise<OpenAiUpstream> {
   const received: ReceivedRequest[] = [];
+  let requestIndex = 0;
 
   const server: Server = createServer((req, res) => {
     let raw = "";
     req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
     req.on("end", async () => {
+      const step = opts.scriptedResponses?.[requestIndex++] ?? opts;
       received.push({
         method: req.method ?? "GET",
         path: req.url ?? "/",
@@ -56,32 +70,32 @@ export async function startOpenAiUpstream(
         body: raw,
       });
 
-      if (opts.responseDelayMs) await sleep(opts.responseDelayMs);
+      if (step.responseDelayMs) await sleep(step.responseDelayMs);
 
-      const status = opts.status ?? 200;
+      const status = step.status ?? 200;
       if (status >= 400) {
         res.statusCode = status;
         res.setHeader("content-type", "application/json");
-        res.end(JSON.stringify(opts.errorBody ?? { error: { message: "mock error" } }));
+        res.end(JSON.stringify(step.errorBody ?? { error: { message: "mock error" } }));
         return;
       }
 
-      const isStream = !!opts.streamEvents;
+      const isStream = !!step.streamEvents;
       if (isStream) {
         res.statusCode = 200;
         res.setHeader("content-type", "text/event-stream");
         res.setHeader("cache-control", "no-cache");
-        const events = opts.streamEvents ?? [];
+        const events = step.streamEvents ?? [];
         for (let i = 0; i < events.length; i++) {
           if (
-            opts.disconnectAfterEvents !== undefined &&
-            i >= opts.disconnectAfterEvents
+            step.disconnectAfterEvents !== undefined &&
+            i >= step.disconnectAfterEvents
           ) {
             res.destroy();
             return;
           }
           res.write(`data: ${events[i]}\n\n`);
-          if (opts.eventDelayMs) await sleep(opts.eventDelayMs);
+          if (step.eventDelayMs) await sleep(step.eventDelayMs);
         }
         res.end();
         return;
@@ -91,7 +105,7 @@ export async function startOpenAiUpstream(
       res.setHeader("content-type", "application/json");
       res.end(
         JSON.stringify(
-          opts.nonStreamBody ?? {
+          step.nonStreamBody ?? {
             id: "mock-1",
             object: "chat.completion",
             created: Math.floor(Date.now() / 1000),

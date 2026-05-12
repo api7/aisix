@@ -3,7 +3,8 @@
 //! When a Model carries a `routing` block, the proxy treats it as a
 //! pointer to other Models. Per-request the proxy picks one target via
 //! the configured strategy and dispatches through that target's bridge.
-//! Failures fall back to the next target up to `retry_budget` attempts.
+//! Failures may retry the current target and then fall back to later
+//! targets.
 //!
 //! Three strategies (spec §3):
 //! - `round_robin`: cycle through targets in declaration order.
@@ -61,19 +62,33 @@ pub struct Routing {
     #[serde(default)]
     pub strategy: RoutingStrategy,
     pub targets: Vec<RoutingTarget>,
-    /// Max number of distinct targets to attempt per request. Defaults
-    /// to `targets.len()` when absent. A value of 1 disables fallback.
+    /// Retry attempts on the current target before failing over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retry_budget: Option<u32>,
+    pub retries: Option<u32>,
+    /// Max number of later targets to attempt after the initial target
+    /// fails permanently. Defaults to all later targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fallbacks: Option<u32>,
+    /// Whether upstream 429 participates in retries and failover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_on_429: Option<bool>,
 }
 
 impl Routing {
-    pub fn retry_budget_or_default(&self) -> usize {
-        match self.retry_budget {
-            Some(0) => self.targets.len(),
-            Some(n) => (n as usize).min(self.targets.len()),
-            None => self.targets.len(),
+    pub fn retries_or_default(&self) -> usize {
+        self.retries.unwrap_or(0) as usize
+    }
+
+    pub fn max_fallbacks_or_default(&self) -> usize {
+        let later_targets = self.targets.len().saturating_sub(1);
+        match self.max_fallbacks {
+            Some(n) => (n as usize).min(later_targets),
+            None => later_targets,
         }
+    }
+
+    pub fn retry_on_429_or_default(&self) -> bool {
+        self.retry_on_429.unwrap_or(false)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -93,14 +108,18 @@ mod tests {
                 {"model": "primary", "weight": 90},
                 {"model": "backup",  "weight": 10}
             ],
-            "retry_budget": 2
+            "retries": 2,
+            "max_fallbacks": 1,
+            "retry_on_429": true
         }"#;
         let r: Routing = serde_json::from_str(json).unwrap();
         assert_eq!(r.strategy, RoutingStrategy::Weighted);
         assert_eq!(r.targets.len(), 2);
         assert_eq!(r.targets[0].model, "primary");
         assert_eq!(r.targets[0].weight_or_default(), 90);
-        assert_eq!(r.retry_budget_or_default(), 2);
+        assert_eq!(r.retries_or_default(), 2);
+        assert_eq!(r.max_fallbacks_or_default(), 1);
+        assert!(r.retry_on_429_or_default());
     }
 
     #[test]
@@ -108,27 +127,33 @@ mod tests {
         let r: Routing =
             serde_json::from_str(r#"{"targets":[{"model":"a"},{"model":"b"}]}"#).unwrap();
         assert_eq!(r.strategy, RoutingStrategy::Failover);
-        assert_eq!(r.retry_budget_or_default(), 2);
+        assert_eq!(r.retries_or_default(), 0);
+        assert_eq!(r.max_fallbacks_or_default(), 1);
+        assert!(!r.retry_on_429_or_default());
     }
 
     #[test]
-    fn retry_budget_zero_means_full_targets() {
+    fn max_fallbacks_zero_disables_failover() {
         let r = Routing {
             strategy: RoutingStrategy::RoundRobin,
             targets: vec![RoutingTarget::new("a"), RoutingTarget::new("b")],
-            retry_budget: Some(0),
+            retries: Some(0),
+            max_fallbacks: Some(0),
+            retry_on_429: None,
         };
-        assert_eq!(r.retry_budget_or_default(), 2);
+        assert_eq!(r.max_fallbacks_or_default(), 0);
     }
 
     #[test]
-    fn retry_budget_clamps_to_targets_len() {
+    fn max_fallbacks_clamps_to_later_targets() {
         let r = Routing {
             strategy: RoutingStrategy::Failover,
             targets: vec![RoutingTarget::new("a")],
-            retry_budget: Some(99),
+            retries: None,
+            max_fallbacks: Some(99),
+            retry_on_429: None,
         };
-        assert_eq!(r.retry_budget_or_default(), 1);
+        assert_eq!(r.max_fallbacks_or_default(), 0);
     }
 
     #[test]

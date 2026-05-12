@@ -12,7 +12,7 @@
 //!   so callers spread evenly across targets.
 //! - **weighted**: pick a starting target with probability proportional
 //!   to `weight`, then walk forward on failure (weights only affect the
-//!   *first* attempt — once we're falling back, order is positional).
+//!   *first* target choice — once we're falling back, order is positional).
 
 use aisix_core::{Routing, RoutingStrategy, RoutingTarget};
 use aisix_gateway::BridgeError;
@@ -20,13 +20,18 @@ use dashmap::DashMap;
 use rand::Rng;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Whether a Bridge error is retryable across routing targets.
-/// 4xx is the caller's mistake — retrying to a different target won't
-/// help and may amplify damage. Everything else (5xx, timeout, transport,
-/// decode, config, stream abort) gets the fallback path.
-pub fn is_retryable(err: &BridgeError) -> bool {
+/// Whether a Bridge error is retryable at all, optionally treating 429
+/// as retryable. Non-429 4xx is the caller's mistake — retrying won't
+/// help and may amplify damage. Everything else (5xx, timeout,
+/// transport, decode, config, stream abort) gets the retry/failover path.
+pub fn is_retryable(err: &BridgeError, retry_on_429: bool) -> bool {
     match err {
-        BridgeError::UpstreamStatus { status, .. } => !(400..500).contains(status),
+        BridgeError::UpstreamStatus { status, .. } => {
+            if *status == 429 {
+                return retry_on_429;
+            }
+            !(400..500).contains(status)
+        }
         BridgeError::Timeout { .. }
         | BridgeError::Transport(_)
         | BridgeError::UpstreamDecode(_)
@@ -46,17 +51,16 @@ impl RoutingRegistry {
         Self::default()
     }
 
-    /// Pick the attempt order for one request. The first element is the
-    /// initial target; subsequent elements are the fallback chain (in
-    /// declaration order, wrapping if needed). Length is bounded by
-    /// `routing.retry_budget_or_default()`.
-    pub fn pick_order(&self, virtual_name: &str, routing: &Routing) -> Vec<String> {
-        let budget = routing.retry_budget_or_default();
-        if budget == 0 || routing.targets.is_empty() {
+    /// Pick the target order for one request. The first element is the
+    /// initial target; subsequent elements are later fallback targets (in
+    /// declaration order, wrapping if needed). Length is bounded by the
+    /// initial target plus `routing.max_fallbacks_or_default()`.
+    pub fn pick_targets(&self, virtual_name: &str, routing: &Routing) -> Vec<String> {
+        if routing.targets.is_empty() {
             return Vec::new();
         }
         let start = self.starting_index(virtual_name, routing);
-        attempt_order(&routing.targets, start, budget)
+        attempt_order(&routing.targets, start, routing.max_fallbacks_or_default() + 1)
     }
 
     fn starting_index(&self, virtual_name: &str, routing: &Routing) -> usize {
@@ -82,12 +86,12 @@ impl std::fmt::Debug for RoutingRegistry {
     }
 }
 
-/// Build the attempt-order vector starting at `start_idx`, walking forward
-/// (wrap-around) for `budget` distinct entries.
-fn attempt_order(targets: &[RoutingTarget], start_idx: usize, budget: usize) -> Vec<String> {
+/// Build the target-order vector starting at `start_idx`, walking forward
+/// (wrap-around) for `limit` distinct entries.
+fn attempt_order(targets: &[RoutingTarget], start_idx: usize, limit: usize) -> Vec<String> {
     let n = targets.len();
-    let mut order = Vec::with_capacity(budget);
-    for i in 0..budget {
+    let mut order = Vec::with_capacity(limit);
+    for i in 0..limit {
         let t = &targets[(start_idx + i) % n];
         order.push(t.model.clone());
     }
@@ -135,11 +139,17 @@ mod tests {
     use super::*;
     use aisix_core::{Routing, RoutingStrategy, RoutingTarget};
 
-    fn r(strategy: RoutingStrategy, targets: Vec<RoutingTarget>, budget: Option<u32>) -> Routing {
+    fn r(
+        strategy: RoutingStrategy,
+        targets: Vec<RoutingTarget>,
+        max_fallbacks: Option<u32>,
+    ) -> Routing {
         Routing {
             strategy,
             targets,
-            retry_budget: budget,
+            retries: None,
+            max_fallbacks,
+            retry_on_429: None,
         }
     }
 
@@ -156,7 +166,7 @@ mod tests {
             None,
         );
         for _ in 0..5 {
-            let order = reg.pick_order("v", &routing);
+            let order = reg.pick_targets("v", &routing);
             assert_eq!(order, vec!["primary", "secondary", "tertiary"]);
         }
     }
@@ -175,7 +185,7 @@ mod tests {
         );
         let mut firsts = Vec::new();
         for _ in 0..6 {
-            let order = reg.pick_order("v", &routing);
+            let order = reg.pick_targets("v", &routing);
             firsts.push(order[0].clone());
         }
         // Two full cycles of a→b→c.
@@ -191,10 +201,10 @@ mod tests {
             Some(1),
         );
         // Two distinct virtual models advance independently.
-        assert_eq!(reg.pick_order("v1", &routing)[0], "a");
-        assert_eq!(reg.pick_order("v2", &routing)[0], "a");
-        assert_eq!(reg.pick_order("v1", &routing)[0], "b");
-        assert_eq!(reg.pick_order("v2", &routing)[0], "b");
+        assert_eq!(reg.pick_targets("v1", &routing)[0], "a");
+        assert_eq!(reg.pick_targets("v2", &routing)[0], "a");
+        assert_eq!(reg.pick_targets("v1", &routing)[0], "b");
+        assert_eq!(reg.pick_targets("v2", &routing)[0], "b");
     }
 
     #[test]
@@ -207,12 +217,12 @@ mod tests {
                 RoutingTarget::new("b"),
                 RoutingTarget::new("c"),
             ],
-            Some(0), // 0 → use full target count (3 attempts)
+            Some(2),
         );
         // First call starts at a → a, b, c
-        assert_eq!(reg.pick_order("v", &routing), vec!["a", "b", "c"]);
+        assert_eq!(reg.pick_targets("v", &routing), vec!["a", "b", "c"]);
         // Second call starts at b → b, c, a
-        assert_eq!(reg.pick_order("v", &routing), vec!["b", "c", "a"]);
+        assert_eq!(reg.pick_targets("v", &routing), vec!["b", "c", "a"]);
     }
 
     #[test]
@@ -224,13 +234,13 @@ mod tests {
                 RoutingTarget::new("a").with_weight(99),
                 RoutingTarget::new("b").with_weight(1),
             ],
-            Some(0),
+            Some(1),
         );
         // We just assert correctness of the *order* shape:
         // exactly two attempts, distinct targets, both targets covered.
         // (Aggregate distribution is pinned by the dedicated tests
         // below.)
-        let order = reg.pick_order("v", &routing);
+        let order = reg.pick_targets("v", &routing);
         assert_eq!(order.len(), 2);
         assert!(order.iter().any(|t| t == "a"));
         assert!(order.iter().any(|t| t == "b"));
@@ -377,14 +387,14 @@ mod tests {
     }
 
     #[test]
-    fn budget_one_disables_fallback() {
+    fn max_fallbacks_zero_disables_failover() {
         let reg = RoutingRegistry::new();
         let routing = r(
             RoutingStrategy::Failover,
             vec![RoutingTarget::new("a"), RoutingTarget::new("b")],
-            Some(1),
+            Some(0),
         );
-        let order = reg.pick_order("v", &routing);
+        let order = reg.pick_targets("v", &routing);
         assert_eq!(order, vec!["a"]);
     }
 
@@ -392,7 +402,7 @@ mod tests {
     fn empty_targets_yields_empty_order() {
         let reg = RoutingRegistry::new();
         let routing = r(RoutingStrategy::Failover, vec![], None);
-        assert!(reg.pick_order("v", &routing).is_empty());
+        assert!(reg.pick_targets("v", &routing).is_empty());
     }
 
     #[test]
@@ -400,19 +410,23 @@ mod tests {
         assert!(!is_retryable(&BridgeError::UpstreamStatus {
             status: 400,
             message: "bad request".into(),
-        }));
+        }, false));
         assert!(!is_retryable(&BridgeError::UpstreamStatus {
             status: 429,
             message: "rate limited".into(),
-        }));
+        }, false));
+        assert!(is_retryable(&BridgeError::UpstreamStatus {
+            status: 429,
+            message: "rate limited".into(),
+        }, true));
         assert!(is_retryable(&BridgeError::UpstreamStatus {
             status: 502,
             message: "bad gateway".into(),
-        }));
-        assert!(is_retryable(&BridgeError::Timeout { elapsed_ms: 1 }));
-        assert!(is_retryable(&BridgeError::Transport("conn".into())));
-        assert!(is_retryable(&BridgeError::UpstreamDecode("x".into())));
-        assert!(is_retryable(&BridgeError::Config("bad key".into())));
-        assert!(is_retryable(&BridgeError::StreamAborted));
+        }, false));
+        assert!(is_retryable(&BridgeError::Timeout { elapsed_ms: 1 }, false));
+        assert!(is_retryable(&BridgeError::Transport("conn".into()), false));
+        assert!(is_retryable(&BridgeError::UpstreamDecode("x".into()), false));
+        assert!(is_retryable(&BridgeError::Config("bad key".into()), false));
+        assert!(is_retryable(&BridgeError::StreamAborted, false));
     }
 }

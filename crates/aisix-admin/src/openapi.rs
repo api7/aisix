@@ -332,7 +332,9 @@ const OPENAPI_JSON: &str = r##"{
               }
             }
           },
-          "retry_budget": {"type": "integer", "minimum": 0}
+          "retries": {"type": "integer", "minimum": 0},
+          "max_fallbacks": {"type": "integer", "minimum": 0},
+          "retry_on_429": {"type": "boolean"}
         }
       },
       "ModelCost": {

@@ -86,6 +86,14 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
     if (v !== undefined && !k.startsWith("AISIX_")) childEnv[k] = v;
   }
   childEnv.RUST_LOG = process.env.RUST_LOG ?? "warn";
+  childEnv.HTTP_PROXY = "";
+  childEnv.HTTPS_PROXY = "";
+  childEnv.ALL_PROXY = "";
+  childEnv.http_proxy = "";
+  childEnv.https_proxy = "";
+  childEnv.all_proxy = "";
+  childEnv.NO_PROXY = "127.0.0.1,localhost";
+  childEnv.no_proxy = "127.0.0.1,localhost";
 
   const child = spawn(BIN_PATH, ["--config", cfgPath], {
     stdio: ["ignore", "pipe", "pipe"],

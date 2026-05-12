@@ -428,7 +428,7 @@ async fn dispatch(
     // single-provider Model we just dispatch to it directly.
     let attempt_models: Vec<aisix_core::Model> =
         if let Some(routing) = virtual_entry.value.routing.as_ref() {
-            let names = state.routing.pick_order(&req.model, routing);
+            let names = state.routing.pick_targets(&req.model, routing);
             if names.is_empty() {
                 return Err(with_model(ProxyError::InvalidRequest(
                     "routing model has no targets".into(),
@@ -735,11 +735,24 @@ async fn dispatch(
         }
     }
 
-    // Walk the attempt-list. First retryable failure → next target.
-    // Non-retryable (4xx) or exhausted budget → propagate the last error.
+    // Walk the target list. Retry the current target first, then fail over
+    // to later targets only after retries are exhausted. Non-retryable
+    // (non-429 4xx) errors stop immediately.
     let mut last_err: Option<BridgeError> = None;
     let mut chosen_provider: Option<String> = None;
     let mut upstream: Option<aisix_gateway::ChatResponse> = None;
+    let retries = virtual_entry
+        .value
+        .routing
+        .as_ref()
+        .map(|routing| routing.retries_or_default())
+        .unwrap_or(0);
+    let retry_on_429 = virtual_entry
+        .value
+        .routing
+        .as_ref()
+        .map(|routing| routing.retry_on_429_or_default())
+        .unwrap_or(false);
 
     for model in &attempt_models {
         let Some(provider) = model.provider else {
@@ -765,31 +778,42 @@ async fn dispatch(
         let pk_arc = Arc::new(pk_entry.value.clone());
         let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
 
-        match bridge.chat(req, &ctx).await {
-            Ok(resp) => {
-                state.health.record_success(&model.display_name);
-                chosen_provider = Some(format!("{provider:?}").to_lowercase());
-                upstream = Some(resp);
-                break;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    target_model = %model.display_name,
-                    error = %err,
-                    retryable = is_retryable(&err),
-                    "routing target attempt failed",
-                );
-                // Only retryable (server-side) errors indicate deployment
-                // health deterioration; 4xx are caller mistakes.
-                if is_retryable(&err) {
-                    state.health.record_failure(&model.display_name);
-                }
-                if !is_retryable(&err) {
-                    last_err = Some(err);
+        for attempt_idx in 0..=retries {
+            match bridge.chat(req, &ctx).await {
+                Ok(resp) => {
+                    state.health.record_success(&model.display_name);
+                    chosen_provider = Some(format!("{provider:?}").to_lowercase());
+                    upstream = Some(resp);
                     break;
                 }
-                last_err = Some(err);
-                continue;
+                Err(err) => {
+                    let retryable = is_retryable(&err, retry_on_429);
+                    tracing::warn!(
+                        target_model = %model.display_name,
+                        target_attempt = attempt_idx + 1,
+                        error = %err,
+                        retryable,
+                        "routing target attempt failed",
+                    );
+                    if retryable {
+                        state.health.record_failure(&model.display_name);
+                    }
+                    last_err = Some(err);
+                    if !retryable {
+                        break;
+                    }
+                    if attempt_idx == retries {
+                        break;
+                    }
+                }
+            }
+        }
+        if upstream.is_some() {
+            break;
+        }
+        if let Some(err) = last_err.as_ref() {
+            if !is_retryable(err, retry_on_429) {
+                break;
             }
         }
     }

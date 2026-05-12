@@ -192,6 +192,7 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use futures::StreamExt;
+    use reqwest::Client;
     use std::sync::Arc;
     use tower::ServiceExt;
     use wiremock::matchers::{header, method, path};
@@ -203,6 +204,15 @@ mod tests {
             request_body_limit_bytes: 1_048_576,
             tls: None,
         }
+    }
+
+    fn openai_test_bridge() -> OpenAiBridge {
+        let client = Client::builder()
+            .user_agent("aisix-test/0.1")
+            .no_proxy()
+            .build()
+            .unwrap();
+        OpenAiBridge::with_client(client)
     }
 
     /// State used by the *existing* tests — cache disabled so the
@@ -353,7 +363,7 @@ mod tests {
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let app = build_router(build_state(snap, hub));
 
@@ -488,7 +498,7 @@ mod tests {
     #[tokio::test]
     async fn model_not_in_allowed_list_returns_403() {
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         // ApiKey allows only "other-model", the caller asks for "my-gpt4".
         let snap = seed_snapshot("my-gpt4", &["other-model"], "http://unused");
         let app = build_router(build_state(snap, hub));
@@ -689,7 +699,7 @@ mod tests {
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let app = build_router(build_state(snap, hub));
 
@@ -814,7 +824,7 @@ mod tests {
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let app = build_router(build_state(snap, hub));
 
@@ -873,7 +883,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let app = build_router(build_state(snap, hub));
 
@@ -1161,7 +1171,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot_with_limits(
             "my-gpt4",
             &["my-gpt4"],
@@ -1238,7 +1248,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot_with_limits(
             "my-gpt4",
             &["my-gpt4"],
@@ -1303,7 +1313,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot_with_limits(
             "my-gpt4",
             &["my-gpt4"],
@@ -1365,7 +1375,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot_with_limits(
             "my-gpt4",
             &["my-gpt4"],
@@ -1419,7 +1429,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
 
         let state = build_state(snap, hub);
@@ -1474,7 +1484,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot_with_limits(
             "my-gpt4",
             &["my-gpt4"],
@@ -1528,7 +1538,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         // Cache gate opens only when an enabled policy exists in
         // snapshot. Without this seed step the test would 200 but
@@ -1603,7 +1613,7 @@ data: [DONE]\n\n";
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         seed_cache_policy(&snap, "test-cache");
         let state = build_state_with_cache(snap, hub).with_usage_sink(UsageSink::new(tx));
@@ -1669,7 +1679,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         seed_cache_policy(&snap, "test-cache");
         let state = build_state_with_cache(snap, hub);
@@ -1730,7 +1740,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         // The api key + model are named "my-gpt4"; the policy below
         // pins applies_to to a different model name so no request in
         // this test matches.
@@ -1852,7 +1862,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         seed_cache_policy_with_applies_to(&snap, "scoped", "model:my-gpt4");
         let state = build_state_with_cache(snap, hub);
@@ -1916,7 +1926,14 @@ data: [DONE]\n\n";
 
     /// Build a virtual routing Model that points at `targets` (other
     /// Model.display_name values) using the given strategy.
-    fn routing_entry(name: &str, strategy: &str, targets: &[&str]) -> ResourceEntry<Model> {
+    fn routing_entry(
+        name: &str,
+        strategy: &str,
+        targets: &[&str],
+        retries: Option<u32>,
+        max_fallbacks: Option<u32>,
+        retry_on_429: Option<bool>,
+    ) -> ResourceEntry<Model> {
         let target_objs: Vec<serde_json::Value> = targets
             .iter()
             .map(|t| serde_json::json!({"model": t}))
@@ -1926,6 +1943,9 @@ data: [DONE]\n\n";
             "routing": {
                 "strategy": strategy,
                 "targets": target_objs,
+                "retries": retries,
+                "max_fallbacks": max_fallbacks,
+                "retry_on_429": retry_on_429,
             }
         });
         let model: Model = serde_json::from_value(cfg).unwrap();
@@ -1958,7 +1978,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
 
         let snap = AisixSnapshot::new();
         snap.provider_keys
@@ -1973,6 +1993,9 @@ data: [DONE]\n\n";
             "smart",
             "failover",
             &["primary", "secondary"],
+            None,
+            None,
+            None,
         ));
         snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
 
@@ -1990,8 +2013,9 @@ data: [DONE]\n\n";
             .unwrap();
 
         let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["choices"][0]["message"]["content"], "fallback worked");
     }
@@ -2019,7 +2043,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
 
         let snap = AisixSnapshot::new();
         snap.provider_keys
@@ -2034,6 +2058,9 @@ data: [DONE]\n\n";
             "smart",
             "failover",
             &["primary", "secondary"],
+            None,
+            None,
+            None,
         ));
         snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
 
@@ -2051,7 +2078,149 @@ data: [DONE]\n\n";
             .unwrap();
 
         let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&bytes));
+    }
+
+    #[tokio::test]
+    async fn routing_retries_current_target_before_failover() {
+        let flaky_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("try again"))
+            .expect(2)
+            .mount(&flaky_upstream)
+            .await;
+
+        let good_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-good",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "after retries"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&good_upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-flaky", &flaky_upstream.uri()));
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-good", &good_upstream.uri()));
+        snap.models
+            .insert(model_entry_with_id("m-flaky", "primary", "pk-flaky"));
+        snap.models
+            .insert(model_entry_with_id("m-good", "secondary", "pk-good"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary", "secondary"],
+            Some(1),
+            Some(1),
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let app = build_router(build_state(snap, hub));
+        let body = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "after retries");
+    }
+
+    #[tokio::test]
+    async fn routing_can_retry_and_failover_on_429_when_enabled() {
+        let ratelimited_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+            .expect(2)
+            .mount(&ratelimited_upstream)
+            .await;
+
+        let good_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-good",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "429 fallback worked"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&good_upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-429", &ratelimited_upstream.uri()));
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-good", &good_upstream.uri()));
+        snap.models
+            .insert(model_entry_with_id("m-429", "primary", "pk-429"));
+        snap.models
+            .insert(model_entry_with_id("m-good", "secondary", "pk-good"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary", "secondary"],
+            Some(1),
+            Some(1),
+            Some(true),
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let app = build_router(build_state(snap, hub));
+        let body = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "429 fallback worked");
     }
 
     #[tokio::test]
@@ -2059,11 +2228,11 @@ data: [DONE]\n\n";
         // Routing references a Model that isn't in the snapshot — this
         // is a misconfiguration and should surface as a clean 400.
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
 
         let snap = AisixSnapshot::new();
         snap.models
-            .insert(routing_entry("smart", "failover", &["nonexistent"]));
+            .insert(routing_entry("smart", "failover", &["nonexistent"], None, None, None));
         snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
         // No upstream provider_key needed — the routing target itself
         // is missing so dispatch fails before any provider lookup.
@@ -2104,7 +2273,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot_with_limits(
             "my-gpt4",
             &["my-gpt4"],
@@ -2172,7 +2341,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
 
         let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(KeywordBlocklist::new(
@@ -2234,7 +2403,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(KeywordBlocklist::new(
             vec![KeywordRule::literal("forbidden-token")],
@@ -2293,7 +2462,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
 
         let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(
@@ -2620,7 +2789,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
 
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let state = build_state(snap, hub).with_budget_client(Arc::new(BudgetClient::new(
