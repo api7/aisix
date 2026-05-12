@@ -28,7 +28,23 @@ const OPENAPI_JSON: &str = r##"{
       "get": {
         "summary": "minimal process health status",
         "security": [],
-        "responses": {"200": {"description": "OK"}}
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["status"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "status": {"type": "string", "enum": ["ok"]}
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/metrics": {
@@ -467,6 +483,19 @@ mod tests {
                 "{path} should declare security: [] but got {security:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn openapi_health_documents_minimal_status_only() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(OPENAPI_JSON).expect("OPENAPI_JSON must parse");
+        let schema = &parsed["paths"]["/health"]["get"]["responses"]["200"]["content"]
+            ["application/json"]["schema"];
+
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], serde_json::json!(["status"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["status"]["enum"], serde_json::json!(["ok"]));
     }
 
     #[tokio::test]
