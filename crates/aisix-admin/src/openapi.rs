@@ -24,22 +24,36 @@ const OPENAPI_JSON: &str = r##"{
     "description": "Admin surface for the standalone aisix gateway. All `/admin/v1/*` routes require Bearer admin-key auth (configured via `admin.admin_keys`). Errors use {\"error_msg\": \"...\"}.\n\nIn managed mode (aisix.cloud tenant) the admin listener is not bound — the dashboard owns CRUD via the AISIX-Cloud control plane."
   },
   "paths": {
-    "/health": {
+    "/livez": {
       "get": {
-        "summary": "minimal process health status",
+        "summary": "minimal public liveness probe",
         "security": [],
+        "parameters": [
+          {
+            "name": "verbose",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "string"},
+            "description": "When present, returns a multi-line text report instead of the terse `ok` body."
+          }
+        ],
         "responses": {
           "200": {
             "description": "OK",
             "content": {
-              "application/json": {
+              "text/plain": {
                 "schema": {
-                  "type": "object",
-                  "required": ["status"],
-                  "additionalProperties": false,
-                  "properties": {
-                    "status": {"type": "string", "enum": ["ok"]}
-                  }
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Liveness checks failed during shutdown",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -415,7 +429,7 @@ mod tests {
             serde_json::from_str(OPENAPI_JSON).expect("OPENAPI_JSON must parse");
         // Every route mounted in build_router should be documented.
         for path in [
-            "/health",
+            "/livez",
             "/metrics",
             "/admin/openapi.json",
             "/admin/openapi-scalar",
@@ -464,7 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn openapi_unauthenticated_routes_carry_empty_security() {
-        // /health, /metrics, and the openapi self-references are public
+        // /livez, /metrics, and the openapi self-references are public
         // (mirrors the `unauthenticated like /metrics` design note in
         // build_router). The spec must mark them with security: [] so
         // Scalar's "Try it" doesn't prompt for an admin key on those
@@ -472,7 +486,7 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(OPENAPI_JSON).expect("OPENAPI_JSON must parse");
         for path in [
-            "/health",
+            "/livez",
             "/metrics",
             "/admin/openapi.json",
             "/admin/openapi-scalar",
@@ -486,19 +500,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openapi_health_documents_minimal_status_only() {
+    async fn openapi_livez_documents_plain_ok() {
         let parsed: serde_json::Value =
             serde_json::from_str(OPENAPI_JSON).expect("OPENAPI_JSON must parse");
-        let schema = &parsed["paths"]["/health"]["get"]["responses"]["200"]["content"]
-            ["application/json"]["schema"];
+        let schema = &parsed["paths"]["/livez"]["get"]["responses"]["200"]["content"]["text/plain"]
+            ["schema"];
 
-        assert_eq!(schema["type"], "object");
-        assert_eq!(schema["required"], serde_json::json!(["status"]));
-        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["type"], "string");
+        assert!(schema.get("enum").is_none());
         assert_eq!(
-            schema["properties"]["status"]["enum"],
-            serde_json::json!(["ok"])
+            parsed["paths"]["/livez"]["get"]["parameters"][0]["name"],
+            "verbose"
         );
+        assert!(parsed["paths"]["/livez"]["get"]["responses"]["500"].is_object());
     }
 
     #[tokio::test]

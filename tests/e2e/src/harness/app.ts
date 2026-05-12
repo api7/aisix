@@ -23,6 +23,7 @@ export interface SpawnedApp {
   adminUrl: string;
   adminKey: string;
   etcdPrefix: string;
+  signal(signal: NodeJS.Signals): void;
   exit(): Promise<void>;
 }
 
@@ -34,8 +35,9 @@ const SHUTDOWN_GRACE_MS = 3_000;
 /**
  * Per-test handle to a spawned `aisix` binary. Each call writes a fresh
  * config YAML into a tmp dir, picks two free ports, picks a unique etcd
- * prefix, and waits up to 10s for `/health` on both ports to respond
- * 200. `exit()` issues SIGTERM and waits up to 3s, escalating to SIGKILL.
+ * prefix, and waits up to 10s for `/livez` on the proxy and `/admin/v1/health`
+ * on the admin listener to respond 200. `exit()` issues SIGTERM and waits up to
+ * 3s, escalating to SIGKILL.
  */
 export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   const etcd = new EtcdClient();
@@ -109,7 +111,7 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
 
   try {
     await Promise.all([
-      waitForReady(`${proxyUrl}/health`, READY_TIMEOUT_MS),
+      waitForReady(`${proxyUrl}/livez`, READY_TIMEOUT_MS),
       waitForReady(`${adminUrl}/admin/v1/health`, READY_TIMEOUT_MS, adminKey),
     ]);
   } catch (err) {
@@ -127,6 +129,9 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
     adminUrl,
     adminKey,
     etcdPrefix,
+    signal(signal: NodeJS.Signals) {
+      if (child.exitCode === null) child.kill(signal);
+    },
     async exit() {
       await terminate(child);
       await cleanup(etcd, etcdPrefix, dir);
