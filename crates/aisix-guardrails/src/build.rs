@@ -178,12 +178,15 @@ impl LiveGuardrailChain {
         snapshot: SnapshotHandle<AisixSnapshot>,
         bedrock_endpoint_url: Option<String>,
     ) -> Arc<Self> {
+        // Read version before load so that a concurrent store() between
+        // the two reads causes current() to see a version bump and rebuild,
+        // rather than caching stale data under the new version.
+        let last_version = snapshot.version();
         let snap = snapshot.load();
         let chain = Arc::new(build_chain_from_snapshot(
             &snap.guardrails,
             bedrock_endpoint_url.as_deref(),
         ));
-        let last_version = snapshot.version();
         Arc::new(Self {
             snapshot,
             bedrock_endpoint_url,
