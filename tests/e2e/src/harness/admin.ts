@@ -72,28 +72,29 @@ export class AdminClient {
  * omitted, the helper falls back to the historical fixed-time wait.
  * The poll interval is 50ms.
  *
- * The deadline is **10s** (raised from 5s after #157). Vitest runs
+ * The default deadline is **30s** (raised from 10s). Vitest runs
  * up to `maxForks: 4` test files in parallel, each spawning an
  * `aisix` instance against a single shared etcd. Under that
  * concurrency the etcd watch dispatch can lag, especially for
  * tests that rely on the LAST resource in a write batch (e.g. a
  * Guardrail rule following Model + ApiKey + ProviderKey writes,
- * see `guardrail-keyword-e2e.test.ts`). 5s was sized for a
- * ~9-test suite; the suite is now 20+ files. 10s preserves the
- * "fail loudly on a genuinely stuck snapshot" property without
- * burning CI cycles on rerun-flakes.
+ * see `guardrail-keyword-e2e.test.ts`). The poll interval is
+ * 50ms so in practice the function returns in 1-2s; the generous
+ * ceiling only fires on genuinely stuck snapshots and avoids
+ * CI rerun-flakes on slow GitHub Actions runners.
  */
 export async function waitConfigPropagation(
   condition?: () => Promise<boolean>,
+  timeoutMs = 30_000,
 ): Promise<void> {
   if (!condition) {
     await new Promise((r) => setTimeout(r, 500));
     return;
   }
-  const deadline = Date.now() + 10_000;
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await condition()) return;
     await new Promise((r) => setTimeout(r, 50));
   }
-  throw new Error("waitConfigPropagation: condition not met within 10s");
+  throw new Error(`waitConfigPropagation: condition not met within ${timeoutMs / 1000}s`);
 }
