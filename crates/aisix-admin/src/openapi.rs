@@ -90,7 +90,7 @@ const OPENAPI_JSON: &str = r##"{
       "post": {
         "summary": "create api key",
         "description": "Body carries `key_hash` (SHA-256 of plaintext). The plaintext is generated client-side; the gateway never sees it.",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiKey"}}}},
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PublicApiKey"}}}},
         "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "409": {"description": "duplicate key_hash"}}
       }
     },
@@ -99,7 +99,7 @@ const OPENAPI_JSON: &str = r##"{
       "get":    { "summary": "get api key",    "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} },
       "put":    {
         "summary": "update api key",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiKey"}}}},
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PublicApiKey"}}}},
         "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "404": {"description": "not found"}, "409": {"description": "duplicate key_hash"}}
       },
       "delete": { "summary": "delete api key", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
@@ -114,7 +114,7 @@ const OPENAPI_JSON: &str = r##"{
             "type": "object",
             "required": ["entry", "plaintext"],
             "properties": {
-              "entry":     {"$ref": "#/components/schemas/ApiKeyEntry"},
+              "entry":     {"$ref": "#/components/schemas/PublicApiKeyEntry"},
               "plaintext": {"type": "string", "example": "sk-abcd1234ef567890"}
             }
           }}}},
@@ -248,22 +248,21 @@ const OPENAPI_JSON: &str = r##"{
           "revision": {"type": "integer"}
         }
       },
-      "ApiKey": {
+      "PublicApiKey": {
         "type": "object",
         "required": ["key_hash", "allowed_models"],
         "properties": {
           "key_hash":       {"type": "string", "description": "SHA-256 hex of the plaintext bearer. Lowercase.", "example": "91ed2dbc407561556f3e7be98ba0bd2a57986d6a868c482d867d19c6d40d201c"},
           "allowed_models": {"type": "array", "items": {"type": "string"}, "description": "Allowed Model display_names. `[\"*\"]` for all; `[]` denies everything."},
-          "rate_limit":     {"$ref": "#/components/schemas/RateLimit"},
-          "max_budget_usd": {"type": "number", "minimum": 0, "description": "Per-month USD spend cap. Absent = unlimited."}
+          "rate_limit":     {"$ref": "#/components/schemas/RateLimit"}
         }
       },
-      "ApiKeyEntry": {
+      "PublicApiKeyEntry": {
         "type": "object",
         "required": ["id", "value", "revision"],
         "properties": {
           "id":       {"type": "string"},
-          "value":    {"$ref": "#/components/schemas/ApiKey"},
+          "value":    {"$ref": "#/components/schemas/PublicApiKey"},
           "revision": {"type": "integer"}
         }
       },
@@ -428,8 +427,8 @@ mod tests {
         for schema in [
             "Model",
             "ModelEntry",
-            "ApiKey",
-            "ApiKeyEntry",
+            "PublicApiKey",
+            "PublicApiKeyEntry",
             "ProviderKey",
             "Guardrail",
             "CachePolicy",

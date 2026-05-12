@@ -133,13 +133,12 @@ curl -X POST http://localhost:3001/admin/v1/apikeys \
   -d '{
     "key_hash": "'"$KEY_HASH"'",
     "allowed_models": ["my-gpt4"],
-    "rate_limit": {"rpm": 60, "concurrency": 10},
-    "max_budget_usd": 500.0
+    "rate_limit": {"rpm": 60, "concurrency": 10}
   }'
 ```
 
-> `max_budget_usd` is enforced only in SaaS / managed mode. See
-> §4.4 for the standalone caveat and the SaaS propagation model.
+> `max_budget_usd` is not part of the standalone admin API contract.
+> Budget policy is owned by the managed control plane.
 
 The `/rotate` endpoint replaces the stored hash and returns the new
 plaintext directly, so the operator does not need to compute the
@@ -178,12 +177,10 @@ curl -X POST http://localhost:3001/admin/v1/provider_keys \
 
 ### 4.4 Budgets
 
-Per-ApiKey USD spend caps are expressed via `max_budget_usd` on the
-ApiKey resource — there is no separate `/admin/v1/budgets`
-collection. **Enforcement is a SaaS-tier feature**: the data-plane
-proxy never reads `max_budget_usd` from the etcd snapshot. The
-field is populated by the SaaS control plane for parity with its
-own `api_keys` table and is informational on the DP side.
+Per-key USD budget enforcement is a managed control-plane feature.
+There is no standalone `/admin/v1/budgets` collection, and the
+standalone admin API does not accept `max_budget_usd` on ApiKey
+writes.
 
 #### SaaS / Managed mode
 
@@ -218,11 +215,11 @@ same cp-api stay consistent without DP-side coordination.
 
 #### Standalone mode
 
-Budget enforcement is **not implemented**. The admin API still
-accepts `max_budget_usd` on POST/PUT (the field passes through
-schema validation and persists to etcd) so the wire shape stays
-compatible with managed mode, but no part of the proxy reads it.
-Operators who need per-key spend caps must run in managed mode.
+Budget enforcement is **not implemented**.
+
+The standalone admin API rejects `max_budget_usd` on POST/PUT so
+operators do not mistake a stored field for an active enforcement
+path. Operators who need per-key spend caps must run in managed mode.
 
 Team-level budgets are SaaS-tier (cp-api owns cross-key
 aggregation) and have no standalone counterpart.

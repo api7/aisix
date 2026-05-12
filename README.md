@@ -51,7 +51,7 @@ Surfaces and capabilities currently in main:
 
 - **Managed-mode bootstrap** — cert-bundle path (no `/dp/register` round-trip): cp-api signs the mTLS leaf at mint time and ships PEMs as env vars at `docker run`. Snapshot persisted to `config_cache.json` so the proxy survives CP outages and restarts (offline resilience per PRD-09 §9.7.2).
 
-- **Per-key budgets** — `ApiKey.max_budget_usd` inline cap; managed mode delegates evaluation to cp-api `/dp/budget_check` with a 5 s LRU on the DP side.
+- **Per-key budgets** — enforced through the managed cp-api `/dp/budget_check` path with a 5 s LRU on the DP side. Standalone does not provide local budget authoring.
 
 ## Workspace
 
@@ -77,7 +77,7 @@ crates/
 
 The same binary runs both modes; the table is about **which surface owns the feature**, not about whether it works at all in one mode.
 
-> A few resources (Budget, Team, Member/Role, Audit Log, Billing) belong to the SaaS control plane and are intentionally **absent** from the standalone DP — standalone uses inline per-key alternatives (`ApiKey.max_budget_usd`, `ApiKey.rate_limit`).
+> A few resources (Budget, Team, Member/Role, Audit Log, Billing) belong to the SaaS control plane and are intentionally **absent** from the standalone DP. Standalone keeps per-key rate limiting, but budget policy remains CP-owned.
 
 | Capability | Standalone (DP only) | Managed (DP + AISIX-Cloud CP) |
 |---|---|---|
@@ -85,7 +85,7 @@ The same binary runs both modes; the table is about **which surface owns the fea
 | Multi-tenant model | None — single instance, single namespace | Org → Team → Member → Environment hierarchy |
 | ProviderKey storage | Plaintext `secret` in etcd (mTLS-only channel) | Master-key envelope-encrypted at rest, decrypted on projection |
 | API key handling | Hash on create, plaintext shown once | Hash + masked / one-time reveal in dashboard, rotation flow |
-| Budget enforcement | Per-ApiKey inline cap (`max_budget_usd`) | Per-ApiKey + per-ProviderKey + per-Environment + per-Org budgets, hard-stop / warn-only modes, alerts, audit |
+| Budget enforcement | Not locally authored in standalone; enforcement is absent without the managed CP budget-check path | Per-ApiKey + per-ProviderKey + per-Environment + per-Org budgets, hard-stop / warn-only modes, alerts, audit |
 | Audit log | None | Full org-scoped audit with diff viewer, RBAC-gated views |
 | RBAC / Roles | None — admin key is binary access | Org-scoped roles (owner / admin / developer / viewer), invitations |
 | Auth for proxy clients | Inbound `ApiKey` only | Inbound `ApiKey` only (proxy contract is identical) |

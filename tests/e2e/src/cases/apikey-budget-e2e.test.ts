@@ -7,22 +7,14 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: max_budget_usd round-trips through the admin API. Closes the
-// gap that PR #182 surfaced — the JSON schema previously rejected
-// max_budget_usd, making the field unreachable from a standalone
-// admin POST. This test pins the documented §4.2 contract: a body
-// carrying max_budget_usd is accepted, persisted, and returned by
-// GET unchanged. A regression that re-tightens the schema (or
-// re-adds additionalProperties: false without re-listing the field)
-// fails here loudly.
-//
-// Reference: docs/api-admin.md §4.2 (the example body now includes
-// "max_budget_usd": 500.0).
+// E2E: standalone admin API must reject max_budget_usd writes.
+// Budget policy belongs to the managed control-plane path, so the
+// standalone admin public contract must not accept local budget authoring.
 
 const PLAINTEXT = "sk-budget-e2e";
 const KEY_HASH = createHash("sha256").update(PLAINTEXT).digest("hex");
 
-describe("apikey max_budget_usd e2e: admin POST + GET round-trip", () => {
+describe("apikey max_budget_usd e2e: standalone admin rejects budget field", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
   let etcdReachable = false;
@@ -39,27 +31,7 @@ describe("apikey max_budget_usd e2e: admin POST + GET round-trip", () => {
     await app?.exit();
   });
 
-  test("POST persists max_budget_usd; GET returns the same value", async (ctx) => {
-    if (!etcdReachable || !admin) {
-      ctx.skip();
-      return;
-    }
-
-    const created = await admin.createApiKey({
-      key_hash: KEY_HASH,
-      allowed_models: ["*"],
-      max_budget_usd: 500.0,
-    });
-    expect(created.id).toBeTruthy();
-
-    const got = await admin.json<{
-      id: string;
-      value: { max_budget_usd?: number };
-    }>("GET", `/admin/v1/apikeys/${created.id}`);
-    expect(got.value.max_budget_usd).toBe(500);
-  });
-
-  test("POST with negative max_budget_usd is rejected with 400", async (ctx) => {
+  test("POST rejects max_budget_usd with 400", async (ctx) => {
     if (!etcdReachable || !admin) {
       ctx.skip();
       return;
@@ -68,9 +40,9 @@ describe("apikey max_budget_usd e2e: admin POST + GET round-trip", () => {
     let caught: unknown;
     try {
       await admin.createApiKey({
-        key_hash: createHash("sha256").update("sk-neg-budget").digest("hex"),
+        key_hash: KEY_HASH,
         allowed_models: ["*"],
-        max_budget_usd: -1,
+        max_budget_usd: 500.0,
       });
     } catch (e) {
       caught = e;
