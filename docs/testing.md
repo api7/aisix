@@ -100,7 +100,7 @@ Lives in `tests/e2e/`. Each test:
    (`/aisix-e2e-<uuid>`) so concurrent runs cannot collide.
 4. Writes a YAML config to a temp dir.
 5. Spawns `target/debug/aisix --config <path>`.
-6. Waits up to 10 s for `/health` and `/admin/v1/health` to respond.
+6. Waits up to 10 s for the minimal `/health` probe and `/admin/v1/health` to respond.
 7. Drives the request scenario via the Admin and Proxy clients.
 8. Tears down: SIGTERM + 3 s grace + SIGKILL fallback, plus etcd
    prefix cleanup.

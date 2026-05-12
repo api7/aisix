@@ -140,15 +140,12 @@ pub fn build_router(state: AdminState) -> Router {
 }
 
 async fn health(
-    axum::extract::State(state): axum::extract::State<AdminState>,
+    _state: axum::extract::State<AdminState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let snap = state.snapshot.load();
     (
         StatusCode::OK,
         Json(json!({
             "status": "ok",
-            "models": snap.models.len(),
-            "apikeys": snap.apikeys.len(),
         })),
     )
 }
@@ -328,7 +325,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_reports_snapshot_counts() {
+    async fn health_reports_only_minimal_status() {
         let app = build_router(build_state());
         let req = Request::builder()
             .uri("/health")
@@ -338,6 +335,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         assert_eq!(v["status"], "ok");
+        assert_eq!(v.as_object().map(|o| o.len()), Some(1));
+        assert!(v.get("models").is_none());
+        assert!(v.get("apikeys").is_none());
     }
 
     #[tokio::test]

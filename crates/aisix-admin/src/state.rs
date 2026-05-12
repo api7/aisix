@@ -3,7 +3,7 @@
 //! Holds:
 //! - the bootstrap-config-provided `admin_keys` (auth)
 //! - the `ConfigStore` trait object (CRUD backend)
-//! - a `SnapshotHandle` for the /health endpoint (snapshot counts)
+//! - a `SnapshotHandle` for authenticated operator-health handlers
 //! - an optional `Metrics` handle — when present, `/metrics` renders
 //!   the same Prometheus exposition that the proxy's middleware writes to
 //!

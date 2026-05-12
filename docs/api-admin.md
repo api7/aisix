@@ -23,7 +23,7 @@ configured in the bootstrap YAML under `admin.admin_keys` (a list).
 
 The unauthenticated endpoints are:
 
-- `/health` — liveness probe.
+- `/health` — minimal unauthenticated status probe.
 - `/metrics` — Prometheus scrape (intended to be private).
 - `/admin/openapi.json`, `/admin/openapi-scalar` — the OpenAPI spec
   and the Scalar UI.

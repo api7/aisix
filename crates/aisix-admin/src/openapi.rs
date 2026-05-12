@@ -26,7 +26,7 @@ const OPENAPI_JSON: &str = r##"{
   "paths": {
     "/health": {
       "get": {
-        "summary": "process health + snapshot counts",
+        "summary": "minimal process health status",
         "security": [],
         "responses": {"200": {"description": "OK"}}
       }
