@@ -28,6 +28,9 @@ The unauthenticated endpoints are:
 - `/admin/openapi.json`, `/admin/openapi-scalar` — the OpenAPI spec
   and the Scalar UI.
 
+`/health` is no longer mounted as the public liveness route. Update
+probes and automation to use `/livez`.
+
 ## 2. Error envelope
 
 Admin errors use a deliberately simpler envelope than the proxy:
