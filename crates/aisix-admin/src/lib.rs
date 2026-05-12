@@ -1,7 +1,12 @@
 //! aisix-admin — Admin API + Playground (:3001).
 //!
-//! Mounts the admin surface behind admin-key bearer auth:
+//! Public admin-listener endpoints:
 //! - `GET  /health`
+//! - `GET  /metrics`
+//! - `GET  /admin/openapi.json`
+//! - `GET  /admin/openapi-scalar`
+//!
+//! Admin-key protected routes:
 //! - `GET|POST            /admin/v1/models`
 //! - `GET|PUT|DELETE      /admin/v1/models/:id`
 //! - `GET|POST            /admin/v1/apikeys`

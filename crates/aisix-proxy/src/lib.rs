@@ -422,6 +422,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_rejects_non_get_requests() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
     async fn unknown_api_key_returns_401() {
         let hub = Arc::new(Hub::new());
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
