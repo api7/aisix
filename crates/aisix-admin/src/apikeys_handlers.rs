@@ -14,7 +14,6 @@ use aisix_core::resource::ResourceEntry;
 use aisix_core::ApiKey;
 use axum::extract::{Path, State};
 use axum::Json;
-use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -24,81 +23,32 @@ use crate::state::AdminState;
 
 const STARTING_REVISION: i64 = 1;
 
-#[derive(Debug, Clone, Serialize)]
-pub struct PublicApiKey {
-    pub key_hash: String,
-    pub allowed_models: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rate_limit: Option<aisix_core::models::RateLimit>,
-}
-
-impl From<ApiKey> for PublicApiKey {
-    fn from(value: ApiKey) -> Self {
-        Self {
-            key_hash: value.key_hash,
-            allowed_models: value.allowed_models,
-            rate_limit: value.rate_limit,
-        }
-    }
-}
-
-impl From<&ApiKey> for PublicApiKey {
-    fn from(value: &ApiKey) -> Self {
-        Self {
-            key_hash: value.key_hash.clone(),
-            allowed_models: value.allowed_models.clone(),
-            rate_limit: value.rate_limit.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct PublicApiKeyEntry {
-    pub id: String,
-    pub value: PublicApiKey,
-    pub revision: i64,
-}
-
-impl From<ResourceEntry<ApiKey>> for PublicApiKeyEntry {
-    fn from(value: ResourceEntry<ApiKey>) -> Self {
-        Self {
-            id: value.id,
-            value: PublicApiKey::from(value.value),
-            revision: value.revision,
-        }
-    }
-}
-
-fn public_entry(entry: ResourceEntry<ApiKey>) -> PublicApiKeyEntry {
-    entry.into()
-}
-
 pub async fn list_apikeys(
     _auth: AdminAuth,
     State(state): State<AdminState>,
-) -> Result<Json<Vec<PublicApiKeyEntry>>, AdminError> {
+) -> Result<Json<Vec<ResourceEntry<ApiKey>>>, AdminError> {
     let entries = state.store.list_apikeys().await?;
-    Ok(Json(entries.into_iter().map(public_entry).collect()))
+    Ok(Json(entries))
 }
 
 pub async fn get_apikey(
     _auth: AdminAuth,
     Path(id): Path<String>,
     State(state): State<AdminState>,
-) -> Result<Json<PublicApiKeyEntry>, AdminError> {
+) -> Result<Json<ResourceEntry<ApiKey>>, AdminError> {
     let entry = state
         .store
         .get_apikey(&id)
         .await?
         .ok_or(AdminError::NotFound)?;
-    Ok(Json(public_entry(entry)))
+    Ok(Json(entry))
 }
 
 pub async fn create_apikey(
     _auth: AdminAuth,
     State(state): State<AdminState>,
     Json(raw): Json<Value>,
-) -> Result<Json<PublicApiKeyEntry>, AdminError> {
+) -> Result<Json<ResourceEntry<ApiKey>>, AdminError> {
     let apikey = decode_apikey(&raw)?;
     let all = state.store.list_apikeys().await?;
     assert_unique_key(&all, &apikey.key_hash, None)?;
@@ -106,7 +56,7 @@ pub async fn create_apikey(
     let id = Uuid::new_v4().to_string();
     let entry = ResourceEntry::new(&id, apikey, STARTING_REVISION);
     state.store.put_apikey(entry.clone()).await?;
-    Ok(Json(public_entry(entry)))
+    Ok(Json(entry))
 }
 
 pub async fn update_apikey(
@@ -114,7 +64,7 @@ pub async fn update_apikey(
     Path(id): Path<String>,
     State(state): State<AdminState>,
     Json(raw): Json<Value>,
-) -> Result<Json<PublicApiKeyEntry>, AdminError> {
+) -> Result<Json<ResourceEntry<ApiKey>>, AdminError> {
     let existing = state
         .store
         .get_apikey(&id)
@@ -127,7 +77,7 @@ pub async fn update_apikey(
 
     let entry = ResourceEntry::new(&id, apikey, existing.revision + 1);
     state.store.put_apikey(entry.clone()).await?;
-    Ok(Json(public_entry(entry)))
+    Ok(Json(entry))
 }
 
 pub async fn delete_apikey(
@@ -174,17 +124,12 @@ pub async fn rotate_apikey(
     let entry = ResourceEntry::new(&id, updated, existing.revision + 1);
     state.store.put_apikey(entry.clone()).await?;
     Ok(Json(serde_json::json!({
-        "entry":     public_entry(entry),
+        "entry":     entry,
         "plaintext": new_plaintext,
     })))
 }
 
 fn decode_apikey(raw: &Value) -> Result<ApiKey, AdminError> {
-    if raw.get("max_budget_usd").is_some() {
-        return Err(AdminError::BadRequest(
-            "max_budget_usd is managed by the control plane and is not part of the standalone admin API contract".to_string(),
-        ));
-    }
     validate_apikey(raw)?;
     serde_json::from_value(raw.clone())
         .map_err(|e| AdminError::BadRequest(format!("malformed ApiKey payload: {e}")))

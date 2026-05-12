@@ -12,8 +12,7 @@
 //!
 //! Team is intentionally absent: it's a SaaS-tier concept owned by
 //! the AISIX-Cloud control plane, not by the standalone gateway.
-//! Standalone deployments do per-key budgeting via
-//! `ApiKey::max_budget_usd` and per-key rate-limiting via
+//! Standalone deployments do per-key rate-limiting via
 //! `ApiKey::rate_limit`.
 
 pub mod apikey;

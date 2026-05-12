@@ -7,14 +7,13 @@ import {
   type SpawnedApp,
 } from "../harness/index.js";
 
-// E2E: standalone admin API must reject max_budget_usd writes.
-// Budget policy belongs to the managed control-plane path, so the
-// standalone admin public contract must not accept local budget authoring.
+// E2E: the standalone admin ApiKey contract must reject unknown fields.
+// `max_budget_usd` is one concrete case pinned here.
 
 const PLAINTEXT = "sk-budget-e2e";
 const KEY_HASH = createHash("sha256").update(PLAINTEXT).digest("hex");
 
-describe("apikey max_budget_usd e2e: standalone admin rejects budget field", () => {
+describe("apikey max_budget_usd e2e: standalone admin rejects removed field", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
   let etcdReachable = false;
@@ -31,7 +30,7 @@ describe("apikey max_budget_usd e2e: standalone admin rejects budget field", () 
     await app?.exit();
   });
 
-  test("POST rejects max_budget_usd with 400", async (ctx) => {
+  test("POST rejects removed max_budget_usd field with 400", async (ctx) => {
     if (!etcdReachable || !admin) {
       ctx.skip();
       return;

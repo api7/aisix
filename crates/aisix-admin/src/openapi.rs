@@ -90,7 +90,7 @@ const OPENAPI_JSON: &str = r##"{
       "post": {
         "summary": "create api key",
         "description": "Body carries `key_hash` (SHA-256 of plaintext). The plaintext is generated client-side; the gateway never sees it.",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PublicApiKey"}}}},
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiKey"}}}},
         "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "409": {"description": "duplicate key_hash"}}
       }
     },
@@ -99,7 +99,7 @@ const OPENAPI_JSON: &str = r##"{
       "get":    { "summary": "get api key",    "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} },
       "put":    {
         "summary": "update api key",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PublicApiKey"}}}},
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiKey"}}}},
         "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "404": {"description": "not found"}, "409": {"description": "duplicate key_hash"}}
       },
       "delete": { "summary": "delete api key", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
@@ -114,7 +114,7 @@ const OPENAPI_JSON: &str = r##"{
             "type": "object",
             "required": ["entry", "plaintext"],
             "properties": {
-              "entry":     {"$ref": "#/components/schemas/PublicApiKeyEntry"},
+              "entry":     {"$ref": "#/components/schemas/ApiKeyEntry"},
               "plaintext": {"type": "string", "example": "sk-abcd1234ef567890"}
             }
           }}}},
@@ -248,7 +248,7 @@ const OPENAPI_JSON: &str = r##"{
           "revision": {"type": "integer"}
         }
       },
-      "PublicApiKey": {
+      "ApiKey": {
         "type": "object",
         "required": ["key_hash", "allowed_models"],
         "properties": {
@@ -257,12 +257,12 @@ const OPENAPI_JSON: &str = r##"{
           "rate_limit":     {"$ref": "#/components/schemas/RateLimit"}
         }
       },
-      "PublicApiKeyEntry": {
+      "ApiKeyEntry": {
         "type": "object",
         "required": ["id", "value", "revision"],
         "properties": {
           "id":       {"type": "string"},
-          "value":    {"$ref": "#/components/schemas/PublicApiKey"},
+          "value":    {"$ref": "#/components/schemas/ApiKey"},
           "revision": {"type": "integer"}
         }
       },
@@ -427,8 +427,8 @@ mod tests {
         for schema in [
             "Model",
             "ModelEntry",
-            "PublicApiKey",
-            "PublicApiKeyEntry",
+            "ApiKey",
+            "ApiKeyEntry",
             "ProviderKey",
             "Guardrail",
             "CachePolicy",

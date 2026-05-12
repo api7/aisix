@@ -658,7 +658,6 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(allowed, ["my-model"]);
-        assert!(entry["value"].get("max_budget_usd").is_none());
     }
 
     #[tokio::test]
@@ -708,7 +707,6 @@ mod tests {
         let resp = run(app, auth_req("GET", "/admin/v1/apikeys", None)).await;
         let listed = body_json(resp).await;
         assert_eq!(listed.as_array().unwrap().len(), 1);
-        assert!(listed[0]["value"].get("max_budget_usd").is_none());
 
         // Delete.
         let app = build_router(state);
@@ -721,7 +719,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_apikey_rejects_max_budget_usd() {
+    async fn create_apikey_rejects_unknown_field() {
         let app = build_router(build_state());
         let resp = run(
             app,
@@ -741,15 +739,16 @@ mod tests {
         assert!(v["error_msg"]
             .as_str()
             .unwrap()
-            .contains("max_budget_usd is managed by the control plane"));
+            .contains("schema validation"));
     }
 
     #[tokio::test]
-    async fn openapi_public_apikey_schema_excludes_max_budget_usd() {
+    async fn openapi_apikey_schema_excludes_max_budget_usd() {
         let resp = openapi::openapi_json().await;
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("OPENAPI_JSON must parse");
-        let props = &parsed["components"]["schemas"]["PublicApiKey"]["properties"];
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("OPENAPI_JSON must parse");
+        let props = &parsed["components"]["schemas"]["ApiKey"]["properties"];
         assert!(props["key_hash"].is_object());
         assert!(props["allowed_models"].is_object());
         assert!(props["rate_limit"].is_object());

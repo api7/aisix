@@ -137,8 +137,7 @@ curl -X POST http://localhost:3001/admin/v1/apikeys \
   }'
 ```
 
-> `max_budget_usd` is not part of the standalone admin API contract.
-> Budget policy is owned by the managed control plane.
+> `max_budget_usd` is not part of the AISIX AI Gateway ApiKey schema.
 
 The `/rotate` endpoint replaces the stored hash and returns the new
 plaintext directly, so the operator does not need to compute the
@@ -179,8 +178,7 @@ curl -X POST http://localhost:3001/admin/v1/provider_keys \
 
 Per-key USD budget enforcement is a managed control-plane feature.
 There is no standalone `/admin/v1/budgets` collection, and the
-standalone admin API does not accept `max_budget_usd` on ApiKey
-writes.
+gateway ApiKey schema does not include `max_budget_usd`.
 
 #### SaaS / Managed mode
 
@@ -217,9 +215,7 @@ same cp-api stay consistent without DP-side coordination.
 
 Budget enforcement is **not implemented**.
 
-The standalone admin API rejects `max_budget_usd` on POST/PUT so
-operators do not mistake a stored field for an active enforcement
-path. Operators who need per-key spend caps must run in managed mode.
+Operators who need per-key spend caps must run in managed mode.
 
 Team-level budgets are SaaS-tier (cp-api owns cross-key
 aggregation) and have no standalone counterpart.

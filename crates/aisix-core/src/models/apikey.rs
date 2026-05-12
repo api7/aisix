@@ -30,12 +30,6 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
 
-    /// Maximum USD spend per calendar month. When the accumulated spend
-    /// for this key reaches or exceeds this cap the proxy returns 429.
-    /// Absent = no budget enforcement.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_budget_usd: Option<f64>,
-
     /// etcd-key uuid; filled by the loader, never in the JSON payload.
     #[serde(skip)]
     pub(crate) runtime_id: String,
@@ -150,7 +144,6 @@ mod tests {
             key_hash: "abc".into(),
             allowed_models: vec![],
             rate_limit: None,
-            max_budget_usd: None,
             runtime_id: String::new(),
         };
         assert!(!k.can_access("my-gpt4"));
