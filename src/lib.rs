@@ -7,6 +7,10 @@ pub mod gateway {
     pub use aisix_llm::*;
 }
 
+pub mod guardrail {
+    pub use aisix_guardrail::*;
+}
+
 use std::{fmt::Debug, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
