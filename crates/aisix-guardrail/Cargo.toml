@@ -6,5 +6,13 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+aws-credential-types.workspace = true
+aws-sigv4.workspace = true
+aws-smithy-runtime-api.workspace = true
+http.workspace = true
+percent-encoding.workspace = true
+reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 utoipa.workspace = true

@@ -110,7 +110,15 @@ name = "aisix-guardrail"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "aws-credential-types",
+ "aws-sigv4",
+ "aws-smithy-runtime-api",
+ "http 1.4.0",
+ "percent-encoding",
+ "reqwest",
  "serde",
+ "serde_json",
+ "thiserror",
  "utoipa",
 ]
 
