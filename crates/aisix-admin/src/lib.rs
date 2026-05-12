@@ -401,7 +401,7 @@ mod tests {
         assert!(v["error_msg"]
             .as_str()
             .unwrap()
-            .contains("unknown field"));
+            .contains("schema validation"));
     }
 
     #[tokio::test]
@@ -736,10 +736,7 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let v = body_json(resp).await;
-        assert!(v["error_msg"]
-            .as_str()
-            .unwrap()
-            .contains("unknown field"));
+        assert!(v["error_msg"].as_str().unwrap().contains("unknown field"));
     }
 
     #[tokio::test]
