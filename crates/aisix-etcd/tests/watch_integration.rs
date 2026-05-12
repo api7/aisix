@@ -83,9 +83,9 @@ async fn watch_stream_delivers_events_after_put() {
         .expect("cleanup delete");
 }
 
-/// Regression test: when multiple keys are written in rapid succession, etcd
-/// may batch them into a single WatchResponse. Before the fix, only the first
-/// event was emitted and the rest were silently dropped.
+/// Regression test: an etcd transaction writes multiple keys atomically in a
+/// single revision, producing a single WatchResponse with multiple events.
+/// Before the fix, only the first event was emitted and the rest were dropped.
 #[tokio::test]
 async fn watch_stream_delivers_all_events_from_batched_response() {
     let url = match etcd_url() {
@@ -110,14 +110,15 @@ async fn watch_stream_delivers_all_events_from_batched_response() {
         .await
         .expect("writer connect");
 
-    // Write 4 keys in rapid succession to encourage etcd batching.
+    // Write 4 keys in a single transaction so etcd emits one multi-event
+    // WatchResponse. This is the exact scenario the buffer fix addresses.
     let keys: Vec<String> = (0..4).map(|i| format!("{prefix}/batch/{i}")).collect();
-    for key in &keys {
-        writer
-            .put(key.as_bytes(), b"v".as_ref(), None)
-            .await
-            .expect("put");
-    }
+    let txn = etcd_client::Txn::new().and_then(
+        keys.iter()
+            .map(|k| etcd_client::TxnOp::put(k.as_bytes(), b"v", None))
+            .collect::<Vec<_>>(),
+    );
+    writer.txn(txn).await.expect("txn");
 
     // All 4 events must arrive.
     let mut received = Vec::new();
