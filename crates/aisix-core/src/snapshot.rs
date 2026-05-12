@@ -18,6 +18,7 @@
 use crate::resource::{Resource, ResourceEntry};
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Per-kind table with primary id-index and secondary name-index.
@@ -120,12 +121,14 @@ impl<T: Resource> ResourceTable<T> {
 #[derive(Debug)]
 pub struct SnapshotHandle<S> {
     inner: Arc<ArcSwap<S>>,
+    version: Arc<AtomicU64>,
 }
 
 impl<S> Clone for SnapshotHandle<S> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            version: Arc::clone(&self.version),
         }
     }
 }
@@ -134,6 +137,7 @@ impl<S> SnapshotHandle<S> {
     pub fn new(initial: S) -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(initial)),
+            version: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -142,10 +146,19 @@ impl<S> SnapshotHandle<S> {
         self.inner.load_full()
     }
 
+    /// Monotonic version counter. Incremented on every `store` / `rcu`.
+    /// Consumers can compare this to detect snapshot changes without
+    /// relying on `Arc` pointer identity (which suffers from the ABA
+    /// problem when the allocator reuses addresses).
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
     /// Atomic store. Called by the etcd watch supervisor after building a
     /// fresh snapshot.
     pub fn store(&self, new: S) {
         self.inner.store(Arc::new(new));
+        self.version.fetch_add(1, Ordering::Release);
     }
 
     /// Read-copy-update. Runs `f(current)` to produce a new snapshot,
@@ -165,6 +178,7 @@ impl<S> SnapshotHandle<S> {
         F: FnMut(&S) -> S,
     {
         self.inner.rcu(|current| f(current.as_ref()));
+        self.version.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -248,8 +262,21 @@ mod tests {
     fn snapshot_handle_atomic_swap() {
         let handle: SnapshotHandle<u64> = SnapshotHandle::new(0);
         assert_eq!(*handle.load(), 0);
+        assert_eq!(handle.version(), 0);
         handle.store(42);
         assert_eq!(*handle.load(), 42);
+        assert_eq!(handle.version(), 1);
+    }
+
+    #[test]
+    fn version_increments_on_rcu() {
+        let handle: SnapshotHandle<u64> = SnapshotHandle::new(0);
+        assert_eq!(handle.version(), 0);
+        handle.rcu(|v| v + 1);
+        assert_eq!(handle.version(), 1);
+        handle.rcu(|v| v + 1);
+        assert_eq!(handle.version(), 2);
+        assert_eq!(*handle.load(), 2);
     }
 
     #[test]
