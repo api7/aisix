@@ -49,6 +49,6 @@ describe("apikey max_budget_usd e2e: standalone admin rejects removed field", ()
     expect(caught).toBeInstanceOf(Error);
     expect((caught as Error).message).toContain("400");
     expect((caught as Error).message).toContain("max_budget_usd");
-    expect((caught as Error).message).toContain("managed by the control plane");
+    expect((caught as Error).message).toContain("unknown field");
   });
 });
