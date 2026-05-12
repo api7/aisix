@@ -14,6 +14,7 @@ use aisix_core::resource::ResourceEntry;
 use aisix_core::ApiKey;
 use axum::extract::{Path, State};
 use axum::Json;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -23,32 +24,81 @@ use crate::state::AdminState;
 
 const STARTING_REVISION: i64 = 1;
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StandaloneApiKeyBody {
+    key_hash: String,
+    allowed_models: Vec<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate_limit: Option<aisix_core::models::RateLimit>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicApiKey {
+    pub key_hash: String,
+    pub allowed_models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<aisix_core::models::RateLimit>,
+}
+
+impl From<ApiKey> for PublicApiKey {
+    fn from(value: ApiKey) -> Self {
+        Self {
+            key_hash: value.key_hash,
+            allowed_models: value.allowed_models,
+            rate_limit: value.rate_limit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicApiKeyEntry {
+    pub id: String,
+    pub value: PublicApiKey,
+    pub revision: i64,
+}
+
+impl From<ResourceEntry<ApiKey>> for PublicApiKeyEntry {
+    fn from(value: ResourceEntry<ApiKey>) -> Self {
+        Self {
+            id: value.id,
+            value: PublicApiKey::from(value.value),
+            revision: value.revision,
+        }
+    }
+}
+
+fn public_entry(entry: ResourceEntry<ApiKey>) -> PublicApiKeyEntry {
+    entry.into()
+}
+
 pub async fn list_apikeys(
     _auth: AdminAuth,
     State(state): State<AdminState>,
-) -> Result<Json<Vec<ResourceEntry<ApiKey>>>, AdminError> {
+) -> Result<Json<Vec<PublicApiKeyEntry>>, AdminError> {
     let entries = state.store.list_apikeys().await?;
-    Ok(Json(entries))
+    Ok(Json(entries.into_iter().map(public_entry).collect()))
 }
 
 pub async fn get_apikey(
     _auth: AdminAuth,
     Path(id): Path<String>,
     State(state): State<AdminState>,
-) -> Result<Json<ResourceEntry<ApiKey>>, AdminError> {
+) -> Result<Json<PublicApiKeyEntry>, AdminError> {
     let entry = state
         .store
         .get_apikey(&id)
         .await?
         .ok_or(AdminError::NotFound)?;
-    Ok(Json(entry))
+    Ok(Json(public_entry(entry)))
 }
 
 pub async fn create_apikey(
     _auth: AdminAuth,
     State(state): State<AdminState>,
     Json(raw): Json<Value>,
-) -> Result<Json<ResourceEntry<ApiKey>>, AdminError> {
+) -> Result<Json<PublicApiKeyEntry>, AdminError> {
     let apikey = decode_apikey(&raw)?;
     let all = state.store.list_apikeys().await?;
     assert_unique_key(&all, &apikey.key_hash, None)?;
@@ -56,7 +106,7 @@ pub async fn create_apikey(
     let id = Uuid::new_v4().to_string();
     let entry = ResourceEntry::new(&id, apikey, STARTING_REVISION);
     state.store.put_apikey(entry.clone()).await?;
-    Ok(Json(entry))
+    Ok(Json(public_entry(entry)))
 }
 
 pub async fn update_apikey(
@@ -64,7 +114,7 @@ pub async fn update_apikey(
     Path(id): Path<String>,
     State(state): State<AdminState>,
     Json(raw): Json<Value>,
-) -> Result<Json<ResourceEntry<ApiKey>>, AdminError> {
+) -> Result<Json<PublicApiKeyEntry>, AdminError> {
     let existing = state
         .store
         .get_apikey(&id)
@@ -77,7 +127,7 @@ pub async fn update_apikey(
 
     let entry = ResourceEntry::new(&id, apikey, existing.revision + 1);
     state.store.put_apikey(entry.clone()).await?;
-    Ok(Json(entry))
+    Ok(Json(public_entry(entry)))
 }
 
 pub async fn delete_apikey(
@@ -124,14 +174,18 @@ pub async fn rotate_apikey(
     let entry = ResourceEntry::new(&id, updated, existing.revision + 1);
     state.store.put_apikey(entry.clone()).await?;
     Ok(Json(serde_json::json!({
-        "entry":     entry,
+        "entry":     public_entry(entry),
         "plaintext": new_plaintext,
     })))
 }
 
 fn decode_apikey(raw: &Value) -> Result<ApiKey, AdminError> {
-    validate_apikey(raw)?;
-    serde_json::from_value(raw.clone())
+    let body: StandaloneApiKeyBody = serde_json::from_value(raw.clone())
+        .map_err(|e| AdminError::BadRequest(format!("malformed ApiKey payload: {e}")))?;
+    let value = serde_json::to_value(&body)
+        .map_err(|e| AdminError::BadRequest(format!("malformed ApiKey payload: {e}")))?;
+    validate_apikey(&value)?;
+    serde_json::from_value(value)
         .map_err(|e| AdminError::BadRequest(format!("malformed ApiKey payload: {e}")))
 }
 

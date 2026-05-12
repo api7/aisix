@@ -401,7 +401,7 @@ mod tests {
         assert!(v["error_msg"]
             .as_str()
             .unwrap()
-            .contains("schema validation"));
+            .contains("unknown field"));
     }
 
     #[tokio::test]
@@ -739,7 +739,7 @@ mod tests {
         assert!(v["error_msg"]
             .as_str()
             .unwrap()
-            .contains("schema validation"));
+            .contains("unknown field"));
     }
 
     #[tokio::test]
