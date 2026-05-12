@@ -495,7 +495,10 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["required"], serde_json::json!(["status"]));
         assert_eq!(schema["additionalProperties"], false);
-        assert_eq!(schema["properties"]["status"]["enum"], serde_json::json!(["ok"]));
+        assert_eq!(
+            schema["properties"]["status"]["enum"],
+            serde_json::json!(["ok"])
+        );
     }
 
     #[tokio::test]

@@ -174,9 +174,7 @@ async fn drain_body(body: axum::body::Body) {
     .await;
 }
 
-async fn health(
-    _state: axum::extract::State<ProxyState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn health(_state: axum::extract::State<ProxyState>) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::OK,
         Json(json!({

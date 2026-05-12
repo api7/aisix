@@ -144,9 +144,7 @@ pub fn build_router(state: AdminState) -> Router {
         .with_state(state)
 }
 
-async fn health(
-    _state: axum::extract::State<AdminState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+async fn health(_state: axum::extract::State<AdminState>) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::OK,
         Json(json!({
