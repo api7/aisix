@@ -352,6 +352,8 @@ pub struct ChatDelta {
     pub role: Option<Role>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
 // ─── Embeddings ──────────────────────────────────────────────────────────────
@@ -675,6 +677,7 @@ mod tests {
             delta: ChatDelta {
                 role: None,
                 content: Some("hello".into()),
+                tool_calls: None,
             },
             finish_reason: None,
             usage: None,

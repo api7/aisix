@@ -294,6 +294,71 @@ pub(crate) fn translate_openai_tool_choice_to_anthropic(
     }
 }
 
+/// Translate Anthropic-shape `tools` array into OpenAI's tools-spec shape.
+///
+///   Anthropic                                 OpenAI
+///   {name,                                    {type: "function",
+///    description,                              function: {name, description,
+///    input_schema}                                        parameters}}
+///
+/// Returns `None` when the input isn't an array or when no entries
+/// translated — keeping the field absent from the outbound request.
+pub fn translate_anthropic_tools_to_openai(tools: serde_json::Value) -> Option<serde_json::Value> {
+    let arr = tools.as_array()?;
+    let translated: Vec<serde_json::Value> = arr
+        .iter()
+        .filter_map(|t| {
+            let name = t.get("name")?.as_str()?;
+            let mut function = serde_json::Map::new();
+            function.insert("name".into(), name.into());
+            if let Some(desc) = t.get("description") {
+                function.insert("description".into(), desc.clone());
+            }
+            if let Some(schema) = t.get("input_schema") {
+                function.insert("parameters".into(), schema.clone());
+            }
+            Some(serde_json::json!({
+                "type": "function",
+                "function": serde_json::Value::Object(function),
+            }))
+        })
+        .collect();
+    if translated.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Array(translated))
+    }
+}
+
+/// Translate Anthropic-shape `tool_choice` to OpenAI's.
+///
+///   Anthropic                              OpenAI
+///   {"type":"auto"}                    →   "auto"
+///   {"type":"none"}                    →   "none"  (Anthropic doesn't officially
+///                                          document this but clients may send it)
+///   {"type":"any"}                     →   "required"
+///   {"type":"tool", "name":"X"}        →   {type:"function", function:{name:"X"}}
+///
+/// Returns `None` for unrecognised shapes.
+pub fn translate_anthropic_tool_choice_to_openai(
+    v: serde_json::Value,
+) -> Option<serde_json::Value> {
+    let obj = v.as_object()?;
+    let typ = obj.get("type").and_then(|t| t.as_str())?;
+    match typ {
+        "auto" | "none" => Some(serde_json::Value::String(typ.to_string())),
+        "any" => Some(serde_json::Value::String("required".to_string())),
+        "tool" => {
+            let name = obj.get("name").and_then(|n| n.as_str())?;
+            Some(serde_json::json!({
+                "type": "function",
+                "function": {"name": name}
+            }))
+        }
+        _ => None,
+    }
+}
+
 /// Non-streaming response shape from `/v1/messages`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct AnthropicResponse {
@@ -527,6 +592,7 @@ impl StreamState {
                 delta: ChatDelta {
                     role: None,
                     content: Some(text.clone()),
+                    tool_calls: None,
                 },
                 finish_reason: None,
                 usage: None,
@@ -719,12 +785,61 @@ pub fn chat_response_into_anthropic_json(
         FinishReason::ToolCalls => "tool_use",
         FinishReason::Other(_) => "end_turn",
     };
+
+    let mut content: Vec<serde_json::Value> = Vec::new();
+
+    if !resp.message.content.is_empty() {
+        content.push(serde_json::json!({"type": "text", "text": resp.message.content}));
+    }
+
+    // Translate OpenAI-shape tool_calls from message.extra into
+    // Anthropic tool_use content blocks so Anthropic clients see
+    // the tool invocations the model requested.
+    if let Some(tool_calls) = resp
+        .message
+        .extra
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+    {
+        for tc in tool_calls {
+            let id = match tc.get("id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s,
+                _ => continue,
+            };
+            let name = match tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+            {
+                Some(s) if !s.is_empty() => s,
+                _ => continue,
+            };
+            let input = tc
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|a| a.as_str())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .filter(|v| v.is_object())
+                .unwrap_or(serde_json::json!({}));
+            content.push(serde_json::json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input,
+            }));
+        }
+    }
+
+    if content.is_empty() {
+        content.push(serde_json::json!({"type": "text", "text": ""}));
+    }
+
     serde_json::json!({
         "id": resp.id,
         "type": "message",
         "role": "assistant",
         "model": model_display_name,
-        "content": [{"type": "text", "text": resp.message.content}],
+        "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": serde_json::Value::Null,
         "usage": {
@@ -768,6 +883,16 @@ impl AnthropicSseEvent {
     }
 }
 
+/// Per-tool-call accumulator used by the SSE encoder to track which
+/// tool_use blocks have been started and at which content-block index.
+#[derive(Debug)]
+struct ToolCallState {
+    id: String,
+    name: String,
+    content_block_index: usize,
+    started: bool,
+}
+
 /// State machine for re-encoding a stream of internal `ChatChunk`s as
 /// Anthropic SSE events.
 #[derive(Debug)]
@@ -776,8 +901,13 @@ pub struct AnthropicSseEncoder {
     model_display_name: String,
     initial_input_tokens: u32,
     sent_message_start: bool,
-    sent_content_block_start: bool,
+    /// Index assigned to the text content block (if any).
+    text_block_index: Option<usize>,
     finished: bool,
+    /// Next content-block index to assign (shared across text + tool_use blocks).
+    next_block_index: usize,
+    /// Per-OpenAI-delta-index tool call state.
+    tool_calls: std::collections::BTreeMap<u64, ToolCallState>,
 }
 
 impl AnthropicSseEncoder {
@@ -796,8 +926,10 @@ impl AnthropicSseEncoder {
             model_display_name: model_display_name.into(),
             initial_input_tokens,
             sent_message_start: false,
-            sent_content_block_start: false,
+            text_block_index: None,
             finished: false,
+            next_block_index: 0,
+            tool_calls: std::collections::BTreeMap::new(),
         }
     }
 
@@ -815,24 +947,33 @@ impl AnthropicSseEncoder {
             .content
             .as_deref()
             .is_some_and(|s| !s.is_empty());
+        let has_tool_calls = chunk
+            .delta
+            .tool_calls
+            .as_ref()
+            .is_some_and(|v| !v.is_empty());
         let has_finish = chunk.finish_reason.is_some();
 
-        if !self.sent_message_start && (has_content || has_finish) {
+        if !self.sent_message_start && (has_content || has_tool_calls || has_finish) {
             events.push(self.message_start_event());
             self.sent_message_start = true;
         }
 
-        if !self.sent_content_block_start && has_content {
-            events.push(content_block_start_event());
-            self.sent_content_block_start = true;
+        // ── Text content block ──
+        if self.text_block_index.is_none() && has_content {
+            let idx = self.next_block_index;
+            self.next_block_index += 1;
+            self.text_block_index = Some(idx);
+            events.push(content_block_start_event(idx));
         }
 
         if has_content {
+            let idx = self.text_block_index.unwrap_or(0);
             events.push(AnthropicSseEvent {
                 event: "content_block_delta",
                 data: serde_json::json!({
                     "type": "content_block_delta",
-                    "index": 0,
+                    "index": idx,
                     "delta": {
                         "type": "text_delta",
                         "text": chunk.delta.content.clone().unwrap_or_default(),
@@ -841,10 +982,88 @@ impl AnthropicSseEncoder {
             });
         }
 
-        if let Some(fr) = &chunk.finish_reason {
-            if self.sent_content_block_start {
-                events.push(content_block_stop_event());
+        // ── Tool-use content blocks ──
+        if let Some(tool_calls) = &chunk.delta.tool_calls {
+            for tc in tool_calls {
+                let oai_index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                let arguments = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("");
+
+                let state = self.tool_calls.entry(oai_index).or_insert_with(|| {
+                    let block_idx = self.next_block_index;
+                    self.next_block_index += 1;
+                    ToolCallState {
+                        id: String::new(),
+                        name: String::new(),
+                        content_block_index: block_idx,
+                        started: false,
+                    }
+                });
+
+                if !id.is_empty() {
+                    state.id = id.to_string();
+                }
+                if !name.is_empty() {
+                    state.name = name.to_string();
+                }
+
+                // Emit content_block_start once id and name are known.
+                if !state.started && !state.id.is_empty() && !state.name.is_empty() {
+                    state.started = true;
+                    events.push(AnthropicSseEvent {
+                        event: "content_block_start",
+                        data: serde_json::json!({
+                            "type": "content_block_start",
+                            "index": state.content_block_index,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": state.id,
+                                "name": state.name,
+                                "input": {},
+                            },
+                        }),
+                    });
+                }
+
+                if state.started && !arguments.is_empty() {
+                    events.push(AnthropicSseEvent {
+                        event: "content_block_delta",
+                        data: serde_json::json!({
+                            "type": "content_block_delta",
+                            "index": state.content_block_index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": arguments,
+                            },
+                        }),
+                    });
+                }
             }
+        }
+
+        // ── Finish ──
+        if let Some(fr) = &chunk.finish_reason {
+            // Close text block if open.
+            if let Some(text_idx) = self.text_block_index {
+                events.push(content_block_stop_event(text_idx));
+            }
+            // Close all open tool_use blocks.
+            for state in self.tool_calls.values() {
+                if state.started {
+                    events.push(content_block_stop_event(state.content_block_index));
+                }
+            }
+
             let stop_reason = match fr {
                 FinishReason::Stop => "end_turn",
                 FinishReason::Length => "max_tokens",
@@ -895,8 +1114,13 @@ impl AnthropicSseEncoder {
             events.push(self.message_start_event());
             self.sent_message_start = true;
         }
-        if self.sent_content_block_start {
-            events.push(content_block_stop_event());
+        if let Some(text_idx) = self.text_block_index {
+            events.push(content_block_stop_event(text_idx));
+        }
+        for state in self.tool_calls.values() {
+            if state.started {
+                events.push(content_block_stop_event(state.content_block_index));
+            }
         }
         events.push(AnthropicSseEvent {
             event: "message_delta",
@@ -940,21 +1164,21 @@ impl AnthropicSseEncoder {
     }
 }
 
-fn content_block_start_event() -> AnthropicSseEvent {
+fn content_block_start_event(index: usize) -> AnthropicSseEvent {
     AnthropicSseEvent {
         event: "content_block_start",
         data: serde_json::json!({
             "type": "content_block_start",
-            "index": 0,
+            "index": index,
             "content_block": {"type": "text", "text": ""},
         }),
     }
 }
 
-fn content_block_stop_event() -> AnthropicSseEvent {
+fn content_block_stop_event(index: usize) -> AnthropicSseEvent {
     AnthropicSseEvent {
         event: "content_block_stop",
-        data: serde_json::json!({"type": "content_block_stop", "index": 0}),
+        data: serde_json::json!({"type": "content_block_stop", "index": index}),
     }
 }
 
@@ -1247,6 +1471,102 @@ mod tests {
             translate_openai_tool_choice_to_anthropic(serde_json::json!(42)),
             None,
         );
+    }
+
+    // ─── Anthropic → OpenAI tool translation (#236) ──────────────
+
+    #[test]
+    fn anthropic_tools_translate_to_openai_function_shape() {
+        let anthropic = serde_json::json!([
+            {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        ]);
+        let result = translate_anthropic_tools_to_openai(anthropic).unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "function");
+        assert_eq!(arr[0]["function"]["name"], "get_weather");
+        assert_eq!(arr[0]["function"]["description"], "Get current weather");
+        assert_eq!(arr[0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn anthropic_tool_without_description_or_schema_still_translates() {
+        let anthropic = serde_json::json!([{"name": "noop"}]);
+        let result = translate_anthropic_tools_to_openai(anthropic).unwrap();
+        let tool = &result.as_array().unwrap()[0];
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["function"]["name"], "noop");
+        assert!(tool["function"].get("description").is_none());
+        assert!(tool["function"].get("parameters").is_none());
+    }
+
+    #[test]
+    fn anthropic_tools_non_array_returns_none() {
+        assert!(translate_anthropic_tools_to_openai(serde_json::json!("not_array")).is_none());
+    }
+
+    #[test]
+    fn anthropic_tools_empty_array_returns_none() {
+        assert!(translate_anthropic_tools_to_openai(serde_json::json!([])).is_none());
+    }
+
+    #[test]
+    fn anthropic_tools_entries_without_name_are_skipped() {
+        let anthropic = serde_json::json!([
+            {"description": "no name field"},
+            {"name": "valid", "description": "ok"}
+        ]);
+        let result = translate_anthropic_tools_to_openai(anthropic).unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["function"]["name"], "valid");
+    }
+
+    #[test]
+    fn anthropic_tool_choice_auto_translates() {
+        assert_eq!(
+            translate_anthropic_tool_choice_to_openai(serde_json::json!({"type": "auto"})),
+            Some(serde_json::json!("auto")),
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_choice_any_translates_to_required() {
+        assert_eq!(
+            translate_anthropic_tool_choice_to_openai(serde_json::json!({"type": "any"})),
+            Some(serde_json::json!("required")),
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_choice_none_translates() {
+        assert_eq!(
+            translate_anthropic_tool_choice_to_openai(serde_json::json!({"type": "none"})),
+            Some(serde_json::json!("none")),
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_choice_specific_tool_translates() {
+        let anthropic = serde_json::json!({"type": "tool", "name": "get_weather"});
+        assert_eq!(
+            translate_anthropic_tool_choice_to_openai(anthropic),
+            Some(serde_json::json!({"type": "function", "function": {"name": "get_weather"}})),
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_choice_unrecognised_returns_none() {
+        assert!(
+            translate_anthropic_tool_choice_to_openai(serde_json::json!({"type": "unknown"}))
+                .is_none()
+        );
+        assert!(translate_anthropic_tool_choice_to_openai(serde_json::json!("auto")).is_none());
+        assert!(translate_anthropic_tool_choice_to_openai(serde_json::json!(42)).is_none());
     }
 
     #[test]
@@ -1570,6 +1890,38 @@ mod tests {
 
     // ─── AnthropicSseEncoder ──────────────────────────────────────
 
+    #[test]
+    fn render_anthropic_response_translates_openai_tool_calls_to_tool_use() {
+        let mut msg = ChatMessage::assistant("");
+        msg.extra.insert(
+            "tool_calls".to_string(),
+            serde_json::json!([{
+                "id": "call_abc",
+                "type": "function",
+                "function": {
+                    "name": "get_time",
+                    "arguments": "{\"timezone\":\"UTC\"}"
+                }
+            }]),
+        );
+        let resp = ChatResponse {
+            id: "cmpl-tc".into(),
+            model: "gpt-4o".into(),
+            message: msg,
+            finish_reason: FinishReason::ToolCalls,
+            usage: UsageStats::new(10, 5),
+        };
+        let json = chat_response_into_anthropic_json(&resp, "my-model");
+        assert_eq!(json["stop_reason"], "tool_use");
+        let content = json["content"].as_array().unwrap();
+        let tool_block = content.iter().find(|b| b["type"] == "tool_use");
+        assert!(tool_block.is_some(), "tool_use block must be present");
+        let tb = tool_block.unwrap();
+        assert_eq!(tb["id"], "call_abc");
+        assert_eq!(tb["name"], "get_time");
+        assert_eq!(tb["input"]["timezone"], "UTC");
+    }
+
     fn delta_chunk(text: &str) -> ChatChunk {
         ChatChunk {
             id: "cmpl-1".into(),
@@ -1577,6 +1929,7 @@ mod tests {
             delta: ChatDelta {
                 role: None,
                 content: Some(text.into()),
+                tool_calls: None,
             },
             finish_reason: None,
             usage: None,
@@ -1687,5 +2040,137 @@ mod tests {
         };
         let s = ev.to_sse_string();
         assert_eq!(s, "event: content_block_delta\ndata: {\"x\":1}\n\n");
+    }
+
+    // ─── Streaming tool_calls ──────────────────────────────────────
+
+    fn tool_call_chunk(index: u64, id: &str, name: &str, arguments: &str) -> ChatChunk {
+        let mut tc = serde_json::json!({"index": index});
+        if !id.is_empty() {
+            tc["id"] = serde_json::json!(id);
+            tc["type"] = serde_json::json!("function");
+        }
+        let mut func = serde_json::Map::new();
+        if !name.is_empty() {
+            func.insert("name".into(), serde_json::json!(name));
+        }
+        if !arguments.is_empty() {
+            func.insert("arguments".into(), serde_json::json!(arguments));
+        }
+        if !func.is_empty() {
+            tc["function"] = serde_json::Value::Object(func);
+        }
+        ChatChunk {
+            id: "cmpl-1".into(),
+            model: "u".into(),
+            delta: ChatDelta {
+                role: None,
+                content: None,
+                tool_calls: Some(vec![tc]),
+            },
+            finish_reason: None,
+            usage: None,
+        }
+    }
+
+    fn tool_finish_chunk() -> ChatChunk {
+        ChatChunk {
+            id: "cmpl-1".into(),
+            model: "u".into(),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::ToolCalls),
+            usage: Some(UsageStats::new(10, 5)),
+        }
+    }
+
+    #[test]
+    fn sse_encoder_tool_call_emits_block_start_and_argument_deltas() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "m", 0);
+        // First chunk: tool header with id+name and initial args.
+        let events = enc.next_events(&tool_call_chunk(0, "call_1", "get_weather", "{\"loc"));
+        let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta"
+            ]
+        );
+        // content_block_start should be tool_use
+        assert_eq!(events[1].data["content_block"]["type"], "tool_use");
+        assert_eq!(events[1].data["content_block"]["id"], "call_1");
+        assert_eq!(events[1].data["content_block"]["name"], "get_weather");
+        // content_block_delta should be input_json_delta
+        assert_eq!(events[2].data["delta"]["type"], "input_json_delta");
+        assert_eq!(events[2].data["delta"]["partial_json"], "{\"loc");
+    }
+
+    #[test]
+    fn sse_encoder_tool_call_subsequent_args_emit_delta_only() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "m", 0);
+        enc.next_events(&tool_call_chunk(0, "call_1", "get_weather", ""));
+        let events = enc.next_events(&tool_call_chunk(0, "", "", "ation\"}"));
+        let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
+        assert_eq!(kinds, vec!["content_block_delta"]);
+        assert_eq!(events[0].data["delta"]["partial_json"], "ation\"}");
+    }
+
+    #[test]
+    fn sse_encoder_tool_finish_closes_all_blocks() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "m", 0);
+        enc.next_events(&tool_call_chunk(0, "call_1", "fn_a", "{}"));
+        enc.next_events(&tool_call_chunk(1, "call_2", "fn_b", "{}"));
+        let events = enc.next_events(&tool_finish_chunk());
+        let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
+        // Should close both tool blocks, then message_delta + message_stop
+        assert_eq!(
+            kinds,
+            vec![
+                "content_block_stop",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+        assert_eq!(events[2].data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn sse_encoder_mixed_text_and_tool_call() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "m", 0);
+        // Text first
+        enc.next_events(&delta_chunk("thinking..."));
+        // Then a tool call
+        let events = enc.next_events(&tool_call_chunk(0, "call_1", "search", "{\"q\":\"x\"}"));
+        let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
+        assert_eq!(kinds, vec!["content_block_start", "content_block_delta"]);
+        // Tool block should be at index 1 (text was 0)
+        assert_eq!(events[0].data["index"], 1);
+        // Finish
+        let events = enc.next_events(&tool_finish_chunk());
+        let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
+        // Close text block (0), tool block (1), then message_delta + stop
+        assert_eq!(
+            kinds,
+            vec![
+                "content_block_stop",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
+        );
+    }
+
+    #[test]
+    fn sse_encoder_force_finish_closes_tool_blocks() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "m", 0);
+        enc.next_events(&tool_call_chunk(0, "call_1", "fn_a", "{}"));
+        let events = enc.force_finish();
+        let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
+        assert_eq!(
+            kinds,
+            vec!["content_block_stop", "message_delta", "message_stop"]
+        );
     }
 }

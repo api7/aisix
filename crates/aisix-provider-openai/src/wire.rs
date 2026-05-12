@@ -147,6 +147,8 @@ pub(crate) struct OpenAiResponseMessage {
     pub role: String,
     #[serde(default)]
     pub content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -184,17 +186,28 @@ pub(crate) struct OpenAiCompletionDetails {
 pub(crate) fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
     let first = raw.choices.drain(..).next();
     let (message, finish) = match first {
-        Some(c) => (
-            ChatMessage {
-                role: role_from_str(&c.message.role),
-                content: c.message.content.unwrap_or_default(),
-                content_blocks: None,
-                name: None,
-                tool_call_id: None,
-                extra: serde_json::Map::new(),
-            },
-            finish_reason(c.finish_reason.as_deref()),
-        ),
+        Some(c) => {
+            let mut extra = serde_json::Map::new();
+            if let Some(tool_calls) = c.message.tool_calls {
+                if !tool_calls.is_empty() {
+                    extra.insert(
+                        "tool_calls".to_string(),
+                        serde_json::Value::Array(tool_calls),
+                    );
+                }
+            }
+            (
+                ChatMessage {
+                    role: role_from_str(&c.message.role),
+                    content: c.message.content.unwrap_or_default(),
+                    content_blocks: None,
+                    name: None,
+                    tool_call_id: None,
+                    extra,
+                },
+                finish_reason(c.finish_reason.as_deref()),
+            )
+        }
         None => (ChatMessage::assistant(""), FinishReason::Stop),
     };
 
@@ -264,6 +277,8 @@ pub(crate) struct OpenAiStreamDelta {
     pub role: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
 }
 
 pub(crate) fn stream_chunk_into_chat_chunk(mut raw: OpenAiStreamChunk) -> ChatChunk {
@@ -273,6 +288,7 @@ pub(crate) fn stream_chunk_into_chat_chunk(mut raw: OpenAiStreamChunk) -> ChatCh
             ChatDelta {
                 role: c.delta.role.as_deref().map(role_from_str),
                 content: c.delta.content,
+                tool_calls: c.delta.tool_calls,
             },
             c.finish_reason
                 .as_deref()
@@ -427,6 +443,42 @@ mod tests {
     }
 
     #[test]
+    fn response_with_tool_calls_propagates_to_message_extra() {
+        let body = r#"{
+            "id": "cmpl-tc",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {"name": "get_time", "arguments": "{\"tz\":\"UTC\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        }"#;
+        let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        assert_eq!(out.finish_reason, FinishReason::ToolCalls);
+        let tc = out
+            .message
+            .extra
+            .get("tool_calls")
+            .expect("tool_calls in extra")
+            .as_array()
+            .unwrap();
+        assert_eq!(tc.len(), 1);
+        assert_eq!(tc[0]["id"], "call_abc");
+        assert_eq!(tc[0]["function"]["name"], "get_time");
+    }
+
+    #[test]
     fn cache_and_reasoning_details_populate_when_present() {
         // Verified shape from
         // https://platform.openai.com/docs/api-reference/chat/object#chat/object-usage
@@ -518,6 +570,32 @@ mod tests {
         let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
         let chunk = stream_chunk_into_chat_chunk(raw);
         assert_eq!(chunk.finish_reason, Some(FinishReason::Stop));
+    }
+
+    #[test]
+    fn stream_chunk_with_tool_calls_propagates_to_delta() {
+        let body = r#"{
+            "id": "cmpl-t",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": { "name": "get_weather", "arguments": "" }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        }"#;
+        let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
+        let chunk = stream_chunk_into_chat_chunk(raw);
+        let tc = chunk.delta.tool_calls.expect("tool_calls in delta");
+        assert_eq!(tc.len(), 1);
+        assert_eq!(tc[0]["id"], "call_abc");
+        assert_eq!(tc[0]["function"]["name"], "get_weather");
     }
 
     #[test]
