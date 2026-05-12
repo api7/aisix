@@ -380,6 +380,11 @@ fn outcome_from_response(
 ) -> Result<GuardrailOutcome, BedrockError> {
     match response.action.as_str() {
         "NONE" => Ok(GuardrailOutcome::Allow),
+        "GUARDRAIL_BLOCKED" => Ok(GuardrailOutcome::Block {
+            reason: response
+                .action_reason
+                .unwrap_or_else(|| "bedrock guardrail blocked".into()),
+        }),
         "GUARDRAIL_INTERVENED" => {
             if response.outputs.is_empty() {
                 return Ok(GuardrailOutcome::Block {
@@ -577,6 +582,27 @@ mod tests {
             &[0],
             ApplyGuardrailResponse {
                 action: "GUARDRAIL_INTERVENED".into(),
+                action_reason: Some("policy triggered".into()),
+                outputs: vec![],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            GuardrailOutcome::Block {
+                reason: "policy triggered".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn outcome_from_response_blocks_when_bedrock_reports_blocked() {
+        let outcome = outcome_from_response(
+            &input_payload("hello"),
+            &[0],
+            ApplyGuardrailResponse {
+                action: "GUARDRAIL_BLOCKED".into(),
                 action_reason: Some("policy triggered".into()),
                 outputs: vec![],
             },
