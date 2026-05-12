@@ -10,16 +10,22 @@ use span_attributes::{
 };
 pub use types::ChatCompletionError;
 
+use super::FormatHandlerAdapter;
 use crate::{
     gateway::{
+        error::GatewayError,
         formats::OpenAIChatFormat,
-        traits::ProviderCapabilities,
+        traits::{ChatFormat, ProviderCapabilities},
         types::{
             common::Usage,
             openai::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse},
         },
     },
-    proxy::handlers::format_handler::FormatHandlerAdapter,
+    proxy::guardrails::{
+        input_guardrail_payload_from_chat_messages, input_payload_from_check_payload,
+        input_payload_to_chat_messages, output_guardrail_payload_from_chat_messages,
+        output_payload_from_check_payload, output_payload_to_chat_messages,
+    },
 };
 
 pub(crate) struct ChatCompletionsAdapter;
@@ -86,7 +92,77 @@ impl FormatHandlerAdapter for ChatCompletionsAdapter {
         collector.output_message_span_properties()
     }
 
+    fn guardrail_input_payload(
+        _lifecycle_state: &Self::LifecycleState,
+        request: &Self::Request,
+    ) -> Result<Option<crate::guardrail::traits::GuardrailCheckPayload>, Self::Error> {
+        let (hub_request, _) = OpenAIChatFormat::to_hub(request)?;
+        let payload = input_guardrail_payload_from_chat_messages(&hub_request.messages)
+            .map(crate::guardrail::traits::GuardrailCheckPayload::Input)
+            .map_err(bridge_error)?;
+        Ok(Some(payload))
+    }
+
+    fn apply_input_guardrail_rewrite(
+        _lifecycle_state: &mut Self::LifecycleState,
+        request: &mut Self::Request,
+        rewrite: crate::guardrail::traits::GuardrailCheckPayload,
+    ) -> Result<(), Self::Error> {
+        request.messages = input_payload_to_chat_messages(
+            &input_payload_from_check_payload(rewrite).map_err(bridge_error)?,
+        )
+        .map_err(bridge_error)?;
+        Ok(())
+    }
+
+    fn guardrail_output_payload(
+        _lifecycle_state: &Self::LifecycleState,
+        response: &Self::Response,
+    ) -> Result<Option<crate::guardrail::traits::GuardrailCheckPayload>, Self::Error> {
+        let messages = response
+            .choices
+            .iter()
+            .map(|choice| choice.message.clone())
+            .collect::<Vec<_>>();
+        let payload = output_guardrail_payload_from_chat_messages(&messages)
+            .map(crate::guardrail::traits::GuardrailCheckPayload::Output)
+            .map_err(bridge_error)?;
+        Ok(Some(payload))
+    }
+
+    fn apply_output_guardrail_rewrite(
+        _lifecycle_state: &mut Self::LifecycleState,
+        response: &mut Self::Response,
+        rewrite: crate::guardrail::traits::GuardrailCheckPayload,
+    ) -> Result<(), Self::Error> {
+        let messages = output_payload_to_chat_messages(
+            &output_payload_from_check_payload(rewrite).map_err(bridge_error)?,
+        )
+        .map_err(bridge_error)?;
+
+        if messages.len() != response.choices.len() {
+            return Err(bridge_error(GatewayError::Bridge(format!(
+                "chat completion output guardrail rewrite expected {} messages, got {}",
+                response.choices.len(),
+                messages.len()
+            ))));
+        }
+
+        for (choice, message) in response.choices.iter_mut().zip(messages) {
+            choice.message = message;
+        }
+
+        Ok(())
+    }
+
     fn end_of_stream_event(saw_item: bool) -> Option<SseEvent> {
         saw_item.then(|| SseEvent::default().data("[DONE]"))
     }
+}
+
+fn bridge_error<E>(error: E) -> ChatCompletionError
+where
+    E: std::fmt::Display,
+{
+    ChatCompletionError::GatewayError(GatewayError::Bridge(error.to_string()))
 }

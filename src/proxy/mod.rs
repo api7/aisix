@@ -1,3 +1,4 @@
+mod guardrails;
 mod handlers;
 mod hooks;
 pub(crate) mod message_history;
@@ -64,19 +65,19 @@ pub fn create_router(state: AppState) -> Result<Router> {
         .route(
             "/v1/chat/completions",
             post(
-                handlers::format_handler::format_handler::<
+                handlers::format_handler::<
                     handlers::chat_completions::ChatCompletionsAdapter,
                 >,
             ),
         )
         .route(
             "/v1/messages",
-            post(handlers::format_handler::format_handler::<handlers::messages::MessagesAdapter>)
+            post(handlers::format_handler::<handlers::messages::MessagesAdapter>)
                 .layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .route(
             "/v1/responses",
-            post(handlers::format_handler::format_handler::<handlers::responses::ResponsesAdapter>),
+            post(handlers::format_handler::<handlers::responses::ResponsesAdapter>),
         )
         .route("/v1/embeddings", post(handlers::embeddings::embeddings))
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))

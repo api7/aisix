@@ -9,7 +9,8 @@ use reqwest::Url;
 use runtime::{
     ResponsesLifecycleState, accumulate_complete, accumulate_stream_event,
     accumulate_stream_success, build_merged_input_messages, init_lifecycle, load_previous_messages,
-    persist_if_enabled,
+    persist_if_enabled, response_output_to_chat_messages, rewrite_request_from_messages,
+    rewrite_response_from_messages,
 };
 use span_attributes::{
     StreamOutputCollector, chunk_span_properties, event_starts_output, request_span_properties,
@@ -30,8 +31,18 @@ use crate::{
             },
         },
     },
-    proxy::{AppState, handlers::format_handler::FormatHandlerAdapter, hooks::RequestContext},
+    proxy::{
+        AppState,
+        guardrails::{
+            input_guardrail_payload_from_chat_messages, input_payload_from_check_payload,
+            input_payload_to_chat_messages, output_guardrail_payload_from_chat_messages,
+            output_payload_from_check_payload, output_payload_to_chat_messages,
+        },
+        hooks::RequestContext,
+    },
 };
+
+use super::FormatHandlerAdapter;
 
 fn serialize_stream_event(event: &ResponsesApiStreamEvent) -> SseEvent {
     let mut sse_event =
@@ -96,6 +107,51 @@ impl FormatHandlerAdapter for ResponsesAdapter {
         collector.output_message_span_properties()
     }
 
+    fn guardrail_input_payload(
+        lifecycle_state: &Self::LifecycleState,
+        _request: &Self::Request,
+    ) -> Result<Option<crate::guardrail::traits::GuardrailCheckPayload>, Self::Error> {
+        let payload = input_guardrail_payload_from_chat_messages(&lifecycle_state.merged_input_messages)
+            .map(crate::guardrail::traits::GuardrailCheckPayload::Input)
+            .map_err(bridge_error)?;
+        Ok(Some(payload))
+    }
+
+    fn apply_input_guardrail_rewrite(
+        lifecycle_state: &mut Self::LifecycleState,
+        request: &mut Self::Request,
+        rewrite: crate::guardrail::traits::GuardrailCheckPayload,
+    ) -> Result<(), Self::Error> {
+        let messages = input_payload_to_chat_messages(&input_payload_from_check_payload(rewrite)
+            .map_err(bridge_error)?)
+            .map_err(bridge_error)?;
+        rewrite_request_from_messages(lifecycle_state, request, messages)?;
+        Ok(())
+    }
+
+    fn guardrail_output_payload(
+        _lifecycle_state: &Self::LifecycleState,
+        response: &Self::Response,
+    ) -> Result<Option<crate::guardrail::traits::GuardrailCheckPayload>, Self::Error> {
+        let messages = response_output_to_chat_messages(&response.output);
+        let payload = output_guardrail_payload_from_chat_messages(&messages)
+            .map(crate::guardrail::traits::GuardrailCheckPayload::Output)
+            .map_err(bridge_error)?;
+        Ok(Some(payload))
+    }
+
+    fn apply_output_guardrail_rewrite(
+        _lifecycle_state: &mut Self::LifecycleState,
+        response: &mut Self::Response,
+        rewrite: crate::guardrail::traits::GuardrailCheckPayload,
+    ) -> Result<(), Self::Error> {
+        let messages = output_payload_to_chat_messages(&output_payload_from_check_payload(rewrite)
+            .map_err(bridge_error)?)
+            .map_err(bridge_error)?;
+        rewrite_response_from_messages(response, &messages)?;
+        Ok(())
+    }
+
     async fn prepare_lifecycle(
         state: &AppState,
         _request_ctx: &mut RequestContext,
@@ -106,6 +162,7 @@ impl FormatHandlerAdapter for ResponsesAdapter {
         let previous_messages =
             load_previous_messages(storage.as_ref(), request.previous_response_id.as_deref())
                 .await?;
+        lifecycle_state.replay_messages_len = previous_messages.len();
         lifecycle_state.merged_input_messages =
             build_merged_input_messages(request, &previous_messages)?;
         request.replay_messages = previous_messages;
@@ -204,4 +261,11 @@ fn rewrite_output_item_ids(item: &mut ResponsesOutputItem, response_id: &str, ou
     if let ResponsesOutputItem::Message { id, .. } = item {
         *id = format!("{}_message_{}", response_id, output_index);
     }
+}
+
+fn bridge_error<E>(error: E) -> ResponsesError
+where
+    E: std::fmt::Display,
+{
+    ResponsesError::GatewayError(GatewayError::Bridge(error.to_string()))
 }

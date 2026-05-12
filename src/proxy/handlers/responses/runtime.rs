@@ -27,6 +27,7 @@ use crate::{
 pub(crate) struct ResponsesLifecycleState {
     pub response_id: String,
     pub previous_response_id: Option<String>,
+    pub replay_messages_len: usize,
     pub merged_input_messages: Vec<ChatMessage>,
     pub model: String,
     pub metadata: HashMap<String, Value>,
@@ -246,6 +247,7 @@ pub(crate) fn init_lifecycle(request: &ResponsesApiRequest) -> ResponsesLifecycl
     ResponsesLifecycleState {
         response_id: generate_response_id(),
         previous_response_id: request.previous_response_id.clone(),
+        replay_messages_len: 0,
         merged_input_messages: vec![],
         model: request.model.clone(),
         metadata: request_metadata(request),
@@ -370,7 +372,7 @@ fn request_metadata(request: &ResponsesApiRequest) -> HashMap<String, Value> {
         .unwrap_or_default()
 }
 
-fn request_input_messages(request: &ResponsesApiRequest) -> Result<Vec<ChatMessage>> {
+pub(crate) fn request_input_messages(request: &ResponsesApiRequest) -> Result<Vec<ChatMessage>> {
     match &request.input {
         ResponsesInput::Text(text) => Ok(vec![ChatMessage {
             role: "user".into(),
@@ -454,7 +456,7 @@ fn request_content_part_to_content_part(
     }
 }
 
-fn response_output_to_chat_messages(output: &[ResponsesOutputItem]) -> Vec<ChatMessage> {
+pub(crate) fn response_output_to_chat_messages(output: &[ResponsesOutputItem]) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     let mut current_assistant_index = None;
 
@@ -520,6 +522,38 @@ fn response_output_to_chat_messages(output: &[ResponsesOutputItem]) -> Vec<ChatM
         .collect()
 }
 
+pub(crate) fn rewrite_request_from_messages(
+    state: &mut ResponsesLifecycleState,
+    request: &mut ResponsesApiRequest,
+    messages: Vec<ChatMessage>,
+) -> Result<()> {
+    if messages.len() < state.replay_messages_len {
+        return Err(GatewayError::Bridge(format!(
+            "responses guardrail rewrite returned {} messages, fewer than {} replay messages",
+            messages.len(),
+            state.replay_messages_len
+        )));
+    }
+
+    let replay_messages = messages[..state.replay_messages_len].to_vec();
+    let current_messages = &messages[state.replay_messages_len..];
+    let (instructions, input) = responses_request_body_from_messages(current_messages)?;
+
+    state.merged_input_messages = messages;
+    request.replay_messages = replay_messages;
+    request.instructions = instructions;
+    request.input = input;
+    Ok(())
+}
+
+pub(crate) fn rewrite_response_from_messages(
+    response: &mut ResponsesApiResponse,
+    messages: &[ChatMessage],
+) -> Result<()> {
+    response.output = chat_messages_to_response_output(&response.id, messages)?;
+    Ok(())
+}
+
 fn response_output_content_to_message_content(
     content: &[ResponsesOutputContent],
 ) -> Option<MessageContent> {
@@ -536,6 +570,210 @@ fn response_output_content_to_message_content(
                 })
                 .collect(),
         )),
+    }
+}
+
+fn responses_request_body_from_messages(
+    messages: &[ChatMessage],
+) -> Result<(Option<String>, ResponsesInput)> {
+    let split_index = messages
+        .iter()
+        .position(|message| message.role != "system")
+        .unwrap_or(messages.len());
+
+    if messages[split_index..]
+        .iter()
+        .any(|message| message.role == "system")
+    {
+        return Err(GatewayError::Bridge(
+            "Responses request rewrite requires system messages to remain at the front".into(),
+        ));
+    }
+
+    let instructions = if split_index == 0 {
+        None
+    } else {
+        let mut segments = Vec::new();
+        for message in &messages[..split_index] {
+            segments.extend(message_content_text_segments(message.content.as_ref())?);
+        }
+        (!segments.is_empty()).then_some(segments.join("\n\n"))
+    };
+
+    let items = messages[split_index..]
+        .iter()
+        .map(chat_message_to_responses_input_item)
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok((instructions, ResponsesInput::Items(items)))
+}
+
+fn chat_message_to_responses_input_item(message: &ChatMessage) -> Result<ResponsesInputItem> {
+    match message.role.as_str() {
+        "user" | "assistant" | "system" => Ok(ResponsesInputItem::Message {
+            role: message.role.clone(),
+            content: message_content_to_responses_content(message.content.as_ref())?,
+        }),
+        "tool" => Ok(ResponsesInputItem::FunctionCallOutput {
+            call_id: message.tool_call_id.clone().ok_or_else(|| {
+                GatewayError::Bridge(
+                    "Responses request rewrite requires tool_call_id for tool messages".into(),
+                )
+            })?,
+            output: message_content_to_text(message.content.as_ref())?,
+        }),
+        other => Err(GatewayError::Bridge(format!(
+            "unsupported role {} for Responses request rewrite",
+            other
+        ))),
+    }
+}
+
+fn message_content_to_responses_content(content: Option<&MessageContent>) -> Result<ResponsesContent> {
+    let Some(content) = content else {
+        return Err(GatewayError::Bridge(
+            "Responses request rewrite requires message content".into(),
+        ));
+    };
+
+    match content {
+        MessageContent::Text(text) => Ok(ResponsesContent::Text(text.clone())),
+        MessageContent::Parts(parts) => Ok(ResponsesContent::Parts(
+            parts
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Text { text } => Ok(ResponsesContentPart::InputText {
+                        text: text.clone(),
+                    }),
+                    ContentPart::ImageUrl { image_url } => Ok(ResponsesContentPart::InputImage {
+                        image_url: Some(image_url.url.clone()),
+                        file_id: None,
+                        detail: image_url.detail.clone(),
+                    }),
+                })
+                .collect::<Result<Vec<_>>>()?,
+        )),
+    }
+}
+
+fn message_content_to_text(content: Option<&MessageContent>) -> Result<String> {
+    let Some(content) = content else {
+        return Ok(String::new());
+    };
+
+    match content {
+        MessageContent::Text(text) => Ok(text.clone()),
+        MessageContent::Parts(parts) => {
+            let mut text = String::new();
+            for part in parts {
+                match part {
+                    ContentPart::Text { text: part_text } => text.push_str(part_text),
+                    ContentPart::ImageUrl { .. } => {
+                        return Err(GatewayError::Bridge(
+                            "Responses text-only rewrite does not support image content here"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+            Ok(text)
+        }
+    }
+}
+
+fn message_content_text_segments(content: Option<&MessageContent>) -> Result<Vec<String>> {
+    let Some(content) = content else {
+        return Ok(vec![]);
+    };
+
+    match content {
+        MessageContent::Text(text) => Ok(vec![text.clone()]),
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text { text } => Ok(text.clone()),
+                ContentPart::ImageUrl { .. } => Err(GatewayError::Bridge(
+                    "Responses instructions rewrite does not support image content".into(),
+                )),
+            })
+            .collect(),
+    }
+}
+
+fn chat_messages_to_response_output(
+    response_id: &str,
+    messages: &[ChatMessage],
+) -> Result<Vec<ResponsesOutputItem>> {
+    let mut output = Vec::new();
+    let mut next_output_index = 0;
+
+    for message in messages {
+        let items = chat_message_to_response_output(response_id, next_output_index, message)?;
+        next_output_index += items.len();
+        output.extend(items);
+    }
+
+    Ok(output)
+}
+
+fn chat_message_to_response_output(
+    response_id: &str,
+    next_output_index: usize,
+    message: &ChatMessage,
+) -> Result<Vec<ResponsesOutputItem>> {
+    let mut output = Vec::new();
+    let content = chat_message_content_to_response_output_content(message.content.as_ref())?;
+
+    if !content.is_empty() {
+        output.push(ResponsesOutputItem::Message {
+            id: response_message_output_id(response_id, next_output_index),
+            role: message.role.clone(),
+            content,
+            status: "completed".into(),
+        });
+    }
+
+    if let Some(tool_calls) = &message.tool_calls {
+        let first_tool_output_index = next_output_index + output.len();
+        for (offset, tool_call) in tool_calls.iter().enumerate() {
+            output.push(ResponsesOutputItem::FunctionCall {
+                id: response_function_call_output_id(
+                    response_id,
+                    first_tool_output_index + offset,
+                ),
+                call_id: tool_call.id.clone(),
+                name: tool_call.function.name.clone(),
+                arguments: tool_call.function.arguments.clone(),
+                status: "completed".into(),
+            });
+        }
+    }
+
+    Ok(output)
+}
+
+fn chat_message_content_to_response_output_content(
+    content: Option<&MessageContent>,
+) -> Result<Vec<ResponsesOutputContent>> {
+    let Some(content) = content else {
+        return Ok(vec![]);
+    };
+
+    match content {
+        MessageContent::Text(text) => Ok(vec![ResponsesOutputContent::OutputText {
+            text: text.clone(),
+        }]),
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text { text } => Ok(ResponsesOutputContent::OutputText {
+                    text: text.clone(),
+                }),
+                ContentPart::ImageUrl { .. } => Err(GatewayError::Bridge(
+                    "Responses output rewrite does not support image content".into(),
+                )),
+            })
+            .collect(),
     }
 }
 
