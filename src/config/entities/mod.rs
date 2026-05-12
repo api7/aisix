@@ -1,4 +1,5 @@
 pub mod apikeys;
+pub mod guardrails;
 pub mod models;
 pub mod providers;
 pub mod types;
@@ -7,6 +8,7 @@ use std::{collections::HashMap, ops::Deref, sync::Arc};
 
 pub use apikeys::ApiKey;
 use arc_swap::ArcSwap;
+pub use guardrails::Guardrail;
 use log::{info, warn};
 pub use models::Model;
 pub use providers::Provider;
@@ -19,18 +21,21 @@ use crate::config::{ConfigEvent, ConfigProvider, GetEntry};
 pub struct ResourceRegistry {
     pub models: models::ModelsStore,
     pub apikeys: apikeys::ApiKeysStore,
+    pub guardrails: guardrails::GuardrailsStore,
     pub providers: providers::ProvidersStore,
 }
 
 impl ResourceRegistry {
     pub async fn new(provider: Arc<dyn ConfigProvider + Send + Sync>) -> Self {
         let providers = providers::ProvidersStore::new(provider.clone()).await;
+        let guardrails = guardrails::GuardrailsStore::new(provider.clone()).await;
         let models = models::ModelsStore::new(provider.clone()).await;
         let apikeys = apikeys::ApiKeysStore::new(provider).await;
 
         Self {
             models,
             apikeys,
+            guardrails,
             providers,
         }
     }

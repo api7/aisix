@@ -5,6 +5,10 @@
     "name": { "type": "string", "minLength": 1 },
     "provider_id": { "type": "string", "minLength": 1 },
     "model": { "type": "string", "minLength": 1 },
+    "guardrail_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
     "timeout": {
       "type": "integer",
       "minimum": 0

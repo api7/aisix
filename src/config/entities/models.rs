@@ -28,6 +28,12 @@ pub struct Model {
     pub provider_id: String,
     pub model: String,
 
+    // Temporary binding surface for guardrail runtime wiring until policy evaluation attaches
+    // guardrails dynamically. Keeping this on Model lets tests and the current runtime path stay
+    // simple without committing to the long-term control-plane shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub guardrail_ids: Vec<String>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
 
@@ -109,6 +115,12 @@ mod tests {
         "provider_id": "openai-primary",
         "model": "gpt-5"
     }), true, None)]
+    #[case::ok_with_guardrails(json!({
+        "name": "test",
+        "provider_id": "bedrock-primary",
+        "model": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        "guardrail_ids": ["gr-input", "gr-output"]
+    }), true, None)]
     #[case::ok_with_rate_limit(json!({
         "name": "test",
         "provider_id": "bedrock-primary",
@@ -142,6 +154,18 @@ mod tests {
         "provider_id": "openai-primary",
         "model": 123
     }), false, Some(r#"property "/model" validation failed: 123 is not of type "string""#.to_string()))]
+    #[case::invalid_guardrail_ids_type(json!({
+        "name": "test",
+        "provider_id": "openai-primary",
+        "model": "gpt-5",
+        "guardrail_ids": "gr-input"
+    }), false, Some(r#"property "/guardrail_ids" validation failed: "gr-input" is not of type "array""#.to_string()))]
+    #[case::invalid_guardrail_ids_element_type(json!({
+        "name": "test",
+        "provider_id": "openai-primary",
+        "model": "gpt-5",
+        "guardrail_ids": [1]
+    }), false, Some(r#"property "/guardrail_ids/0" validation failed: 1 is not of type "string""#.to_string()))]
     #[case::invalid_root_additional_property(json!({
         "name": "test",
         "provider_id": "openai-primary",
@@ -171,6 +195,7 @@ mod tests {
             "name": "test",
             "provider_id": "bedrock-primary",
             "model": "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "guardrail_ids": ["gr-input"],
             "timeout": 30000
         }))
         .unwrap();
@@ -181,6 +206,7 @@ mod tests {
             model.model,
             "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-3-5-sonnet-20240620-v1:0"
         );
+        assert_eq!(model.guardrail_ids, vec!["gr-input"]);
         assert_eq!(model.timeout, Some(30000));
     }
 }

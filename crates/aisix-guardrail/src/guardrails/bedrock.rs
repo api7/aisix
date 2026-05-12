@@ -39,14 +39,10 @@ const PATH_SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b'}')
     .add(b'/');
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
 pub struct BedrockGuardrailConfig {
     pub identifier: String,
     pub version: String,
-}
-
-#[derive(Clone, Serialize, Deserialize, ToSchema)]
-pub struct BedrockRuntimeConfig {
     pub region: String,
     pub access_key_id: String,
     pub secret_access_key: String,
@@ -58,11 +54,13 @@ pub struct BedrockRuntimeConfig {
     pub endpoint: Option<String>,
 }
 
-impl fmt::Debug for BedrockRuntimeConfig {
+impl fmt::Debug for BedrockGuardrailConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         const REDACTED: &str = "[REDACTED]";
 
-        f.debug_struct("BedrockRuntimeConfig")
+        f.debug_struct("BedrockGuardrailConfig")
+            .field("identifier", &self.identifier)
+            .field("version", &self.version)
             .field("region", &self.region)
             .field("access_key_id", &REDACTED)
             .field("secret_access_key", &REDACTED)
@@ -87,37 +85,40 @@ impl GuardrailMeta for BedrockGuardrailMeta {
 #[derive(Debug, Clone)]
 pub struct BedrockGuardrailRuntime {
     client: Client,
-    runtime: BedrockRuntimeConfig,
+}
+
+impl Default for BedrockGuardrailRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BedrockGuardrailRuntime {
-    pub fn new(runtime: BedrockRuntimeConfig) -> Self {
+    pub fn new() -> Self {
         Self {
             client: Client::new(),
-            runtime,
         }
     }
 
-    pub fn with_client(client: Client, runtime: BedrockRuntimeConfig) -> Self {
-        Self { client, runtime }
+    pub fn with_client(client: Client) -> Self {
+        Self { client }
     }
 
-    fn build_apply_url(&self, guardrail: &BedrockGuardrailConfig) -> Result<Url, BedrockError> {
-        let base_url = self
-            .runtime
+    fn build_apply_url(&self, config: &BedrockGuardrailConfig) -> Result<Url, BedrockError> {
+        let base_url = config
             .endpoint
             .as_deref()
             .map(str::to_owned)
             .unwrap_or_else(|| {
                 format!(
                     "{DEFAULT_RUNTIME_HOST_PREFIX}{}{DEFAULT_RUNTIME_HOST_SUFFIX}",
-                    self.runtime.region
+                    config.region
                 )
             });
         let endpoint_path = format!(
             "/guardrail/{}/version/{}/apply",
-            encode_path_segment(&guardrail.identifier),
-            encode_path_segment(&guardrail.version),
+            encode_path_segment(&config.identifier),
+            encode_path_segment(&config.version),
         );
 
         build_url_for_endpoint(&base_url, &endpoint_path)
@@ -149,6 +150,7 @@ impl BedrockGuardrailRuntime {
         url: &Url,
         body: &[u8],
         time: SystemTime,
+        config: &BedrockGuardrailConfig,
     ) -> Result<SignedRequest, BedrockError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -167,16 +169,16 @@ impl BedrockGuardrailRuntime {
             .collect::<Result<Vec<_>, BedrockError>>()?;
 
         let identity: Identity = Credentials::new(
-            self.runtime.access_key_id.clone(),
-            self.runtime.secret_access_key.clone(),
-            self.runtime.session_token.clone(),
+            config.access_key_id.clone(),
+            config.secret_access_key.clone(),
+            config.session_token.clone(),
             None,
             "aisix-bedrock-guardrail-static",
         )
         .into();
         let signing_params = v4::SigningParams::builder()
             .identity(&identity)
-            .region(self.runtime.region.as_str())
+            .region(config.region.as_str())
             .name("bedrock")
             .time(time)
             .settings(SigningSettings::default())
@@ -234,7 +236,7 @@ impl GuardrailRuntime<BedrockGuardrailConfig> for BedrockGuardrailRuntime {
         };
 
         let url = self.build_apply_url(config)?;
-        let signed = self.sign_request(&url, &body, SystemTime::now())?;
+        let signed = self.sign_request(&url, &body, SystemTime::now(), config)?;
         let response = self
             .client
             .post(signed.url)
@@ -430,22 +432,27 @@ mod tests {
 
     use super::{
         ApplyGuardrailOutput, ApplyGuardrailResponse, BedrockError, BedrockGuardrailConfig,
-        BedrockGuardrailRuntime, BedrockRuntimeConfig, build_url_for_endpoint,
-        outcome_from_response,
+        BedrockGuardrailRuntime, build_url_for_endpoint, outcome_from_response,
     };
     use crate::traits::{
         GuardrailCheckPayload, GuardrailMessage, GuardrailMessageContent, GuardrailOutcome,
         GuardrailRole, InputGuardrailPayload,
     };
 
-    fn runtime() -> BedrockGuardrailRuntime {
-        BedrockGuardrailRuntime::new(BedrockRuntimeConfig {
+    fn config() -> BedrockGuardrailConfig {
+        BedrockGuardrailConfig {
+            identifier: "guardrail-123".into(),
+            version: "1".into(),
             region: "us-east-1".into(),
             access_key_id: "AKIA123".into(),
             secret_access_key: "secret".into(),
             session_token: Some("token".into()),
             endpoint: Some("https://bedrock-runtime.us-east-1.amazonaws.com/guardrail".into()),
-        })
+        }
+    }
+
+    fn runtime() -> BedrockGuardrailRuntime {
+        BedrockGuardrailRuntime::new()
     }
 
     fn input_payload(text: &str) -> GuardrailCheckPayload {
@@ -461,14 +468,8 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_runtime_config_debug_redacts_credentials() {
-        let config = BedrockRuntimeConfig {
-            region: "us-east-1".into(),
-            access_key_id: "AKIA123".into(),
-            secret_access_key: "secret".into(),
-            session_token: Some("token".into()),
-            endpoint: Some("https://bedrock-runtime.us-east-1.amazonaws.com".into()),
-        };
+    fn bedrock_guardrail_config_debug_redacts_credentials() {
+        let config = config();
 
         let output = format!("{config:?}");
         assert!(output.contains("[REDACTED]"));
@@ -494,12 +495,10 @@ mod tests {
     #[test]
     fn build_apply_url_percent_encodes_identifier_segments() {
         let runtime = runtime();
-        let url = runtime
-            .build_apply_url(&BedrockGuardrailConfig {
-                identifier: "guardrail/name".into(),
-                version: "DRAFT".into(),
-            })
-            .unwrap();
+        let mut config = config();
+        config.identifier = "guardrail/name".into();
+        config.version = "DRAFT".into();
+        let url = runtime.build_apply_url(&config).unwrap();
 
         assert!(
             url.path()
@@ -510,6 +509,7 @@ mod tests {
     #[test]
     fn sign_request_adds_sigv4_authorization_header() {
         let runtime = runtime();
+        let config = config();
         let signed = runtime
             .sign_request(
                 &Url::parse(
@@ -518,6 +518,7 @@ mod tests {
                 .unwrap(),
                 br#"{"content":[{"text":{"text":"hello"}}],"source":"INPUT"}"#,
                 UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                &config,
             )
             .unwrap();
 

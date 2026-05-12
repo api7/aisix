@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
+  "type": "object",
+  "properties": {
+    "name": { "type": "string", "minLength": 1 },
+    "type": {
+      "type": "string",
+      "enum": ["bedrock"]
+    },
+    "config": { "type": "object" }
+  },
+  "required": ["name", "type", "config"],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": { "type": { "const": "bedrock" } },
+        "required": ["type"]
+      },
+      "then": {
+        "properties": {
+          "config": { "$ref": "#/$defs/bedrock" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "bedrock": {
+      "type": "object",
+      "required": [
+        "identifier",
+        "version",
+        "region",
+        "access_key_id",
+        "secret_access_key"
+      ],
+      "properties": {
+        "identifier": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "region": { "type": "string", "minLength": 1 },
+        "access_key_id": { "type": "string", "minLength": 1 },
+        "secret_access_key": { "type": "string", "minLength": 1 },
+        "session_token": { "type": "string", "minLength": 1 },
+        "endpoint": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,6 +1,6 @@
 pub mod bedrock;
 
-pub use bedrock::{BedrockGuardrailMeta, BedrockGuardrailRuntime, BedrockRuntimeConfig};
+pub use bedrock::{BedrockGuardrailMeta, BedrockGuardrailRuntime};
 
 pub mod identifiers {
     use super::bedrock;
