@@ -70,18 +70,11 @@ export class AdminClient {
  *
  * `condition` lets the caller provide a positive readiness probe; if
  * omitted, the helper falls back to the historical fixed-time wait.
- * The poll interval is 50ms.
  *
- * The default deadline is **30s** (raised from 10s). Vitest runs
- * up to `maxForks: 4` test files in parallel, each spawning an
- * `aisix` instance against a single shared etcd. Under that
- * concurrency the etcd watch dispatch can lag, especially for
- * tests that rely on the LAST resource in a write batch (e.g. a
- * Guardrail rule following Model + ApiKey + ProviderKey writes,
- * see `guardrail-keyword-e2e.test.ts`). The poll interval is
- * 50ms so in practice the function returns in 1-2s; the generous
- * ceiling only fires on genuinely stuck snapshots and avoids
- * CI rerun-flakes on slow GitHub Actions runners.
+ * Polls every 50ms, so in practice returns in 1-2s. The default
+ * deadline is **30s** (raised from 10s) to tolerate slow CI runners
+ * where multiple aisix instances share a single etcd and guardrail
+ * resources (written last) take longer to propagate.
  */
 export async function waitConfigPropagation(
   condition?: () => Promise<boolean>,
@@ -96,5 +89,5 @@ export async function waitConfigPropagation(
     if (await condition()) return;
     await new Promise((r) => setTimeout(r, 50));
   }
-  throw new Error(`waitConfigPropagation: condition not met within ${timeoutMs / 1000}s`);
+  throw new Error(`waitConfigPropagation: condition not met within ${timeoutMs}ms`);
 }
