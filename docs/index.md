@@ -23,11 +23,18 @@ This documentation set is organized for two primary audiences:
 
 - Follow the [Self-Hosted Quickstart](quickstart/self-hosted.md).
 - Continue with [First Model, First Key, First Request](quickstart/first-model-first-key-first-request.md).
+- Use [OpenAI SDK Quickstart](quickstart/openai-sdk.md) if you already have an OpenAI client.
+- Use [Anthropic SDK Quickstart](quickstart/anthropic-sdk.md) if you need the Anthropic-style `messages` API.
 - If you are evaluating the managed control plane, use the [Deployment Modes](overview/deployment-modes.md) and [Roadmap](roadmap.md) pages first.
+- For current Cloud bootstrap behavior, review [AISIX Cloud Managed Data Plane Quickstart](quickstart/aisix-cloud-managed-dp.md).
 
 ### I want to integrate an SDK or client
 
 - Start with the [OpenAI-Compatible API](integration/openai-compatible-api.md).
+- Use [Streaming](integration/streaming.md) for SSE behavior.
+- Use [Tool Calling](integration/tool-calling.md) for agent-style integrations.
+- Use [Anthropic Messages](integration/anthropic-messages.md) for Claude-style clients.
+- Use [Errors And Retries](integration/errors-and-retries.md) for shared failure handling.
 - Use the quickstarts to configure a working model and caller key first.
 
 ### I want to operate the gateway in production
@@ -44,6 +51,8 @@ This documentation set is organized for two primary audiences:
 - [Overview](overview/what-is-aisix-ai-gateway.md)
 - [Quickstart](quickstart/self-hosted.md)
 - [Client Integration](integration/openai-compatible-api.md)
+- [Streaming](integration/streaming.md)
+- [Errors And Retries](integration/errors-and-retries.md)
 - [Gateway Configuration](configuration/bootstrap-config.md)
 - [Models](configuration/models.md)
 - [API Keys](configuration/api-keys.md)
