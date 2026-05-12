@@ -169,13 +169,7 @@ pub struct LiveGuardrailChain {
 }
 
 struct Cache {
-    /// Pointer-identity of the snapshot the chain was built from,
-    /// stored as `usize` for `Send + Sync` (this crate forbids
-    /// `unsafe`). `Arc::as_ptr` is stable for the snapshot's
-    /// lifetime; comparing the integer to a fresh load tells us
-    /// cheaply whether the supervisor stored a new snapshot since
-    /// we last rebuilt. We never deref the address.
-    last_snapshot_addr: usize,
+    last_version: u64,
     chain: Arc<GuardrailChain>,
 }
 
@@ -184,40 +178,35 @@ impl LiveGuardrailChain {
         snapshot: SnapshotHandle<AisixSnapshot>,
         bedrock_endpoint_url: Option<String>,
     ) -> Arc<Self> {
-        // Eager-build at construct time so the very first chat
-        // doesn't pay the rebuild cost. The pointer recorded here
-        // is the snapshot at construct time — a subsequent store
-        // from the supervisor flips the cache miss bit on next
-        // check.
         let snap = snapshot.load();
         let chain = Arc::new(build_chain_from_snapshot(
             &snap.guardrails,
             bedrock_endpoint_url.as_deref(),
         ));
-        let last_snapshot_addr = Arc::as_ptr(&snap) as usize;
+        let last_version = snapshot.version();
         Arc::new(Self {
             snapshot,
             bedrock_endpoint_url,
             cache: Mutex::new(Cache {
-                last_snapshot_addr,
+                last_version,
                 chain,
             }),
         })
     }
 
     fn current(&self) -> Arc<GuardrailChain> {
-        let snap = self.snapshot.load();
-        let cur_ptr = Arc::as_ptr(&snap) as usize;
+        let cur_version = self.snapshot.version();
         let mut cache = self
             .cache
             .lock()
             .expect("LiveGuardrailChain mutex poisoned");
-        if cache.last_snapshot_addr != cur_ptr {
+        if cache.last_version != cur_version {
+            let snap = self.snapshot.load();
             cache.chain = Arc::new(build_chain_from_snapshot(
                 &snap.guardrails,
                 self.bedrock_endpoint_url.as_deref(),
             ));
-            cache.last_snapshot_addr = cur_ptr;
+            cache.last_version = cur_version;
         }
         Arc::clone(&cache.chain)
     }
