@@ -380,7 +380,9 @@ async fn cross_provider_dispatch(
 ) -> Result<DispatchOutcome, ProxyError> {
     use aisix_gateway::{Bridge, BridgeContext};
     use aisix_provider_anthropic::{
-        chat_response_into_anthropic_json, parse_inbound_request, AnthropicSseEncoder,
+        chat_response_into_anthropic_json, parse_inbound_request,
+        translate_anthropic_tool_choice_to_openai, translate_anthropic_tools_to_openai,
+        AnthropicSseEncoder,
     };
     use std::sync::Arc;
 
@@ -401,6 +403,20 @@ async fn cross_provider_dispatch(
     // (`model_name`) so the bridge can re-resolve the upstream id
     // through `ctx.model.upstream_model()` exactly like chat.rs does.
     chat.model = model_name.to_string();
+
+    // Translate Anthropic-shape tools/tool_choice in `extra` to
+    // OpenAI shape so the non-Anthropic bridge receives the format
+    // it expects. Without this, tools are silently dropped (#236).
+    if let Some(tools) = chat.extra.remove("tools") {
+        if let Some(translated) = translate_anthropic_tools_to_openai(tools) {
+            chat.extra.insert("tools".to_string(), translated);
+        }
+    }
+    if let Some(tc) = chat.extra.remove("tool_choice") {
+        if let Some(translated) = translate_anthropic_tool_choice_to_openai(tc) {
+            chat.extra.insert("tool_choice".to_string(), translated);
+        }
+    }
 
     let is_stream = chat.is_streaming();
     let model_arc = Arc::new(model.clone());

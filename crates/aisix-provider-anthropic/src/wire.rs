@@ -294,6 +294,71 @@ pub(crate) fn translate_openai_tool_choice_to_anthropic(
     }
 }
 
+/// Translate Anthropic-shape `tools` array into OpenAI's tools-spec shape.
+///
+///   Anthropic                                 OpenAI
+///   {name,                                    {type: "function",
+///    description,                              function: {name, description,
+///    input_schema}                                        parameters}}
+///
+/// Returns `None` when the input isn't an array or when no entries
+/// translated — keeping the field absent from the outbound request.
+pub fn translate_anthropic_tools_to_openai(tools: serde_json::Value) -> Option<serde_json::Value> {
+    let arr = tools.as_array()?;
+    let translated: Vec<serde_json::Value> = arr
+        .iter()
+        .filter_map(|t| {
+            let name = t.get("name")?.as_str()?;
+            let mut function = serde_json::Map::new();
+            function.insert("name".into(), name.into());
+            if let Some(desc) = t.get("description") {
+                function.insert("description".into(), desc.clone());
+            }
+            if let Some(schema) = t.get("input_schema") {
+                function.insert("parameters".into(), schema.clone());
+            }
+            Some(serde_json::json!({
+                "type": "function",
+                "function": serde_json::Value::Object(function),
+            }))
+        })
+        .collect();
+    if translated.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Array(translated))
+    }
+}
+
+/// Translate Anthropic-shape `tool_choice` to OpenAI's.
+///
+///   Anthropic                              OpenAI
+///   {"type":"auto"}                    →   "auto"
+///   {"type":"none"}                    →   "none"  (Anthropic doesn't officially
+///                                          document this but clients may send it)
+///   {"type":"any"}                     →   "required"
+///   {"type":"tool", "name":"X"}        →   {type:"function", function:{name:"X"}}
+///
+/// Returns `None` for unrecognised shapes.
+pub fn translate_anthropic_tool_choice_to_openai(
+    v: serde_json::Value,
+) -> Option<serde_json::Value> {
+    let obj = v.as_object()?;
+    let typ = obj.get("type").and_then(|t| t.as_str())?;
+    match typ {
+        "auto" | "none" => Some(serde_json::Value::String(typ.to_string())),
+        "any" => Some(serde_json::Value::String("required".to_string())),
+        "tool" => {
+            let name = obj.get("name").and_then(|n| n.as_str())?;
+            Some(serde_json::json!({
+                "type": "function",
+                "function": {"name": name}
+            }))
+        }
+        _ => None,
+    }
+}
+
 /// Non-streaming response shape from `/v1/messages`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct AnthropicResponse {
@@ -719,12 +784,61 @@ pub fn chat_response_into_anthropic_json(
         FinishReason::ToolCalls => "tool_use",
         FinishReason::Other(_) => "end_turn",
     };
+
+    let mut content: Vec<serde_json::Value> = Vec::new();
+
+    if !resp.message.content.is_empty() {
+        content.push(serde_json::json!({"type": "text", "text": resp.message.content}));
+    }
+
+    // Translate OpenAI-shape tool_calls from message.extra into
+    // Anthropic tool_use content blocks so Anthropic clients see
+    // the tool invocations the model requested.
+    if let Some(tool_calls) = resp
+        .message
+        .extra
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+    {
+        for tc in tool_calls {
+            let id = match tc.get("id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s,
+                _ => continue,
+            };
+            let name = match tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+            {
+                Some(s) if !s.is_empty() => s,
+                _ => continue,
+            };
+            let input = tc
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|a| a.as_str())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .filter(|v| v.is_object())
+                .unwrap_or(serde_json::json!({}));
+            content.push(serde_json::json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input,
+            }));
+        }
+    }
+
+    if content.is_empty() {
+        content.push(serde_json::json!({"type": "text", "text": ""}));
+    }
+
     serde_json::json!({
         "id": resp.id,
         "type": "message",
         "role": "assistant",
         "model": model_display_name,
-        "content": [{"type": "text", "text": resp.message.content}],
+        "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": serde_json::Value::Null,
         "usage": {
@@ -1249,6 +1363,102 @@ mod tests {
         );
     }
 
+    // ─── Anthropic → OpenAI tool translation (#236) ──────────────
+
+    #[test]
+    fn anthropic_tools_translate_to_openai_function_shape() {
+        let anthropic = serde_json::json!([
+            {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        ]);
+        let result = translate_anthropic_tools_to_openai(anthropic).unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "function");
+        assert_eq!(arr[0]["function"]["name"], "get_weather");
+        assert_eq!(arr[0]["function"]["description"], "Get current weather");
+        assert_eq!(arr[0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn anthropic_tool_without_description_or_schema_still_translates() {
+        let anthropic = serde_json::json!([{"name": "noop"}]);
+        let result = translate_anthropic_tools_to_openai(anthropic).unwrap();
+        let tool = &result.as_array().unwrap()[0];
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["function"]["name"], "noop");
+        assert!(tool["function"].get("description").is_none());
+        assert!(tool["function"].get("parameters").is_none());
+    }
+
+    #[test]
+    fn anthropic_tools_non_array_returns_none() {
+        assert!(translate_anthropic_tools_to_openai(serde_json::json!("not_array")).is_none());
+    }
+
+    #[test]
+    fn anthropic_tools_empty_array_returns_none() {
+        assert!(translate_anthropic_tools_to_openai(serde_json::json!([])).is_none());
+    }
+
+    #[test]
+    fn anthropic_tools_entries_without_name_are_skipped() {
+        let anthropic = serde_json::json!([
+            {"description": "no name field"},
+            {"name": "valid", "description": "ok"}
+        ]);
+        let result = translate_anthropic_tools_to_openai(anthropic).unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["function"]["name"], "valid");
+    }
+
+    #[test]
+    fn anthropic_tool_choice_auto_translates() {
+        assert_eq!(
+            translate_anthropic_tool_choice_to_openai(serde_json::json!({"type": "auto"})),
+            Some(serde_json::json!("auto")),
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_choice_any_translates_to_required() {
+        assert_eq!(
+            translate_anthropic_tool_choice_to_openai(serde_json::json!({"type": "any"})),
+            Some(serde_json::json!("required")),
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_choice_none_translates() {
+        assert_eq!(
+            translate_anthropic_tool_choice_to_openai(serde_json::json!({"type": "none"})),
+            Some(serde_json::json!("none")),
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_choice_specific_tool_translates() {
+        let anthropic = serde_json::json!({"type": "tool", "name": "get_weather"});
+        assert_eq!(
+            translate_anthropic_tool_choice_to_openai(anthropic),
+            Some(serde_json::json!({"type": "function", "function": {"name": "get_weather"}})),
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_choice_unrecognised_returns_none() {
+        assert!(
+            translate_anthropic_tool_choice_to_openai(serde_json::json!({"type": "unknown"}))
+                .is_none()
+        );
+        assert!(translate_anthropic_tool_choice_to_openai(serde_json::json!("auto")).is_none());
+        assert!(translate_anthropic_tool_choice_to_openai(serde_json::json!(42)).is_none());
+    }
+
     #[test]
     fn build_request_strips_tool_choice_from_extra() {
         // Even when the value is unrecognised, tool_choice MUST NOT
@@ -1569,6 +1779,38 @@ mod tests {
     }
 
     // ─── AnthropicSseEncoder ──────────────────────────────────────
+
+    #[test]
+    fn render_anthropic_response_translates_openai_tool_calls_to_tool_use() {
+        let mut msg = ChatMessage::assistant("");
+        msg.extra.insert(
+            "tool_calls".to_string(),
+            serde_json::json!([{
+                "id": "call_abc",
+                "type": "function",
+                "function": {
+                    "name": "get_time",
+                    "arguments": "{\"timezone\":\"UTC\"}"
+                }
+            }]),
+        );
+        let resp = ChatResponse {
+            id: "cmpl-tc".into(),
+            model: "gpt-4o".into(),
+            message: msg,
+            finish_reason: FinishReason::ToolCalls,
+            usage: UsageStats::new(10, 5),
+        };
+        let json = chat_response_into_anthropic_json(&resp, "my-model");
+        assert_eq!(json["stop_reason"], "tool_use");
+        let content = json["content"].as_array().unwrap();
+        let tool_block = content.iter().find(|b| b["type"] == "tool_use");
+        assert!(tool_block.is_some(), "tool_use block must be present");
+        let tb = tool_block.unwrap();
+        assert_eq!(tb["id"], "call_abc");
+        assert_eq!(tb["name"], "get_time");
+        assert_eq!(tb["input"]["timezone"], "UTC");
+    }
 
     fn delta_chunk(text: &str) -> ChatChunk {
         ChatChunk {
