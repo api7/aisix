@@ -82,3 +82,65 @@ async fn watch_stream_delivers_events_after_put() {
         .await
         .expect("cleanup delete");
 }
+
+/// Regression test: when multiple keys are written in rapid succession, etcd
+/// may batch them into a single WatchResponse. Before the fix, only the first
+/// event was emitted and the rest were silently dropped.
+#[tokio::test]
+async fn watch_stream_delivers_all_events_from_batched_response() {
+    let url = match etcd_url() {
+        Some(u) => u,
+        None => {
+            eprintln!("ETCD_TEST_URL not set — skipping");
+            return;
+        }
+    };
+
+    let prefix = unique_prefix();
+    let endpoints = vec![url.clone()];
+    let provider = EtcdConfigProvider::connect(&endpoints, prefix.clone(), None)
+        .await
+        .expect("connect");
+
+    let (_entries, revision) = provider.load_all().await.expect("load_all");
+    let mut stream = provider.watch(revision + 1).await.expect("watch");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut writer = Client::connect([url.as_str()], None)
+        .await
+        .expect("writer connect");
+
+    // Write 4 keys in rapid succession to encourage etcd batching.
+    let keys: Vec<String> = (0..4).map(|i| format!("{prefix}/batch/{i}")).collect();
+    for key in &keys {
+        writer
+            .put(key.as_bytes(), b"v".as_ref(), None)
+            .await
+            .expect("put");
+    }
+
+    // All 4 events must arrive.
+    let mut received = Vec::new();
+    for _ in 0..4 {
+        let ev = timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("timed out waiting for batched event")
+            .expect("stream ended early");
+        match ev.expect("watch error") {
+            aisix_etcd::WatchEvent::Put(entry) => received.push(entry.key),
+            other => panic!("expected Put, got {other:?}"),
+        }
+    }
+    received.sort();
+    let mut expected = keys.clone();
+    expected.sort();
+    assert_eq!(received, expected, "all batched events must be delivered");
+
+    // Cleanup
+    for key in &keys {
+        writer
+            .delete(key.as_bytes(), None)
+            .await
+            .expect("cleanup delete");
+    }
+}

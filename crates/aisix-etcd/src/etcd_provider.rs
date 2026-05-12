@@ -12,6 +12,7 @@ use etcd_client::{
     Client, ConnectOptions, Error as EtcdError, EventType, GetOptions, WatchOptions,
 };
 use futures::{Stream, StreamExt};
+use std::collections::VecDeque;
 use std::error::Error as StdError;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -178,32 +179,50 @@ impl ConfigProvider for EtcdConfigProvider {
         Ok(Box::new(EtcdWatchStream {
             inner: stream,
             _watcher: watcher,
+            buf: VecDeque::new(),
         }))
     }
 }
 
 /// Adapter from `etcd-client`'s WatchStream to our typed [`WatchEvent`].
 ///
-/// Each `WatchResponse` carries a batch of events; we flatten them.
-/// Errors from etcd are inspected for compaction and mapped to
-/// [`ProviderError::Compacted`] so the supervisor can resync.
+/// Each `WatchResponse` carries a batch of events; we flatten them
+/// into individual `WatchEvent` items. A `VecDeque` buffer drains
+/// multi-event responses across successive `poll_next` calls so that
+/// no events are silently dropped.
 pub struct EtcdWatchStream {
     inner: etcd_client::WatchStream,
     // Must outlive `inner` — dropping the Watcher closes the client→server
     // half of the gRPC stream, causing the server to tear down the watch.
     _watcher: etcd_client::Watcher,
+    buf: VecDeque<WatchEvent>,
+}
+
+fn convert_event(ev: &etcd_client::Event) -> Option<WatchEvent> {
+    match ev.event_type() {
+        EventType::Put => ev.kv().map(|kv| {
+            WatchEvent::Put(RawEntry {
+                key: String::from_utf8_lossy(kv.key()).into_owned(),
+                value: kv.value().to_vec(),
+                revision: kv.mod_revision(),
+            })
+        }),
+        EventType::Delete => ev.kv().map(|kv| WatchEvent::Delete {
+            key: String::from_utf8_lossy(kv.key()).into_owned(),
+            revision: kv.mod_revision(),
+        }),
+    }
 }
 
 impl Stream for EtcdWatchStream {
     type Item = Result<WatchEvent, ProviderError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // We use a simple one-event-at-a-time strategy: on every poll
-        // we ask the underlying stream for the next WatchResponse, then
-        // emit its events back-to-back by storing leftovers… but to keep
-        // this crate small the first event of the batch is emitted and
-        // the rest arrive on subsequent responses, since etcd in practice
-        // batches per key and our prefix produces one-entry batches.
+        // Drain buffered events from a previous multi-event response first.
+        if let Some(item) = self.buf.pop_front() {
+            return Poll::Ready(Some(Ok(item)));
+        }
+
         match self.inner.poll_next_unpin(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(None),
@@ -221,29 +240,17 @@ impl Stream for EtcdWatchStream {
                 if resp.compact_revision() > 0 {
                     return Poll::Ready(Some(Err(ProviderError::Compacted)));
                 }
-                // Emit the first event. If a single response has multiple
-                // events, they will be received on subsequent polls by
-                // etcd's own batching — good enough for small clusters
-                // and correct under heavy load (we never drop events,
-                // we only smear them over wakeups).
-                if let Some(ev) = resp.events().first() {
-                    let item = match ev.event_type() {
-                        EventType::Put => ev.kv().map(|kv| {
-                            WatchEvent::Put(RawEntry {
-                                key: String::from_utf8_lossy(kv.key()).into_owned(),
-                                value: kv.value().to_vec(),
-                                revision: kv.mod_revision(),
-                            })
-                        }),
-                        EventType::Delete => ev.kv().map(|kv| WatchEvent::Delete {
-                            key: String::from_utf8_lossy(kv.key()).into_owned(),
-                            revision: kv.mod_revision(),
-                        }),
-                    };
-                    if let Some(item) = item {
-                        return Poll::Ready(Some(Ok(item)));
+
+                for ev in resp.events() {
+                    if let Some(item) = convert_event(ev) {
+                        self.buf.push_back(item);
                     }
                 }
+
+                if let Some(item) = self.buf.pop_front() {
+                    return Poll::Ready(Some(Ok(item)));
+                }
+
                 // Empty response (e.g. header-only): tell the runtime
                 // to poll us again rather than stalling.
                 cx.waker().wake_by_ref();
