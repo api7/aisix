@@ -20,6 +20,7 @@ use tokio::{
 
 use crate::{
     config::entities::{Model, ResourceEntry},
+    guardrail::traits::{GuardrailCheckPayload, GuardrailOutcome},
     gateway::{
         error::GatewayError,
         traits::{ChatFormat, ProviderCapabilities},
@@ -30,6 +31,7 @@ use crate::{
     },
     proxy::{
         AppState,
+        guardrails::{ConfiguredGuardrailRuntime, resolve_model_guardrails},
         hooks::{
             self, RequestContext, authorization::AuthorizationError, rate_limit::RateLimitError,
         },
@@ -84,6 +86,36 @@ pub(crate) trait FormatHandlerAdapter: Send + Sync + 'static {
     fn record_stream_item(collector: &mut Self::Collector, chunk: &Self::StreamChunk);
 
     fn output_message_span_properties(collector: &Self::Collector) -> Vec<(String, String)>;
+
+    fn guardrail_input_payload(
+        _lifecycle_state: &Self::LifecycleState,
+        _request: &Self::Request,
+    ) -> Result<Option<GuardrailCheckPayload>, Self::Error> {
+        Ok(None)
+    }
+
+    fn apply_input_guardrail_rewrite(
+        _lifecycle_state: &mut Self::LifecycleState,
+        _request: &mut Self::Request,
+        _rewrite: GuardrailCheckPayload,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn guardrail_output_payload(
+        _lifecycle_state: &Self::LifecycleState,
+        _response: &Self::Response,
+    ) -> Result<Option<GuardrailCheckPayload>, Self::Error> {
+        Ok(None)
+    }
+
+    fn apply_output_guardrail_rewrite(
+        _lifecycle_state: &mut Self::LifecycleState,
+        _response: &mut Self::Response,
+        _rewrite: GuardrailCheckPayload,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     async fn prepare_lifecycle(
         _state: &AppState,
@@ -183,10 +215,18 @@ where
     let provider = model.provider(resources.as_ref()).ok_or_else(|| {
         GatewayError::Internal(format!("provider {} not found", model.provider_id))
     })?;
+    let configured_guardrails = resolve_model_guardrails(&model, resources.as_ref())?;
     let provider_instance = create_provider_instance(gateway.as_ref(), &provider)?;
     let provider_base_url = provider_instance.effective_base_url().ok();
     let mut lifecycle_state =
         A::prepare_lifecycle(&state, &mut request_ctx, &mut request_data).await?;
+
+    apply_input_guardrails::<A>(
+        &configured_guardrails,
+        &mut lifecycle_state,
+        &mut request_data,
+    )
+    .await?;
 
     let span = Span::enter_with_local_parent(A::span_name());
     apply_span_properties(
@@ -214,6 +254,12 @@ where
             mut response,
             usage,
         })) => {
+            apply_output_guardrails::<A>(
+                &configured_guardrails,
+                &mut lifecycle_state,
+                &mut response,
+            )
+            .await?;
             A::handle_complete_response(
                 &state,
                 &mut request_ctx,
@@ -245,6 +291,76 @@ where
             Err(err.into())
         }
     }
+}
+
+async fn apply_input_guardrails<A>(
+    guardrails: &[Box<dyn ConfiguredGuardrailRuntime>],
+    lifecycle_state: &mut A::LifecycleState,
+    request: &mut AdapterRequest<A>,
+) -> Result<(), A::Error>
+where
+    A: FormatHandlerAdapter,
+{
+    for guardrail in guardrails {
+        let Some(payload) = A::guardrail_input_payload(lifecycle_state, request)? else {
+            continue;
+        };
+        let Some(outcome) = guardrail.check(&payload).await? else {
+            continue;
+        };
+
+        match outcome {
+            GuardrailOutcome::Allow => {}
+            GuardrailOutcome::Rewrite(rewrite) => {
+                A::apply_input_guardrail_rewrite(lifecycle_state, request, rewrite)?;
+            }
+            GuardrailOutcome::Block { reason } => {
+                return Err(GatewayError::Validation(format!(
+                    "guardrail {} blocked input: {}",
+                    guardrail.name(),
+                    reason
+                ))
+                .into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn apply_output_guardrails<A>(
+    guardrails: &[Box<dyn ConfiguredGuardrailRuntime>],
+    lifecycle_state: &mut A::LifecycleState,
+    response: &mut AdapterResponse<A>,
+) -> Result<(), A::Error>
+where
+    A: FormatHandlerAdapter,
+{
+    for guardrail in guardrails {
+        let Some(payload) = A::guardrail_output_payload(lifecycle_state, response)? else {
+            continue;
+        };
+        let Some(outcome) = guardrail.check(&payload).await? else {
+            continue;
+        };
+
+        match outcome {
+            GuardrailOutcome::Allow => {}
+            GuardrailOutcome::Rewrite(rewrite) => {
+                A::apply_output_guardrail_rewrite(lifecycle_state, response, rewrite)?;
+            }
+            GuardrailOutcome::Block { reason } => {
+                return Err(GatewayError::Validation(format!(
+                    "guardrail {} blocked output: {}",
+                    guardrail.name(),
+                    reason
+                ))
+                .into());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn handle_regular_response<A>(
