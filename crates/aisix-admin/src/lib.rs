@@ -1,7 +1,7 @@
 //! aisix-admin — Admin API + Playground (:3001).
 //!
 //! Public admin-listener endpoints:
-//! - `GET  /health`
+//! - `GET  /livez`
 //! - `GET  /metrics`
 //! - `GET  /admin/openapi.json`
 //! - `GET  /admin/openapi-scalar`
@@ -53,12 +53,11 @@ pub use state::AdminState;
 pub use store::{ConfigStore, InMemoryStore, StoreError};
 
 use axum::routing::{get, post};
-use axum::{http::StatusCode, Json, Router};
-use serde_json::json;
+use axum::{http::StatusCode, response::Response, Router};
 
 pub fn build_router(state: AdminState) -> Router {
     Router::new()
-        .route("/health", get(health))
+        .route("/livez", get(livez))
         .route("/metrics", get(metrics_handler))
         // OpenAPI scalar UI is unauthenticated like /metrics — admin
         // listener is private in production.
@@ -144,13 +143,11 @@ pub fn build_router(state: AdminState) -> Router {
         .with_state(state)
 }
 
-async fn health(_state: axum::extract::State<AdminState>) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::OK,
-        Json(json!({
-            "status": "ok",
-        })),
-    )
+async fn livez(
+    axum::extract::State(state): axum::extract::State<AdminState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    aisix_proxy::health::livez_response(&state.livez_state, params.contains_key("verbose"))
 }
 
 /// Prometheus `/metrics` endpoint. Unauthenticated by design — the admin
@@ -328,31 +325,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_reports_only_minimal_status() {
+    async fn livez_reports_plain_ok_by_default() {
         let app = build_router(build_state());
         let req = Request::builder()
-            .uri("/health")
+            .uri("/livez")
             .body(Body::empty())
             .unwrap();
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let v = body_json(resp).await;
-        assert_eq!(v["status"], "ok");
-        assert_eq!(v.as_object().map(|o| o.len()), Some(1));
-        assert!(v.get("models").is_none());
-        assert!(v.get("apikeys").is_none());
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), "ok");
     }
 
     #[tokio::test]
-    async fn health_rejects_non_get_requests() {
+    async fn livez_rejects_non_get_requests() {
         let app = build_router(build_state());
         let req = Request::builder()
             .method("POST")
-            .uri("/health")
+            .uri("/livez")
             .body(Body::empty())
             .unwrap();
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn livez_returns_500_when_shutting_down() {
+        let state = build_state();
+        state.livez_state.mark_shutting_down();
+        let app = build_router(state);
+        let req = Request::builder()
+            .uri("/livez")
+            .body(Body::empty())
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("livez check failed"));
+    }
+
+    #[tokio::test]
+    async fn health_route_is_not_found() {
+        let app = build_router(build_state());
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

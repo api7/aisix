@@ -15,7 +15,7 @@ use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AdminConfig, AisixSnapshot};
 use aisix_etcd::WatchStatus;
 use aisix_obs::Metrics;
-use aisix_proxy::HealthTracker;
+use aisix_proxy::{HealthTracker, LivezState};
 use axum::Router;
 use std::sync::Arc;
 
@@ -36,6 +36,8 @@ pub struct AdminState {
     /// stream that would otherwise let the gateway serve a stale
     /// snapshot indefinitely. See issue #114.
     pub watch_status: Option<WatchStatus>,
+    /// Shared liveness state for the public `GET /livez` endpoint.
+    pub livez_state: Arc<LivezState>,
     /// Proxy router shared for the `/playground/chat/completions` endpoint.
     /// The playground handler calls `router.oneshot(req)` so the request
     /// goes through the full proxy middleware stack (auth, rate-limit, bridge)
@@ -56,6 +58,7 @@ impl AdminState {
             metrics: None,
             health_tracker: None,
             watch_status: None,
+            livez_state: Arc::new(LivezState::new()),
             proxy_router: None,
         }
     }
@@ -80,6 +83,13 @@ impl AdminState {
     /// `GET /admin/v1/health` reflects per-model upstream health.
     pub fn with_health_tracker(mut self, tracker: Arc<HealthTracker>) -> Self {
         self.health_tracker = Some(tracker);
+        self
+    }
+
+    /// Share the public liveness state with the proxy so both listeners
+    /// report the same shutdown signal.
+    pub fn with_livez_state(mut self, livez_state: Arc<LivezState>) -> Self {
+        self.livez_state = livez_state;
         self
     }
 

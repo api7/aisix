@@ -1,7 +1,7 @@
 //! aisix-proxy — client-facing proxy router (`:3000`).
 //!
 //! Mounts the OpenAI-compatible surface:
-//! - `GET  /health`
+//! - `GET  /livez`
 //! - `POST /v1/chat/completions` (streaming + non-streaming)
 //!
 //! Handlers run behind the [`AuthenticatedKey`] extractor which reads
@@ -47,7 +47,7 @@ mod state;
 
 pub use auth::AuthenticatedKey;
 pub use error::{ErrorEnvelope, ProxyError};
-pub use health::HealthTracker;
+pub use health::{HealthTracker, LivezState};
 pub use state::ProxyState;
 
 use axum::extract::State;
@@ -55,15 +55,14 @@ use axum::http::Request;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
-use axum::{http::StatusCode, Json, Router};
-use serde_json::json;
+use axum::Router;
 
-/// Build the proxy router. Mounts `/health` plus the
+/// Build the proxy router. Mounts `/livez` plus the
 /// OpenAI-compatible proxy surface.
 pub fn build_router(state: ProxyState) -> Router {
     let body_limit = state.request_body_limit_bytes;
     Router::new()
-        .route("/health", get(health))
+        .route("/livez", get(livez))
         .route("/v1/models", get(models::list_models))
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/v1/completions", post(completions::completions))
@@ -174,13 +173,11 @@ async fn drain_body(body: axum::body::Body) {
     .await;
 }
 
-async fn health(_state: axum::extract::State<ProxyState>) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::OK,
-        Json(json!({
-            "status": "ok",
-        })),
-    )
+async fn livez(
+    State(state): State<ProxyState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    crate::health::livez_response(&state.livez, params.contains_key("verbose"))
 }
 
 #[cfg(test)]
@@ -401,7 +398,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_reports_only_minimal_status() {
+    async fn livez_reports_plain_ok_by_default() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/livez")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn livez_rejects_non_get_requests() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/livez")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn livez_returns_500_when_shutting_down() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let state = build_state(snap, hub);
+        state.livez.mark_shutting_down();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/livez")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("livez check failed"));
+    }
+
+    #[tokio::test]
+    async fn health_route_is_not_found() {
         let hub = Arc::new(Hub::new());
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
         let app = build_router(build_state(snap, hub));
@@ -413,26 +465,7 @@ mod tests {
             .unwrap();
 
         let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v, serde_json::json!({"status": "ok"}));
-    }
-
-    #[tokio::test]
-    async fn health_rejects_non_get_requests() {
-        let hub = Arc::new(Hub::new());
-        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
-        let app = build_router(build_state(snap, hub));
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/health")
-            .body(Body::empty())
-            .unwrap();
-
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
