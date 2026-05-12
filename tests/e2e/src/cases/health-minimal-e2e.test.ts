@@ -38,4 +38,34 @@ describe("livez e2e: public liveness route is /livez and /health is gone", () =>
     expect(adminHealth.statusCode).toBe(404);
     await adminHealth.body.dump();
   });
+
+  test("proxy /livez turns unhealthy after SIGTERM before exit", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+
+    app.signal("SIGTERM");
+
+    const deadline = Date.now() + 3000;
+    let observedUnhealthy = false;
+    while (Date.now() < deadline) {
+      try {
+        const res = await harnessRequest(`${app.proxyUrl}/livez`, { method: "GET" });
+        if (res.statusCode !== 200) {
+          observedUnhealthy = true;
+          await res.body.dump();
+          break;
+        }
+        await res.body.dump();
+      } catch {
+        observedUnhealthy = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    expect(observedUnhealthy).toBe(true);
+    app = undefined;
+  });
 });

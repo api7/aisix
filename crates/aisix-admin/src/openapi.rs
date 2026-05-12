@@ -28,14 +28,32 @@ const OPENAPI_JSON: &str = r##"{
       "get": {
         "summary": "minimal public liveness probe",
         "security": [],
+        "parameters": [
+          {
+            "name": "verbose",
+            "in": "query",
+            "required": false,
+            "schema": {"type": "string"},
+            "description": "When present, returns a multi-line text report instead of the terse `ok` body."
+          }
+        ],
         "responses": {
           "200": {
             "description": "OK",
             "content": {
               "text/plain": {
                 "schema": {
-                  "type": "string",
-                  "enum": ["ok"]
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Liveness checks failed during shutdown",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -489,7 +507,12 @@ mod tests {
             ["schema"];
 
         assert_eq!(schema["type"], "string");
-        assert_eq!(schema["enum"], serde_json::json!(["ok"]));
+        assert!(schema.get("enum").is_none());
+        assert_eq!(
+            parsed["paths"]["/livez"]["get"]["parameters"][0]["name"],
+            "verbose"
+        );
+        assert!(parsed["paths"]["/livez"]["get"]["responses"]["500"].is_object());
     }
 
     #[tokio::test]

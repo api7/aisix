@@ -23,6 +23,7 @@ export interface SpawnedApp {
   adminUrl: string;
   adminKey: string;
   etcdPrefix: string;
+  signal(signal: NodeJS.Signals): void;
   exit(): Promise<void>;
 }
 
@@ -128,6 +129,9 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
     adminUrl,
     adminKey,
     etcdPrefix,
+    signal(signal: NodeJS.Signals) {
+      if (child.exitCode === null) child.kill(signal);
+    },
     async exit() {
       await terminate(child);
       await cleanup(etcd, etcdPrefix, dir);

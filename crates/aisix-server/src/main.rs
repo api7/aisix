@@ -825,6 +825,7 @@ async fn wait_for_signal(
     }
 
     livez_state.mark_shutting_down();
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     let _ = cancel_tx.send(true);
 }
 
