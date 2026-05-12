@@ -105,9 +105,6 @@ Lives in `tests/e2e/`. Each test:
 8. Tears down: SIGTERM + 3 s grace + SIGKILL fallback, plus etcd
    prefix cleanup.
 
-If you have older local scripts that still poll `/health`, update them
-to `/livez` before running the harness.
-
 ### 4.1 Layout
 
 ```
