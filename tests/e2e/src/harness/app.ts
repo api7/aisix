@@ -34,7 +34,8 @@ const SHUTDOWN_GRACE_MS = 3_000;
 /**
  * Per-test handle to a spawned `aisix` binary. Each call writes a fresh
  * config YAML into a tmp dir, picks two free ports, picks a unique etcd
- * prefix, and waits up to 10s for `/health` on both ports to respond
+ * prefix, and waits up to 10s for `/livez` on the proxy and `/admin/v1/health`
+ * on the admin listener to respond
  * 200. `exit()` issues SIGTERM and waits up to 3s, escalating to SIGKILL.
  */
 export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp> {
@@ -109,7 +110,7 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
 
   try {
     await Promise.all([
-      waitForReady(`${proxyUrl}/health`, READY_TIMEOUT_MS),
+      waitForReady(`${proxyUrl}/livez`, READY_TIMEOUT_MS),
       waitForReady(`${adminUrl}/admin/v1/health`, READY_TIMEOUT_MS, adminKey),
     ]);
   } catch (err) {

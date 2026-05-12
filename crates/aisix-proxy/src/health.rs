@@ -14,7 +14,78 @@
 //! under stress without waiting for a full outage.
 
 use dashmap::DashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+use axum::http::header::{HeaderName, HeaderValue, CONTENT_TYPE};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+
+static X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
+static NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
+static TEXT_PLAIN_UTF8: HeaderValue = HeaderValue::from_static("text/plain; charset=utf-8");
+
+#[derive(Debug, Default)]
+pub struct LivezState {
+    shutting_down: AtomicBool,
+}
+
+impl LivezState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mark_shutting_down(&self) {
+        self.shutting_down.store(true, Ordering::Relaxed);
+    }
+
+    fn shutdown_check(&self) -> Result<(), &'static str> {
+        if self.shutting_down.load(Ordering::Relaxed) {
+            Err("process is shutting down")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub fn livez_response(livez: &LivezState, verbose: bool) -> Response {
+    let mut body = String::new();
+    let mut failed = false;
+
+    body.push_str("[+]ping ok\n");
+    match livez.shutdown_check() {
+        Ok(()) => body.push_str("[+]shutdown ok\n"),
+        Err(_) => {
+            failed = true;
+            body.push_str("[-]shutdown failed: reason withheld\n");
+        }
+    }
+
+    let headers = [
+        (CONTENT_TYPE, TEXT_PLAIN_UTF8.clone()),
+        (X_CONTENT_TYPE_OPTIONS.clone(), NOSNIFF.clone()),
+    ];
+
+    if failed {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            headers,
+            format!("{body}livez check failed"),
+        )
+            .into_response();
+    }
+
+    if !verbose {
+        return (StatusCode::OK, headers, "ok").into_response();
+    }
+
+    (
+        StatusCode::OK,
+        headers,
+        format!("{body}livez check passed\n"),
+    )
+        .into_response()
+}
 
 /// Numeric health level reported by the API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -143,6 +214,7 @@ impl HealthTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
 
     #[test]
     fn new_model_is_healthy() {
@@ -193,5 +265,41 @@ mod tests {
         assert!(t.all_levels().is_empty());
         t.record_success("m");
         assert_eq!(t.all_levels().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn livez_default_success_is_plain_ok() {
+        let state = LivezState::new();
+        let resp = livez_response(&state, false);
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn livez_verbose_success_lists_checks() {
+        let state = LivezState::new();
+        let resp = livez_response(&state, true);
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("[+]ping ok"));
+        assert!(text.contains("[+]shutdown ok"));
+        assert!(text.contains("livez check passed"));
+    }
+
+    #[tokio::test]
+    async fn livez_failure_returns_500_with_reason_withheld() {
+        let state = LivezState::new();
+        state.mark_shutting_down();
+        let resp = livez_response(&state, false);
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("[-]shutdown failed: reason withheld"));
+        assert!(text.contains("livez check failed"));
     }
 }

@@ -297,7 +297,7 @@ impl<P: ConfigProvider> Supervisor<P> {
     /// stamp the cache with the etcd `load_all` revision even when the
     /// resulting entry set is empty (so the file still reflects when
     /// the DP last successfully reached the CP). Also stamps
-    /// `WatchStatus.last_apply_at` so `/health` reflects the
+    /// `WatchStatus.last_apply_at` so `/admin/v1/health` reflects the
     /// successful round-trip with etcd even on an empty config.
     fn set_revision_floor(&self, revision: i64) {
         let mut rev = self.revision.lock().unwrap();
@@ -373,7 +373,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                 *rev = entry.revision;
             }
         }
-        // /health reads this — record the apply so `last_apply_age`
+        // /admin/v1/health reads this — record the apply so `last_apply_age`
         // resets on every event we successfully process.
         self.status.record_apply(entry.revision);
         self.flush_cache();
@@ -447,7 +447,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             new
         });
         self.state.lock().unwrap().remove(key_str);
-        // Stamp /health freshness on a successful delete. We
+        // Stamp /admin/v1/health freshness on a successful delete. We
         // don't have a per-event revision on the wire delete
         // (the etcd watch revision is held at the cycle level);
         // call record_apply with the current revision so age
@@ -481,7 +481,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                 *rev = rev_val;
             }
         }
-        // /health: stamp freshness on every resync, even when the
+        // /admin/v1/health: stamp freshness on every resync, even when the
         // resulting entry set is empty (record_apply with the current
         // revision floor so the operator sees recent activity).
         let cur_rev = *self.revision.lock().unwrap();
@@ -1079,7 +1079,7 @@ mod tests {
     async fn watch_status_age_grows_when_no_events_arrive() {
         // Pin the freshness signal: after an apply, the age is small;
         // wait briefly and observe it has grown. This is what the
-        // /health handler reads to detect a wedged watch — without
+        // /admin/v1/health reads this to detect a wedged watch — without
         // this signal the proxy could serve stale config indefinitely.
         let provider = Arc::new(FakeProvider::new(vec![], 5));
         let sup = Supervisor::new(provider, "/aisix");

@@ -480,6 +480,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     ));
     // Clone shared trackers before consuming proxy_state in build_router.
     let health_tracker = proxy_state.health.clone();
+    let livez_state = proxy_state.livez.clone();
     let proxy_router = aisix_proxy::build_router(proxy_state);
 
     // Admin router + listener are only built in standalone mode.
@@ -494,6 +495,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // Share the health tracker so /admin/v1/health reflects live
             // per-model upstream failure counts.
             .with_health_tracker(health_tracker)
+            .with_livez_state(livez_state.clone())
             // Share the supervisor's freshness state so /admin/v1/health
             // exposes etcd watch staleness — without this, a wedged
             // watch lets the gateway serve stale config indefinitely
@@ -514,7 +516,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         // Drop unused shared components so the compiler can see they
         // don't escape managed mode. The health tracker exists on
         // proxy_state and keeps working regardless.
-        let _ = &health_tracker;
+        let _ = (&health_tracker, &livez_state);
         tracing::info!("managed mode enabled — admin surface not bound");
         None
     };
@@ -529,7 +531,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
 
     // Step 10: shutdown coordinator. Whichever of (signal, proxy, admin)
     // completes first triggers the rest.
-    let signal_task = tokio::spawn(wait_for_signal(cancel_tx.clone()));
+    let signal_task = tokio::spawn(wait_for_signal(cancel_tx.clone(), livez_state));
 
     let proxy_res = proxy_serve.await;
     proxy_res.map_err(|e| anyhow::anyhow!("proxy serve error: {e}"))?;
@@ -796,7 +798,10 @@ async fn shutdown_signal(mut cancel: watch::Receiver<bool>, label: &'static str)
     }
 }
 
-async fn wait_for_signal(cancel_tx: watch::Sender<bool>) {
+async fn wait_for_signal(
+    cancel_tx: watch::Sender<bool>,
+    livez_state: std::sync::Arc<aisix_proxy::LivezState>,
+) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -819,6 +824,7 @@ async fn wait_for_signal(cancel_tx: watch::Sender<bool>) {
         _ = term => tracing::info!("received SIGTERM"),
     }
 
+    livez_state.mark_shutting_down();
     let _ = cancel_tx.send(true);
 }
 
