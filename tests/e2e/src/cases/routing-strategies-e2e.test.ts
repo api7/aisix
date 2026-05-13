@@ -129,17 +129,7 @@ describe("routing strategies and retry behavior e2e", () => {
       maxRetries: 0,
     });
 
-    await waitConfigPropagation(async () => {
-      try {
-        const probe = await client.chat.completions.create({
-          model: "routing-retry-virtual",
-          messages: [{ role: "user", content: "ready-routing-retry" }],
-        });
-        return probe.choices[0]?.message.content === "after retries";
-      } catch {
-        return false;
-      }
-    });
+    await waitConfigPropagation();
 
     const primaryBaseline = primary.receivedRequests.length;
     const secondaryBaseline = secondary.receivedRequests.length;
@@ -205,17 +195,7 @@ describe("routing strategies and retry behavior e2e", () => {
       maxRetries: 0,
     });
 
-    await waitConfigPropagation(async () => {
-      try {
-        const probe = await client.chat.completions.create({
-          model: "routing-429-virtual",
-          messages: [{ role: "user", content: "ready-routing-429" }],
-        });
-        return probe.choices[0]?.message.content === "429 fallback worked";
-      } catch {
-        return false;
-      }
-    });
+    await waitConfigPropagation();
 
     const primaryBaseline = primary.receivedRequests.length;
     const secondaryBaseline = secondary.receivedRequests.length;
