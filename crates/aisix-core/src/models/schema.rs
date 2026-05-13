@@ -197,7 +197,11 @@ fn apikey_schema() -> Value {
                 "type": "array",
                 "items": { "type": "string" }
             },
-            "rate_limit": { "$ref": "#/$defs/rate_limit" }
+            "rate_limit": { "$ref": "#/$defs/rate_limit" },
+            "team_id": { "type": "string" },
+            "team_rate_limit": { "$ref": "#/$defs/rate_limit" },
+            "owner_id": { "type": "string" },
+            "owner_rate_limit": { "$ref": "#/$defs/rate_limit" }
         },
         "$defs": {
             "rate_limit": {
@@ -506,11 +510,24 @@ mod tests {
     }
 
     #[test]
+    fn apikey_with_team_and_owner_fields_passes() {
+        let v = json!({
+            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models":["gpt-4o"],
+            "team_id": "team-uuid-1",
+            "team_rate_limit": {"rpm": 600},
+            "owner_id": "member-uuid-1",
+            "owner_rate_limit": {"tpm": 200000}
+        });
+        validate_apikey(&v).unwrap();
+    }
+
+    #[test]
     fn apikey_unknown_field_rejected() {
         let v = json!({
             "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
             "allowed_models":["a"],
-            "max_budget_usd": 500.0
+            "bogus_field": true
         });
         assert!(validate_apikey(&v).is_err());
     }
