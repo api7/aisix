@@ -198,9 +198,9 @@ fn apikey_schema() -> Value {
                 "items": { "type": "string" }
             },
             "rate_limit": { "$ref": "#/$defs/rate_limit" },
-            "team_id": { "type": "string" },
+            "team_id": { "type": "string", "minLength": 1 },
             "team_rate_limit": { "$ref": "#/$defs/rate_limit" },
-            "owner_id": { "type": "string" },
+            "owner_id": { "type": "string", "minLength": 1 },
             "owner_rate_limit": { "$ref": "#/$defs/rate_limit" }
         },
         "$defs": {
