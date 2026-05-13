@@ -228,8 +228,12 @@ fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
     let key_pem = std::fs::read(&mtls.client_key_path)
         .with_context(|| format!("read {}", mtls.client_key_path.display()))?;
 
-    let mut identity_pem = Vec::with_capacity(cert_pem.len() + key_pem.len());
+    // Ensure a newline separates the two PEM blocks (see heartbeat.rs).
+    let mut identity_pem = Vec::with_capacity(cert_pem.len() + key_pem.len() + 1);
     identity_pem.extend_from_slice(&key_pem);
+    if !key_pem.ends_with(b"\n") {
+        identity_pem.push(b'\n');
+    }
     identity_pem.extend_from_slice(&cert_pem);
     let identity = reqwest::Identity::from_pem(&identity_pem)
         .context("build mTLS Identity from client cert + key")?;
