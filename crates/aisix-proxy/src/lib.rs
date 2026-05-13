@@ -26,6 +26,7 @@
 
 mod audio;
 mod auth;
+pub mod background;
 pub mod budget;
 mod chat;
 mod completions;
@@ -47,7 +48,9 @@ mod state;
 
 pub use auth::AuthenticatedKey;
 pub use error::{ErrorEnvelope, ProxyError};
-pub use health::{HealthTracker, LivezState};
+pub use health::{
+    HealthTracker, LivezState, ModelRuntimeStatusTracker, RuntimeStatus, RuntimeStatusSnapshot,
+};
 pub use state::ProxyState;
 
 use axum::extract::State;
@@ -2015,12 +2018,7 @@ data: [DONE]\n\n";
         let resp = run(app, req).await;
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "{}",
-            String::from_utf8_lossy(&bytes)
-        );
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["choices"][0]["message"]["content"], "fallback worked");
     }
@@ -2085,12 +2083,7 @@ data: [DONE]\n\n";
         let resp = run(app, req).await;
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        assert_eq!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "{}",
-            String::from_utf8_lossy(&bytes)
-        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&bytes));
     }
 
     #[tokio::test]
@@ -2158,12 +2151,7 @@ data: [DONE]\n\n";
         let resp = run(app, req).await;
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "{}",
-            String::from_utf8_lossy(&bytes)
-        );
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["choices"][0]["message"]["content"], "after retries");
     }
@@ -2233,14 +2221,248 @@ data: [DONE]\n\n";
         let resp = run(app, req).await;
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "{}",
-            String::from_utf8_lossy(&bytes)
-        );
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["choices"][0]["message"]["content"], "429 fallback worked");
+    }
+
+    #[tokio::test]
+    async fn routing_skips_target_in_runtime_cooldown() {
+        let cooled_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-cooled",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "should not be called"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(0)
+            .mount(&cooled_upstream)
+            .await;
+
+        let good_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-good",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "cooldown skipped"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&good_upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-cooled", &cooled_upstream.uri()));
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-good", &good_upstream.uri()));
+        snap.models
+            .insert(model_entry_with_id("m-cooled", "primary", "pk-cooled"));
+        snap.models
+            .insert(model_entry_with_id("m-good", "secondary", "pk-good"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary", "secondary"],
+            None,
+            None,
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let state = build_state(snap, hub);
+        state.runtime_status.mark_cooldown(
+            "m-cooled",
+            std::time::Duration::from_secs(30),
+            "retryable_failure",
+        );
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "cooldown skipped");
+    }
+
+    #[tokio::test]
+    async fn routing_ignores_cooldown_when_it_would_empty_all_candidates() {
+        let primary_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-primary",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "cooldown fallback"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&primary_upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-primary", &primary_upstream.uri()));
+        snap.models
+            .insert(model_entry_with_id("m-primary", "primary", "pk-primary"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary"],
+            None,
+            None,
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let state = build_state(snap, hub);
+        state.runtime_status.mark_cooldown(
+            "m-primary",
+            std::time::Duration::from_secs(30),
+            "retryable_failure",
+        );
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "cooldown fallback");
+    }
+
+    #[tokio::test]
+    async fn routing_retryable_failure_puts_target_into_cooldown_for_next_request() {
+        let flaky_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(502).set_body_string("temporary upstream failure"),
+            )
+            .expect(1)
+            .mount(&flaky_upstream)
+            .await;
+
+        let stable_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-stable",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "stable fallback"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(2)
+            .mount(&stable_upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-flaky", &flaky_upstream.uri()));
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-stable", &stable_upstream.uri()));
+        snap.models
+            .insert(model_entry_with_id("m-flaky", "primary", "pk-flaky"));
+        snap.models
+            .insert(model_entry_with_id("m-stable", "secondary", "pk-stable"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary", "secondary"],
+            Some(0),
+            Some(1),
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let state = build_state(snap, hub);
+        let app = build_router(state.clone());
+        let body = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "first"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.runtime_status.status("m-flaky").status, RuntimeStatus::Cooldown);
+
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "second"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "stable fallback");
     }
 
     #[tokio::test]
@@ -2251,14 +2473,8 @@ data: [DONE]\n\n";
         hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
 
         let snap = AisixSnapshot::new();
-        snap.models.insert(routing_entry(
-            "smart",
-            "failover",
-            &["nonexistent"],
-            None,
-            None,
-            None,
-        ));
+        snap.models
+            .insert(routing_entry("smart", "failover", &["nonexistent"], None, None, None));
         snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
         // No upstream provider_key needed — the routing target itself
         // is missing so dispatch fails before any provider lookup.

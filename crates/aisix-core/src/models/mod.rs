@@ -32,7 +32,7 @@ pub use guardrail::{
     BedrockAWSCredentials, BedrockConfig, BedrockLatencyMode, Guardrail, GuardrailHookPoint,
     GuardrailKind, KeywordConfig, KeywordPattern,
 };
-pub use model::{Model, Provider};
+pub use model::{BackgroundModelCheck, Model, Provider};
 pub use observability_exporter::{ExporterKind, ObservabilityExporter, OtlpHttpConfig};
 pub use provider_key::ProviderKey;
 pub use rate_limit::RateLimit;

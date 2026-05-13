@@ -15,7 +15,7 @@ use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AdminConfig, AisixSnapshot};
 use aisix_etcd::WatchStatus;
 use aisix_obs::Metrics;
-use aisix_proxy::{HealthTracker, LivezState};
+use aisix_proxy::{HealthTracker, LivezState, ModelRuntimeStatusTracker};
 use axum::Router;
 use std::sync::Arc;
 
@@ -30,6 +30,9 @@ pub struct AdminState {
     /// Shared in-process health tracker from the proxy. Used by the
     /// `/admin/v1/health` endpoint to report per-model health status.
     pub health_tracker: Option<Arc<HealthTracker>>,
+    /// Shared in-process runtime status tracker from the proxy. Used by
+    /// `/admin/v1/models/status` to report direct-model runtime state.
+    pub runtime_status_tracker: Option<Arc<ModelRuntimeStatusTracker>>,
     /// Watch supervisor's freshness state. When wired, the
     /// `/admin/v1/health` endpoint includes etcd revision +
     /// snapshot age so operators can detect a frozen / wedged config
@@ -57,6 +60,7 @@ impl AdminState {
             store,
             metrics: None,
             health_tracker: None,
+            runtime_status_tracker: None,
             watch_status: None,
             livez_state: Arc::new(LivezState::new()),
             proxy_router: None,
@@ -90,6 +94,12 @@ impl AdminState {
     /// report the same shutdown signal.
     pub fn with_livez_state(mut self, livez_state: Arc<LivezState>) -> Self {
         self.livez_state = livez_state;
+        self
+    }
+
+    /// Attach the in-process runtime status tracker from the proxy.
+    pub fn with_runtime_status_tracker(mut self, tracker: Arc<ModelRuntimeStatusTracker>) -> Self {
+        self.runtime_status_tracker = Some(tracker);
         self
     }
 

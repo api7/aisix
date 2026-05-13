@@ -32,6 +32,7 @@ use aisix_provider_anthropic::AnthropicBridge;
 use aisix_provider_deepseek::deepseek_bridge;
 use aisix_provider_gemini::gemini_bridge;
 use aisix_provider_openai::OpenAiBridge;
+use aisix_proxy::background::run_background_model_check_once;
 use aisix_proxy::budget::BudgetClient;
 use aisix_proxy::ProxyState;
 use aisix_ratelimit::Limiter;
@@ -481,7 +482,38 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     // Clone shared trackers before consuming proxy_state in build_router.
     let health_tracker = proxy_state.health.clone();
     let livez_state = proxy_state.livez.clone();
+    let runtime_status_tracker = proxy_state.runtime_status.clone();
+    let background_snapshot = snapshot_handle.clone();
+    let background_hub = hub.clone();
+    let background_runtime_status_tracker = runtime_status_tracker.clone();
+    let background_cancel_rx = cancel_rx.clone();
     let proxy_router = aisix_proxy::build_router(proxy_state);
+
+    let background_check_task = tokio::spawn(async move {
+        let mut cancel = background_cancel_rx;
+        loop {
+            if *cancel.borrow() {
+                break;
+            }
+            let snapshot = background_snapshot.load();
+            run_background_model_check_once(
+                snapshot.clone(),
+                background_hub.clone(),
+                background_runtime_status_tracker.clone(),
+                "background-model-check",
+            )
+            .await;
+            let sleep_for = background_check_interval(snapshot.as_ref());
+            tokio::select! {
+                changed = cancel.changed() => {
+                    if changed.is_err() || *cancel.borrow() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(sleep_for) => {}
+            }
+        }
+    });
 
     // Admin router + listener are only built in standalone mode.
     // In managed mode (`cfg.managed.enabled = true`) the DP reads
@@ -496,6 +528,9 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // per-model upstream failure counts.
             .with_health_tracker(health_tracker)
             .with_livez_state(livez_state.clone())
+            // Share runtime status so /admin/v1/models/status exposes
+            // direct-model cooldown/background-health state.
+            .with_runtime_status_tracker(runtime_status_tracker)
             // Share the supervisor's freshness state so /admin/v1/health
             // exposes etcd watch staleness — without this, a wedged
             // watch lets the gateway serve stale config indefinitely
@@ -516,7 +551,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         // Drop unused shared components so the compiler can see they
         // don't escape managed mode. The health tracker exists on
         // proxy_state and keeps working regardless.
-        let _ = (&health_tracker, &livez_state);
+        let _ = (&health_tracker, &livez_state, &runtime_status_tracker);
         tracing::info!("managed mode enabled — admin surface not bound");
         None
     };
@@ -553,6 +588,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     if let Some(task) = telemetry_task {
         let _ = task.await;
     }
+    let _ = background_check_task.await;
     tracing::info!("aisix shut down cleanly");
     Ok(())
 }
@@ -781,6 +817,19 @@ fn build_hub() -> Hub {
     hub.register(Provider::Gemini, Arc::new(gemini_bridge()));
     hub.register(Provider::Deepseek, Arc::new(deepseek_bridge()));
     hub
+}
+
+fn background_check_interval(snapshot: &aisix_core::AisixSnapshot) -> std::time::Duration {
+    let min_interval = snapshot
+        .models
+        .entries()
+        .into_iter()
+        .filter_map(|entry| entry.value.background_model_check.clone())
+        .filter(|cfg| cfg.enabled)
+        .map(|cfg| cfg.interval_seconds)
+        .min()
+        .unwrap_or(1);
+    std::time::Duration::from_secs(min_interval.max(1))
 }
 
 /// Completes when the process receives SIGINT or SIGTERM (best-effort on

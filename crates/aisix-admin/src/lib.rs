@@ -39,6 +39,7 @@ pub mod etcd_store;
 mod guardrails_handlers;
 mod health_handler;
 mod models_handlers;
+mod models_status_handler;
 mod observability_exporters_handlers;
 mod openapi;
 mod playground_handler;
@@ -72,6 +73,10 @@ pub fn build_router(state: AdminState) -> Router {
             get(models_handlers::get_model)
                 .put(models_handlers::update_model)
                 .delete(models_handlers::delete_model),
+        )
+        .route(
+            "/admin/v1/models/status",
+            get(models_status_handler::get_models_status),
         )
         .route(
             "/admin/v1/apikeys",
@@ -1088,5 +1093,91 @@ mod tests {
         assert_eq!(v["status"], "ok");
         // Empty snapshot → empty model list, but endpoint is operational.
         assert!(v["models"].is_array());
+    }
+
+    #[tokio::test]
+    async fn models_status_returns_direct_and_routing_rows() {
+        use aisix_core::resource::ResourceEntry;
+        use aisix_core::Model;
+        use aisix_proxy::ModelRuntimeStatusTracker;
+
+        let handle = SnapshotHandle::new(AisixSnapshot::new());
+        let store = InMemoryStore::new() as Arc<dyn ConfigStore>;
+        let runtime = Arc::new(ModelRuntimeStatusTracker::new());
+
+        let direct: Model = serde_json::from_value(model_payload("gpt4")).unwrap();
+        store
+            .put_model(ResourceEntry {
+                id: "direct-1".into(),
+                value: direct,
+                revision: 1,
+            })
+            .await
+            .unwrap();
+
+        let routing: Model = serde_json::from_value(json!({
+            "display_name": "router",
+            "routing": {
+                "targets": [{"model": "gpt4"}]
+            }
+        }))
+        .unwrap();
+        store
+            .put_model(ResourceEntry {
+                id: "routing-1".into(),
+                value: routing,
+                revision: 1,
+            })
+            .await
+            .unwrap();
+
+        runtime.record_ignored_check("direct-1", 429, "ignored_transient_error");
+
+        let state = AdminState::new(handle, store, &cfg()).with_runtime_status_tracker(runtime);
+        let app = build_router(state);
+        let resp = run(app, auth_req("GET", "/admin/v1/models/status", None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rows = body_json(resp).await;
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let direct = rows.iter().find(|row| row["id"] == "direct-1").unwrap();
+        assert_eq!(direct["kind"], "direct");
+        assert_eq!(direct["status"], "healthy");
+        assert_eq!(direct["last_check_status"], 429);
+        assert_eq!(direct["status_reason"], "ignored_transient_error");
+
+        let routing = rows.iter().find(|row| row["id"] == "routing-1").unwrap();
+        assert_eq!(routing["kind"], "routing");
+        assert_eq!(routing["status"], "not_applicable");
+    }
+
+    #[tokio::test]
+    async fn create_model_accepts_background_model_check() {
+        let app = build_router(build_state());
+        let resp = run(
+            app,
+            auth_req(
+                "POST",
+                "/admin/v1/models",
+                Some(json!({
+                    "display_name": "bg-model",
+                    "provider": "openai",
+                    "model_name": "gpt-4o-mini",
+                    "provider_key_id": "11111111-1111-1111-1111-111111111111",
+                    "background_model_check": {
+                        "enabled": true,
+                        "interval_seconds": 1,
+                        "timeout_seconds": 10,
+                        "prompt": "Respond with OK",
+                        "max_tokens": 8,
+                        "ignore_statuses": [408, 429],
+                        "stale_after_seconds": 90
+                    }
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

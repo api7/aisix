@@ -60,11 +60,7 @@ impl RoutingRegistry {
             return Vec::new();
         }
         let start = self.starting_index(virtual_name, routing);
-        attempt_order(
-            &routing.targets,
-            start,
-            routing.max_fallbacks_or_default() + 1,
-        )
+        attempt_order(&routing.targets, start, routing.max_fallbacks_or_default() + 1)
     }
 
     fn starting_index(&self, virtual_name: &str, routing: &Routing) -> usize {
@@ -411,40 +407,25 @@ mod tests {
 
     #[test]
     fn is_retryable_distinguishes_4xx_from_other_failures() {
-        assert!(!is_retryable(
-            &BridgeError::UpstreamStatus {
-                status: 400,
-                message: "bad request".into(),
-            },
-            false
-        ));
-        assert!(!is_retryable(
-            &BridgeError::UpstreamStatus {
-                status: 429,
-                message: "rate limited".into(),
-            },
-            false
-        ));
-        assert!(is_retryable(
-            &BridgeError::UpstreamStatus {
-                status: 429,
-                message: "rate limited".into(),
-            },
-            true
-        ));
-        assert!(is_retryable(
-            &BridgeError::UpstreamStatus {
-                status: 502,
-                message: "bad gateway".into(),
-            },
-            false
-        ));
+        assert!(!is_retryable(&BridgeError::UpstreamStatus {
+            status: 400,
+            message: "bad request".into(),
+        }, false));
+        assert!(!is_retryable(&BridgeError::UpstreamStatus {
+            status: 429,
+            message: "rate limited".into(),
+        }, false));
+        assert!(is_retryable(&BridgeError::UpstreamStatus {
+            status: 429,
+            message: "rate limited".into(),
+        }, true));
+        assert!(is_retryable(&BridgeError::UpstreamStatus {
+            status: 502,
+            message: "bad gateway".into(),
+        }, false));
         assert!(is_retryable(&BridgeError::Timeout { elapsed_ms: 1 }, false));
         assert!(is_retryable(&BridgeError::Transport("conn".into()), false));
-        assert!(is_retryable(
-            &BridgeError::UpstreamDecode("x".into()),
-            false
-        ));
+        assert!(is_retryable(&BridgeError::UpstreamDecode("x".into()), false));
         assert!(is_retryable(&BridgeError::Config("bad key".into()), false));
         assert!(is_retryable(&BridgeError::StreamAborted, false));
     }

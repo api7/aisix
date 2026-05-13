@@ -81,6 +81,19 @@ impl ModelCost {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BackgroundModelCheck {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub timeout_seconds: u64,
+    pub prompt: String,
+    pub max_tokens: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore_statuses: Vec<u16>,
+    pub stale_after_seconds: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Model {
@@ -123,6 +136,10 @@ pub struct Model {
     /// Per-token cost for budget tracking. Absent = no cost tracked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<ModelCost>,
+
+    /// Optional direct-model-only background health-check configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_model_check: Option<BackgroundModelCheck>,
 
     /// Non-schema runtime id. Not part of the JSON payload — filled in by
     /// the snapshot loader from the etcd key path. Kept here so `Resource`
@@ -225,6 +242,31 @@ mod tests {
         assert_eq!(<Model as Resource>::kind(), "models");
         assert_eq!(m.id(), "uuid-1");
         assert_eq!(m.name(), "my-gpt4");
+    }
+
+    #[test]
+    fn direct_model_can_deserialize_background_check() {
+        let m: Model = serde_json::from_str(
+            r#"{
+              "display_name": "my-gpt4",
+              "provider": "openai",
+              "model_name": "gpt-4o",
+              "provider_key_id": "11111111-1111-1111-1111-111111111111",
+              "background_model_check": {
+                "enabled": true,
+                "interval_seconds": 30,
+                "timeout_seconds": 10,
+                "prompt": "Respond with OK",
+                "max_tokens": 8,
+                "ignore_statuses": [408, 429],
+                "stale_after_seconds": 90
+              }
+            }"#,
+        )
+        .unwrap();
+        let bg = m.background_model_check.unwrap();
+        assert!(bg.enabled);
+        assert_eq!(bg.ignore_statuses, vec![408, 429]);
     }
 
     #[test]

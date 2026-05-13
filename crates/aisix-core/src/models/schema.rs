@@ -149,6 +149,30 @@ fn model_schema() -> Value {
                     "input_per_1k":  { "type": "number", "minimum": 0 },
                     "output_per_1k": { "type": "number", "minimum": 0 }
                 }
+            },
+            "background_model_check": {
+                "type": "object",
+                "required": [
+                    "enabled",
+                    "interval_seconds",
+                    "timeout_seconds",
+                    "prompt",
+                    "max_tokens",
+                    "stale_after_seconds"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                    "enabled": { "type": "boolean" },
+                    "interval_seconds": { "type": "integer", "minimum": 1 },
+                    "timeout_seconds": { "type": "integer", "minimum": 1 },
+                    "prompt": { "type": "string", "minLength": 1 },
+                    "max_tokens": { "type": "integer", "minimum": 1 },
+                    "ignore_statuses": {
+                        "type": "array",
+                        "items": { "type": "integer", "minimum": 100, "maximum": 599 }
+                    },
+                    "stale_after_seconds": { "type": "integer", "minimum": 1 }
+                }
             }
         },
         // Direct vs routing model: a model EITHER ships a `routing`
@@ -161,7 +185,8 @@ fn model_schema() -> Value {
                 "not": { "anyOf": [
                     { "required": ["provider"] },
                     { "required": ["model_name"] },
-                    { "required": ["provider_key_id"] }
+                    { "required": ["provider_key_id"] },
+                    { "required": ["background_model_check"] }
                 ]}
             },
             {
@@ -520,6 +545,65 @@ mod tests {
         let v = json!({
             "display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1",
             "rate_limit": {"rpm": -1}
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn direct_model_background_check_passes() {
+        let v = json!({
+            "display_name": "x",
+            "provider": "openai",
+            "model_name": "g",
+            "provider_key_id": "pk-1",
+            "background_model_check": {
+                "enabled": true,
+                "interval_seconds": 30,
+                "timeout_seconds": 10,
+                "prompt": "Respond with OK",
+                "max_tokens": 8,
+                "ignore_statuses": [408, 429],
+                "stale_after_seconds": 90
+            }
+        });
+        validate_model(&v).unwrap();
+    }
+
+    #[test]
+    fn routing_model_background_check_fails() {
+        let v = json!({
+            "display_name": "router-1",
+            "routing": {
+                "targets": [{"model": "my-gpt4"}]
+            },
+            "background_model_check": {
+                "enabled": true,
+                "interval_seconds": 30,
+                "timeout_seconds": 10,
+                "prompt": "Respond with OK",
+                "max_tokens": 8,
+                "stale_after_seconds": 90
+            }
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn background_check_rejects_invalid_ignore_status() {
+        let v = json!({
+            "display_name": "x",
+            "provider": "openai",
+            "model_name": "g",
+            "provider_key_id": "pk-1",
+            "background_model_check": {
+                "enabled": true,
+                "interval_seconds": 30,
+                "timeout_seconds": 10,
+                "prompt": "Respond with OK",
+                "max_tokens": 8,
+                "ignore_statuses": [99],
+                "stale_after_seconds": 90
+            }
         });
         assert!(validate_model(&v).is_err());
     }

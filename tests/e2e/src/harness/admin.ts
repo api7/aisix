@@ -36,6 +36,10 @@ export class AdminClient {
     return (res.items ?? []).map((entry) => entry.value);
   }
 
+  async listModelStatuses(): Promise<Array<Record<string, unknown>>> {
+    return this.json<Array<Record<string, unknown>>>("GET", "/admin/v1/models/status");
+  }
+
   async json<T = Record<string, unknown>>(
     method: string,
     path: string,

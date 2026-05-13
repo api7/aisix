@@ -40,6 +40,13 @@ use crate::state::ProxyState;
 /// Header set on every non-streaming response indicating whether the
 /// response came from the cache (`hit`) or the upstream (`miss`).
 pub const CACHE_HEADER: &str = "x-aisix-cache";
+const RETRYABLE_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct AttemptModel {
+    id: String,
+    model: aisix_core::Model,
+}
 
 pub async fn chat_completions(
     State(state): State<ProxyState>,
@@ -426,7 +433,7 @@ async fn dispatch(
     // Resolve the attempt-list of underlying Model entries. For a
     // routing model we walk targets per the configured strategy; for a
     // single-provider Model we just dispatch to it directly.
-    let attempt_models: Vec<aisix_core::Model> =
+    let attempt_models: Vec<AttemptModel> =
         if let Some(routing) = virtual_entry.value.routing.as_ref() {
             let names = state.routing.pick_targets(&req.model, routing);
             if names.is_empty() {
@@ -441,11 +448,17 @@ async fn dispatch(
                         "routing target {name:?} does not resolve to a Model"
                     )))
                 })?;
-                resolved.push(target_entry.value.clone());
+                resolved.push(AttemptModel {
+                    id: target_entry.id.clone(),
+                    model: target_entry.value.clone(),
+                });
             }
-            resolved
+            filter_attempt_models(&state.runtime_status, resolved)
         } else {
-            vec![virtual_entry.value.clone()]
+            vec![AttemptModel {
+                id: virtual_entry.id.clone(),
+                model: virtual_entry.value.clone(),
+            }]
         };
 
     // For non-routing requests, surface a misconfigured bridge as a
@@ -453,7 +466,7 @@ async fn dispatch(
     // Routing requests rely on the loop's `is_retryable` path so a
     // single bad provider doesn't take down the whole request.
     if attempt_models.len() == 1 {
-        let only = &attempt_models[0];
+        let only = &attempt_models[0].model;
         let provider = crate::dispatch::require_provider(only).map_err(with_model)?;
         if state.hub.get(provider).is_none() {
             return Err(with_model(ProxyError::ProviderUnavailable));
@@ -473,7 +486,7 @@ async fn dispatch(
     // is genuinely hard (we'd have to buffer the stream to detect
     // failure mid-flight) and not worth the complexity for V1.
     if req.is_streaming() {
-        let model = &attempt_models[0];
+        let model = &attempt_models[0].model;
         let provider = crate::dispatch::require_provider(model).map_err(with_model)?;
         let pk_entry =
             crate::dispatch::resolve_provider_key(&snapshot, model).map_err(with_model)?;
@@ -687,6 +700,7 @@ async fn dispatch(
                 // cache hit we don't know (or care) which target ran the
                 // original call; the fingerprint identified the answer.
                 let provider_label = attempt_models[0]
+                    .model
                     .provider
                     .map(|p| format!("{p:?}").to_lowercase())
                     .unwrap_or_else(|| "unknown".into());
@@ -754,7 +768,8 @@ async fn dispatch(
         .map(|routing| routing.retry_on_429_or_default())
         .unwrap_or(false);
 
-    for model in &attempt_models {
+    for attempt in &attempt_models {
+        let model = &attempt.model;
         let Some(provider) = model.provider else {
             last_err = Some(BridgeError::Config("model has no provider".into()));
             continue;
@@ -782,6 +797,7 @@ async fn dispatch(
             match bridge.chat(req, &ctx).await {
                 Ok(resp) => {
                     state.health.record_success(&model.display_name);
+                    state.runtime_status.mark_healthy(&attempt.id);
                     chosen_provider = Some(format!("{provider:?}").to_lowercase());
                     upstream = Some(resp);
                     break;
@@ -797,6 +813,11 @@ async fn dispatch(
                     );
                     if retryable {
                         state.health.record_failure(&model.display_name);
+                        state.runtime_status.mark_cooldown(
+                            &attempt.id,
+                            RETRYABLE_FAILURE_COOLDOWN,
+                            "retryable_failure",
+                        );
                     }
                     last_err = Some(err);
                     if !retryable {
@@ -958,6 +979,50 @@ async fn dispatch(
         cache_hit_saved_output_tokens: 0,
         telemetry_handled_by_stream: false,
     })
+}
+
+fn filter_attempt_models(
+    runtime_status: &crate::ModelRuntimeStatusTracker,
+    attempts: Vec<AttemptModel>,
+) -> Vec<AttemptModel> {
+    let mut healthy = Vec::new();
+    let mut cooldown_only = Vec::new();
+    let mut unhealthy_count = 0usize;
+
+    for attempt in attempts.iter().cloned() {
+        let stale_after = attempt
+            .model
+            .background_model_check
+            .as_ref()
+            .map(|cfg| Duration::from_secs(cfg.stale_after_seconds));
+        let status = runtime_status.status_with_stale(&attempt.id, stale_after);
+        match status.status {
+            crate::RuntimeStatus::Unhealthy => unhealthy_count += 1,
+            crate::RuntimeStatus::Cooldown => cooldown_only.push(attempt),
+            crate::RuntimeStatus::Healthy | crate::RuntimeStatus::NotApplicable => {
+                healthy.push(attempt)
+            }
+        }
+    }
+
+    if !healthy.is_empty() {
+        return healthy;
+    }
+    if unhealthy_count < attempts.len() && !cooldown_only.is_empty() {
+        return attempts
+            .into_iter()
+            .filter(|attempt| {
+                let stale_after = attempt
+                    .model
+                    .background_model_check
+                    .as_ref()
+                    .map(|cfg| Duration::from_secs(cfg.stale_after_seconds));
+                runtime_status.should_skip_for_routing(&attempt.id, stale_after)
+                    != crate::RuntimeStatus::Unhealthy
+            })
+            .collect();
+    }
+    attempts
 }
 
 /// Wire-shape label for `FinishReason`. cp-api stores this verbatim

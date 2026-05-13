@@ -115,6 +115,18 @@ const OPENAPI_JSON: &str = r##"{
       },
       "delete": { "summary": "delete model", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
     },
+    "/admin/v1/models/status": {
+      "get": {
+        "summary": "list per-model runtime status",
+        "description": "Returns runtime routing/exclusion state for every Model. Direct models surface live runtime state keyed by resolved direct-model id; routing models return `not_applicable`. Request-path retryable failures surface as `cooldown`. Background checks can surface `unhealthy` or a healthy row with `status_reason=ignored_transient_error`.",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/ModelStatusView"}}}}
+          }
+        }
+      }
+    },
     "/admin/v1/apikeys": {
       "get":  { "summary": "list api keys",  "responses": {"200": {"description": "OK"}} },
       "post": {
@@ -265,9 +277,10 @@ const OPENAPI_JSON: &str = r##"{
           "timeout":         {"type": "integer", "minimum": 0, "description": "Request timeout in milliseconds. Absent or 0 = no timeout."},
           "rate_limit":      {"$ref": "#/components/schemas/RateLimit"},
           "routing":         {"$ref": "#/components/schemas/Routing"},
-          "cost":            {"$ref": "#/components/schemas/ModelCost"}
+          "cost":            {"$ref": "#/components/schemas/ModelCost"},
+          "background_model_check": {"$ref": "#/components/schemas/BackgroundModelCheck"}
         },
-        "description": "A direct model ships `provider` + `model_name` + `provider_key_id`; a routing model ships `routing` and omits the upstream triple."
+        "description": "A direct model ships `provider` + `model_name` + `provider_key_id`; a routing model ships `routing` and omits the upstream triple. `background_model_check` is direct-model-only and rejected on routing models."
       },
       "ModelEntry": {
         "type": "object",
@@ -276,6 +289,55 @@ const OPENAPI_JSON: &str = r##"{
           "id":       {"type": "string"},
           "value":    {"$ref": "#/components/schemas/Model"},
           "revision": {"type": "integer"}
+        }
+      },
+      "BackgroundModelCheck": {
+        "type": "object",
+        "required": ["enabled", "interval_seconds", "timeout_seconds", "prompt", "max_tokens", "stale_after_seconds"],
+        "properties": {
+          "enabled": {"type": "boolean", "description": "Turns the periodic direct-model probe on or off."},
+          "interval_seconds": {"type": "integer", "minimum": 1, "description": "Probe interval in seconds."},
+          "timeout_seconds": {"type": "integer", "minimum": 1, "description": "Per-probe timeout in seconds."},
+          "prompt": {"type": "string", "minLength": 1, "description": "Minimal prompt used by the background probe request."},
+          "max_tokens": {"type": "integer", "minimum": 1, "description": "Max completion tokens used by the probe request."},
+          "ignore_statuses": {
+            "type": "array",
+            "description": "Upstream HTTP statuses that should be recorded without marking the model unhealthy. Typical values are 408 and 429.",
+            "items": {"type": "integer", "minimum": 100, "maximum": 599}
+          },
+          "stale_after_seconds": {"type": "integer", "minimum": 1, "description": "Age threshold after which an unhealthy background-check result is treated as stale and stops excluding the model."}
+        },
+        "description": "Periodic direct-model health-check configuration. Rejected on routing models."
+      },
+      "ModelStatusView": {
+        "type": "object",
+        "required": ["id", "display_name", "kind", "status"],
+        "properties": {
+          "id": {"type": "string", "description": "Resolved model id. Direct-model runtime status is keyed by this id."},
+          "display_name": {"type": "string"},
+          "kind": {"$ref": "#/components/schemas/ModelKind"},
+          "status": {"$ref": "#/components/schemas/RuntimeStatus"},
+          "cooldown_until": {"$ref": "#/components/schemas/SystemTime"},
+          "last_checked_at": {"$ref": "#/components/schemas/SystemTime"},
+          "last_check_status": {"type": "integer", "minimum": 100, "maximum": 599},
+          "status_reason": {"type": "string", "description": "Machine-readable explanation such as `retryable_failure`, `background_check_failed`, or `ignored_transient_error`."}
+        },
+        "description": "Per-model runtime routing status. Routing rows always return `kind=routing` and `status=not_applicable`."
+      },
+      "ModelKind": {
+        "type": "string",
+        "enum": ["direct", "routing"]
+      },
+      "RuntimeStatus": {
+        "type": "string",
+        "enum": ["healthy", "unhealthy", "cooldown", "not_applicable"]
+      },
+      "SystemTime": {
+        "type": "object",
+        "required": ["secs_since_epoch", "nanos_since_epoch"],
+        "properties": {
+          "secs_since_epoch": {"type": "integer", "minimum": 0},
+          "nanos_since_epoch": {"type": "integer", "minimum": 0, "maximum": 999999999}
         }
       },
       "ApiKey": {
@@ -436,6 +498,7 @@ mod tests {
             "/admin/openapi-scalar",
             "/admin/v1/models",
             "/admin/v1/models/{id}",
+            "/admin/v1/models/status",
             "/admin/v1/apikeys",
             "/admin/v1/apikeys/{id}",
             "/admin/v1/apikeys/{id}/rotate",
@@ -459,6 +522,11 @@ mod tests {
         for schema in [
             "Model",
             "ModelEntry",
+            "BackgroundModelCheck",
+            "ModelStatusView",
+            "ModelKind",
+            "RuntimeStatus",
+            "SystemTime",
             "ApiKey",
             "ApiKeyEntry",
             "ProviderKey",

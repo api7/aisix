@@ -24,7 +24,7 @@ use aisix_ratelimit::Limiter;
 use std::sync::Arc;
 
 use crate::budget::BudgetClient;
-use crate::health::{HealthTracker, LivezState};
+use crate::health::{HealthTracker, LivezState, ModelRuntimeStatusTracker};
 use crate::routing::RoutingRegistry;
 
 #[derive(Clone)]
@@ -46,6 +46,10 @@ pub struct ProxyState {
     pub health: Arc<HealthTracker>,
     /// Public liveness state served on `GET /livez`.
     pub livez: Arc<LivezState>,
+    /// Runtime model-status tracker keyed by resolved direct-model id.
+    /// Used for request-path cooldown/background health exclusion and
+    /// surfaced by `GET /admin/v1/models/status`.
+    pub runtime_status: Arc<ModelRuntimeStatusTracker>,
     /// CP-side usage telemetry sink. Backed by an mpsc channel into the
     /// sender worker spawned in aisix-server (see `telemetry::spawn`).
     /// Defaults to a no-op sink when running outside managed mode so
@@ -73,6 +77,7 @@ impl ProxyState {
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
+            runtime_status: Arc::new(ModelRuntimeStatusTracker::new()),
             usage_sink: UsageSink::disabled(),
             otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
@@ -98,6 +103,7 @@ impl ProxyState {
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
+            runtime_status: Arc::new(ModelRuntimeStatusTracker::new()),
             usage_sink: UsageSink::disabled(),
             otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
@@ -126,6 +132,7 @@ impl ProxyState {
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
+            runtime_status: Arc::new(ModelRuntimeStatusTracker::new()),
             usage_sink: UsageSink::disabled(),
             otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,

@@ -16,6 +16,7 @@
 use dashmap::DashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, SystemTime};
 
 use axum::http::header::{HeaderName, HeaderValue, CONTENT_TYPE};
 use axum::http::StatusCode;
@@ -99,6 +100,95 @@ pub enum HealthLevel {
     Down,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeStatus {
+    Healthy,
+    Unhealthy,
+    Cooldown,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimeStatusSnapshot {
+    pub status: RuntimeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<SystemTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checked_at: Option<SystemTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_check_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
+}
+
+impl Default for RuntimeStatusSnapshot {
+    fn default() -> Self {
+        Self {
+            status: RuntimeStatus::Healthy,
+            cooldown_until: None,
+            last_checked_at: None,
+            last_check_status: None,
+            status_reason: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeEntry {
+    unhealthy: bool,
+    cooldown_until: Option<SystemTime>,
+    last_checked_at: Option<SystemTime>,
+    last_check_status: Option<u16>,
+    status_reason: Option<String>,
+}
+
+impl Default for RuntimeEntry {
+    fn default() -> Self {
+        Self {
+            unhealthy: false,
+            cooldown_until: None,
+            last_checked_at: None,
+            last_check_status: None,
+            status_reason: None,
+        }
+    }
+}
+
+impl RuntimeEntry {
+    fn snapshot(&self, now: SystemTime, stale_after: Option<Duration>) -> RuntimeStatusSnapshot {
+        let cooldown_until = self.cooldown_until.filter(|until| *until > now);
+        let unhealthy = self.unhealthy && !self.is_stale(now, stale_after);
+        let status = if cooldown_until.is_some() {
+            RuntimeStatus::Cooldown
+        } else if unhealthy {
+            RuntimeStatus::Unhealthy
+        } else {
+            RuntimeStatus::Healthy
+        };
+        RuntimeStatusSnapshot {
+            status,
+            cooldown_until,
+            last_checked_at: self.last_checked_at,
+            last_check_status: self.last_check_status,
+            status_reason: self.status_reason.clone(),
+        }
+    }
+
+    fn is_stale(&self, now: SystemTime, stale_after: Option<Duration>) -> bool {
+        let Some(stale_after) = stale_after else {
+            return false;
+        };
+        let Some(last_checked_at) = self.last_checked_at else {
+            return false;
+        };
+        match now.duration_since(last_checked_at) {
+            Ok(elapsed) => elapsed > stale_after,
+            Err(_) => false,
+        }
+    }
+}
+
 impl From<HealthLevel> for u8 {
     fn from(h: HealthLevel) -> u8 {
         match h {
@@ -170,6 +260,11 @@ pub struct HealthTracker {
     entries: DashMap<String, Entry>,
 }
 
+#[derive(Default, Debug)]
+pub struct ModelRuntimeStatusTracker {
+    entries: DashMap<String, RuntimeEntry>,
+}
+
 impl HealthTracker {
     pub fn new() -> Self {
         Self::default()
@@ -211,10 +306,114 @@ impl HealthTracker {
     }
 }
 
+impl ModelRuntimeStatusTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mark_cooldown(&self, model_id: &str, ttl: Duration, reason: impl Into<String>) {
+        let now = SystemTime::now();
+        let until = now + ttl;
+        let reason = reason.into();
+        self.entries
+            .entry(model_id.to_string())
+            .and_modify(|entry| {
+                entry.cooldown_until = Some(until);
+                entry.status_reason = Some(reason.clone());
+            })
+            .or_insert_with(|| RuntimeEntry {
+                cooldown_until: Some(until),
+                status_reason: Some(reason),
+                ..RuntimeEntry::default()
+            });
+    }
+
+    pub fn mark_healthy(&self, model_id: &str) {
+        if let Some(mut entry) = self.entries.get_mut(model_id) {
+            entry.unhealthy = false;
+            entry.cooldown_until = None;
+            entry.status_reason = None;
+        }
+    }
+
+    pub fn clear_unhealthy(&self, model_id: &str) {
+        if let Some(mut entry) = self.entries.get_mut(model_id) {
+            entry.unhealthy = false;
+            if entry.status_reason.as_deref() == Some("background_check_failed") {
+                entry.status_reason = None;
+            }
+        }
+    }
+
+    pub fn mark_unhealthy(&self, model_id: &str, status: Option<u16>, reason: impl Into<String>) {
+        let now = SystemTime::now();
+        let reason = reason.into();
+        self.entries
+            .entry(model_id.to_string())
+            .and_modify(|entry| {
+                entry.unhealthy = true;
+                entry.last_checked_at = Some(now);
+                entry.last_check_status = status;
+                entry.status_reason = Some(reason.clone());
+            })
+            .or_insert_with(|| RuntimeEntry {
+                unhealthy: true,
+                last_checked_at: Some(now),
+                last_check_status: status,
+                status_reason: Some(reason),
+                ..RuntimeEntry::default()
+            });
+    }
+
+    pub fn record_ignored_check(
+        &self,
+        model_id: &str,
+        status: u16,
+        reason: impl Into<String>,
+    ) {
+        let now = SystemTime::now();
+        let reason = reason.into();
+        self.entries
+            .entry(model_id.to_string())
+            .and_modify(|entry| {
+                entry.last_checked_at = Some(now);
+                entry.last_check_status = Some(status);
+                entry.status_reason = Some(reason.clone());
+            })
+            .or_insert_with(|| RuntimeEntry {
+                last_checked_at: Some(now),
+                last_check_status: Some(status),
+                status_reason: Some(reason),
+                ..RuntimeEntry::default()
+            });
+    }
+
+    pub fn status(&self, model_id: &str) -> RuntimeStatusSnapshot {
+        self.status_with_stale(model_id, None)
+    }
+
+    pub fn status_with_stale(
+        &self,
+        model_id: &str,
+        stale_after: Option<Duration>,
+    ) -> RuntimeStatusSnapshot {
+        let now = SystemTime::now();
+        self.entries
+            .get(model_id)
+            .map(|entry| entry.snapshot(now, stale_after))
+            .unwrap_or_default()
+    }
+
+    pub fn should_skip_for_routing(&self, model_id: &str, stale_after: Option<Duration>) -> RuntimeStatus {
+        self.status_with_stale(model_id, stale_after).status
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+    use std::thread;
 
     #[test]
     fn new_model_is_healthy() {
@@ -301,5 +500,58 @@ mod tests {
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("[-]shutdown failed: reason withheld"));
         assert!(text.contains("livez check failed"));
+    }
+
+    #[test]
+    fn runtime_tracker_defaults_to_healthy() {
+        let t = ModelRuntimeStatusTracker::new();
+        let s = t.status("m-1");
+        assert_eq!(s.status, RuntimeStatus::Healthy);
+        assert!(s.cooldown_until.is_none());
+    }
+
+    #[test]
+    fn runtime_tracker_cooldown_expires() {
+        let t = ModelRuntimeStatusTracker::new();
+        t.mark_cooldown("m-1", Duration::from_millis(5), "retryable_failure");
+        assert_eq!(t.status("m-1").status, RuntimeStatus::Cooldown);
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(t.status("m-1").status, RuntimeStatus::Healthy);
+    }
+
+    #[test]
+    fn runtime_tracker_unhealthy_then_healthy() {
+        let t = ModelRuntimeStatusTracker::new();
+        t.mark_unhealthy("m-1", Some(500), "background_check_failed");
+        let unhealthy = t.status("m-1");
+        assert_eq!(unhealthy.status, RuntimeStatus::Unhealthy);
+        assert_eq!(unhealthy.last_check_status, Some(500));
+        t.mark_healthy("m-1");
+        assert_eq!(t.status("m-1").status, RuntimeStatus::Healthy);
+    }
+
+    #[test]
+    fn runtime_tracker_ignored_status_does_not_mark_unhealthy() {
+        let t = ModelRuntimeStatusTracker::new();
+        t.record_ignored_check("m-1", 429, "ignored_transient_error");
+        let s = t.status("m-1");
+        assert_eq!(s.status, RuntimeStatus::Healthy);
+        assert_eq!(s.last_check_status, Some(429));
+        assert_eq!(s.status_reason.as_deref(), Some("ignored_transient_error"));
+    }
+
+    #[test]
+    fn runtime_tracker_unhealthy_becomes_healthy_after_stale_window() {
+        let t = ModelRuntimeStatusTracker::new();
+        t.mark_unhealthy("m-1", Some(503), "background_check_failed");
+        assert_eq!(
+            t.status_with_stale("m-1", Some(Duration::from_secs(60))).status,
+            RuntimeStatus::Unhealthy
+        );
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(
+            t.status_with_stale("m-1", Some(Duration::from_millis(1))).status,
+            RuntimeStatus::Healthy
+        );
     }
 }
