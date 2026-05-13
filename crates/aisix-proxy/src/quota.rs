@@ -1,50 +1,52 @@
 //! Pre-dispatch quota gate shared by every LLM endpoint.
 //!
-//! Before this gate landed, only `/v1/chat/completions` ran budget +
-//! rate-limit checks (`chat::dispatch`). Every other LLM endpoint —
-//! `/v1/embeddings`, `/v1/messages`, `/v1/audio/*`,
-//! `/v1/images/generations`, `/v1/responses`, `/v1/rerank`,
-//! `/v1/completions`, the `/passthrough/...` family — went straight
-//! from auth into the upstream Bridge, silently bypassing both. A
-//! customer running the gateway as their org's LLM proxy expected
-//! RPM/TPM caps and budget cutoffs to apply uniformly across
-//! endpoints; the gap was visible to anyone using `/v1/messages`
-//! (Anthropic API-shape) or `/v1/embeddings`. See issue #107.
+//! Applies budget + multi-layer rate limiting:
+//! 1. Budget pre-check (cp-api cached decision)
+//! 2. API-key rate limit (`auth.entry.id`)
+//! 3. Model rate limit (`model:<name>`) — when the resolved Model has one
+//! 4. Team rate limit (`team:<id>`) — when the ApiKey carries team info
+//! 5. Member rate limit (`member:<id>`) — when the ApiKey carries owner info
 //!
-//! This module hosts the minimum check every non-chat handler now
-//! performs: a budget pre-check via cp-api, then a rate-limit
-//! reservation. Guardrails are *not* applied here — they need
-//! per-handler text extraction (chat reads messages, embeddings reads
-//! `input` strings, audio reads transcripts) and that wiring is a
-//! larger, separate change. The chat handler still has its own
-//! guardrail path; this gate runs in parallel for every other
-//! endpoint.
-//!
-//! Returning a [`Reservation`] (not just a permit) lets the caller
-//! commit token usage post-dispatch. Non-chat handlers that don't
-//! track upstream tokens uniformly call
-//! [`aisix_ratelimit::Reservation::commit_tokens`] with `0`, which
-//! still releases the concurrency permit and counts the request
-//! against RPM but skips TPM. Future work can plumb per-endpoint
-//! token totals through.
+//! All layers use AND logic — every layer must pass or the request gets
+//! 429. The returned [`MultiReservation`] commits token usage to all
+//! layers and releases all concurrency permits on drop.
 
-use aisix_ratelimit::Reservation;
+use aisix_core::RateLimit;
+use aisix_ratelimit::MultiReservation;
 
 use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
 use crate::state::ProxyState;
 
-/// Apply budget + rate-limit checks for one request. Call this before
-/// touching the Bridge in every LLM endpoint handler. The returned
-/// [`Reservation`] is alive until the caller commits or drops it; on
-/// commit, RPM is finalised and TPM accounted for the supplied total.
+/// Optional model rate-limit info resolved by the caller before enforce.
+pub(crate) struct ModelRateLimit {
+    pub name: String,
+    pub limits: RateLimit,
+}
+
+impl ModelRateLimit {
+    /// Build from a resolved model entry. Returns `None` when the model
+    /// has no rate limit configured.
+    pub fn from_model(model_name: &str, model: &aisix_core::Model) -> Option<Self> {
+        model
+            .rate_limit
+            .as_ref()
+            .filter(|rl| !rl.is_unrestricted())
+            .map(|rl| Self {
+                name: model_name.to_owned(),
+                limits: rl.clone(),
+            })
+    }
+}
+
+/// Apply budget + multi-layer rate-limit checks for one request.
+/// `model_rl` is the resolved Model's rate_limit (if any). Pass `None`
+/// for endpoints that don't resolve a model (e.g. passthrough).
 pub(crate) async fn enforce<'a>(
     state: &'a ProxyState,
     auth: &AuthenticatedKey,
-) -> Result<Reservation<'a, aisix_ratelimit::SystemClock>, ProxyError> {
-    // Budget pre-check via cp-api. Mirrors chat::dispatch — the DP no
-    // longer owns budget state; cp-api returns a cached/live decision
-    // per api_key.
+    model_rl: Option<ModelRateLimit>,
+) -> Result<MultiReservation<'a, aisix_ratelimit::SystemClock>, ProxyError> {
     let decision = state.budgets.check(&auth.entry.id).await;
     if !decision.allowed {
         return Err(ProxyError::BudgetExceeded(
@@ -52,14 +54,107 @@ pub(crate) async fn enforce<'a>(
         ));
     }
 
-    // Rate-limit reservation. The reservation holds a concurrency
-    // permit until it's committed (or dropped). Commit at the end of
-    // dispatch with whatever token count the upstream returned (0 if
-    // the handler doesn't track tokens — RPM still counts).
-    let rl_key = auth.entry.id.clone();
-    let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
-    state
-        .limiter
-        .pre_commit(&rl_key, &rl_limits)
-        .map_err(ProxyError::from)
+    let mut reservations = Vec::with_capacity(4);
+
+    // Layer 1: API key rate limit.
+    let key_limits = auth.key().rate_limit.clone().unwrap_or_default();
+    if !key_limits.is_unrestricted() {
+        let r = state
+            .limiter
+            .pre_commit(&auth.entry.id, &key_limits)
+            .map_err(ProxyError::from)?;
+        reservations.push(r);
+    }
+
+    // Layer 2: Model rate limit.
+    if let Some(mrl) = model_rl {
+        if !mrl.limits.is_unrestricted() {
+            let key = format!("model:{}", mrl.name);
+            let r = state
+                .limiter
+                .pre_commit(&key, &mrl.limits)
+                .map_err(ProxyError::from)?;
+            reservations.push(r);
+        }
+    }
+
+    // Layer 3: Team rate limit.
+    if let (Some(tid), Some(trl)) = (&auth.key().team_id, &auth.key().team_rate_limit) {
+        if !tid.is_empty() && !trl.is_unrestricted() {
+            let key = format!("team:{tid}");
+            let r = state
+                .limiter
+                .pre_commit(&key, trl)
+                .map_err(ProxyError::from)?;
+            reservations.push(r);
+        }
+    }
+
+    // Layer 4: Member/owner rate limit.
+    if let (Some(oid), Some(orl)) = (&auth.key().owner_id, &auth.key().owner_rate_limit) {
+        if !oid.is_empty() && !orl.is_unrestricted() {
+            let key = format!("member:{oid}");
+            let r = state
+                .limiter
+                .pre_commit(&key, orl)
+                .map_err(ProxyError::from)?;
+            reservations.push(r);
+        }
+    }
+
+    Ok(MultiReservation::new(reservations))
+}
+
+/// Rate-limit-only enforcement (no budget check). Used by `chat.rs`
+/// which handles budget separately before model resolution.
+pub(crate) fn enforce_rate_limit<'a>(
+    state: &'a ProxyState,
+    auth: &AuthenticatedKey,
+    model_rl: Option<ModelRateLimit>,
+) -> Result<MultiReservation<'a, aisix_ratelimit::SystemClock>, ProxyError> {
+    let mut reservations = Vec::with_capacity(4);
+
+    let key_limits = auth.key().rate_limit.clone().unwrap_or_default();
+    if !key_limits.is_unrestricted() {
+        let r = state
+            .limiter
+            .pre_commit(&auth.entry.id, &key_limits)
+            .map_err(ProxyError::from)?;
+        reservations.push(r);
+    }
+
+    if let Some(mrl) = model_rl {
+        if !mrl.limits.is_unrestricted() {
+            let key = format!("model:{}", mrl.name);
+            let r = state
+                .limiter
+                .pre_commit(&key, &mrl.limits)
+                .map_err(ProxyError::from)?;
+            reservations.push(r);
+        }
+    }
+
+    if let (Some(tid), Some(trl)) = (&auth.key().team_id, &auth.key().team_rate_limit) {
+        if !tid.is_empty() && !trl.is_unrestricted() {
+            let key = format!("team:{tid}");
+            let r = state
+                .limiter
+                .pre_commit(&key, trl)
+                .map_err(ProxyError::from)?;
+            reservations.push(r);
+        }
+    }
+
+    if let (Some(oid), Some(orl)) = (&auth.key().owner_id, &auth.key().owner_rate_limit) {
+        if !oid.is_empty() && !orl.is_unrestricted() {
+            let key = format!("member:{oid}");
+            let r = state
+                .limiter
+                .pre_commit(&key, orl)
+                .map_err(ProxyError::from)?;
+            reservations.push(r);
+        }
+    }
+
+    Ok(MultiReservation::new(reservations))
 }

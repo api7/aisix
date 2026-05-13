@@ -141,13 +141,8 @@ async fn dispatch(
         .get(provider)
         .ok_or(ProxyError::ProviderUnavailable)?;
 
-    // Budget + rate-limit gate (issue #107). Pre-fix this endpoint
-    // bypassed both. The reservation is held until commit_tokens at
-    // the end of dispatch — embeddings don't surface a stable token
-    // count across providers, so we commit 0 for now (RPM counts,
-    // TPM doesn't). Plumbing per-provider token totals through is a
-    // follow-up.
-    let reservation = crate::quota::enforce(state, auth).await?;
+    let model_rl = crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.value);
+    let reservation = crate::quota::enforce(state, auth, model_rl).await?;
 
     let upstream_model_id = crate::dispatch::require_upstream_model(model)?.to_string();
 

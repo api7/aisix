@@ -460,12 +460,10 @@ async fn dispatch(
         }
     }
 
-    let rl_key = auth.entry.id.clone();
-    let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
-    let reservation = state
-        .limiter
-        .pre_commit(&rl_key, &rl_limits)
-        .map_err(|e| with_model(ProxyError::from(e)))?;
+    // Multi-layer rate-limit reservation (api_key + model + team + member).
+    let model_rl = crate::quota::ModelRateLimit::from_model(&req.model, &virtual_entry.value);
+    let reservation =
+        crate::quota::enforce_rate_limit(state, auth, model_rl).map_err(&with_model)?;
 
     let now = created_ts();
 
@@ -488,13 +486,10 @@ async fn dispatch(
             .chat_stream(req, &ctx)
             .await
             .map_err(|e| with_model(ProxyError::Bridge(e)))?;
-        // Drop the reservation now: concurrency releases (the SSE
-        // stream that follows is driven by the client, not by the
-        // proxy holding open an upstream-bound future), and RPM was
-        // already counted by pre_commit. TPM is updated retroactively
-        // on stream-end by `add_tokens_post_stream` — see issue #108.
-        // Pre-fix this path called commit_tokens(0) and never came
-        // back, leaving TPM caps blind for all streaming traffic.
+        // Drop the reservation now: concurrency releases on all layers.
+        // RPM was already counted by pre_commit. TPM is updated
+        // retroactively on stream-end by `add_tokens_post_stream`.
+        let post_stream_keys = reservation.keys();
         drop(reservation);
         // Capture everything the stream-completion callback needs so
         // it can fire `emit_usage_event` once the terminal SSE chunk
@@ -503,7 +498,6 @@ async fn dispatch(
         // populate `usage` on the last chunk; emitting at handler
         // return (the non-streaming path's spot) would record zeros.
         let limiter = Arc::clone(&state.limiter);
-        let post_stream_key = rl_key.clone();
         let state_for_telem = state.clone();
         let request_id_for_telem = request_id.to_string();
         let model_id_for_telem = model_id.clone();
@@ -534,8 +528,10 @@ async fn dispatch(
             now,
             stream_guardrail,
             move |comp: StreamCompletion| {
-                // Existing: rate-limit accounting (TPM cap) — see #108.
-                limiter.add_tokens_post_stream(&post_stream_key, comp.total_tokens);
+                // Rate-limit accounting (TPM cap) for all layers.
+                for key in &post_stream_keys {
+                    limiter.add_tokens_post_stream(key, comp.total_tokens);
+                }
                 // Telemetry: emit with the actual upstream-reported counts.
                 // cost_usd stays 0.0; cp-api recomputes server-side from
                 // its model_pricing catalog (same pattern as the non-

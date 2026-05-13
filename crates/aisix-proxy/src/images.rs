@@ -104,8 +104,8 @@ async fn dispatch(
         return Err(ProxyError::ModelForbidden(model_name.to_string()));
     }
 
-    // Budget + rate-limit gate (issue #107).
-    let _reservation = crate::quota::enforce(state, auth).await?;
+    let model_rl = crate::quota::ModelRateLimit::from_model(model_name, &model_entry.value);
+    let _reservation = crate::quota::enforce(state, auth, model_rl).await?;
 
     let model = &model_entry.value;
 

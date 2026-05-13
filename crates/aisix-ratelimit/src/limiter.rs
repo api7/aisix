@@ -286,6 +286,39 @@ impl<'a, C: Clock> Drop for Reservation<'a, C> {
     }
 }
 
+/// Wraps multiple [`Reservation`]s across rate-limit layers (api_key,
+/// model, team, member). Commits all with the same token count;
+/// dropping releases all concurrency permits.
+pub struct MultiReservation<'a, C: Clock> {
+    reservations: Vec<Reservation<'a, C>>,
+}
+
+impl<'a, C: Clock> MultiReservation<'a, C> {
+    pub fn new(reservations: Vec<Reservation<'a, C>>) -> Self {
+        Self { reservations }
+    }
+
+    /// Commit the actual token cost to every layer.
+    pub fn commit_tokens(self, tokens: u64) {
+        for r in self.reservations {
+            r.commit_tokens(tokens);
+        }
+    }
+
+    /// Return owned keys for post-stream token accounting.
+    pub fn keys(&self) -> Vec<String> {
+        self.reservations.iter().map(|r| r.key.clone()).collect()
+    }
+}
+
+impl<'a, C: Clock> std::fmt::Debug for MultiReservation<'a, C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiReservation")
+            .field("layers", &self.reservations.len())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,5 +647,78 @@ mod tests {
             matches!(err, RateLimitError::Tokens { .. }),
             "TPM cap should block the next request after streaming over-shoot; got {err:?}",
         );
+    }
+
+    // --- MultiReservation tests ----------------------------------------
+
+    #[test]
+    fn multi_reservation_commit_tokens_updates_all_layers() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::with_clock(clock.clone());
+        let l = limits(None, Some(1000), None);
+
+        let r1 = limiter.pre_commit("api_key:k1", &l).unwrap();
+        let r2 = limiter.pre_commit("model:gpt-4o", &l).unwrap();
+        let multi = MultiReservation::new(vec![r1, r2]);
+
+        multi.commit_tokens(500);
+
+        let s1 = limiter.peek("api_key:k1", &l).unwrap();
+        let s2 = limiter.peek("model:gpt-4o", &l).unwrap();
+        assert_eq!(s1.tpm_used, 500);
+        assert_eq!(s2.tpm_used, 500);
+    }
+
+    #[test]
+    fn multi_reservation_drop_releases_all_concurrency() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::with_clock(clock.clone());
+        let l = limits(None, None, Some(1));
+
+        let r1 = limiter.pre_commit("k1", &l).unwrap();
+        let r2 = limiter.pre_commit("k2", &l).unwrap();
+        let multi = MultiReservation::new(vec![r1, r2]);
+
+        assert!(limiter.pre_commit("k1", &l).is_err());
+        assert!(limiter.pre_commit("k2", &l).is_err());
+
+        drop(multi);
+
+        assert!(limiter.pre_commit("k1", &l).is_ok());
+        assert!(limiter.pre_commit("k2", &l).is_ok());
+    }
+
+    #[test]
+    fn multi_reservation_keys_returns_all_held_keys() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::with_clock(clock.clone());
+        let l = limits(Some(10), None, None);
+
+        let r1 = limiter.pre_commit("api_key:k1", &l).unwrap();
+        let r2 = limiter.pre_commit("model:m1", &l).unwrap();
+        let r3 = limiter.pre_commit("team:t1", &l).unwrap();
+        let multi = MultiReservation::new(vec![r1, r2, r3]);
+
+        let keys = multi.keys();
+        assert_eq!(keys, vec!["api_key:k1", "model:m1", "team:t1"]);
+    }
+
+    #[test]
+    fn multi_reservation_partial_failure_drops_earlier_reservations() {
+        let clock = TestClock::new(100);
+        let limiter = Limiter::with_clock(clock.clone());
+        let l_key = limits(None, None, Some(1));
+        let l_model = limits(Some(1), None, None);
+
+        let _exhaust = limiter.pre_commit("model:m1", &l_model).unwrap();
+
+        let r1 = limiter.pre_commit("k1", &l_key).unwrap();
+        assert!(limiter.pre_commit("k1", &l_key).is_err());
+
+        assert!(limiter.pre_commit("model:m1", &l_model).is_err());
+
+        drop(r1);
+
+        assert!(limiter.pre_commit("k1", &l_key).is_ok());
     }
 }
