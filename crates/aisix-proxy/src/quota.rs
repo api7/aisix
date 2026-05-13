@@ -116,7 +116,7 @@ pub(crate) async fn enforce<'a>(
 }
 
 /// Rate-limit-only enforcement (no budget check). Used by `chat.rs`
-/// which handles budget separately before model resolution.
+/// which handles budget separately.
 pub(crate) fn enforce_rate_limit<'a>(
     state: &'a ProxyState,
     auth: &AuthenticatedKey,
