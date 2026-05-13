@@ -378,4 +378,44 @@ mod tests {
         let mtls = write_test_bundle(dir.path());
         let _ = build_client(&mtls).expect("real bundle should build");
     }
+
+    /// Mirror heartbeat regression: PEM without trailing newline.
+    #[test]
+    fn build_client_works_without_trailing_newlines() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let ca_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.distinguished_name = {
+            let mut dn = DistinguishedName::new();
+            dn.push(rcgen::DnType::CommonName, "aisix-test-ca");
+            dn
+        };
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_kp).unwrap();
+
+        let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut leaf_params = CertificateParams::new(vec!["dp-test".to_string()]).unwrap();
+        leaf_params.distinguished_name = {
+            let mut dn = DistinguishedName::new();
+            dn.push(rcgen::DnType::CommonName, "dp-test");
+            dn
+        };
+        let leaf_cert = leaf_params.signed_by(&leaf_kp, &ca_cert, &ca_kp).unwrap();
+
+        let ca_path = dir.path().join("ca.crt");
+        let cert_path = dir.path().join("client.crt");
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&ca_path, ca_cert.pem().trim_end()).unwrap();
+        std::fs::write(&cert_path, leaf_cert.pem().trim_end()).unwrap();
+        std::fs::write(&key_path, leaf_kp.serialize_pem().trim_end()).unwrap();
+
+        let mtls = MtlsBundle {
+            ca_cert_path: ca_path,
+            client_cert_path: cert_path,
+            client_key_path: key_path,
+            extra_ca_pem: None,
+        };
+        build_client(&mtls).expect("build_client must tolerate PEM without trailing newline");
+    }
 }
