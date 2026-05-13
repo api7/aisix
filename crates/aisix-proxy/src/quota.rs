@@ -26,7 +26,8 @@ pub(crate) struct ModelRateLimit {
 
 impl ModelRateLimit {
     /// Build from a resolved model entry. Returns `None` when the model
-    /// has no rate limit configured.
+    /// has no rate limit configured or has an unrestricted one (all fields
+    /// are `None`).
     pub fn from_model(model_name: &str, model: &aisix_core::Model) -> Option<Self> {
         model
             .rate_limit

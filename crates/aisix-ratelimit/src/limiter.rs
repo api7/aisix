@@ -704,21 +704,32 @@ mod tests {
     }
 
     #[test]
-    fn multi_reservation_partial_failure_drops_earlier_reservations() {
+    fn multi_reservation_partial_failure_releases_acquired_layers() {
         let clock = TestClock::new(100);
         let limiter = Limiter::with_clock(clock.clone());
         let l_key = limits(None, None, Some(1));
+        let l_team = limits(None, None, Some(1));
         let l_model = limits(Some(1), None, None);
 
+        // Exhaust model RPM so the third layer will fail.
         let _exhaust = limiter.pre_commit("model:m1", &l_model).unwrap();
 
-        let r1 = limiter.pre_commit("k1", &l_key).unwrap();
+        // Simulate multi-layer acquisition: key + team succeed, model fails.
+        let r_key = limiter.pre_commit("k1", &l_key).unwrap();
+        let r_team = limiter.pre_commit("team:t1", &l_team).unwrap();
+        let acquired = vec![r_key, r_team];
+
+        // Both concurrency slots are now taken.
         assert!(limiter.pre_commit("k1", &l_key).is_err());
+        assert!(limiter.pre_commit("team:t1", &l_team).is_err());
 
+        // Model layer fails — drop acquired reservations (simulates error
+        // path where partially-built MultiReservation is dropped).
         assert!(limiter.pre_commit("model:m1", &l_model).is_err());
+        drop(MultiReservation::new(acquired));
 
-        drop(r1);
-
+        // Both earlier layers' concurrency is released.
         assert!(limiter.pre_commit("k1", &l_key).is_ok());
+        assert!(limiter.pre_commit("team:t1", &l_team).is_ok());
     }
 }
