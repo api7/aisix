@@ -458,7 +458,11 @@ fn rate_limit_policy_schema() -> Value {
             "window":       { "type": "string", "enum": ["second", "minute", "hour"] },
             "max_requests": { "type": "integer", "minimum": 1 },
             "max_tokens":   { "type": "integer", "minimum": 1 }
-        }
+        },
+        "anyOf": [
+            { "required": ["max_requests"] },
+            { "required": ["max_tokens"] }
+        ]
     })
 }
 
@@ -927,6 +931,17 @@ mod tests {
             "scope_ref": "x",
             "window": "minute",
             "max_requests": 0
+        });
+        assert!(validate_rate_limit_policy(&v).is_err());
+    }
+
+    #[test]
+    fn rate_limit_policy_rejects_no_limits() {
+        let v = json!({
+            "name": "noop",
+            "scope": "team",
+            "scope_ref": "x",
+            "window": "minute"
         });
         assert!(validate_rate_limit_policy(&v).is_err());
     }

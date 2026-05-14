@@ -23,27 +23,24 @@ use crate::state::ProxyState;
 pub(crate) struct ModelRateLimit {
     pub name: String,
     pub entry_id: String,
-    pub limits: RateLimit,
+    pub limits: Option<RateLimit>,
 }
 
 impl ModelRateLimit {
-    /// Build from a resolved model entry. Returns `None` when the model
-    /// has no rate limit configured or has an unrestricted one (all fields
-    /// are `None`).
-    pub fn from_model(
-        model_name: &str,
-        model_entry_id: &str,
-        model: &aisix_core::Model,
-    ) -> Option<Self> {
-        model
+    /// Build from a resolved model entry. Always returns `Some` so that
+    /// model-scope policies can match even when the model has no inline
+    /// rate limit.
+    pub fn from_model(model_name: &str, model_entry_id: &str, model: &aisix_core::Model) -> Self {
+        let limits = model
             .rate_limit
             .as_ref()
             .filter(|rl| !rl.is_unrestricted())
-            .map(|rl| Self {
-                name: model_name.to_owned(),
-                entry_id: model_entry_id.to_owned(),
-                limits: rl.clone(),
-            })
+            .cloned();
+        Self {
+            name: model_name.to_owned(),
+            entry_id: model_entry_id.to_owned(),
+            limits,
+        }
     }
 }
 
@@ -51,16 +48,16 @@ fn policy_to_rate_limit(policy: &RateLimitPolicy) -> RateLimit {
     let mut rl = RateLimit::default();
     match policy.window.as_str() {
         "second" => {
-            rl.rpm = policy.max_requests.map(|r| r * 60);
-            rl.tpm = policy.max_tokens.map(|t| t * 60);
+            rl.rpm = policy.max_requests.map(|r| r.saturating_mul(60));
+            rl.tpm = policy.max_tokens.map(|t| t.saturating_mul(60));
         }
         "minute" => {
             rl.rpm = policy.max_requests;
             rl.tpm = policy.max_tokens;
         }
         "hour" => {
-            rl.rpd = policy.max_requests.map(|r| r * 24);
-            rl.tpd = policy.max_tokens.map(|t| t * 24);
+            rl.rpd = policy.max_requests.map(|r| r.saturating_mul(24));
+            rl.tpd = policy.max_tokens.map(|t| t.saturating_mul(24));
         }
         _ => {}
     }
@@ -71,7 +68,7 @@ fn policy_to_rate_limit(policy: &RateLimitPolicy) -> RateLimit {
 fn reserve_layers<'a>(
     state: &'a ProxyState,
     auth: &AuthenticatedKey,
-    model_rl: Option<ModelRateLimit>,
+    model_rl: Option<&ModelRateLimit>,
 ) -> Result<MultiReservation<'a, aisix_ratelimit::SystemClock>, ProxyError> {
     let mut reservations = Vec::with_capacity(8);
 
@@ -86,12 +83,12 @@ fn reserve_layers<'a>(
     }
 
     // Layer 2: Model inline rate limit.
-    if let Some(ref mrl) = model_rl {
-        if !mrl.limits.is_unrestricted() {
+    if let Some(mrl) = model_rl {
+        if let Some(ref limits) = mrl.limits {
             let key = format!("model:{}", mrl.name);
             let r = state
                 .limiter
-                .pre_commit(&key, &mrl.limits)
+                .pre_commit(&key, limits)
                 .map_err(ProxyError::from)?;
             reservations.push(r);
         }
@@ -103,9 +100,7 @@ fn reserve_layers<'a>(
         let policy = &entry.value;
         let applies = match policy.scope.as_str() {
             "api_key" => policy.scope_ref == auth.entry.id,
-            "model" => model_rl
-                .as_ref()
-                .is_some_and(|m| policy.scope_ref == m.entry_id),
+            "model" => model_rl.is_some_and(|m| policy.scope_ref == m.entry_id),
             "team" => auth.key().team_id.as_deref() == Some(policy.scope_ref.as_str()),
             "member" => auth.key().owner_id.as_deref() == Some(policy.scope_ref.as_str()),
             _ => false,
@@ -134,7 +129,7 @@ fn reserve_layers<'a>(
 pub(crate) async fn enforce<'a>(
     state: &'a ProxyState,
     auth: &AuthenticatedKey,
-    model_rl: Option<ModelRateLimit>,
+    model_rl: Option<&ModelRateLimit>,
 ) -> Result<MultiReservation<'a, aisix_ratelimit::SystemClock>, ProxyError> {
     let decision = state.budgets.check(&auth.entry.id).await;
     if !decision.allowed {
@@ -151,7 +146,7 @@ pub(crate) async fn enforce<'a>(
 pub(crate) fn enforce_rate_limit<'a>(
     state: &'a ProxyState,
     auth: &AuthenticatedKey,
-    model_rl: Option<ModelRateLimit>,
+    model_rl: Option<&ModelRateLimit>,
 ) -> Result<MultiReservation<'a, aisix_ratelimit::SystemClock>, ProxyError> {
     reserve_layers(state, auth, model_rl)
 }

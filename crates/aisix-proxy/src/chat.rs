@@ -509,7 +509,7 @@ async fn dispatch(
         &virtual_entry.value,
     );
     let reservation =
-        crate::quota::enforce_rate_limit(state, auth, model_rl).map_err(&with_model)?;
+        crate::quota::enforce_rate_limit(state, auth, Some(&model_rl)).map_err(&with_model)?;
 
     let now = created_ts();
 
