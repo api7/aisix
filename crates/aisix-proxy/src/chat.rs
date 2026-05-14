@@ -1430,7 +1430,12 @@ where
         while let Some(item) = upstream.next().await {
             let ev = match item {
                 Ok(chunk) => {
-                    if !first_chunk_seen {
+                    // Record TTFT on the first chunk carrying generated
+                    // output (content or tool calls). Skip role-only
+                    // chunks that OpenAI emits before actual tokens.
+                    if !first_chunk_seen
+                        && (chunk.delta.content.is_some() || chunk.delta.tool_calls.is_some())
+                    {
                         first_chunk_seen = true;
                         guard.comp().ttft_ms =
                             started.elapsed().as_millis().min(u32::MAX as u128) as u32;
