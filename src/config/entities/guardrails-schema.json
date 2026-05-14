@@ -5,7 +5,7 @@
     "name": { "type": "string", "minLength": 1 },
     "type": {
       "type": "string",
-      "enum": ["bedrock"]
+      "enum": ["bedrock", "regex"]
     },
     "config": { "type": "object" }
   },
@@ -20,6 +20,17 @@
       "then": {
         "properties": {
           "config": { "$ref": "#/$defs/bedrock" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "type": { "const": "regex" } },
+        "required": ["type"]
+      },
+      "then": {
+        "properties": {
+          "config": { "$ref": "#/$defs/regex" }
         }
       }
     }
@@ -42,6 +53,15 @@
         "secret_access_key": { "type": "string", "minLength": 1 },
         "session_token": { "type": "string", "minLength": 1 },
         "endpoint": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "regex": {
+      "type": "object",
+      "required": ["pattern"],
+      "properties": {
+        "pattern": { "type": "string", "minLength": 1 },
+        "block_reason": { "type": "string", "minLength": 1 }
       },
       "additionalProperties": false
     }

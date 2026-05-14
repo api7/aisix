@@ -11,8 +11,12 @@ aws-sigv4.workspace = true
 aws-smithy-runtime-api.workspace = true
 http.workspace = true
 percent-encoding.workspace = true
+regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 utoipa.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

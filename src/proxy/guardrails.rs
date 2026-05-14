@@ -1,5 +1,5 @@
 use aisix_guardrail::{
-    guardrails::BedrockGuardrailRuntime,
+    guardrails::{BedrockGuardrailRuntime, RegexGuardrailRuntime},
     traits::{
         GuardrailCheckPayload, GuardrailContentPart, GuardrailImageUrl, GuardrailMessage,
         GuardrailMessageContent, GuardrailOutcome, GuardrailRole, GuardrailRuntime, GuardrailStage,
@@ -278,6 +278,10 @@ fn configured_guardrail_runtime_from_configs(
             BedrockGuardrailRuntime::new(),
             config.clone(),
         ))),
+        GuardrailConfig::Regex(config) => Ok(Box::new(GuardrailRuntimeHandle::new(
+            RegexGuardrailRuntime::new(),
+            config.clone(),
+        ))),
     }
 }
 
@@ -353,7 +357,7 @@ mod tests {
     use std::sync::Mutex;
 
     use aisix_guardrail::{
-        guardrails::configs::BedrockGuardrailConfig,
+        guardrails::configs::{BedrockGuardrailConfig, RegexGuardrailConfig},
         traits::{
             GuardrailCheckPayload, GuardrailContentPart, GuardrailMessage, GuardrailMessageContent,
             GuardrailMeta, GuardrailOutcome, GuardrailRole, GuardrailRuntime, GuardrailStage,
@@ -641,6 +645,17 @@ mod tests {
 
         assert_eq!(runtime.name(), "bedrock");
         assert!(runtime.supports_stage(GuardrailStage::Input));
+    }
+
+    #[test]
+    fn configured_guardrail_runtime_from_configs_builds_regex_runtime() {
+        let runtime = configured_guardrail_runtime_from_configs(&GuardrailConfig::Regex(
+            RegexGuardrailConfig::new("secret", Some("matched blocked content".into())).unwrap(),
+        ))
+        .unwrap();
+
+        assert_eq!(runtime.name(), "regex");
+        assert!(runtime.supports_stage(GuardrailStage::Output));
     }
 
     #[test]

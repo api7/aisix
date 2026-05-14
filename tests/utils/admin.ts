@@ -25,13 +25,16 @@ export const extractIdFromStorageKey = (storageKey: string) => {
   return id;
 };
 
-export const startIsolatedAdminApp = async (adminKey: string) => {
+export const startIsolatedAdminApp = async (
+  adminKey: string,
+  etcdPrefix = `/ai-admin-${randomUUID()}`,
+) => {
   return (await (
     await App.spawn(
       defaultConfig({
         deployment: {
           etcd: {
-            prefix: `/ai-admin-${randomUUID()}`,
+            prefix: etcdPrefix,
           },
           admin: { admin_key: [{ key: adminKey }] },
         },
