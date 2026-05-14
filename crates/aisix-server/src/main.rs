@@ -166,7 +166,16 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // heartbeat path under cp_base_url is fixed
             // (`/dp/heartbeat`); we don't need a server response to
             // know it.
-            let cp_base = cfg.managed.cp_base_url.as_deref().unwrap_or_default();
+            let cp_base = cfg
+                .managed
+                .cp_base_url
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "managed.cp_base_url required for heartbeat when cert bundle is provided"
+                    )
+                })?;
             Some(heartbeat::HeartbeatConfig::sanitised(
                 format!("{}/dp/heartbeat", cp_base.trim_end_matches('/')),
                 p.dp_id,
@@ -773,7 +782,8 @@ fn derive_cp_etcd_url(managed: &aisix_core::ManagedConfig) -> anyhow::Result<Str
     let host_port = cp_base
         .strip_prefix("https://")
         .or_else(|| cp_base.strip_prefix("http://"))
-        .unwrap_or(cp_base);
+        .unwrap_or(cp_base)
+        .trim_end_matches('/');
     Ok(format!("https://{host_port}"))
 }
 
@@ -1071,6 +1081,15 @@ mod tests {
     fn derive_etcd_url_strips_http_scheme() {
         let m = managed_with_urls(Some("http://localhost:7944"), None);
         assert_eq!(derive_cp_etcd_url(&m).unwrap(), "https://localhost:7944");
+    }
+
+    #[test]
+    fn derive_etcd_url_strips_trailing_slash() {
+        let m = managed_with_urls(Some("https://dpm.example.com:7944/"), None);
+        assert_eq!(
+            derive_cp_etcd_url(&m).unwrap(),
+            "https://dpm.example.com:7944"
+        );
     }
 
     #[test]
