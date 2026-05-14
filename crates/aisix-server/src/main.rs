@@ -753,6 +753,13 @@ fn default_domain_from_endpoint(endpoint: &str) -> anyhow::Result<String> {
 /// otherwise strip the scheme from `cp_base_url` (cmux means the
 /// same port serves both REST and etcd gRPC).
 fn derive_cp_etcd_url(managed: &aisix_core::ManagedConfig) -> anyhow::Result<String> {
+    if let Some(ep) = managed
+        .cp_etcd_endpoint
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(format!("https://{ep}"));
+    }
     let cp_base = managed
         .cp_base_url
         .as_deref()
@@ -763,17 +770,11 @@ fn derive_cp_etcd_url(managed: &aisix_core::ManagedConfig) -> anyhow::Result<Str
                  (set AISIX_MANAGED__CP_BASE_URL)"
             )
         })?;
-    let cp_etcd = managed
-        .cp_etcd_endpoint
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            cp_base
-                .strip_prefix("https://")
-                .or_else(|| cp_base.strip_prefix("http://"))
-                .unwrap_or(cp_base)
-        });
-    Ok(format!("https://{cp_etcd}"))
+    let host_port = cp_base
+        .strip_prefix("https://")
+        .or_else(|| cp_base.strip_prefix("http://"))
+        .unwrap_or(cp_base);
+    Ok(format!("https://{host_port}"))
 }
 
 /// Synthesise a HeartbeatConfig when the mTLS bundle is already on
@@ -1051,6 +1052,15 @@ mod tests {
             Some("https://dpm.example.com:7944"),
             Some("etcd.internal:2379"),
         );
+        assert_eq!(
+            derive_cp_etcd_url(&m).unwrap(),
+            "https://etcd.internal:2379"
+        );
+    }
+
+    #[test]
+    fn derive_etcd_url_explicit_endpoint_without_base_url() {
+        let m = managed_with_urls(None, Some("etcd.internal:2379"));
         assert_eq!(
             derive_cp_etcd_url(&m).unwrap(),
             "https://etcd.internal:2379"
