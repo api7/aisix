@@ -112,7 +112,7 @@ fn reserve_layers<'a>(
         if rl.is_unrestricted() {
             continue;
         }
-        let bucket_key = format!("policy:{}", entry.id);
+        let bucket_key = format!("policy:{}:{}:{}", policy.scope, policy.scope_ref, entry.id);
         let r = state
             .limiter
             .pre_commit(&bucket_key, &rl)
