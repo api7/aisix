@@ -152,7 +152,14 @@ async fn dispatch(
         .json(body)
         .send()
         .await
-        .map_err(|e| aisix_gateway::BridgeError::Transport(e.to_string()))
+        .map_err(|e| {
+            crate::cooldown::note_failure(
+                &state.runtime_status,
+                &model_entry.id,
+                model.cooldown.as_ref(),
+                aisix_gateway::BridgeError::Transport(e.to_string()),
+            )
+        })
         .map_err(ProxyError::Bridge)?;
 
     let status = upstream_resp.status();
@@ -206,7 +213,14 @@ async fn dispatch(
         let json_body: Value = upstream_resp
             .json()
             .await
-            .map_err(|e| aisix_gateway::BridgeError::UpstreamDecode(e.to_string()))
+            .map_err(|e| {
+                crate::cooldown::note_failure(
+                    &state.runtime_status,
+                    &model_entry.id,
+                    model.cooldown.as_ref(),
+                    aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+                )
+            })
             .map_err(ProxyError::Bridge)?;
 
         Ok((Json(json_body).into_response(), provider_label))

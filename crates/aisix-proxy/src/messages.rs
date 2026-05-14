@@ -225,7 +225,14 @@ async fn dispatch(
     let upstream_resp = req_builder
         .send()
         .await
-        .map_err(|e| aisix_gateway::BridgeError::Transport(e.to_string()))
+        .map_err(|e| {
+            crate::cooldown::note_failure(
+                &state.runtime_status,
+                &model_entry.id,
+                model.cooldown.as_ref(),
+                aisix_gateway::BridgeError::Transport(e.to_string()),
+            )
+        })
         .map_err(ProxyError::Bridge)?;
 
     let status = upstream_resp.status();
@@ -258,8 +265,14 @@ async fn dispatch(
         return Err(ProxyError::Bridge(err));
     }
 
-    // Update health tracker on success.
+    // Update health trackers on success — both the display-name-keyed
+    // observational signal AND the id-keyed runtime status that
+    // routing filters consult. Without `mark_healthy` here, a target
+    // that recovered via the Anthropic passthrough would stay in
+    // `cooldown` on /admin/v1/models/status until its TTL naturally
+    // expired (round-2 audit MEDIUM on PR #268).
     state.health.record_success(&model_name);
+    state.runtime_status.mark_healthy(&model_entry.id);
 
     let provider_label = "anthropic".to_string();
 
@@ -305,11 +318,21 @@ async fn dispatch(
             metrics: AnthropicUsageMetrics::default(),
         })
     } else {
-        // Non-streaming: deserialise and re-serialise as JSON.
+        // Non-streaming: deserialise and re-serialise as JSON. Decode
+        // failures cool down the target — a body the bridge can't
+        // parse is a real upstream problem worth taking out of
+        // rotation, not a caller bug.
         let json_body: Value = upstream_resp
             .json()
             .await
-            .map_err(|e| aisix_gateway::BridgeError::UpstreamDecode(e.to_string()))
+            .map_err(|e| {
+                crate::cooldown::note_failure(
+                    &state.runtime_status,
+                    &model_entry.id,
+                    model.cooldown.as_ref(),
+                    aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+                )
+            })
             .map_err(ProxyError::Bridge)?;
 
         let metrics = anthropic_metrics_from_response_json(&json_body);

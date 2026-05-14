@@ -30,6 +30,8 @@ use std::time::Duration;
 use aisix_core::CooldownConfig;
 use aisix_gateway::BridgeError;
 
+use crate::health::ModelRuntimeStatusTracker;
+
 /// Decide whether a bridge error should trigger cooldown on the
 /// failing direct model, and for how long.
 ///
@@ -103,6 +105,29 @@ pub fn decide_cooldown(
     }
 }
 
+/// Record a failed dispatch attempt against `model_id`: run the
+/// cooldown decision and, if it fires, mark the runtime tracker.
+/// Returns the error unchanged so call sites can keep using `?`.
+///
+/// This is the right entry point for every `.map_err` on the proxy's
+/// upstream call paths — including the early `.send().await` and
+/// body-decode failures that bypass the `!status.is_success()` branch.
+/// The audit on PR #268 (round 2) caught exactly that gap:
+/// transport / decode errors were threading through `?` without ever
+/// hitting `mark_cooldown`, so a TCP-reset against Anthropic via
+/// `/v1/messages` would leave the target healthy in routing.
+pub fn note_failure(
+    tracker: &ModelRuntimeStatusTracker,
+    model_id: &str,
+    cfg: Option<&CooldownConfig>,
+    err: BridgeError,
+) -> BridgeError {
+    if let Some((ttl, reason)) = decide_cooldown(&err, cfg) {
+        tracker.mark_cooldown(model_id, ttl, reason);
+    }
+    err
+}
+
 /// Map an HTTP status to a stable `status_reason` token surfaced on
 /// `/admin/v1/models/status`. Kept narrow and operator-friendly —
 /// callers should not synthesize their own reason strings.
@@ -146,6 +171,54 @@ mod tests {
             ..Default::default()
         };
         assert!(decide_cooldown(&upstream(429), Some(&cfg)).is_none());
+    }
+
+    #[test]
+    fn note_failure_marks_cooldown_for_transport_errors() {
+        // Round-2 audit contract: a Transport error (TCP reset, DNS
+        // failure, …) must mark cooldown when trigger_on_transport
+        // is on (default). The non-status `?` paths in messages.rs /
+        // responses.rs / audio.rs / rerank.rs all route through here.
+        let tracker = ModelRuntimeStatusTracker::new();
+        let err = BridgeError::Transport("connection refused".into());
+        let returned = note_failure(&tracker, "m-1", None, err);
+        // Error returned unchanged.
+        assert!(matches!(returned, BridgeError::Transport(_)));
+        // Tracker now reports cooldown for this target.
+        assert_eq!(
+            tracker.status("m-1").status,
+            crate::health::RuntimeStatus::Cooldown
+        );
+        assert_eq!(
+            tracker.status("m-1").status_reason.as_deref(),
+            Some("transport_error")
+        );
+    }
+
+    #[test]
+    fn note_failure_marks_cooldown_for_decode_errors() {
+        let tracker = ModelRuntimeStatusTracker::new();
+        let err = BridgeError::UpstreamDecode("bad json".into());
+        let _ = note_failure(&tracker, "m-1", None, err);
+        assert_eq!(
+            tracker.status("m-1").status,
+            crate::health::RuntimeStatus::Cooldown
+        );
+    }
+
+    #[test]
+    fn note_failure_no_op_when_cooldown_disabled() {
+        let tracker = ModelRuntimeStatusTracker::new();
+        let cfg = CooldownConfig {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        let err = BridgeError::Transport("nope".into());
+        let _ = note_failure(&tracker, "m-1", Some(&cfg), err);
+        assert_eq!(
+            tracker.status("m-1").status,
+            crate::health::RuntimeStatus::Healthy
+        );
     }
 
     #[test]
