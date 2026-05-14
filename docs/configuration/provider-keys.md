@@ -45,11 +45,11 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
 
 ## `api_base` Behavior
 
-`api_base` overrides the provider's default upstream base URL. The gateway uses the value almost as-is — it only strips a trailing `/`. There is **no `/v1` normalization**. Each provider bridge appends a different suffix at request time, so the exact form `api_base` must take depends on which `provider` your model selects.
+`api_base` overrides the provider's default upstream base URL. Each provider bridge appends a different path at request time, so the canonical form `api_base` should take depends on which `provider` your model selects.
 
 Each provider has its own convention — the four current bridges do **not** share one. Use the table below; do not generalize from one row to another.
 
-| `provider` | What `api_base` should be | Bridge appends | Default if `api_base` is omitted |
+| `provider` | Canonical `api_base` form | Bridge appends | Default if `api_base` is omitted |
 |---|---|---|---|
 | `openai` | include `/v1` | `/chat/completions`, `/embeddings`, `/completions`, `/images/generations`, `/audio/*` | `https://api.openai.com/v1` |
 | `deepseek` | bare host (DeepSeek serves OpenAI-compatible paths at the host root) | `/chat/completions` | `https://api.deepseek.com` |
@@ -58,7 +58,33 @@ Each provider has its own convention — the four current bridges do **not** sha
 
 The OpenAI and Anthropic conventions match each upstream's official SDK — `openai-python` initialises `base_url = "https://api.openai.com/v1"`, while `anthropic-sdk-python` initialises `base_url = "https://api.anthropic.com"` and appends `/v1/messages` itself. DeepSeek is OpenAI-compatible but exposes `/chat/completions` directly at the host root, and Gemini's OpenAI-compatible surface lives under a fixed `/v1beta/openai` prefix that the bridge does not synthesize.
 
-Wrong forms fail at request time with an upstream `404`, not at admin-write time. For example, `api_base: "https://api.openai.com"` for an `openai` provider produces an upstream request to `https://api.openai.com/chat/completions` — the upstream returns `404` because OpenAI's API lives under `/v1`. There is no admin-side validation today that catches this. Tracking issue: [api7/ai-gateway#270](https://github.com/api7/ai-gateway/issues/270).
+### Forms the gateway tolerates
+
+The gateway accepts several common operator paste-mistakes and normalizes them to the canonical form. Tolerance is intentionally conservative — `/v1` synthesis and stripping happens **only for the canonical upstream host of each provider**. Corporate proxies and any non-default path the operator chose on purpose pass through unchanged.
+
+All providers (always tolerated):
+
+- leading and trailing whitespace
+- trailing slash
+- accidental endpoint suffix appended to the URL — e.g. pasting `https://api.openai.com/v1/chat/completions` works the same as `https://api.openai.com/v1`. The same applies to `/embeddings`, `/completions`, `/images/generations`, and `/audio/*` for OpenAI-compat bridges, and to `/v1/messages` and `/v1` for the Anthropic bridge.
+
+For `openai` on the canonical OpenAI host only:
+
+- pasting the bare host without `/v1` — `api_base: "https://api.openai.com"` is accepted and the bridge adds `/v1` at dispatch time.
+
+For `deepseek` on the canonical DeepSeek host only:
+
+- pasting an extra `/v1` segment — `api_base: "https://api.deepseek.com/v1"` is accepted and the bridge strips `/v1` at dispatch time. Common copy-paste habit from OpenAI conventions.
+
+For `anthropic` (always tolerated):
+
+- the full upstream URL `…/v1/messages` or the `/v1` prefix is stripped — `api_base: "https://api.anthropic.com/v1/messages"`, `…/v1`, and bare host all converge to the bare host at dispatch time.
+
+For `gemini` and any other variant: only suffix stripping; the bridge does not synthesize the `/v1beta/openai` prefix. Operators should paste the full canonical form.
+
+### Outside the canonical hosts
+
+For corporate proxies or alternative deployments, the operator's `api_base` is trusted verbatim (after suffix stripping and trailing-slash trim). If your proxy serves the OpenAI API at `https://my-proxy.example.com/openai-shim`, set `api_base` to exactly that — the bridge will not unilaterally add `/v1`.
 
 ## Reuse Model References
 

@@ -81,9 +81,35 @@ fn default_client() -> Client {
         .unwrap_or_else(|_| Client::new())
 }
 
+/// Path suffixes the Anthropic bridge appends. If an operator
+/// accidentally pastes a fuller form into `api_base`, strip the suffix
+/// so request building still produces the right URL.
+const ANTHROPIC_ENDPOINT_SUFFIXES: &[&str] = &["/v1/messages", "/v1"];
+
+/// Tolerate the common variations of `api_base` an operator might
+/// paste for the Anthropic upstream. Accepted forms:
+///
+/// - `https://api.anthropic.com` (canonical)
+/// - `https://api.anthropic.com/` (trailing slash)
+/// - `https://api.anthropic.com/v1` (extra `/v1` segment — common copy-paste
+///   habit from OpenAI conventions)
+/// - `https://api.anthropic.com/v1/messages` (full upstream URL pasted)
+///
+/// All collapse to the canonical bare host. The bridge then appends
+/// `/v1/messages` at request time.
+fn normalize_api_base(base: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    for suffix in ANTHROPIC_ENDPOINT_SUFFIXES {
+        if let Some(rest) = trimmed.strip_suffix(suffix) {
+            return rest.trim_end_matches('/').to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 fn resolve_base(ctx: &BridgeContext) -> String {
     match ctx.provider_key.api_base.as_deref() {
-        Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
+        Some(b) if !b.trim().is_empty() => normalize_api_base(b.trim()),
         _ => ANTHROPIC_DEFAULT_BASE.to_string(),
     }
 }
@@ -522,5 +548,54 @@ data: {\"type\":\"message_stop\"}\n\n";
         .unwrap();
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_override));
         assert_eq!(resolve_base(&ctx), "https://proxy.example.com");
+    }
+
+    fn pk_with_base(api_base: &str) -> ProviderKey {
+        let cfg = format!(r#"{{"display_name":"x","secret":"k","api_base":"{api_base}"}}"#);
+        serde_json::from_str(&cfg).unwrap()
+    }
+
+    /// All four Anthropic api_base forms a real operator might paste must
+    /// collapse to the canonical bare host. The bridge appends
+    /// `/v1/messages` itself at request time.
+    #[test]
+    fn anthropic_api_base_tolerance_bare_host_v1_and_full_messages_path() {
+        let canonical = "https://api.anthropic.com";
+
+        for form in [
+            "https://api.anthropic.com",
+            "https://api.anthropic.com/",
+            "https://api.anthropic.com/v1",
+            "https://api.anthropic.com/v1/",
+            "https://api.anthropic.com/v1/messages",
+            "https://api.anthropic.com/v1/messages/",
+            "  https://api.anthropic.com  ",
+        ] {
+            let pk = pk_with_base(form);
+            let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
+            assert_eq!(
+                resolve_base(&ctx),
+                canonical,
+                "form {form:?} should normalize to {canonical}",
+            );
+        }
+    }
+
+    /// Same normalization applies to a custom proxy host — operator pastes
+    /// whichever form their proxy URL takes, all converge to the bare
+    /// host the bridge can append `/v1/messages` to.
+    #[test]
+    fn anthropic_api_base_tolerance_custom_proxy_host() {
+        let canonical = "https://proxy.example.com";
+
+        for form in [
+            "https://proxy.example.com",
+            "https://proxy.example.com/v1",
+            "https://proxy.example.com/v1/messages",
+        ] {
+            let pk = pk_with_base(form);
+            let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
+            assert_eq!(resolve_base(&ctx), canonical);
+        }
     }
 }

@@ -67,11 +67,61 @@ pub(crate) fn require_upstream_model(model: &Model) -> Result<&str, ProxyError> 
     })
 }
 
+/// Path suffixes the proxy-side handlers (audio, responses, messages)
+/// build via [`build_v1_url`]. If an operator accidentally pasted the
+/// full upstream URL into `api_base`, strip the suffix here so the
+/// later [`build_v1_url`] call does not double-append. The list mirrors
+/// every concrete endpoint the proxy currently routes to upstream,
+/// covered in both the bare (`/responses`) and `/v1`-prefixed
+/// (`/v1/responses`) form an operator might paste.
+///
+/// Longer suffixes appear first so `/v1/audio/transcriptions` matches
+/// before `/audio/transcriptions`, etc.
+const API_BASE_ENDPOINT_SUFFIXES: &[&str] = &[
+    "/v1/audio/transcriptions",
+    "/v1/audio/translations",
+    "/v1/audio/speech",
+    "/v1/chat/completions",
+    "/v1/images/generations",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/responses",
+    "/v1/messages",
+    "/v1/rerank",
+    "/audio/transcriptions",
+    "/audio/translations",
+    "/audio/speech",
+    "/chat/completions",
+    "/images/generations",
+    "/completions",
+    "/embeddings",
+    "/responses",
+    "/messages",
+    "/rerank",
+];
+
+/// Strip a known endpoint suffix from `base` and its trailing slash.
+/// Idempotent. Mirrors the suffix-stripping the bridge crates do on
+/// their own `resolve_base`, so handlers that bypass the bridge (audio,
+/// responses, messages) get the same tolerance.
+fn strip_endpoint_suffix(base: &str) -> &str {
+    let trimmed = base.trim_end_matches('/');
+    for suffix in API_BASE_ENDPOINT_SUFFIXES {
+        if let Some(rest) = trimmed.strip_suffix(suffix) {
+            return rest.trim_end_matches('/');
+        }
+    }
+    trimmed
+}
+
 /// The upstream base URL: `provider_key.api_base` override if set,
-/// otherwise the `Provider`'s built-in default.
+/// otherwise the `Provider`'s built-in default. Tolerates an operator
+/// pasting the full upstream URL into `api_base` by stripping any
+/// trailing endpoint suffix — see [`API_BASE_ENDPOINT_SUFFIXES`] for
+/// the full list and [`build_v1_url`] for the matching `/v1` synthesis.
 pub(crate) fn resolve_base_url(provider: Provider, provider_key: &ProviderKey) -> String {
     match provider_key.api_base.as_deref() {
-        Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
+        Some(b) if !b.trim().is_empty() => strip_endpoint_suffix(b.trim()).to_string(),
         _ => provider.default_base_url().to_string(),
     }
 }
@@ -228,6 +278,133 @@ mod tests {
         let pk: ProviderKey = serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
         let base = resolve_base_url(Provider::Anthropic, &pk);
         assert_eq!(base, Provider::Anthropic.default_base_url());
+    }
+
+    fn pk_with_base(api_base: &str) -> ProviderKey {
+        let cfg = format!(r#"{{"display_name":"x","secret":"k","api_base":"{api_base}"}}"#);
+        serde_json::from_str(&cfg).unwrap()
+    }
+
+    /// Every OpenAI-shape paste an operator might make must, when fed
+    /// to `build_v1_url(base, "/<endpoint>")`, produce the canonical
+    /// upstream URL. The intermediate `resolve_base_url` result may be
+    /// either bare-host or `<host>/v1` — `build_v1_url` accepts both —
+    /// so the assertion is on the final URL the handler dispatches to,
+    /// not on the intermediate base.
+    ///
+    /// Without suffix stripping, pasting `…/v1/audio/transcriptions`
+    /// into `api_base` produces `…/v1/audio/transcriptions/v1/audio/transcriptions`.
+    #[test]
+    fn resolve_base_url_strips_openai_endpoint_suffixes() {
+        let cases: &[(&str, &str)] = &[
+            ("https://api.openai.com/v1", "/responses"),
+            ("https://api.openai.com/v1/", "/responses"),
+            ("https://api.openai.com/v1/responses", "/responses"),
+            (
+                "https://api.openai.com/v1/audio/transcriptions",
+                "/audio/transcriptions",
+            ),
+            (
+                "https://api.openai.com/v1/audio/translations",
+                "/audio/translations",
+            ),
+            ("https://api.openai.com/v1/audio/speech", "/audio/speech"),
+            (
+                "https://api.openai.com/v1/chat/completions",
+                "/chat/completions",
+            ),
+            ("https://api.openai.com/v1/completions", "/completions"),
+            ("https://api.openai.com/v1/embeddings", "/embeddings"),
+            (
+                "https://api.openai.com/v1/images/generations",
+                "/images/generations",
+            ),
+            ("https://api.openai.com/v1/rerank", "/rerank"),
+        ];
+        for (paste, endpoint) in cases {
+            let pk = pk_with_base(paste);
+            let base = resolve_base_url(Provider::Openai, &pk);
+            let url = build_v1_url(&base, endpoint);
+            let expected = format!("https://api.openai.com/v1{endpoint}");
+            assert_eq!(
+                url, expected,
+                "paste {paste:?} + endpoint {endpoint:?} must build to {expected:?}",
+            );
+        }
+    }
+
+    /// DeepSeek serves OpenAI-compatible endpoints at the host root.
+    /// Same contract: every paste must build to the canonical URL.
+    #[test]
+    fn resolve_base_url_strips_deepseek_endpoint_suffixes() {
+        for paste in [
+            "https://api.deepseek.com",
+            "https://api.deepseek.com/",
+            "https://api.deepseek.com/chat/completions",
+            "https://api.deepseek.com/embeddings",
+        ] {
+            let pk = pk_with_base(paste);
+            let base = resolve_base_url(Provider::Deepseek, &pk);
+            let url = build_v1_url(&base, "/chat/completions");
+            assert_eq!(
+                url, "https://api.deepseek.com/v1/chat/completions",
+                "paste {paste:?} must build to the canonical chat-completions URL",
+            );
+        }
+    }
+
+    /// Anthropic: the messages handler builds `…/v1/messages`. A paste
+    /// of the full upstream URL must strip so `build_v1_url("/messages")`
+    /// does not produce `…/v1/messages/v1/messages`.
+    #[test]
+    fn resolve_base_url_strips_anthropic_messages_suffix() {
+        for paste in [
+            "https://api.anthropic.com",
+            "https://api.anthropic.com/",
+            "https://api.anthropic.com/v1",
+            "https://api.anthropic.com/v1/messages",
+            "https://api.anthropic.com/v1/messages/",
+        ] {
+            let pk = pk_with_base(paste);
+            let base = resolve_base_url(Provider::Anthropic, &pk);
+            assert_eq!(
+                build_v1_url(&base, "/messages"),
+                "https://api.anthropic.com/v1/messages",
+                "paste {paste:?} must build to the canonical messages URL",
+            );
+        }
+    }
+
+    /// Non-canonical hosts (corporate proxies, test mocks) pass through
+    /// after suffix-stripping. The operator's path on a non-default
+    /// host is trusted as-is.
+    #[test]
+    fn resolve_base_url_passes_non_canonical_hosts_through() {
+        let pk = pk_with_base("https://proxy.example.com/openai-shim");
+        assert_eq!(
+            resolve_base_url(Provider::Openai, &pk),
+            "https://proxy.example.com/openai-shim",
+        );
+
+        // Suffix stripping still applies on non-canonical hosts —
+        // operator pasting the full upstream URL is still recovered.
+        let pk = pk_with_base("https://proxy.example.com/openai-shim/v1/responses");
+        let base = resolve_base_url(Provider::Openai, &pk);
+        assert_eq!(
+            build_v1_url(&base, "/responses"),
+            "https://proxy.example.com/openai-shim/v1/responses",
+        );
+    }
+
+    /// Whitespace trim must compose with suffix stripping.
+    #[test]
+    fn resolve_base_url_trims_whitespace_and_endpoint_suffix() {
+        let pk = pk_with_base("  https://api.openai.com/v1/chat/completions/  ");
+        let base = resolve_base_url(Provider::Openai, &pk);
+        assert_eq!(
+            build_v1_url(&base, "/chat/completions"),
+            "https://api.openai.com/v1/chat/completions",
+        );
     }
 
     // ---------------------------------------------------------------

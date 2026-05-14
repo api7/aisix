@@ -40,6 +40,32 @@ use crate::wire::{
 /// this constant only covers degenerate config paths.
 pub const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
 
+/// Fallback host for the `deepseek`-named variant of this bridge.
+/// Mirrors `aisix_provider_deepseek::DEEPSEEK_DEFAULT_BASE` so that a
+/// `with_name("deepseek")` instance without an explicit `api_base`
+/// dispatches to DeepSeek rather than OpenAI.
+const DEEPSEEK_DEFAULT_BASE: &str = "https://api.deepseek.com";
+
+/// Fallback host for the `gemini`-named variant of this bridge.
+/// Mirrors `aisix_provider_gemini::GEMINI_DEFAULT_BASE` so that a
+/// `with_name("gemini")` instance without an explicit `api_base`
+/// dispatches to Google's OpenAI-compatible Gemini endpoint.
+const GEMINI_DEFAULT_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
+
+/// Path suffixes the bridge appends to `api_base` when building upstream
+/// URLs. If an operator accidentally pastes the full upstream URL into
+/// `api_base` (e.g. `https://api.openai.com/v1/chat/completions`),
+/// strip the suffix so request building still produces a valid URL.
+const OPENAI_ENDPOINT_SUFFIXES: &[&str] = &[
+    "/chat/completions",
+    "/completions",
+    "/embeddings",
+    "/images/generations",
+    "/audio/transcriptions",
+    "/audio/translations",
+    "/audio/speech",
+];
+
 pub struct OpenAiBridge {
     client: Client,
     name: &'static str,
@@ -63,6 +89,50 @@ impl OpenAiBridge {
         self.name = name;
         self
     }
+
+    /// Default upstream base for this bridge variant. The bridge factory
+    /// wraps with `with_name("deepseek")` / `with_name("gemini")` to
+    /// retarget; the default base follows the same retargeting so a
+    /// degenerate config (no `api_base` on the Model) still reaches the
+    /// right host.
+    fn default_base(&self) -> &'static str {
+        match self.name {
+            "deepseek" => DEEPSEEK_DEFAULT_BASE,
+            "gemini" => GEMINI_DEFAULT_BASE,
+            _ => OPENAI_DEFAULT_BASE,
+        }
+    }
+
+    /// Resolve `ProviderKey.api_base` into the canonical base URL the
+    /// request handlers append paths onto. Tolerates common operator
+    /// mistakes:
+    ///
+    /// - leading and trailing whitespace
+    /// - trailing slash
+    /// - accidental endpoint suffix (e.g. `/chat/completions` pasted
+    ///   along with the host)
+    /// - bare canonical OpenAI host without `/v1` (the bridge adds it)
+    /// - canonical DeepSeek host with an extra `/v1` segment (the
+    ///   bridge strips it — DeepSeek serves OpenAI-compatible endpoints
+    ///   at the host root)
+    ///
+    /// `/v1` synthesis and stripping happens **only for the canonical
+    /// upstream host of each provider**. Corporate proxies, alternative
+    /// deployments, and any non-default path the operator chose on
+    /// purpose pass through unchanged after suffix stripping — the
+    /// operator's intent on a non-canonical host wins.
+    ///
+    /// For the `gemini` variant and any future `with_name` variant, the
+    /// path is left as-is after suffix stripping — Gemini's `/v1beta/openai`
+    /// prefix is non-trivial and operators typically copy-paste the full
+    /// form.
+    fn resolve_base(&self, ctx: &BridgeContext) -> String {
+        let raw = match ctx.provider_key.api_base.as_deref() {
+            Some(b) if !b.trim().is_empty() => b.trim().to_string(),
+            _ => return self.default_base().to_string(),
+        };
+        normalize_api_base(&raw, self.name)
+    }
 }
 
 impl Default for OpenAiBridge {
@@ -78,11 +148,67 @@ fn default_client() -> Client {
         .unwrap_or_else(|_| Client::new())
 }
 
-fn resolve_base(ctx: &BridgeContext) -> String {
-    match ctx.provider_key.api_base.as_deref() {
-        Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
-        _ => OPENAI_DEFAULT_BASE.to_string(),
+/// Strip a known endpoint suffix from `base`. Idempotent: if no known
+/// suffix matches, returns the input with only the trailing slash trimmed.
+fn strip_known_endpoint(base: &str) -> &str {
+    let trimmed = base.trim_end_matches('/');
+    for suffix in OPENAI_ENDPOINT_SUFFIXES {
+        if let Some(rest) = trimmed.strip_suffix(suffix) {
+            return rest.trim_end_matches('/');
+        }
     }
+    trimmed
+}
+
+/// Provider-aware `api_base` normalization for the OpenAI-compatible
+/// bridge.
+///
+/// Normalization is intentionally **conservative**: it only adjusts
+/// `/v1` segments for the canonical upstream host of each provider.
+/// Corporate proxies, alternative deployments, and test mocks pass
+/// through verbatim after suffix stripping — the operator's path on
+/// a non-canonical host is trusted as-is.
+///
+/// See [`OpenAiBridge::resolve_base`] for accepted forms.
+fn normalize_api_base(base: &str, provider: &str) -> String {
+    let stripped = strip_known_endpoint(base);
+    match provider {
+        "openai" => normalize_canonical_openai(stripped),
+        "deepseek" => normalize_canonical_deepseek(stripped),
+        _ => stripped.to_string(),
+    }
+}
+
+/// Canonical OpenAI hosts. Both schemes covered for ops convenience —
+/// in production only `https://` is meaningful.
+const OPENAI_CANONICAL_HOSTS: &[&str] = &["https://api.openai.com", "http://api.openai.com"];
+
+/// Add the canonical `/v1` segment if and only if the operator pasted
+/// the bare canonical OpenAI host. Anything past the host root is left
+/// as-is so non-default paths the operator chose on purpose win.
+fn normalize_canonical_openai(base: &str) -> String {
+    for host in OPENAI_CANONICAL_HOSTS {
+        if base == *host {
+            return format!("{host}/v1");
+        }
+    }
+    base.to_string()
+}
+
+/// Canonical DeepSeek hosts.
+const DEEPSEEK_CANONICAL_HOSTS: &[&str] = &["https://api.deepseek.com", "http://api.deepseek.com"];
+
+/// Strip the `/v1` segment when the operator added it on the canonical
+/// DeepSeek host (a common copy-paste habit from OpenAI conventions).
+/// DeepSeek serves OpenAI-compatible endpoints at the host root.
+fn normalize_canonical_deepseek(base: &str) -> String {
+    for host in DEEPSEEK_CANONICAL_HOSTS {
+        let with_v1 = format!("{host}/v1");
+        if base == with_v1 {
+            return host.to_string();
+        }
+    }
+    base.to_string()
 }
 
 fn api_key(ctx: &BridgeContext) -> Result<&str, BridgeError> {
@@ -150,7 +276,7 @@ impl Bridge for OpenAiBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
-        let base = resolve_base(ctx);
+        let base = self.resolve_base(ctx);
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -191,7 +317,7 @@ impl Bridge for OpenAiBridge {
         req: &EmbeddingRequest,
         ctx: &BridgeContext,
     ) -> Result<EmbeddingResponse, BridgeError> {
-        let base = resolve_base(ctx);
+        let base = self.resolve_base(ctx);
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -231,7 +357,7 @@ impl Bridge for OpenAiBridge {
         body: &serde_json::Value,
         ctx: &BridgeContext,
     ) -> Result<serde_json::Value, BridgeError> {
-        let base = resolve_base(ctx);
+        let base = self.resolve_base(ctx);
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -277,7 +403,7 @@ impl Bridge for OpenAiBridge {
         body: &serde_json::Value,
         ctx: &BridgeContext,
     ) -> Result<serde_json::Value, BridgeError> {
-        let base = resolve_base(ctx);
+        let base = self.resolve_base(ctx);
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -323,7 +449,7 @@ impl Bridge for OpenAiBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
-        let base = resolve_base(ctx);
+        let base = self.resolve_base(ctx);
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -641,11 +767,13 @@ data: [DONE]\n\n";
 
     #[test]
     fn resolve_base_trims_trailing_slash_and_honours_override() {
+        let bridge = OpenAiBridge::new();
+
         // No api_base set → falls back to OPENAI_DEFAULT_BASE.
         let pk_default: ProviderKey =
             serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_default));
-        assert_eq!(resolve_base(&ctx), OPENAI_DEFAULT_BASE);
+        assert_eq!(bridge.resolve_base(&ctx), OPENAI_DEFAULT_BASE);
 
         // api_base override: trailing slash stripped.
         let pk_override: ProviderKey = serde_json::from_str(
@@ -653,6 +781,109 @@ data: [DONE]\n\n";
         )
         .unwrap();
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_override));
-        assert_eq!(resolve_base(&ctx), "https://proxy.example.com/v1");
+        assert_eq!(bridge.resolve_base(&ctx), "https://proxy.example.com/v1");
+    }
+
+    fn pk_with_base(api_base: &str) -> ProviderKey {
+        let cfg = format!(r#"{{"display_name":"x","secret":"k","api_base":"{api_base}"}}"#);
+        serde_json::from_str(&cfg).unwrap()
+    }
+
+    /// All three OpenAI api_base forms a real operator might paste must
+    /// resolve to the same canonical `<host>/v1`.
+    #[test]
+    fn openai_api_base_tolerance_bare_host_v1_and_full_endpoint() {
+        let bridge = OpenAiBridge::new();
+        let canonical = "https://api.openai.com/v1";
+
+        for form in [
+            "https://api.openai.com",
+            "https://api.openai.com/",
+            "https://api.openai.com/v1",
+            "https://api.openai.com/v1/",
+            "https://api.openai.com/v1/chat/completions",
+            "https://api.openai.com/v1/embeddings",
+            "  https://api.openai.com/v1  ",
+        ] {
+            let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_with_base(form)));
+            assert_eq!(
+                bridge.resolve_base(&ctx),
+                canonical,
+                "form {form:?} should normalize to {canonical}",
+            );
+        }
+    }
+
+    /// DeepSeek serves OpenAI-compatible paths at the host root; pasting
+    /// `/v1` (a common copy-paste habit from OpenAI) must be tolerated.
+    #[test]
+    fn deepseek_api_base_tolerance_bare_host_and_v1_form() {
+        let bridge = OpenAiBridge::new().with_name("deepseek");
+        let canonical = "https://api.deepseek.com";
+
+        for form in [
+            "https://api.deepseek.com",
+            "https://api.deepseek.com/",
+            "https://api.deepseek.com/v1",
+            "https://api.deepseek.com/v1/",
+            "https://api.deepseek.com/chat/completions",
+        ] {
+            let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_with_base(form)));
+            assert_eq!(
+                bridge.resolve_base(&ctx),
+                canonical,
+                "form {form:?} should normalize to {canonical}",
+            );
+        }
+    }
+
+    /// DeepSeek without an explicit api_base must default to the DeepSeek
+    /// host, not the OpenAI host. Regression for a long-standing default
+    /// fallback bug exposed during the api_base tolerance work.
+    #[test]
+    fn deepseek_default_base_targets_deepseek_not_openai() {
+        let bridge = OpenAiBridge::new().with_name("deepseek");
+        let pk: ProviderKey = serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
+        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
+        assert_eq!(bridge.resolve_base(&ctx), "https://api.deepseek.com");
+    }
+
+    /// Gemini default must target the OpenAI-compatible `/v1beta/openai`
+    /// path rather than falling through to the OpenAI host.
+    #[test]
+    fn gemini_default_base_targets_gemini_v1beta_openai() {
+        let bridge = OpenAiBridge::new().with_name("gemini");
+        let pk: ProviderKey = serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
+        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
+        assert_eq!(
+            bridge.resolve_base(&ctx),
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        );
+    }
+
+    /// For Gemini and any future `with_name` variant, the bridge does not
+    /// synthesize a `/v1beta/openai` prefix — the path is non-trivial. It
+    /// still strips an accidentally-pasted endpoint suffix.
+    #[test]
+    fn gemini_api_base_strips_endpoint_suffix_but_does_not_synthesize_prefix() {
+        let bridge = OpenAiBridge::new().with_name("gemini");
+
+        // Canonical form passes through.
+        let canonical = "https://generativelanguage.googleapis.com/v1beta/openai";
+        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_with_base(canonical)));
+        assert_eq!(bridge.resolve_base(&ctx), canonical);
+
+        // Endpoint suffix is stripped.
+        let with_suffix =
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_with_base(with_suffix)));
+        assert_eq!(bridge.resolve_base(&ctx), canonical);
+
+        // Bare host is left as-is — the operator's responsibility to
+        // include the unusual prefix. (See provider-keys.md for the
+        // per-provider truth table.)
+        let bare = "https://generativelanguage.googleapis.com";
+        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_with_base(bare)));
+        assert_eq!(bridge.resolve_base(&ctx), bare);
     }
 }
