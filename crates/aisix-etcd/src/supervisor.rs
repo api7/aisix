@@ -357,6 +357,9 @@ impl<P: ConfigProvider> Supervisor<P> {
             for e in tiny.observability_exporters.entries() {
                 new.observability_exporters.insert(clone_entry(&e));
             }
+            for e in tiny.rate_limit_policies.entries() {
+                new.rate_limit_policies.insert(clone_entry(&e));
+            }
             new
         });
 
@@ -408,6 +411,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             "observability_exporters" => {
                 snap.observability_exporters.get_by_id(parsed.id).is_some()
             }
+            "rate_limit_policies" => snap.rate_limit_policies.get_by_id(parsed.id).is_some(),
             _ => false,
         };
         drop(snap);
@@ -441,6 +445,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                 }
                 "observability_exporters" => {
                     new.observability_exporters.remove(parsed.id);
+                }
+                "rate_limit_policies" => {
+                    new.rate_limit_policies.remove(parsed.id);
                 }
                 _ => {}
             }
@@ -657,6 +664,9 @@ fn clone_snapshot(src: &AisixSnapshot) -> AisixSnapshot {
     }
     for e in src.observability_exporters.entries() {
         out.observability_exporters.insert(clone_entry(&e));
+    }
+    for e in src.rate_limit_policies.entries() {
+        out.rate_limit_policies.insert(clone_entry(&e));
     }
     out
 }
