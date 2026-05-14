@@ -1060,29 +1060,20 @@ mod tests {
     #[test]
     fn derive_etcd_url_strips_http_scheme() {
         let m = managed_with_urls(Some("http://localhost:7944"), None);
-        assert_eq!(
-            derive_cp_etcd_url(&m).unwrap(),
-            "https://localhost:7944"
-        );
+        assert_eq!(derive_cp_etcd_url(&m).unwrap(), "https://localhost:7944");
     }
 
     #[test]
     fn derive_etcd_url_errors_without_base_url() {
         let m = managed_with_urls(None, None);
         let err = derive_cp_etcd_url(&m).unwrap_err();
-        assert!(
-            err.to_string().contains("cp_base_url"),
-            "unexpected: {err}"
-        );
+        assert!(err.to_string().contains("cp_base_url"), "unexpected: {err}");
     }
 
     #[test]
     fn derive_etcd_url_errors_on_empty_base_url() {
         let m = managed_with_urls(Some(""), None);
         let err = derive_cp_etcd_url(&m).unwrap_err();
-        assert!(
-            err.to_string().contains("cp_base_url"),
-            "unexpected: {err}"
-        );
+        assert!(err.to_string().contains("cp_base_url"), "unexpected: {err}");
     }
 }
