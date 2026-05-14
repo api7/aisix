@@ -895,7 +895,8 @@ mod tests {
             "name": "bad",
             "scope": "org",
             "scope_ref": "x",
-            "window": "minute"
+            "window": "minute",
+            "max_requests": 10
         });
         assert!(validate_rate_limit_policy(&v).is_err());
     }
@@ -906,7 +907,8 @@ mod tests {
             "name": "bad",
             "scope": "team",
             "scope_ref": "x",
-            "window": "day"
+            "window": "day",
+            "max_requests": 10
         });
         assert!(validate_rate_limit_policy(&v).is_err());
     }
@@ -918,6 +920,7 @@ mod tests {
             "scope": "team",
             "scope_ref": "x",
             "window": "minute",
+            "max_requests": 10,
             "extra": 1
         });
         assert!(validate_rate_limit_policy(&v).is_err());

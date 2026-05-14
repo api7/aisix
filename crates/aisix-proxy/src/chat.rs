@@ -502,7 +502,7 @@ async fn dispatch(
         }
     }
 
-    // Multi-layer rate-limit reservation (api_key + model + team + member).
+    // Multi-layer rate-limit reservation (api_key inline + model inline + policies).
     let model_rl = crate::quota::ModelRateLimit::from_model(
         &req.model,
         &virtual_entry.id,

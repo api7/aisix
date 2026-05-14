@@ -27,9 +27,10 @@ pub(crate) struct ModelRateLimit {
 }
 
 impl ModelRateLimit {
-    /// Build from a resolved model entry. Always returns `Some` so that
-    /// model-scope policies can match even when the model has no inline
-    /// rate limit.
+    /// Build from a resolved model entry. Always returns a
+    /// `ModelRateLimit` carrying the model identity (name + entry ID)
+    /// needed for model-scope policy matching. The inline rate limit
+    /// is `None` when the model has no configured limit.
     pub fn from_model(model_name: &str, model_entry_id: &str, model: &aisix_core::Model) -> Self {
         let limits = model
             .rate_limit
@@ -124,8 +125,9 @@ fn reserve_layers<'a>(
 }
 
 /// Apply budget + multi-layer rate-limit checks for one request.
-/// `model_rl` is the resolved Model's rate_limit (if any). Pass `None`
-/// for endpoints that don't resolve a model (e.g. passthrough).
+/// `model_rl` carries the resolved model identity for policy matching
+/// and optional inline limits. Pass `None` only for endpoints that
+/// don't resolve a model (e.g. passthrough).
 pub(crate) async fn enforce<'a>(
     state: &'a ProxyState,
     auth: &AuthenticatedKey,

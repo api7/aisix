@@ -30,13 +30,13 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
 
-    /// Team this API key belongs to. Used as a limiter bucket key
-    /// (`team:<id>`) for team-level rate limiting.
+    /// Team this API key belongs to. Used for matching team-scope
+    /// rate limit policies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,
 
-    /// Org member who owns this key. Used as a limiter bucket key
-    /// (`member:<id>`) for member-level rate limiting.
+    /// Org member who owns this key. Used for matching member-scope
+    /// rate limit policies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_id: Option<String>,
 
