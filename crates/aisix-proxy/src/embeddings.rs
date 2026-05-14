@@ -141,7 +141,8 @@ async fn dispatch(
         .get(provider)
         .ok_or(ProxyError::ProviderUnavailable)?;
 
-    let model_rl = crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.value);
+    let model_rl =
+        crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, auth, model_rl).await?;
 
     let upstream_model_id = crate::dispatch::require_upstream_model(model)?.to_string();

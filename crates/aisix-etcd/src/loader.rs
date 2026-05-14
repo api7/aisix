@@ -13,8 +13,9 @@
 
 use aisix_core::models::{
     validate_apikey, validate_cache_policy, validate_guardrail, validate_model,
-    validate_observability_exporter, validate_provider_key, ApiKey, CachePolicy, Guardrail, Model,
-    ObservabilityExporter, ProviderKey, SchemaError,
+    validate_observability_exporter, validate_provider_key, validate_rate_limit_policy, ApiKey,
+    CachePolicy, Guardrail, Model, ObservabilityExporter, ProviderKey, RateLimitPolicy,
+    SchemaError,
 };
 use aisix_core::resource::ResourceEntry;
 use aisix_core::AisixSnapshot;
@@ -217,6 +218,18 @@ pub fn build_snapshot(prefix: &str, entries: &[RawEntry]) -> (AisixSnapshot, Bui
                     &mut stats,
                 ) {
                     snapshot.observability_exporters.insert(entry);
+                }
+            }
+            "rate_limit_policies" => {
+                if let Some(entry) = validate_and_parse::<RateLimitPolicy>(
+                    &raw.key,
+                    raw.revision,
+                    parsed,
+                    &value,
+                    validate_rate_limit_policy,
+                    &mut stats,
+                ) {
+                    snapshot.rate_limit_policies.insert(entry);
                 }
             }
             other => {
@@ -429,5 +442,30 @@ mod tests {
         // name to m-2, but both id entries are present in the table.
         assert_eq!(snap.models.len(), 2);
         assert_eq!(snap.apikeys.len(), 1);
+    }
+
+    const VALID_RATE_LIMIT_POLICY: &[u8] = br#"{
+        "name": "team-quota",
+        "scope": "team",
+        "scope_ref": "team-uuid-1",
+        "window": "minute",
+        "max_requests": 100
+    }"#;
+
+    #[test]
+    fn rate_limit_policy_loads_into_snapshot() {
+        let entries = vec![raw(
+            "/aisix/rate_limit_policies/rlp-1",
+            VALID_RATE_LIMIT_POLICY,
+            5,
+        )];
+        let (snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(snap.rate_limit_policies.len(), 1);
+        let entry = snap.rate_limit_policies.get_by_id("rlp-1").unwrap();
+        assert_eq!(entry.value.name, "team-quota");
+        assert_eq!(entry.value.scope, "team");
+        assert_eq!(entry.value.scope_ref, "team-uuid-1");
+        assert_eq!(entry.value.max_requests, Some(100));
     }
 }

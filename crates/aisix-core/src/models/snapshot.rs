@@ -10,6 +10,7 @@ use super::guardrail::Guardrail;
 use super::model::Model;
 use super::observability_exporter::ObservabilityExporter;
 use super::provider_key::ProviderKey;
+use super::rate_limit_policy::RateLimitPolicy;
 use crate::snapshot::ResourceTable;
 
 /// Composite of every typed [`ResourceTable`] the gateway reads on the hot
@@ -27,6 +28,7 @@ pub struct AisixSnapshot {
     /// Per-env observability exporters. Each enabled row receives a
     /// fan-out POST per chat completion (see `aisix-obs::OtlpHttpFanOut`).
     pub observability_exporters: ResourceTable<ObservabilityExporter>,
+    pub rate_limit_policies: ResourceTable<RateLimitPolicy>,
 }
 
 impl AisixSnapshot {
@@ -43,6 +45,7 @@ impl AisixSnapshot {
             + self.guardrails.len()
             + self.cache_policies.len()
             + self.observability_exporters.len()
+            + self.rate_limit_policies.len()
     }
 }
 

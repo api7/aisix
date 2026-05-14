@@ -35,18 +35,10 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,
 
-    /// Rate limit inherited from the owning team.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub team_rate_limit: Option<RateLimit>,
-
     /// Org member who owns this key. Used as a limiter bucket key
     /// (`member:<id>`) for member-level rate limiting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_id: Option<String>,
-
-    /// Rate limit inherited from the owning member.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_rate_limit: Option<RateLimit>,
 
     /// etcd-key uuid; filled by the loader, never in the JSON payload.
     #[serde(skip)]
@@ -163,9 +155,7 @@ mod tests {
             allowed_models: vec![],
             rate_limit: None,
             team_id: None,
-            team_rate_limit: None,
             owner_id: None,
-            owner_rate_limit: None,
             runtime_id: String::new(),
         };
         assert!(!k.can_access("my-gpt4"));
@@ -237,24 +227,18 @@ mod tests {
               "key_hash": "{SAMPLE_HASH}",
               "allowed_models": ["gpt-4o"],
               "team_id": "team-uuid-1",
-              "team_rate_limit": {{"rpm": 600}},
-              "owner_id": "member-uuid-1",
-              "owner_rate_limit": {{"tpm": 200000}}
+              "owner_id": "member-uuid-1"
             }}"#
         ))
         .unwrap();
         assert_eq!(k.team_id.as_deref(), Some("team-uuid-1"));
-        assert_eq!(k.team_rate_limit.as_ref().unwrap().rpm, Some(600));
         assert_eq!(k.owner_id.as_deref(), Some("member-uuid-1"));
-        assert_eq!(k.owner_rate_limit.as_ref().unwrap().tpm, Some(200000));
     }
 
     #[test]
     fn absent_team_owner_fields_default_to_none() {
         let k = sample();
         assert!(k.team_id.is_none());
-        assert!(k.team_rate_limit.is_none());
         assert!(k.owner_id.is_none());
-        assert!(k.owner_rate_limit.is_none());
     }
 }

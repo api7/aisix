@@ -28,6 +28,7 @@ pub struct Schemas {
     pub guardrail: Validator,
     pub cache_policy: Validator,
     pub observability_exporter: Validator,
+    pub rate_limit_policy: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile()));
@@ -53,6 +54,9 @@ impl Schemas {
             observability_exporter: jsonschema::options()
                 .build(&observability_exporter_schema())
                 .expect("observability_exporter schema is well-formed"),
+            rate_limit_policy: jsonschema::options()
+                .build(&rate_limit_policy_schema())
+                .expect("rate_limit_policy schema is well-formed"),
         }
     }
 }
@@ -99,6 +103,10 @@ pub fn validate_cache_policy(value: &Value) -> Result<(), SchemaError> {
 
 pub fn validate_observability_exporter(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.observability_exporter, value)
+}
+
+pub fn validate_rate_limit_policy(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.rate_limit_policy, value)
 }
 
 fn model_schema() -> Value {
@@ -248,9 +256,7 @@ fn apikey_schema() -> Value {
             },
             "rate_limit": { "$ref": "#/$defs/rate_limit" },
             "team_id": { "type": "string", "minLength": 1 },
-            "team_rate_limit": { "$ref": "#/$defs/rate_limit" },
-            "owner_id": { "type": "string", "minLength": 1 },
-            "owner_rate_limit": { "$ref": "#/$defs/rate_limit" }
+            "owner_id": { "type": "string", "minLength": 1 }
         },
         "$defs": {
             "rate_limit": {
@@ -439,6 +445,23 @@ fn observability_exporter_schema() -> Value {
     })
 }
 
+fn rate_limit_policy_schema() -> Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["name", "scope", "scope_ref", "window"],
+        "additionalProperties": false,
+        "properties": {
+            "name":         { "type": "string", "minLength": 1 },
+            "scope":        { "type": "string", "enum": ["api_key", "model", "team", "member"] },
+            "scope_ref":    { "type": "string", "minLength": 1 },
+            "window":       { "type": "string", "enum": ["second", "minute", "hour"] },
+            "max_requests": { "type": "integer", "minimum": 1 },
+            "max_tokens":   { "type": "integer", "minimum": 1 }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,9 +587,7 @@ mod tests {
             "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
             "allowed_models":["gpt-4o"],
             "team_id": "team-uuid-1",
-            "team_rate_limit": {"rpm": 600},
-            "owner_id": "member-uuid-1",
-            "owner_rate_limit": {"tpm": 200000}
+            "owner_id": "member-uuid-1"
         });
         validate_apikey(&v).unwrap();
     }
@@ -847,5 +868,66 @@ mod tests {
         });
         // Phase 4 will add role_arn; today it's rejected.
         assert!(validate_guardrail(&v).is_err());
+    }
+
+    // ---- rate_limit_policy schema tests ----
+
+    #[test]
+    fn rate_limit_policy_happy_path() {
+        let v = json!({
+            "name": "team-quota",
+            "scope": "team",
+            "scope_ref": "team-uuid-1",
+            "window": "minute",
+            "max_requests": 100,
+            "max_tokens": 50000
+        });
+        validate_rate_limit_policy(&v).unwrap();
+    }
+
+    #[test]
+    fn rate_limit_policy_rejects_unknown_scope() {
+        let v = json!({
+            "name": "bad",
+            "scope": "org",
+            "scope_ref": "x",
+            "window": "minute"
+        });
+        assert!(validate_rate_limit_policy(&v).is_err());
+    }
+
+    #[test]
+    fn rate_limit_policy_rejects_unknown_window() {
+        let v = json!({
+            "name": "bad",
+            "scope": "team",
+            "scope_ref": "x",
+            "window": "day"
+        });
+        assert!(validate_rate_limit_policy(&v).is_err());
+    }
+
+    #[test]
+    fn rate_limit_policy_rejects_extra_field() {
+        let v = json!({
+            "name": "bad",
+            "scope": "team",
+            "scope_ref": "x",
+            "window": "minute",
+            "extra": 1
+        });
+        assert!(validate_rate_limit_policy(&v).is_err());
+    }
+
+    #[test]
+    fn rate_limit_policy_rejects_zero_max_requests() {
+        let v = json!({
+            "name": "bad",
+            "scope": "team",
+            "scope_ref": "x",
+            "window": "minute",
+            "max_requests": 0
+        });
+        assert!(validate_rate_limit_policy(&v).is_err());
     }
 }

@@ -503,7 +503,11 @@ async fn dispatch(
     }
 
     // Multi-layer rate-limit reservation (api_key + model + team + member).
-    let model_rl = crate::quota::ModelRateLimit::from_model(&req.model, &virtual_entry.value);
+    let model_rl = crate::quota::ModelRateLimit::from_model(
+        &req.model,
+        &virtual_entry.id,
+        &virtual_entry.value,
+    );
     let reservation =
         crate::quota::enforce_rate_limit(state, auth, model_rl).map_err(&with_model)?;
 

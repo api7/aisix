@@ -2,15 +2,16 @@
 //!
 //! Applies budget + multi-layer rate limiting:
 //! 1. Budget pre-check (cp-api cached decision)
-//! 2. API-key rate limit (`auth.entry.id`)
-//! 3. Model rate limit (`model:<name>`) — when the resolved Model has one
-//! 4. Team rate limit (`team:<id>`) — when the ApiKey carries team info
-//! 5. Member rate limit (`member:<id>`) — when the ApiKey carries owner info
+//! 2. API-key inline rate limit (`auth.entry.id`)
+//! 3. Model inline rate limit (`model:<name>`) — when the resolved Model has one
+//! 4. Policy-based rate limits — looked up from the snapshot's
+//!    `rate_limit_policies` table, matched by scope (api_key/model/team/member)
 //!
 //! All layers use AND logic — every layer must pass or the request gets
 //! 429. The returned [`MultiReservation`] commits token usage to all
 //! layers and releases all concurrency permits on drop.
 
+use aisix_core::models::RateLimitPolicy;
 use aisix_core::RateLimit;
 use aisix_ratelimit::MultiReservation;
 
@@ -21,6 +22,7 @@ use crate::state::ProxyState;
 /// Optional model rate-limit info resolved by the caller before enforce.
 pub(crate) struct ModelRateLimit {
     pub name: String,
+    pub entry_id: String,
     pub limits: RateLimit,
 }
 
@@ -28,27 +30,52 @@ impl ModelRateLimit {
     /// Build from a resolved model entry. Returns `None` when the model
     /// has no rate limit configured or has an unrestricted one (all fields
     /// are `None`).
-    pub fn from_model(model_name: &str, model: &aisix_core::Model) -> Option<Self> {
+    pub fn from_model(
+        model_name: &str,
+        model_entry_id: &str,
+        model: &aisix_core::Model,
+    ) -> Option<Self> {
         model
             .rate_limit
             .as_ref()
             .filter(|rl| !rl.is_unrestricted())
             .map(|rl| Self {
                 name: model_name.to_owned(),
+                entry_id: model_entry_id.to_owned(),
                 limits: rl.clone(),
             })
     }
 }
 
-/// Reserve across all applicable rate-limit layers (api_key, model, team, member).
+fn policy_to_rate_limit(policy: &RateLimitPolicy) -> RateLimit {
+    let mut rl = RateLimit::default();
+    match policy.window.as_str() {
+        "second" => {
+            rl.rpm = policy.max_requests.map(|r| r * 60);
+            rl.tpm = policy.max_tokens.map(|t| t * 60);
+        }
+        "minute" => {
+            rl.rpm = policy.max_requests;
+            rl.tpm = policy.max_tokens;
+        }
+        "hour" => {
+            rl.rpd = policy.max_requests.map(|r| r * 24);
+            rl.tpd = policy.max_tokens.map(|t| t * 24);
+        }
+        _ => {}
+    }
+    rl
+}
+
+/// Reserve across all applicable rate-limit layers (api_key, model, policies).
 fn reserve_layers<'a>(
     state: &'a ProxyState,
     auth: &AuthenticatedKey,
     model_rl: Option<ModelRateLimit>,
 ) -> Result<MultiReservation<'a, aisix_ratelimit::SystemClock>, ProxyError> {
-    let mut reservations = Vec::with_capacity(4);
+    let mut reservations = Vec::with_capacity(8);
 
-    // Layer 1: API key rate limit.
+    // Layer 1: API key inline rate limit.
     let key_limits = auth.key().rate_limit.clone().unwrap_or_default();
     if !key_limits.is_unrestricted() {
         let r = state
@@ -58,8 +85,8 @@ fn reserve_layers<'a>(
         reservations.push(r);
     }
 
-    // Layer 2: Model rate limit.
-    if let Some(mrl) = model_rl {
+    // Layer 2: Model inline rate limit.
+    if let Some(ref mrl) = model_rl {
         if !mrl.limits.is_unrestricted() {
             let key = format!("model:{}", mrl.name);
             let r = state
@@ -70,28 +97,32 @@ fn reserve_layers<'a>(
         }
     }
 
-    // Layer 3: Team rate limit.
-    if let (Some(tid), Some(trl)) = (&auth.key().team_id, &auth.key().team_rate_limit) {
-        if !tid.is_empty() && !trl.is_unrestricted() {
-            let key = format!("team:{tid}");
-            let r = state
-                .limiter
-                .pre_commit(&key, trl)
-                .map_err(ProxyError::from)?;
-            reservations.push(r);
+    // Layer 3+: Rate limit policies from snapshot.
+    let snap = state.snapshot.load();
+    for entry in snap.rate_limit_policies.entries() {
+        let policy = &entry.value;
+        let applies = match policy.scope.as_str() {
+            "api_key" => policy.scope_ref == auth.entry.id,
+            "model" => model_rl
+                .as_ref()
+                .is_some_and(|m| policy.scope_ref == m.entry_id),
+            "team" => auth.key().team_id.as_deref() == Some(policy.scope_ref.as_str()),
+            "member" => auth.key().owner_id.as_deref() == Some(policy.scope_ref.as_str()),
+            _ => false,
+        };
+        if !applies {
+            continue;
         }
-    }
-
-    // Layer 4: Member/owner rate limit.
-    if let (Some(oid), Some(orl)) = (&auth.key().owner_id, &auth.key().owner_rate_limit) {
-        if !oid.is_empty() && !orl.is_unrestricted() {
-            let key = format!("member:{oid}");
-            let r = state
-                .limiter
-                .pre_commit(&key, orl)
-                .map_err(ProxyError::from)?;
-            reservations.push(r);
+        let rl = policy_to_rate_limit(policy);
+        if rl.is_unrestricted() {
+            continue;
         }
+        let bucket_key = format!("policy:{}", entry.id);
+        let r = state
+            .limiter
+            .pre_commit(&bucket_key, &rl)
+            .map_err(ProxyError::from)?;
+        reservations.push(r);
     }
 
     Ok(MultiReservation::new(reservations))
@@ -123,4 +154,58 @@ pub(crate) fn enforce_rate_limit<'a>(
     model_rl: Option<ModelRateLimit>,
 ) -> Result<MultiReservation<'a, aisix_ratelimit::SystemClock>, ProxyError> {
     reserve_layers(state, auth, model_rl)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_policy(window: &str, max_req: Option<u64>, max_tok: Option<u64>) -> RateLimitPolicy {
+        serde_json::from_value(serde_json::json!({
+            "name": "test",
+            "scope": "team",
+            "scope_ref": "ref",
+            "window": window,
+            "max_requests": max_req,
+            "max_tokens": max_tok,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn minute_maps_to_rpm_tpm() {
+        let rl = policy_to_rate_limit(&make_policy("minute", Some(100), Some(50000)));
+        assert_eq!(rl.rpm, Some(100));
+        assert_eq!(rl.tpm, Some(50000));
+        assert!(rl.rpd.is_none());
+        assert!(rl.tpd.is_none());
+    }
+
+    #[test]
+    fn second_scales_to_per_minute() {
+        let rl = policy_to_rate_limit(&make_policy("second", Some(10), Some(1000)));
+        assert_eq!(rl.rpm, Some(600));
+        assert_eq!(rl.tpm, Some(60000));
+    }
+
+    #[test]
+    fn hour_scales_to_per_day() {
+        let rl = policy_to_rate_limit(&make_policy("hour", Some(1000), Some(500000)));
+        assert_eq!(rl.rpd, Some(24000));
+        assert_eq!(rl.tpd, Some(12000000));
+        assert!(rl.rpm.is_none());
+    }
+
+    #[test]
+    fn unknown_window_produces_unrestricted() {
+        let rl = policy_to_rate_limit(&make_policy("week", Some(100), Some(100)));
+        assert!(rl.is_unrestricted());
+    }
+
+    #[test]
+    fn partial_fields_only_set_relevant_dimension() {
+        let rl = policy_to_rate_limit(&make_policy("minute", Some(60), None));
+        assert_eq!(rl.rpm, Some(60));
+        assert!(rl.tpm.is_none());
+    }
 }

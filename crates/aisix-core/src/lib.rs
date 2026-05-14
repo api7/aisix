@@ -31,11 +31,11 @@ pub use error::{
 };
 pub use models::{
     validate_apikey, validate_cache_policy, validate_guardrail, validate_model,
-    validate_observability_exporter, validate_provider_key, AisixSnapshot, ApiKey, CachePolicy,
-    CooldownConfig, ExporterKind, Guardrail, GuardrailHookPoint, GuardrailKind, KeywordConfig,
-    KeywordPattern, Model, ObservabilityExporter, OnAllFilteredPolicy, Provider, ProviderKey,
-    RateLimit, Routing, RoutingStrategy, RoutingTarget, SchemaError,
-    DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+    validate_observability_exporter, validate_provider_key, validate_rate_limit_policy,
+    AisixSnapshot, ApiKey, CachePolicy, CooldownConfig, ExporterKind, Guardrail,
+    GuardrailHookPoint, GuardrailKind, KeywordConfig, KeywordPattern, Model, ObservabilityExporter,
+    OnAllFilteredPolicy, Provider, ProviderKey, RateLimit, RateLimitPolicy, Routing,
+    RoutingStrategy, RoutingTarget, SchemaError, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use resource::{Resource, ResourceEntry};
 pub use snapshot::{ResourceTable, SnapshotHandle};
