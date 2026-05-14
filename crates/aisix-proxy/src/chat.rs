@@ -131,6 +131,7 @@ pub async fn chat_completions(
                         cache_status: success.cache_status.as_str().to_string(),
                         cache_hit_saved_input_tokens: success.cache_hit_saved_input_tokens,
                         cache_hit_saved_output_tokens: success.cache_hit_saved_output_tokens,
+                        ttft_ms: 0,
                     },
                     success.cost_usd,
                     /* guardrail_blocked */ false,
@@ -212,6 +213,7 @@ pub async fn chat_completions(
                         cache_status: c.cache_status.as_str().to_string(),
                         cache_hit_saved_input_tokens: 0,
                         cache_hit_saved_output_tokens: 0,
+                        ttft_ms: 0,
                     },
                 ),
                 None => (0, 0, UsageExtras::default()),
@@ -567,6 +569,7 @@ async fn dispatch(
             upstream,
             now,
             stream_guardrail,
+            started,
             move |comp: StreamCompletion| {
                 // Rate-limit accounting (TPM cap) for all layers.
                 for key in &post_stream_keys {
@@ -613,6 +616,7 @@ async fn dispatch(
                         cache_status: CacheStatus::Disabled.as_str().to_string(),
                         cache_hit_saved_input_tokens: 0,
                         cache_hit_saved_output_tokens: 0,
+                        ttft_ms: comp.ttft_ms,
                     },
                     /* cost_usd */ 0.0,
                     comp.guardrail_blocked,
@@ -1164,6 +1168,7 @@ fn emit_usage_event(
         cache_status: extras.cache_status,
         cache_hit_saved_input_tokens: extras.cache_hit_saved_input_tokens,
         cache_hit_saved_output_tokens: extras.cache_hit_saved_output_tokens,
+        ttft_ms: extras.ttft_ms,
         // chat.rs is the OpenAI-shape /v1/chat/completions handler.
         // /v1/responses / /v1/embeddings / /v1/audio* / /v1/images* /
         // /v1/rerank don't emit UsageEvents today; when they do they
@@ -1212,6 +1217,7 @@ struct UsageExtras {
     /// ingest from these + its pricing catalog (see #88).
     cache_hit_saved_input_tokens: u32,
     cache_hit_saved_output_tokens: u32,
+    ttft_ms: u32,
 }
 
 fn record_error(metrics: &Metrics, err: &ProxyError, model: &str, status: u16, elapsed: Duration) {
@@ -1316,6 +1322,9 @@ struct StreamCompletion {
     /// fail-opened on a streamed response. Empty string = no bypass.
     /// First-bypass-wins matches the non-streaming convention.
     bypass_reason: String,
+    /// Time to first token in milliseconds. Set once when the first
+    /// Ok(chunk) arrives in `build_sse_stream`.
+    ttft_ms: u32,
 }
 
 /// Parameters needed to run output-guardrail evaluation at
@@ -1375,6 +1384,7 @@ fn build_sse_stream<F>(
     upstream: aisix_gateway::ChatChunkStream,
     created: i64,
     output_guardrail: Option<StreamGuardrailContext>,
+    started: Instant,
     on_complete: F,
 ) -> impl Stream<Item = Result<Event, Infallible>>
 where
@@ -1416,9 +1426,15 @@ where
         // treats `[DONE]` as clean-completion would mis-interpret
         // the truncated response as a successful one.
         let mut errored = false;
+        let mut first_chunk_seen = false;
         while let Some(item) = upstream.next().await {
             let ev = match item {
                 Ok(chunk) => {
+                    if !first_chunk_seen {
+                        first_chunk_seen = true;
+                        guard.comp().ttft_ms =
+                            started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                    }
                     let comp = guard.comp();
                     if !chunk.id.is_empty() {
                         comp.provider_request_id = chunk.id.clone();

@@ -312,6 +312,9 @@ fn build_otlp_traces_payload(event: &UsageEvent, exporter_name: &str) -> Value {
     }
     attributes.push(attr_string("aisix.exporter_name", exporter_name));
     attributes.push(attr_string("aisix.request_id", &event.request_id));
+    if event.ttft_ms > 0 {
+        attributes.push(attr_int("aisix.ttft_ms", event.ttft_ms as i64));
+    }
 
     json!({
         "resourceSpans": [{
@@ -557,6 +560,21 @@ mod tests {
         assert!(!keys.contains(&"gen_ai.response.id"));
         assert!(!keys.contains(&"gen_ai.response.model"));
         assert!(!keys.contains(&"gen_ai.response.finish_reasons"));
+        // ttft_ms = 0 (default) → omitted
+        assert!(!keys.contains(&"aisix.ttft_ms"));
+    }
+
+    #[test]
+    fn payload_includes_ttft_when_set() {
+        let mut ev = sample_event();
+        ev.ttft_ms = 42;
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap();
+        let ttft_attr = attrs.iter().find(|a| a["key"] == "aisix.ttft_ms");
+        assert!(ttft_attr.is_some(), "aisix.ttft_ms should be present");
+        assert_eq!(ttft_attr.unwrap()["value"]["intValue"], "42");
     }
 
     #[test]

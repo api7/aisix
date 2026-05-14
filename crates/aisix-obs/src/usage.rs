@@ -90,6 +90,13 @@ pub struct UsageEvent {
 
     pub latency_ms: u32,
 
+    /// Time to first token in milliseconds. Only meaningful on the
+    /// streaming path — measures elapsed time from request entry to
+    /// the first upstream SSE chunk. 0 on non-streaming, error, and
+    /// cache-hit paths (omitted from the wire via skip_serializing_if).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub ttft_ms: u32,
+
     /// HTTP status code the proxy returned to the downstream caller.
     pub status_code: u16,
 
@@ -310,6 +317,7 @@ mod tests {
         assert!(!json.contains("provider_request_id"));
         assert!(!json.contains("provider_model_version"));
         assert!(!json.contains("finish_reason"));
+        assert!(!json.contains("ttft_ms"));
     }
 
     #[test]
@@ -325,6 +333,7 @@ mod tests {
             provider_request_id: "chatcmpl-abc".into(),
             provider_model_version: "gpt-4o-2024-08-06".into(),
             finish_reason: "stop".into(),
+            ttft_ms: 123,
             ..Default::default()
         };
         let json = serde_json::to_string(&ev).unwrap();
@@ -335,6 +344,7 @@ mod tests {
         assert!(json.contains(r#""provider_request_id":"chatcmpl-abc""#));
         assert!(json.contains(r#""provider_model_version":"gpt-4o-2024-08-06""#));
         assert!(json.contains(r#""finish_reason":"stop""#));
+        assert!(json.contains(r#""ttft_ms":123"#));
     }
 
     fn sample_event(id: &str) -> UsageEvent {
