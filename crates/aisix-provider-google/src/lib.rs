@@ -29,7 +29,7 @@ use aisix_provider_openai::OpenAiBridge;
 pub const GOOGLE_DEFAULT_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 
 /// Build a Bridge that speaks Google's OpenAI-compatible chat API.
-pub fn gemini_bridge() -> OpenAiBridge {
+pub fn google_bridge() -> OpenAiBridge {
     OpenAiBridge::new().with_name("google")
 }
 
@@ -43,7 +43,7 @@ mod tests {
 
     #[test]
     fn bridge_reports_gemini_name() {
-        assert_eq!(gemini_bridge().name(), "google");
+        assert_eq!(google_bridge().name(), "google");
     }
 
     #[test]
@@ -87,7 +87,7 @@ mod tests {
         let ctx = BridgeContext::new("req-1", Arc::new(model), Arc::new(pk));
         let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hola")]);
 
-        let resp = gemini_bridge().chat(&req, &ctx).await.unwrap();
+        let resp = google_bridge().chat(&req, &ctx).await.unwrap();
         assert_eq!(resp.message.content, "ciao");
         assert_eq!(resp.usage.total_tokens, 4);
     }

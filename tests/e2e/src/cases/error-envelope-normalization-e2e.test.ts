@@ -95,8 +95,8 @@ const CASES: ReadonlyArray<ProviderCase> = [
   {
     provider: "google",
     upstreamModelId: "gemini-2.0-flash",
-    displayName: "err-norm-gemini",
-    // The gemini bridge talks to Google's OpenAI-compatibility
+    displayName: "err-norm-google",
+    // The google bridge talks to Google's OpenAI-compatibility
     // endpoint per <https://ai.google.dev/gemini-api/docs/openai>,
     // which returns errors in OpenAI envelope shape. The
     // "normalization" the gateway performs for gemini is therefore

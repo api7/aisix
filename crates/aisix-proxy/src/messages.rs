@@ -1128,7 +1128,7 @@ data: [DONE]\n\n";
     /// non-Anthropic Bridge in the workspace.
     #[tokio::test]
     async fn matrix_anthropic_in_gemini_upstream_non_streaming() {
-        use aisix_provider_google::gemini_bridge;
+        use aisix_provider_google::google_bridge;
 
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1154,7 +1154,7 @@ data: [DONE]\n\n";
 
         let hub = Arc::new(Hub::new());
         hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
-        hub.register(Provider::Google, Arc::new(gemini_bridge()));
+        hub.register(Provider::Google, Arc::new(google_bridge()));
         let handle = SnapshotHandle::new(snap);
         let app = crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache());
 
@@ -1343,10 +1343,10 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn matrix_anthropic_in_gemini_upstream_streaming() {
-        use aisix_provider_google::gemini_bridge;
+        use aisix_provider_google::google_bridge;
         assert_anthropic_streams_through_openai_compat_upstream(
             Provider::Google,
-            Arc::new(gemini_bridge()),
+            Arc::new(google_bridge()),
             // Placeholder; helper rebuilds with the wiremock uri.
             gemini_model("my-claude-via-gemini"),
             "my-claude-via-gemini",

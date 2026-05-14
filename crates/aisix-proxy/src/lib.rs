@@ -3313,7 +3313,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     /// different default base URL behavior).
     #[tokio::test]
     async fn matrix_openai_in_gemini_upstream_non_streaming() {
-        use aisix_provider_google::gemini_bridge;
+        use aisix_provider_google::google_bridge;
 
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
@@ -3337,7 +3337,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-gemini"]));
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Google, Arc::new(gemini_bridge()));
+        hub.register(Provider::Google, Arc::new(google_bridge()));
         let app = build_router(build_state(snap, hub));
 
         let body = serde_json::json!({
