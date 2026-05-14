@@ -183,6 +183,7 @@ async fn dispatch(
             state,
             body,
             model,
+            &model_entry.id,
             &pk_entry.value,
             &model_name,
             request_id,
@@ -238,13 +239,23 @@ async fn dispatch(
         } else {
             message
         };
-        return Err(ProxyError::Bridge(
-            aisix_gateway::BridgeError::upstream_status_with_retry_after(
-                status_u16,
-                truncated,
-                retry_after,
-            ),
-        ));
+        let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
+            status_u16,
+            truncated,
+            retry_after,
+        );
+        // Apply the cross-request cooldown contract to the
+        // Anthropic-passthrough path too — without this, a 401 / 429 /
+        // 5xx via /v1/messages would never mark the direct model and
+        // subsequent requests would keep hitting the same broken
+        // upstream. See `crate::cooldown` for the shared decision.
+        if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+        {
+            state
+                .runtime_status
+                .mark_cooldown(&model_entry.id, ttl, reason);
+        }
+        return Err(ProxyError::Bridge(err));
     }
 
     // Update health tracker on success.
@@ -377,6 +388,7 @@ async fn cross_provider_dispatch(
     state: &ProxyState,
     body: &Value,
     model: &aisix_core::Model,
+    model_id: &str,
     provider_key: &aisix_core::ProviderKey,
     model_name: &str,
     request_id: &str,
@@ -428,11 +440,16 @@ async fn cross_provider_dispatch(
     let provider_label = format!("{provider:?}").to_lowercase();
 
     if is_stream {
-        let upstream = bridge
-            .chat_stream(&chat, &ctx)
-            .await
-            .map_err(ProxyError::Bridge)?;
+        let upstream = bridge.chat_stream(&chat, &ctx).await.map_err(|err| {
+            if let Some((ttl, reason)) =
+                crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+            {
+                state.runtime_status.mark_cooldown(model_id, ttl, reason);
+            }
+            ProxyError::Bridge(err)
+        })?;
         state.health.record_success(model_name);
+        state.runtime_status.mark_healthy(model_id);
 
         let message_id = format!("msg_{}", Uuid::new_v4().simple());
         let encoder = AnthropicSseEncoder::new(message_id, model_name, 0);
@@ -466,8 +483,15 @@ async fn cross_provider_dispatch(
     }
 
     // Non-streaming.
-    let resp = bridge.chat(&chat, &ctx).await.map_err(ProxyError::Bridge)?;
+    let resp = bridge.chat(&chat, &ctx).await.map_err(|err| {
+        if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+        {
+            state.runtime_status.mark_cooldown(model_id, ttl, reason);
+        }
+        ProxyError::Bridge(err)
+    })?;
     state.health.record_success(model_name);
+    state.runtime_status.mark_healthy(model_id);
 
     let metrics = AnthropicUsageMetrics {
         prompt_tokens: resp.usage.prompt_tokens,

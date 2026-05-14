@@ -129,12 +129,20 @@ describe("routing strategies and retry behavior e2e", () => {
       maxRetries: 0,
     });
 
-    // Bare propagation wait — probing the virtual would warm the
-    // primary's cooldown (post-PR #268 contract: every retryable
-    // upstream failure cools down the failing direct target) and
-    // throw off the per-target hit counts below. The secondary's
-    // direct readiness was already established above.
-    await waitConfigPropagation();
+    // Probing the virtual would warm the primary's cooldown
+    // (post-PR #268: every retryable upstream failure cools down the
+    // failing direct target) and zero out the per-target hit counts
+    // below. Instead, gate on the admin snapshot containing the
+    // virtual record — that proves the routing config has propagated
+    // to the DP without sending any traffic through the dispatcher.
+    await waitConfigPropagation(async () => {
+      try {
+        const models = await admin!.listModels();
+        return models.some((m) => m.display_name === "routing-retry-virtual");
+      } catch {
+        return false;
+      }
+    });
 
     const primaryBaseline = primary.receivedRequests.length;
     const secondaryBaseline = secondary.receivedRequests.length;
@@ -200,11 +208,18 @@ describe("routing strategies and retry behavior e2e", () => {
       maxRetries: 0,
     });
 
-    // Bare propagation wait — probing the virtual would warm the
-    // primary's 429 cooldown (post-PR #268: 429 cools down even
-    // when retry_on_429=true, since cooldown is independent of
-    // retry) and zero out the per-target counts.
-    await waitConfigPropagation();
+    // Gate on admin-snapshot presence rather than probing the
+    // virtual — probe would warm the primary's 429 cooldown and
+    // zero out per-target counts (post-PR #268: 429 cools down
+    // regardless of retry_on_429).
+    await waitConfigPropagation(async () => {
+      try {
+        const models = await admin!.listModels();
+        return models.some((m) => m.display_name === "routing-429-virtual");
+      } catch {
+        return false;
+      }
+    });
 
     const primaryBaseline = primary.receivedRequests.length;
     const secondaryBaseline = secondary.receivedRequests.length;
@@ -377,11 +392,19 @@ describe("routing strategies and retry behavior e2e", () => {
       maxRetries: 0,
     });
 
-    // Bare propagation wait — probing the virtual would warm the
-    // primary's 502 cooldown (post-PR #268 contract) and skew the
-    // per-target hit counts. Both direct models' readiness was
-    // already established above.
-    await waitConfigPropagation();
+    // Gate on admin-snapshot presence rather than probing the
+    // virtual — probe would warm the weighted primary's 502 cooldown
+    // and skew per-target hit counts. Both direct models' readiness
+    // was already established above; this confirms the routing record
+    // has reached the DP snapshot.
+    await waitConfigPropagation(async () => {
+      try {
+        const models = await admin!.listModels();
+        return models.some((m) => m.display_name === "routing-weighted-virtual");
+      } catch {
+        return false;
+      }
+    });
 
     const beforeBaseline = zeroWeightBefore.receivedRequests.length;
     const primaryBaseline = weightedPrimary.receivedRequests.length;

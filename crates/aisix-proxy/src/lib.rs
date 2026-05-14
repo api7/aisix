@@ -30,6 +30,7 @@ pub mod background;
 pub mod budget;
 mod chat;
 mod completions;
+pub(crate) mod cooldown;
 mod dispatch;
 mod embeddings;
 mod error;

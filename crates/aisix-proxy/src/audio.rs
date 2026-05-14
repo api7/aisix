@@ -343,16 +343,22 @@ async fn multipart_dispatch(
         let s = status.as_u16();
         let retry_after = aisix_gateway::parse_retry_after(resp.headers());
         let msg = resp.text().await.unwrap_or_default();
-        return Err(ProxyError::Bridge(
-            aisix_gateway::BridgeError::upstream_status_with_retry_after(
-                s,
-                msg.chars().take(1024).collect::<String>(),
-                retry_after,
-            ),
-        ));
+        let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
+            s,
+            msg.chars().take(1024).collect::<String>(),
+            retry_after,
+        );
+        if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+        {
+            state
+                .runtime_status
+                .mark_cooldown(&model_entry.id, ttl, reason);
+        }
+        return Err(ProxyError::Bridge(err));
     }
 
     state.health.record_success(&model_name);
+    state.runtime_status.mark_healthy(&model_entry.id);
 
     // Relay response headers that matter for the client.
     let upstream_headers = resp.headers().clone();
@@ -425,16 +431,22 @@ async fn speech_dispatch(
         let s = status.as_u16();
         let retry_after = aisix_gateway::parse_retry_after(resp.headers());
         let msg = resp.text().await.unwrap_or_default();
-        return Err(ProxyError::Bridge(
-            aisix_gateway::BridgeError::upstream_status_with_retry_after(
-                s,
-                msg.chars().take(1024).collect::<String>(),
-                retry_after,
-            ),
-        ));
+        let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
+            s,
+            msg.chars().take(1024).collect::<String>(),
+            retry_after,
+        );
+        if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+        {
+            state
+                .runtime_status
+                .mark_cooldown(&model_entry.id, ttl, reason);
+        }
+        return Err(ProxyError::Bridge(err));
     }
 
     state.health.record_success(&model_name);
+    state.runtime_status.mark_healthy(&model_entry.id);
 
     let upstream_headers = resp.headers().clone();
     let body_bytes = resp

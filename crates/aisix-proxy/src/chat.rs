@@ -54,87 +54,10 @@ struct AttemptModel {
     model: aisix_core::Model,
 }
 
-/// Decide whether a bridge error should trigger cooldown on the
-/// failing direct model, and for how long.
-///
-/// Cooldown is **independent** of `is_retryable`. A 401 (auth failure)
-/// is non-retryable — retrying the same target in the current request
-/// is pointless — but it should still cooldown because every
-/// subsequent request that lands on the same target will see the same
-/// 401. Conversely, a transient timeout may be retryable AND should
-/// also cooldown.
-///
-/// `Retry-After` from upstream is honored when `honor_retry_after`
-/// is set (default true), clamped to `max_seconds`.
-fn decide_cooldown(
-    err: &BridgeError,
-    cfg: Option<&aisix_core::CooldownConfig>,
-) -> Option<(Duration, &'static str)> {
-    use aisix_core::CooldownConfig;
-    let default_cfg = CooldownConfig::default();
-    let cfg = cfg.unwrap_or(&default_cfg);
-    if !cfg.enabled_or_default() {
-        return None;
-    }
-    let max = Duration::from_secs(cfg.max_seconds_or_default());
-    let default_ttl = Duration::from_secs(cfg.default_seconds_or_default());
-    let clamp = |d: Duration| -> Duration {
-        let bounded = d.min(max);
-        // 0 means "disabled" via field; if we got here, default_ttl
-        // should never be 0 — fall back to max if someone set
-        // default_seconds=0 by mistake but didn't disable.
-        if bounded.is_zero() {
-            max
-        } else {
-            bounded
-        }
-    };
-
-    match err {
-        BridgeError::UpstreamStatus {
-            status,
-            retry_after,
-            ..
-        } => {
-            let triggers = cfg.effective_trigger_statuses();
-            if !triggers.contains(status) {
-                return None;
-            }
-            let ttl = if cfg.honor_retry_after_or_default() {
-                retry_after.map(clamp).unwrap_or(default_ttl)
-            } else {
-                default_ttl
-            };
-            Some((ttl, cooldown_reason_for_status(*status)))
-        }
-        BridgeError::Timeout { .. } if cfg.trigger_on_timeout_or_default() => {
-            Some((default_ttl, "request_timeout"))
-        }
-        BridgeError::Transport(_) | BridgeError::StreamAborted
-            if cfg.trigger_on_transport_or_default() =>
-        {
-            Some((default_ttl, "transport_error"))
-        }
-        BridgeError::UpstreamDecode(_) if cfg.trigger_on_transport_or_default() => {
-            Some((default_ttl, "upstream_decode_error"))
-        }
-        // Config errors mean WE are misconfigured (missing provider, bad
-        // bridge registration). Cooling down doesn't help; let it
-        // surface and operator fixes the snapshot.
-        BridgeError::Config(_) => None,
-        _ => None,
-    }
-}
-
-fn cooldown_reason_for_status(status: u16) -> &'static str {
-    match status {
-        401 => "upstream_auth_failure",
-        408 => "upstream_request_timeout",
-        429 => "upstream_rate_limited",
-        500..=599 => "upstream_server_error",
-        _ => "upstream_status_failure",
-    }
-}
+// Per-attempt cooldown decision lives in `crate::cooldown` so every
+// dispatch path (chat, messages, responses, audio, rerank) shares the
+// same logic. See cooldown.rs for the audit context (#264 H-1).
+use crate::cooldown::decide_cooldown;
 
 pub async fn chat_completions(
     State(state): State<ProxyState>,

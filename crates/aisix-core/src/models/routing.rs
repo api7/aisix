@@ -67,13 +67,22 @@ impl RoutingTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnAllFilteredPolicy {
-    /// Return 503 with a Retry-After hint derived from the next
-    /// cooldown expiry (or a fixed fallback if every candidate is
-    /// background-unhealthy with no cooldown timer). Default.
+    /// Return 503 with a fixed Retry-After hint (currently 30 seconds —
+    /// see `FALLBACK_ALL_UNHEALTHY_RETRY_AFTER` in
+    /// `crates/aisix-proxy/src/chat.rs`). Default.
+    ///
+    /// The hint is intentionally coarse: by the time the filter
+    /// reaches the all-filtered branch, every candidate is
+    /// background-unhealthy with no live cooldown timer (cooldown
+    /// candidates are returned via the Selected branch one tier up).
+    /// A future version may derive the hint from probe metadata; the
+    /// current contract is a flat fallback.
     #[default]
     Fail,
     /// Send to the original candidate list anyway, in declaration
     /// order. Preserves availability over caller-facing correctness.
+    /// Use only when the operator explicitly accepts the risk of
+    /// sending traffic to a target the gateway just probed as broken.
     OriginalOrder,
 }
 

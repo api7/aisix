@@ -468,9 +468,16 @@ describe("cooldown contract (H2) — Retry-After header from upstream drives TTL
     // The reported cooldown_until should be ~180s in the future.
     // 30s default is the wrong answer — that would prove H2 isn't
     // wired. `cooldown_until` is serialized via SystemTime's default
-    // serde shape: `{secs_since_epoch, nanos_since_epoch}`.
-    const cooldownUntil = row.cooldown_until as { secs_since_epoch: number };
-    const cooldownUntilMs = cooldownUntil.secs_since_epoch * 1000;
+    // serde shape: `{secs_since_epoch, nanos_since_epoch}`. Assert
+    // the wire shape first so a future change to the admin
+    // serialization (e.g. RFC3339 strings) fails this test with a
+    // clear message rather than a silent NaN parse.
+    const cooldownUntil = row.cooldown_until as { secs_since_epoch?: unknown };
+    expect(
+      typeof cooldownUntil.secs_since_epoch,
+      "cooldown_until shape changed — update this test to match the new admin wire format",
+    ).toBe("number");
+    const cooldownUntilMs = (cooldownUntil.secs_since_epoch as number) * 1000;
     const horizonMs = cooldownUntilMs - before;
     expect(horizonMs).toBeGreaterThan(120_000);
     expect(horizonMs).toBeLessThan(240_000);

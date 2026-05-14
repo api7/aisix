@@ -29,11 +29,15 @@ export class AdminClient {
   }
 
   async listModels(): Promise<Array<Record<string, unknown>>> {
-    const res = await this.json<{ items?: Array<{ value: Record<string, unknown> }> }>(
+    // GET /admin/v1/models returns a bare JSON array of
+    // ResourceEntry<Model> objects (`{id, value, revision}`).
+    // Callers downstream usually only care about the inner value
+    // (which carries `display_name`, `provider`, etc.), so unwrap it.
+    const entries = await this.json<Array<{ id: string; value: Record<string, unknown> }>>(
       "GET",
       "/admin/v1/models",
     );
-    return (res.items ?? []).map((entry) => entry.value);
+    return entries.map((entry) => entry.value);
   }
 
   async listModelStatuses(): Promise<Array<Record<string, unknown>>> {
