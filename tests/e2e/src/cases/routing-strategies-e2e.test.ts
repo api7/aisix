@@ -129,17 +129,12 @@ describe("routing strategies and retry behavior e2e", () => {
       maxRetries: 0,
     });
 
-    await waitConfigPropagation(async () => {
-      try {
-        const probe = await client.chat.completions.create({
-          model: "routing-retry-virtual",
-          messages: [{ role: "user", content: "ready-routing-retry" }],
-        });
-        return probe.choices[0]?.message.content === "after retries";
-      } catch {
-        return false;
-      }
-    });
+    // Bare propagation wait — probing the virtual would warm the
+    // primary's cooldown (post-PR #268 contract: every retryable
+    // upstream failure cools down the failing direct target) and
+    // throw off the per-target hit counts below. The secondary's
+    // direct readiness was already established above.
+    await waitConfigPropagation();
 
     const primaryBaseline = primary.receivedRequests.length;
     const secondaryBaseline = secondary.receivedRequests.length;
@@ -205,17 +200,11 @@ describe("routing strategies and retry behavior e2e", () => {
       maxRetries: 0,
     });
 
-    await waitConfigPropagation(async () => {
-      try {
-        const probe = await client.chat.completions.create({
-          model: "routing-429-virtual",
-          messages: [{ role: "user", content: "ready-routing-429" }],
-        });
-        return probe.choices[0]?.message.content === "429 fallback worked";
-      } catch {
-        return false;
-      }
-    });
+    // Bare propagation wait — probing the virtual would warm the
+    // primary's 429 cooldown (post-PR #268: 429 cools down even
+    // when retry_on_429=true, since cooldown is independent of
+    // retry) and zero out the per-target counts.
+    await waitConfigPropagation();
 
     const primaryBaseline = primary.receivedRequests.length;
     const secondaryBaseline = secondary.receivedRequests.length;
@@ -388,17 +377,11 @@ describe("routing strategies and retry behavior e2e", () => {
       maxRetries: 0,
     });
 
-    await waitConfigPropagation(async () => {
-      try {
-        const probe = await client.chat.completions.create({
-          model: "routing-weighted-virtual",
-          messages: [{ role: "user", content: "ready-routing-weighted" }],
-        });
-        return probe.choices[0]?.message.content === "weighted fallback worked";
-      } catch {
-        return false;
-      }
-    });
+    // Bare propagation wait — probing the virtual would warm the
+    // primary's 502 cooldown (post-PR #268 contract) and skew the
+    // per-target hit counts. Both direct models' readiness was
+    // already established above.
+    await waitConfigPropagation();
 
     const beforeBaseline = zeroWeightBefore.receivedRequests.length;
     const primaryBaseline = weightedPrimary.receivedRequests.length;

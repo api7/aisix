@@ -1167,7 +1167,9 @@ mod tests {
                     "provider_key_id": "11111111-1111-1111-1111-111111111111",
                     "background_model_check": {
                         "enabled": true,
-                        "interval_seconds": 1,
+                        // Minimum interval is 5s in schema; using 30 to
+                        // mirror a realistic operator config.
+                        "interval_seconds": 30,
                         "timeout_seconds": 10,
                         "prompt": "Respond with OK",
                         "max_tokens": 8,

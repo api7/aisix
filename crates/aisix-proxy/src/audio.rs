@@ -341,12 +341,14 @@ async fn multipart_dispatch(
     let status = resp.status();
     if !status.is_success() {
         let s = status.as_u16();
+        let retry_after = aisix_gateway::parse_retry_after(resp.headers());
         let msg = resp.text().await.unwrap_or_default();
         return Err(ProxyError::Bridge(
-            aisix_gateway::BridgeError::UpstreamStatus {
-                status: s,
-                message: msg.chars().take(1024).collect(),
-            },
+            aisix_gateway::BridgeError::upstream_status_with_retry_after(
+                s,
+                msg.chars().take(1024).collect::<String>(),
+                retry_after,
+            ),
         ));
     }
 
@@ -421,12 +423,14 @@ async fn speech_dispatch(
     let status = resp.status();
     if !status.is_success() {
         let s = status.as_u16();
+        let retry_after = aisix_gateway::parse_retry_after(resp.headers());
         let msg = resp.text().await.unwrap_or_default();
         return Err(ProxyError::Bridge(
-            aisix_gateway::BridgeError::UpstreamStatus {
-                status: s,
-                message: msg.chars().take(1024).collect(),
-            },
+            aisix_gateway::BridgeError::upstream_status_with_retry_after(
+                s,
+                msg.chars().take(1024).collect::<String>(),
+                retry_after,
+            ),
         ));
     }
 

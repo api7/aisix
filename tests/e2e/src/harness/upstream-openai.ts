@@ -18,6 +18,12 @@ export interface OpenAiUpstreamOptions {
   disconnectAfterEvents?: number;
   /** Per-request response script; used in order before static opts. */
   scriptedResponses?: OpenAiUpstreamStep[];
+  /**
+   * Extra response headers to set on every reply. Used by the cooldown
+   * contract tests to assert that the gateway honors `Retry-After`
+   * from the upstream when computing the cooldown TTL.
+   */
+  responseHeaders?: Record<string, string>;
 }
 
 export interface OpenAiUpstreamStep {
@@ -28,6 +34,8 @@ export interface OpenAiUpstreamStep {
   status?: number;
   errorBody?: unknown;
   disconnectAfterEvents?: number;
+  /** Extra response headers, same semantics as on the top-level options. */
+  responseHeaders?: Record<string, string>;
 }
 
 export interface OpenAiUpstream {
@@ -71,6 +79,11 @@ export async function startOpenAiUpstream(
       });
 
       if (step.responseDelayMs) await sleep(step.responseDelayMs);
+
+      const extraHeaders = { ...(opts.responseHeaders ?? {}), ...(step.responseHeaders ?? {}) };
+      for (const [k, v] of Object.entries(extraHeaders)) {
+        res.setHeader(k, v);
+      }
 
       const status = step.status ?? 200;
       if (status >= 400) {

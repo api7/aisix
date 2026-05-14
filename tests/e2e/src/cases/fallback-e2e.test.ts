@@ -76,6 +76,13 @@ describe("fallback e2e: virtual routing fails over from 5xx to next target", () 
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: badPk.id,
+      // This test is specifically about retry-time failover (bad→good
+      // within one request). Cooldown (post-PR #268) would mark fb-bad
+      // after the readiness probe exercises the failover path, and
+      // the subsequent test request would then skip fb-bad — defeating
+      // the very contract the test is pinning. Disable cooldown here
+      // so the test exercises only its target behavior.
+      cooldown: { enabled: false },
     });
     await admin.createModel({
       display_name: "fb-good",

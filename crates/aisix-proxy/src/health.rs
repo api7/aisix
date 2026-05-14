@@ -134,25 +134,13 @@ impl Default for RuntimeStatusSnapshot {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct RuntimeEntry {
     unhealthy: bool,
     cooldown_until: Option<SystemTime>,
     last_checked_at: Option<SystemTime>,
     last_check_status: Option<u16>,
     status_reason: Option<String>,
-}
-
-impl Default for RuntimeEntry {
-    fn default() -> Self {
-        Self {
-            unhealthy: false,
-            cooldown_until: None,
-            last_checked_at: None,
-            last_check_status: None,
-            status_reason: None,
-        }
-    }
 }
 
 impl RuntimeEntry {
@@ -365,12 +353,7 @@ impl ModelRuntimeStatusTracker {
             });
     }
 
-    pub fn record_ignored_check(
-        &self,
-        model_id: &str,
-        status: u16,
-        reason: impl Into<String>,
-    ) {
+    pub fn record_ignored_check(&self, model_id: &str, status: u16, reason: impl Into<String>) {
         let now = SystemTime::now();
         let reason = reason.into();
         self.entries
@@ -404,7 +387,11 @@ impl ModelRuntimeStatusTracker {
             .unwrap_or_default()
     }
 
-    pub fn should_skip_for_routing(&self, model_id: &str, stale_after: Option<Duration>) -> RuntimeStatus {
+    pub fn should_skip_for_routing(
+        &self,
+        model_id: &str,
+        stale_after: Option<Duration>,
+    ) -> RuntimeStatus {
         self.status_with_stale(model_id, stale_after).status
     }
 }
@@ -545,12 +532,14 @@ mod tests {
         let t = ModelRuntimeStatusTracker::new();
         t.mark_unhealthy("m-1", Some(503), "background_check_failed");
         assert_eq!(
-            t.status_with_stale("m-1", Some(Duration::from_secs(60))).status,
+            t.status_with_stale("m-1", Some(Duration::from_secs(60)))
+                .status,
             RuntimeStatus::Unhealthy
         );
         std::thread::sleep(Duration::from_millis(15));
         assert_eq!(
-            t.status_with_stale("m-1", Some(Duration::from_millis(1))).status,
+            t.status_with_stale("m-1", Some(Duration::from_millis(1)))
+                .status,
             RuntimeStatus::Healthy
         );
     }

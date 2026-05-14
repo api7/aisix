@@ -72,6 +72,13 @@ pub enum ProxyError {
     InvalidRequest(String),
     #[error("no bridge registered for provider")]
     ProviderUnavailable,
+    /// Every routing candidate was excluded by the runtime status layer
+    /// (all in cooldown or background-unhealthy) and the routing model
+    /// is configured with `on_all_filtered: fail`. Caller-visible as
+    /// 503 with a Retry-After hint derived from the nearest cooldown
+    /// expiry. See [`aisix_core::OnAllFilteredPolicy`].
+    #[error("all routing candidates are unavailable")]
+    AllCandidatesUnavailable { retry_after_secs: Option<u64> },
     /// Caller-visible message MUST NOT carry the matched-pattern detail.
     /// Per #153, leaking the matched literal back to the caller defeats
     /// the point of an output guardrail (the whole purpose is to keep the
@@ -109,6 +116,7 @@ impl ProxyError {
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ProxyError::AllCandidatesUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::ContentFiltered(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ProxyError::BudgetExceeded(_) => StatusCode::TOO_MANY_REQUESTS,
             ProxyError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
@@ -127,6 +135,7 @@ impl ProxyError {
             ProxyError::InvalidRequest(_) => "invalid_request_error",
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",
             ProxyError::ProviderUnavailable => "provider_unavailable",
+            ProxyError::AllCandidatesUnavailable { .. } => "all_candidates_unavailable",
             ProxyError::ContentFiltered(_) => "content_filter",
             ProxyError::BudgetExceeded(_) => "billing_error",
             ProxyError::RateLimit(_) => "rate_limit_exceeded",
@@ -140,6 +149,7 @@ impl ProxyError {
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self {
             ProxyError::RateLimit(e) => e.retry_after_secs(),
+            ProxyError::AllCandidatesUnavailable { retry_after_secs } => *retry_after_secs,
             _ => None,
         }
     }
@@ -188,10 +198,7 @@ mod tests {
 
     #[test]
     fn bridge_error_inherits_status_and_type() {
-        let bridge_err = BridgeError::UpstreamStatus {
-            status: 429,
-            message: "rate limited".into(),
-        };
+        let bridge_err = BridgeError::upstream_status(429, "rate limited");
         let wrapped = ProxyError::Bridge(bridge_err);
         assert_eq!(wrapped.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(wrapped.kind(), "upstream_error");
@@ -199,12 +206,24 @@ mod tests {
 
     #[test]
     fn bridge_5xx_collapses_via_bridge_error_mapping() {
-        let bridge_err = BridgeError::UpstreamStatus {
-            status: 503,
-            message: "busy".into(),
-        };
+        let bridge_err = BridgeError::upstream_status(503, "busy");
         let wrapped = ProxyError::Bridge(bridge_err);
         assert_eq!(wrapped.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn all_candidates_unavailable_is_503_with_optional_retry_after() {
+        let with_hint = ProxyError::AllCandidatesUnavailable {
+            retry_after_secs: Some(42),
+        };
+        assert_eq!(with_hint.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(with_hint.kind(), "all_candidates_unavailable");
+        assert_eq!(with_hint.retry_after_secs(), Some(42));
+
+        let no_hint = ProxyError::AllCandidatesUnavailable {
+            retry_after_secs: None,
+        };
+        assert_eq!(no_hint.retry_after_secs(), None);
     }
 
     #[test]

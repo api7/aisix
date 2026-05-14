@@ -71,8 +71,18 @@ impl BridgeContext {
 pub enum BridgeError {
     #[error("upstream request timed out after {elapsed_ms}ms")]
     Timeout { elapsed_ms: u64 },
+    /// Upstream returned a non-2xx HTTP status. `retry_after` carries
+    /// the upstream's `Retry-After` header parsed to a Duration when
+    /// present — used by the cooldown layer to honor provider-supplied
+    /// backoff hints. Bridges that cannot parse the header (or where
+    /// the header is absent) leave this `None`; the cooldown layer
+    /// falls back to its configured default in that case.
     #[error("upstream returned HTTP {status}: {message}")]
-    UpstreamStatus { status: u16, message: String },
+    UpstreamStatus {
+        status: u16,
+        message: String,
+        retry_after: Option<Duration>,
+    },
     #[error("upstream returned an unparseable body: {0}")]
     UpstreamDecode(String),
     #[error("bridge is misconfigured: {0}")]
@@ -81,6 +91,52 @@ pub enum BridgeError {
     Transport(String),
     #[error("upstream cancelled the response mid-stream")]
     StreamAborted,
+}
+
+impl BridgeError {
+    /// Convenience constructor for upstream status errors when no
+    /// `Retry-After` is available. Keeps existing call sites readable.
+    pub fn upstream_status(status: u16, message: impl Into<String>) -> Self {
+        Self::UpstreamStatus {
+            status,
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+
+    /// Convenience constructor for upstream status errors that carry
+    /// a parsed `Retry-After` hint.
+    pub fn upstream_status_with_retry_after(
+        status: u16,
+        message: impl Into<String>,
+        retry_after: Option<Duration>,
+    ) -> Self {
+        Self::UpstreamStatus {
+            status,
+            message: message.into(),
+            retry_after,
+        }
+    }
+}
+
+/// Parse the `Retry-After` response header into a Duration.
+///
+/// Per RFC 9110 §10.2.3, `Retry-After` may be either:
+/// - a non-negative integer number of seconds, or
+/// - an HTTP-date.
+///
+/// We accept the seconds form (which is what OpenAI / Anthropic /
+/// DeepSeek / Gemini all return on 429). The HTTP-date form is rare
+/// for AI providers and parsing it pulls in `httpdate`; skip for V1
+/// — callers fall back to the configured default cooldown TTL.
+///
+/// Returns `None` when the header is absent, unparseable, or the
+/// seconds value is unreasonable (the cooldown layer applies a
+/// `max_seconds` clamp regardless).
+pub fn parse_retry_after(headers: &http::HeaderMap) -> Option<Duration> {
+    let raw = headers.get(http::header::RETRY_AFTER)?.to_str().ok()?;
+    let seconds: u64 = raw.trim().parse().ok()?;
+    Some(Duration::from_secs(seconds))
 }
 
 impl BridgeError {
@@ -209,24 +265,54 @@ mod tests {
 
     #[test]
     fn upstream_4xx_passes_through_5xx_collapses_to_502() {
-        let e400 = BridgeError::UpstreamStatus {
-            status: 429,
-            message: "rate limit".into(),
-        };
+        let e400 = BridgeError::upstream_status(429, "rate limit");
         assert_eq!(e400.http_status(), 429);
 
-        let e500 = BridgeError::UpstreamStatus {
-            status: 503,
-            message: "busy".into(),
-        };
+        let e500 = BridgeError::upstream_status(503, "busy");
         assert_eq!(e500.http_status(), 502);
 
-        let e3xx = BridgeError::UpstreamStatus {
-            status: 301,
-            message: "redirect".into(),
-        };
+        let e3xx = BridgeError::upstream_status(301, "redirect");
         // Non-4xx collapses too — redirects we don't follow are 502-worthy.
         assert_eq!(e3xx.http_status(), 502);
+    }
+
+    #[test]
+    fn upstream_status_carries_retry_after_when_provided() {
+        let e = BridgeError::upstream_status_with_retry_after(
+            429,
+            "slow down",
+            Some(Duration::from_secs(60)),
+        );
+        match e {
+            BridgeError::UpstreamStatus { retry_after, .. } => {
+                assert_eq!(retry_after, Some(Duration::from_secs(60)));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_retry_after_handles_seconds_form() {
+        let mut h = http::HeaderMap::new();
+        h.insert(http::header::RETRY_AFTER, "30".parse().unwrap());
+        assert_eq!(parse_retry_after(&h), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn parse_retry_after_returns_none_for_http_date_form() {
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            http::header::RETRY_AFTER,
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        // V1: HTTP-date form is intentionally not parsed.
+        assert_eq!(parse_retry_after(&h), None);
+    }
+
+    #[test]
+    fn parse_retry_after_returns_none_when_absent() {
+        let h = http::HeaderMap::new();
+        assert_eq!(parse_retry_after(&h), None);
     }
 
     #[test]

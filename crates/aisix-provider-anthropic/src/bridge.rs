@@ -105,11 +105,13 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
 }
 
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
+    let retry_after = aisix_gateway::parse_retry_after(resp.headers());
     let message = resp.text().await.unwrap_or_default();
-    BridgeError::UpstreamStatus {
-        status: status.as_u16(),
-        message: truncate(&message, 1024),
-    }
+    BridgeError::upstream_status_with_retry_after(
+        status.as_u16(),
+        truncate(&message, 1024),
+        retry_after,
+    )
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -354,7 +356,9 @@ mod tests {
         let ctx = sample_ctx(&server.uri());
         let err = bridge.chat(&req(), &ctx).await.unwrap_err();
         match err {
-            BridgeError::UpstreamStatus { status, message } => {
+            BridgeError::UpstreamStatus {
+                status, message, ..
+            } => {
                 assert_eq!(status, 400);
                 assert!(message.contains("invalid_request"));
             }

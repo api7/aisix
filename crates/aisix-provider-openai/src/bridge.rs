@@ -102,11 +102,13 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
 }
 
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
+    let retry_after = aisix_gateway::parse_retry_after(resp.headers());
     let message = resp.text().await.unwrap_or_default();
-    BridgeError::UpstreamStatus {
-        status: status.as_u16(),
-        message: truncate(&message, 1024),
-    }
+    BridgeError::upstream_status_with_retry_after(
+        status.as_u16(),
+        truncate(&message, 1024),
+        retry_after,
+    )
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -468,9 +470,70 @@ mod tests {
         let ctx = sample_ctx(&server.uri());
         let err = bridge.chat(&req(), &ctx).await.unwrap_err();
         match err {
-            BridgeError::UpstreamStatus { status, message } => {
+            BridgeError::UpstreamStatus {
+                status, message, ..
+            } => {
                 assert_eq!(status, 429);
                 assert!(message.contains("slow down"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_streaming_429_surfaces_retry_after_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "42")
+                    .set_body_string("slow down"),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        let err = bridge.chat(&req(), &ctx).await.unwrap_err();
+        match err {
+            BridgeError::UpstreamStatus {
+                status,
+                retry_after,
+                ..
+            } => {
+                assert_eq!(status, 429);
+                assert_eq!(retry_after, Some(Duration::from_secs(42)));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_streaming_503_with_garbled_retry_after_is_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")
+                    .set_body_string("down"),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        let err = bridge.chat(&req(), &ctx).await.unwrap_err();
+        match err {
+            BridgeError::UpstreamStatus {
+                status,
+                retry_after,
+                ..
+            } => {
+                assert_eq!(status, 503);
+                // HTTP-date form is intentionally not parsed in V1.
+                assert!(retry_after.is_none());
             }
             other => panic!("unexpected: {other:?}"),
         }

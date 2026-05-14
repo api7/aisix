@@ -32,11 +32,13 @@ pub use guardrail::{
     BedrockAWSCredentials, BedrockConfig, BedrockLatencyMode, Guardrail, GuardrailHookPoint,
     GuardrailKind, KeywordConfig, KeywordPattern,
 };
-pub use model::{BackgroundModelCheck, Model, Provider};
+pub use model::{
+    BackgroundModelCheck, CooldownConfig, Model, Provider, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+};
 pub use observability_exporter::{ExporterKind, ObservabilityExporter, OtlpHttpConfig};
 pub use provider_key::ProviderKey;
 pub use rate_limit::RateLimit;
-pub use routing::{Routing, RoutingStrategy, RoutingTarget};
+pub use routing::{OnAllFilteredPolicy, Routing, RoutingStrategy, RoutingTarget};
 pub use schema::{
     validate_apikey, validate_cache_policy, validate_guardrail, validate_model,
     validate_observability_exporter, validate_provider_key, SchemaError,

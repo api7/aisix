@@ -94,6 +94,98 @@ pub struct BackgroundModelCheck {
     pub stale_after_seconds: u64,
 }
 
+/// Request-path cooldown configuration for a direct model. Controls
+/// which upstream failures temporarily exclude this model from routing
+/// candidate selection, and for how long.
+///
+/// Cooldown is **independent** of request retry semantics — i.e.
+/// `Routing.retry_on_429` governs whether a 429 is retried within the
+/// current request, but `CooldownConfig.trigger_statuses` governs
+/// whether 429 takes the model out of rotation for subsequent
+/// requests. The two layers serve different purposes:
+/// - retry: short-window in-request recovery
+/// - cooldown: medium-window cross-request backpressure
+///
+/// All fields are optional; defaults preserve a safe behavior for any
+/// direct model that doesn't ship a `cooldown` block.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CooldownConfig {
+    /// Whether cooldown is active for this model. Default: true.
+    /// Set to `false` to disable cooldown entirely (the model stays in
+    /// rotation regardless of upstream failures).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Cooldown TTL in seconds when the upstream did not supply a
+    /// `Retry-After` header (or `honor_retry_after=false`). Default: 30.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_seconds: Option<u64>,
+    /// Upper bound on cooldown TTL. Caps a misbehaving upstream that
+    /// returns an unreasonable `Retry-After` value. Default: 600 (10 min).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_seconds: Option<u64>,
+    /// Whether to use the upstream's `Retry-After` header (seconds form)
+    /// as the cooldown TTL when present. Default: true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub honor_retry_after: Option<bool>,
+    /// Status codes that trigger cooldown. Default:
+    /// `[401, 408, 429, 500, 502, 503, 504]` — auth failures and rate
+    /// limits + transient server errors. `400/403/422` etc. are caller
+    /// mistakes and intentionally excluded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_statuses: Option<Vec<u16>>,
+    /// Whether request-path timeouts trigger cooldown. Default: true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_on_timeout: Option<bool>,
+    /// Whether transport / decode / stream-abort errors trigger
+    /// cooldown. Default: true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_on_transport: Option<bool>,
+}
+
+/// Default cooldown trigger statuses applied when the operator does
+/// not override `trigger_statuses` on a direct model.
+pub const DEFAULT_COOLDOWN_TRIGGER_STATUSES: &[u16] = &[401, 408, 429, 500, 502, 503, 504];
+
+const DEFAULT_COOLDOWN_SECONDS: u64 = 30;
+const DEFAULT_COOLDOWN_MAX_SECONDS: u64 = 600;
+
+impl CooldownConfig {
+    pub fn enabled_or_default(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    pub fn default_seconds_or_default(&self) -> u64 {
+        self.default_seconds.unwrap_or(DEFAULT_COOLDOWN_SECONDS)
+    }
+
+    pub fn max_seconds_or_default(&self) -> u64 {
+        self.max_seconds.unwrap_or(DEFAULT_COOLDOWN_MAX_SECONDS)
+    }
+
+    pub fn honor_retry_after_or_default(&self) -> bool {
+        self.honor_retry_after.unwrap_or(true)
+    }
+
+    /// Effective trigger-status list — operator override OR built-in
+    /// default. Returned as `Cow` so callers can avoid copies on the
+    /// default path.
+    pub fn effective_trigger_statuses(&self) -> std::borrow::Cow<'_, [u16]> {
+        match &self.trigger_statuses {
+            Some(list) => std::borrow::Cow::Borrowed(list.as_slice()),
+            None => std::borrow::Cow::Borrowed(DEFAULT_COOLDOWN_TRIGGER_STATUSES),
+        }
+    }
+
+    pub fn trigger_on_timeout_or_default(&self) -> bool {
+        self.trigger_on_timeout.unwrap_or(true)
+    }
+
+    pub fn trigger_on_transport_or_default(&self) -> bool {
+        self.trigger_on_transport.unwrap_or(true)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Model {
@@ -140,6 +232,12 @@ pub struct Model {
     /// Optional direct-model-only background health-check configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_model_check: Option<BackgroundModelCheck>,
+
+    /// Optional direct-model-only request-path cooldown configuration.
+    /// When absent, default cooldown semantics apply (see
+    /// [`CooldownConfig`] field docs for defaults).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown: Option<CooldownConfig>,
 
     /// Non-schema runtime id. Not part of the JSON payload — filled in by
     /// the snapshot loader from the etcd key path. Kept here so `Resource`
@@ -242,6 +340,75 @@ mod tests {
         assert_eq!(<Model as Resource>::kind(), "models");
         assert_eq!(m.id(), "uuid-1");
         assert_eq!(m.name(), "my-gpt4");
+    }
+
+    #[test]
+    fn cooldown_config_defaults_via_helpers() {
+        let cfg = CooldownConfig::default();
+        assert!(cfg.enabled_or_default());
+        assert_eq!(cfg.default_seconds_or_default(), 30);
+        assert_eq!(cfg.max_seconds_or_default(), 600);
+        assert!(cfg.honor_retry_after_or_default());
+        assert_eq!(
+            cfg.effective_trigger_statuses().as_ref(),
+            DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+        );
+        assert!(cfg.trigger_on_timeout_or_default());
+        assert!(cfg.trigger_on_transport_or_default());
+    }
+
+    #[test]
+    fn cooldown_default_trigger_statuses_match_advertised_set() {
+        // Lock the documented default so a future change has to update
+        // both the constant and the test, surfaced as one diff.
+        assert_eq!(
+            DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+            &[401, 408, 429, 500, 502, 503, 504]
+        );
+    }
+
+    #[test]
+    fn cooldown_config_partial_override_keeps_other_defaults() {
+        let cfg: CooldownConfig = serde_json::from_str(r#"{"default_seconds": 90}"#).unwrap();
+        assert_eq!(cfg.default_seconds_or_default(), 90);
+        // Other fields fall back to defaults.
+        assert!(cfg.enabled_or_default());
+        assert_eq!(cfg.max_seconds_or_default(), 600);
+        assert!(cfg.honor_retry_after_or_default());
+    }
+
+    #[test]
+    fn cooldown_config_disable_via_enabled_false() {
+        let cfg: CooldownConfig = serde_json::from_str(r#"{"enabled": false}"#).unwrap();
+        assert!(!cfg.enabled_or_default());
+    }
+
+    #[test]
+    fn cooldown_config_override_trigger_statuses() {
+        let cfg: CooldownConfig = serde_json::from_str(r#"{"trigger_statuses": [503]}"#).unwrap();
+        assert_eq!(cfg.effective_trigger_statuses().as_ref(), &[503]);
+    }
+
+    #[test]
+    fn direct_model_can_deserialize_cooldown_config() {
+        let m: Model = serde_json::from_str(
+            r#"{
+              "display_name": "my-gpt4",
+              "provider": "openai",
+              "model_name": "gpt-4o",
+              "provider_key_id": "11111111-1111-1111-1111-111111111111",
+              "cooldown": {
+                "enabled": true,
+                "default_seconds": 45,
+                "trigger_statuses": [429, 503]
+              }
+            }"#,
+        )
+        .unwrap();
+        let cooldown = m.cooldown.unwrap();
+        assert!(cooldown.enabled_or_default());
+        assert_eq!(cooldown.default_seconds_or_default(), 45);
+        assert_eq!(cooldown.effective_trigger_statuses().as_ref(), &[429, 503]);
     }
 
     #[test]

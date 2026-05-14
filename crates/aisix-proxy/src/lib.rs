@@ -2018,7 +2018,12 @@ data: [DONE]\n\n";
         let resp = run(app, req).await;
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["choices"][0]["message"]["content"], "fallback worked");
     }
@@ -2083,7 +2088,12 @@ data: [DONE]\n\n";
         let resp = run(app, req).await;
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&bytes));
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
     }
 
     #[tokio::test]
@@ -2151,7 +2161,12 @@ data: [DONE]\n\n";
         let resp = run(app, req).await;
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["choices"][0]["message"]["content"], "after retries");
     }
@@ -2221,7 +2236,12 @@ data: [DONE]\n\n";
         let resp = run(app, req).await;
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["choices"][0]["message"]["content"], "429 fallback worked");
     }
@@ -2306,7 +2326,12 @@ data: [DONE]\n\n";
         let resp = run(app, req).await;
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["choices"][0]["message"]["content"], "cooldown skipped");
     }
@@ -2370,7 +2395,12 @@ data: [DONE]\n\n";
         let resp = run(app, req).await;
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["choices"][0]["message"]["content"], "cooldown fallback");
     }
@@ -2380,9 +2410,7 @@ data: [DONE]\n\n";
         let flaky_upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .respond_with(
-                ResponseTemplate::new(502).set_body_string("temporary upstream failure"),
-            )
+            .respond_with(ResponseTemplate::new(502).set_body_string("temporary upstream failure"))
             .expect(1)
             .mount(&flaky_upstream)
             .await;
@@ -2442,7 +2470,10 @@ data: [DONE]\n\n";
 
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(state.runtime_status.status("m-flaky").status, RuntimeStatus::Cooldown);
+        assert_eq!(
+            state.runtime_status.status("m-flaky").status,
+            RuntimeStatus::Cooldown
+        );
 
         let app = build_router(state);
         let body = serde_json::json!({
@@ -2460,7 +2491,12 @@ data: [DONE]\n\n";
         let resp = run(app, req).await;
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["choices"][0]["message"]["content"], "stable fallback");
     }
@@ -2473,8 +2509,14 @@ data: [DONE]\n\n";
         hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
 
         let snap = AisixSnapshot::new();
-        snap.models
-            .insert(routing_entry("smart", "failover", &["nonexistent"], None, None, None));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["nonexistent"],
+            None,
+            None,
+            None,
+        ));
         snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
         // No upstream provider_key needed — the routing target itself
         // is missing so dispatch fails before any provider lookup.

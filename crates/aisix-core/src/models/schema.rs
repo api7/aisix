@@ -138,7 +138,11 @@ fn model_schema() -> Value {
                     },
                     "retries": { "type": "integer", "minimum": 0 },
                     "max_fallbacks": { "type": "integer", "minimum": 0 },
-                    "retry_on_429": { "type": "boolean" }
+                    "retry_on_429": { "type": "boolean" },
+                    "on_all_filtered": {
+                        "type": "string",
+                        "enum": ["fail", "original_order"]
+                    }
                 }
             },
             "cost": {
@@ -163,7 +167,10 @@ fn model_schema() -> Value {
                 "additionalProperties": false,
                 "properties": {
                     "enabled": { "type": "boolean" },
-                    "interval_seconds": { "type": "integer", "minimum": 1 },
+                    // Minimum 5s guards against misconfiguration. Setting
+                    // interval_seconds=1 with multiple direct models would
+                    // burn provider quota and money very quickly.
+                    "interval_seconds": { "type": "integer", "minimum": 5 },
                     "timeout_seconds": { "type": "integer", "minimum": 1 },
                     "prompt": { "type": "string", "minLength": 1 },
                     "max_tokens": { "type": "integer", "minimum": 1 },
@@ -172,6 +179,22 @@ fn model_schema() -> Value {
                         "items": { "type": "integer", "minimum": 100, "maximum": 599 }
                     },
                     "stale_after_seconds": { "type": "integer", "minimum": 1 }
+                }
+            },
+            "cooldown": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "enabled":              { "type": "boolean" },
+                    "default_seconds":      { "type": "integer", "minimum": 0 },
+                    "max_seconds":          { "type": "integer", "minimum": 1 },
+                    "honor_retry_after":    { "type": "boolean" },
+                    "trigger_statuses": {
+                        "type": "array",
+                        "items": { "type": "integer", "minimum": 100, "maximum": 599 }
+                    },
+                    "trigger_on_timeout":   { "type": "boolean" },
+                    "trigger_on_transport": { "type": "boolean" }
                 }
             }
         },
@@ -186,7 +209,8 @@ fn model_schema() -> Value {
                     { "required": ["provider"] },
                     { "required": ["model_name"] },
                     { "required": ["provider_key_id"] },
-                    { "required": ["background_model_check"] }
+                    { "required": ["background_model_check"] },
+                    { "required": ["cooldown"] }
                 ]}
             },
             {
@@ -579,6 +603,134 @@ mod tests {
             "background_model_check": {
                 "enabled": true,
                 "interval_seconds": 30,
+                "timeout_seconds": 10,
+                "prompt": "Respond with OK",
+                "max_tokens": 8,
+                "stale_after_seconds": 90
+            }
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn direct_model_cooldown_block_passes() {
+        let v = json!({
+            "display_name": "x",
+            "provider": "openai",
+            "model_name": "g",
+            "provider_key_id": "pk-1",
+            "cooldown": {
+                "enabled": true,
+                "default_seconds": 30,
+                "max_seconds": 600,
+                "honor_retry_after": true,
+                "trigger_statuses": [401, 408, 429, 500, 502, 503, 504],
+                "trigger_on_timeout": true,
+                "trigger_on_transport": true
+            }
+        });
+        validate_model(&v).unwrap();
+    }
+
+    #[test]
+    fn cooldown_block_partial_override_passes() {
+        // Only set one field — defaults fill the rest at runtime.
+        let v = json!({
+            "display_name": "x",
+            "provider": "openai",
+            "model_name": "g",
+            "provider_key_id": "pk-1",
+            "cooldown": {
+                "default_seconds": 90
+            }
+        });
+        validate_model(&v).unwrap();
+    }
+
+    #[test]
+    fn routing_model_cooldown_block_fails() {
+        // Cooldown is direct-model-only — routing models project to
+        // their underlying targets and have no upstream of their own.
+        let v = json!({
+            "display_name": "router-1",
+            "routing": { "targets": [{"model": "x"}] },
+            "cooldown": { "default_seconds": 30 }
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn cooldown_rejects_invalid_status_code() {
+        let v = json!({
+            "display_name": "x",
+            "provider": "openai",
+            "model_name": "g",
+            "provider_key_id": "pk-1",
+            "cooldown": { "trigger_statuses": [99] }
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn cooldown_max_seconds_must_be_positive() {
+        let v = json!({
+            "display_name": "x",
+            "provider": "openai",
+            "model_name": "g",
+            "provider_key_id": "pk-1",
+            "cooldown": { "max_seconds": 0 }
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn routing_on_all_filtered_fail_passes() {
+        let v = json!({
+            "display_name": "router-1",
+            "routing": {
+                "targets": [{"model": "a"}],
+                "on_all_filtered": "fail"
+            }
+        });
+        validate_model(&v).unwrap();
+    }
+
+    #[test]
+    fn routing_on_all_filtered_original_order_passes() {
+        let v = json!({
+            "display_name": "router-1",
+            "routing": {
+                "targets": [{"model": "a"}],
+                "on_all_filtered": "original_order"
+            }
+        });
+        validate_model(&v).unwrap();
+    }
+
+    #[test]
+    fn routing_on_all_filtered_rejects_unknown_value() {
+        let v = json!({
+            "display_name": "router-1",
+            "routing": {
+                "targets": [{"model": "a"}],
+                "on_all_filtered": "yolo"
+            }
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn background_check_interval_below_min_fails() {
+        // Minimum interval is 5s — guards misconfiguration from
+        // burning provider quota on a 1s loop.
+        let v = json!({
+            "display_name": "x",
+            "provider": "openai",
+            "model_name": "g",
+            "provider_key_id": "pk-1",
+            "background_model_check": {
+                "enabled": true,
+                "interval_seconds": 1,
                 "timeout_seconds": 10,
                 "prompt": "Respond with OK",
                 "max_tokens": 8,

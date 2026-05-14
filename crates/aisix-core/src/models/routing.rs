@@ -56,6 +56,27 @@ impl RoutingTarget {
     }
 }
 
+/// Behavior when every candidate target is filtered out by the
+/// runtime status layer (all in cooldown or background-unhealthy).
+///
+/// `Fail` is the default because sending traffic to a target we know
+/// is currently bad — just because every other target is also bad —
+/// amplifies cascading outages. Operators that prefer the legacy
+/// behavior (try every candidate regardless of known state) can opt
+/// into `OriginalOrder` per routing model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnAllFilteredPolicy {
+    /// Return 503 with a Retry-After hint derived from the next
+    /// cooldown expiry (or a fixed fallback if every candidate is
+    /// background-unhealthy with no cooldown timer). Default.
+    #[default]
+    Fail,
+    /// Send to the original candidate list anyway, in declaration
+    /// order. Preserves availability over caller-facing correctness.
+    OriginalOrder,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Routing {
@@ -72,6 +93,10 @@ pub struct Routing {
     /// Whether upstream 429 participates in retries and failover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_on_429: Option<bool>,
+    /// Policy for the case where every candidate is filtered out by
+    /// runtime status. See [`OnAllFilteredPolicy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_all_filtered: Option<OnAllFilteredPolicy>,
 }
 
 impl Routing {
@@ -89,6 +114,10 @@ impl Routing {
 
     pub fn retry_on_429_or_default(&self) -> bool {
         self.retry_on_429.unwrap_or(false)
+    }
+
+    pub fn on_all_filtered_or_default(&self) -> OnAllFilteredPolicy {
+        self.on_all_filtered.unwrap_or_default()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -140,6 +169,7 @@ mod tests {
             retries: Some(0),
             max_fallbacks: Some(0),
             retry_on_429: None,
+            on_all_filtered: None,
         };
         assert_eq!(r.max_fallbacks_or_default(), 0);
     }
@@ -152,8 +182,34 @@ mod tests {
             retries: None,
             max_fallbacks: Some(99),
             retry_on_429: None,
+            on_all_filtered: None,
         };
         assert_eq!(r.max_fallbacks_or_default(), 0);
+    }
+
+    #[test]
+    fn on_all_filtered_defaults_to_fail() {
+        let r: Routing = serde_json::from_str(r#"{"targets":[{"model":"a"}]}"#).unwrap();
+        assert_eq!(r.on_all_filtered_or_default(), OnAllFilteredPolicy::Fail);
+    }
+
+    #[test]
+    fn on_all_filtered_parses_original_order() {
+        let r: Routing = serde_json::from_str(
+            r#"{"targets":[{"model":"a"}],"on_all_filtered":"original_order"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            r.on_all_filtered_or_default(),
+            OnAllFilteredPolicy::OriginalOrder
+        );
+    }
+
+    #[test]
+    fn on_all_filtered_rejects_unknown_value() {
+        let r: Result<Routing, _> =
+            serde_json::from_str(r#"{"targets":[{"model":"a"}],"on_all_filtered":"explode"}"#);
+        assert!(r.is_err());
     }
 
     #[test]
