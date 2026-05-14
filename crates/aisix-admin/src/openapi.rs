@@ -271,7 +271,7 @@ const OPENAPI_JSON: &str = r##"{
         "required": ["display_name"],
         "properties": {
           "display_name":    {"type": "string", "example": "my-gpt4"},
-          "provider":        {"type": "string", "enum": ["openai","anthropic","google","deepseek"]},
+          "provider":        {"type": "string", "enum": ["openai","anthropic","google","deepseek","cohere","jina"]},
           "model_name":      {"type": "string", "example": "gpt-4o"},
           "provider_key_id": {"type": "string", "example": "11111111-1111-1111-1111-111111111111"},
           "timeout":         {"type": "integer", "minimum": 0, "description": "Request timeout in milliseconds. Absent or 0 = no timeout."},

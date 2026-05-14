@@ -6,7 +6,7 @@
 //! every field we care about — this crate only relabels the bridge
 //! (`name() == "google"`) so metrics and logs can distinguish traffic.
 //!
-//! Operators configure Gemini access by setting on the Model:
+//! Operators configure Google (Gemini) access by setting on the Model:
 //!
 //! ```yaml
 //! provider_config:
@@ -14,7 +14,7 @@
 //!   api_base: "https://generativelanguage.googleapis.com/v1beta/openai"
 //! ```
 //!
-//! The Gemini native `:generateContent` format (different request/response
+//! The Google Gemini native `:generateContent` format (different request/response
 //! shape, split role model) is intentionally out of scope here; routing
 //! to it would belong in its own crate with its own wire module.
 
@@ -42,7 +42,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
-    fn bridge_reports_gemini_name() {
+    fn bridge_reports_google_name() {
         assert_eq!(google_bridge().name(), "google");
     }
 

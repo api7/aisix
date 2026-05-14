@@ -56,7 +56,7 @@ Each provider has its own convention — the four current bridges do **not** sha
 | `google` | host plus the OpenAI-compat prefix `/v1beta/openai` | `/chat/completions` | `https://generativelanguage.googleapis.com/v1beta/openai` |
 | `anthropic` | bare host | `/v1/messages` | `https://api.anthropic.com` |
 
-The OpenAI and Anthropic conventions match each upstream's official SDK — `openai-python` initialises `base_url = "https://api.openai.com/v1"`, while `anthropic-sdk-python` initialises `base_url = "https://api.anthropic.com"` and appends `/v1/messages` itself. DeepSeek is OpenAI-compatible but exposes `/chat/completions` directly at the host root, and Gemini's OpenAI-compatible surface lives under a fixed `/v1beta/openai` prefix that the bridge does not synthesize.
+The OpenAI and Anthropic conventions match each upstream's official SDK — `openai-python` initialises `base_url = "https://api.openai.com/v1"`, while `anthropic-sdk-python` initialises `base_url = "https://api.anthropic.com"` and appends `/v1/messages` itself. DeepSeek is OpenAI-compatible but exposes `/chat/completions` directly at the host root, and Google's Gemini OpenAI-compatible surface lives under a fixed `/v1beta/openai` prefix that the bridge does not synthesize.
 
 ### Forms the gateway tolerates
 

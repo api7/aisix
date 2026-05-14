@@ -21,7 +21,7 @@ Use it as a navigation aid, not as a replacement for detailed feature pages.
 | --- | --- | --- |
 | OpenAI-compatible proxy API | Available | Includes chat, completions, embeddings, images, audio, responses, rerank, and passthrough routes currently wired by the proxy router. |
 | Anthropic-style `/v1/messages` path | Available | Current behavior is implemented as a first-class route. Feature depth still varies by provider and message content shape. |
-| Multi-provider model support | Available | Current provider enum includes OpenAI, Anthropic, Gemini, and DeepSeek. |
+| Multi-provider model support | Available | Current provider enum includes OpenAI, Anthropic, Google (Gemini), DeepSeek, Cohere, and Jina. |
 | Provider-specific passthrough | Available | Use `/passthrough/:provider/*rest` for unsupported or provider-native routes. |
 | Standalone admin API | Available | Current admin surface includes models, API keys, provider keys, guardrails, cache policies, observability exporters, health, metrics, OpenAPI, and playground. |
 | API key allowlist authz | Available | Uses hashed caller keys and model allowlists. |
