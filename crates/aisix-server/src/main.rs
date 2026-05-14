@@ -139,39 +139,14 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             let p = cert_bundle::provision(&cfg.managed)
                 .await
                 .map_err(|e| anyhow::anyhow!("DP cert-bundle provisioning failed: {e:#}"))?;
-            // The cert-bundle path requires cp_base_url for the
-            // heartbeat worker but skips registration_token. cp-api
-            // also needs cp_etcd_endpoint to be set (cmux serves
-            // gRPC + REST on the same port, but the etcd-client
-            // crate wants a host:port string). We accept the same
-            // endpoint as the cp_base_url's host:port if
-            // cp_etcd_endpoint is unset.
-            let cp_base = cfg
-                .managed
-                .cp_base_url
-                .clone()
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("managed.cp_base_url required when cert bundle is provided",)
-                })?;
-            let cp_etcd = cfg
-                .managed
-                .cp_etcd_endpoint
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| {
-                    cp_base
-                        .trim_start_matches("https://")
-                        .trim_start_matches("http://")
-                        .to_string()
-                });
+            let etcd_url = derive_cp_etcd_url(&cfg.managed)?;
             tracing::info!(
                 dp_id = %p.dp_id,
                 env_id = %p.env_id,
-                etcd = %cp_etcd,
+                etcd = %etcd_url,
                 "provisioned with dashboard-issued cert bundle",
             );
-            cfg.etcd.endpoints = vec![format!("https://{cp_etcd}")];
+            cfg.etcd.endpoints = vec![etcd_url];
             cfg.etcd.env_id = p.env_id.clone();
             cfg.etcd.tls = Some(EtcdTlsConfig {
                 ca_cert_file: p.ca_cert_path.to_string_lossy().into_owned(),
@@ -191,6 +166,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // heartbeat path under cp_base_url is fixed
             // (`/dp/heartbeat`); we don't need a server response to
             // know it.
+            let cp_base = cfg.managed.cp_base_url.as_deref().unwrap_or_default();
             Some(heartbeat::HeartbeatConfig::sanitised(
                 format!("{}/dp/heartbeat", cp_base.trim_end_matches('/')),
                 p.dp_id,
@@ -261,11 +237,20 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             // and env_id from disk and synthesise heartbeat config
             // from the configured cp_base_url. Registration doesn't
             // re-run — but we still have to carry over the etcd
-            // bundle paths and env_id, otherwise the etcd client
-            // falls back to the unencrypted placeholder from
-            // config.managed.yaml and reads/writes against the wrong
-            // (empty) tenant prefix.
+            // endpoint, bundle paths and env_id, otherwise the etcd
+            // client uses the placeholder from config.managed.yaml
+            // and reads/writes against the wrong (empty) tenant
+            // prefix.
             tracing::info!("managed mode: reusing persisted mTLS bundle");
+            // Derive the real etcd endpoint from cp_base_url /
+            // cp_etcd_endpoint — same logic as the cert-bundle
+            // provision path. Without this the placeholder
+            // "https://placeholder-overridden-at-register:2379"
+            // from config.managed.yaml survives into the etcd dial,
+            // causing the stale-endpoint bug (AISIX-Cloud#289).
+            let etcd_url = derive_cp_etcd_url(&cfg.managed)?;
+            tracing::info!(etcd = %etcd_url, "managed mode: etcd endpoint for subsequent boot");
+            cfg.etcd.endpoints = vec![etcd_url];
             cfg.etcd.tls = Some(EtcdTlsConfig {
                 ca_cert_file: register::ca_cert_path(&cfg.managed.mtls_dir)
                     .to_string_lossy()
@@ -760,6 +745,37 @@ fn default_domain_from_endpoint(endpoint: &str) -> anyhow::Result<String> {
     Ok(host.to_string())
 }
 
+/// Derive the etcd endpoint from `managed.cp_base_url` or
+/// `managed.cp_etcd_endpoint`. Returns a fully-qualified
+/// `https://<host:port>` URL for the etcd gRPC dial.
+///
+/// Logic: if `cp_etcd_endpoint` is set, use it as `host:port`;
+/// otherwise strip the scheme from `cp_base_url` (cmux means the
+/// same port serves both REST and etcd gRPC).
+fn derive_cp_etcd_url(managed: &aisix_core::ManagedConfig) -> anyhow::Result<String> {
+    let cp_base = managed
+        .cp_base_url
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "managed mode: cp_base_url must be set \
+                 (set AISIX_MANAGED__CP_BASE_URL)"
+            )
+        })?;
+    let cp_etcd = managed
+        .cp_etcd_endpoint
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            cp_base
+                .strip_prefix("https://")
+                .or_else(|| cp_base.strip_prefix("http://"))
+                .unwrap_or(cp_base)
+        });
+    Ok(format!("https://{cp_etcd}"))
+}
+
 /// Synthesise a HeartbeatConfig when the mTLS bundle is already on
 /// disk from a previous boot. Reads `managed.dp_id_file` and
 /// combines with `managed.cp_base_url` — the register response is
@@ -1004,6 +1020,68 @@ mod tests {
         let err = parse_host_port("host:abc").unwrap_err();
         assert!(
             err.to_string().contains("invalid port"),
+            "unexpected: {err}"
+        );
+    }
+
+    fn managed_with_urls(
+        base_url: Option<&str>,
+        etcd_endpoint: Option<&str>,
+    ) -> aisix_core::ManagedConfig {
+        aisix_core::ManagedConfig {
+            enabled: true,
+            cp_base_url: base_url.map(String::from),
+            cp_etcd_endpoint: etcd_endpoint.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn derive_etcd_url_from_base_url_strips_scheme() {
+        let m = managed_with_urls(Some("https://dpm.example.com:7944"), None);
+        assert_eq!(
+            derive_cp_etcd_url(&m).unwrap(),
+            "https://dpm.example.com:7944"
+        );
+    }
+
+    #[test]
+    fn derive_etcd_url_prefers_explicit_endpoint() {
+        let m = managed_with_urls(
+            Some("https://dpm.example.com:7944"),
+            Some("etcd.internal:2379"),
+        );
+        assert_eq!(
+            derive_cp_etcd_url(&m).unwrap(),
+            "https://etcd.internal:2379"
+        );
+    }
+
+    #[test]
+    fn derive_etcd_url_strips_http_scheme() {
+        let m = managed_with_urls(Some("http://localhost:7944"), None);
+        assert_eq!(
+            derive_cp_etcd_url(&m).unwrap(),
+            "https://localhost:7944"
+        );
+    }
+
+    #[test]
+    fn derive_etcd_url_errors_without_base_url() {
+        let m = managed_with_urls(None, None);
+        let err = derive_cp_etcd_url(&m).unwrap_err();
+        assert!(
+            err.to_string().contains("cp_base_url"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn derive_etcd_url_errors_on_empty_base_url() {
+        let m = managed_with_urls(Some(""), None);
+        let err = derive_cp_etcd_url(&m).unwrap_err();
+        assert!(
+            err.to_string().contains("cp_base_url"),
             "unexpected: {err}"
         );
     }
