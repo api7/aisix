@@ -12,6 +12,8 @@ The current provider set is:
 - `anthropic`
 - `google`
 - `deepseek`
+- `cohere`
+- `jina`
 
 ## Compatibility Boundary
 

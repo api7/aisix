@@ -117,7 +117,7 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
 ## Field Notes
 
 - `display_name` is the alias clients send in proxy requests.
-- `provider` currently supports `openai`, `anthropic`, `google`, and `deepseek`.
+- `provider` currently supports `openai`, `anthropic`, `google`, `deepseek`, `cohere`, and `jina`.
 - `provider_key_id` must reference an existing `ProviderKey` resource.
 - `timeout` is in milliseconds. `0` or omission means no timeout.
 - `cost` stores pricing metadata used by budget and usage accounting paths.

@@ -24,6 +24,8 @@ The current provider enum includes:
 - `anthropic`
 - `google`
 - `deepseek`
+- `cohere`
+- `jina`
 
 ## Provider Key
 
