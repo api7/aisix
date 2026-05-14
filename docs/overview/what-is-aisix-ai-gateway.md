@@ -78,7 +78,7 @@ The current provider enum includes:
 
 - `openai`
 - `anthropic`
-- `gemini`
+- `google`
 - `deepseek`
 
 Provider support is not identical across every endpoint. The current high-level support summary is captured in the [Feature Matrix](feature-matrix.md), and the current provider-oriented reference lives in [Provider Compatibility](../reference/provider-compatibility.md).

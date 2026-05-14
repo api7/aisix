@@ -47,10 +47,10 @@ pub const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
 const DEEPSEEK_DEFAULT_BASE: &str = "https://api.deepseek.com";
 
 /// Fallback host for the `gemini`-named variant of this bridge.
-/// Mirrors `aisix_provider_gemini::GEMINI_DEFAULT_BASE` so that a
-/// `with_name("gemini")` instance without an explicit `api_base`
+/// Mirrors `aisix_provider_google::GOOGLE_DEFAULT_BASE` so that a
+/// `with_name("google")` instance without an explicit `api_base`
 /// dispatches to Google's OpenAI-compatible Gemini endpoint.
-const GEMINI_DEFAULT_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
+const GOOGLE_DEFAULT_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 
 /// Path suffixes the bridge appends to `api_base` when building upstream
 /// URLs. If an operator accidentally pastes the full upstream URL into
@@ -91,14 +91,14 @@ impl OpenAiBridge {
     }
 
     /// Default upstream base for this bridge variant. The bridge factory
-    /// wraps with `with_name("deepseek")` / `with_name("gemini")` to
+    /// wraps with `with_name("deepseek")` / `with_name("google")` to
     /// retarget; the default base follows the same retargeting so a
     /// degenerate config (no `api_base` on the Model) still reaches the
     /// right host.
     fn default_base(&self) -> &'static str {
         match self.name {
             "deepseek" => DEEPSEEK_DEFAULT_BASE,
-            "gemini" => GEMINI_DEFAULT_BASE,
+            "google" => GOOGLE_DEFAULT_BASE,
             _ => OPENAI_DEFAULT_BASE,
         }
     }
@@ -852,7 +852,7 @@ data: [DONE]\n\n";
     /// path rather than falling through to the OpenAI host.
     #[test]
     fn gemini_default_base_targets_gemini_v1beta_openai() {
-        let bridge = OpenAiBridge::new().with_name("gemini");
+        let bridge = OpenAiBridge::new().with_name("google");
         let pk: ProviderKey = serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
         assert_eq!(
@@ -866,7 +866,7 @@ data: [DONE]\n\n";
     /// still strips an accidentally-pasted endpoint suffix.
     #[test]
     fn gemini_api_base_strips_endpoint_suffix_but_does_not_synthesize_prefix() {
-        let bridge = OpenAiBridge::new().with_name("gemini");
+        let bridge = OpenAiBridge::new().with_name("google");
 
         // Canonical form passes through.
         let canonical = "https://generativelanguage.googleapis.com/v1beta/openai";

@@ -3115,7 +3115,7 @@ data: [DONE]\n\n";
     // → upstream → Bridge response decoder → renderer → wire bytes.
 
     const MATRIX_ANTHROPIC_PK_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-    const MATRIX_GEMINI_PK_ID: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    const MATRIX_GOOGLE_PK_ID: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
     const MATRIX_DEEPSEEK_PK_ID: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
 
     fn anthropic_model_entry(name: &str) -> ResourceEntry<Model> {
@@ -3134,9 +3134,9 @@ data: [DONE]\n\n";
         let cfg = format!(
             r#"{{
                 "display_name": "{name}",
-                "provider": "gemini",
+                "provider": "google",
                 "model_name": "gemini-2.0-flash",
-                "provider_key_id": "{MATRIX_GEMINI_PK_ID}"
+                "provider_key_id": "{MATRIX_GOOGLE_PK_ID}"
             }}"#
         );
         ResourceEntry::new("model-gemini-1", serde_json::from_str(&cfg).unwrap(), 1)
@@ -3171,7 +3171,7 @@ data: [DONE]\n\n";
     }
 
     fn matrix_gemini_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
-        matrix_pk_entry(MATRIX_GEMINI_PK_ID, "ya29-test", api_base)
+        matrix_pk_entry(MATRIX_GOOGLE_PK_ID, "ya29-test", api_base)
     }
 
     fn matrix_deepseek_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
@@ -3308,12 +3308,12 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     /// (OpenAI inbound) × (Gemini upstream). Gemini's bridge is a
     /// thin wrapper around the OpenAi-compat `/chat/completions`
     /// endpoint, so the upstream wire is OpenAI-shape — but the
-    /// `Hub.get(Provider::Gemini)` lookup must still resolve to the
+    /// `Hub.get(Provider::Google)` lookup must still resolve to the
     /// Gemini-specific bridge instance (different metrics label,
     /// different default base URL behavior).
     #[tokio::test]
     async fn matrix_openai_in_gemini_upstream_non_streaming() {
-        use aisix_provider_gemini::gemini_bridge;
+        use aisix_provider_google::gemini_bridge;
 
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
@@ -3337,7 +3337,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-gemini"]));
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Gemini, Arc::new(gemini_bridge()));
+        hub.register(Provider::Google, Arc::new(gemini_bridge()));
         let app = build_router(build_state(snap, hub));
 
         let body = serde_json::json!({

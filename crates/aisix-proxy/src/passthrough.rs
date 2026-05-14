@@ -49,7 +49,7 @@ fn default_base(provider_prefix: &str) -> Option<&'static str> {
     match provider_prefix {
         "openai" => Some("https://api.openai.com"),
         "anthropic" => Some("https://api.anthropic.com"),
-        "gemini" => Some("https://generativelanguage.googleapis.com"),
+        "google" => Some("https://generativelanguage.googleapis.com"),
         "deepseek" => Some("https://api.deepseek.com"),
         _ => None,
     }

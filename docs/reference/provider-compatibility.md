@@ -10,7 +10,7 @@ The current provider set is:
 
 - `openai`
 - `anthropic`
-- `gemini`
+- `google`
 - `deepseek`
 
 ## Compatibility Boundary

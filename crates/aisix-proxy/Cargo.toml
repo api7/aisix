@@ -56,5 +56,5 @@ aisix-provider-openai = { path = "../aisix-provider-openai" }
 # aisix-provider-anthropic moved to [dependencies] so the /v1/messages
 # handler can use its inbound wire helpers in non-test builds too.
 aisix-provider-deepseek = { path = "../aisix-provider-deepseek" }
-aisix-provider-gemini = { path = "../aisix-provider-gemini" }
+aisix-provider-google = { path = "../aisix-provider-google" }
 wiremock.workspace = true

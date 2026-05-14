@@ -230,7 +230,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "aisix-provider-gemini"
+name = "aisix-provider-google"
 version = "0.1.0"
 dependencies = [
  "aisix-core",
@@ -273,7 +273,7 @@ dependencies = [
  "aisix-obs",
  "aisix-provider-anthropic",
  "aisix-provider-deepseek",
- "aisix-provider-gemini",
+ "aisix-provider-google",
  "aisix-provider-openai",
  "aisix-ratelimit",
  "async-stream",
@@ -329,7 +329,7 @@ dependencies = [
  "aisix-obs",
  "aisix-provider-anthropic",
  "aisix-provider-deepseek",
- "aisix-provider-gemini",
+ "aisix-provider-google",
  "aisix-provider-openai",
  "aisix-proxy",
  "aisix-ratelimit",

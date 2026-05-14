@@ -236,7 +236,7 @@ describe("responses endpoint e2e: /v1/responses dispatch + provider mismatch", (
       apiBaseSuffix: "" as const,
     },
     {
-      provider: "gemini" as const,
+      provider: "google" as const,
       modelName: "gemini-2.0-flash",
       secret: "sk-mock",
       apiBaseSuffix: "/v1" as const,

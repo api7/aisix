@@ -46,7 +46,7 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
 ```
 
 :::caution `api_base` convention differs per provider
-Each provider has its own canonical form — do not generalize from this OpenAI example. `openai` expects `api_base` to include `/v1`; `deepseek` wants the bare host (`https://api.deepseek.com`); `gemini` wants the OpenAI-compat prefix (`https://generativelanguage.googleapis.com/v1beta/openai`); `anthropic` wants the bare host (the bridge appends `/v1/messages` itself). The gateway tolerates common paste-mistakes such as trailing slashes, full endpoint URLs, and (for the canonical OpenAI/DeepSeek hosts) the missing or extra `/v1` segment. See [Provider Keys § `api_base` Behavior](../configuration/provider-keys.md#api_base-behavior) for the full truth table and the tolerated forms.
+Each provider has its own canonical form — do not generalize from this OpenAI example. `openai` expects `api_base` to include `/v1`; `deepseek` wants the bare host (`https://api.deepseek.com`); `google` wants the OpenAI-compat prefix (`https://generativelanguage.googleapis.com/v1beta/openai`); `anthropic` wants the bare host (the bridge appends `/v1/messages` itself). The gateway tolerates common paste-mistakes such as trailing slashes, full endpoint URLs, and (for the canonical OpenAI/DeepSeek hosts) the missing or extra `/v1` segment. See [Provider Keys § `api_base` Behavior](../configuration/provider-keys.md#api_base-behavior) for the full truth table and the tolerated forms.
 :::
 
 The admin envelope returns a `ResourceEntry` shape:

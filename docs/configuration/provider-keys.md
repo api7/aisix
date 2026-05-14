@@ -53,7 +53,7 @@ Each provider has its own convention — the four current bridges do **not** sha
 |---|---|---|---|
 | `openai` | include `/v1` | `/chat/completions`, `/embeddings`, `/completions`, `/images/generations`, `/audio/*` | `https://api.openai.com/v1` |
 | `deepseek` | bare host (DeepSeek serves OpenAI-compatible paths at the host root) | `/chat/completions` | `https://api.deepseek.com` |
-| `gemini` | host plus the OpenAI-compat prefix `/v1beta/openai` | `/chat/completions` | `https://generativelanguage.googleapis.com/v1beta/openai` |
+| `google` | host plus the OpenAI-compat prefix `/v1beta/openai` | `/chat/completions` | `https://generativelanguage.googleapis.com/v1beta/openai` |
 | `anthropic` | bare host | `/v1/messages` | `https://api.anthropic.com` |
 
 The OpenAI and Anthropic conventions match each upstream's official SDK — `openai-python` initialises `base_url = "https://api.openai.com/v1"`, while `anthropic-sdk-python` initialises `base_url = "https://api.anthropic.com"` and appends `/v1/messages` itself. DeepSeek is OpenAI-compatible but exposes `/chat/completions` directly at the host root, and Gemini's OpenAI-compatible surface lives under a fixed `/v1beta/openai` prefix that the bridge does not synthesize.
@@ -80,7 +80,7 @@ For `anthropic` (always tolerated):
 
 - the full upstream URL `…/v1/messages` or the `/v1` prefix is stripped — `api_base: "https://api.anthropic.com/v1/messages"`, `…/v1`, and bare host all converge to the bare host at dispatch time.
 
-For `gemini` and any other variant: only suffix stripping; the bridge does not synthesize the `/v1beta/openai` prefix. Operators should paste the full canonical form.
+For `google` and any other variant: only suffix stripping; the bridge does not synthesize the `/v1beta/openai` prefix. Operators should paste the full canonical form.
 
 ### Outside the canonical hosts
 

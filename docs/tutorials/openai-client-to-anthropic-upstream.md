@@ -152,7 +152,7 @@ curl -sS -X DELETE http://127.0.0.1:3001/admin/v1/provider_keys/ANTHROPIC_PK_ID 
 
 - **Add a routing model on top** — combine an OpenAI-backed direct model and `claude-prod` under one virtual alias and let the gateway pick between them. See [Build A Virtual Model With Failover](build-a-virtual-model-with-failover.md).
 - **Use the Anthropic-style endpoint directly** — `POST /v1/messages` exposes the Anthropic shape end-to-end without translation. See [Anthropic SDK Quickstart](../quickstart/anthropic-sdk.md).
-- **Cover other providers the same way** — `provider: "gemini"` and `provider: "deepseek"` use the same pattern. The bridges handle their own wire translation; the caller stays on OpenAI Chat Completions.
+- **Cover other providers the same way** — `provider: "google"` and `provider: "deepseek"` use the same pattern. The bridges handle their own wire translation; the caller stays on OpenAI Chat Completions.
 
 ## Related Pages
 

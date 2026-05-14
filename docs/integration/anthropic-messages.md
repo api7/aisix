@@ -27,7 +27,7 @@ If you rely on Anthropic-specific semantics, this is the safest path.
 
 ### Non-Anthropic Upstream
 
-When the resolved model provider is `openai`, `gemini`, or `deepseek`, the gateway translates the Anthropic-style request into the internal chat format, dispatches through the provider bridge, and then re-encodes the response as Anthropic-style JSON or SSE.
+When the resolved model provider is `openai`, `google`, or `deepseek`, the gateway translates the Anthropic-style request into the internal chat format, dispatches through the provider bridge, and then re-encodes the response as Anthropic-style JSON or SSE.
 
 This path is useful for keeping a stable Anthropic-style client edge, but it should not be treated as feature-identical to native Anthropic behavior.
 

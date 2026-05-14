@@ -259,7 +259,7 @@ fn default_base_for_provider(provider: aisix_core::models::Provider) -> Option<S
         // body fields, same `results` array shape, Bearer auth.
         Provider::Jina => Some("https://api.jina.ai".to_string()),
         Provider::Anthropic => None, // Anthropic doesn't expose a rerank API
-        Provider::Gemini => None,    // Gemini doesn't expose a rerank API
+        Provider::Google => None,    // Gemini doesn't expose a rerank API
         Provider::Deepseek => None,
     }
 }

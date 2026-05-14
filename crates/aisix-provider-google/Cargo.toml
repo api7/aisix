@@ -1,5 +1,5 @@
 [package]
-name = "aisix-provider-gemini"
+name = "aisix-provider-google"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

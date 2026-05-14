@@ -53,7 +53,7 @@ const CALLER_KEY_HASH = createHash("sha256")
   .digest("hex");
 
 interface ProviderCase {
-  readonly provider: "anthropic" | "gemini" | "deepseek";
+  readonly provider: "anthropic" | "google" | "deepseek";
   readonly upstreamModelId: string;
   readonly displayName: string;
   // The wire shape the upstream sends back on a 400. Each provider
@@ -93,7 +93,7 @@ const CASES: ReadonlyArray<ProviderCase> = [
     apiBaseSuffix: "",
   },
   {
-    provider: "gemini",
+    provider: "google",
     upstreamModelId: "gemini-2.0-flash",
     displayName: "err-norm-gemini",
     // The gemini bridge talks to Google's OpenAI-compatibility

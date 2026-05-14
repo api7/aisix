@@ -1,10 +1,10 @@
-//! aisix-provider-gemini — Google Gemini via its OpenAI-compatible endpoint.
+//! aisix-provider-google — Google Gemini via its OpenAI-compatible endpoint.
 //!
 //! Google exposes an OpenAI-shaped `/chat/completions` surface at
 //! `generativelanguage.googleapis.com/v1beta/openai`. The wire format is
 //! close enough to plain OpenAI that the upstream `OpenAiBridge` covers
 //! every field we care about — this crate only relabels the bridge
-//! (`name() == "gemini"`) so metrics and logs can distinguish traffic.
+//! (`name() == "google"`) so metrics and logs can distinguish traffic.
 //!
 //! Operators configure Gemini access by setting on the Model:
 //!
@@ -23,14 +23,14 @@
 
 use aisix_provider_openai::OpenAiBridge;
 
-/// Default base for Gemini's OpenAI-compat endpoint. Only used when the
+/// Default base for Google's OpenAI-compat endpoint. Only used when the
 /// Model doesn't carry an explicit `api_base` — production configs should
 /// set one.
-pub const GEMINI_DEFAULT_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
+pub const GOOGLE_DEFAULT_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 
-/// Build a Bridge that speaks Gemini's OpenAI-compatible chat API.
+/// Build a Bridge that speaks Google's OpenAI-compatible chat API.
 pub fn gemini_bridge() -> OpenAiBridge {
-    OpenAiBridge::new().with_name("gemini")
+    OpenAiBridge::new().with_name("google")
 }
 
 #[cfg(test)]
@@ -43,12 +43,12 @@ mod tests {
 
     #[test]
     fn bridge_reports_gemini_name() {
-        assert_eq!(gemini_bridge().name(), "gemini");
+        assert_eq!(gemini_bridge().name(), "google");
     }
 
     #[test]
     fn default_base_targets_v1beta_openai_shim() {
-        assert!(GEMINI_DEFAULT_BASE.contains("/v1beta/openai"));
+        assert!(GOOGLE_DEFAULT_BASE.contains("/v1beta/openai"));
     }
 
     #[tokio::test]
@@ -73,7 +73,7 @@ mod tests {
         let model: aisix_core::Model = serde_json::from_str(
             r#"{
                 "display_name": "my-gemini",
-                "provider": "gemini",
+                "provider": "google",
                 "model_name": "gemini-2.5-flash",
                 "provider_key_id": "11111111-1111-1111-1111-111111111111"
             }"#,

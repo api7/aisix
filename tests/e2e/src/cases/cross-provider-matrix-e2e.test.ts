@@ -41,7 +41,7 @@ const CALLER_KEY_HASH = createHash("sha256")
   .update(CALLER_PLAINTEXT)
   .digest("hex");
 
-type Provider = "gemini" | "deepseek";
+type Provider = "google" | "deepseek";
 
 interface MatrixCase {
   readonly provider: Provider;
@@ -52,7 +52,7 @@ interface MatrixCase {
 
 const CASES: ReadonlyArray<MatrixCase> = [
   {
-    provider: "gemini",
+    provider: "google",
     upstreamModelId: "gemini-2.0-flash",
     displayPrefix: "matrix-gemini",
     expectedContent: "Hello from Gemini!",

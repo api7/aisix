@@ -691,7 +691,7 @@ mod tests {
 
     const ANTHROPIC_PK_ID: &str = "11111111-1111-1111-1111-111111111111";
     const OPENAI_PK_ID: &str = "22222222-2222-2222-2222-222222222222";
-    const GEMINI_PK_ID: &str = "33333333-3333-3333-3333-333333333333";
+    const GOOGLE_PK_ID: &str = "33333333-3333-3333-3333-333333333333";
     const DEEPSEEK_PK_ID: &str = "44444444-4444-4444-4444-444444444444";
 
     fn anthropic_model(name: &str) -> ResourceEntry<Model> {
@@ -1072,9 +1072,9 @@ data: [DONE]\n\n";
         let cfg = format!(
             r#"{{
                 "display_name": "{name}",
-                "provider": "gemini",
+                "provider": "google",
                 "model_name": "gemini-2.0-flash",
-                "provider_key_id": "{GEMINI_PK_ID}"
+                "provider_key_id": "{GOOGLE_PK_ID}"
             }}"#
         );
         ResourceEntry::new("m-3", serde_json::from_str(&cfg).unwrap(), 1)
@@ -1097,7 +1097,7 @@ data: [DONE]\n\n";
             r#"{{"display_name":"gemini-up","secret":"ya29-test","api_base":"{api_base}"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
-        ResourceEntry::new(GEMINI_PK_ID, pk, 1)
+        ResourceEntry::new(GOOGLE_PK_ID, pk, 1)
     }
 
     fn deepseek_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
@@ -1128,7 +1128,7 @@ data: [DONE]\n\n";
     /// non-Anthropic Bridge in the workspace.
     #[tokio::test]
     async fn matrix_anthropic_in_gemini_upstream_non_streaming() {
-        use aisix_provider_gemini::gemini_bridge;
+        use aisix_provider_google::gemini_bridge;
 
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1154,7 +1154,7 @@ data: [DONE]\n\n";
 
         let hub = Arc::new(Hub::new());
         hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
-        hub.register(Provider::Gemini, Arc::new(gemini_bridge()));
+        hub.register(Provider::Google, Arc::new(gemini_bridge()));
         let handle = SnapshotHandle::new(snap);
         let app = crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache());
 
@@ -1343,9 +1343,9 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn matrix_anthropic_in_gemini_upstream_streaming() {
-        use aisix_provider_gemini::gemini_bridge;
+        use aisix_provider_google::gemini_bridge;
         assert_anthropic_streams_through_openai_compat_upstream(
-            Provider::Gemini,
+            Provider::Google,
             Arc::new(gemini_bridge()),
             // Placeholder; helper rebuilds with the wiremock uri.
             gemini_model("my-claude-via-gemini"),

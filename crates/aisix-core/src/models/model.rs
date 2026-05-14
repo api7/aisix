@@ -23,7 +23,7 @@ use crate::resource::Resource;
 pub enum Provider {
     Openai,
     Anthropic,
-    Gemini,
+    Google,
     Deepseek,
     /// Cohere — currently exposed for `/v1/rerank` only (#213 Phase 1).
     /// Cohere's chat / generate APIs are not OpenAI-compatible; a
@@ -43,7 +43,7 @@ impl Provider {
         match self {
             Self::Openai => "https://api.openai.com",
             Self::Anthropic => "https://api.anthropic.com",
-            Self::Gemini => "https://generativelanguage.googleapis.com/v1beta/openai",
+            Self::Google => "https://generativelanguage.googleapis.com/v1beta/openai",
             Self::Deepseek => "https://api.deepseek.com",
             Self::Cohere => "https://api.cohere.com",
             Self::Jina => "https://api.jina.ai",
@@ -54,7 +54,7 @@ impl Provider {
         match self {
             Self::Openai => "openai",
             Self::Anthropic => "anthropic",
-            Self::Gemini => "gemini",
+            Self::Google => "google",
             Self::Deepseek => "deepseek",
             Self::Cohere => "cohere",
             Self::Jina => "jina",
@@ -447,7 +447,7 @@ mod tests {
             "https://api.anthropic.com"
         );
         assert_eq!(
-            Provider::Gemini.default_base_url(),
+            Provider::Google.default_base_url(),
             "https://generativelanguage.googleapis.com/v1beta/openai"
         );
         assert_eq!(
