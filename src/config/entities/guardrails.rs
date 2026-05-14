@@ -8,7 +8,10 @@ use utoipa::ToSchema;
 
 use super::{ConfigProvider, EntityStore, ResourceEntry};
 use crate::{
-    guardrail::guardrails::{configs::BedrockGuardrailConfig, identifiers},
+    guardrail::guardrails::{
+        configs::{BedrockGuardrailConfig, RegexGuardrailConfig},
+        identifiers,
+    },
     utils::jsonschema::format_evaluation_error,
 };
 
@@ -25,12 +28,16 @@ pub static SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> = LazyLock::new(|| 
 pub enum GuardrailConfig {
     #[serde(rename = "bedrock")]
     Bedrock(BedrockGuardrailConfig),
+
+    #[serde(rename = "regex")]
+    Regex(RegexGuardrailConfig),
 }
 
 impl GuardrailConfig {
     pub fn guardrail_type(&self) -> &'static str {
         match self {
             Self::Bedrock(_) => identifiers::BEDROCK,
+            Self::Regex(_) => identifiers::REGEX,
         }
     }
 }
@@ -62,7 +69,16 @@ fn validate(key: &str, value: &Guardrail) -> Result<(), String> {
         ));
     }
 
+    validate_config(key, &value.guardrail)?;
+
     Ok(())
+}
+
+fn validate_config(_key: &str, config: &GuardrailConfig) -> Result<(), String> {
+    match config {
+        GuardrailConfig::Bedrock(_) => Ok(()),
+        GuardrailConfig::Regex(_) => Ok(()),
+    }
 }
 
 #[derive(Clone)]
@@ -212,6 +228,14 @@ mod tests {
             "secret_access_key": "secret"
         }
     }), true, None)]
+    #[case::regex_ok(json!({
+        "name": "regex-prod",
+        "type": "regex",
+        "config": {
+            "pattern": "secret",
+            "block_reason": "matched blocked content"
+        }
+    }), true, None)]
     #[case::missing_type(json!({
         "name": "bedrock-prod",
         "config": {
@@ -252,6 +276,13 @@ mod tests {
             "secret_access_key": "secret"
         }
     }), false, Some(r#"property "/config" validation failed: "region" is a required property"#.to_string()))]
+    #[case::regex_missing_pattern(json!({
+        "name": "regex-prod",
+        "type": "regex",
+        "config": {
+            "block_reason": "matched blocked content"
+        }
+    }), false, Some(r#"property "/config" validation failed: "pattern" is a required property"#.to_string()))]
     #[case::invalid_root_additional_property(json!({
         "name": "bedrock-prod",
         "type": "bedrock",
@@ -282,6 +313,25 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_regex_guardrail_rejects_invalid_patterns() {
+        let error = serde_json::from_value::<Guardrail>(json!({
+            "name": "regex-invalid",
+            "type": "regex",
+            "config": {
+                "pattern": "[",
+                "block_reason": "matched blocked content"
+            }
+        }))
+        .expect_err("invalid regex pattern should be rejected while loading config");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid regex guardrail pattern")
+        );
+    }
+
+    #[test]
     fn deserialize_guardrail_preserves_type_information() {
         let guardrail: Guardrail = serde_json::from_value(json!({
             "name": "bedrock-prod",
@@ -299,6 +349,23 @@ mod tests {
         assert_eq!(guardrail.name, "bedrock-prod");
         assert_eq!(guardrail.guardrail_type(), "bedrock");
         assert_matches!(guardrail.guardrail, GuardrailConfig::Bedrock(_));
+    }
+
+    #[test]
+    fn deserialize_regex_guardrail_preserves_type_information() {
+        let guardrail: Guardrail = serde_json::from_value(json!({
+            "name": "regex-prod",
+            "type": "regex",
+            "config": {
+                "pattern": "secret",
+                "block_reason": "matched blocked content"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(guardrail.name, "regex-prod");
+        assert_eq!(guardrail.guardrail_type(), "regex");
+        assert_matches!(guardrail.guardrail, GuardrailConfig::Regex(_));
     }
 
     #[tokio::test]

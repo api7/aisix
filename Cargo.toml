@@ -38,6 +38,7 @@ reqwest = { version = "0.13", default-features = false, features = [
   "stream",
   "native-tls",
 ] }
+regex = "1"
 serde = "1.0.228"
 serde_json = "1.0"
 thiserror = "2"
@@ -63,6 +64,7 @@ tokio.workspace = true
 reqwest.workspace = true
 http.workspace = true
 axum.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true

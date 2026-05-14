@@ -72,6 +72,7 @@ dependencies = [
  "pin-project",
  "pretty_assertions",
  "rand 0.10.1",
+ "regex",
  "reqwest",
  "rstest",
  "rust-embed",
@@ -115,10 +116,12 @@ dependencies = [
  "aws-smithy-runtime-api",
  "http 1.4.0",
  "percent-encoding",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "utoipa",
 ]
 
