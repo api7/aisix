@@ -2,9 +2,9 @@ name: Build
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,6 +31,15 @@ jobs:
 
       - name: Setup Rust toolchain
         run: rustup toolchain install stable --profile minimal
+
+      - name: Install etcdctl
+        env:
+          ETCD_VER: v3.6.11
+        run: |
+          curl -fsSL "https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz" -o /tmp/etcd-${ETCD_VER}-linux-amd64.tar.gz
+          tar xzf /tmp/etcd-${ETCD_VER}-linux-amd64.tar.gz -C /tmp
+          sudo install /tmp/etcd-${ETCD_VER}-linux-amd64/etcdctl /usr/local/bin/etcdctl
+          etcdctl version
 
       - name: Setup environment
         run: sudo docker compose -f ci/docker-compose.yaml up -d
