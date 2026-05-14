@@ -10,6 +10,8 @@ AISIX AI Gateway uses TLS in three distinct places:
 - etcd TLS or mTLS for config transport
 - managed-mode mTLS for data-plane communication with the control plane
 
+Use this page to separate those three concerns clearly during deployment and debugging.
+
 ## Listener TLS
 
 Bootstrap config supports optional TLS on:
@@ -18,6 +20,8 @@ Bootstrap config supports optional TLS on:
 - `admin.tls`
 
 Use listener TLS whenever these surfaces are exposed beyond local development.
+
+This is the correct place to secure inbound client and operator traffic.
 
 ## etcd TLS
 
@@ -29,6 +33,8 @@ Use listener TLS whenever these surfaces are exposed beyond local development.
 - optional domain name override
 
 This is the right path when your etcd deployment requires TLS or mTLS.
+
+It is independent from listener TLS. A working HTTPS proxy listener does not tell you anything about etcd trust configuration.
 
 ## Managed mTLS Bundle
 
@@ -47,6 +53,12 @@ Current managed bootstrap paths include:
 
 For current AISIX Cloud behavior, treat the certificate-bundle flow as the primary path.
 
+## How To Think About Failures
+
+- listener TLS failures usually show up on inbound proxy or admin traffic
+- etcd TLS failures usually show up as bootstrap or watch/connectivity problems
+- managed mTLS failures usually show up on heartbeat, rotation, or budget-check paths
+
 ## Failure Signals
 
 Common TLS or mTLS failures surface as:
@@ -54,6 +66,16 @@ Common TLS or mTLS failures surface as:
 - startup failures reading certificate files
 - outbound client build failures for heartbeat or budget check
 - etcd connection failures that can look like transport or DNS errors
+
+## Troubleshooting
+
+### The process fails at startup with certificate errors
+
+Check file readability and whether the configured cert/key pair matches the intended TLS use.
+
+### Managed mode starts but never heartbeats
+
+Treat that as a managed mTLS bundle or trust-root problem first.
 
 ## Related Pages
 

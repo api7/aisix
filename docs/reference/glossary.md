@@ -15,3 +15,9 @@ sidebar_position: 65
 - `Snapshot`: the in-memory config view used by the proxy hot path
 - `Watch Supervisor`: the task that keeps the snapshot current from etcd
 - `Managed DP`: a managed data plane operating under AISIX Cloud control-plane workflows
+
+## Reading Tips
+
+- when a page says `caller-facing`, it refers to the client contract on `/v1/*`
+- when a page says `operator-facing`, it refers to the standalone admin or Cloud control surface
+- when a page says `projected`, it means control-plane state has been materialized into the data-plane snapshot

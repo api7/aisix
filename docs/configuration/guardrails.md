@@ -8,6 +8,8 @@ Guardrails are content-policy resources attached to the gateway's chat path.
 
 Current guardrails run on `POST /v1/chat/completions` through the live guardrail chain.
 
+Use this page to understand where guardrails execute today, not just what the schema can store.
+
 ## Current Fields
 
 - `name`
@@ -21,6 +23,8 @@ Current guardrails run on `POST /v1/chat/completions` through the live guardrail
 - `input`
 - `output`
 - `both`
+
+These settings control where in the chat request/response lifecycle the current guardrail is asked to act.
 
 ## Keyword Guardrails
 
@@ -49,6 +53,8 @@ Current runtime behavior:
 - blocked requests return `422`
 - input blocking prevents the prompt from reaching the upstream
 - output blocking prevents the upstream response from reaching the caller
+
+That makes keyword guardrails the currently reliable operator tool for in-process content blocking.
 
 ## Bedrock-Shaped Guardrails
 
@@ -81,7 +87,24 @@ Current runtime boundary:
 - the gateway accepts and stores this shape
 - the live chain does not document it as generally available runtime enforcement yet
 
+This is the key difference between schema support and dependable runtime support.
+
 Keep Bedrock runtime support in the roadmap and limited-capability framing, not as fully available behavior.
+
+## Operator Guidance
+
+- use `keyword` for production behavior you need to rely on today
+- treat `bedrock` rows as an advanced or staged capability until your own deployment proves the runtime path you want
+
+## Troubleshooting
+
+### The resource saves but nothing is blocked
+
+First confirm you are testing the `POST /v1/chat/completions` path and not assuming every proxy endpoint runs the guardrail chain.
+
+### A blocked request returns `422`
+
+That is expected for current guardrail denials.
 
 ## Related Pages
 

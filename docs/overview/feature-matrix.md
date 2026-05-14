@@ -25,7 +25,7 @@ Use it as a navigation aid, not as a replacement for detailed feature pages.
 | Provider-specific passthrough | Available | Use `/passthrough/:provider/*rest` for unsupported or provider-native routes. |
 | Standalone admin API | Available | Current admin surface includes models, API keys, provider keys, guardrails, cache policies, observability exporters, health, metrics, OpenAPI, and playground. |
 | API key allowlist authz | Available | Uses hashed caller keys and model allowlists. |
-| Per-key budgets | Limited | `ApiKey.max_budget_usd` is part of the resource schema, but live enforcement is currently centered on managed-mode `/dp/budget_check`. Standalone self-hosted mode defaults to allow-all unless that managed budget client is wired. |
+| Per-key budgets | Limited | Live enforcement is currently centered on managed-mode `/dp/budget_check`. Standalone self-hosted mode defaults to allow-all, and the standalone admin write validator does not currently accept `max_budget_usd`. |
 | Rate limits and concurrency limits | Available | Current docs should treat these as active gateway behavior. |
 | Routing models and failover | Available | Current model schema supports routing strategies and retry budget behavior. |
 | Keyword guardrails | Available | Current runtime enforcement is on `POST /v1/chat/completions`; non-chat endpoints do not run the guardrail chain today. |

@@ -8,7 +8,7 @@ sidebar_position: 60
 
 The proxy router currently mounts:
 
-- `GET /health`
+- `GET /livez`
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - `POST /v1/completions`
@@ -22,6 +22,8 @@ The proxy router currently mounts:
 - `POST /v1/audio/speech`
 - `ANY /passthrough/:provider/*rest`
 
+Use this page as the route inventory. Use the integration pages when you need behavior details and examples.
+
 ## Auth
 
 Proxy requests use caller-facing API keys.
@@ -30,6 +32,23 @@ Current accepted forms:
 
 - `Authorization: Bearer <plaintext>`
 - `x-api-key: <plaintext>` fallback on proxy auth paths
+
+The caller key is an AISIX gateway credential, not an upstream provider key.
+
+## Route Families
+
+You can think about the proxy surface in these groups:
+
+- health and discovery: `/livez`, `/v1/models`
+- modeled OpenAI-compatible endpoints: chat, completions, embeddings, images, audio, responses
+- Anthropic-style endpoint: `/v1/messages`
+- escape hatch: `/passthrough/:provider/*rest`
+
+## Important Reference Boundaries
+
+- `/v1/models` does not expose every callable alias in every case because routing aliases are hidden today
+- `/v1/responses` is currently OpenAI-provider-only
+- `/passthrough/:provider/*rest` is intentionally thinner than first-class modeled routes
 
 ## Related Pages
 

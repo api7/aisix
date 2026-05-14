@@ -6,6 +6,8 @@ sidebar_position: 56
 
 Upgrade the gateway conservatively when dynamic configuration and provider behavior matter to production traffic.
 
+Treat upgrades as behavior changes to be verified, not just binary replacements.
+
 ## Compatibility Principles
 
 - bootstrap config must still parse on the new binary
@@ -17,9 +19,12 @@ Upgrade the gateway conservatively when dynamic configuration and provider behav
 Before and after an upgrade, verify:
 
 1. `GET /health`
-2. `GET /admin/v1/health`
-3. `GET /v1/models`
-4. one real request on each critical endpoint your clients use
+2. admin-listener `GET /health`
+3. `GET /admin/v1/health`
+4. `GET /v1/models`
+5. one real request on each critical endpoint your clients use
+
+If you use several endpoint families in production, test each one you depend on rather than assuming chat-completions success proves all compatibility.
 
 ## Areas To Treat Carefully
 
@@ -27,6 +32,19 @@ Before and after an upgrade, verify:
 - etcd TLS and trust roots
 - cache backend selection
 - dynamic resources written by a newer or older control plane
+
+## Suggested Upgrade Flow
+
+1. verify bootstrap config parses with the new binary
+2. start the new instance without sending full traffic
+3. confirm health, config freshness, and one real request per critical path
+4. only then widen traffic exposure
+
+## Troubleshooting
+
+### The new binary starts but behaves differently on one endpoint family
+
+Treat that as a compatibility issue even if health checks are green.
 
 ## Related Pages
 

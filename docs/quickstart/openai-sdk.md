@@ -6,6 +6,12 @@ sidebar_position: 12
 
 This quickstart shows the smallest working setup for the official OpenAI SDK against AISIX AI Gateway.
 
+Use it when:
+
+- your application already uses the official OpenAI SDK
+- you want to keep OpenAI request and response shapes unchanged
+- you want AISIX to own provider selection, upstream credentials, and policy enforcement
+
 Use this page after you have already created:
 
 - a provider key
@@ -22,6 +28,12 @@ Point the SDK at the gateway instead of the upstream provider:
 - set `baseURL` to the gateway's `/v1` prefix
 - use the gateway model alias in `model`
 
+What does **not** change:
+
+- you still call `client.chat.completions.create(...)`
+- you still send OpenAI-style `messages`
+- you still receive OpenAI-style JSON or SSE chunks
+
 ## Install The SDK
 
 ```bash title="Install openai"
@@ -30,7 +42,9 @@ npm install openai
 
 ## Minimal Example
 
-```ts title="openai-sdk-example.ts"
+Use the `.mjs` extension so Node treats top-level `await` and `import` as ES modules without extra configuration.
+
+```js title="openai-sdk-example.mjs"
 import OpenAI from "openai";
 
 const client = new OpenAI({
@@ -49,14 +63,30 @@ console.log(response.choices[0]?.message.content);
 ## Run It
 
 ```bash title="Run the OpenAI SDK example"
-AISIX_API_KEY=sk-demo-caller node openai-sdk-example.ts
+AISIX_API_KEY=sk-demo-caller node openai-sdk-example.mjs
 ```
+
+:::note
+If you prefer TypeScript, save the file as `openai-sdk-example.ts` and run it with `npx tsx openai-sdk-example.ts`. Plain `node openai-sdk-example.ts` does not work because Node cannot execute TypeScript without a loader such as `tsx` or `ts-node`.
+:::
+
+## Expected Result
+
+If the gateway can resolve `gpt-4o-prod` and the upstream provider is reachable, the SDK returns a standard OpenAI chat-completions object.
+
+The important caller-visible properties are:
+
+- `response.object` is `chat.completion`
+- `response.choices[0].message.role` is `assistant`
+- `response.choices[0].message.content` contains the model output
+
+At the gateway layer, AISIX resolves `gpt-4o-prod` to the configured upstream model and injects the provider credential from the stored `ProviderKey`.
 
 ## Streaming Example
 
 The same `baseURL` works for streaming.
 
-```ts title="openai-sdk-streaming.ts"
+```js title="openai-sdk-streaming.mjs"
 import OpenAI from "openai";
 
 const client = new OpenAI({
@@ -75,6 +105,34 @@ for await (const chunk of stream) {
   process.stdout.write(chunk.choices[0]?.delta?.content ?? "");
 }
 ```
+
+Run with `AISIX_API_KEY=sk-demo-caller node openai-sdk-streaming.mjs`.
+
+## When To Use This Quickstart
+
+Choose this path when your client code is already built around:
+
+- OpenAI SDKs
+- OpenAI-compatible chat-completions requests
+- OpenAI-style streaming consumers
+
+If you instead want Claude-style request and response shapes, use [Anthropic SDK Quickstart](anthropic-sdk.md).
+
+## Common Setup Pattern
+
+In most deployments, your application should know only three gateway-specific inputs:
+
+- gateway URL such as `http://127.0.0.1:3000`
+- AISIX caller API key such as `sk-demo-caller`
+- AISIX model alias such as `gpt-4o-prod`
+
+Everything else stays behind the gateway:
+
+- upstream provider API key
+- upstream base URL
+- upstream model identifier
+- routing and failover policy
+- rate limits, guardrails, and observability hooks
 
 ## What Stays The Same
 
@@ -95,6 +153,28 @@ for await (const chunk of stream) {
 - `404` means the model alias is not present in the current gateway snapshot
 - upstream `4xx` errors are returned in the proxy error envelope
 - upstream `5xx` errors collapse to `502`
+
+## Troubleshooting
+
+### The SDK still talks to OpenAI directly
+
+Check `baseURL`. It must point to the gateway, not to `api.openai.com`.
+
+### The request fails with `404`
+
+The `model` value must be the AISIX model alias, not the raw upstream model name unless they are intentionally the same.
+
+### The request fails with `403`
+
+The caller key exists, but its `allowed_models` list does not include the alias you requested.
+
+### The request works in curl but not in the SDK
+
+Compare these three values first:
+
+- `apiKey`
+- `baseURL`
+- `model`
 
 ## Related Pages
 

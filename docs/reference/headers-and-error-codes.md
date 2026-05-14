@@ -15,6 +15,8 @@ Current operational headers vary by endpoint:
 
 `x-aisix-cache` is currently used on chat cache hit or miss paths.
 
+Do not treat every header as universal across every endpoint.
+
 ## Proxy Error Types
 
 Current proxy error `type` values include:
@@ -28,6 +30,8 @@ Current proxy error `type` values include:
 - `billing_error`
 - `rate_limit_exceeded`
 
+These values appear in the proxy's OpenAI-compatible error envelope.
+
 ## Proxy Status Boundaries
 
 - `400` invalid request
@@ -37,6 +41,8 @@ Current proxy error `type` values include:
 - `422` content blocked by policy
 - `429` rate limit or budget rejection
 - `503` provider bridge unavailable
+
+Upstream `5xx` failures generally collapse into `502` through the bridge mapping path, even though `502` is not one of the gateway-originated business-logic classes listed above.
 
 ## Admin Error Envelope
 
@@ -55,6 +61,8 @@ Current admin status boundaries include:
 - `404`
 - `409`
 - `500`
+
+Use admin errors and proxy errors as two separate reference contracts.
 
 ## Related Pages
 

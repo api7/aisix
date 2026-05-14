@@ -30,6 +30,10 @@ The standalone gateway uses:
 
 Create a provider key that points at your upstream provider.
 
+:::warning Production credentials
+The standalone gateway stores `secret` as plaintext under the etcd `prefix` you configured in [`config.yaml`](self-hosted.md#step-2-create-a-bootstrap-config). For production, front etcd with encryption-at-rest, or use AISIX Cloud's managed [Provider Key Rotation](../cloud/provider-key-rotation.md), which holds the secret in the control plane and projects only what each environment needs.
+:::
+
 ```bash title="Create a provider key"
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
   -H "Authorization: Bearer YOUR_ADMIN_KEY" \
@@ -39,6 +43,24 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
     "secret": "YOUR_PROVIDER_API_KEY",
     "api_base": "https://api.openai.com/v1"
   }'
+```
+
+:::caution `api_base` convention differs per provider
+Each provider has its own rule — do not generalize from this OpenAI example. `openai` expects `api_base` to include `/v1`; `deepseek` wants the bare host (`https://api.deepseek.com`); `gemini` wants the OpenAI-compat prefix (`https://generativelanguage.googleapis.com/v1beta/openai`); `anthropic` wants the bare host (the bridge appends `/v1/messages` itself). The gateway does not normalize these forms today; a wrong `api_base` fails as an upstream `404` at request time, not at admin-write time. See [Provider Keys § `api_base` Behavior](../configuration/provider-keys.md#api_base-behavior) for the full truth table.
+:::
+
+The admin envelope returns a `ResourceEntry` shape:
+
+```json
+{
+  "id": "...",
+  "revision": 1,
+  "value": {
+    "display_name": "openai-upstream",
+    "secret": "YOUR_PROVIDER_API_KEY",
+    "api_base": "https://api.openai.com/v1"
+  }
+}
 ```
 
 Capture the returned `id`. You will use it as `provider_key_id` when creating the model.
@@ -83,13 +105,25 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/apikeys \
 
 ## Step 4: Wait For Configuration Propagation
 
-Admin writes do not become visible to the proxy instantly. The gateway publishes dynamic resources through the watch-driven snapshot path.
+Admin writes do not become visible to the proxy instantly. The gateway publishes dynamic resources through the watch-driven snapshot path. On a healthy local etcd this is typically under 500 ms; on a slow CI runner or a cold etcd it can be several seconds.
 
-In practice, allow a short delay before the proxy request:
+A fixed sleep is fine for local evaluation:
 
 ```bash title="Wait briefly for propagation"
 sleep 1
 ```
+
+For automation or slow environments, poll the proxy until the model becomes visible — this is what the e2e harness does with its `waitConfigPropagation` helper:
+
+```bash title="Poll until the model is visible"
+until curl -sf http://127.0.0.1:3000/v1/models \
+  -H "Authorization: Bearer sk-demo-caller" \
+  | grep -q '"gpt-4o-prod"'; do
+  sleep 1
+done
+```
+
+If a subsequent proxy call returns `404 model_not_found`, propagation is still in flight — wait longer or switch to the polling form.
 
 ## Step 5: Verify `/v1/models`
 
@@ -109,11 +143,14 @@ Expected result:
     {
       "id": "gpt-4o-prod",
       "object": "model",
+      "created": 1715000000,
       "owned_by": "openai"
     }
   ]
 }
 ```
+
+`created` is the gateway-side unix timestamp at response time, not when the model resource was provisioned. The OpenAI SDK accepts it as-is.
 
 ## Step 6: Send The First Chat Request
 
@@ -129,14 +166,74 @@ curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
   }'
 ```
 
-If the upstream provider is reachable and the model is configured correctly, the response will follow the OpenAI chat-completions shape.
+If the upstream provider is reachable and the model is configured correctly, the response follows the OpenAI chat-completions shape.
+
+## Step 7: Verify The Auth And Allowlist Contract
+
+Two negative-path checks prove the proxy is doing the work the configuration claims it is doing.
+
+### Missing bearer returns `401`
+
+```bash title="Verify missing-bearer rejection"
+curl -sS -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-prod","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Expected: `401`. The response body uses the proxy error envelope:
+
+```json
+{
+  "error": {
+    "message": "missing or malformed Authorization header",
+    "type": "invalid_api_key"
+  }
+}
+```
+
+### Unauthorized model returns `403`
+
+Ask for a model alias the caller key is **not** in `allowed_models` for:
+
+```bash title="Verify unauthorized-model rejection"
+curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
+  -H "Authorization: Bearer sk-demo-caller" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"some-model-not-in-allowed-models","messages":[{"role":"user","content":"hi"}]}'
+```
+
+Expected: `403` with `"type": "permission_denied"`. Or `404` with `"type": "model_not_found"` if the alias does not exist in the snapshot at all.
+
+These two paths exercise the same authentication and authorization code paths that gate every production request — passing them proves the gateway is correctly enforcing the caller key and the `allowed_models` list, not just returning `200` because the upstream happens to be reachable.
 
 ## Verification Notes
 
-- `401` usually means the caller API key is missing or incorrect.
-- `403` means the key exists, but the model is not in `allowed_models`.
-- `404` means the model alias does not resolve in the current snapshot.
-- `500` on the admin API usually means the store or etcd path failed.
+- `401` (`invalid_api_key`) — the caller key is missing, malformed, or unknown to the snapshot.
+- `403` (`permission_denied`) — the key exists, but the resolved model is not in its `allowed_models`.
+- `404` (`model_not_found`) — the model alias does not resolve in the current snapshot.
+- `503` (`provider_unavailable`) — no provider bridge is registered for the resolved provider.
+- Admin errors (`/admin/v1/*`) use a different envelope: `{"error_msg": "..."}`. See [Admin API](../configuration/admin-api.md).
+
+## Cleanup
+
+Delete the resources you created so they don't leak into other work. Delete in reverse dependency order — caller key first (so the model can no longer be reached), then the model, then the provider key.
+
+```bash title="Delete the caller API key"
+curl -sS -X DELETE http://127.0.0.1:3001/admin/v1/apikeys/YOUR_APIKEY_ID \
+  -H "Authorization: Bearer YOUR_ADMIN_KEY"
+```
+
+```bash title="Delete the model"
+curl -sS -X DELETE http://127.0.0.1:3001/admin/v1/models/YOUR_MODEL_ID \
+  -H "Authorization: Bearer YOUR_ADMIN_KEY"
+```
+
+```bash title="Delete the provider key"
+curl -sS -X DELETE http://127.0.0.1:3001/admin/v1/provider_keys/YOUR_PROVIDER_KEY_ID \
+  -H "Authorization: Bearer YOUR_ADMIN_KEY"
+```
+
+Use the `id` values captured from each `POST` response. To remove the gateway itself, see the [self-hosted cleanup](self-hosted.md#cleanup).
 
 ## Related Pages
 

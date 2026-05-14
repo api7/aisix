@@ -69,45 +69,47 @@ In another terminal, you should now have:
 
 ## Step 4: Verify the listeners
 
+Both listeners expose an unauthenticated liveness route at `/livez`. The proxy and admin handlers share the same response shape, so you can probe either with the same expectation.
+
 Verify the proxy listener:
 
-```bash title="Check proxy health"
-curl -s http://127.0.0.1:3000/health
+```bash title="Check proxy liveness"
+curl -sS http://127.0.0.1:3000/livez
 ```
 
 Verify the admin listener:
 
-```bash title="Check operator health surface"
-curl -s \
-  -H "Authorization: Bearer YOUR_ADMIN_KEY" \
-  http://127.0.0.1:3001/admin/v1/health
+```bash title="Check admin liveness"
+curl -sS http://127.0.0.1:3001/livez
 ```
 
 ## Expected Result
 
-The proxy health response should include a JSON body like:
+A healthy gateway returns `200 OK` with the plain-text body `ok` on both listeners:
 
-```json
-{
-  "status": "ok",
-  "models": 0,
-  "apikeys": 0,
-  "providers": 0
-}
+```text
+ok
 ```
 
-The operator health response should include a JSON body with a top-level `status` field and a `models` array. For example:
+The body is intentionally minimal — the unauthenticated liveness route does not expose snapshot counts or registered providers. During shutdown the same routes return `500 Internal Server Error` with a body ending in `livez check failed`, which Kubernetes-style probes can match on.
 
-```json
-{
-  "status": "ok",
-  "models": []
-}
-```
+For more detail, append `?verbose=1`. The verbose body is human-readable plain text suitable for `curl`, ending with `livez check passed` when the process is healthy.
+
+For authenticated per-model operator health after boot, use `GET /admin/v1/health`. That endpoint returns the per-model `health` level (`0` healthy, `1` degraded, `2` down) for every model in the current snapshot. See [Health Checks](../operations/health-checks.md) for the operator-facing routes.
 
 :::note
 This quickstart only verifies gateway bootstrap. Dynamic resources such as models, API keys, provider keys, guardrails, cache policies, and observability exporters are managed after boot through the admin API.
 :::
+
+## Cleanup
+
+Stop the gateway process (Ctrl-C in its terminal) and remove the etcd container so you don't leak local state:
+
+```bash title="Stop the etcd container"
+docker rm -f aisix-etcd
+```
+
+If you created admin resources later (models, API keys, provider keys), delete them through the admin API before stopping etcd, or remove the etcd `--prefix` keyspace if you want a clean slate.
 
 ## Next Steps
 

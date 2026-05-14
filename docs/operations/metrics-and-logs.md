@@ -6,11 +6,15 @@ sidebar_position: 54
 
 The gateway currently exposes observability through multiple paths.
 
+Use them together. No single signal tells the whole story.
+
 ## Metrics
 
 `GET /metrics` on the admin listener is the Prometheus scrape endpoint.
 
 This endpoint is unauthenticated by design on the private admin listener.
+
+Treat `/metrics` as infrastructure-facing, not as a public diagnostics surface.
 
 ## Access Logs And Usage Signals
 
@@ -20,6 +24,12 @@ Current proxy behavior emits:
 - metrics updates
 - usage-event emission on request paths that support it
 
+These signals answer different questions:
+
+- access logs: what happened to one request
+- metrics: what is happening over time
+- usage events: what usage/accounting-oriented event was emitted on supported paths
+
 ## Response Headers With Operational Value
 
 Current response headers include:
@@ -28,11 +38,30 @@ Current response headers include:
 - `x-aisix-cache` on chat cache hit or miss paths
 - `Retry-After` on rate-limit-style rejections when applicable
 
+Those headers are often the fastest per-request debugging hints available to a client team.
+
 ## Exporters
 
 Observability exporters are dynamic resources configured through `/admin/v1/observability_exporters`.
 
 Current exporter support is `otlp_http` only.
+
+## Operator Workflow
+
+1. use `/metrics` for scrape-based monitoring
+2. use access logs for request-level diagnosis
+3. use response headers for caller-visible operational hints
+4. use dynamic exporters when you need telemetry fan-out to external observability systems
+
+## Troubleshooting
+
+### Metrics look healthy but callers report failures
+
+Inspect access logs and caller-visible headers for request-level evidence.
+
+### Exporters are configured but downstream traces are missing
+
+Validate exporter enablement, endpoint correctness, and outbound connectivity from the data plane.
 
 ## Related Pages
 

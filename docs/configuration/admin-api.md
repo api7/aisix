@@ -14,6 +14,8 @@ Use this API when you need to:
 - manage guardrails, cache policies, and observability exporters
 - inspect operator-facing health
 
+Use it as the write path for standalone deployments, not as a caller-facing integration surface.
+
 ## Listener And Auth Model
 
 In standalone mode, the admin API runs on the admin listener configured in bootstrap config.
@@ -34,9 +36,16 @@ The following routes are currently public on the admin listener:
 Example:
 
 ```bash title="Authenticated admin request"
-curl -sS http://127.0.0.1:3001/admin/v1/health \
+curl -sS http://127.0.0.1:3001/admin/v1/models \
   -H "Authorization: Bearer YOUR_ADMIN_KEY"
 ```
+
+Operationally, there are two very different key types in this product:
+
+- admin keys for operator access to `/admin/v1/*`
+- proxy caller API keys for `/v1/*`
+
+Do not mix them.
 
 ## Current Admin Surface
 
@@ -62,6 +71,12 @@ The current admin router exposes:
 - `GET /admin/v1/health`
 - `POST /playground/chat/completions`
 
+Think about these routes in three groups:
+
+- public operator helpers: health, metrics, and OpenAPI discovery
+- CRUD resources: models, API keys, provider keys, guardrails, cache policies, exporters
+- convenience operator workflow: the in-process playground
+
 ## Error Envelope
 
 The admin API does **not** use the OpenAI-style proxy error shape.
@@ -84,6 +99,10 @@ Current status behavior includes:
 
 Public routes such as `/health`, `/metrics`, and the OpenAPI endpoints do not require admin auth.
 
+Use `GET /health` for simple admin-listener reachability. Use `GET /admin/v1/health` when you need authenticated per-model operator health.
+
+For automation, plan to branch on admin status codes and `error_msg`, not on the proxy-side OpenAI-compatible error envelope.
+
 ## Models
 
 `/admin/v1/models` manages model resources.
@@ -93,6 +112,8 @@ Current behavior:
 - POST creates a UUID-backed resource entry
 - PUT updates an existing model and bumps revision
 - duplicate `display_name` values are rejected
+
+Use model CRUD when you need to change caller-visible routing behavior. A model row is the main bridge between your caller contract and the upstream provider configuration.
 
 Example:
 
@@ -118,6 +139,8 @@ Important current behavior:
 - `allowed_models` controls model authorization
 - `POST /admin/v1/apikeys/:id/rotate` returns a new plaintext key exactly once in the rotation response
 
+This makes API-key creation and rotation an operator workflow with one-time secret reveal semantics. Treat the rotate response as the only chance to capture the new plaintext key.
+
 ## Provider Keys
 
 `/admin/v1/provider_keys` manages upstream credentials reused by models.
@@ -127,6 +150,8 @@ Current fields include:
 - `display_name`
 - `secret`
 - optional `api_base`
+
+Provider keys should be reused across related models where that matches your operational ownership boundary. That keeps upstream credential rotation separate from model alias changes.
 
 ## Guardrails
 
@@ -141,6 +166,8 @@ Current operator guidance:
 
 - use `keyword` for current in-process blocking behavior
 - treat `bedrock` as a schema-backed but limited runtime path
+
+Create guardrails only when you are also clear about where they execute today. The current live guardrail path is narrower than the full schema surface.
 
 See [Guardrails](guardrails.md).
 
@@ -162,6 +189,8 @@ Current documented `applies_to` forms are:
 - `model:<display_name>`
 - `api_key:<api_key_id>`
 
+Cache policies are a matching layer, not a guarantee that every request will be cached. They must line up with the bootstrap cache backend and the current request shape.
+
 See [Caching](caching.md).
 
 ## Observability Exporters
@@ -173,6 +202,8 @@ Current behavior:
 - `kind=otlp_http` is the supported resource type
 - plain `http://` endpoints are rejected unless they are loopback-style development endpoints
 
+Use dynamic exporters when you want request telemetry fan-out to be configurable without restarting the gateway process.
+
 See [Observability Exporters](observability-exporters.md).
 
 ## Health, Metrics, And Playground
@@ -182,6 +213,12 @@ See [Observability Exporters](observability-exporters.md).
 This is the operator-facing health endpoint.
 
 It reports top-level health plus current model health state.
+
+Use it to answer operator questions such as:
+
+- is the admin surface alive
+- does the process have a current snapshot
+- are configured models currently healthy from the gateway's point of view
 
 ### `GET /metrics`
 
@@ -197,6 +234,8 @@ Important current behavior:
 - it forwards into the proxy router inside the same process
 - it runs the full proxy middleware path
 
+This is useful for operator debugging because it exercises the normal proxy stack while avoiding a separate client setup step.
+
 ## Verification
 
 Verify that the admin surface is reachable:
@@ -207,6 +246,20 @@ curl -sS http://127.0.0.1:3001/admin/v1/health \
 ```
 
 Then create a provider key, model, and API key as shown in [First Model, First Key, First Request](../quickstart/first-model-first-key-first-request.md).
+
+## Troubleshooting
+
+### `401` on `/admin/v1/*`
+
+Check the bootstrap admin key first. Do not test with a proxy caller key.
+
+### A resource is created but proxy traffic still fails
+
+That is usually a configuration propagation delay, not a failed admin write.
+
+### `409` on create
+
+The most common cause is a duplicate logical name such as `display_name`.
 
 ## Related Pages
 

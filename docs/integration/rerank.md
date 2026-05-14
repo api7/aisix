@@ -6,6 +6,8 @@ sidebar_position: 28
 
 AISIX AI Gateway exposes `POST /v1/rerank` as a rerank proxy endpoint.
 
+Use this endpoint when you want to keep rerank calls behind the same caller-key and model-alias contract as the rest of the gateway.
+
 ## Gateway Behavior
 
 For rerank requests, the gateway:
@@ -18,11 +20,15 @@ For rerank requests, the gateway:
 
 The gateway builds the upstream target by appending `/v1/rerank` to the configured rerank base URL.
 
+That makes the `ProviderKey.api_base` value especially important for rerank-capable models.
+
 ## Configuration Boundary
 
 This endpoint is intended for providers that expose a native rerank surface.
 
 In practice, configure the provider key `api_base` for the provider's rerank endpoint root.
+
+If the base URL is wrong, rerank failures are usually configuration mistakes rather than caller-auth issues.
 
 ## Example
 
@@ -36,6 +42,12 @@ curl -sS -X POST http://127.0.0.1:3000/v1/rerank \
     "documents": ["doc a", "doc b", "doc c"]
   }'
 ```
+
+## Troubleshooting
+
+### The request returns an upstream `404`
+
+Check the rerank provider base URL first. The gateway appends `/v1/rerank` to that root.
 
 ## Related Pages
 

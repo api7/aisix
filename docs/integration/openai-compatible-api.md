@@ -13,11 +13,43 @@ Use this page when you need to understand:
 - how model aliases are resolved
 - what the current error and authorization boundaries look like
 
+## Request Flow
+
+A `POST /v1/chat/completions` (or any other proxy endpoint) takes this path through the gateway:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client
+    participant Proxy as AISIX proxy (:3000)
+    participant Hub as Provider bridge (hub)
+    participant Upstream as Upstream LLM
+
+    Client->>Proxy: POST /v1/chat/completions (Bearer sk-...)
+    Note over Proxy: 1. hash bearer (SHA-256) and resolve ApiKey
+    Note over Proxy: 2. resolve req.model to a Model in the snapshot
+    Note over Proxy: 3. enforce allowed_models on the ApiKey
+    Note over Proxy: 4. run input guardrails
+    Note over Proxy: 5. budget pre-check (allow-all in standalone; cp-api /dp/budget_check in managed mode)
+    Note over Proxy: 6. enforce per-key / per-model rate limits
+    Note over Proxy: 7. cache lookup — on hit, return cached response and skip steps 8–10
+    Proxy->>Hub: dispatch by Model.provider
+    Hub->>Upstream: provider-native request shape
+    Upstream-->>Hub: provider-native response (JSON or SSE)
+    Hub-->>Proxy: normalised OpenAI-shaped response
+    Note over Proxy: 8. run output guardrails
+    Note over Proxy: 9. on cache miss, write the response into the CachePolicy backend
+    Note over Proxy: 10. emit metrics + access log + UsageEvent
+    Proxy-->>Client: 200 OK or proxy error envelope
+```
+
+Each step has its own failure path; see [Error boundaries](#error-boundaries) below for the matching status codes. The budget pre-check is a no-op in standalone mode (the DP runs an allow-all budget client) and a live call to cp-api over mTLS in managed mode — both modes traverse the same code path.
+
 ## Current Proxy Surface
 
 The proxy router currently mounts:
 
-- `GET /health`
+- `GET /livez`
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - `POST /v1/completions`
@@ -79,7 +111,7 @@ At a high level, the request flow is:
 2. resolve the model
 3. enforce allowlist authorization
 4. run input guardrails
-5. enforce rate limits and budget checks
+5. enforce rate limits and, in managed mode, budget checks
 6. dispatch to the upstream bridge
 7. render an OpenAI-shaped response
 8. emit metrics, access logs, and usage events

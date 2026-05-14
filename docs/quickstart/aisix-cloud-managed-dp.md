@@ -8,6 +8,12 @@ This guide explains the current managed data-plane bootstrap path for AISIX Clou
 
 Use it when you want to understand how a data plane connects to the AISIX Cloud control plane, receives configuration, and starts serving traffic.
 
+Use it before:
+
+- deploying a managed data plane into your own environment
+- debugging why a data plane is not connecting to AISIX Cloud
+- reading the deeper Cloud pages about projection, resilience, and certificate rotation
+
 ## Current Bootstrap Model
 
 The current managed flow is certificate-based.
@@ -22,6 +28,8 @@ At a high level:
 
 The current `/dp/*` surface is mTLS-authenticated. The older `/dp/register` bearer-token pattern is not the current bootstrap path.
 
+That distinction matters because older comments and older mental models can make the bootstrap path look token-based when current Cloud behavior is certificate-based.
+
 ## What The Control Plane Issues
 
 The control plane issues a gateway certificate bundle for the target environment.
@@ -33,6 +41,8 @@ That bundle contains:
 - a CA bundle PEM
 
 The data plane uses those materials to authenticate to the control-plane data-plane manager.
+
+The bundle is environment-scoped. The managed data plane uses it to connect to the control-plane surface that owns heartbeat, telemetry, certificate rotation, and budget checks.
 
 ## What The Data Plane Receives
 
@@ -46,17 +56,48 @@ In managed mode, the data plane is started with environment variables for:
 
 The managed data plane then uses the same single binary, but follows the managed bootstrap path instead of binding the standalone admin surface.
 
+In other words:
+
+- standalone mode expects operator-driven admin writes on `:3001`
+- managed mode expects control-plane projection and mTLS-authenticated control-plane coordination
+
 ## Operational Notes
 
 - configuration is projected from the control plane into the managed environment
 - the data plane persists a local config cache for offline resilience
 - the control-plane data-plane manager exposes `/dp/heartbeat`, `/dp/telemetry`, `/dp/rotate-cert`, and `/dp/budget_check` behind mTLS
 
+## What This Quickstart Does Not Cover
+
+This page is a bootstrap overview, not a full deployment manual.
+
+It does not try to document:
+
+- every dashboard click path
+- every environment creation workflow
+- every certificate rotation sequence
+- every billing or usage-event detail
+
 ## Product Boundary
 
 This page is intentionally about the bootstrap flow, not a full step-by-step dashboard tutorial.
 
 For current customer-facing Cloud behavior, continue with the Cloud docs section.
+
+## Troubleshooting Pointers
+
+### The data plane never becomes healthy
+
+Start with:
+
+- certificate bundle correctness
+- `AISIX_MANAGED__CP_BASE_URL`
+- `AISIX_MANAGED__CP_ETCD_ENDPOINT`
+- trust chain in `AISIX_MANAGED__CP_CA_PEM`
+
+### The data plane starts but does not receive configuration
+
+Focus on control-plane projection and environment-scoped resource visibility rather than the standalone admin API, because managed mode does not use the standalone admin surface as its source of truth.
 
 ## Related Pages
 

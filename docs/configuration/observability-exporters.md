@@ -8,6 +8,8 @@ Observability exporters let the data plane send request telemetry directly to yo
 
 Current scope is `kind: "otlp_http"` only.
 
+Use this page when you want request-level telemetry fan-out without restarting the process for every endpoint change.
+
 ## Current Fields
 
 - `name`
@@ -15,6 +17,12 @@ Current scope is `kind: "otlp_http"` only.
 - `kind`
 - `endpoint`
 - optional `headers`
+
+The basic operator questions for this resource are:
+
+- where should telemetry be sent
+- what auth headers are required for that destination
+- should the exporter currently participate in fan-out
 
 Example:
 
@@ -45,6 +53,8 @@ Allowed non-TLS development cases include:
 
 For non-loopback deployments, use `https://...`.
 
+This protects against accidentally configuring plain HTTP exporters for non-local destinations.
+
 ## Runtime Model
 
 Current exporter behavior:
@@ -53,7 +63,25 @@ Current exporter behavior:
 - the data plane, not the control plane, sends the HTTP export traffic
 - disabled exporters remain in the snapshot but are skipped
 
+This means the request content and telemetry egress path stay with the data plane.
+
 This keeps sensitive prompt and response content on the data plane egress path.
+
+## Operator Guidance
+
+- start with one exporter and verify delivery before adding several
+- keep credentials in `headers` aligned with the destination's OTLP/HTTP auth model
+- disable exporters rather than deleting them immediately when you are diagnosing delivery issues
+
+## Troubleshooting
+
+### The exporter saves but no telemetry appears downstream
+
+Check endpoint correctness, destination auth headers, and whether the exporter is enabled.
+
+### The admin API rejects an `http://` endpoint
+
+That is expected unless the destination is one of the allowed local-development forms.
 
 ## Related Pages
 

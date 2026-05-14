@@ -12,6 +12,28 @@ Current documented behavior includes:
 - usage-event views surfaced from the control plane
 - managed budget enforcement and budget-driven `429` outcomes on real DP traffic
 
+This is where Cloud behavior goes beyond a standalone gateway instance with only local request handling.
+
+## Operational Meaning
+
+In managed mode, the data plane is not only serving traffic. It is also emitting usage-oriented signals back to the control plane.
+
+Those signals support:
+
+- usage visibility
+- budget workflows
+- billing-oriented control-plane features
+
+## Budget Relationship
+
+The most important customer-visible effect is that managed deployments can apply real budget decisions on data-plane traffic, which can result in `429` denials when a budget policy is exceeded.
+
+## Troubleshooting
+
+### Usage appears incomplete in Cloud
+
+Look first at telemetry delivery and managed data-plane health, not just caller request success.
+
 ## Related Pages
 
 - [AISIX Cloud Overview](overview.md)

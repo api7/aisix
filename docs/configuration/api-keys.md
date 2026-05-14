@@ -8,12 +8,19 @@ API keys are the caller-facing credentials used on the proxy surface.
 
 The gateway does not store plaintext caller keys in the `ApiKey` resource. It stores `key_hash`, which is the SHA-256 hex digest of the plaintext bearer token.
 
+This resource controls who can call the proxy and which model aliases they can use.
+
 ## Current Fields
 
 - `key_hash`
 - `allowed_models`
 - optional `rate_limit`
-- optional `max_budget_usd`
+
+Think of those fields as three distinct control layers:
+
+- identity: `key_hash`
+- authorization: `allowed_models`
+- policy: `rate_limit`
 
 ## Create A Caller Key
 
@@ -39,6 +46,8 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/apikeys \
   }'
 ```
 
+The plaintext bearer token is the value your clients will send in `Authorization: Bearer ...`.
+
 ## Model Authorization
 
 `allowed_models` controls which model aliases the caller may use.
@@ -49,9 +58,13 @@ Current behavior:
 - an explicit list allows only those model aliases
 - an empty array is valid but denies every model
 
+Choose explicit allowlists unless you intentionally want a wildcard operator or internal key.
+
 ## Rotation
 
 `POST /admin/v1/apikeys/:id/rotate` generates a new plaintext bearer, stores only its hash, and returns the plaintext exactly once.
+
+That means rotation is both a security action and a distribution event. You need a plan for getting the new plaintext into the caller before the old one is retired.
 
 Example response shape:
 
@@ -81,16 +94,32 @@ The current rate-limit object supports:
 
 Current enforcement uses the API key's `rate_limit` object. Model-level `rate_limit` exists in the schema, but current hot-path enforcement is keyed off the authenticated API key.
 
+Use `ApiKey.rate_limit` as the real operator control today.
+
 ## Budget Boundary
 
-`max_budget_usd` exists in the `ApiKey` schema and admin OpenAPI surface.
+Managed budget enforcement exists on the managed `/dp/budget_check` path.
 
-Current runtime boundary:
+Current standalone boundary:
 
-- managed deployments can run budget checks through the managed `/dp/budget_check` path
 - standalone self-hosted deployments default to a disabled budget client, which is allow-all
+- the standalone admin write validator currently rejects `max_budget_usd`, even though broader typed and OpenAPI surfaces reference it
 
-Do not treat `max_budget_usd` as a fully documented standalone self-hosted budget control yet.
+Do not treat `max_budget_usd` as part of the current verified standalone admin write contract.
+
+## Troubleshooting
+
+### A valid key gets `403`
+
+Check `allowed_models` first. That is an authorization failure, not an authentication failure.
+
+### The caller lost access after rotation
+
+Make sure the client is using the newly returned plaintext key, not the old one.
+
+### Rate-limit behavior is not matching a model row
+
+That is expected today if you configured only `Model.rate_limit`. Current hot-path enforcement is centered on `ApiKey.rate_limit`.
 
 ## Related Pages
 

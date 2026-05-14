@@ -47,7 +47,8 @@ An API key also carries:
 
 - `allowed_models`
 - optional `rate_limit`
-- optional `max_budget_usd`
+
+Managed budget paths may also reference per-key budget state, but `max_budget_usd` is not part of the current verified standalone admin write contract.
 
 An empty `allowed_models` list denies access to every model. A wildcard entry `"*"` allows access to every model in scope.
 

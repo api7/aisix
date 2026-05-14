@@ -23,7 +23,13 @@ Typical signal:
 What to do:
 
 - poll the target endpoint or `/v1/models`
-- inspect `/admin/v1/health` for snapshot freshness
+- inspect `/admin/v1/health` for per-model health and optional freshness data
+
+First-response checklist:
+
+1. confirm the admin write succeeded
+2. check admin health freshness
+3. poll instead of re-writing the same resource immediately
 
 ## etcd Connectivity Problems
 
@@ -39,6 +45,8 @@ What to check:
 - etcd TLS files
 - network path from gateway to etcd
 
+If startup is involved, treat etcd reachability as a hard dependency, not as an optional background component.
+
 ## Guardrail Blocking
 
 Symptoms:
@@ -51,6 +59,8 @@ What to check:
 - enabled keyword guardrails
 - `hook_point`
 - the prompt or response content that triggered the rule
+
+Remember that current live guardrail behavior is centered on the chat-completions path.
 
 ## Managed Budget Or mTLS Issues
 
@@ -65,6 +75,8 @@ What to check:
 - managed bootstrap produced the expected bundle
 - control-plane URL and trust roots are correct
 
+Also check whether you are diagnosing a managed-mode deployment at all. These symptoms do not apply the same way to standalone mode.
+
 ## Playground Issues
 
 Symptom:
@@ -74,6 +86,15 @@ Symptom:
 Meaning:
 
 - the admin surface does not have a proxy router wired into the same process state
+
+## Fast Triage Order
+
+When you are not sure where to start:
+
+1. check `GET /health`
+2. check admin-listener `GET /health`, then `GET /admin/v1/health` in standalone mode
+3. identify whether the symptom is startup, propagation, upstream, or policy related
+4. inspect the most specific signal next: logs, metrics, headers, or admin health freshness
 
 ## Related Pages
 
