@@ -81,7 +81,29 @@ fn default_client() -> Client {
 fn resolve_base(ctx: &BridgeContext) -> String {
     match ctx.provider_key.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
-        _ => OPENAI_DEFAULT_BASE.to_string(),
+        _ => {
+            // Use the model's provider-specific default when available,
+            // falling back to the OpenAI default for backward compat.
+            ctx.model
+                .provider
+                .map(provider_bridge_base)
+                .unwrap_or(OPENAI_DEFAULT_BASE)
+                .to_string()
+        }
+    }
+}
+
+/// Provider-specific base URL for the OpenAI-compatible bridge.
+/// Unlike `Provider::default_base_url()` (which omits path prefixes),
+/// this returns the full base including any required version prefix
+/// so that `{base}/chat/completions` produces the correct upstream URL.
+fn provider_bridge_base(provider: aisix_core::Provider) -> &'static str {
+    match provider {
+        aisix_core::Provider::Openai => OPENAI_DEFAULT_BASE, // https://api.openai.com/v1
+        aisix_core::Provider::Deepseek => "https://api.deepseek.com",
+        // Other providers that reuse the OpenAI bridge get their own
+        // default_base_url (no /v1 prefix needed for most).
+        other => other.default_base_url(),
     }
 }
 
@@ -654,5 +676,26 @@ data: [DONE]\n\n";
         .unwrap();
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_override));
         assert_eq!(resolve_base(&ctx), "https://proxy.example.com/v1");
+    }
+
+    #[test]
+    fn resolve_base_uses_provider_specific_default() {
+        let pk: ProviderKey =
+            serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
+
+        // DeepSeek model without api_base → deepseek default, not openai.
+        let deepseek_model: Arc<Model> = Arc::new(
+            serde_json::from_str(
+                r#"{
+                    "display_name": "my-ds",
+                    "provider": "deepseek",
+                    "model_name": "deepseek-chat",
+                    "provider_key_id": "11111111-1111-1111-1111-111111111111"
+                }"#,
+            )
+            .unwrap(),
+        );
+        let ctx = BridgeContext::new("rid", deepseek_model, Arc::new(pk));
+        assert_eq!(resolve_base(&ctx), "https://api.deepseek.com");
     }
 }
