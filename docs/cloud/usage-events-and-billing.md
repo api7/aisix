@@ -29,7 +29,7 @@ Those signals support:
 In addition to token counts, status, and cost, each usage event the data plane emits carries:
 
 - `latency_ms` — total elapsed time for the request, populated on every request path
-- `ttft_ms` — time to first token, populated on streaming chat completions when the first content-bearing chunk arrives
+- `ttft_ms` — time to first token, populated on streaming chat completions when the first chunk carrying generated output arrives (text content **or** a tool-call delta)
 
 `ttft_ms` is omitted from the wire when it would otherwise be zero — non-streaming, cache-hit, and error paths do not contribute a TTFT value. Use it to break down end-to-end latency into the upstream-warm-up portion versus the streaming portion.
 

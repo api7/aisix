@@ -79,7 +79,7 @@ Policies are normalised to the same internal limit fields used by inline limits:
 | `minute` | `rpm` | `tpm` |
 | `hour` | `rpd` (× 24) | `tpd` (× 24) |
 
-Window values outside this set produce an unrestricted policy (the row loads but contributes nothing).
+Out-of-enum window values are rejected by the JSON Schema at etcd load — the row never enters the snapshot and is surfaced through the rejection signal.
 
 ### Example Policies
 

@@ -101,7 +101,7 @@ A failed probe transitions the model to `unhealthy` in the runtime status tracke
 }
 ```
 
-All fields are optional. The example shows the current defaults — omitting the block entirely uses the same values.
+All fields are optional. The example shows the *effective* defaults the proxy applies; at the schema level every field is `null` until set, but every accessor falls back to the value shown above. Omitting the `cooldown` block entirely is equivalent to writing the example above verbatim.
 
 Field semantics:
 

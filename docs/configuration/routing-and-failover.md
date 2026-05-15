@@ -88,7 +88,7 @@ Before dispatch, routing consults direct-model runtime state and produces the ac
 
 1. partition targets into `healthy`, `cooldown`, and `unhealthy` based on the runtime status tracker
 2. if any healthy targets exist, dispatch to those
-3. if no healthy targets exist but at least one `cooldown` target is non-`unhealthy`, dispatch to the non-`unhealthy` set (cooldown targets are preferred over background-confirmed-unhealthy ones)
+3. if no healthy targets exist but at least one target is in `cooldown`, dispatch to every target whose runtime status is not `unhealthy` (cooldown candidates are preferred over background-confirmed-unhealthy ones)
 4. if every target is filtered out, apply the routing model's [`on_all_filtered`](#all-targets-filtered-policy) policy
 
 The runtime state itself is exposed on `GET /admin/v1/models/status`.
