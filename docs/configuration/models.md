@@ -31,9 +31,12 @@ Optional fields include:
 - `timeout`
 - `rate_limit`
 - `cost`
+- `cooldown`
 - `background_model_check`
 
 Read those optional fields as metadata and policy hints layered onto the basic alias mapping.
+
+`cooldown` and `background_model_check` are the two runtime-status sources that feed [`GET /admin/v1/models/status`](../reference/admin-api-reference.md#runtime-model-status) and the [routing filter](routing-and-failover.md#runtime-filtering). Both are direct-model-only and rejected on routing models.
 
 Example:
 
@@ -74,8 +77,45 @@ Current semantics:
 
 - only direct models may carry `background_model_check`
 - routing models reject `background_model_check`
-- `ignore_statuses` records the last probe result without marking the model unhealthy
+- `ignore_statuses` records the last probe result without marking the model unhealthy; the default ignored set is `[408, 429]`
 - `stale_after_seconds` is a safety valve for old unhealthy probe state when the checker stops refreshing
+- `interval_seconds` has a minimum of `5`; `timeout_seconds`, `max_tokens`, and `stale_after_seconds` have a minimum of `1`
+
+A failed probe transitions the model to `unhealthy` in the runtime status tracker. A subsequent successful probe clears that state. The routing filter excludes `unhealthy` candidates ahead of `cooldown` candidates.
+
+### Cooldown
+
+`cooldown` is the request-path complement to `background_model_check`. Where the background probe sets `unhealthy` from out-of-band probes, `cooldown` sets a short-lived skip window from the failures observed on real traffic.
+
+```json title="Direct model cooldown"
+{
+  "cooldown": {
+    "enabled": true,
+    "default_seconds": 30,
+    "max_seconds": 600,
+    "honor_retry_after": true,
+    "trigger_statuses": [401, 408, 429, 500, 502, 503, 504],
+    "trigger_on_timeout": true,
+    "trigger_on_transport": true
+  }
+}
+```
+
+All fields are optional. The example shows the current defaults — omitting the block entirely uses the same values.
+
+Field semantics:
+
+- `enabled` (default `true`) — set to `false` to keep the model in rotation no matter what request-path failures look like.
+- `default_seconds` (default `30`) — cooldown TTL when the upstream did not return a `Retry-After` header, or when `honor_retry_after` is `false`. Setting this to `0` disables cooldown for the model (alternative to `enabled: false`).
+- `max_seconds` (default `600`) — upper bound on the cooldown TTL. Caps a misbehaving upstream that returns an unreasonable `Retry-After` value.
+- `honor_retry_after` (default `true`) — when the upstream OpenAI / Anthropic bridge parses a `Retry-After: <seconds>` header, the cooldown layer uses that value (clamped by `max_seconds`).
+- `trigger_statuses` (default `[401, 408, 429, 500, 502, 503, 504]`) — upstream HTTP status codes that put the target into cooldown. The default set covers auth failures, request timeouts, rate limits, and transient server errors. Caller-mistake classes (`400`, `403`, `422`) are intentionally excluded so a single bad request does not cool down a healthy upstream.
+- `trigger_on_timeout` (default `true`) — request-path timeouts trigger cooldown.
+- `trigger_on_transport` (default `true`) — transport, decode, and stream-abort errors trigger cooldown.
+
+Cooldown triggers independently of whether the failure is retryable. A `429`, for example, cools the model down even when the request itself is not retried.
+
+Once a target enters cooldown, the routing filter prefers other targets within the same routing model. If every candidate is filtered, behavior is governed by [`routing.on_all_filtered`](routing-and-failover.md#all-targets-filtered-policy).
 
 ## Routing Models
 
@@ -122,6 +162,7 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
 - `timeout` is in milliseconds. `0` or omission means no timeout.
 - `cost` stores pricing metadata used by budget and usage accounting paths.
 - `background_model_check` drives direct-model runtime unhealthy state and the `/admin/v1/models/status` view.
+- `cooldown` drives direct-model request-path cooldown and is also surfaced through `/admin/v1/models/status`.
 
 Practical guidance:
 

@@ -53,6 +53,10 @@ This auth model is separate from proxy caller API keys.
 - authenticated operator health route: `/admin/v1/health`
 - operator convenience route: `/playground/chat/completions`
 
+## Resources Without Admin CRUD
+
+`RateLimitPolicy` rows are loaded from etcd directly and do not currently have admin API CRUD routes. Provision them through your control-plane projection or, in self-hosted setups, by writing under the etcd `rate_limit_policies/<id>` prefix. See [Rate Limits § Rate-Limit Policy Entities](../configuration/rate-limits.md#rate-limit-policy-entities).
+
 ## Runtime Model Status
 
 `GET /admin/v1/models/status` returns one row per model in the current snapshot.

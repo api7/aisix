@@ -42,6 +42,7 @@ The proxy emits the following gateway-generated failures. The `error.type` strin
 | `429`  | `rate_limit_exceeded`    | Rate-limit rejection (per-key or per-model) |
 | `429`  | `billing_error` (with `code: "budget_exceeded"`) | Budget rejection from the ApiKey's `max_budget_usd` |
 | `503`  | `provider_unavailable`   | No provider bridge is registered for the resolved provider |
+| `503`  | `all_candidates_unavailable` | Every routing candidate was excluded by runtime status (cooldown or background-unhealthy) and the routing model is configured with `on_all_filtered: fail`. The response carries `Retry-After: 30`. See [Routing And Failover § All-Targets-Filtered Policy](../configuration/routing-and-failover.md#all-targets-filtered-policy) |
 
 Bridge-level upstream failures inherit their `status` and `error.type` from the upstream provider response (see "Upstream Error Mapping" below).
 
@@ -58,6 +59,8 @@ The `billing_error` row is the one case where `error.code` is set on the wire. T
 ```
 
 `503 provider_unavailable` is emitted on the direct-dispatch path when no bridge is registered for the resolved provider. On a routing model the same condition is absorbed into the retry/failover loop and surfaces through the per-target runtime state on `GET /admin/v1/models/status` rather than as a top-level `503` to the caller.
+
+`503 all_candidates_unavailable` is the routing-model fail-fast response when every candidate has been removed by the runtime filter. This is distinct from `provider_unavailable`: the bridge is registered and the model is well-configured, but every target is currently in cooldown or has been marked unhealthy by `background_model_check`.
 
 ## Upstream Error Mapping
 

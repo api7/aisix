@@ -12,6 +12,7 @@ sidebar_position: 65
 - `Guardrail`: content-policy resource applied on chat paths
 - `CachePolicy`: dynamic cache-control resource
 - `ObservabilityExporter`: dynamic OTLP exporter resource
+- `RateLimitPolicy`: standalone rate-limit rule stored in etcd, scoped by `api_key`, `model`, `team`, or `member`
 - `Snapshot`: the in-memory config view used by the proxy hot path
 - `Watch Supervisor`: the task that keeps the snapshot current from etcd
 - `Managed DP`: a managed data plane operating under AISIX Cloud control-plane workflows

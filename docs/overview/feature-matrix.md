@@ -26,7 +26,7 @@ Use it as a navigation aid, not as a replacement for detailed feature pages.
 | Standalone admin API | Available | Current admin surface includes models, API keys, provider keys, guardrails, cache policies, observability exporters, health, metrics, OpenAPI, and playground. |
 | API key allowlist authz | Available | Uses hashed caller keys and model allowlists. |
 | Per-key budgets | Limited | Live enforcement is currently centered on managed-mode `/dp/budget_check`. Standalone self-hosted mode defaults to allow-all, and the standalone admin write validator does not currently accept `max_budget_usd`. |
-| Rate limits and concurrency limits | Available | Current docs should treat these as active gateway behavior. |
+| Rate limits and concurrency limits | Available | Three layers are AND-combined per request: `ApiKey.rate_limit`, `Model.rate_limit`, and scope-matched `RateLimitPolicy` rows (`api_key` / `model` / `team` / `member`). |
 | Routing models and failover | Available | Current model schema supports routing strategies and retry budget behavior. |
 | Keyword guardrails | Available | Current runtime enforcement is on `POST /v1/chat/completions`; non-chat endpoints do not run the guardrail chain today. |
 | Bedrock guardrails | Limited | Current code includes feature-gated runtime wiring. Treat it as an advanced capability with deployment and support caveats rather than as a planned-only feature. |

@@ -26,6 +26,7 @@ Current proxy error `type` values include:
 - `model_not_found`
 - `invalid_request_error`
 - `provider_unavailable`
+- `all_candidates_unavailable`
 - `content_filter`
 - `billing_error`
 - `rate_limit_exceeded`
@@ -40,7 +41,7 @@ These values appear in the proxy's OpenAI-compatible error envelope.
 - `404` model alias not found
 - `422` content blocked by policy
 - `429` rate limit or budget rejection
-- `503` provider bridge unavailable
+- `503` provider bridge unavailable, or every routing candidate filtered out by runtime status
 
 Upstream `5xx` failures generally collapse into `502` through the bridge mapping path, even though `502` is not one of the gateway-originated business-logic classes listed above.
 

@@ -30,6 +30,12 @@ These signals answer different questions:
 - metrics: what is happening over time
 - usage events: what usage/accounting-oriented event was emitted on supported paths
 
+### Streaming TTFT
+
+For streaming chat completions, the per-request usage event carries `ttft_ms` — the elapsed milliseconds from request entry to the first upstream chunk that contains generated content (text or tool-call delta). Role-only opening chunks are skipped so the value reflects the time to actual output, not the time to the first SSE frame.
+
+`ttft_ms` is meaningful only on the streaming path. Non-streaming, cache-hit, and error paths do not surface a TTFT value.
+
 ## Response Headers With Operational Value
 
 Current response headers include:

@@ -15,12 +15,17 @@ This resource controls who can call the proxy and which model aliases they can u
 - `key_hash`
 - `allowed_models`
 - optional `rate_limit`
+- optional `team_id`
+- optional `owner_id`
 
-Think of those fields as three distinct control layers:
+Think of those fields as four distinct control layers:
 
 - identity: `key_hash`
 - authorization: `allowed_models`
-- policy: `rate_limit`
+- inline policy: `rate_limit`
+- bucket identity: `team_id` and `owner_id`
+
+`team_id` and `owner_id` are not access controls in themselves. They are the bucket keys that `team`-scoped and `member`-scoped [`RateLimitPolicy`](rate-limits.md#rate-limit-policy-entities) rows match against. Set them when you want a policy to span all keys belonging to the same team or to the same member.
 
 ## Create A Caller Key
 
@@ -84,7 +89,7 @@ Example response shape:
 
 ## Rate Limits
 
-The current rate-limit object supports:
+The inline rate-limit object on `ApiKey` supports:
 
 - `tpm`
 - `tpd`
@@ -92,9 +97,9 @@ The current rate-limit object supports:
 - `rpd`
 - `concurrency`
 
-Current enforcement uses the API key's `rate_limit` object. Model-level `rate_limit` exists in the schema, but current hot-path enforcement is keyed off the authenticated API key.
+`ApiKey.rate_limit` is one of three layers the proxy enforces. The other two are `Model.rate_limit` (inline on the resolved model) and standalone `RateLimitPolicy` rows. All applicable layers are AND-combined per request.
 
-Use `ApiKey.rate_limit` as the real operator control today.
+See [Rate Limits](rate-limits.md) for the full enforcement model and for `team`/`member`-scope policies that match against `team_id` / `owner_id`.
 
 ## Budget Boundary
 
@@ -117,9 +122,9 @@ Check `allowed_models` first. That is an authorization failure, not an authentic
 
 Make sure the client is using the newly returned plaintext key, not the old one.
 
-### Rate-limit behavior is not matching a model row
+### Rate-limit behavior is not matching the layer you configured
 
-That is expected today if you configured only `Model.rate_limit`. Current hot-path enforcement is centered on `ApiKey.rate_limit`.
+The proxy combines `ApiKey.rate_limit`, `Model.rate_limit`, and matching `RateLimitPolicy` rows on every request. If a layer looks silent, check whether another layer is the actual gating one — a tighter `ApiKey.rate_limit` will trip before a looser `Model.rate_limit`. See [Rate Limits § Troubleshooting](rate-limits.md#troubleshooting).
 
 ## Related Pages
 

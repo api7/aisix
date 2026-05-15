@@ -49,10 +49,24 @@ An API key also carries:
 
 - `allowed_models`
 - optional `rate_limit`
+- optional `team_id` and `owner_id`
+
+`team_id` and `owner_id` are bucket identifiers consumed by `team`-scoped and `member`-scoped [`RateLimitPolicy`](#rate-limit-policy) rows. They are not access controls on their own.
 
 Managed budget paths may also reference per-key budget state, but `max_budget_usd` is not part of the current verified standalone admin write contract.
 
 An empty `allowed_models` list denies access to every model. A wildcard entry `"*"` allows access to every model in scope.
+
+## Rate Limit Policy
+
+A `RateLimitPolicy` is a standalone rate-limit rule stored in etcd. Each policy targets a single subject through `(scope, scope_ref)`:
+
+- `api_key` — match by `ApiKey` entry id
+- `model` — match by `Model` entry id
+- `team` — match by `ApiKey.team_id`
+- `member` — match by `ApiKey.owner_id`
+
+The proxy enforces all matching policies alongside the inline `ApiKey.rate_limit` and `Model.rate_limit` layers. Any layer with a configured limit can reject a request with `429`. See [Rate Limits](../configuration/rate-limits.md) for the full enforcement model.
 
 ## Routing Model
 
