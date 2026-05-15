@@ -40,7 +40,7 @@ The proxy emits the following gateway-generated failures. The `error.type` strin
 | `413`  | `invalid_request_error`  | Request body exceeded `proxy.request_body_limit_bytes` |
 | `422`  | `content_filter`         | Guardrail blocked the request or response content |
 | `429`  | `rate_limit_exceeded`    | Rate-limit rejection (per-key or per-model) |
-| `429`  | `billing_error` (with `code: "budget_exceeded"`) | Budget rejection from the ApiKey's `max_budget_usd` |
+| `429`  | `billing_error` (with `code: "budget_exceeded"`) | Budget rejection from the managed budget controller |
 | `503`  | `provider_unavailable`   | No provider bridge is registered for the resolved provider |
 | `503`  | `all_candidates_unavailable` | Every routing candidate was excluded by runtime status (cooldown or background-unhealthy) and the routing model is configured with `on_all_filtered: fail`. The response carries `Retry-After: 30`. See [Routing And Failover § All-Targets-Filtered Policy](../configuration/routing-and-failover.md#all-targets-filtered-policy) |
 

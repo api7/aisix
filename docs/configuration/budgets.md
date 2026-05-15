@@ -6,8 +6,6 @@ sidebar_position: 37
 
 Budget enforcement in the current gateway runtime is driven by the managed budget-check path, not by a standalone in-process budget engine.
 
-Use this page to avoid over-assuming what `max_budget_usd` means in standalone deployments.
-
 ## Current Runtime Model
 
 Before dispatch, the proxy can call:
@@ -26,13 +24,6 @@ Current boundary:
 
 - managed deployments can attach a live budget client through the managed data-plane path
 - standalone self-hosted deployments default to `BudgetClient::disabled()`, which allows requests through
-
-Because of that boundary, `max_budget_usd` should not be treated as part of the current verified standalone admin write contract.
-
-Current standalone caveat:
-
-- the typed `ApiKey` model and admin OpenAPI mention `max_budget_usd`
-- the active standalone admin JSON Schema validator rejects `max_budget_usd` on write today
 
 ## Operator Guidance
 
@@ -61,11 +52,9 @@ This is a caller-visible denial, not just an internal accounting event.
 
 Inspect budget-check freshness and the cached-decision behavior first.
 
-### A standalone deployment ignores `max_budget_usd`
+### A standalone deployment does not enforce per-key budgets
 
-That is expected with the current standalone runtime boundary.
-
-If you are using the standalone admin API directly, do not send `max_budget_usd` until the write validator and runtime contract are aligned.
+That is expected with the current standalone runtime boundary. Standalone deployments default to allow-all; per-key budget enforcement lives in the managed control plane via the budget-check path.
 
 ## Related Pages
 

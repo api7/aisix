@@ -108,9 +108,6 @@ Managed budget enforcement exists on the managed `/dp/budget_check` path.
 Current standalone boundary:
 
 - standalone self-hosted deployments default to a disabled budget client, which is allow-all
-- the standalone admin write validator currently rejects `max_budget_usd`, even though broader typed and OpenAPI surfaces reference it
-
-Do not treat `max_budget_usd` as part of the current verified standalone admin write contract.
 
 ## Troubleshooting
 
