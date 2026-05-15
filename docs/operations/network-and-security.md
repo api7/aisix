@@ -20,7 +20,7 @@ Recommended boundary:
 
 Do not assume admin auth alone is enough protection. Current admin design intentionally leaves some routes unauthenticated on that private listener.
 
-Current admin design intentionally leaves `/health`, `/metrics`, and OpenAPI endpoints unauthenticated on that private listener, so network placement matters.
+Current admin design intentionally leaves `/livez`, `/metrics`, and OpenAPI endpoints unauthenticated on that private listener, so network placement matters.
 
 ## Secrets And Credentials
 

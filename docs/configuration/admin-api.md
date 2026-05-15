@@ -28,7 +28,7 @@ Admin authentication is static and bootstrap-based for the authenticated operato
 
 The following routes are currently public on the admin listener:
 
-- `GET /health`
+- `GET /livez`
 - `GET /metrics`
 - `GET /admin/openapi.json`
 - `GET /admin/openapi-scalar`
@@ -51,7 +51,7 @@ Do not mix them.
 
 The current admin router exposes:
 
-- `GET /health`
+- `GET /livez`
 - `GET /metrics`
 - `GET /admin/openapi.json`
 - `GET /admin/openapi-scalar`
@@ -97,9 +97,9 @@ Current status behavior includes:
 - `409` for conflicts such as duplicate names
 - `500` for store failures
 
-Public routes such as `/health`, `/metrics`, and the OpenAPI endpoints do not require admin auth.
+Public routes such as `/livez`, `/metrics`, and the OpenAPI endpoints do not require admin auth.
 
-Use `GET /health` for simple admin-listener reachability. Use `GET /admin/v1/health` when you need authenticated per-model operator health.
+Use `GET /livez` for simple admin-listener reachability. Use `GET /admin/v1/health` when you need authenticated per-model operator health.
 
 For automation, plan to branch on admin status codes and `error_msg`, not on the proxy-side OpenAI-compatible error envelope.
 

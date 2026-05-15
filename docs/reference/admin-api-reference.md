@@ -6,7 +6,7 @@ sidebar_position: 61
 
 ## Public Admin-Listener Routes
 
-- `GET /health`
+- `GET /livez`
 - `GET /metrics`
 - `GET /admin/openapi.json`
 - `GET /admin/openapi-scalar`

@@ -91,8 +91,8 @@ Meaning:
 
 When you are not sure where to start:
 
-1. check `GET /health`
-2. check admin-listener `GET /health`, then `GET /admin/v1/health` in standalone mode
+1. check `GET /livez`
+2. check admin-listener `GET /livez`, then `GET /admin/v1/health` in standalone mode
 3. identify whether the symptom is startup, propagation, upstream, or policy related
 4. inspect the most specific signal next: logs, metrics, headers, or admin health freshness
 

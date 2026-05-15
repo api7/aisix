@@ -85,8 +85,8 @@ Before routing real traffic, verify:
 
 After deployment, confirm:
 
-1. `GET /health` returns `200`
-2. admin-listener `GET /health` returns `200` in standalone mode
+1. `GET /livez` returns `200`
+2. admin-listener `GET /livez` returns `200` in standalone mode
 3. `GET /admin/v1/health` returns `200` in standalone mode
 4. `GET /v1/models` returns the expected caller-visible aliases for a test key
 5. one real request succeeds on each endpoint family you actually use

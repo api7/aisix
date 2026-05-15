@@ -207,13 +207,13 @@ This is a deployment concern, not a per-guardrail-row field.
 After updating the bootstrap config, start the gateway and verify:
 
 ```bash title="Verify proxy bootstrap"
-curl -s http://127.0.0.1:3000/health
+curl -s http://127.0.0.1:3000/livez
 ```
 
 For standalone mode, also verify:
 
 ```bash title="Verify admin bootstrap"
-curl -s http://127.0.0.1:3001/health
+curl -s http://127.0.0.1:3001/livez
 ```
 
 ## Troubleshooting

@@ -18,8 +18,8 @@ Treat upgrades as behavior changes to be verified, not just binary replacements.
 
 Before and after an upgrade, verify:
 
-1. `GET /health`
-2. admin-listener `GET /health`
+1. `GET /livez`
+2. admin-listener `GET /livez`
 3. `GET /admin/v1/health`
 4. `GET /v1/models`
 5. one real request on each critical endpoint your clients use
