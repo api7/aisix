@@ -24,6 +24,8 @@ Before and after an upgrade, verify:
 4. `GET /v1/models`
 5. one real request on each critical endpoint your clients use
 
+Note: the unauthenticated liveness route was renamed from `GET /health` to `GET /livez`. If your existing health-check tooling targets `/health`, it will return `404` after upgrading; update it to point at `/livez`. The authenticated `GET /admin/v1/health` endpoint is unchanged.
+
 If you use several endpoint families in production, test each one you depend on rather than assuming chat-completions success proves all compatibility.
 
 ## Areas To Treat Carefully
