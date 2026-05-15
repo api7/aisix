@@ -355,6 +355,7 @@ dependencies = [
  "tower 0.5.3",
  "tower-http",
  "tracing",
+ "uuid",
  "wiremock",
  "x509-parser",
 ]
