@@ -216,14 +216,24 @@ impl<P: ConfigProvider> Supervisor<P> {
     }
 
     /// Append one rejection from a per-event apply path (apply_put).
-    /// Drops the oldest on overflow. apply_delete doesn't reject —
-    /// it's not represented here.
+    /// Drops the oldest on overflow. Existing entries for the same
+    /// key are replaced so heartbeat reports the latest error once.
     fn push_rejection(&self, r: RejectedEntry) {
         let mut guard = self.rejections.lock().unwrap();
+        guard.retain(|existing| existing.key != r.key);
         if guard.len() >= MAX_RETAINED_REJECTIONS {
             guard.remove(0);
         }
         guard.push(r);
+    }
+
+    /// Remove retained rejection signal for a key that was either
+    /// successfully applied or deleted.
+    fn remove_rejection_for_key(&self, key: &str) -> bool {
+        let mut guard = self.rejections.lock().unwrap();
+        let before = guard.len();
+        guard.retain(|existing| existing.key != key);
+        guard.len() != before
     }
 
     /// Drain the JoinHandles for any in-flight cache writes spawned
@@ -362,6 +372,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             }
             new
         });
+        self.remove_rejection_for_key(&entry.key);
 
         // Mirror the put into the cache-tracking map and flush.
         // Track the highest revision we've observed so the cache file
@@ -414,9 +425,14 @@ impl<P: ConfigProvider> Supervisor<P> {
             "rate_limit_policies" => snap.rate_limit_policies.get_by_id(parsed.id).is_some(),
             _ => false,
         };
+        let removed_rejection = self.remove_rejection_for_key(key_str);
         drop(snap);
         if !present {
-            return false;
+            if removed_rejection {
+                let cur_rev = *self.revision.lock().unwrap();
+                self.status.record_apply(cur_rev);
+            }
+            return removed_rejection;
         }
 
         // RCU: load → clone → remove → CAS, retrying under contention.
@@ -1108,9 +1124,9 @@ mod tests {
     // The supervisor now retains the loader's rejected-entry list so
     // the heartbeat path can forward "DP rejected these resources" to
     // cp-api. Tests pin (1) apply_resync replaces the buffer wholesale,
-    // (2) apply_put with a bad row appends to the buffer, (3) the
-    // buffer survives a successful apply_put after a rejection so the
-    // heartbeat doesn't lose signal.
+    // (2) apply_put with a bad row appends to the buffer, (3) a
+    // different successful apply_put does not hide an unrelated
+    // rejection, and (4) fixing/deleting the rejected key clears it.
 
     const BAD_PROVIDER_MODEL: &[u8] = br#"{
         "display_name":"x",
@@ -1150,11 +1166,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recent_rejections_survives_a_successful_subsequent_put() {
-        // The buffer is the heartbeat's only signal; a successful put
-        // *after* a rejection must NOT clear it (the dashboard banner
-        // would race the user — we leave clearing to the next resync,
-        // which is what cp-api triggers when the user fixes the row).
+    async fn recent_rejections_replaces_existing_key() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+
+        assert!(!sup.apply_put(&entry("/aisix/models/m-bad", BAD_PROVIDER_MODEL, 1)));
+        assert!(!sup.apply_put(&entry("/aisix/models/m-bad", b"not-json", 2)));
+
+        let rejections = sup.recent_rejections();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].kind, loader::RejectionKind::NonJson);
+    }
+
+    #[tokio::test]
+    async fn recent_rejections_survives_a_successful_put_for_different_key() {
+        // A different key succeeding must not hide an unrelated
+        // rejection; only the rejected key being fixed or deleted
+        // should clear the heartbeat signal.
         let provider = Arc::new(FakeProvider::new(vec![], 0));
         let sup = Supervisor::new(provider, "/aisix");
         assert!(!sup.apply_put(&entry("/aisix/models/m-bad", BAD_PROVIDER_MODEL, 1)));
@@ -1166,6 +1194,36 @@ mod tests {
             sup.recent_rejections().len(),
             1,
             "successful put must not silently drop earlier rejections",
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_rejections_clears_when_same_key_becomes_valid() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+
+        assert!(!sup.apply_put(&entry("/aisix/models/m-bad", BAD_PROVIDER_MODEL, 1)));
+        assert_eq!(sup.recent_rejections().len(), 1);
+
+        assert!(sup.apply_put(&entry("/aisix/models/m-bad", VALID_MODEL, 2)));
+        assert!(
+            sup.recent_rejections().is_empty(),
+            "valid put for the same key must clear the retained rejection",
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_rejections_clears_when_rejected_key_is_deleted() {
+        let provider = Arc::new(FakeProvider::new(vec![], 0));
+        let sup = Supervisor::new(provider, "/aisix");
+
+        assert!(!sup.apply_put(&entry("/aisix/models/m-bad", BAD_PROVIDER_MODEL, 1)));
+        assert_eq!(sup.recent_rejections().len(), 1);
+
+        assert!(sup.apply_delete("/aisix/models/m-bad"));
+        assert!(
+            sup.recent_rejections().is_empty(),
+            "delete must clear a rejection even when the bad row never entered the snapshot",
         );
     }
 }
