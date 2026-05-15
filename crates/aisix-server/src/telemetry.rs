@@ -16,8 +16,7 @@
 //!   correlation.
 //!
 //! mTLS: the sender presents the same on-disk bundle the heartbeat
-//! worker uses (the bundle persisted by `register::register_and_persist`
-//! at first boot). cp-api derives `env_id` and `dp_id` from the peer
+//! worker uses. cp-api derives `env_id` and `dp_id` from the peer
 //! cert SAN URI, so the request body doesn't carry them — same wire
 //! shape as `/dp/heartbeat`.
 
@@ -52,7 +51,7 @@ const QUEUE_CAPACITY: usize = 1024;
 
 /// Configuration for the sender. Mirrors `HeartbeatConfig` — the URL
 /// is the absolute `/dp/telemetry` endpoint on cp-api, the bundle is
-/// the on-disk mTLS material persisted by register, and `interval`
+/// the externally provisioned on-disk mTLS material, and `interval`
 /// is the flush cadence (kept overridable so tests can speed up).
 #[derive(Debug, Clone)]
 pub struct TelemetryConfig {

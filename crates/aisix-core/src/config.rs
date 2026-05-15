@@ -140,18 +140,8 @@ pub struct EtcdTlsConfig {
 pub struct ManagedConfig {
     pub enabled: bool,
 
-    /// When set, aisix performs a one-shot `POST /dp/register` against
-    /// `cp_base_url` at boot to exchange this token for an mTLS bundle
-    /// and a dp_id. Subsequent boots detect the existing bundle at
-    /// `mtls_dir` and skip re-registration (the token is single-use).
-    ///
-    /// Leave empty if the mTLS bundle is already on disk — typical for
-    /// configs installed via an out-of-band "download bundle" flow.
-    #[serde(default)]
-    pub registration_token: Option<String>,
-
     /// aisix.cloud CP base URL, e.g. "https://api.us.aisix.cloud".
-    /// Required whenever `registration_token` is set.
+    /// Required for heartbeat when managed mode is enabled.
     #[serde(default)]
     pub cp_base_url: Option<String>,
 
@@ -164,9 +154,8 @@ pub struct ManagedConfig {
     pub cp_etcd_endpoint: Option<String>,
 
     /// Optional path to a PEM-encoded CA bundle the DP adds as an
-    /// additional trust root for outbound calls to the CP — both the
-    /// `/dp/register` HTTPS handshake and the etcd v3 gRPC connection
-    /// after registration.
+    /// additional trust root for outbound calls to the CP and the etcd
+    /// v3 gRPC connection.
     ///
     /// In production the CP terminates TLS with a public-CA-issued
     /// certificate that the system trust store already covers, so
@@ -186,9 +175,8 @@ pub struct ManagedConfig {
     /// cert-via-env-var bootstrap path (cp-api's
     /// /api/environments/:id/gateway_certificates endpoint, dashboard
     /// CertIssueCard). When all three of `cp_cert_pem` / `cp_key_pem`
-    /// / `cp_ca_pem` are set, the DP skips `/dp/register` entirely:
-    /// the operator has already minted the bundle on the dashboard
-    /// and inlined it here. env_id is parsed from the cert's URI SAN
+    /// / `cp_ca_pem` are set, the DP materialises the operator-minted
+    /// dashboard bundle at boot. env_id is parsed from the cert's URI SAN
     /// (`x-aisix://env/<env_id>`).
     ///
     /// File-based variants below let operators store PEMs on disk
@@ -223,9 +211,8 @@ pub struct ManagedConfig {
     pub cp_ca_file: Option<String>,
 
     /// Directory where the DP persists `ca.crt`, `client.crt`,
-    /// `client.key` received from the register response. Files are
-    /// written `0600`. Parent directory must already exist and be
-    /// writable by the aisix process user.
+    /// `client.key`. Files are written `0600`. Parent directory must
+    /// already exist and be writable by the aisix process user.
     #[serde(default = "ManagedConfig::default_mtls_dir")]
     pub mtls_dir: String,
 
@@ -252,15 +239,6 @@ impl ManagedConfig {
     /// True if the DP should behave as an aisix.cloud tenant.
     pub const fn is_managed(&self) -> bool {
         self.enabled
-    }
-
-    /// True when both the token and CP URL are set — i.e. the DP
-    /// should attempt `/dp/register` at boot.
-    pub fn registration_enabled(&self) -> bool {
-        self.registration_token
-            .as_deref()
-            .is_some_and(|s| !s.is_empty())
-            && self.cp_base_url.as_deref().is_some_and(|s| !s.is_empty())
     }
 
     /// True when the operator pre-provisioned a cert/key/CA bundle
@@ -536,12 +514,11 @@ impl Config {
                 .separator("__")
                 // Per-key list parsing. Setting `list_separator`
                 // without explicit `with_list_parse_key` would force
-                // EVERY string env override through comma-splitting —
+                // EVERY string env override through comma-splitting,
                 // which blows up secrets that happen to contain a
-                // comma (AISIX_MANAGED__REGISTRATION_TOKEN has been
-                // the visible victim) with a serde "invalid type:
-                // sequence, expected a string" error. Opt in only for
-                // fields that are actually Vec<String>.
+                // comma with a serde "invalid type: sequence, expected
+                // a string" error. Opt in only for fields that are
+                // actually Vec<String>.
                 .list_separator(",")
                 .with_list_parse_key("etcd.endpoints")
                 .with_list_parse_key("admin.admin_keys")
@@ -750,7 +727,7 @@ managed:
     }
 
     #[test]
-    fn parses_managed_block_with_register_fields() {
+    fn parses_managed_block_without_register_fields() {
         // Mirrors the shape of the baked-in config.managed.yaml so the
         // image's bootstrap template stays a valid Config; if anyone
         // adds a required ManagedConfig field they have to update both
@@ -780,22 +757,32 @@ managed:
             cfg.managed.snapshot_cache_path,
             "/var/lib/aisix/config_cache.json",
         );
-        // Token / CP URL come from env at runtime — empty here is fine.
-        assert!(cfg.managed.registration_token.is_none());
+        // CP URL comes from env at runtime — empty here is fine.
         assert!(cfg.managed.cp_base_url.is_none());
-        assert!(!cfg.managed.registration_enabled());
     }
 
-    // NOTE: the env-prefix regression (config-rs default
-    // prefix_separator inheriting from separator, silently dropping
-    // `AISIX_FOO__BAR` shaped vars) is covered end-to-end by
-    // aisix.cloud's Go e2e suite, which runs the DP docker image
-    // with `AISIX_MANAGED__REGISTRATION_TOKEN` + `AISIX_MANAGED__CP_BASE_URL`
-    // and asserts on registration_enabled=true via the structured
-    // boot log added in the same release. A unit test here would
-    // need std::env::set_var (forbidden by the crate-level
-    // #![forbid(unsafe_code)]) or an extra dev-dep for a guarded
-    // env helper; the downstream integration coverage is enough.
+    #[test]
+    fn rejects_legacy_registration_token_field() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["https://placeholder:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:0"
+  admin_keys: ["disabled"]
+managed:
+  enabled: true
+  registration_token: "unused"
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(
+            err.to_string().contains("registration_token"),
+            "expected unknown legacy field error, got {err}",
+        );
+    }
 
     #[test]
     fn bedrock_endpoint_url_defaults_to_none_when_unset() {

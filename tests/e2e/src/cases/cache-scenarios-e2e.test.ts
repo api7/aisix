@@ -93,11 +93,19 @@ describe("cache scenarios e2e: different prompt → miss", () => {
 
     await waitConfigPropagation(async () => {
       try {
-        await client.chat.completions.create({
-          model: "cache-diff",
-          messages: [{ role: "user", content: "ready-probe" }],
+        const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${CALLER_PLAINTEXT}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            model: "cache-diff",
+            messages: [{ role: "user", content: "ready-probe" }],
+          }),
         });
-        return true;
+        await res.text();
+        return res.status === 200 && res.headers.get("x-aisix-cache") === "miss";
       } catch {
         return false;
       }
