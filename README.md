@@ -77,8 +77,14 @@ curl -fsSL https://run.api7.ai/aisix/quickstart | sh
 This script downloads configuration files, generates a random Admin Key, and starts AISIX with etcd via Docker Compose. Once running:
 
 - Proxy API: `http://127.0.0.1:3000`
-- Admin API: `http://127.0.0.1:3001/aisix/admin`
+- Admin API prefix: `http://127.0.0.1:3001/aisix/admin`
+- API Docs: `http://127.0.0.1:3001/openapi`
 - Admin UI: `http://127.0.0.1:3001/ui`
+
+The Admin API prefix is not a browsable endpoint by itself. Use the API docs
+or a concrete resource path such as `/aisix/admin/models` or
+`/aisix/admin/apikeys`. For the Admin UI, use `127.0.0.1`, `localhost`, or an
+HTTPS origin so browser Web Crypto APIs are available.
 
 For the full setup guide including model configuration and making your first request, see the [Quick Start documentation](docs/getting-started/quick-start.md).
 

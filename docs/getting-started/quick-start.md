@@ -44,6 +44,12 @@ Copy the `export` line and run it in your terminal — all examples in this guid
 export ADMIN_KEY=<your-admin-key>
 ```
 
+The Admin API value above is the API prefix, not a standalone page. Open
+`/openapi` for the interactive API docs, or call a concrete resource path such
+as `/aisix/admin/models` or `/aisix/admin/apikeys`. The Admin UI should be
+opened through `127.0.0.1`, `localhost`, or an HTTPS origin so browser Web
+Crypto APIs are available.
+
 ## Step 2: Configure a Model
 
 Tell AISIX which upstream LLM to use. This example uses OpenAI's `gpt-4o-mini`:

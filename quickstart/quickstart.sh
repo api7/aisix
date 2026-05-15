@@ -94,7 +94,7 @@ main() {
     ok "AISIX is running!"
     echo
     echo "  Proxy API:   http://127.0.0.1:3000"
-    echo "  Admin API:   http://127.0.0.1:3001/aisix/admin"
+    echo "  Admin API:   http://127.0.0.1:3001/aisix/admin  (prefix; see /openapi for docs)"
     echo "  Admin UI:    http://127.0.0.1:3001/ui"
     echo "  API Docs:    http://127.0.0.1:3001/openapi"
     echo "  Admin Key:   ${ADMIN_KEY}"
@@ -104,6 +104,7 @@ main() {
     echo "  Next steps:"
     echo "    1. Open the Admin UI to configure models and API keys."
     echo "    2. Or use the Admin API directly (see docs)."
+    echo "       Example resources: /aisix/admin/models, /aisix/admin/apikeys"
     echo
     echo "  Documentation: https://github.com/${REPO}#readme"
     echo
