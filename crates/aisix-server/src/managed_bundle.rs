@@ -45,6 +45,13 @@ pub fn read_env_id(mtls_dir: impl AsRef<Path>) -> anyhow::Result<String> {
     if trimmed.is_empty() {
         bail!("env_id file {} is empty", path.display());
     }
+    if uuid::Uuid::parse_str(&trimmed).is_err() {
+        bail!(
+            "env_id file {} contains invalid env_id {:?}",
+            path.display(),
+            trimmed,
+        );
+    }
     Ok(trimmed)
 }
 
@@ -161,6 +168,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = read_env_id(dir.path()).unwrap_err();
         assert!(err.to_string().contains("read env_id"), "got: {err}");
+    }
+
+    #[test]
+    fn read_env_id_rejects_invalid_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("env_id"), "not/a/uuid").unwrap();
+        let err = read_env_id(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("invalid env_id"), "got: {err}");
     }
 
     #[test]

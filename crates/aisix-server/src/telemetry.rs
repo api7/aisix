@@ -51,7 +51,7 @@ const QUEUE_CAPACITY: usize = 1024;
 
 /// Configuration for the sender. Mirrors `HeartbeatConfig` — the URL
 /// is the absolute `/dp/telemetry` endpoint on cp-api, the bundle is
-/// the on-disk mTLS material persisted by register, and `interval`
+/// the externally provisioned on-disk mTLS material, and `interval`
 /// is the flush cadence (kept overridable so tests can speed up).
 #[derive(Debug, Clone)]
 pub struct TelemetryConfig {

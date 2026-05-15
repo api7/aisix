@@ -112,7 +112,8 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             anyhow::bail!(
                 "managed mode is enabled but no boot path is available: \
                  cert_bundle_provided={}; \
-                 set AISIX_MANAGED__CP_CERT_PEM + _KEY_PEM + _CA_PEM, \
+                 set AISIX_MANAGED__CP_CERT_PEM + _KEY_PEM + _CA_PEM \
+                 (or AISIX_MANAGED__CP_CERT_FILE + _KEY_FILE + _CA_FILE), \
                  or persist an mTLS bundle at {:?}",
                 bundle_provided,
                 cfg.managed.mtls_dir,
