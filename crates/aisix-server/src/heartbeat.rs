@@ -38,9 +38,8 @@ use tokio::sync::watch;
 pub type RejectionFetcher = Arc<dyn Fn() -> Vec<RejectedEntry> + Send + Sync>;
 
 /// File paths to the on-disk mTLS bundle the heartbeat client presents
-/// to cp-api. Same three files written by `register::register_and_persist`
-/// (and re-used on every subsequent boot when the bundle is already on
-/// disk).
+/// to cp-api. Same three files written by cert-bundle provisioning and
+/// re-used on every subsequent boot when the bundle is already on disk.
 ///
 /// `extra_ca_pem` is an optional second CA bundle the operator points
 /// at via `managed.cp_ca_cert_file` — needed in e2e / on-prem

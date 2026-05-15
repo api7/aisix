@@ -18,7 +18,7 @@
 //!   without creating a cycle (server already depends on proxy).
 //! - The SERVER crate owns the worker because telemetry batching, the
 //!   mTLS reqwest client, and graceful-shutdown wiring naturally live
-//!   alongside `register::register_and_persist` and `heartbeat::spawn`.
+//!   alongside cert-bundle provisioning and `heartbeat::spawn`.
 //! - This module sits in `aisix-obs` (proxy already depends on it for
 //!   metrics + access_log + otlp_http_sink), exposes the data type and
 //!   the sink wrapper, and lets server-side wire up the consumer.

@@ -95,7 +95,7 @@ impl BudgetClient {
     /// `https://cp.aisix.cloud:9101`); `http` must be a reqwest client
     /// already loaded with the DP's client cert + CA bundle. Build it
     /// with `aisix_server::heartbeat::build_mtls_client` (or its
-    /// equivalent) using the same `MtlsBundle` `/dp/register` persisted.
+    /// equivalent) using the same persisted `MtlsBundle`.
     pub fn new(base_url: impl Into<String>, http: reqwest::Client) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let stale_max = std::env::var("AISIX_DP_BUDGET_STALE_MAX_SECONDS")

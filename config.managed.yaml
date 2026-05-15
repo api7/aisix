@@ -4,28 +4,29 @@
 # Only the bare minimum is set here:
 #
 #   - `managed.enabled: true`           always on for this image
-#   - `etcd.endpoints: [placeholder]`   overridden at first boot by the
-#                                       `/dp/register` response
+#   - `etcd.endpoints: [placeholder]`   overridden at boot from managed
+#                                       CP endpoint config
 #   - `admin.admin_keys: [placeholder]` validation requires the slot,
 #                                       but the admin listener is never
 #                                       bound in managed mode
 #
 # Operators inject these env vars at `docker run` time:
 #
-#   AISIX_MANAGED__REGISTRATION_TOKEN=aisix_dp_us_east_1_AbCd…
 #   AISIX_MANAGED__CP_BASE_URL=https://api.us.aisix.cloud
+#   AISIX_MANAGED__CP_ETCD_ENDPOINT=etcd.us.aisix.cloud:7943
+#   AISIX_MANAGED__CP_CERT_PEM=...
+#   AISIX_MANAGED__CP_KEY_PEM=...
+#   AISIX_MANAGED__CP_CA_PEM=...
 #
 # Plus optionally `AISIX_PROXY__ADDR`, `AISIX_OBSERVABILITY__LOG_LEVEL`,
 # `AISIX_CACHE__BACKEND`, etc. — every config field is reachable via
 # `AISIX_<UPPER>__<UPPER>` (see crates/aisix-core/src/config.rs).
 #
 # Subsequent boots re-use the mTLS bundle written under
-# `managed.mtls_dir` and skip the register round-trip entirely.
+# `managed.mtls_dir`.
 
 etcd:
-  # Placeholder — overwritten at first boot. The Rust bootstrap copies
-  # the etcd endpoint + mTLS paths from the /dp/register response into
-  # this field before opening the gRPC channel.
+  # Placeholder — overwritten at boot before opening the gRPC channel.
   endpoints:
     - "https://placeholder-overridden-at-register:2379"
   prefix: "/aisix"
@@ -61,8 +62,8 @@ observability:
 
 managed:
   enabled: true
-  # registration_token + cp_base_url come from env vars — never bake
-  # secrets into the image.
+  # CP URL, etcd endpoint, and cert bundle come from env vars — never
+  # bake secrets into the image.
   mtls_dir: "/var/lib/aisix/mtls"
   dp_id_file: "/var/lib/aisix/dp_id"
   # On-disk snapshot cache (prd-09 §9.7.2). The supervisor writes the

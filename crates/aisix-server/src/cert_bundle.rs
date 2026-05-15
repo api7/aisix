@@ -37,9 +37,7 @@ use x509_parser::extensions::GeneralName;
 use x509_parser::pem::parse_x509_pem;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
-/// Outcome of materialising a pre-provisioned bundle. Mirrors
-/// `register::Registered` minus the metadata cp-api would have
-/// returned (we don't have a register response to crib from).
+/// Outcome of materialising a pre-provisioned bundle.
 #[derive(Debug, Clone)]
 pub struct Provisioned {
     /// env_id parsed from the leaf cert's URI SAN
