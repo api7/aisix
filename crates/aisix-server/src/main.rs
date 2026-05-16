@@ -29,8 +29,6 @@ use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor};
 use aisix_gateway::Hub;
 use aisix_obs::{init_tracing, install_otlp_tracer, Metrics};
 use aisix_provider_anthropic::AnthropicBridge;
-use aisix_provider_deepseek::deepseek_bridge;
-use aisix_provider_google::google_bridge;
 use aisix_provider_openai::OpenAiBridge;
 use aisix_proxy::background::run_background_model_check_once;
 use aisix_proxy::budget::BudgetClient;
@@ -774,8 +772,14 @@ fn build_hub() -> Hub {
     let hub = Hub::new();
     hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
     hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
-    hub.register(Provider::Google, Arc::new(google_bridge()));
-    hub.register(Provider::Deepseek, Arc::new(deepseek_bridge()));
+    hub.register(
+        Provider::Google,
+        Arc::new(OpenAiBridge::new().with_name("google")),
+    );
+    hub.register(
+        Provider::Deepseek,
+        Arc::new(OpenAiBridge::new().with_name("deepseek")),
+    );
     hub
 }
 

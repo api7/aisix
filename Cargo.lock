@@ -216,34 +216,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aisix-provider-deepseek"
-version = "0.1.0"
-dependencies = [
- "aisix-core",
- "aisix-gateway",
- "aisix-provider-openai",
- "async-trait",
- "serde_json",
- "tokio",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "aisix-provider-google"
-version = "0.1.0"
-dependencies = [
- "aisix-core",
- "aisix-gateway",
- "aisix-provider-openai",
- "async-trait",
- "serde_json",
- "tokio",
- "tracing",
- "wiremock",
-]
-
-[[package]]
 name = "aisix-provider-openai"
 version = "0.1.0"
 dependencies = [
@@ -272,8 +244,6 @@ dependencies = [
  "aisix-guardrails",
  "aisix-obs",
  "aisix-provider-anthropic",
- "aisix-provider-deepseek",
- "aisix-provider-google",
  "aisix-provider-openai",
  "aisix-ratelimit",
  "async-stream",
@@ -328,8 +298,6 @@ dependencies = [
  "aisix-guardrails",
  "aisix-obs",
  "aisix-provider-anthropic",
- "aisix-provider-deepseek",
- "aisix-provider-google",
  "aisix-provider-openai",
  "aisix-proxy",
  "aisix-ratelimit",

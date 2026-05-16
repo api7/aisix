@@ -1129,7 +1129,7 @@ data: [DONE]\n\n";
     /// non-Anthropic Bridge in the workspace.
     #[tokio::test]
     async fn matrix_anthropic_in_gemini_upstream_non_streaming() {
-        use aisix_provider_google::google_bridge;
+        use aisix_provider_openai::OpenAiBridge;
 
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1155,7 +1155,10 @@ data: [DONE]\n\n";
 
         let hub = Arc::new(Hub::new());
         hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
-        hub.register(Provider::Google, Arc::new(google_bridge()));
+        hub.register(
+            Provider::Google,
+            Arc::new(OpenAiBridge::new().with_name("google")),
+        );
         let handle = SnapshotHandle::new(snap);
         let app = crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache());
 
@@ -1179,7 +1182,7 @@ data: [DONE]\n\n";
     /// (Anthropic inbound) × (DeepSeek upstream).
     #[tokio::test]
     async fn matrix_anthropic_in_deepseek_upstream_non_streaming() {
-        use aisix_provider_deepseek::deepseek_bridge;
+        use aisix_provider_openai::OpenAiBridge;
 
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
@@ -1203,7 +1206,10 @@ data: [DONE]\n\n";
 
         let hub = Arc::new(Hub::new());
         hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
-        hub.register(Provider::Deepseek, Arc::new(deepseek_bridge()));
+        hub.register(
+            Provider::Deepseek,
+            Arc::new(OpenAiBridge::new().with_name("deepseek")),
+        );
         let handle = SnapshotHandle::new(snap);
         let app = crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache());
 
@@ -1344,10 +1350,10 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn matrix_anthropic_in_gemini_upstream_streaming() {
-        use aisix_provider_google::google_bridge;
+        use aisix_provider_openai::OpenAiBridge;
         assert_anthropic_streams_through_openai_compat_upstream(
             Provider::Google,
-            Arc::new(google_bridge()),
+            Arc::new(OpenAiBridge::new().with_name("google")),
             // Placeholder; helper rebuilds with the wiremock uri.
             gemini_model("my-claude-via-gemini"),
             "my-claude-via-gemini",
@@ -1357,10 +1363,10 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn matrix_anthropic_in_deepseek_upstream_streaming() {
-        use aisix_provider_deepseek::deepseek_bridge;
+        use aisix_provider_openai::OpenAiBridge;
         assert_anthropic_streams_through_openai_compat_upstream(
             Provider::Deepseek,
-            Arc::new(deepseek_bridge()),
+            Arc::new(OpenAiBridge::new().with_name("deepseek")),
             deepseek_model("my-claude-via-ds"),
             "my-claude-via-ds",
         )

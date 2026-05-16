@@ -3313,7 +3313,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     /// different default base URL behavior).
     #[tokio::test]
     async fn matrix_openai_in_gemini_upstream_non_streaming() {
-        use aisix_provider_google::google_bridge;
+        use aisix_provider_openai::OpenAiBridge;
 
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
@@ -3337,7 +3337,10 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-gemini"]));
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Google, Arc::new(google_bridge()));
+        hub.register(
+            Provider::Google,
+            Arc::new(OpenAiBridge::new().with_name("google")),
+        );
         let app = build_router(build_state(snap, hub));
 
         let body = serde_json::json!({
@@ -3365,7 +3368,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     /// that `Provider::Deepseek` resolves correctly.
     #[tokio::test]
     async fn matrix_openai_in_deepseek_upstream_non_streaming() {
-        use aisix_provider_deepseek::deepseek_bridge;
+        use aisix_provider_openai::OpenAiBridge;
 
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
@@ -3391,7 +3394,10 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-deepseek"]));
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Deepseek, Arc::new(deepseek_bridge()));
+        hub.register(
+            Provider::Deepseek,
+            Arc::new(OpenAiBridge::new().with_name("deepseek")),
+        );
         let app = build_router(build_state(snap, hub));
 
         let body = serde_json::json!({

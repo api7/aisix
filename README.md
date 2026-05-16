@@ -66,10 +66,8 @@ crates/
 ├── aisix-core                 Config, Snapshot, ResourceEntry, errors
 ├── aisix-etcd                 ConfigProvider, watch supervisor
 ├── aisix-gateway              Hub & Bridge, SSE parser, provider trait
-├── aisix-provider-openai
+├── aisix-provider-openai      Also serves DeepSeek + Google Gemini via with_name()
 ├── aisix-provider-anthropic
-├── aisix-provider-gemini
-├── aisix-provider-deepseek
 ├── aisix-proxy                /v1/* handlers + middleware
 ├── aisix-admin                CRUD + playground + OpenAPI
 ├── aisix-obs                  tracing, metrics, access log

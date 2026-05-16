@@ -40,14 +40,12 @@ use crate::wire::{
 /// this constant only covers degenerate config paths.
 pub const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
 
-/// Fallback host for the `deepseek`-named variant of this bridge.
-/// Mirrors `aisix_provider_deepseek::DEEPSEEK_DEFAULT_BASE` so that a
+/// Fallback host for the `deepseek`-named variant of this bridge, so a
 /// `with_name("deepseek")` instance without an explicit `api_base`
 /// dispatches to DeepSeek rather than OpenAI.
 const DEEPSEEK_DEFAULT_BASE: &str = "https://api.deepseek.com";
 
-/// Fallback host for the `gemini`-named variant of this bridge.
-/// Mirrors `aisix_provider_google::GOOGLE_DEFAULT_BASE` so that a
+/// Fallback host for the `google`-named variant of this bridge, so a
 /// `with_name("google")` instance without an explicit `api_base`
 /// dispatches to Google's OpenAI-compatible Gemini endpoint.
 const GOOGLE_DEFAULT_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
