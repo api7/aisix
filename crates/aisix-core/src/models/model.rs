@@ -88,15 +88,26 @@ pub enum Adapter {
 }
 
 impl From<Provider> for Adapter {
-    /// Best-effort mapping from the legacy `Provider` enum onto the
-    /// `Adapter` wire-shape set, for use during the Phase A skeleton
-    /// stage. Rationale per variant:
+    /// Mapping from the current `Provider` enum onto the `Adapter`
+    /// wire-shape set, for use during the issue #302 Phase A skeleton
+    /// stage. This mapping is **not** wired into dispatch in this PR;
+    /// it exists as a forward-looking reference that follow-up Phase A
+    /// PRs will consume when migrating entities, the Hub, and Bridges
+    /// onto `Adapter`.
+    ///
+    /// Rationale per variant:
     ///
     /// - `Openai` / `Anthropic`: direct equivalents.
-    /// - `Google` → `Vertex`: Gemini-family models are routed through
-    ///   the Vertex AI wire shape (the production target for Google
-    ///   upstream traffic). `Adapter` does not currently have a
-    ///   separate Google AI Studio variant.
+    /// - `Google` → `Vertex`: forward-looking choice for the Phase A
+    ///   migration target. **Note:** this intentionally diverges from
+    ///   the current runtime behavior — `Provider::Google` today calls
+    ///   the Gemini Generative Language API via its OpenAI-compatible
+    ///   endpoint (`/v1beta/openai`), which is an `openai`-shaped
+    ///   wire. Any downstream PR that flips dispatch onto `Adapter`
+    ///   MUST either also migrate the Google bridge to native Vertex
+    ///   AI request encoding, or revisit this arm before merging — a
+    ///   silent flip would change the wire shape sent to Google
+    ///   upstreams. See issue #302 Phase A for the migration plan.
     /// - `Deepseek` → `Openai`: DeepSeek exposes an OpenAI-compatible
     ///   chat completions endpoint, so the adapter shape is `openai`.
     /// - `Cohere` → `Openai`: the gateway currently talks to Cohere's
