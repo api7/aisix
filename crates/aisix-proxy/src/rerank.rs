@@ -110,6 +110,21 @@ async fn dispatch(
 
     let model = &model_entry.value;
 
+    // Provider routing key, derived from `model.provider` as a
+    // lowercase string. Per #302 Phase A this dispatch path
+    // identifies Cohere/Jina by string rather than by `Provider`
+    // enum variant so that, when the `Provider` enum is later
+    // collapsed into the closed `Adapter` set, this file does not
+    // depend on variants (`Provider::Cohere`, `Provider::Jina`)
+    // that are slated for removal. The string values
+    // ("openai", "cohere", "jina") are the same labels emitted in
+    // metrics/access logs today, so dashboards keep working
+    // unchanged.
+    let provider_label = model
+        .provider
+        .map(|p| format!("{p:?}").to_lowercase())
+        .unwrap_or_else(|| "unknown".to_string());
+
     // Per #168 + #213 Phases 1–2: `/v1/rerank` accepts OpenAI-,
     // Cohere-, and Jina-shape upstreams. All three speak the same
     // body shape (`{model, query, documents, top_n, ...}`) at
@@ -125,11 +140,7 @@ async fn dispatch(
     // request and `data` (not `results`) on response, so it
     // requires a request/response adapter that's out of scope
     // for this phase. Tracked in the #213 follow-up.
-    use aisix_core::models::Provider;
-    let provider_allowed = matches!(
-        model.provider,
-        Some(Provider::Openai) | Some(Provider::Cohere) | Some(Provider::Jina)
-    );
+    let provider_allowed = matches!(provider_label.as_str(), "openai" | "cohere" | "jina");
     if !provider_allowed {
         return Err(ProxyError::InvalidRequest(format!(
             "model `{model_name}` is not an OpenAI, Cohere, or Jina provider; \
@@ -140,10 +151,6 @@ async fn dispatch(
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
     let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?.to_string();
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
-    let provider_label = model
-        .provider
-        .map(|p| format!("{p:?}").to_lowercase())
-        .unwrap_or_else(|| "unknown".to_string());
 
     // Rewrite model field.
     if let Some(m) = body.get_mut("model") {
@@ -157,17 +164,15 @@ async fn dispatch(
     //
     // The provider arm of `default_base_for_provider` is guaranteed to
     // return `Some` here because the gate above already rejected any
-    // `model.provider` outside `{Openai, Cohere, Jina}` — all three
+    // provider label outside `{"openai", "cohere", "jina"}` — all three
     // have explicit arms in the helper. The `unwrap_or_else` is
-    // defensive against a future enum variant that gets through the
+    // defensive against a future provider string that gets through the
     // gate without an arm in the helper; the audit-trail-friendly
     // default is OpenAI's host (it's a 4xx-from-OpenAI rather than
     // dispatching to a stale legacy domain).
     let base = match pk_entry.value.api_base.as_deref() {
         Some(b) if !b.trim().is_empty() => b.trim_end_matches('/').to_string(),
-        _ => model
-            .provider
-            .and_then(default_base_for_provider)
+        _ => default_base_for_provider(&provider_label)
             .unwrap_or_else(|| "https://api.openai.com".to_string()),
     };
     let url = crate::dispatch::build_v1_url(&base, "/rerank");
@@ -245,23 +250,28 @@ async fn dispatch(
     Ok((resp, provider_label))
 }
 
-fn default_base_for_provider(provider: aisix_core::models::Provider) -> Option<String> {
-    use aisix_core::models::Provider;
+/// Default upstream host for the rerank-supporting providers,
+/// keyed by the lowercase provider string. Per #302 Phase A this
+/// is intentionally a string-keyed match (not a `Provider` enum
+/// match) so the file does not depend on `Provider::Cohere` /
+/// `Provider::Jina` variants that are slated for removal. The
+/// `{"openai", "cohere", "jina"}` set mirrors the rerank gate in
+/// `dispatch`; any other string returns `None` and the caller
+/// falls back to OpenAI's host.
+fn default_base_for_provider(provider: &str) -> Option<String> {
     match provider {
-        Provider::Openai => Some("https://api.openai.com".to_string()),
+        "openai" => Some("https://api.openai.com".to_string()),
         // Cohere v1 path (deprecated by Cohere but still functional)
         // is what the gateway's `build_v1_url` produces from this
         // base. Operators who want the Cohere v2 path can override
         // `api_base` to `https://api.cohere.com/v2` — see #213's v2
         // follow-up for the version-routing extension if needed.
-        Provider::Cohere => Some("https://api.cohere.com".to_string()),
+        "cohere" => Some("https://api.cohere.com".to_string()),
         // Jina rerank is identity-mapped to the OpenAI-compat /
         // Cohere wire shape on both request AND response — same
         // body fields, same `results` array shape, Bearer auth.
-        Provider::Jina => Some("https://api.jina.ai".to_string()),
-        Provider::Anthropic => None, // Anthropic doesn't expose a rerank API
-        Provider::Google => None,    // Gemini doesn't expose a rerank API
-        Provider::Deepseek => None,
+        "jina" => Some("https://api.jina.ai".to_string()),
+        _ => None,
     }
 }
 
