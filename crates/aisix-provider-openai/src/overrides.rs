@@ -90,8 +90,15 @@ pub enum StreamDoneOutcome {
 ///
 /// Rewrites every present top-level key whose name matches a key in
 /// `renames` to the renames-map's value. Absent source keys are
-/// no-ops. Conflicts (the target key already exists) prefer the
-/// already-present value — the rename is *non-destructive*.
+/// no-ops.
+///
+/// **Collision semantics: source wins.** When both source and target
+/// are present in the body, the source value overwrites the target.
+/// Matches LiteLLM's convention across `databricks` / `openai_like` /
+/// `sambanova` / `dynamic_config` transformations — for the canonical
+/// `max_completion_tokens → max_tokens` case the newer (source) value
+/// is what the caller intended; an accidentally-leftover deprecated
+/// `max_tokens` value should not shadow it.
 ///
 /// Non-object bodies are no-ops by construction; the function does
 /// not panic on `null` / array / scalar inputs.
@@ -106,11 +113,8 @@ pub fn apply_param_renames(body: &mut Value, renames: &HashMap<String, String>) 
         let Some(value) = obj.remove(from) else {
             continue;
         };
-        // Non-destructive: if the target already has a value, the
-        // existing entry wins and we drop the renamed one. cp-api
-        // shouldn't ship a rename that collides with an explicit
-        // value the caller already set.
-        obj.entry(to.clone()).or_insert(value);
+        // Source wins: overwrite any pre-existing target value.
+        obj.insert(to.clone(), value);
     }
 }
 
@@ -151,6 +155,17 @@ pub fn apply_param_constraints(body: &mut Value, constraints: &Constraints) {
     }
 }
 
+/// Authentication-related headers that `apply_default_headers` will
+/// never set, even if cp-api validation slips and allows them through.
+/// Defense-in-depth: a misconfigured `default_headers` block must never
+/// override the auth header the OpenAiBridge sets itself. cp-api SHOULD
+/// reject these at write time (issue #302 §5 validation rules), but
+/// the DP enforces it again at apply time.
+///
+/// `HeaderName` is case-insensitive so the lowercase form is the
+/// canonical comparison key.
+const RESERVED_DEFAULT_HEADERS: &[&str] = &["authorization", "x-api-key", "x-goog-api-key"];
+
 /// Apply `request.default_headers` to an outbound `HeaderMap`.
 ///
 /// Headers already present on `headers` (case-insensitive, since
@@ -160,11 +175,19 @@ pub fn apply_param_constraints(body: &mut Value, constraints: &Constraints) {
 /// silently skipped; the default block came from cp-api validation
 /// and any unparseable entry is a config error one layer up, not a
 /// runtime failure the dispatch should hard-fail on.
+///
+/// **Auth-header guard:** keys in [`RESERVED_DEFAULT_HEADERS`] are
+/// dropped before insertion as defense-in-depth — a misconfigured
+/// default_headers block must never inject `Authorization` or vendor
+/// API-key headers that would override the Bridge's own auth.
 pub fn apply_default_headers(headers: &mut HeaderMap, defaults: &HashMap<String, String>) {
     for (name, value) in defaults {
         let Ok(parsed_name) = name.parse::<HeaderName>() else {
             continue;
         };
+        if RESERVED_DEFAULT_HEADERS.contains(&parsed_name.as_str()) {
+            continue;
+        }
         if headers.contains_key(&parsed_name) {
             continue;
         }
@@ -406,16 +429,19 @@ mod tests {
     }
 
     #[test]
-    fn rename_with_existing_target_keeps_existing() {
-        // Caller already supplied `max_tokens`; the rename from
-        // `max_completion_tokens` must not overwrite it.
+    fn rename_source_wins_when_both_present() {
+        // Both source and target keys are present in the body. Per
+        // LiteLLM convention (source wins), the source's value should
+        // overwrite the target's pre-existing value — for the canonical
+        // max_completion_tokens → max_tokens case, the newer source
+        // value 100 wins over the deprecated target value 50.
         let mut body = json!({ "max_completion_tokens": 100, "max_tokens": 50 });
         let renames = HashMap::from([(
             "max_completion_tokens".to_string(),
             "max_tokens".to_string(),
         )]);
         apply_param_renames(&mut body, &renames);
-        assert_eq!(body, json!({ "max_tokens": 50 }));
+        assert_eq!(body, json!({ "max_tokens": 100 }));
     }
 
     #[test]
@@ -541,6 +567,43 @@ mod tests {
         apply_default_headers(&mut headers, &defaults);
         assert!(headers.get("x-foo").is_some());
         assert_eq!(headers.len(), 1);
+    }
+
+    #[test]
+    fn rejects_reserved_auth_headers() {
+        // Defense-in-depth: even if cp-api validation slipped and shipped
+        // a default_headers block containing Authorization / X-Api-Key /
+        // X-Goog-Api-Key, DP must not inject them. Case-insensitive via
+        // HeaderName canonicalization.
+        let mut headers = HeaderMap::new();
+        let defaults = HashMap::from([
+            (
+                "Authorization".to_string(),
+                "Bearer attacker-token".to_string(),
+            ),
+            ("X-Api-Key".to_string(), "attacker-key".to_string()),
+            ("X-API-KEY".to_string(), "attacker-key-2".to_string()),
+            (
+                "x-goog-api-key".to_string(),
+                "attacker-google-key".to_string(),
+            ),
+            ("x-foo".to_string(), "ok-default".to_string()),
+        ]);
+        apply_default_headers(&mut headers, &defaults);
+        assert!(
+            headers.get("authorization").is_none(),
+            "auth must be blocked"
+        );
+        assert!(
+            headers.get("x-api-key").is_none(),
+            "x-api-key must be blocked"
+        );
+        assert!(
+            headers.get("x-goog-api-key").is_none(),
+            "x-goog-api-key must be blocked"
+        );
+        assert_eq!(headers.get("x-foo").unwrap(), "ok-default");
+        assert_eq!(headers.len(), 1, "only x-foo should have been inserted");
     }
 
     // --- apply_default_body_fields --------------------------------
