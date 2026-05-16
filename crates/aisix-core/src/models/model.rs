@@ -62,6 +62,62 @@ impl Provider {
     }
 }
 
+/// Wire-shape adapter used to talk to an upstream. This is the closed
+/// set of upstream protocols the gateway knows how to encode against —
+/// distinct from a vendor identity (which is captured separately on
+/// `ProviderKey`).
+///
+/// Introduced as a skeleton for issue #302 Phase A. This type is purely
+/// additive in this PR: nothing in the gateway dispatches off `Adapter`
+/// yet, no entity field is changed, and `Provider` continues to drive
+/// all runtime behavior. Follow-up PRs in Phase A migrate entities and
+/// the Hub to consume `Adapter` directly.
+///
+/// Note on serde casing: `Adapter` uses `kebab-case` so the `AzureOpenai`
+/// variant serializes as `"azure-openai"`. This intentionally differs
+/// from `Provider`'s `lowercase` casing, which produced no hyphens
+/// because all current `Provider` names are single tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Adapter {
+    Openai,
+    Anthropic,
+    Bedrock,
+    Vertex,
+    AzureOpenai,
+}
+
+impl From<Provider> for Adapter {
+    /// Best-effort mapping from the legacy `Provider` enum onto the
+    /// `Adapter` wire-shape set, for use during the Phase A skeleton
+    /// stage. Rationale per variant:
+    ///
+    /// - `Openai` / `Anthropic`: direct equivalents.
+    /// - `Google` → `Vertex`: Gemini-family models are routed through
+    ///   the Vertex AI wire shape (the production target for Google
+    ///   upstream traffic). `Adapter` does not currently have a
+    ///   separate Google AI Studio variant.
+    /// - `Deepseek` → `Openai`: DeepSeek exposes an OpenAI-compatible
+    ///   chat completions endpoint, so the adapter shape is `openai`.
+    /// - `Cohere` → `Openai`: the gateway currently talks to Cohere's
+    ///   OpenAI-compatible endpoints (#213 Phase 1 — rerank-only),
+    ///   so the wire adapter is `openai`. A native Cohere adapter is
+    ///   not part of this skeleton.
+    /// - `Jina` → `Openai`: Jina's rerank is identity-mapped to the
+    ///   OpenAI-compat rerank shape (#213 Phase 2), so the wire
+    ///   adapter is `openai`.
+    fn from(provider: Provider) -> Self {
+        match provider {
+            Provider::Openai => Adapter::Openai,
+            Provider::Anthropic => Adapter::Anthropic,
+            Provider::Google => Adapter::Vertex,
+            Provider::Deepseek => Adapter::Openai,
+            Provider::Cohere => Adapter::Openai,
+            Provider::Jina => Adapter::Openai,
+        }
+    }
+}
+
 /// Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -434,6 +490,84 @@ mod tests {
         let bg = m.background_model_check.unwrap();
         assert!(bg.enabled);
         assert_eq!(bg.ignore_statuses, vec![408, 429]);
+    }
+
+    #[test]
+    fn adapter_from_provider_covers_every_variant() {
+        // Every Provider variant must map to a defined Adapter. This
+        // test exists to fail the build if a new Provider is added
+        // without an explicit From arm — the match in `From<Provider>`
+        // is exhaustive so the real safety net is the compiler, but
+        // pinning the chosen Adapter per variant guards against a
+        // future edit silently changing the mapping.
+        assert_eq!(Adapter::from(Provider::Openai), Adapter::Openai);
+        assert_eq!(Adapter::from(Provider::Anthropic), Adapter::Anthropic);
+        assert_eq!(Adapter::from(Provider::Google), Adapter::Vertex);
+        assert_eq!(Adapter::from(Provider::Deepseek), Adapter::Openai);
+        assert_eq!(Adapter::from(Provider::Cohere), Adapter::Openai);
+        assert_eq!(Adapter::from(Provider::Jina), Adapter::Openai);
+    }
+
+    #[test]
+    fn adapter_serializes_to_kebab_case_wire_strings() {
+        // Pin each Adapter's wire form. AzureOpenai → "azure-openai"
+        // is the load-bearing case for the kebab-case choice; the
+        // others are pinned to lock the contract so a future
+        // rename_all change is surfaced as a test failure.
+        assert_eq!(
+            serde_json::to_string(&Adapter::Openai).unwrap(),
+            "\"openai\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Adapter::Anthropic).unwrap(),
+            "\"anthropic\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Adapter::Bedrock).unwrap(),
+            "\"bedrock\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Adapter::Vertex).unwrap(),
+            "\"vertex\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Adapter::AzureOpenai).unwrap(),
+            "\"azure-openai\""
+        );
+    }
+
+    #[test]
+    fn adapter_deserializes_from_kebab_case_wire_strings() {
+        assert_eq!(
+            serde_json::from_str::<Adapter>("\"openai\"").unwrap(),
+            Adapter::Openai
+        );
+        assert_eq!(
+            serde_json::from_str::<Adapter>("\"anthropic\"").unwrap(),
+            Adapter::Anthropic
+        );
+        assert_eq!(
+            serde_json::from_str::<Adapter>("\"bedrock\"").unwrap(),
+            Adapter::Bedrock
+        );
+        assert_eq!(
+            serde_json::from_str::<Adapter>("\"vertex\"").unwrap(),
+            Adapter::Vertex
+        );
+        assert_eq!(
+            serde_json::from_str::<Adapter>("\"azure-openai\"").unwrap(),
+            Adapter::AzureOpenai
+        );
+    }
+
+    #[test]
+    fn adapter_rejects_unknown_variant_strings() {
+        // Closed enum — any string outside the kebab-case wire set
+        // must fail to deserialize so callers can't silently smuggle
+        // in a typo or a legacy provider name.
+        assert!(serde_json::from_str::<Adapter>("\"gemini\"").is_err());
+        assert!(serde_json::from_str::<Adapter>("\"azureopenai\"").is_err());
+        assert!(serde_json::from_str::<Adapter>("\"azure_openai\"").is_err());
     }
 
     #[test]

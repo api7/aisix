@@ -34,7 +34,8 @@ pub use guardrail::{
     GuardrailKind, KeywordConfig, KeywordPattern,
 };
 pub use model::{
-    BackgroundModelCheck, CooldownConfig, Model, Provider, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+    Adapter, BackgroundModelCheck, CooldownConfig, Model, Provider,
+    DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use observability_exporter::{ExporterKind, ObservabilityExporter, OtlpHttpConfig};
 pub use provider_key::ProviderKey;
