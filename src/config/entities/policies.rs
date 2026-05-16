@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, OnceLock},
 };
 
 use cel::Program;
@@ -23,6 +23,10 @@ fn default_enabled() -> bool {
 
 fn default_policy_stages() -> Vec<PolicyStage> {
     vec![PolicyStage::Input, PolicyStage::Output]
+}
+
+fn default_compiled_when() -> Arc<OnceLock<Arc<Program>>> {
+    Arc::new(OnceLock::new())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -67,6 +71,10 @@ pub struct Policy {
     pub when: String,
 
     pub actions: Vec<PolicyAction>,
+
+    #[serde(skip, default = "default_compiled_when")]
+    #[schema(ignore)]
+    compiled_when: Arc<OnceLock<Arc<Program>>>,
 }
 
 impl Policy {
@@ -74,6 +82,17 @@ impl Policy {
         self.actions
             .iter()
             .flat_map(|action| action.guardrail_ids().iter().map(String::as_str))
+    }
+
+    pub fn compiled_when(&self) -> Result<Arc<Program>, cel::ParseErrors> {
+        if let Some(program) = self.compiled_when.get() {
+            return Ok(Arc::clone(program));
+        }
+
+        let compiled = Arc::new(Program::compile(&self.when)?);
+        let _ = self.compiled_when.set(Arc::clone(&compiled));
+
+        Ok(self.compiled_when.get().map(Arc::clone).unwrap_or(compiled))
     }
 }
 
@@ -89,7 +108,8 @@ pub(crate) fn validate_policy_definition(key: &str, value: &Policy) -> Result<()
         ));
     }
 
-    Program::compile(&value.when)
+    value
+        .compiled_when()
         .map_err(|error| format!(r#"CEL validation error on policy "{key}": {error}"#))?;
 
     Ok(())
@@ -131,6 +151,8 @@ impl PoliciesStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -278,5 +300,25 @@ mod tests {
             policy.referenced_guardrail_ids().collect::<Vec<_>>(),
             vec!["gr-input"]
         );
+    }
+
+    #[test]
+    fn compiled_when_reuses_cached_program() {
+        let policy: Policy = serde_json::from_value(json!({
+            "name": "cached-program",
+            "when": "route.format == 'chat_completions'",
+            "actions": [{
+                "type": "guardrail",
+                "config": {
+                    "guardrail_ids": ["gr-input"]
+                }
+            }]
+        }))
+        .unwrap();
+
+        let first = policy.compiled_when().unwrap();
+        let second = policy.compiled_when().unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }
