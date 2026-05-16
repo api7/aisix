@@ -122,7 +122,7 @@ async fn dispatch(
     // unchanged.
     let provider_label = model
         .provider
-        .map(|p| format!("{p:?}").to_lowercase())
+        .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
     // Per #168 + #213 Phases 1–2: `/v1/rerank` accepts OpenAI-,
