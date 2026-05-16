@@ -38,7 +38,7 @@ pub use model::{
     DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use observability_exporter::{ExporterKind, ObservabilityExporter, OtlpHttpConfig};
-pub use provider_key::ProviderKey;
+pub use provider_key::{ProviderKey, TelemetryTags};
 pub use rate_limit::RateLimit;
 pub use rate_limit_policy::RateLimitPolicy;
 pub use routing::{OnAllFilteredPolicy, Routing, RoutingStrategy, RoutingTarget};

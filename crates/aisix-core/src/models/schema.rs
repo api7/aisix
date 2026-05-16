@@ -275,6 +275,11 @@ fn apikey_schema() -> Value {
 }
 
 fn provider_key_schema() -> Value {
+    // `provider`, `adapter`, and `telemetry_tags` were added as a
+    // skeleton for issue #302 Phase A. They are optional on the wire
+    // (matching `#[serde(default)]` on the Rust side) so existing
+    // ProviderKey payloads without these fields keep validating. No
+    // dispatch path reads them in this PR.
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -283,7 +288,25 @@ fn provider_key_schema() -> Value {
         "properties": {
             "display_name": { "type": "string", "minLength": 1 },
             "secret":       { "type": "string", "minLength": 1 },
-            "api_base":     { "type": "string" }
+            "api_base":     { "type": "string" },
+            // Phase A skeleton — vendor identity, free-form string.
+            // Closed-set validation is deferred to a follow-up Phase A
+            // PR that wires dispatch onto `provider`.
+            "provider":     { "type": "string" },
+            // Phase A skeleton — wire-shape adapter. Pinned to the
+            // closed Adapter enum.
+            "adapter":      { "type": "string", "enum": ["openai", "anthropic", "bedrock", "vertex", "azure-openai"] },
+            "telemetry_tags": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "kind":             { "type": "string", "enum": ["catalog", "byo"] },
+                    "featured":         { "type": "boolean" },
+                    "branded_provider": { "type": ["string", "null"] },
+                    "pk_label":         { "type": ["string", "null"] },
+                    "byo_label":        { "type": ["string", "null"] }
+                }
+            }
         }
     })
 }
@@ -947,5 +970,103 @@ mod tests {
             "window": "minute"
         });
         assert!(validate_rate_limit_policy(&v).is_err());
+    }
+
+    // ---- provider_key schema (issue #302 Phase A skeleton) ----
+
+    #[test]
+    fn provider_key_minimal_passes() {
+        let v = json!({
+            "display_name": "openai-prod",
+            "secret": "sk-x"
+        });
+        validate_provider_key(&v).unwrap();
+    }
+
+    #[test]
+    fn provider_key_legacy_payload_without_phase_a_fields_passes() {
+        // Pre-#302 payload — no provider / adapter / telemetry_tags.
+        // Must still validate so existing on-disk rows keep loading.
+        let v = json!({
+            "display_name": "openai-prod",
+            "secret": "sk-x",
+            "api_base": "https://api.openai.com/v1"
+        });
+        validate_provider_key(&v).unwrap();
+    }
+
+    #[test]
+    fn provider_key_with_phase_a_fields_passes() {
+        let v = json!({
+            "display_name": "deepseek-prod",
+            "secret": "sk-x",
+            "api_base": "https://api.deepseek.com/v1",
+            "provider": "deepseek",
+            "adapter": "openai",
+            "telemetry_tags": {
+                "kind": "catalog",
+                "featured": true,
+                "branded_provider": "deepseek",
+                "pk_label": "production"
+            }
+        });
+        validate_provider_key(&v).unwrap();
+    }
+
+    #[test]
+    fn provider_key_with_byo_telemetry_shape_passes() {
+        let v = json!({
+            "display_name": "internal-llm",
+            "secret": "sk-x",
+            "telemetry_tags": {
+                "kind": "byo",
+                "branded_provider": null,
+                "byo_label": "platform-team"
+            }
+        });
+        validate_provider_key(&v).unwrap();
+    }
+
+    #[test]
+    fn provider_key_rejects_unknown_adapter_value() {
+        let v = json!({
+            "display_name": "x",
+            "secret": "k",
+            "adapter": "not-a-real-adapter"
+        });
+        assert!(validate_provider_key(&v).is_err());
+    }
+
+    #[test]
+    fn provider_key_rejects_unknown_telemetry_field() {
+        let v = json!({
+            "display_name": "x",
+            "secret": "k",
+            "telemetry_tags": { "unknown_tag": "v" }
+        });
+        assert!(validate_provider_key(&v).is_err());
+    }
+
+    #[test]
+    fn provider_key_rejects_unknown_top_level_field() {
+        // Top-level additionalProperties=false still applies — only
+        // the explicitly-listed Phase A fields are accepted.
+        let v = json!({
+            "display_name": "x",
+            "secret": "k",
+            "rogue": 1
+        });
+        assert!(validate_provider_key(&v).is_err());
+    }
+
+    #[test]
+    fn provider_key_rejects_unknown_telemetry_kind() {
+        // `kind` is the closed `"catalog" | "byo"` set.
+        let v = json!({
+            "display_name": "x",
+            "secret": "k",
+            "telemetry_tags": { "kind": "third-party" }
+        });
+        assert!(validate_provider_key(&v).is_err());
     }
 }

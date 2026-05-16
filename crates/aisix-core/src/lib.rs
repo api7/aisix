@@ -35,7 +35,7 @@ pub use models::{
     AisixSnapshot, ApiKey, CachePolicy, CooldownConfig, ExporterKind, Guardrail,
     GuardrailHookPoint, GuardrailKind, KeywordConfig, KeywordPattern, Model, ObservabilityExporter,
     OnAllFilteredPolicy, Provider, ProviderKey, RateLimit, RateLimitPolicy, Routing,
-    RoutingStrategy, RoutingTarget, SchemaError, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+    RoutingStrategy, RoutingTarget, SchemaError, TelemetryTags, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use resource::{Resource, ResourceEntry};
 pub use snapshot::{ResourceTable, SnapshotHandle};
