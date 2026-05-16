@@ -8,19 +8,19 @@
 //! cp-api can capture per-provider quirks without forking a Bridge.
 //!
 //! This module ships the primitive transforms. **Nothing in
-//! [`OpenAiBridge`](crate::OpenAiBridge) wires them in yet** — the
-//! struct types that would carry the override blocks on `ProviderKey`
-//! are not landed (#298 added `provider` / `adapter` / `telemetry_tags`
-//! only). Phase D consumes these functions from inside the Bridge
-//! when the new contract cuts over. Until then the public API is
-//! exercised by unit tests against `serde_json::Value` /
-//! `http::HeaderMap` inputs.
+//! [`OpenAiBridge`](crate::OpenAiBridge) wires them in yet** — Phase
+//! A2.5 added the on-disk shape (`RequestOverrides` / `ResponseOverrides`
+//! on [`aisix_core::ProviderKey`]); Phase D consumes the functions
+//! here from inside the Bridge once the new contract cuts over. Until
+//! then the public API is exercised by unit tests against
+//! `serde_json::Value` / `http::HeaderMap` inputs.
 //!
-//! Each function takes primitive Rust types rather than a future
-//! `RequestOverrides` / `ResponseOverrides` struct on purpose — the
-//! caller picks fields out of whatever container lands and forwards
-//! them here, so the wire schema for those blocks can iterate without
-//! touching this file.
+//! The closed schema types ([`ParamConstraints`], [`StreamDoneMarker`])
+//! live in `aisix-core` so cp-api can write them straight into etcd
+//! payloads; this module re-uses those types for its apply-function
+//! signatures so cp-api and the DP agree on a single wire shape.
+//! [`StreamDoneOutcome`] is purely a runtime evaluation result and
+//! stays here — it never serializes.
 //!
 //! Reference implementations consulted:
 //! - LiteLLM `convert_content_list_to_str` —
@@ -34,48 +34,16 @@
 
 use std::collections::HashMap;
 
+use aisix_core::{ParamConstraints, StreamDoneMarker};
 use http::{
     header::{HeaderName, HeaderValue},
     HeaderMap,
 };
 use serde_json::{Map, Value};
 
-/// Numeric range clamps applied to chat-completion request bodies.
-///
-/// Mirrors the `param_constraints` block in issue #302 §5. Phase A
-/// scope: `temperature` only — `top_p`, `frequency_penalty`, and
-/// friends are intentionally deferred until a real upstream quirk
-/// requires them (YAGNI per CLAUDE.md §2).
-#[derive(Debug, Default, Clone)]
-pub struct Constraints {
-    /// Upper bound for `temperature`. Values above this are clamped
-    /// to this value. `None` means "no upper clamp".
-    pub temperature_max: Option<f64>,
-    /// Lower bound for `temperature`. Values below this are clamped
-    /// to this value. `None` means "no lower clamp".
-    pub temperature_min: Option<f64>,
-}
-
-/// Stream `[DONE]` terminator policy for an SSE response.
-///
-/// Mirrors `response.stream_done_marker` in issue #302 §5. The
-/// caller observes whether the upstream actually emitted
-/// `data: [DONE]` and dispatches into [`apply_stream_done_marker_policy`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamDoneMarker {
-    /// Upstream must emit `data: [DONE]`. Absence is a wire-shape
-    /// violation. OpenAI proper, DeepSeek, Groq.
-    Required,
-    /// Either presence or absence is acceptable. Used when the
-    /// upstream is OpenAI-compat but does not promise the terminator.
-    Optional,
-    /// Upstream is expected to *omit* the marker. Some Azure / Vertex
-    /// flavors terminate cleanly on connection close.
-    None,
-}
-
 /// Outcome of evaluating an SSE stream against a
-/// [`StreamDoneMarker`] policy.
+/// [`StreamDoneMarker`] policy. Runtime-only — never serialized to
+/// etcd, so it stays in the provider crate rather than `aisix-core`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamDoneOutcome {
     /// Stream complied with the policy.
@@ -124,7 +92,7 @@ pub fn apply_param_renames(body: &mut Value, renames: &HashMap<String, String>) 
 /// added when a real upstream needs them. If the body has no
 /// `temperature` field, or its value is not a number, the function
 /// is a no-op (the upstream itself will surface invalid types).
-pub fn apply_param_constraints(body: &mut Value, constraints: &Constraints) {
+pub fn apply_param_constraints(body: &mut Value, constraints: &ParamConstraints) {
     let Some(obj) = body.as_object_mut() else {
         return;
     };
@@ -465,7 +433,7 @@ mod tests {
     #[test]
     fn temperature_above_max_is_clamped() {
         let mut body = json!({ "temperature": 1.7 });
-        let constraints = Constraints {
+        let constraints = ParamConstraints {
             temperature_max: Some(1.0),
             temperature_min: None,
         };
@@ -476,7 +444,7 @@ mod tests {
     #[test]
     fn temperature_within_range_is_untouched() {
         let mut body = json!({ "temperature": 0.7 });
-        let constraints = Constraints {
+        let constraints = ParamConstraints {
             temperature_max: Some(1.0),
             temperature_min: Some(0.0),
         };
@@ -487,7 +455,7 @@ mod tests {
     #[test]
     fn temperature_below_min_is_clamped() {
         let mut body = json!({ "temperature": -0.2 });
-        let constraints = Constraints {
+        let constraints = ParamConstraints {
             temperature_max: None,
             temperature_min: Some(0.0),
         };
@@ -498,7 +466,7 @@ mod tests {
     #[test]
     fn temperature_missing_is_noop() {
         let mut body = json!({ "model": "gpt-4o" });
-        let constraints = Constraints {
+        let constraints = ParamConstraints {
             temperature_max: Some(1.0),
             temperature_min: None,
         };
@@ -511,7 +479,7 @@ mod tests {
         // Garbage-typed temperature lets the upstream surface the
         // type error; the clamp doesn't try to coerce.
         let mut body = json!({ "temperature": "hot" });
-        let constraints = Constraints {
+        let constraints = ParamConstraints {
             temperature_max: Some(1.0),
             temperature_min: None,
         };
@@ -522,7 +490,7 @@ mod tests {
     #[test]
     fn empty_constraints_is_noop() {
         let mut body = json!({ "temperature": 2.0 });
-        let constraints = Constraints::default();
+        let constraints = ParamConstraints::default();
         apply_param_constraints(&mut body, &constraints);
         assert_eq!(body["temperature"].as_f64(), Some(2.0));
     }

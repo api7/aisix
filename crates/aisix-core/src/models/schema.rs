@@ -276,10 +276,13 @@ fn apikey_schema() -> Value {
 
 fn provider_key_schema() -> Value {
     // `provider`, `adapter`, and `telemetry_tags` were added as a
-    // skeleton for issue #302 Phase A. They are optional on the wire
-    // (matching `#[serde(default)]` on the Rust side) so existing
-    // ProviderKey payloads without these fields keep validating. No
-    // dispatch path reads them in this PR.
+    // skeleton for issue #302 Phase A (PR #298). `request` and
+    // `response` were added in Phase A2.5 to land the on-disk shape
+    // for the `RuntimeConfig.request` / `RuntimeConfig.response`
+    // blocks from issue #302 §5. All Phase A fields are optional on
+    // the wire (matching `#[serde(default)]` on the Rust side) so
+    // existing ProviderKey payloads without these fields keep
+    // validating. No dispatch path reads them in this PR.
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -305,6 +308,53 @@ fn provider_key_schema() -> Value {
                     "branded_provider": { "type": ["string", "null"] },
                     "pk_label":         { "type": ["string", "null"] },
                     "byo_label":        { "type": ["string", "null"] }
+                }
+            },
+            // Phase A2.5 — RuntimeConfig.request, see issue #302 §5.
+            // Each sub-field is the input to a primitive apply
+            // function in aisix-provider-openai's overrides module.
+            "request": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "param_renames": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" }
+                    },
+                    "param_constraints": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "temperature_max": { "type": "number" },
+                            "temperature_min": { "type": "number" }
+                        }
+                    },
+                    "default_headers": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" }
+                    },
+                    // Free-form on purpose — the cp-api spec lets
+                    // operators set any default top-level body field
+                    // (`safe_prompt`, `transforms`, etc.); the apply
+                    // path only adds keys when the caller did not
+                    // set them.
+                    "default_body_fields": {
+                        "type": "object"
+                    }
+                }
+            },
+            // Phase A2.5 — RuntimeConfig.response, see issue #302 §5.
+            "response": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "stream_done_marker":     { "type": "string", "enum": ["required", "optional", "none"] },
+                    "content_list_to_string": { "type": "boolean" },
+                    // Open string in Phase A2.5 — matches the Rust
+                    // `Option<String>`. Phase D pins the closed
+                    // ("openai" | "passthrough") set.
+                    "error_envelope":         { "type": "string" },
+                    "reasoning_field":        { "type": "string" }
                 }
             }
         }
@@ -1066,6 +1116,97 @@ mod tests {
             "display_name": "x",
             "secret": "k",
             "telemetry_tags": { "kind": "third-party" }
+        });
+        assert!(validate_provider_key(&v).is_err());
+    }
+
+    // ---- provider_key schema (issue #302 Phase A2.5 — request/response) ----
+
+    #[test]
+    fn provider_key_with_request_block_passes() {
+        // Mirror the on-disk example in issue #302 §5 exactly.
+        let v = json!({
+            "display_name": "deepseek-prod",
+            "secret": "sk-x",
+            "request": {
+                "param_renames":       { "max_completion_tokens": "max_tokens" },
+                "param_constraints":   { "temperature_max": 1.0 },
+                "default_headers":     { "X-Foo": "bar" },
+                "default_body_fields": { "safe_prompt": true }
+            }
+        });
+        validate_provider_key(&v).unwrap();
+    }
+
+    #[test]
+    fn provider_key_with_response_block_passes() {
+        let v = json!({
+            "display_name": "deepseek-prod",
+            "secret": "sk-x",
+            "response": {
+                "stream_done_marker":     "required",
+                "content_list_to_string": false,
+                "error_envelope":         "openai",
+                "reasoning_field":        "delta.reasoning_content"
+            }
+        });
+        validate_provider_key(&v).unwrap();
+    }
+
+    #[test]
+    fn provider_key_with_empty_request_response_blocks_passes() {
+        // `{}` for each block must validate — matches the Rust-side
+        // all-default deserialization path.
+        let v = json!({
+            "display_name": "x",
+            "secret": "k",
+            "request": {},
+            "response": {}
+        });
+        validate_provider_key(&v).unwrap();
+    }
+
+    #[test]
+    fn provider_key_request_rejects_unknown_field() {
+        let v = json!({
+            "display_name": "x",
+            "secret": "k",
+            "request": { "param_rename": {} }
+        });
+        assert!(validate_provider_key(&v).is_err());
+    }
+
+    #[test]
+    fn provider_key_response_rejects_unknown_field() {
+        let v = json!({
+            "display_name": "x",
+            "secret": "k",
+            "response": { "reasoning_fields": "delta.foo" }
+        });
+        assert!(validate_provider_key(&v).is_err());
+    }
+
+    #[test]
+    fn provider_key_response_rejects_unknown_stream_done_marker() {
+        let v = json!({
+            "display_name": "x",
+            "secret": "k",
+            "response": { "stream_done_marker": "maybe" }
+        });
+        assert!(validate_provider_key(&v).is_err());
+    }
+
+    #[test]
+    fn provider_key_request_param_constraints_rejects_unknown_field() {
+        // `param_constraints` is closed (`additionalProperties: false`)
+        // so a stray `top_p_max` from a future schema iteration can't
+        // sneak past today's DP.
+        let v = json!({
+            "display_name": "x",
+            "secret": "k",
+            "request": {
+                "param_constraints": { "top_p_max": 0.9 }
+            }
         });
         assert!(validate_provider_key(&v).is_err());
     }
