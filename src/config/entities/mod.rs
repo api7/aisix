@@ -1,6 +1,7 @@
 pub mod apikeys;
 pub mod guardrails;
 pub mod models;
+pub mod policies;
 pub mod providers;
 pub mod types;
 
@@ -11,6 +12,7 @@ use arc_swap::ArcSwap;
 pub use guardrails::Guardrail;
 use log::{info, warn};
 pub use models::Model;
+pub use policies::Policy;
 pub use providers::Provider;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc::Receiver;
@@ -22,6 +24,7 @@ pub struct ResourceRegistry {
     pub models: models::ModelsStore,
     pub apikeys: apikeys::ApiKeysStore,
     pub guardrails: guardrails::GuardrailsStore,
+    pub policies: policies::PoliciesStore,
     pub providers: providers::ProvidersStore,
 }
 
@@ -29,6 +32,7 @@ impl ResourceRegistry {
     pub async fn new(provider: Arc<dyn ConfigProvider + Send + Sync>) -> Self {
         let providers = providers::ProvidersStore::new(provider.clone()).await;
         let guardrails = guardrails::GuardrailsStore::new(provider.clone()).await;
+        let policies = policies::PoliciesStore::new(provider.clone()).await;
         let models = models::ModelsStore::new(provider.clone()).await;
         let apikeys = apikeys::ApiKeysStore::new(provider).await;
 
@@ -36,6 +40,7 @@ impl ResourceRegistry {
             models,
             apikeys,
             guardrails,
+            policies,
             providers,
         }
     }

@@ -1,6 +1,7 @@
 mod apikeys;
 mod models;
 mod playground;
+mod policies;
 mod providers;
 mod types;
 
@@ -37,6 +38,7 @@ pub const PATH_PREFIX: &str = "/aisix/admin";
     tags(
         (name = models::OPENAPI_TAG, description = "Admin API for managing AI models"),
         (name = apikeys::OPENAPI_TAG, description = "Admin API for managing API keys"),
+        (name = policies::OPENAPI_TAG, description = "Admin API for managing guardrail policies"),
         (name = providers::OPENAPI_TAG, description = "Admin API for managing AI providers")
     ),
     security(
@@ -59,6 +61,11 @@ pub const PATH_PREFIX: &str = "/aisix/admin";
         apikeys::post,
         apikeys::put,
         apikeys::delete,
+        policies::list,
+        policies::get,
+        policies::post,
+        policies::put,
+        policies::delete,
     )
 )]
 struct ApiDoc;
@@ -137,6 +144,16 @@ pub fn create_router(state: AppState) -> Result<Router> {
                         .route(
                             "/apikeys/{id}",
                             get(apikeys::get).put(apikeys::put).delete(apikeys::delete),
+                        ),
+                )
+                .merge(
+                    Router::new()
+                        .route("/policies", get(policies::list).post(policies::post))
+                        .route(
+                            "/policies/{id}",
+                            get(policies::get)
+                                .put(policies::put)
+                                .delete(policies::delete),
                         ),
                 )
                 .layer(axum::middleware::from_fn_with_state(state.clone(), auth)),

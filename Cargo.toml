@@ -25,6 +25,7 @@ axum = { version = "0.8.9", features = [
   "macros",
 ], default-features = false }
 bytes = "1.0"
+cel = "0.13.0"
 fastrace = { version = "0.7.16", features = ["enable"] }
 futures = "0.3"
 http = "1.4.0"
@@ -67,6 +68,7 @@ axum.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+cel.workspace = true
 async-trait.workspace = true
 aws-credential-types.workspace = true
 aws-sigv4.workspace = true
