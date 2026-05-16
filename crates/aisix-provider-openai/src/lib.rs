@@ -12,6 +12,7 @@
 #![deny(rust_2018_idioms)]
 
 mod bridge;
+pub mod overrides;
 mod wire;
 
 pub use bridge::{OpenAiBridge, OPENAI_DEFAULT_BASE};

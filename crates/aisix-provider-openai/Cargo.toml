@@ -21,6 +21,7 @@ tokio.workspace = true
 futures.workspace = true
 async-stream = "0.3"
 bytes.workspace = true
+http.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
