@@ -52,17 +52,6 @@ This is a caller-visible denial, not just an internal accounting event.
 
 Inspect budget-check freshness and the cached-decision behavior first.
 
-### Standalone admin write validator rejects `max_budget_usd`
-
-`max_budget_usd` is a managed-mode field implemented in AISIX Cloud's control plane.
-The standalone OSS admin write validator rejects it with `400 Bad Request — unknown field`
-(via `#[serde(deny_unknown_fields)]` on `StandaloneApiKeyBody`).
-
-If you are migrating a config from AISIX Cloud to standalone deployment, drop
-`max_budget_usd` from your API key write payload. Standalone deployments currently do
-not enforce per-key budgets by default; budget enforcement is implemented in the managed
-data-plane budget controller.
-
 ## Related Pages
 
 - [API Keys](api-keys.md)
