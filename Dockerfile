@@ -42,6 +42,10 @@ WORKDIR /src
 # the Dockerfile complexity. Source copy is a single layer.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml ./
 COPY crates ./crates
+# `crates/aisix-admin/src/openapi.rs` uses `include_str!` to embed
+# every `schemas/resources/*.schema.json` at compile time, so the
+# Docker context must carry this directory or the release build fails.
+COPY schemas ./schemas
 
 # `--locked` forces the build to use the exact versions in Cargo.lock —
 # fails fast if the lockfile is stale rather than silently resolving
