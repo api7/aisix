@@ -28,6 +28,26 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  schema-drift:
+    name: schema drift (resources)
+    runs-on: ubicloud-standard-2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: regenerate schemas
+        run: cargo run -p aisix-core --bin dump-schema
+      - name: assert no drift
+        run: |
+          if ! git diff --exit-code schemas/; then
+            echo "::error::Resource JSON Schemas in 'schemas/resources/' drift from the Rust types in 'crates/aisix-core/src/models/'."
+            echo "::error::Fix: run 'cargo run -p aisix-core --bin dump-schema' locally and commit the diff."
+            exit 1
+          fi
+
   rust-unit:
     name: rust unit + coverage
     runs-on: ubicloud-standard-2
