@@ -143,17 +143,26 @@ impl Bridge for VertexBridge {
 
     async fn chat(
         &self,
-        req: &ChatFormat,
-        _ctx: &BridgeContext,
+        _req: &ChatFormat,
+        ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
         // Skeleton: validate the publisher resolution path so a
         // misconfigured upstream_id surfaces a clear error today,
         // even though the actual HTTP call is TODO.
-        let _publisher = VertexPublisher::from_upstream_id(&req.model).ok_or_else(|| {
+        //
+        // IMPORTANT: the Vertex upstream model id (e.g.
+        // `gemini-1.5-pro`, `claude-3-5-sonnet@20241022`) lives on
+        // Model.model_name, NOT on req.model (which is the
+        // gateway-internal display name the customer typed in
+        // `/v1/chat/completions`). See OpenAiBridge /
+        // `upstream_model(ctx)` for the established pattern. This
+        // is the D6 audit HIGH-1 fix backported.
+        let upstream_id = upstream_model(ctx)?;
+        let _publisher = VertexPublisher::from_upstream_id(upstream_id).ok_or_else(|| {
             BridgeError::Config(format!(
-                "vertex publisher unknown for upstream model id {:?}; \
-                 expected one of gemini-* / claude-* / llama-* / mistral-* / jamba-*",
-                req.model
+                "vertex publisher unknown for upstream model id {upstream_id:?}; \
+                 expected one of gemini-* / claude-* / meta/llama-* or llama* / \
+                 mistral-* / jamba-*"
             ))
         })?;
         // Reserved-config helper exercised by tests: keeps the wire
@@ -169,14 +178,15 @@ impl Bridge for VertexBridge {
 
     async fn chat_stream(
         &self,
-        req: &ChatFormat,
-        _ctx: &BridgeContext,
+        _req: &ChatFormat,
+        ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
-        let _publisher = VertexPublisher::from_upstream_id(&req.model).ok_or_else(|| {
+        let upstream_id = upstream_model(ctx)?;
+        let _publisher = VertexPublisher::from_upstream_id(upstream_id).ok_or_else(|| {
             BridgeError::Config(format!(
-                "vertex publisher unknown for upstream model id {:?}; \
-                 expected one of gemini-* / claude-* / llama-* / mistral-* / jamba-*",
-                req.model
+                "vertex publisher unknown for upstream model id {upstream_id:?}; \
+                 expected one of gemini-* / claude-* / meta/llama-* or llama* / \
+                 mistral-* / jamba-*"
             ))
         })?;
         Err(BridgeError::Config(
@@ -185,6 +195,18 @@ impl Bridge for VertexBridge {
                 .into(),
         ))
     }
+}
+
+/// Pull the upstream model id off the BridgeContext. Vertex model ids
+/// (e.g. `gemini-1.5-pro`, `claude-3-5-sonnet@20241022`,
+/// `meta/llama-3.3-70b-instruct-maas`) live on Model.model_name. The
+/// customer-facing display name in req.model is NOT the source of
+/// truth — that was D6 audit HIGH-1, backported here proactively.
+fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
+    ctx.model
+        .model_name
+        .as_deref()
+        .ok_or_else(|| BridgeError::Config("model.model_name missing".into()))
 }
 
 #[cfg(test)]
@@ -307,18 +329,20 @@ mod tests {
     use aisix_gateway::ChatMessage;
     use std::sync::Arc;
 
-    fn sample_model() -> Arc<Model> {
-        Arc::new(
-            serde_json::from_str(
-                r#"{
-                    "display_name": "my-gemini",
-                    "provider": "google",
-                    "model_name": "gemini-1.5-pro",
-                    "provider_key_id": "11111111-1111-1111-1111-111111111111"
-                }"#,
-            )
-            .unwrap(),
-        )
+    /// Build a Model fixture where `model_name` (the upstream Vertex
+    /// id) and `display_name` (the customer-facing name) deliberately
+    /// differ. The bridge must dispatch off `model_name`, not the
+    /// typed display name in `req.model`.
+    fn sample_model_with(model_name: &str) -> Arc<Model> {
+        let cfg = format!(
+            r#"{{
+                "display_name": "customer-facing-name",
+                "provider": "google",
+                "model_name": {model_name:?},
+                "provider_key_id": "11111111-1111-1111-1111-111111111111"
+            }}"#
+        );
+        Arc::new(serde_json::from_str(&cfg).unwrap())
     }
 
     fn sample_pk() -> Arc<ProviderKey> {
@@ -334,8 +358,10 @@ mod tests {
         // tracking-issue link, so an operator who lands here knows
         // the path is intentional-WIP not silently-broken.
         let bridge = VertexBridge::new();
-        let ctx = BridgeContext::new("req-1", sample_model(), sample_pk());
-        let req = ChatFormat::new("gemini-1.5-pro", vec![ChatMessage::user("hi")]);
+        let ctx = BridgeContext::new("req-1", sample_model_with("gemini-1.5-pro"), sample_pk());
+        // req.model is the customer-facing display name; the bridge
+        // must ignore it and resolve off Model.model_name.
+        let req = ChatFormat::new("customer-facing-name", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
             BridgeError::Config(msg) => {
@@ -352,14 +378,45 @@ mod tests {
         }
     }
 
+    /// D6 audit HIGH-1 regression (backported to D5): dispatch must
+    /// read the upstream model id from ctx.model.model_name, NOT
+    /// from req.model. req.model is the customer-typed display
+    /// name; resolving off it would produce `/<region>/projects/
+    /// .../publishers/google/models/<customer-display-name>` and
+    /// 404 from every Vertex request.
+    #[tokio::test]
+    async fn chat_ignores_req_model_and_uses_ctx_model_name() {
+        let bridge = VertexBridge::new();
+        // model_name = valid Vertex id; req.model = something the
+        // publisher resolver would reject if it were the source of
+        // truth. Expectation: the not-implemented stub fires,
+        // proving model_name was the actual input.
+        let ctx = BridgeContext::new("req-1", sample_model_with("gemini-1.5-pro"), sample_pk());
+        let req = ChatFormat::new("gpt-4o", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(
+                    msg.contains("not yet implemented"),
+                    "must hit the not-implemented stub (proving model_name was used); got {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn chat_with_unknown_publisher_prefix_errors_before_dispatch() {
-        // The publisher-resolution guard fires before the
-        // not-implemented stub — proves the bridge will route per
+        // Publisher-resolution guard fires when model_name is
+        // unrecognized — proves the bridge will route per
         // upstream_id once the dispatch lands.
         let bridge = VertexBridge::new();
-        let ctx = BridgeContext::new("req-1", sample_model(), sample_pk());
-        let req = ChatFormat::new("gpt-4o", vec![ChatMessage::user("hi")]);
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("totally-bogus-vertex-id"),
+            sample_pk(),
+        );
+        let req = ChatFormat::new("customer-facing-name", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
             BridgeError::Config(msg) => {
@@ -368,9 +425,37 @@ mod tests {
                     "must mention publisher resolution failure; got {msg}"
                 );
                 assert!(
-                    msg.contains("gpt-4o"),
-                    "must include the offending upstream id; got {msg}"
+                    msg.contains("totally-bogus-vertex-id"),
+                    "must include the offending model id; got {msg}"
                 );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    /// Defense: if Model.model_name is absent (shouldn't happen in
+    /// practice — cp-api requires it — but the field is
+    /// Option<String>), the bridge surfaces a clear error rather
+    /// than panicking or treating "" as a publisher.
+    #[tokio::test]
+    async fn chat_with_missing_model_name_errors_before_dispatch() {
+        let bridge = VertexBridge::new();
+        let model_no_name: Arc<Model> = Arc::new(
+            serde_json::from_str(
+                r#"{
+                    "display_name": "no-upstream-id",
+                    "provider": "google",
+                    "provider_key_id": "11111111-1111-1111-1111-111111111111"
+                }"#,
+            )
+            .unwrap(),
+        );
+        let ctx = BridgeContext::new("req-1", model_no_name, sample_pk());
+        let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(msg.contains("model_name missing"), "got {msg}");
             }
             other => panic!("expected Config error, got {other:?}"),
         }
