@@ -16,11 +16,20 @@ pub(crate) fn reserved_query_params() -> &'static [&'static str] {
 }
 
 /// Header names reserved by Azure OpenAI authentication that
-/// `default_headers` must never inject. Azure uses `api-key`
-/// (different from OpenAI's `Authorization: Bearer`); the bridge's
-/// own auth header must always win.
+/// `default_headers` must never inject. Azure supports two auth
+/// modes:
+///
+/// - `api-key: <key>` — legacy / RBAC-disabled tenants
+/// - `Authorization: Bearer <aad-token>` — Entra (AAD) RBAC
+///
+/// Reserving both prevents a future AAD-mode operator from poking
+/// either header through the override block — same defense-in-depth
+/// pattern OpenAiBridge uses for `Authorization` / `x-api-key`.
+///
+/// Values are lowercase canonical so they compare case-insensitively
+/// against `http::HeaderName::as_str()` (which lowercases on parse).
 pub(crate) fn reserved_auth_headers() -> &'static [&'static str] {
-    &["api-key"]
+    &["api-key", "authorization"]
 }
 
 #[cfg(test)]
@@ -34,12 +43,20 @@ mod tests {
     }
 
     #[test]
-    fn reserved_auth_headers_pins_azure_api_key() {
-        // The `api-key` header name is Azure's auth convention.
-        // A default_headers block trying to inject it must be
+    fn reserved_auth_headers_pins_both_azure_auth_modes() {
+        // Azure supports `api-key: <key>` AND
+        // `Authorization: Bearer <aad-token>` (Entra RBAC). A
+        // default_headers block trying to inject EITHER must be
         // dropped at apply time — same defense-in-depth contract
-        // OpenAiBridge uses for `Authorization` / `x-api-key`.
+        // OpenAiBridge uses for its Bearer / vendor api-key headers.
         let reserved = reserved_auth_headers();
-        assert!(reserved.contains(&"api-key"));
+        assert!(
+            reserved.contains(&"api-key"),
+            "must reserve api-key (legacy auth)"
+        );
+        assert!(
+            reserved.contains(&"authorization"),
+            "must reserve authorization (AAD Bearer auth)"
+        );
     }
 }

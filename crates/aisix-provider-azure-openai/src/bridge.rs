@@ -66,30 +66,34 @@ pub struct AzureUpstreamRef {
 }
 
 impl AzureUpstreamRef {
-    /// Default Azure REST API version Bridge tests rely on when the
-    /// operator hasn't pinned one. Real production deployments
-    /// **must** pin a version explicitly via `provider_key.api_base`
-    /// — Azure deprecates older versions on a published schedule:
-    /// <https://learn.microsoft.com/en-us/azure/ai-services/openai/api-version-deprecation>
-    pub const DEFAULT_API_VERSION: &'static str = "2024-08-01-preview";
+    /// Most recent GA REST API version at crate publish time.
+    /// Operators **must** pin an explicit version via
+    /// `provider_key.api_base` for production traffic — this constant
+    /// is a stop-gap default for tests + early skeleton plumbing
+    /// only. Azure deprecates older versions on a published schedule:
+    /// <https://learn.microsoft.com/en-us/azure/ai-services/openai/api-version-deprecation>.
+    ///
+    /// Pinned at a GA shape (`YYYY-MM-DD`, no `-preview` suffix) so a
+    /// future bump can't silently re-introduce a preview default.
+    pub const DEFAULT_API_VERSION: &'static str = "2024-10-21";
 
     /// Resolve from the deployment name + an optional pre-parsed
-    /// `api_base`. Real dispatch will call this from `chat()`; today
-    /// it's exercised purely by the publisher-resolution tests.
+    /// `api_base`. Real dispatch will call this from `chat()`.
+    ///
+    /// Both `deployment` and the resolved `resource` are validated to
+    /// match a strict `[A-Za-z0-9_-]+` shape: Azure resource names
+    /// and deployment names are constrained to that set per the
+    /// portal, and a URL-injection vector via `?`, `#`, `/`, or
+    /// whitespace would let an operator-supplied default redirect
+    /// the dispatch to an attacker-pinned API version.
     pub fn resolve(deployment: &str, api_base: Option<&str>) -> Result<Self, BridgeError> {
-        if deployment.trim().is_empty() {
-            return Err(BridgeError::Config(
-                "azure deployment name is empty (expected a deployment id from \
-                 the Azure portal, e.g. \"gpt4o-prod\")"
-                    .into(),
-            ));
-        }
+        validate_url_token("deployment name", deployment)?;
 
         // Skeleton: the api_base contains the resource. Real parser
         // lands in follow-up PRs; for now we accept either:
         //   - "https://<resource>.openai.azure.com" (canonical)
         //   - "<resource>" (bare resource name shorthand)
-        // and require the canonical form for anything else.
+        // Both forms get the same strict token-shape validation.
         let base = api_base.unwrap_or_default().trim();
         let resource = if base.is_empty() {
             return Err(BridgeError::Config(
@@ -101,16 +105,36 @@ impl AzureUpstreamRef {
             .strip_prefix("https://")
             .or_else(|| base.strip_prefix("http://"))
         {
-            rest.split('.').next().unwrap_or_default().to_string()
+            // Canonical form: split off the leading host segment
+            // before the first `.`. The remainder of the host MUST
+            // be `openai.azure.com` — anything else is a misconfig
+            // we surface up rather than silently dropping the path.
+            let (host_resource, host_tail) = rest.split_once('.').ok_or_else(|| {
+                BridgeError::Config(format!(
+                    "azure api_base {base:?} missing the .openai.azure.com suffix"
+                ))
+            })?;
+            // Strip a trailing `/...` path so an operator who pasted
+            // the full chat-completions URL still parses correctly,
+            // but reject anything that injected query params.
+            let host_tail_trimmed = host_tail.trim_end_matches('/');
+            let host_tail_core = host_tail_trimmed
+                .split_once('/')
+                .map(|(host, _path)| host)
+                .unwrap_or(host_tail_trimmed);
+            if host_tail_core != "openai.azure.com" {
+                return Err(BridgeError::Config(format!(
+                    "azure api_base {base:?} host must end in .openai.azure.com \
+                     (got host suffix {host_tail_core:?})"
+                )));
+            }
+            host_resource.to_string()
         } else {
+            // Bare-resource shorthand.
             base.to_string()
         };
 
-        if resource.is_empty() {
-            return Err(BridgeError::Config(format!(
-                "azure resource not resolvable from api_base {base:?}"
-            )));
-        }
+        validate_url_token("resource name", &resource)?;
 
         Ok(Self {
             resource,
@@ -129,6 +153,29 @@ impl AzureUpstreamRef {
     }
 }
 
+/// Reject URL-control characters in operator/customer-supplied tokens
+/// that end up in the Azure URL path. Azure resource names and
+/// deployment names are documented as `[A-Za-z0-9_-]+`, so anything
+/// outside that set is either a misconfig or a URL-injection attempt
+/// (e.g. `?api-version=evil` to override the bridge's version pin).
+fn validate_url_token(name: &str, value: &str) -> Result<(), BridgeError> {
+    if value.is_empty() {
+        return Err(BridgeError::Config(format!(
+            "azure {name} is empty (expected an identifier matching [A-Za-z0-9_-]+)"
+        )));
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(BridgeError::Config(format!(
+            "azure {name} {value:?} contains URL-control characters — \
+             must match [A-Za-z0-9_-]+ (no spaces, slashes, dots, query params, or hash)"
+        )));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Bridge for AzureOpenAiBridge {
     fn name(&self) -> &'static str {
@@ -137,14 +184,22 @@ impl Bridge for AzureOpenAiBridge {
 
     async fn chat(
         &self,
-        req: &ChatFormat,
+        _req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
         // Skeleton: validate the deployment resolution path so a
         // misconfigured row surfaces a clear error today, even
         // though the actual HTTP call is TODO.
+        //
+        // IMPORTANT: the Azure deployment name lives on
+        // Model.model_name (the operator-pinned upstream id), NOT on
+        // req.model (which is the gateway-internal display name the
+        // customer typed in `/v1/chat/completions`). See
+        // OpenAiBridge / `upstream_model(ctx)` for the established
+        // pattern.
+        let deployment = upstream_model(ctx)?;
         let _upstream =
-            AzureUpstreamRef::resolve(&req.model, ctx.provider_key.api_base.as_deref())?;
+            AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
         // Reserved-config helpers exercised by tests: keep the wire
         // module reachable from the public surface so a future
         // dispatch PR can drop its body straight in (header / query
@@ -161,17 +216,30 @@ impl Bridge for AzureOpenAiBridge {
 
     async fn chat_stream(
         &self,
-        req: &ChatFormat,
+        _req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
+        let deployment = upstream_model(ctx)?;
         let _upstream =
-            AzureUpstreamRef::resolve(&req.model, ctx.provider_key.api_base.as_deref())?;
+            AzureUpstreamRef::resolve(deployment, ctx.provider_key.api_base.as_deref())?;
         Err(BridgeError::Config(
             "azure-openai bridge is not yet implemented — \
              tracked under api7/AISIX-Cloud#302 Phase F (D6)"
                 .into(),
         ))
     }
+}
+
+/// Pull the upstream deployment name off the BridgeContext. Azure
+/// deployment names (operator-defined in the Azure portal, e.g.
+/// `gpt4o-prod`) live on Model.model_name. `req.model` is the
+/// customer-facing display name and must NOT be used here — that
+/// was D6 audit HIGH-1.
+fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
+    ctx.model
+        .model_name
+        .as_deref()
+        .ok_or_else(|| BridgeError::Config("model.model_name missing".into()))
 }
 
 #[cfg(test)]
@@ -242,12 +310,102 @@ mod tests {
         let r = AzureUpstreamRef {
             resource: "acme-west".into(),
             deployment: "gpt4o-prod".into(),
-            api_version: "2024-08-01-preview".into(),
+            api_version: "2024-10-21".into(),
         };
         assert_eq!(
             r.chat_completions_url(),
-            "https://acme-west.openai.azure.com/openai/deployments/gpt4o-prod/chat/completions?api-version=2024-08-01-preview",
+            "https://acme-west.openai.azure.com/openai/deployments/gpt4o-prod/chat/completions?api-version=2024-10-21",
         );
+    }
+
+    /// D6 audit HIGH-2 regression: a deployment name with URL-control
+    /// chars (`?`, `#`, `/`, whitespace) would inject extra query
+    /// params or path segments into `chat_completions_url()`. The
+    /// resolver must reject these before the URL is ever built.
+    #[test]
+    fn resolve_rejects_deployment_with_query_injection() {
+        let err = AzureUpstreamRef::resolve("foo?api-version=evil", Some("acme-east")).unwrap_err();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(msg.contains("URL-control characters"), "got {msg}");
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_deployment_with_slash_injection() {
+        let err = AzureUpstreamRef::resolve("foo/bar/chat", Some("acme")).unwrap_err();
+        assert!(matches!(err, BridgeError::Config(_)));
+    }
+
+    #[test]
+    fn resolve_rejects_deployment_with_hash_fragment() {
+        let err = AzureUpstreamRef::resolve("foo#bar", Some("acme")).unwrap_err();
+        assert!(matches!(err, BridgeError::Config(_)));
+    }
+
+    #[test]
+    fn resolve_rejects_resource_with_query_injection() {
+        // Bare-resource form with `?` — would corrupt the host.
+        let err = AzureUpstreamRef::resolve("dep", Some("acme?evil=1")).unwrap_err();
+        assert!(matches!(err, BridgeError::Config(_)));
+    }
+
+    #[test]
+    fn resolve_rejects_canonical_https_with_wrong_suffix() {
+        // `acme.evil.com` is not Azure — must reject so a misconfig
+        // doesn't dispatch chat traffic to an attacker-controlled
+        // host that happens to look canonical.
+        let err = AzureUpstreamRef::resolve("dep", Some("https://acme.evil.com")).unwrap_err();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(
+                    msg.contains("openai.azure.com"),
+                    "must call out the required host suffix; got {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_accepts_canonical_https_with_trailing_slash() {
+        let r =
+            AzureUpstreamRef::resolve("gpt4o-prod", Some("https://acme-west.openai.azure.com/"))
+                .unwrap();
+        assert_eq!(r.resource, "acme-west");
+    }
+
+    #[test]
+    fn resolve_accepts_canonical_https_with_pasted_endpoint_path() {
+        // Operator copy-paste tolerance: full chat-completions URL
+        // pasted into api_base should still parse the resource.
+        let r = AzureUpstreamRef::resolve(
+            "gpt4o-prod",
+            Some("https://acme-west.openai.azure.com/openai/deployments/x/chat/completions"),
+        )
+        .unwrap();
+        assert_eq!(r.resource, "acme-west");
+    }
+
+    /// D6 audit HIGH-3 regression: the default MUST be GA shape
+    /// (`YYYY-MM-DD`, no `-preview` suffix). Preview versions are
+    /// rotated aggressively by Azure and should not be the
+    /// implicit default for production traffic.
+    #[test]
+    fn default_api_version_is_ga_shape() {
+        let v = AzureUpstreamRef::DEFAULT_API_VERSION;
+        assert!(
+            !v.contains("preview"),
+            "default API version must be GA, not preview; got {v:?}"
+        );
+        // YYYY-MM-DD shape: exactly 10 chars, hyphens at positions
+        // 4 and 7. A future bump can't accidentally re-introduce a
+        // preview default without tripping this assertion.
+        assert_eq!(v.len(), 10, "must match YYYY-MM-DD; got {v:?}");
+        assert_eq!(v.chars().nth(4), Some('-'), "{v:?}");
+        assert_eq!(v.chars().nth(7), Some('-'), "{v:?}");
     }
 
     #[test]
@@ -306,7 +464,9 @@ mod tests {
             sample_model(),
             sample_pk(Some("https://acme-west.openai.azure.com")),
         );
-        let req = ChatFormat::new("gpt4o-prod", vec![ChatMessage::user("hi")]);
+        // req.model is the customer-facing display name; the bridge
+        // must ignore it and resolve the deployment from Model.model_name.
+        let req = ChatFormat::new("customer-facing-name", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
             BridgeError::Config(msg) => {
@@ -323,6 +483,36 @@ mod tests {
         }
     }
 
+    /// D6 audit HIGH-1 regression: dispatch must read the upstream
+    /// deployment from ctx.model.model_name, NOT from req.model.
+    /// req.model is the customer-typed display name; resolving off
+    /// it would produce `/openai/deployments/customer-facing-name/`
+    /// — 404 from Azure every time.
+    #[tokio::test]
+    async fn chat_ignores_req_model_and_uses_ctx_model_name() {
+        let bridge = AzureOpenAiBridge::new();
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model(),
+            sample_pk(Some("https://acme-west.openai.azure.com")),
+        );
+        // req.model set to something the deployment-token validator
+        // would reject if it were the source of truth (whitespace +
+        // path traversal). Model.model_name = "gpt4o-prod" is valid,
+        // so the bridge must reach the not-implemented stub.
+        let req = ChatFormat::new("foo bar/../etc", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(
+                    msg.contains("not yet implemented"),
+                    "must hit the not-implemented stub (proving model_name was used); got {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn chat_with_missing_api_base_errors_before_dispatch() {
         // The resolve-time guard fires before the not-implemented
@@ -330,7 +520,7 @@ mod tests {
         // registrations early once dispatch lands.
         let bridge = AzureOpenAiBridge::new();
         let ctx = BridgeContext::new("req-1", sample_model(), sample_pk(None));
-        let req = ChatFormat::new("gpt4o-prod", vec![ChatMessage::user("hi")]);
+        let req = ChatFormat::new("customer-facing-name", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
             BridgeError::Config(msg) => {
