@@ -136,9 +136,7 @@ async fn dispatch(
     let provider = crate::dispatch::require_provider(model)?;
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
 
-    let bridge = state
-        .hub
-        .get(provider)
+    let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, provider)
         .ok_or(ProxyError::ProviderUnavailable)?;
 
     let model_rl =

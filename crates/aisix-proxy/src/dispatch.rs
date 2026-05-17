@@ -42,8 +42,27 @@ pub(crate) fn resolve_bridge(
     provider_key: &ProviderKey,
     provider: Provider,
 ) -> Option<Arc<dyn Bridge>> {
-    hub.dispatch_two_tier(provider_key)
-        .or_else(|| hub.get(provider))
+    if let Some(bridge) = hub.dispatch_two_tier(provider_key) {
+        return Some(bridge);
+    }
+    // Legacy fallback. Emit a tracing::debug! when the PK carries the
+    // new-shape fields (`provider` or `adapter`) but the two-tier path
+    // still missed — post-cutover this is the early signal that a
+    // specialized Bridge name was misregistered (typo, runtime
+    // unregister) or that the adapter map missed an entry. Pre-cutover
+    // PKs (empty provider + adapter: None) take the silent path because
+    // they're the dominant case.
+    let pk_carries_new_fields = !provider_key.provider.is_empty() || provider_key.adapter.is_some();
+    if pk_carries_new_fields {
+        tracing::debug!(
+            target: "aisix_proxy::dispatch",
+            pk_provider = %provider_key.provider,
+            pk_adapter = ?provider_key.adapter,
+            legacy_provider = ?provider,
+            "two-tier dispatch missed for new-shape ProviderKey; falling back to legacy hub.get"
+        );
+    }
+    hub.get(provider)
 }
 
 /// Look up the `ProviderKey` a given `Model` references. Returns a
@@ -486,5 +505,138 @@ mod tests {
     fn build_v1_url_rejects_path_without_leading_slash() {
         // Misuse — handlers should always pass a `/`-prefixed path.
         let _ = build_v1_url("https://api.openai.com", "responses");
+    }
+
+    // --- resolve_bridge tests -------------------------------------
+    //
+    // Cover the three reachable outcomes of resolve_bridge:
+    //   1. specialized hit — pk.provider matches a specialized entry
+    //   2. family hit       — pk.adapter matches a family entry,
+    //                          specialized misses
+    //   3. legacy fallback  — both new-tier maps miss, legacy hub.get
+    //                          serves the bridge
+    //   4. none miss        — nothing registered at all
+    //
+    // A minimal Bridge stub is used so the test doesn't need reqwest
+    // or a real upstream.
+
+    mod resolve_bridge_tests {
+        use super::*;
+        use aisix_core::models::Adapter;
+        use aisix_gateway::{
+            Bridge, BridgeContext, BridgeError, ChatChunkStream, ChatFormat, ChatMessage,
+            ChatResponse, EmbeddingRequest, EmbeddingResponse, FinishReason, Hub, UsageStats,
+        };
+        use async_trait::async_trait;
+        use futures::stream;
+
+        /// Minimal Bridge that records its identity via `name()`. Lets
+        /// resolve_bridge tests verify which Bridge was returned without
+        /// dragging in reqwest.
+        struct StubBridge {
+            name: &'static str,
+        }
+
+        #[async_trait]
+        impl Bridge for StubBridge {
+            fn name(&self) -> &'static str {
+                self.name
+            }
+
+            async fn chat(
+                &self,
+                req: &ChatFormat,
+                _ctx: &BridgeContext,
+            ) -> Result<ChatResponse, BridgeError> {
+                Ok(ChatResponse {
+                    id: "stub".into(),
+                    model: req.model.clone(),
+                    message: ChatMessage::assistant("stub"),
+                    finish_reason: FinishReason::Stop,
+                    usage: UsageStats::new(0, 0),
+                })
+            }
+
+            async fn chat_stream(
+                &self,
+                _req: &ChatFormat,
+                _ctx: &BridgeContext,
+            ) -> Result<ChatChunkStream, BridgeError> {
+                Ok(Box::pin(stream::iter(Vec::new())))
+            }
+
+            async fn embed(
+                &self,
+                _req: &EmbeddingRequest,
+                _ctx: &BridgeContext,
+            ) -> Result<EmbeddingResponse, BridgeError> {
+                Err(BridgeError::Config("stub".into()))
+            }
+        }
+
+        /// Build a ProviderKey JSON with the new-shape fields. `adapter`
+        /// is passed as the kebab-case wire string (`"openai"` /
+        /// `"azure-openai"` etc.) rather than the enum, to keep the
+        /// helper independent of any `as_str()` method on `Adapter`.
+        fn pk_with_provider_and_adapter(provider: &str, adapter: Option<&str>) -> ProviderKey {
+            let adapter_json = match adapter {
+                Some(a) => format!(", \"adapter\":\"{a}\""),
+                None => String::new(),
+            };
+            let cfg = format!(
+                r#"{{"display_name":"x","secret":"k","provider":"{provider}"{adapter_json}}}"#
+            );
+            serde_json::from_str(&cfg).unwrap()
+        }
+
+        #[test]
+        fn specialized_hit_wins_over_family_and_legacy() {
+            let hub = Hub::new();
+            hub.register_specialized(
+                "deepseek",
+                Arc::new(StubBridge {
+                    name: "specialized",
+                }),
+            );
+            hub.register_family(Adapter::Openai, Arc::new(StubBridge { name: "family" }));
+            hub.register(Provider::Openai, Arc::new(StubBridge { name: "legacy" }));
+
+            let pk = pk_with_provider_and_adapter("deepseek", Some("openai"));
+            let bridge = resolve_bridge(&hub, &pk, Provider::Openai).unwrap();
+            assert_eq!(bridge.name(), "specialized");
+        }
+
+        #[test]
+        fn family_hit_when_specialized_misses() {
+            let hub = Hub::new();
+            hub.register_family(Adapter::Openai, Arc::new(StubBridge { name: "family" }));
+            hub.register(Provider::Openai, Arc::new(StubBridge { name: "legacy" }));
+
+            // pk.provider = "unknown-vendor" → no specialized; pk.adapter
+            // = Openai → family hit.
+            let pk = pk_with_provider_and_adapter("unknown-vendor", Some("openai"));
+            let bridge = resolve_bridge(&hub, &pk, Provider::Openai).unwrap();
+            assert_eq!(bridge.name(), "family");
+        }
+
+        #[test]
+        fn legacy_fallback_when_both_new_tiers_miss() {
+            let hub = Hub::new();
+            // No family / specialized registered — only legacy.
+            hub.register(Provider::Openai, Arc::new(StubBridge { name: "legacy" }));
+
+            // Today's on-disk PK shape: empty provider + adapter: None.
+            // The two-tier path returns None on both layers; legacy serves.
+            let pk = pk_with_provider_and_adapter("", None);
+            let bridge = resolve_bridge(&hub, &pk, Provider::Openai).unwrap();
+            assert_eq!(bridge.name(), "legacy");
+        }
+
+        #[test]
+        fn none_when_nothing_registered() {
+            let hub = Hub::new();
+            let pk = pk_with_provider_and_adapter("", None);
+            assert!(resolve_bridge(&hub, &pk, Provider::Openai).is_none());
+        }
     }
 }
