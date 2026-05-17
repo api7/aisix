@@ -23,13 +23,14 @@ mod telemetry;
 
 use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore};
 use aisix_cache::{Cache, MemoryCache, RedisCache};
-use aisix_core::models::Provider;
+use aisix_core::models::{Adapter, Provider};
 use aisix_core::{CacheBackend, Config, EtcdConfig, EtcdTlsConfig};
 use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor};
 use aisix_gateway::Hub;
 use aisix_obs::{init_tracing, install_otlp_tracer, Metrics};
 use aisix_provider_anthropic::AnthropicBridge;
 use aisix_provider_openai::OpenAiBridge;
+use aisix_provider_vertex::VertexBridge;
 use aisix_proxy::background::run_background_model_check_once;
 use aisix_proxy::budget::BudgetClient;
 use aisix_proxy::ProxyState;
@@ -780,6 +781,21 @@ fn build_hub() -> Hub {
         Provider::Deepseek,
         Arc::new(OpenAiBridge::new().with_name("deepseek")),
     );
+
+    // Family bridges (issue #302 Phase A/D two-tier dispatch). The
+    // legacy `Provider`-keyed register() above stays the live
+    // dispatch path until cp-api stops emitting the legacy enum
+    // field; this only adds the new-schema-keyed lookup so a
+    // catalog row with `adapter: "vertex"` can resolve to a real
+    // bridge instead of falling through to the legacy fallback.
+    //
+    // Vertex is currently a SKELETON bridge — it returns a clear
+    // `BridgeError::Config` referencing api7/AISIX-Cloud#302 Phase E
+    // (D5). Registering it now lets the dispatch path light up the
+    // moment cp-api starts shipping adapter strings, instead of
+    // having the catalog be permanently inaccessible.
+    hub.register_family(Adapter::Vertex, Arc::new(VertexBridge::new()));
+
     hub
 }
 
