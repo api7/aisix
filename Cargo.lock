@@ -227,6 +227,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aisix-provider-bedrock"
+version = "0.1.0"
+dependencies = [
+ "aisix-core",
+ "aisix-gateway",
+ "async-trait",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "aisix-provider-openai"
 version = "0.1.0"
 dependencies = [
@@ -324,6 +337,7 @@ dependencies = [
  "aisix-obs",
  "aisix-provider-anthropic",
  "aisix-provider-azure-openai",
+ "aisix-provider-bedrock",
  "aisix-provider-openai",
  "aisix-provider-vertex",
  "aisix-proxy",

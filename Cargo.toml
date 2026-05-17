@@ -8,6 +8,7 @@ members = [
     "crates/aisix-provider-anthropic",
     "crates/aisix-provider-vertex",
     "crates/aisix-provider-azure-openai",
+    "crates/aisix-provider-bedrock",
     "crates/aisix-proxy",
     "crates/aisix-admin",
     "crates/aisix-obs",

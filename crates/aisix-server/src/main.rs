@@ -30,6 +30,7 @@ use aisix_gateway::Hub;
 use aisix_obs::{init_tracing, install_otlp_tracer, Metrics};
 use aisix_provider_anthropic::AnthropicBridge;
 use aisix_provider_azure_openai::AzureOpenAiBridge;
+use aisix_provider_bedrock::BedrockBridge;
 use aisix_provider_openai::OpenAiBridge;
 use aisix_provider_vertex::VertexBridge;
 use aisix_proxy::background::run_background_model_check_once;
@@ -809,6 +810,7 @@ fn build_hub() -> Hub {
     // catalog for that adapter.
     hub.register_family(Adapter::Vertex, Arc::new(VertexBridge::new()));
     hub.register_family(Adapter::AzureOpenai, Arc::new(AzureOpenAiBridge::new()));
+    hub.register_family(Adapter::Bedrock, Arc::new(BedrockBridge::new()));
 
     hub
 }

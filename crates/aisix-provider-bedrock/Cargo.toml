@@ -1,0 +1,20 @@
+[package]
+name = "aisix-provider-bedrock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix: AWS Bedrock runtime provider bridge (skeleton — multi-publisher dispatch)"
+
+[dependencies]
+aisix-core = { path = "../aisix-core" }
+aisix-gateway = { path = "../aisix-gateway" }
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+serde_json.workspace = true
