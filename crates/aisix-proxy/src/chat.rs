@@ -814,7 +814,12 @@ async fn dispatch(
                 continue;
             }
         };
-        let Some(bridge) = state.hub.get(provider) else {
+        // Phase D cutover join point: try two-tier (specialized vendor
+        // → adapter family) first; fall back to the legacy
+        // Provider-keyed registry when the new fields aren't filled in
+        // on this PK yet. See crate::dispatch::resolve_bridge.
+        let Some(bridge) = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, provider)
+        else {
             last_err = Some(BridgeError::Config(
                 "no bridge registered for provider".into(),
             ));

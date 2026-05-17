@@ -22,8 +22,29 @@ use std::sync::Arc;
 use aisix_core::models::Provider;
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, Model, ProviderKey};
+use aisix_gateway::{Bridge, Hub};
 
 use crate::error::ProxyError;
+
+/// Resolve the Bridge to dispatch this request through.
+///
+/// Tries the two-tier dispatch first (specialized vendor → adapter
+/// family), and falls back to the legacy `Provider`-keyed registry if
+/// neither tier matches. This is the Phase D cutover join point: new
+/// `ProviderKey` payloads carrying `adapter` and `provider` hit the
+/// two-tier path; pre-cutover payloads (`adapter: None`, empty
+/// `provider`) fall through to the legacy registry unchanged.
+///
+/// Returns `None` only when both layers miss — i.e. the operator has no
+/// bridge wired for this request at all.
+pub(crate) fn resolve_bridge(
+    hub: &Hub,
+    provider_key: &ProviderKey,
+    provider: Provider,
+) -> Option<Arc<dyn Bridge>> {
+    hub.dispatch_two_tier(provider_key)
+        .or_else(|| hub.get(provider))
+}
 
 /// Look up the `ProviderKey` a given `Model` references. Returns a
 /// 400 if the Model is a virtual router (those don't dispatch
