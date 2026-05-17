@@ -354,6 +354,18 @@ impl VertexBridge {
         );
 
         let body = build_gemini_request(req);
+        // Audit LOW-4: Gemini requires `contents` to be a non-empty
+        // array. If the caller passed system-only messages (lifted to
+        // `systemInstruction`), `contents` ends up empty and Vertex
+        // returns a generic 400. Fail fast with a clear error so the
+        // operator can fix the request shape before the round trip.
+        if body.contents.is_empty() {
+            return Err(BridgeError::Config(
+                "vertex chat: messages must include at least one user / \
+                 assistant turn (system-only requests are not supported by Gemini)"
+                    .into(),
+            ));
+        }
         let headers = build_request_headers(&creds.access_token, &ctx.request_id)?;
         let client = self.client.clone();
         let started = Instant::now();
@@ -384,6 +396,14 @@ impl VertexBridge {
 /// Build the outbound headers: `Authorization: Bearer <access_token>`,
 /// `Content-Type: application/json`, `x-aisix-request-id`. The Bearer
 /// token is the pre-minted GCP OAuth2 access token.
+///
+/// **Audit MEDIUM-1:** header-invalid errors deliberately drop the
+/// underlying `InvalidHeaderValue` Display output. The `http` crate's
+/// current Display impl is opaque, but it's an implementation detail
+/// — a future change could include the offending byte position, which
+/// for `access_token` would leak partial secret content. The bytes
+/// being validated ARE the customer's bearer token; the operator can
+/// reproduce locally without us echoing them back.
 fn build_request_headers(access_token: &str, request_id: &str) -> Result<HeaderMap, BridgeError> {
     if access_token.is_empty() {
         return Err(BridgeError::Config(
@@ -391,17 +411,16 @@ fn build_request_headers(access_token: &str, request_id: &str) -> Result<HeaderM
         ));
     }
     let mut headers = HeaderMap::new();
-    let auth = HeaderValue::from_str(&format!("Bearer {access_token}")).map_err(|e| {
-        BridgeError::Config(format!("access_token contains invalid header chars: {e}"))
+    let auth = HeaderValue::from_str(&format!("Bearer {access_token}")).map_err(|_| {
+        BridgeError::Config("access_token contains invalid header characters".into())
     })?;
     headers.insert(header::AUTHORIZATION, auth);
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
-    let rid = HeaderValue::from_str(request_id).map_err(|e| {
-        BridgeError::Config(format!("request_id contains invalid header chars: {e}"))
-    })?;
+    let rid = HeaderValue::from_str(request_id)
+        .map_err(|_| BridgeError::Config("request_id contains invalid header characters".into()))?;
     headers.insert(HeaderName::from_static("x-aisix-request-id"), rid);
     Ok(headers)
 }
@@ -601,8 +620,14 @@ fn gemini_response_into_chat_response(
 /// - `STOP` → `FinishReason::Stop`
 /// - `MAX_TOKENS` → `FinishReason::Length`
 /// - `SAFETY` / `RECITATION` / `BLOCKLIST` / `PROHIBITED_CONTENT` /
-///   `SPII` → `FinishReason::ContentFilter`
-/// - everything else → `FinishReason::Stop` (graceful default)
+///   `SPII` / `IMAGE_SAFETY` / `LANGUAGE` → `FinishReason::ContentFilter`
+/// - `MALFORMED_FUNCTION_CALL` / `UNEXPECTED_TOOL_CALL` / `OTHER` /
+///   `FINISH_REASON_UNSPECIFIED` / unknown → `FinishReason::Stop`
+///
+/// **Audit LOW-3:** `IMAGE_SAFETY` and `LANGUAGE` previously fell
+/// through to `Stop` — misleading for tracing, because a customer
+/// would see a successful "stop" when Google in fact filtered the
+/// response.
 fn map_gemini_finish_reason(reason: Option<&str>) -> FinishReason {
     match reason {
         Some("STOP") => FinishReason::Stop,
@@ -611,7 +636,9 @@ fn map_gemini_finish_reason(reason: Option<&str>) -> FinishReason {
         | Some("RECITATION")
         | Some("BLOCKLIST")
         | Some("PROHIBITED_CONTENT")
-        | Some("SPII") => FinishReason::ContentFilter,
+        | Some("SPII")
+        | Some("IMAGE_SAFETY")
+        | Some("LANGUAGE") => FinishReason::ContentFilter,
         _ => FinishReason::Stop,
     }
 }
@@ -913,12 +940,18 @@ mod tests {
 
     #[test]
     fn gemini_response_maps_safety_finish_reasons_to_content_filter() {
+        // Audit LOW-3: IMAGE_SAFETY and LANGUAGE are content-filter
+        // semantics. Mapping them to Stop would mislead tracing — a
+        // customer's dashboard would show a successful "stop" when
+        // Google in fact filtered the response.
         for r in &[
             "SAFETY",
             "RECITATION",
             "BLOCKLIST",
             "PROHIBITED_CONTENT",
             "SPII",
+            "IMAGE_SAFETY",
+            "LANGUAGE",
         ] {
             let body = format!(
                 r#"{{"candidates": [{{"content": {{"parts": [{{"text": ""}}]}}, "finishReason": {r:?}}}]}}"#
@@ -1386,6 +1419,89 @@ mod tests {
                 assert!(
                     msg.contains("URL-control characters"),
                     "must reject path injection in project; got {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    /// Audit MEDIUM-1: `BridgeError::Config` must NOT echo any byte
+    /// of the underlying `InvalidHeaderValue` Display output, because
+    /// the bytes being validated ARE the customer's bearer token. A
+    /// future change to the `http` crate's Display impl could surface
+    /// the offending byte position, leaking partial secret content.
+    #[test]
+    fn header_invalid_access_token_error_does_not_leak_bytes() {
+        // Newline in the access token would let it inject an extra
+        // header — header builder must reject AND must not echo the
+        // bad bytes back to the customer.
+        let err =
+            build_request_headers("ya29.X-DISTINCTIVE-LEAK-Y\nX-Evil: 1", "req-1").unwrap_err();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(
+                    !msg.contains("DISTINCTIVE")
+                        && !msg.contains("LEAK")
+                        && !msg.contains("X-Evil"),
+                    "error must NOT echo any token bytes; got {msg}"
+                );
+                assert!(
+                    msg.contains("invalid header characters"),
+                    "must still surface the shape error; got {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_invalid_request_id_error_does_not_leak_bytes() {
+        let err =
+            build_request_headers("ya29.legit", "req-X-DISTINCTIVE-RID-LEAK-Y\nfoo").unwrap_err();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(
+                    !msg.contains("DISTINCTIVE") && !msg.contains("RID-LEAK"),
+                    "must NOT leak request_id bytes; got {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    /// Audit LOW-4: system-only messages produce empty `contents[]`
+    /// (system lifted to top-level). Gemini's schema requires
+    /// `contents` to be non-empty; the bridge must fail fast with a
+    /// clear error instead of letting Vertex 400 with a generic
+    /// "upstream returned 400" surface.
+    #[tokio::test]
+    async fn chat_gemini_with_system_only_messages_fails_fast() {
+        let server = MockServer::start().await;
+        // The mock is set up but should NOT be called — the bridge
+        // must reject before dispatch. expect(0) catches a regression
+        // where the request leaks through.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new(
+            "my-gemini",
+            vec![ChatMessage::system("only system, no user")],
+        );
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(
+                    msg.contains("at least one user") && msg.contains("system-only"),
+                    "must explain system-only is not supported; got {msg}"
                 );
             }
             other => panic!("expected Config error, got {other:?}"),
