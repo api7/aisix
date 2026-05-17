@@ -19,15 +19,26 @@
 //! - malformed JSON from upstream → `BridgeError::UpstreamDecode`
 //! - elapsed deadline → `BridgeError::Timeout { elapsed_ms }`
 
+use aisix_core::{RequestOverrides, ResponseOverrides, StreamDoneMarker};
 use aisix_gateway::{
     Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatFormat, ChatResponse,
     EmbeddingRequest, EmbeddingResponse, SseDecoder, SseEvent,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
+use http::{
+    header::{HeaderName, HeaderValue},
+    HeaderMap,
+};
 use reqwest::{header, Client, StatusCode};
+use serde_json::Value;
 use std::time::{Duration, Instant};
 
+use crate::overrides::{
+    apply_content_list_to_string, apply_default_body_fields, apply_default_headers,
+    apply_param_constraints, apply_param_renames, apply_stream_done_marker_policy,
+    extract_reasoning_field, StreamDoneOutcome,
+};
 use crate::wire::{
     build_request, embed_request_body, embed_response_into, messages_from,
     response_into_chat_response, stream_chunk_into_chat_chunk, OpenAiEmbedResponse, OpenAiResponse,
@@ -263,6 +274,73 @@ where
     }
 }
 
+/// Convert the typed [`build_request`] output to a `serde_json::Value`
+/// and apply every [`RequestOverrides`] / [`ResponseOverrides`] field
+/// whose primitive lives in [`crate::overrides`]. Issue #302 §5 lays
+/// out the apply order: `param_renames` → `param_constraints` →
+/// `default_body_fields` (request side), `content_list_to_string`
+/// (response side flag, but it transforms the *request* body before
+/// send when the upstream only accepts string content per LiteLLM's
+/// convention). Anything not configured is a no-op.
+fn prepare_outbound_body<T: serde::Serialize>(
+    typed: &T,
+    request: Option<&RequestOverrides>,
+    response: Option<&ResponseOverrides>,
+) -> Result<Value, BridgeError> {
+    let mut body = serde_json::to_value(typed)
+        .map_err(|e| BridgeError::Config(format!("serialize request body: {e}")))?;
+    if let Some(r) = request {
+        apply_param_renames(&mut body, &r.param_renames);
+        if let Some(constraints) = &r.param_constraints {
+            apply_param_constraints(&mut body, constraints);
+        }
+        apply_default_body_fields(&mut body, &r.default_body_fields);
+    }
+    if response.is_some_and(|r| r.content_list_to_string) {
+        apply_content_list_to_string(&mut body);
+    }
+    Ok(body)
+}
+
+/// Build the base outbound `HeaderMap` (Authorization, Content-Type,
+/// x-aisix-request-id, and optionally Accept: text/event-stream for
+/// streaming calls), then merge any `default_headers` the PK carries.
+/// Bridge-owned headers are inserted before the merge so
+/// [`apply_default_headers`] cannot overwrite them — the
+/// `if headers.contains_key(&parsed_name)` guard inside
+/// `apply_default_headers` plus the [`RESERVED_DEFAULT_HEADERS`] list
+/// gives two layers of defense against an operator-supplied
+/// `default_headers` accidentally clobbering auth.
+fn build_request_headers(
+    api_key_str: &str,
+    request_id: &str,
+    sse: bool,
+    request: Option<&RequestOverrides>,
+) -> Result<HeaderMap, BridgeError> {
+    let mut headers = HeaderMap::new();
+    let auth = HeaderValue::from_str(&format!("Bearer {api_key_str}"))
+        .map_err(|e| BridgeError::Config(format!("api key contains invalid header chars: {e}")))?;
+    headers.insert(header::AUTHORIZATION, auth);
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let rid = HeaderValue::from_str(request_id).map_err(|e| {
+        BridgeError::Config(format!("request_id contains invalid header chars: {e}"))
+    })?;
+    headers.insert(HeaderName::from_static("x-aisix-request-id"), rid);
+    if sse {
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+    }
+    if let Some(r) = request {
+        apply_default_headers(&mut headers, &r.default_headers);
+    }
+    Ok(headers)
+}
+
 #[async_trait]
 impl Bridge for OpenAiBridge {
     fn name(&self) -> &'static str {
@@ -279,18 +357,26 @@ impl Bridge for OpenAiBridge {
         let upstream = upstream_model(ctx)?;
 
         let messages = messages_from(req);
-        let body = build_request(req, upstream, &messages, false);
+        let typed = build_request(req, upstream, &messages, false);
+        let body = prepare_outbound_body(
+            &typed,
+            ctx.provider_key.request.as_ref(),
+            ctx.provider_key.response.as_ref(),
+        )?;
+        let headers = build_request_headers(
+            key,
+            &ctx.request_id,
+            false,
+            ctx.provider_key.request.as_ref(),
+        )?;
         let url = format!("{base}/chat/completions");
         let client = self.client.clone();
         let started = Instant::now();
-        let request_id = ctx.request_id.clone();
 
         with_deadline(ctx.deadline, started, async move {
             let resp = client
                 .post(&url)
-                .header(header::AUTHORIZATION, format!("Bearer {key}"))
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("x-aisix-request-id", &request_id)
+                .headers(headers)
                 .json(&body)
                 .send()
                 .await
@@ -452,19 +538,26 @@ impl Bridge for OpenAiBridge {
         let upstream = upstream_model(ctx)?;
 
         let messages = messages_from(req);
-        let body = build_request(req, upstream, &messages, true);
+        let typed = build_request(req, upstream, &messages, true);
+        let body = prepare_outbound_body(
+            &typed,
+            ctx.provider_key.request.as_ref(),
+            ctx.provider_key.response.as_ref(),
+        )?;
+        let headers = build_request_headers(
+            key,
+            &ctx.request_id,
+            true,
+            ctx.provider_key.request.as_ref(),
+        )?;
         let url = format!("{base}/chat/completions");
         let client = self.client.clone();
         let started = Instant::now();
-        let request_id = ctx.request_id.clone();
 
         let resp = with_deadline(ctx.deadline, started, async move {
             client
                 .post(&url)
-                .header(header::AUTHORIZATION, format!("Bearer {key}"))
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ACCEPT, "text/event-stream")
-                .header("x-aisix-request-id", &request_id)
+                .headers(headers)
                 .json(&body)
                 .send()
                 .await
@@ -477,14 +570,40 @@ impl Bridge for OpenAiBridge {
             return Err(map_http_error(status, resp).await);
         }
 
+        // Snapshot the response-side override knobs onto the stream
+        // closure. `Option<String>` for the reasoning path is cheap and
+        // means the stream can run after `ctx` drops.
+        let reasoning_path = ctx
+            .provider_key
+            .response
+            .as_ref()
+            .and_then(|r| r.reasoning_field.clone());
+        let done_marker_policy = ctx
+            .provider_key
+            .response
+            .as_ref()
+            .and_then(|r| r.stream_done_marker);
+        let bridge_name = self.name;
+        let request_id_for_log = ctx.request_id.clone();
+
         let byte_stream = resp.bytes_stream();
-        let stream = build_chunk_stream(byte_stream);
+        let stream = build_chunk_stream(
+            byte_stream,
+            reasoning_path,
+            done_marker_policy,
+            bridge_name,
+            request_id_for_log,
+        );
         Ok(Box::pin(stream))
     }
 }
 
 fn build_chunk_stream<S>(
     byte_stream: S,
+    reasoning_path: Option<String>,
+    done_marker_policy: Option<StreamDoneMarker>,
+    bridge_name: &'static str,
+    request_id: String,
 ) -> impl futures::Stream<Item = Result<ChatChunk, BridgeError>> + Send
 where
     S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
@@ -492,23 +611,72 @@ where
     async_stream::try_stream! {
         let mut decoder = SseDecoder::new();
         let mut stream = Box::pin(byte_stream);
-        while let Some(next) = stream.next().await {
+        let mut done_marker_seen = false;
+        'outer: while let Some(next) = stream.next().await {
             let chunk = next.map_err(|e| BridgeError::Transport(e.to_string()))?;
             for event in decoder.feed(chunk.as_ref()) {
                 match event {
-                    SseEvent::Done => return,
+                    SseEvent::Done => {
+                        done_marker_seen = true;
+                        break 'outer;
+                    }
                     SseEvent::Data(payload) => {
-                        let parsed: OpenAiStreamChunk = serde_json::from_str(&payload)
-                            .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+                        let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
                         yield stream_chunk_into_chat_chunk(parsed);
                     }
                 }
             }
         }
         if let Some(SseEvent::Data(payload)) = decoder.finish() {
-            let parsed: OpenAiStreamChunk = serde_json::from_str(&payload)
-                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
             yield stream_chunk_into_chat_chunk(parsed);
+        }
+        // Issue #302 §5 `response.stream_done_marker` — evaluate the
+        // policy once the stream ends. Violations are logged (operator
+        // diagnostic) but never error the request: the customer's
+        // chunks have already been delivered, and surfacing a wire-
+        // shape violation now would only break a working chat.
+        if let Some(policy) = done_marker_policy {
+            match apply_stream_done_marker_policy(policy, done_marker_seen) {
+                StreamDoneOutcome::Ok => {}
+                StreamDoneOutcome::MissingDoneMarker => {
+                    tracing::warn!(
+                        bridge = bridge_name,
+                        request_id = %request_id,
+                        "upstream stream ended without [DONE] marker (policy=Required)"
+                    );
+                }
+                StreamDoneOutcome::UnexpectedDoneMarker => {
+                    tracing::warn!(
+                        bridge = bridge_name,
+                        request_id = %request_id,
+                        "upstream emitted [DONE] marker (policy=None)"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Parse one SSE `data:` payload into [`OpenAiStreamChunk`]. When
+/// `reasoning_path` is set, the parse goes typed → `Value` → mutate →
+/// typed so the canonical `delta.reasoning_content` slot reflects
+/// whatever the upstream put at the configured path (e.g.
+/// DeepSeek's `delta.reasoning_content` is already canonical and
+/// requires no lift; a hypothetical future `delta.thinking` would).
+fn parse_stream_chunk(
+    payload: &str,
+    reasoning_path: Option<&str>,
+) -> Result<OpenAiStreamChunk, BridgeError> {
+    match reasoning_path {
+        Some(path) => {
+            let mut value: Value = serde_json::from_str(payload)
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            extract_reasoning_field(&mut value, path);
+            serde_json::from_value(value).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
+        }
+        None => {
+            serde_json::from_str(payload).map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
         }
     }
 }
@@ -883,5 +1051,335 @@ data: [DONE]\n\n";
         let bare = "https://generativelanguage.googleapis.com";
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_with_base(bare)));
         assert_eq!(bridge.resolve_base(&ctx), bare);
+    }
+
+    // ----------- issue #302 §5 wire-in: RequestOverrides -----------
+    //
+    // The matcher-based assertion pattern: a Mock that returns 200
+    // only when the matcher passes. If the bridge sends a wrong
+    // body / wrong header, the matcher fails, wiremock falls through
+    // with a default 404, and `bridge.chat(...).unwrap()` panics. So
+    // "the call succeeded" == "the bridge sent what we wanted".
+
+    fn pk_with_overrides(base: &str, overrides_json: &str) -> Arc<ProviderKey> {
+        let cfg = format!(
+            r#"{{"display_name": "openai-prod", "secret": "sk-test", "api_base": "{base}", {overrides_json}}}"#
+        );
+        Arc::new(serde_json::from_str(&cfg).unwrap())
+    }
+
+    fn ok_chat_response() -> serde_json::Value {
+        serde_json::json!({
+            "id": "cmpl-1",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })
+    }
+
+    /// `param_renames` must rewrite the outbound body key. Build a
+    /// request with `max_tokens=64`; configure rename
+    /// `max_tokens → max_completion_tokens`; the bytes leaving the
+    /// bridge must carry the renamed key (LiteLLM source-wins).
+    #[tokio::test]
+    async fn chat_applies_param_renames_to_outbound_body() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "max_completion_tokens": 64,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_chat_response()))
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let pk = pk_with_overrides(
+            &server.uri(),
+            r#""request": {"param_renames": {"max_tokens": "max_completion_tokens"}}"#,
+        );
+        let ctx = BridgeContext::new("req-1", sample_model(), pk);
+        let mut request = ChatFormat::new("my-gpt4", vec![ChatMessage::user("hi")]);
+        request.max_tokens = Some(64);
+        bridge
+            .chat(&request, &ctx)
+            .await
+            .expect("matcher pinned the renamed key");
+    }
+
+    /// `param_constraints.temperature_max` clamps the outbound value.
+    /// Customer sends `temperature=2.0`; max=1.0; outbound body must
+    /// carry `temperature=1.0`. Negative axis: a `temperature_min`
+    /// clamps from below.
+    #[tokio::test]
+    async fn chat_applies_param_constraints_clamp_to_outbound_body() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"temperature": 1.0})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_chat_response()))
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let pk = pk_with_overrides(
+            &server.uri(),
+            r#""request": {"param_constraints": {"temperature_max": 1.0}}"#,
+        );
+        let ctx = BridgeContext::new("req-1", sample_model(), pk);
+        let mut request = ChatFormat::new("my-gpt4", vec![ChatMessage::user("hi")]);
+        request.temperature = Some(2.0);
+        bridge
+            .chat(&request, &ctx)
+            .await
+            .expect("matcher pinned the clamped value");
+    }
+
+    /// `default_body_fields` fills absent top-level keys without
+    /// overwriting caller-set ones. Configure `safe_prompt=true`;
+    /// the outbound body must carry it.
+    #[tokio::test]
+    async fn chat_applies_default_body_fields_to_outbound_body() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"safe_prompt": true})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_chat_response()))
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let pk = pk_with_overrides(
+            &server.uri(),
+            r#""request": {"default_body_fields": {"safe_prompt": true}}"#,
+        );
+        let ctx = BridgeContext::new("req-1", sample_model(), pk);
+        bridge
+            .chat(&req(), &ctx)
+            .await
+            .expect("matcher pinned default_body_fields");
+    }
+
+    /// `default_headers` adds operator-supplied headers to the
+    /// outbound request. Configure `x-custom: trace-on`; the request
+    /// must carry it.
+    #[tokio::test]
+    async fn chat_applies_default_headers_to_outbound_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("x-custom", "trace-on"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_chat_response()))
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let pk = pk_with_overrides(
+            &server.uri(),
+            r#""request": {"default_headers": {"x-custom": "trace-on"}}"#,
+        );
+        let ctx = BridgeContext::new("req-1", sample_model(), pk);
+        bridge
+            .chat(&req(), &ctx)
+            .await
+            .expect("matcher pinned the operator header");
+    }
+
+    /// Defense-in-depth: a `default_headers` block that tries to set
+    /// `authorization` must NOT clobber the bridge's own auth header.
+    /// The outbound request must carry `Bearer sk-test`, not the
+    /// override value.
+    #[tokio::test]
+    async fn chat_default_headers_cannot_override_authorization() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer sk-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_chat_response()))
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let pk = pk_with_overrides(
+            &server.uri(),
+            r#""request": {"default_headers": {"authorization": "Bearer evil-override"}}"#,
+        );
+        let ctx = BridgeContext::new("req-1", sample_model(), pk);
+        bridge
+            .chat(&req(), &ctx)
+            .await
+            .expect("auth was kept as-is");
+    }
+
+    // ----------- issue #302 §5 wire-in: ResponseOverrides ----------
+
+    /// `content_list_to_string=true` flattens the request body's
+    /// `messages[*].content` array of text blocks into a string
+    /// before send (LiteLLM convention — applies to the request).
+    /// The outbound body must carry `content: "abc"`, not the array.
+    #[tokio::test]
+    async fn chat_content_list_to_string_flattens_text_blocks_in_outbound_body() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "messages": [{"role": "user", "content": "abc"}]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_chat_response()))
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let pk = pk_with_overrides(
+            &server.uri(),
+            r#""response": {"content_list_to_string": true}"#,
+        );
+        let ctx = BridgeContext::new("req-1", sample_model(), pk);
+        // Multi-block message: ["a", "b", "c"] → "abc" after flatten.
+        let mut msg = ChatMessage::user("abc");
+        msg.content_blocks = Some(vec![
+            serde_json::json!({"type": "text", "text": "a"}),
+            serde_json::json!({"type": "text", "text": "b"}),
+            serde_json::json!({"type": "text", "text": "c"}),
+        ]);
+        let request = ChatFormat::new("my-gpt4", vec![msg]);
+        bridge
+            .chat(&request, &ctx)
+            .await
+            .expect("matcher pinned the flattened string");
+    }
+
+    /// `reasoning_field` lifts a vendor-specific path on streaming
+    /// chunks up to the canonical `delta.reasoning_content` slot.
+    /// Upstream emits `delta.thinking="step1"`; with reasoning_field
+    /// path `delta.thinking`, the parsed chunk's `delta` must carry
+    /// `reasoning_content="step1"` for the downstream emitter.
+    #[tokio::test]
+    async fn chat_stream_extracts_reasoning_field_onto_canonical_slot() {
+        let server = MockServer::start().await;
+        // Upstream chunk uses `delta.thinking` (hypothetical vendor
+        // shape); after extract_reasoning_field the parsed chunk's
+        // delta should have reasoning_content="step1".
+        let sse = "\
+data: {\"id\":\"cmpl-r\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"thinking\":\"step1\"},\"finish_reason\":null}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let pk = pk_with_overrides(
+            &server.uri(),
+            r#""response": {"reasoning_field": "delta.thinking"}"#,
+        );
+        let ctx = BridgeContext::new("req-1", sample_model(), pk);
+        let mut stream = bridge.chat_stream(&req(), &ctx).await.unwrap();
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            first.delta.reasoning_content.as_deref(),
+            Some("step1"),
+            "extract_reasoning_field must lift delta.thinking onto delta.reasoning_content"
+        );
+    }
+
+    /// `stream_done_marker` policy is evaluated but never errors the
+    /// stream — the contract is "log-only" so a working chat is not
+    /// broken by a wire-shape diagnostic. The test asserts that
+    /// (a) the stream completes successfully, and (b) all chunks
+    /// are delivered, even when policy=Required and the upstream
+    /// omitted the `[DONE]` marker.
+    #[tokio::test]
+    async fn chat_stream_done_marker_required_but_missing_does_not_error() {
+        let server = MockServer::start().await;
+        // No `data: [DONE]` line — Required policy will fire a
+        // MissingDoneMarker warning, but the stream must still
+        // complete cleanly.
+        let sse = "\
+data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let pk = pk_with_overrides(
+            &server.uri(),
+            r#""response": {"stream_done_marker": "required"}"#,
+        );
+        let ctx = BridgeContext::new("req-1", sample_model(), pk);
+        let mut stream = bridge.chat_stream(&req(), &ctx).await.unwrap();
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("chunk must not error on missing DONE"));
+        }
+        assert_eq!(chunks.len(), 1, "all chunks delivered before policy check");
+    }
+
+    /// Negative axis on the parse path: a malformed SSE payload still
+    /// surfaces as `UpstreamDecode` after the reasoning-field roundtrip
+    /// — the typed↔Value detour must not swallow parse errors.
+    #[tokio::test]
+    async fn chat_stream_malformed_chunk_surfaces_decode_error_via_reasoning_path() {
+        let server = MockServer::start().await;
+        let sse = "data: not-json\n\ndata: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let pk = pk_with_overrides(
+            &server.uri(),
+            r#""response": {"reasoning_field": "delta.thinking"}"#,
+        );
+        let ctx = BridgeContext::new("req-1", sample_model(), pk);
+        let mut stream = bridge.chat_stream(&req(), &ctx).await.unwrap();
+        let first = stream.next().await.unwrap();
+        assert!(matches!(first, Err(BridgeError::UpstreamDecode(_))));
+    }
+
+    /// Backward-compat: a ProviderKey with no `request` / `response`
+    /// block (most production rows today) must behave identically to
+    /// the pre-wire-in bridge. Sanity-check that the body still goes
+    /// through and the response parses.
+    #[tokio::test]
+    async fn chat_with_no_overrides_behaves_like_pre_d2() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer sk-test"))
+            .and(header("x-aisix-request-id", "req-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_chat_response()))
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        let resp = bridge.chat(&req(), &ctx).await.unwrap();
+        assert_eq!(resp.id, "cmpl-1");
     }
 }

@@ -279,6 +279,14 @@ pub(crate) struct OpenAiStreamDelta {
     pub content: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Vec<serde_json::Value>>,
+    /// Canonical reasoning slot — DeepSeek emits this directly; for
+    /// upstreams that put their reasoning text at a different path
+    /// (issue #302 §5 `response.reasoning_field`) the bridge runs
+    /// [`extract_reasoning_field`](crate::overrides::extract_reasoning_field)
+    /// over the parsed [`Value`] before the typed parse so the lifted
+    /// string lands here.
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
 }
 
 pub(crate) fn stream_chunk_into_chat_chunk(mut raw: OpenAiStreamChunk) -> ChatChunk {
@@ -289,6 +297,7 @@ pub(crate) fn stream_chunk_into_chat_chunk(mut raw: OpenAiStreamChunk) -> ChatCh
                 role: c.delta.role.as_deref().map(role_from_str),
                 content: c.delta.content,
                 tool_calls: c.delta.tool_calls,
+                reasoning_content: c.delta.reasoning_content,
             },
             c.finish_reason
                 .as_deref()

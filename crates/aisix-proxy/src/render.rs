@@ -76,6 +76,12 @@ pub struct RenderedDelta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<serde_json::Value>>,
+    /// Reasoning text (DeepSeek-canonical `delta.reasoning_content`).
+    /// Surfaced when the bridge applied
+    /// [`response.reasoning_field`](aisix_core::ResponseOverrides::reasoning_field)
+    /// — issue #302 §5.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 pub fn render_response(created_unix_ts: i64, resp: ChatResponse) -> ChatCompletion {
@@ -115,6 +121,7 @@ pub fn render_chunk(created_unix_ts: i64, chunk: ChatChunk) -> ChatCompletionChu
                 role: chunk.delta.role.map(role_to_str),
                 content: chunk.delta.content,
                 tool_calls: chunk.delta.tool_calls,
+                reasoning_content: chunk.delta.reasoning_content,
             },
             finish_reason: chunk
                 .finish_reason
@@ -236,6 +243,7 @@ mod tests {
                 role: None,
                 content: Some("hi".into()),
                 tool_calls: None,
+                reasoning_content: None,
             },
             finish_reason: None,
             usage: None,

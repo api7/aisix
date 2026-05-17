@@ -354,6 +354,16 @@ pub struct ChatDelta {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<serde_json::Value>>,
+    /// Reasoning-content slot the DP renders into `delta
+    /// .reasoning_content` on the customer-visible SSE chunk. Populated
+    /// by the Bridge after applying the
+    /// [`response.reasoning_field`](aisix_core::ResponseOverrides::reasoning_field)
+    /// path — issue #302 §5. `None` for upstreams that don't carry a
+    /// reasoning field or where cp-api didn't configure a path. Matches
+    /// DeepSeek's canonical `delta.reasoning_content` shape so the
+    /// emitter is a passthrough.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 // ─── Embeddings ──────────────────────────────────────────────────────────────
@@ -678,6 +688,7 @@ mod tests {
                 role: None,
                 content: Some("hello".into()),
                 tool_calls: None,
+                reasoning_content: None,
             },
             finish_reason: None,
             usage: None,
