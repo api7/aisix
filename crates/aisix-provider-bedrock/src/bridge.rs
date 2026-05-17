@@ -29,6 +29,7 @@ use aws_sdk_bedrockruntime::primitives::Blob;
 use aws_sdk_bedrockruntime::Client as BedrockClient;
 use aws_smithy_runtime_api::client::result::ServiceError;
 use serde::Deserialize;
+use std::time::{Duration, Instant};
 
 use aisix_provider_anthropic::wire::{
     build_request, response_into_chat_response, split_system, AnthropicResponse,
@@ -340,9 +341,29 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
 /// numbers (in ARNs), and IAM role names. Surfacing these to a
 /// downstream customer leaks operator-internal taxonomy. We map to
 /// canned status-keyed phrases.
-fn map_sdk_error(err: SdkError<InvokeModelError>) -> BridgeError {
+///
+/// **Audit H3** — `deadline` is threaded through so a SDK-side timeout
+/// reports the actual elapsed budget instead of `0ms` (which formats
+/// as "timed out after 0ms" in customer logs).
+fn map_sdk_error(
+    err: SdkError<InvokeModelError>,
+    started: Instant,
+    deadline: Option<Duration>,
+) -> BridgeError {
     match err {
-        SdkError::TimeoutError(_) => BridgeError::Timeout { elapsed_ms: 0 },
+        SdkError::TimeoutError(_) => {
+            // Prefer the actual elapsed budget; fall back to the
+            // deadline if elapsed somehow rounds to 0 (clock skew).
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let reported = if elapsed_ms > 0 {
+                elapsed_ms
+            } else {
+                deadline.map(|d| d.as_millis() as u64).unwrap_or(0)
+            };
+            BridgeError::Timeout {
+                elapsed_ms: reported,
+            }
+        }
         SdkError::DispatchFailure(_) => BridgeError::Transport("upstream dispatch failed".into()),
         SdkError::ConstructionFailure(_) => {
             BridgeError::Config("upstream request construction failed".into())
@@ -355,11 +376,29 @@ fn map_sdk_error(err: SdkError<InvokeModelError>) -> BridgeError {
     }
 }
 
+/// Audit H1 — propagate `Retry-After` from the upstream's HTTP
+/// response so the gateway's cooldown layer gets the actual upstream
+/// hint instead of falling back to its configured default. Bedrock
+/// returns `Retry-After` on 429 throttle responses; collapsing it to
+/// `None` silently degrades multi-region / burst behavior.
 fn map_service_error(
     svc: ServiceError<InvokeModelError, aws_smithy_runtime_api::http::Response>,
 ) -> BridgeError {
     let raw = svc.into_raw();
     let status = raw.status().as_u16();
+    // Convert smithy HeaderMap → http::HeaderMap so we can reuse the
+    // gateway-level `parse_retry_after` helper. Headers with invalid
+    // bytes are dropped (defensive — SDK should not produce them).
+    let mut hdrs = http::HeaderMap::new();
+    for (k, v) in raw.headers() {
+        if let (Ok(name), Ok(val)) = (
+            http::HeaderName::from_bytes(k.as_bytes()),
+            http::HeaderValue::from_str(v),
+        ) {
+            hdrs.insert(name, val);
+        }
+    }
+    let retry_after = aisix_gateway::parse_retry_after(&hdrs);
     let message = match status {
         401 | 403 => "upstream authentication failed".to_string(),
         404 => "upstream model not found".to_string(),
@@ -371,8 +410,30 @@ fn map_service_error(
     BridgeError::UpstreamStatus {
         status,
         message,
-        retry_after: None,
+        retry_after,
     }
+}
+
+/// **Audit M2** — defense-in-depth check on the upstream model id
+/// before it's URL-encoded into the Bedrock `/model/<id>/invoke`
+/// path. The SDK encodes reserved characters, but pinning the
+/// allowed set at the gateway layer prevents log-injection /
+/// dashboard-label corruption (the model id propagates into metrics
+/// labels) and forces typos to fail loudly at registration time.
+///
+/// Bedrock model ids are documented as
+/// `<publisher>.<family>-<version>:<revision>` with all-ASCII tokens.
+fn validate_model_id_chars(model_id: &str) -> Result<(), BridgeError> {
+    if !model_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_' | '/'))
+    {
+        return Err(BridgeError::Config(format!(
+            "bedrock model id {model_id:?} contains unexpected characters — \
+             only [A-Za-z0-9._:/-] are allowed"
+        )));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -387,6 +448,7 @@ impl Bridge for BedrockBridge {
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
         let upstream_id = upstream_model(ctx)?;
+        validate_model_id_chars(upstream_id)?;
         let publisher = BedrockPublisher::from_model_id(upstream_id).ok_or_else(|| {
             BridgeError::Config(format!(
                 "bedrock publisher unknown for model id {upstream_id:?}; \
@@ -402,9 +464,15 @@ impl Bridge for BedrockBridge {
 
         match publisher {
             BedrockPublisher::Anthropic => self.chat_anthropic(req, ctx, upstream_id).await,
+            // Audit H2: surface the operator's actual model id rather
+            // than the enum's Debug taxonomy (`Other` / `<unspecified>`
+            // are internal labels that don't help the customer or the
+            // operator diagnose). The `publisher.name()` is the
+            // catalog-level identifier the operator pinned.
             other => Err(BridgeError::Config(format!(
-                "bedrock publisher {publisher:?} not yet implemented — \
-                 tracked under api7/AISIX-Cloud#302 Phase G (D7.3+, publisher={})",
+                "bedrock dispatch for model id {upstream_id:?} (publisher={}) \
+                 not yet implemented — tracked under api7/AISIX-Cloud#302 \
+                 Phase G (D7.3+)",
                 other.name()
             ))),
         }
@@ -416,7 +484,8 @@ impl Bridge for BedrockBridge {
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
         let upstream_id = upstream_model(ctx)?;
-        let _publisher = BedrockPublisher::from_model_id(upstream_id).ok_or_else(|| {
+        validate_model_id_chars(upstream_id)?;
+        let publisher = BedrockPublisher::from_model_id(upstream_id).ok_or_else(|| {
             BridgeError::Config(format!(
                 "bedrock publisher unknown for model id {upstream_id:?}; \
                  expected one of anthropic.claude-* / meta.llama* / mistral.* / \
@@ -424,11 +493,24 @@ impl Bridge for BedrockBridge {
                  (optionally prefixed with a cross-region inference profile like us. / eu. / apac.)"
             ))
         })?;
-        Err(BridgeError::Config(
-            "bedrock streaming is not yet implemented — \
-             tracked under api7/AISIX-Cloud#302 Phase G (D7.2.b)"
-                .into(),
-        ))
+        // Audit M4: distinguish "anthropic streaming not yet wired"
+        // (D7.2.b — same publisher as chat, just streaming) from
+        // "publisher X not yet wired at all" (D7.3+). Mixing them
+        // would mis-route the operator to the wrong follow-up
+        // tracking task.
+        match publisher {
+            BedrockPublisher::Anthropic => Err(BridgeError::Config(
+                "bedrock anthropic streaming is not yet implemented — \
+                 tracked under api7/AISIX-Cloud#302 Phase G (D7.2.b)"
+                    .into(),
+            )),
+            other => Err(BridgeError::Config(format!(
+                "bedrock dispatch (chat_stream) for model id {upstream_id:?} \
+                 (publisher={}) not yet implemented — tracked under \
+                 api7/AISIX-Cloud#302 Phase G (D7.3+)",
+                other.name()
+            ))),
+        }
     }
 }
 
@@ -487,6 +569,8 @@ impl BedrockBridge {
         // Dispatch via the SDK. SigV4 + retries + content-type
         // headers are handled by the SDK; we pass model id +
         // accept/content-type + body bytes.
+        let started = Instant::now();
+        let deadline = ctx.deadline;
         let resp = client
             .invoke_model()
             .model_id(upstream_id)
@@ -495,7 +579,7 @@ impl BedrockBridge {
             .body(Blob::new(body_bytes))
             .send()
             .await
-            .map_err(map_sdk_error)?;
+            .map_err(|e| map_sdk_error(e, started, deadline))?;
 
         let parsed: AnthropicResponse = serde_json::from_slice(resp.body().as_ref())
             .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
@@ -1142,6 +1226,19 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("get_weather")
         );
+        // Audit H4: `arguments` MUST be a JSON-encoded STRING per the
+        // OpenAI Chat Completions spec, not a parsed object. SDK
+        // consumers do `JSON.parse(toolCall.function.arguments)` — a
+        // future refactor that passes the parsed object would silently
+        // break every OpenAI-SDK caller against an Anthropic upstream.
+        let args = tool_calls[0]
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(|v| v.as_str())
+            .expect("arguments must be a JSON-encoded STRING per OpenAI spec");
+        let parsed: serde_json::Value =
+            serde_json::from_str(args).expect("arguments string must itself be valid JSON");
+        assert_eq!(parsed.get("city").and_then(|v| v.as_str()), Some("SF"));
     }
 
     #[tokio::test]
@@ -1149,6 +1246,11 @@ mod tests {
         // Audit M1: Bedrock error envelopes can contain account
         // numbers (in ARNs), model IDs, IAM role names — must not
         // leak into customer-visible error.
+        //
+        // Audit M5 follow-up: assert the canned message EXACTLY,
+        // not just absence-of-leak. A future refactor that re-renders
+        // SDK metadata into the message would pass an absence check
+        // but fail the exact-match assertion.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
@@ -1170,10 +1272,20 @@ mod tests {
         let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
-            BridgeError::UpstreamStatus { message, .. } => {
+            BridgeError::UpstreamStatus {
+                status, message, ..
+            } => {
+                assert_eq!(status, 400);
                 assert!(
                     !message.contains("123456789012") && !message.contains("internal-leaky-role"),
                     "upstream body must not leak account / role info into customer error; got {message:?}"
+                );
+                // Positive pin (audit M5): exact-match the canned
+                // status-keyed phrase. Bedrock returns 400 → bucket
+                // is "upstream returned 400" per `map_service_error`.
+                assert_eq!(
+                    message, "upstream returned 400",
+                    "must emit canned 4xx phrasing only; got {message:?}"
                 );
             }
             other => panic!("expected UpstreamStatus, got {other:?}"),
@@ -1181,13 +1293,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_maps_upstream_429_to_canned_rate_limited() {
+    async fn chat_maps_upstream_429_with_retry_after_and_canned_rate_limited() {
+        // Audit H1: Bedrock's `Retry-After` header on 429 must reach
+        // the cooldown layer. Collapsing it to `None` silently
+        // degrades multi-region / burst behavior.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path_regex(r"^/model/.+/invoke$"))
-            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
-                "message": "Too many requests for account 123456789012"
-            })))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "42")
+                    .set_body_json(serde_json::json!({
+                        "message": "Too many requests for account 123456789012"
+                    })),
+            )
             .mount(&server)
             .await;
 
@@ -1201,16 +1320,27 @@ mod tests {
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
             BridgeError::UpstreamStatus {
-                status, message, ..
+                status,
+                message,
+                retry_after,
             } => {
                 assert_eq!(status, 429);
-                assert!(message.contains("rate limited"));
+                assert_eq!(message, "upstream rate limited");
                 assert!(
                     !message.contains("123456789012"),
                     "must not leak account id; got {message:?}"
                 );
+                // Audit H1 pin: the SDK / smithy headers must round-trip
+                // Retry-After into the BridgeError so the cooldown
+                // layer sees the upstream's hint instead of falling
+                // back to a configured default.
+                assert_eq!(
+                    retry_after,
+                    Some(std::time::Duration::from_secs(42)),
+                    "Retry-After must reach BridgeError::UpstreamStatus"
+                );
             }
-            other => panic!("expected UpstreamStatus, got {other:?}"),
+            other => panic!("expected UpstreamStatus with retry_after, got {other:?}"),
         }
     }
 
@@ -1245,6 +1375,184 @@ mod tests {
         let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
         assert_eq!(chat.message.content, "cross-region ok");
+    }
+
+    /// Audit M6: cross-region dispatch coverage was only `us.`; the
+    /// historically-broken case (`us-gov.` with hyphen) and `global.`
+    /// (exactly 6 chars — accidentally working under the old matcher)
+    /// need real dispatch-path tests so a future regression in
+    /// `strip_region_prefix` is caught at the wire layer, not just at
+    /// the unit-test layer.
+    #[tokio::test]
+    async fn chat_with_us_gov_cross_region_prefix_dispatches_with_full_model_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"^/model/us-gov\.anthropic\.claude-3-5-sonnet-20241022-v2(:0|%3A0)/invoke$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_xr", "model": "claude-3-5-sonnet",
+                "content": [{"type": "text", "text": "us-gov ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("us-gov.anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+        assert_eq!(chat.message.content, "us-gov ok");
+    }
+
+    #[tokio::test]
+    async fn chat_with_global_cross_region_prefix_dispatches_with_full_model_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"^/model/global\.anthropic\.claude-3-5-sonnet-20241022-v2(:0|%3A0)/invoke$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_xr", "model": "claude-3-5-sonnet",
+                "content": [{"type": "text", "text": "global ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("global.anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+        assert_eq!(chat.message.content, "global ok");
+    }
+
+    /// Audit H2 regression: rejection error for a not-yet-wired
+    /// publisher must include the operator's model id (so they can
+    /// open the right follow-up tracking issue) and the publisher
+    /// name (so dashboards can group). The earlier message echoed
+    /// `BedrockPublisher::Other` Debug output (`Other` /
+    /// `<unspecified>`) which is internal taxonomy that doesn't help.
+    #[tokio::test]
+    async fn chat_publisher_not_implemented_error_includes_model_id_and_publisher_name() {
+        let bridge = BedrockBridge::new();
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(
+                    msg.contains("meta.llama3-3-70b-instruct-v1:0"),
+                    "must include operator's model id; got {msg}"
+                );
+                assert!(
+                    msg.contains("publisher=meta"),
+                    "must name the publisher catalog identifier; got {msg}"
+                );
+                assert!(
+                    !msg.contains("Other") && !msg.contains("<unspecified>"),
+                    "must not leak internal enum taxonomy; got {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    /// Audit M2 regression: defense-in-depth model-id char check.
+    /// Even though the AWS SDK URL-encodes reserved chars, the gateway
+    /// layer must reject upfront so the model id can't carry
+    /// log-injection / dashboard-corruption payloads (it propagates
+    /// into metrics labels).
+    #[tokio::test]
+    async fn chat_rejects_model_id_with_path_injection_chars() {
+        let bridge = BedrockBridge::new();
+        // Whitespace + tab — would corrupt metrics labels even if the
+        // SDK URL-encoded the path correctly.
+        let evil_model = "anthropic.claude\t evil model";
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with(evil_model),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(
+                    msg.contains("unexpected characters"),
+                    "must reject invalid model id chars; got {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    /// Audit M4 regression: `chat_stream` must distinguish "anthropic
+    /// streaming not wired yet" (D7.2.b — same publisher as chat
+    /// just streaming) from "publisher X not wired at all" (D7.3+).
+    /// Mixing them mis-routes operators to the wrong tracking task.
+    #[tokio::test]
+    async fn chat_stream_anthropic_returns_d7_2_b_specific_error() {
+        let bridge = BedrockBridge::new();
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat_stream(&req, &ctx).await.err().unwrap();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(
+                    msg.contains("anthropic streaming"),
+                    "must call out anthropic streaming specifically; got {msg}"
+                );
+                assert!(msg.contains("D7.2.b"), "must point at D7.2.b; got {msg}");
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_stream_non_anthropic_publisher_returns_d7_3_specific_error() {
+        let bridge = BedrockBridge::new();
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat_stream(&req, &ctx).await.err().unwrap();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(
+                    msg.contains("publisher=meta"),
+                    "must call out the publisher; got {msg}"
+                );
+                assert!(msg.contains("D7.3+"), "must point at D7.3+; got {msg}");
+                assert!(
+                    !msg.contains("D7.2.b"),
+                    "must NOT point at the anthropic-streaming task; got {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

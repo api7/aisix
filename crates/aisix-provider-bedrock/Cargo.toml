@@ -23,6 +23,7 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+http.workspace = true
 # AWS SDK: handles SigV4 + retries + binary event-stream framing.
 # Same workspace deps the guardrails crate uses for ApplyGuardrail.
 aws-config.workspace = true
