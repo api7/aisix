@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use super::rate_limit::RateLimit;
 use crate::resource::Resource;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ApiKey {
     /// SHA-256 hex of the plaintext bearer. Secondary-indexed for

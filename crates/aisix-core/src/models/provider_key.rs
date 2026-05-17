@@ -26,7 +26,7 @@ use crate::resource::Resource;
 // `default_body_fields`), neither of which can implement `Eq` due to
 // NaN / Number-equality semantics. Tests compare via `assert_eq!`
 // which only needs `PartialEq`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderKey {
     /// Operator-facing label, unique within the gateway. Surfaces in
@@ -101,7 +101,7 @@ pub struct ProviderKey {
 /// means an omitted block or omitted individual key both yield the
 /// zero-value `TelemetryTags`, preserving backward compatibility
 /// with existing `ProviderKey` payloads.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryTags {
     /// `"catalog"` for first-party curated providers, `"byo"` for
@@ -145,7 +145,7 @@ pub struct TelemetryTags {
 ///
 /// `f64` in [`ParamConstraints`] is the reason the parent
 /// [`ProviderKey`] derives `PartialEq` rather than `Eq`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RequestOverrides {
     /// `apply_param_renames` input. Top-level body keys named on the
@@ -179,7 +179,7 @@ pub struct RequestOverrides {
 ///
 /// `f64` not `Eq`: NaN comparisons make a derived `Eq` unsound.
 /// [`PartialEq`] is enough for the round-trip test.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ParamConstraints {
     /// Upper bound for `temperature`. Values above this are clamped
@@ -208,7 +208,7 @@ pub struct ParamConstraints {
 /// `error_envelope` is on-disk only — issue #302 §5 keeps it as a
 /// `"openai" | "passthrough"` string so cp-api can iterate without
 /// a Rust-side enum migration. Phase D pins the closed set.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseOverrides {
     /// Stream `[DONE]` terminator expectation. `None` means "no
@@ -246,7 +246,7 @@ pub struct ResponseOverrides {
 /// The runtime apply function lives in `aisix-provider-openai`
 /// (`apply_stream_done_marker_policy`) and consumes this enum
 /// directly via re-export from `aisix-core`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum StreamDoneMarker {
     /// Upstream must emit `data: [DONE]`. Absence is a wire-shape

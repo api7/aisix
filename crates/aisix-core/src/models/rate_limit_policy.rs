@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::resource::Resource;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitPolicy {
     pub name: String,

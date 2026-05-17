@@ -41,13 +41,13 @@ use crate::resource::Resource;
 /// `tag = "kind"` puts the variant tag inline with the inner struct's
 /// fields — same shape as `GuardrailKind` so the kine wire stays
 /// consistent across resource types.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExporterKind {
     OtlpHttp(OtlpHttpConfig),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OtlpHttpConfig {
     /// Full URL of the OTLP/HTTP traces endpoint. Must already include
@@ -70,7 +70,7 @@ pub struct OtlpHttpConfig {
 /// field. Strict typo rejection happens at the JSON Schema layer
 /// (`schema::validate_observability_exporter`) which the etcd loader
 /// runs before the serde deserialize.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 pub struct ObservabilityExporter {
     /// Operator-facing label, surfaced in /logs and the dashboard list.
     /// Not used for routing — the etcd-key uuid is the identity.

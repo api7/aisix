@@ -18,7 +18,9 @@ use crate::resource::Resource;
 /// Cache backend choice. `Memory` is enforced by the DP today;
 /// `Redis` is the kine-level wire-shape stub for the upcoming
 /// shared-cluster backend (DP enforcement pending).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheBackend {
     #[default]
@@ -35,7 +37,7 @@ pub enum CacheBackend {
 /// new fields ahead of a DP rollout without a hard reject. New
 /// optional fields land at `#[serde(default)]` here on the next DP
 /// release.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct CachePolicy {
     /// Operator-facing name; surfaces in metric labels + cache headers.
     pub name: String,

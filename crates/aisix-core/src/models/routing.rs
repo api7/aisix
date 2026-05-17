@@ -15,7 +15,9 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingStrategy {
     RoundRobin,
@@ -28,7 +30,7 @@ pub enum RoutingStrategy {
 
 /// One destination in a routing config. `model` references another
 /// `Model.name` in the snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingTarget {
     pub model: String,
@@ -64,7 +66,9 @@ impl RoutingTarget {
 /// amplifies cascading outages. Operators that prefer the legacy
 /// behavior (try every candidate regardless of known state) can opt
 /// into `OriginalOrder` per routing model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum OnAllFilteredPolicy {
     /// Return 503 with a fixed Retry-After hint (currently 30 seconds —
@@ -86,7 +90,7 @@ pub enum OnAllFilteredPolicy {
     OriginalOrder,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Routing {
     #[serde(default)]

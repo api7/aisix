@@ -18,7 +18,7 @@ use super::routing::Routing;
 use crate::resource::Resource;
 
 /// Supported upstream providers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     Openai,
@@ -77,7 +77,7 @@ impl Provider {
 /// variant serializes as `"azure-openai"`. This intentionally differs
 /// from `Provider`'s `lowercase` casing, which produced no hyphens
 /// because all current `Provider` names are single tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Adapter {
     Openai,
@@ -130,7 +130,7 @@ impl From<Provider> for Adapter {
 }
 
 /// Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelCost {
     /// Input (prompt) token cost in USD per 1,000 tokens.
@@ -148,7 +148,7 @@ impl ModelCost {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BackgroundModelCheck {
     pub enabled: bool,
@@ -175,7 +175,7 @@ pub struct BackgroundModelCheck {
 ///
 /// All fields are optional; defaults preserve a safe behavior for any
 /// direct model that doesn't ship a `cooldown` block.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct CooldownConfig {
     /// Whether cooldown is active for this model. Default: true.
@@ -253,7 +253,7 @@ impl CooldownConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Model {
     /// Operator-facing unique label. Surfaces on `/v1/models`,

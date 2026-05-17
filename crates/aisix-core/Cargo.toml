@@ -21,6 +21,7 @@ tracing.workspace = true
 config.workspace = true
 humantime-serde.workspace = true
 jsonschema.workspace = true
+schemars.workspace = true
 once_cell.workspace = true
 regex.workspace = true
 # ApiKey::hash_bearer (prd-09a §9A.7B.4) is the canonical SHA-256 the

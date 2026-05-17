@@ -32,7 +32,9 @@ use serde::{Deserialize, Serialize};
 use crate::resource::Resource;
 
 /// What part of the request lifecycle a guardrail inspects.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum GuardrailHookPoint {
     /// Run on the request payload before bridge dispatch.
@@ -49,7 +51,7 @@ pub enum GuardrailHookPoint {
 /// `Regex` to a compiled `regex::Regex`. Invalid regex at parse
 /// time is loader-rejected (the DP refuses to apply a guardrail it
 /// can't compile, so a typo doesn't silently disarm the policy).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", content = "value", rename_all = "lowercase")]
 pub enum KeywordPattern {
     Literal(String),
@@ -57,7 +59,7 @@ pub enum KeywordPattern {
 }
 
 /// Config block for `kind: "keyword"`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct KeywordConfig {
     /// Blocklist patterns. Empty list is legal but pointless — the
@@ -73,7 +75,7 @@ pub struct KeywordConfig {
 /// envelope-encrypted secret at projection time (same trust
 /// boundary as `provider_keys` — see PRD-09c §6.3). The DP only
 /// ever holds plaintext in memory; it does not need a master key.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BedrockAWSCredentials {
     Static {
@@ -89,7 +91,7 @@ pub enum BedrockAWSCredentials {
 /// waits unconditionally; `timed` aborts at `timeout_ms` and
 /// applies the row-level `fail_open` flag. Range matches cp-api's
 /// validator (100..5000ms) — see PRD-09c §6.6.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BedrockLatencyMode {
     Serial,
@@ -99,7 +101,7 @@ pub enum BedrockLatencyMode {
 /// Config block for `kind: "bedrock"`. Phase 1 stores the shape +
 /// passes it through `aisix-guardrails::build` which logs
 /// `bedrock not yet implemented` and skips the row.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BedrockConfig {
     /// AWS-console-issued guardrail identifier (12 chars today).
@@ -116,7 +118,7 @@ pub struct BedrockConfig {
 
 /// Provider discriminator. The kind drives which `*_config` block is
 /// expected; serde's `tag = "kind"` keeps us honest at parse time.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum GuardrailKind {
     /// In-process literal/regex blocklist. Always available.
@@ -137,7 +139,7 @@ pub enum GuardrailKind {
 /// inner enum needs. Strict typo-rejection happens earlier in the
 /// JSON Schema (`schema::validate_guardrail`) which the loader
 /// runs before deserialise on every watch event.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 pub struct Guardrail {
     /// Operator-facing name; surfaces in metric labels + error reasons.
     pub name: String,
