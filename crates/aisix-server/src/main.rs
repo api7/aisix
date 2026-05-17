@@ -29,6 +29,7 @@ use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor};
 use aisix_gateway::Hub;
 use aisix_obs::{init_tracing, install_otlp_tracer, Metrics};
 use aisix_provider_anthropic::AnthropicBridge;
+use aisix_provider_azure_openai::AzureOpenAiBridge;
 use aisix_provider_openai::OpenAiBridge;
 use aisix_provider_vertex::VertexBridge;
 use aisix_proxy::background::run_background_model_check_once;
@@ -786,24 +787,28 @@ fn build_hub() -> Hub {
     // legacy `Provider`-keyed register() above stays the live
     // dispatch path until cp-api stops emitting the legacy enum
     // field; this only adds the new-schema-keyed lookup so a
-    // catalog row with `adapter: "vertex"` can resolve to a real
+    // catalog row with `adapter: "<wire>"` can resolve to a real
     // bridge instead of falling through to the legacy fallback.
     //
-    // Vertex is currently a SKELETON bridge — it returns a clear
-    // `BridgeError::Config` referencing api7/AISIX-Cloud#302 Phase E
-    // (D5). Registering it now lets the dispatch path light up the
-    // moment cp-api starts shipping adapter strings, instead of
-    // having the catalog be permanently inaccessible.
+    // All non-OpenAI-compat adapters are SKELETON bridges today —
+    // they return a clear `BridgeError::Config` referencing
+    // api7/AISIX-Cloud#302 Phases E/F/G. Registering them now lets
+    // the dispatch path light up the moment cp-api starts shipping
+    // adapter strings, instead of having the catalog be permanently
+    // inaccessible.
     //
-    // CUTOVER CAUTION: cp-api today blocks `provider: "google-vertex"`
+    // CUTOVER CAUTION: cp-api today blocks the catalog providers
+    // these bridges serve (`google-vertex`, `azure`, `amazon-bedrock`)
     // at createProviderKey via `isSupportedProvider` (handlers.go).
     // The moment that gate is loosened — which Phase B is actively
-    // enabling — every chat through a `google-vertex` provider_key
-    // will route here and hit this NOT-IMPLEMENTED skeleton, taking
-    // Gemini from "works via OpenAI-compat" to "500: not implemented"
-    // in a single cp-api flip. The cutover order MUST be:
-    //   D5.2 (Gemini dispatch) merge → cp-api flip catalog.
+    // enabling — every chat through one of those provider_keys will
+    // route here and hit a NOT-IMPLEMENTED skeleton, taking the
+    // matching catalog from "works via OpenAI-compat" to "500: not
+    // implemented" in a single cp-api flip. The cutover order MUST
+    // be: per-adapter dispatch PR (D5.2 / D6.1 / D7.1) → cp-api flip
+    // catalog for that adapter.
     hub.register_family(Adapter::Vertex, Arc::new(VertexBridge::new()));
+    hub.register_family(Adapter::AzureOpenai, Arc::new(AzureOpenAiBridge::new()));
 
     hub
 }
