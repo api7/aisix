@@ -627,9 +627,22 @@ where
                 }
             }
         }
-        if let Some(SseEvent::Data(payload)) = decoder.finish() {
-            let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
-            yield stream_chunk_into_chat_chunk(parsed);
+        // `decoder.finish()` flushes any event sitting in the tail
+        // buffer — an SSE stream that ends with `data: [DONE]\n\n`
+        // gets the Done event from `feed`, but a stream that ends
+        // with `data: [DONE]\n` (no trailing blank line) only surfaces
+        // it here. Both forms occur in the wild (the OpenAI SDK
+        // tolerates both), so we treat `finish()`-returned Done the
+        // same as a feed()-returned Done.
+        match decoder.finish() {
+            Some(SseEvent::Done) => {
+                done_marker_seen = true;
+            }
+            Some(SseEvent::Data(payload)) => {
+                let parsed = parse_stream_chunk(&payload, reasoning_path.as_deref())?;
+                yield stream_chunk_into_chat_chunk(parsed);
+            }
+            None => {}
         }
         // Issue #302 §5 `response.stream_done_marker` — evaluate the
         // policy once the stream ends. Violations are logged (operator
@@ -1360,6 +1373,53 @@ data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\
         let mut stream = bridge.chat_stream(&req(), &ctx).await.unwrap();
         let first = stream.next().await.unwrap();
         assert!(matches!(first, Err(BridgeError::UpstreamDecode(_))));
+    }
+
+    /// Audit regression: a `data: [DONE]` line without the trailing
+    /// blank line is held in `SseDecoder`'s tail buffer and only
+    /// surfaces via `decoder.finish()`. The bridge must treat that as
+    /// "the marker was seen" — otherwise a policy=Required stream that
+    /// happened to omit the trailing blank line would log a false-
+    /// positive MissingDoneMarker warning. The customer-visible
+    /// behavior we pin here: the chunks are yielded AND the stream
+    /// completes cleanly without a spurious warning being the only
+    /// observable. (We can't easily assert on tracing output without
+    /// adding a dev-dep, so we lock in the next-best contract: chunks
+    /// arrive intact.)
+    #[tokio::test]
+    async fn chat_stream_done_marker_in_decoder_finish_tail_is_counted_as_seen() {
+        let server = MockServer::start().await;
+        // Note: NO trailing `\n\n` after [DONE] — exercises the
+        // decoder.finish() flush path rather than feed().
+        let sse = "\
+data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let pk = pk_with_overrides(
+            &server.uri(),
+            r#""response": {"stream_done_marker": "required"}"#,
+        );
+        let ctx = BridgeContext::new("req-1", sample_model(), pk);
+        let mut stream = bridge.chat_stream(&req(), &ctx).await.unwrap();
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.expect("chunk must not error"));
+        }
+        assert_eq!(
+            chunks.len(),
+            1,
+            "chunk before [DONE] must still be delivered"
+        );
     }
 
     /// Backward-compat: a ProviderKey with no `request` / `response`

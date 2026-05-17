@@ -132,7 +132,14 @@ pub fn apply_param_constraints(body: &mut Value, constraints: &ParamConstraints)
 ///
 /// `HeaderName` is case-insensitive so the lowercase form is the
 /// canonical comparison key.
-const RESERVED_DEFAULT_HEADERS: &[&str] = &["authorization", "x-api-key", "x-goog-api-key"];
+const RESERVED_DEFAULT_HEADERS: &[&str] = &[
+    "authorization",        // OpenAI / Anthropic / Vertex Bearer
+    "x-api-key",            // Anthropic raw, also OpenAI legacy proxies
+    "x-goog-api-key",       // Gemini API key
+    "api-key",              // Azure OpenAI key
+    "x-amz-security-token", // AWS SigV4 session header (Bedrock)
+    "x-amz-date",           // AWS SigV4 timestamp (Bedrock)
+];
 
 /// Apply `request.default_headers` to an outbound `HeaderMap`.
 ///
