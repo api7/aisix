@@ -6,6 +6,7 @@ members = [
     "crates/aisix-gateway",
     "crates/aisix-provider-openai",
     "crates/aisix-provider-anthropic",
+    "crates/aisix-provider-vertex",
     "crates/aisix-proxy",
     "crates/aisix-admin",
     "crates/aisix-obs",
