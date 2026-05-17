@@ -1,0 +1,100 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ApiKey",
+  "type": "object",
+  "required": [
+    "allowed_models",
+    "key_hash"
+  ],
+  "properties": {
+    "allowed_models": {
+      "description": "Whitelisted Model identifiers. cp-api stores them as model UUIDs; self-hosted dev fixtures may still use names — the DP does string equality and doesn't care which. An **empty array** denies every model (spec §3 authz rule).",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "key_hash": {
+      "description": "SHA-256 hex of the plaintext bearer. Secondary-indexed for O(1) auth — the proxy hashes incoming bearers before lookup.",
+      "type": "string"
+    },
+    "owner_id": {
+      "description": "Org member who owns this key. Used for matching member-scope rate limit policies.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "rate_limit": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RateLimit"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "team_id": {
+      "description": "Team this API key belongs to. Used for matching team-scope rate limit policies.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "RateLimit": {
+      "type": "object",
+      "properties": {
+        "concurrency": {
+          "description": "Max concurrent in-flight requests.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "rpd": {
+          "description": "Requests per day (86400s window).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "rpm": {
+          "description": "Requests per minute (60s window).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tpd": {
+          "description": "Tokens per day (86400s window).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tpm": {
+          "description": "Tokens per minute (60s window).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

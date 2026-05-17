@@ -1,0 +1,51 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CachePolicy",
+  "description": "Top-level `CachePolicy` resource shape. Mirrors what cp-api writes to kine. `name` is operator-facing; `enabled` flips the policy on without delete + recreate. `applies_to` is parsed into a typed matcher (see `parsed_applies_to`).\n\n`deny_unknown_fields` is intentionally NOT set so cp-api can ship new fields ahead of a DP rollout without a hard reject. New optional fields land at `#[serde(default)]` here on the next DP release.",
+  "type": "object",
+  "required": [
+    "name"
+  ],
+  "properties": {
+    "applies_to": {
+      "description": "Free-form scope. v1 understands \"all\", \"model:<name>\", \"api_key:<id>\". See `parsed_applies_to`.",
+      "default": "all",
+      "type": "string"
+    },
+    "backend": {
+      "description": "Backend hint. `memory` is the only enforced backend today; `redis` parses + persists but the DP currently falls back to memory until that backend wires up.",
+      "default": "memory",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CacheBackend"
+        }
+      ]
+    },
+    "enabled": {
+      "description": "When false the cache gate skips this policy. Lets operators stage a rule (write it, sanity-check it, then flip it on).",
+      "default": true,
+      "type": "boolean"
+    },
+    "name": {
+      "description": "Operator-facing name; surfaces in metric labels + cache headers.",
+      "type": "string"
+    },
+    "ttl_seconds": {
+      "description": "TTL hint in seconds. Per-policy TTL is honored by the cache backend on each entry. Default 3600 matches the cp-api validator.",
+      "default": 3600,
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    }
+  },
+  "definitions": {
+    "CacheBackend": {
+      "description": "Cache backend choice. `Memory` is enforced by the DP today; `Redis` is the kine-level wire-shape stub for the upcoming shared-cluster backend (DP enforcement pending).",
+      "type": "string",
+      "enum": [
+        "memory",
+        "redis"
+      ]
+    }
+  }
+}

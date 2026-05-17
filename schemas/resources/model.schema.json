@@ -1,0 +1,436 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Model",
+  "type": "object",
+  "required": [
+    "display_name"
+  ],
+  "properties": {
+    "background_model_check": {
+      "description": "Optional direct-model-only background health-check configuration.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/BackgroundModelCheck"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "cooldown": {
+      "description": "Optional direct-model-only request-path cooldown configuration. When absent, default cooldown semantics apply (see [`CooldownConfig`] field docs for defaults).",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CooldownConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "cost": {
+      "description": "Per-token cost for budget tracking. Absent = no cost tracked.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ModelCost"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "display_name": {
+      "description": "Operator-facing unique label. Surfaces on `/v1/models`, `req.model` on chat completions, ApiKey.allowed_models, and the dashboard model list. `Resource::name()` returns this.",
+      "type": "string"
+    },
+    "model_name": {
+      "description": "Upstream model id sent to the provider (e.g. \"gpt-4o\", \"claude-sonnet-4-5\"). None for routing models.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "provider": {
+      "description": "Upstream provider. None for routing models (the router picks a target whose own `provider` is used at dispatch time).",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Provider"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "provider_key_id": {
+      "description": "References a `ProviderKey` row by id. The bridge resolves this against `AisixSnapshot::provider_keys` at dispatch time to fetch the upstream secret + optional `api_base`. None for routing models.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "rate_limit": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RateLimit"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "routing": {
+      "description": "Virtual-router config. When set, the proxy walks `routing.targets` to pick a downstream Model and dispatches against THAT model's `provider` / `model_name` / `provider_key_id`. The fields on this entity are intentionally absent in that case.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Routing"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "timeout": {
+      "description": "Request timeout in ms. 0 or absent = no timeout.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "BackgroundModelCheck": {
+      "type": "object",
+      "required": [
+        "enabled",
+        "interval_seconds",
+        "max_tokens",
+        "prompt",
+        "stale_after_seconds",
+        "timeout_seconds"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "ignore_statuses": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0.0
+          }
+        },
+        "interval_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_tokens": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "prompt": {
+          "type": "string"
+        },
+        "stale_after_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "CooldownConfig": {
+      "description": "Request-path cooldown configuration for a direct model. Controls which upstream failures temporarily exclude this model from routing candidate selection, and for how long.\n\nCooldown is **independent** of request retry semantics — i.e. `Routing.retry_on_429` governs whether a 429 is retried within the current request, but `CooldownConfig.trigger_statuses` governs whether 429 takes the model out of rotation for subsequent requests. The two layers serve different purposes: - retry: short-window in-request recovery - cooldown: medium-window cross-request backpressure\n\nAll fields are optional; defaults preserve a safe behavior for any direct model that doesn't ship a `cooldown` block.",
+      "type": "object",
+      "properties": {
+        "default_seconds": {
+          "description": "Cooldown TTL in seconds when the upstream did not supply a `Retry-After` header (or `honor_retry_after=false`). Default: 30.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "enabled": {
+          "description": "Whether cooldown is active for this model. Default: true. Set to `false` to disable cooldown entirely (the model stays in rotation regardless of upstream failures).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "honor_retry_after": {
+          "description": "Whether to use the upstream's `Retry-After` header (seconds form) as the cooldown TTL when present. Default: true.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "max_seconds": {
+          "description": "Upper bound on cooldown TTL. Caps a misbehaving upstream that returns an unreasonable `Retry-After` value. Default: 600 (10 min).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "trigger_on_timeout": {
+          "description": "Whether request-path timeouts trigger cooldown. Default: true.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "trigger_on_transport": {
+          "description": "Whether transport / decode / stream-abort errors trigger cooldown. Default: true.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "trigger_statuses": {
+          "description": "Status codes that trigger cooldown. Default: `[401, 408, 429, 500, 502, 503, 504]` — auth failures and rate limits + transient server errors. `400/403/422` etc. are caller mistakes and intentionally excluded.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0.0
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelCost": {
+      "description": "Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.",
+      "type": "object",
+      "required": [
+        "input_per_1k",
+        "output_per_1k"
+      ],
+      "properties": {
+        "input_per_1k": {
+          "description": "Input (prompt) token cost in USD per 1,000 tokens.",
+          "type": "number",
+          "format": "double"
+        },
+        "output_per_1k": {
+          "description": "Output (completion) token cost in USD per 1,000 tokens.",
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OnAllFilteredPolicy": {
+      "description": "Behavior when every candidate target is filtered out by the runtime status layer (all in cooldown or background-unhealthy).\n\n`Fail` is the default because sending traffic to a target we know is currently bad — just because every other target is also bad — amplifies cascading outages. Operators that prefer the legacy behavior (try every candidate regardless of known state) can opt into `OriginalOrder` per routing model.",
+      "oneOf": [
+        {
+          "description": "Return 503 with a fixed Retry-After hint (currently 30 seconds — see `FALLBACK_ALL_UNHEALTHY_RETRY_AFTER` in `crates/aisix-proxy/src/chat.rs`). Default.\n\nThe hint is intentionally coarse: by the time the filter reaches the all-filtered branch, every candidate is background-unhealthy with no live cooldown timer (cooldown candidates are returned via the Selected branch one tier up). A future version may derive the hint from probe metadata; the current contract is a flat fallback.",
+          "type": "string",
+          "enum": [
+            "fail"
+          ]
+        },
+        {
+          "description": "Send to the original candidate list anyway, in declaration order. Preserves availability over caller-facing correctness. Use only when the operator explicitly accepts the risk of sending traffic to a target the gateway just probed as broken.",
+          "type": "string",
+          "enum": [
+            "original_order"
+          ]
+        }
+      ]
+    },
+    "Provider": {
+      "description": "Supported upstream providers.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "openai",
+            "anthropic",
+            "google",
+            "deepseek"
+          ]
+        },
+        {
+          "description": "Cohere — currently exposed for `/v1/rerank` only (#213 Phase 1). Cohere's chat / generate APIs are not OpenAI-compatible; a future bridge implementation can extend coverage.",
+          "type": "string",
+          "enum": [
+            "cohere"
+          ]
+        },
+        {
+          "description": "Jina AI — currently exposed for `/v1/rerank` only (#213 Phase 2). Jina's rerank wire shape is identity-mapped to the OpenAI-compat shape (`{model, query, documents, top_n}` with Bearer auth at `https://api.jina.ai/v1/rerank`), so the gateway forwards verbatim with no transform. Jina's chat / embeddings APIs are out of scope for this phase.",
+          "type": "string",
+          "enum": [
+            "jina"
+          ]
+        }
+      ]
+    },
+    "RateLimit": {
+      "type": "object",
+      "properties": {
+        "concurrency": {
+          "description": "Max concurrent in-flight requests.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "rpd": {
+          "description": "Requests per day (86400s window).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "rpm": {
+          "description": "Requests per minute (60s window).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tpd": {
+          "description": "Tokens per day (86400s window).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "tpm": {
+          "description": "Tokens per minute (60s window).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Routing": {
+      "type": "object",
+      "required": [
+        "targets"
+      ],
+      "properties": {
+        "max_fallbacks": {
+          "description": "Max number of later targets to attempt after the initial target fails permanently. Defaults to all later targets.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "on_all_filtered": {
+          "description": "Policy for the case where every candidate is filtered out by runtime status. See [`OnAllFilteredPolicy`].",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OnAllFilteredPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retries": {
+          "description": "Retry attempts on the current target before failing over.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "retry_on_429": {
+          "description": "Whether upstream 429 participates in retries and failover.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "strategy": {
+          "default": "failover",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RoutingStrategy"
+            }
+          ]
+        },
+        "targets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/RoutingTarget"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RoutingStrategy": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "round_robin",
+            "weighted"
+          ]
+        },
+        {
+          "description": "Failover is the safest default — predictable order, no shared state, no surprises on first deploy.",
+          "type": "string",
+          "enum": [
+            "failover"
+          ]
+        }
+      ]
+    },
+    "RoutingTarget": {
+      "description": "One destination in a routing config. `model` references another `Model.name` in the snapshot.",
+      "type": "object",
+      "required": [
+        "model"
+      ],
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "weight": {
+          "description": "Only meaningful for `weighted`. Optional everywhere else; falls back to 1 when missing.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

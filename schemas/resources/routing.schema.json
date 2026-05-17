@@ -1,0 +1,122 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Routing",
+  "type": "object",
+  "required": [
+    "targets"
+  ],
+  "properties": {
+    "max_fallbacks": {
+      "description": "Max number of later targets to attempt after the initial target fails permanently. Defaults to all later targets.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "on_all_filtered": {
+      "description": "Policy for the case where every candidate is filtered out by runtime status. See [`OnAllFilteredPolicy`].",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/OnAllFilteredPolicy"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "retries": {
+      "description": "Retry attempts on the current target before failing over.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "retry_on_429": {
+      "description": "Whether upstream 429 participates in retries and failover.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "strategy": {
+      "default": "failover",
+      "allOf": [
+        {
+          "$ref": "#/definitions/RoutingStrategy"
+        }
+      ]
+    },
+    "targets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/RoutingTarget"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "OnAllFilteredPolicy": {
+      "description": "Behavior when every candidate target is filtered out by the runtime status layer (all in cooldown or background-unhealthy).\n\n`Fail` is the default because sending traffic to a target we know is currently bad — just because every other target is also bad — amplifies cascading outages. Operators that prefer the legacy behavior (try every candidate regardless of known state) can opt into `OriginalOrder` per routing model.",
+      "oneOf": [
+        {
+          "description": "Return 503 with a fixed Retry-After hint (currently 30 seconds — see `FALLBACK_ALL_UNHEALTHY_RETRY_AFTER` in `crates/aisix-proxy/src/chat.rs`). Default.\n\nThe hint is intentionally coarse: by the time the filter reaches the all-filtered branch, every candidate is background-unhealthy with no live cooldown timer (cooldown candidates are returned via the Selected branch one tier up). A future version may derive the hint from probe metadata; the current contract is a flat fallback.",
+          "type": "string",
+          "enum": [
+            "fail"
+          ]
+        },
+        {
+          "description": "Send to the original candidate list anyway, in declaration order. Preserves availability over caller-facing correctness. Use only when the operator explicitly accepts the risk of sending traffic to a target the gateway just probed as broken.",
+          "type": "string",
+          "enum": [
+            "original_order"
+          ]
+        }
+      ]
+    },
+    "RoutingStrategy": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "round_robin",
+            "weighted"
+          ]
+        },
+        {
+          "description": "Failover is the safest default — predictable order, no shared state, no surprises on first deploy.",
+          "type": "string",
+          "enum": [
+            "failover"
+          ]
+        }
+      ]
+    },
+    "RoutingTarget": {
+      "description": "One destination in a routing config. `model` references another `Model.name` in the snapshot.",
+      "type": "object",
+      "required": [
+        "model"
+      ],
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "weight": {
+          "description": "Only meaningful for `weighted`. Optional everywhere else; falls back to 1 when missing.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,243 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Guardrail",
+  "description": "Top-level `Guardrail` resource shape. Mirrors what cp-api writes to kine at `/aisix/<env>/guardrails/<uuid>`.\n\n`deny_unknown_fields` is intentionally NOT set here: serde's `flatten` + `tag = \"kind\"` interaction can't pass the \"I consumed this field\" signal up to the outer struct, so a `deny_unknown_fields` outer would reject the very `kind` the inner enum needs. Strict typo-rejection happens earlier in the JSON Schema (`schema::validate_guardrail`) which the loader runs before deserialise on every watch event.",
+  "type": "object",
+  "oneOf": [
+    {
+      "description": "In-process literal/regex blocklist. Always available.",
+      "type": "object",
+      "required": [
+        "kind",
+        "patterns"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "keyword"
+          ]
+        },
+        "patterns": {
+          "description": "Blocklist patterns. Empty list is legal but pointless — the guardrail will allow every request, same as `enabled: false`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/KeywordPattern"
+          }
+        }
+      }
+    },
+    {
+      "description": "AWS Bedrock managed guardrail. Phase 1 parses + persists; the chain builder skips it with a warn log. Phase 2 wires real `ApplyGuardrail` dispatch.",
+      "type": "object",
+      "required": [
+        "aws_credentials",
+        "guardrail_id",
+        "guardrail_version",
+        "kind",
+        "latency_mode",
+        "region"
+      ],
+      "properties": {
+        "aws_credentials": {
+          "description": "IAM credentials. v1 = static access keys (encrypted).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/BedrockAWSCredentials"
+            }
+          ]
+        },
+        "guardrail_id": {
+          "description": "AWS-console-issued guardrail identifier (12 chars today).",
+          "type": "string"
+        },
+        "guardrail_version": {
+          "description": "Version label: `DRAFT`, `1`, `2`, ...",
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "bedrock"
+          ]
+        },
+        "latency_mode": {
+          "description": "`serial` (default) or `timed { timeout_ms }`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/BedrockLatencyMode"
+            }
+          ]
+        },
+        "region": {
+          "description": "AWS region the Bedrock endpoint lives in (e.g. `us-east-1`).",
+          "type": "string"
+        }
+      }
+    }
+  ],
+  "required": [
+    "name"
+  ],
+  "properties": {
+    "enabled": {
+      "description": "When false the chain skips this rule entirely. Lets operators stage a rule (write it, sanity-check it via dry runs, then flip it on) without deleting + recreating.",
+      "default": true,
+      "type": "boolean"
+    },
+    "fail_open": {
+      "description": "Behavior when a remote-API guardrail (today `kind=bedrock`) can't reach its upstream. `true` lets the request through (recorded in usage_events.guardrail_bypassed_reason); `false` blocks with 422. No-op for `kind=keyword`. Defaults `true` (matches the PG schema default + PRD-09c §6.4).",
+      "default": true,
+      "type": "boolean"
+    },
+    "hook_point": {
+      "description": "Where in the lifecycle this rule runs. Defaults to `both`.",
+      "default": "both",
+      "allOf": [
+        {
+          "$ref": "#/definitions/GuardrailHookPoint"
+        }
+      ]
+    },
+    "name": {
+      "description": "Operator-facing name; surfaces in metric labels + error reasons.",
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "BedrockAWSCredentials": {
+      "description": "AWS credentials for `kind: \"bedrock\"`. Phase 2 supports `static` (access-key pair); Phase 4 adds `role_arn` (sts:AssumeRole) under the same tag.\n\nWire shape on the kine path is plaintext: cp-api decrypts the envelope-encrypted secret at projection time (same trust boundary as `provider_keys` — see PRD-09c §6.3). The DP only ever holds plaintext in memory; it does not need a master key.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "access_key_id",
+            "kind",
+            "secret_access_key"
+          ],
+          "properties": {
+            "access_key_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "static"
+              ]
+            },
+            "secret_access_key": {
+              "description": "Decrypted by cp-api before kine projection; plaintext in memory only, never logged. The DP feeds it to the AWS SDK's static credentials provider.",
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "BedrockLatencyMode": {
+      "description": "Per-guardrail latency policy for `kind: \"bedrock\"`. `serial` waits unconditionally; `timed` aborts at `timeout_ms` and applies the row-level `fail_open` flag. Range matches cp-api's validator (100..5000ms) — see PRD-09c §6.6.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "serial"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "timeout_ms"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "timed"
+              ]
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          }
+        }
+      ]
+    },
+    "GuardrailHookPoint": {
+      "description": "What part of the request lifecycle a guardrail inspects.",
+      "oneOf": [
+        {
+          "description": "Run on the request payload before bridge dispatch.",
+          "type": "string",
+          "enum": [
+            "input"
+          ]
+        },
+        {
+          "description": "Run on the upstream response before the cache write + render.",
+          "type": "string",
+          "enum": [
+            "output"
+          ]
+        },
+        {
+          "description": "Run on both. Default for keyword blocklists.",
+          "type": "string",
+          "enum": [
+            "both"
+          ]
+        }
+      ]
+    },
+    "KeywordPattern": {
+      "description": "One pattern in a `keyword`-kind guardrail's blocklist. The DP translates `Literal` to a case-insensitive substring match and `Regex` to a compiled `regex::Regex`. Invalid regex at parse time is loader-rejected (the DP refuses to apply a guardrail it can't compile, so a typo doesn't silently disarm the policy).",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "literal"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "regex"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

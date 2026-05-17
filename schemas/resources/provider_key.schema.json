@@ -1,0 +1,252 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ProviderKey",
+  "type": "object",
+  "required": [
+    "display_name",
+    "secret"
+  ],
+  "properties": {
+    "adapter": {
+      "description": "Wire-shape adapter (`openai` / `anthropic` / `bedrock` / `vertex` / `azure-openai`). Introduced as a skeleton for issue #302 Phase A. `None` in this PR — no dispatch path consumes it yet; the field exists so future Phase A sub-PRs can populate it without an on-disk schema break. Old payloads that omit `adapter` continue to deserialize via `#[serde(default)]`.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Adapter"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "api_base": {
+      "description": "Override for the upstream base URL. Empty/None means the provider default applies (see `Provider::default_base_url`).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "display_name": {
+      "description": "Operator-facing label, unique within the gateway. Surfaces in the Admin API list view and in dashboard UIs that wrap this resource.",
+      "type": "string"
+    },
+    "provider": {
+      "description": "Vendor identity (e.g. `\"deepseek\"`, `\"openai\"`). Introduced as a skeleton for issue #302 Phase A. Empty in this PR — no dispatch path consumes it yet; the field exists so future Phase A sub-PRs can populate it without an on-disk schema break. Old payloads that omit `provider` continue to deserialize via `#[serde(default)]`.",
+      "default": "",
+      "type": "string"
+    },
+    "request": {
+      "description": "Per-key request-shape overrides — see issue #302 §5 `RuntimeConfig.request`. `None` until cp-api ships the block. No dispatch path reads it in this PR; #301 already provides the primitive apply functions in `aisix-provider-openai` that Phase D will call once the wire stage cuts over.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RequestOverrides"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "response": {
+      "description": "Per-key response-shape overrides — see issue #302 §5 `RuntimeConfig.response`. `None` until cp-api ships the block. Same Phase D wiring story as [`Self::request`].",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ResponseOverrides"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "secret": {
+      "description": "Upstream provider's API key, stored in plaintext on the standalone path (the etcd channel is mTLS-only — same trust boundary as Guardrail credentials and ObservabilityExporter headers). On the AISIX-Cloud path cp-api decrypts the envelope-encrypted secret at projection time and writes the plaintext here.",
+      "type": "string"
+    },
+    "telemetry_tags": {
+      "description": "Telemetry tags carried alongside the key for metric/log emission. Introduced as a skeleton for issue #302 Phase A. No metric path consumes these tags yet; the field exists so future Phase A sub-PRs can attribute traffic without an on-disk schema break. Old payloads that omit `telemetry_tags` fall back to the `Default` impl via `#[serde(default)]`.",
+      "default": {
+        "featured": false
+      },
+      "allOf": [
+        {
+          "$ref": "#/definitions/TelemetryTags"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "Adapter": {
+      "description": "Wire-shape adapter used to talk to an upstream. This is the closed set of upstream protocols the gateway knows how to encode against — distinct from a vendor identity (which is captured separately on `ProviderKey`).\n\nIntroduced as a skeleton for issue #302 Phase A. This type is purely additive in this PR: nothing in the gateway dispatches off `Adapter` yet, no entity field is changed, and `Provider` continues to drive all runtime behavior. Follow-up PRs in Phase A migrate entities and the Hub to consume `Adapter` directly.\n\nNote on serde casing: `Adapter` uses `kebab-case` so the `AzureOpenai` variant serializes as `\"azure-openai\"`. This intentionally differs from `Provider`'s `lowercase` casing, which produced no hyphens because all current `Provider` names are single tokens.",
+      "type": "string",
+      "enum": [
+        "openai",
+        "anthropic",
+        "bedrock",
+        "vertex",
+        "azure-openai"
+      ]
+    },
+    "ParamConstraints": {
+      "description": "Numeric range clamps applied to chat-completion request bodies — the on-disk shape of issue #302 §5 `param_constraints`. Phase A scope is `temperature` only; `top_p` / `frequency_penalty` are deferred until a real upstream quirk demands them (YAGNI per `CLAUDE.md` §2).\n\n`f64` not `Eq`: NaN comparisons make a derived `Eq` unsound. [`PartialEq`] is enough for the round-trip test.",
+      "type": "object",
+      "properties": {
+        "temperature_max": {
+          "description": "Upper bound for `temperature`. Values above this are clamped to this value. `None` means \"no upper clamp\".",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "temperature_min": {
+          "description": "Lower bound for `temperature`. Values below this are clamped to this value. `None` means \"no lower clamp\".",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RequestOverrides": {
+      "description": "Per-`ProviderKey` request-shape overrides — see issue #302 §5 `RuntimeConfig.request`. Each field maps 1:1 onto a primitive apply function in [`aisix-provider-openai`'s `overrides` module](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-openai/src/overrides.rs):\n\n- `param_renames` → `apply_param_renames` - `param_constraints` → `apply_param_constraints` - `default_headers` → `apply_default_headers` - `default_body_fields` → `apply_default_body_fields`\n\n`f64` in [`ParamConstraints`] is the reason the parent [`ProviderKey`] derives `PartialEq` rather than `Eq`.",
+      "type": "object",
+      "properties": {
+        "default_body_fields": {
+          "description": "`apply_default_body_fields` input. Top-level body fields added when the caller did not set them. `serde_json::Map` preserves insertion order on serialize, matching the etcd round-trip.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "default_headers": {
+          "description": "`apply_default_headers` input. Top-level headers added to the outbound request when the caller did not set them. Reserved auth headers are dropped by `apply_default_headers` as defense-in-depth.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "param_constraints": {
+          "description": "`apply_param_constraints` input. `None` means no clamping.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ParamConstraints"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "param_renames": {
+          "description": "`apply_param_renames` input. Top-level body keys named on the left are renamed to the right. Empty map is the default.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ResponseOverrides": {
+      "description": "Per-`ProviderKey` response-shape overrides — see issue #302 §5 `RuntimeConfig.response`. Each field maps onto behavior the [`aisix-provider-openai`'s `overrides` module](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-openai/src/overrides.rs) already implements:\n\n- `stream_done_marker` → `apply_stream_done_marker_policy` - `content_list_to_string` → `apply_content_list_to_string` (applied to the *request* body before send when the upstream only accepts string content) - `reasoning_field` → `extract_reasoning_field`\n\n`error_envelope` is on-disk only — issue #302 §5 keeps it as a `\"openai\" | \"passthrough\"` string so cp-api can iterate without a Rust-side enum migration. Phase D pins the closed set.",
+      "type": "object",
+      "properties": {
+        "content_list_to_string": {
+          "description": "When `true`, the request-body `messages[*].content` array of text blocks gets flattened to a single string before dispatch. Defaults to `false` (no flattening).",
+          "default": false,
+          "type": "boolean"
+        },
+        "error_envelope": {
+          "description": "On-disk discriminator for the error-translation strategy. `\"openai\"` projects upstream errors into the OpenAI envelope; `\"passthrough\"` returns the upstream body as-is. Open string in this PR (issue #302 §5 wire shape); Phase D pins the closed set in a follow-up.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasoning_field": {
+          "description": "`extract_reasoning_field` path. Empty / `None` means no lift. Example: `\"delta.reasoning_content\"` (DeepSeek's canonical shape, already aligned with the gateway's emit slot).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stream_done_marker": {
+          "description": "Stream `[DONE]` terminator expectation. `None` means \"no opinion\" — same effect as [`StreamDoneMarker::Optional`].",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StreamDoneMarker"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "StreamDoneMarker": {
+      "description": "Stream `[DONE]` terminator policy for an SSE response — the on-disk shape of issue #302 §5 `stream_done_marker`. The wire form is the lowercased variant name (`\"required\"` / `\"optional\"` / `\"none\"`) so cp-api JSON keeps the same set the original spec drafted.\n\nThe runtime apply function lives in `aisix-provider-openai` (`apply_stream_done_marker_policy`) and consumes this enum directly via re-export from `aisix-core`.",
+      "oneOf": [
+        {
+          "description": "Upstream must emit `data: [DONE]`. Absence is a wire-shape violation. OpenAI proper, DeepSeek, Groq.",
+          "type": "string",
+          "enum": [
+            "required"
+          ]
+        },
+        {
+          "description": "Either presence or absence is acceptable. Used when the upstream is OpenAI-compat but does not promise the terminator.",
+          "type": "string",
+          "enum": [
+            "optional"
+          ]
+        },
+        {
+          "description": "Upstream is expected to *omit* the marker. Some Azure / Vertex flavors terminate cleanly on connection close.",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        }
+      ]
+    },
+    "TelemetryTags": {
+      "description": "Telemetry attribution tags emitted alongside requests routed through this `ProviderKey`. Introduced as a skeleton for issue #302 Phase A — no metric/log path consumes these fields yet.\n\nThe `#[serde(default)]` on each field plus `#[derive(Default)]` means an omitted block or omitted individual key both yield the zero-value `TelemetryTags`, preserving backward compatibility with existing `ProviderKey` payloads.",
+      "type": "object",
+      "properties": {
+        "branded_provider": {
+          "description": "Branded provider slug for catalog entries (e.g. `\"openai\"`, `\"anthropic\"`). `None` for byo or until Phase A wires attribution.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "byo_label": {
+          "description": "Operator-defined label for bring-your-own entries (e.g. an internal team name). `None` for catalog entries or until Phase A wires attribution.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "featured": {
+          "description": "Whether this provider is surfaced in the featured list. Defaults to `false`.",
+          "default": false,
+          "type": "boolean"
+        },
+        "kind": {
+          "description": "`\"catalog\"` for first-party curated providers, `\"byo\"` for bring-your-own. `None` until Phase A wires attribution.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pk_label": {
+          "description": "Operator-defined label for this provider key (e.g. `\"production\"`, `\"shared-test\"`). `None` until Phase A wires attribution.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

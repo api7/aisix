@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RateLimitPolicy",
+  "type": "object",
+  "required": [
+    "name",
+    "scope",
+    "scope_ref",
+    "window"
+  ],
+  "properties": {
+    "max_requests": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "max_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "name": {
+      "type": "string"
+    },
+    "scope": {
+      "type": "string"
+    },
+    "scope_ref": {
+      "type": "string"
+    },
+    "window": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

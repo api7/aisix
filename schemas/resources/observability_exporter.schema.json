@@ -1,0 +1,48 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ObservabilityExporter",
+  "description": "Top-level `ObservabilityExporter` resource. `deny_unknown_fields` deliberately NOT set — serde's `flatten` + `tag = \"kind\"` interaction makes outer-strict-mode reject the inner discriminator field. Strict typo rejection happens at the JSON Schema layer (`schema::validate_observability_exporter`) which the etcd loader runs before the serde deserialize.",
+  "type": "object",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "endpoint",
+        "kind"
+      ],
+      "properties": {
+        "endpoint": {
+          "description": "Full URL of the OTLP/HTTP traces endpoint. Must already include the `/v1/traces` path the receiver expects — we don't append it because some vendors (Honeycomb, Grafana) use a different path.",
+          "type": "string"
+        },
+        "headers": {
+          "description": "Static headers to attach to every export request. Typical use: `Authorization: Bearer <api-token>` or vendor-specific keys like `x-honeycomb-team`. Values are plaintext at this MVP — the kine path is mTLS-only, so the trust boundary matches `provider_keys`. Field-level encryption arrives in Phase 2.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "otlp_http"
+          ]
+        }
+      }
+    }
+  ],
+  "required": [
+    "name"
+  ],
+  "properties": {
+    "enabled": {
+      "description": "Soft kill switch. Disabled exporters stay in the snapshot but the fan-out sink skips them. Lets operators pause an exporter without losing the row's headers / endpoint.",
+      "default": true,
+      "type": "boolean"
+    },
+    "name": {
+      "description": "Operator-facing label, surfaced in /logs and the dashboard list. Not used for routing — the etcd-key uuid is the identity.",
+      "type": "string"
+    }
+  }
+}
