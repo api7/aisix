@@ -23,6 +23,7 @@ aisix-admin = { path = "../aisix-admin" }
 aisix-provider-openai = { path = "../aisix-provider-openai" }
 aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
 aisix-provider-vertex = { path = "../aisix-provider-vertex" }
+aisix-provider-azure-openai = { path = "../aisix-provider-azure-openai" }
 aisix-ratelimit = { path = "../aisix-ratelimit" }
 aisix-cache = { path = "../aisix-cache", features = ["redis"] }
 tokio.workspace = true
