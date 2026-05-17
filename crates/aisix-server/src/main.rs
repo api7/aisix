@@ -794,6 +794,15 @@ fn build_hub() -> Hub {
     // (D5). Registering it now lets the dispatch path light up the
     // moment cp-api starts shipping adapter strings, instead of
     // having the catalog be permanently inaccessible.
+    //
+    // CUTOVER CAUTION: cp-api today blocks `provider: "google-vertex"`
+    // at createProviderKey via `isSupportedProvider` (handlers.go).
+    // The moment that gate is loosened — which Phase B is actively
+    // enabling — every chat through a `google-vertex` provider_key
+    // will route here and hit this NOT-IMPLEMENTED skeleton, taking
+    // Gemini from "works via OpenAI-compat" to "500: not implemented"
+    // in a single cp-api flip. The cutover order MUST be:
+    //   D5.2 (Gemini dispatch) merge → cp-api flip catalog.
     hub.register_family(Adapter::Vertex, Arc::new(VertexBridge::new()));
 
     hub

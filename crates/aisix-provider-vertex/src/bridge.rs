@@ -74,21 +74,35 @@ impl VertexPublisher {
     /// clear `BridgeError::Config` so the operator can correct the
     /// model registration.
     ///
-    /// Recognized prefixes (case-insensitive on the model name itself,
-    /// not on the publisher tag):
+    /// Recognized prefixes (case-insensitive on the model name):
     ///
     /// - `gemini-*` → [`Self::Google`]
     /// - `claude-*` → [`Self::Anthropic`]
-    /// - `llama-*` → [`Self::Meta`]
+    /// - `meta/llama-*` / `llama*` (e.g. `llama3-405b-...`) →
+    ///   [`Self::Meta`] (per LiteLLM `vertex_ai_partner_models/main.py`
+    ///   META_PREFIX = "meta/" plus the bare `llama` family)
     /// - `mistral-*` / `codestral-*` → [`Self::Mistral`]
     /// - `jamba-*` → [`Self::Ai21`]
+    ///
+    /// Publishers known to LiteLLM but not yet handled here (filed for
+    /// follow-up): `deepseek-ai/*`, `qwen*`, `openai/gpt-oss-*`,
+    /// `minimaxai/*`, `moonshotai/*`, `zai-org/*`. The current
+    /// implementation surfaces "publisher unknown" for these — an
+    /// operator hitting them gets a clear error before any traffic
+    /// reaches Vertex.
     pub fn from_upstream_id(upstream_id: &str) -> Option<Self> {
         let lower = upstream_id.to_ascii_lowercase();
         if lower.starts_with("gemini-") {
             Some(Self::Google)
         } else if lower.starts_with("claude-") {
             Some(Self::Anthropic)
-        } else if lower.starts_with("llama-") {
+        } else if lower.starts_with("meta/") || lower.starts_with("llama") {
+            // Both `meta/llama-3.3-70b-instruct-maas` and the bare
+            // `llama3-405b-instruct-maas` form occur on real Vertex
+            // deployments (per LiteLLM `vertex_ai_partner_models/
+            // main.py:33-34`). The bare-llama branch deliberately
+            // does NOT require a trailing hyphen — `llama3-...`
+            // would miss otherwise.
             Some(Self::Meta)
         } else if lower.starts_with("mistral-") || lower.starts_with("codestral-") {
             Some(Self::Mistral)
@@ -99,16 +113,25 @@ impl VertexPublisher {
         }
     }
 
-    /// The `publishers/<tag>` URL segment Vertex expects. Used by the
-    /// follow-up dispatch PR when building per-publisher endpoint URLs.
-    pub fn url_segment(self) -> &'static str {
-        match self {
+    /// The `publishers/<tag>` URL segment Vertex expects on the
+    /// `:streamRawPredict` and `:rawPredict` request paths. Used by
+    /// the follow-up dispatch PR when building per-publisher endpoint
+    /// URLs.
+    ///
+    /// **Returns `None` for [`Self::Meta`]** — Llama on Vertex does
+    /// NOT use a `publishers/meta/...` URL. LiteLLM routes Llama
+    /// through an OpenAPI shim at `endpoints/openapi/chat/completions`
+    /// instead (see `litellm/llms/vertex_ai/vertex_llm_base.py:277`).
+    /// A future D5.4 (Meta dispatch) builds that URL separately rather
+    /// than via this helper.
+    pub fn url_segment(self) -> Option<&'static str> {
+        Some(match self {
             Self::Google => "publishers/google",
             Self::Anthropic => "publishers/anthropic",
-            Self::Meta => "publishers/meta",
             Self::Mistral => "publishers/mistralai",
             Self::Ai21 => "publishers/ai21",
-        }
+            Self::Meta => return None,
+        })
     }
 }
 
@@ -196,8 +219,17 @@ mod tests {
 
     #[test]
     fn publisher_resolves_meta_mistral_ai21_prefixes() {
+        // Both wire forms occur on real Vertex deployments:
+        //   - `meta/llama-3.3-70b-instruct-maas` (META_PREFIX in
+        //     LiteLLM vertex_ai_partner_models/main.py)
+        //   - `llama3-405b-instruct-maas` (bare-llama form, no
+        //     trailing hyphen between "llama" and the version)
         assert_eq!(
-            VertexPublisher::from_upstream_id("llama-3-70b-instruct-maas"),
+            VertexPublisher::from_upstream_id("meta/llama-3.3-70b-instruct-maas"),
+            Some(VertexPublisher::Meta),
+        );
+        assert_eq!(
+            VertexPublisher::from_upstream_id("llama3-405b-instruct-maas"),
             Some(VertexPublisher::Meta),
         );
         assert_eq!(
@@ -236,19 +268,32 @@ mod tests {
     fn publisher_url_segment_matches_vertex_api_path() {
         // Tight pin on the URL fragment Vertex expects — a typo here
         // would surface as a 404 from every Vertex dispatch.
-        assert_eq!(VertexPublisher::Google.url_segment(), "publishers/google");
+        assert_eq!(
+            VertexPublisher::Google.url_segment(),
+            Some("publishers/google"),
+        );
         assert_eq!(
             VertexPublisher::Anthropic.url_segment(),
-            "publishers/anthropic",
+            Some("publishers/anthropic"),
         );
-        assert_eq!(VertexPublisher::Meta.url_segment(), "publishers/meta");
         // Mistral's Vertex publisher tag is `mistralai`, not `mistral`
         // — Google's catalog convention.
         assert_eq!(
             VertexPublisher::Mistral.url_segment(),
-            "publishers/mistralai",
+            Some("publishers/mistralai"),
         );
-        assert_eq!(VertexPublisher::Ai21.url_segment(), "publishers/ai21");
+        assert_eq!(VertexPublisher::Ai21.url_segment(), Some("publishers/ai21"));
+    }
+
+    #[test]
+    fn publisher_url_segment_meta_is_none() {
+        // Llama on Vertex does NOT use `publishers/meta/...` —
+        // LiteLLM routes through `endpoints/openapi/chat/completions`
+        // (see vertex_llm_base.py:277). Pinning `None` here so a
+        // future dispatch PR can rely on the helper's signal and
+        // build the OpenAPI-shim URL separately for Meta instead of
+        // synthesizing a 404-producing path.
+        assert_eq!(VertexPublisher::Meta.url_segment(), None);
     }
 
     #[test]
