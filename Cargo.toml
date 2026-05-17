@@ -100,11 +100,6 @@ sha2 = "0.10"
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 hex = "0.4"
 
-# OpenAPI
-utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
-utoipa-axum = "0.1"
-utoipa-scalar = { version = "0.2", features = ["axum"] }
-
 # Caching / storage backends
 moka = { version = "0.12", features = ["future"] }
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "cluster-async"] }
