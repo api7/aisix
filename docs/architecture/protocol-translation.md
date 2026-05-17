@@ -39,7 +39,7 @@ flowchart LR
   handler --> resolve[Resolve Model<br/>via snapshot]
   resolve --> branch{model.provider<br/>== Anthropic?}
 
-  branch -->|yes| pass[Byte-passthrough<br/>messages.rs:188-318]
+  branch -->|yes| pass[Byte-passthrough<br/>messages.rs:189-349]
   branch -->|no| cross[cross_provider_dispatch<br/>messages.rs:405]
 
   pass -->|reqwest bytes_stream| upstream_a[(Anthropic<br/>/v1/messages)]
@@ -304,17 +304,24 @@ we've already emitted `message_start`, returning a regular JSON
 error response is no longer an option — the client is in
 streaming mode, the connection is reused. The cross-provider
 stream emits a proper error event
-([`messages.rs:556-563`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L556)):
+([`messages.rs:555-563`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L555-L563)):
 
 ```rust
-yield Ok(Bytes::from(format!(
-    "event: error\ndata: {{\"type\":\"error\",\
-     \"error\":{{\"type\":\"{}\",\"message\":\"{}\"}}}}\n\n",
+let frame = format!(
+    "event: error\ndata: {{\"type\":\"error\",\"error\":{{\
+     \"type\":\"{}\",\"message\":{}}}}}\n\n",
     e.error_type(),
-    e.to_string(),
-)));
+    serde_json::to_string(&e.to_string())
+        .unwrap_or_else(|_| "\"error\"".into()),
+);
+yield Ok(bytes::Bytes::from(frame));
 return;
 ```
+
+The `message` field is run through `serde_json::to_string` so an
+upstream error message containing quotes or control characters
+serialises into valid JSON; the fallback `"error"` literal kicks
+in only if the message itself fails to encode.
 
 The body shape mirrors Anthropic's own error envelope; SDKs that
 recognise `event: error` will surface the message via the same
@@ -359,16 +366,25 @@ of upstream 401s.
 
 **Inbound (upstream Anthropic → client):**
 
-- `content-type` — copied from upstream (typically
-  `text/event-stream` for streaming, `application/json` otherwise)
-- `cache-control: no-cache` — set so intermediaries cannot serve
-  a stale streaming response
-- `x-aisix-call-id` — set on the outbound response so customers
-  can correlate
+- *Streaming path* ([`messages.rs:283-301`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L283-L301)):
+  - `content-type` — copied from upstream (typically
+    `text/event-stream`)
+  - `cache-control: no-cache` — set explicitly so intermediaries
+    cannot serve a stale streaming response
+  - `x-aisix-request-id` — set on the outbound response so
+    customers can correlate
+- *Non-streaming path* ([`messages.rs:344-348`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L344-L348)):
+  the response is rebuilt via `Json(...).into_response()`, which
+  produces a fresh response with `content-type: application/json`
+  and **no** upstream headers attached.
 
-The byte-passthrough path leaves Anthropic-specific response
-headers (`anthropic-ratelimit-*`, `request-id`) alone, which is
-deliberate — they're useful and the Anthropic SDK reads them.
+A real consequence of the current implementation:
+Anthropic-specific response headers like `anthropic-ratelimit-*`
+and `request-id` are **not** propagated to the client on either
+path today. The Anthropic SDK reads these for back-pressure /
+correlation, so this is an observable gap, not a deliberate
+omission; forwarding them on both paths is tracked in
+[issue #318](https://github.com/api7/ai-gateway/issues/318).
 
 ## Test coverage
 
