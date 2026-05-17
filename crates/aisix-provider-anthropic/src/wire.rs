@@ -28,10 +28,10 @@ use serde::{Deserialize, Serialize};
 /// Anthropic requires a non-zero `max_tokens`. Clients that omit it get
 /// this ceiling — generous enough to cover normal completions, conservative
 /// enough that a runaway prompt doesn't burn tokens silently.
-pub(crate) const DEFAULT_MAX_TOKENS: u32 = 4096;
+pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct AnthropicRequest<'a> {
+pub struct AnthropicRequest<'a> {
     pub model: &'a str,
     pub messages: Vec<AnthropicMessage<'a>>,
     pub max_tokens: u32,
@@ -71,7 +71,7 @@ pub(crate) struct AnthropicRequest<'a> {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct AnthropicMessage<'a> {
+pub struct AnthropicMessage<'a> {
     pub role: &'a str,
     /// Polymorphic content blocks — text and `tool_result` blocks
     /// emit different shapes per
@@ -128,7 +128,7 @@ pub enum TranslateError {
 /// [{type:"tool_result", tool_use_id, content}]}` shape per
 /// <https://docs.anthropic.com/en/api/messages> so agent-loop turn 2
 /// (caller sends the tool's output back to the model) round-trips.
-pub(crate) fn split_system<'a>(
+pub fn split_system<'a>(
     req: &'a ChatFormat,
 ) -> Result<(Option<String>, Vec<AnthropicMessage<'a>>), TranslateError> {
     let mut system_parts: Vec<&'a str> = Vec::new();
@@ -174,7 +174,7 @@ pub(crate) fn split_system<'a>(
     Ok((system, messages))
 }
 
-pub(crate) fn build_request<'a>(
+pub fn build_request<'a>(
     req: &'a ChatFormat,
     upstream_model: &'a str,
     system: Option<String>,
@@ -224,7 +224,7 @@ pub(crate) fn build_request<'a>(
 /// when the input isn't an array or when no entries translated —
 /// keeping the field absent from the upstream wire shape so
 /// Anthropic doesn't reject for empty-tools.
-pub(crate) fn translate_openai_tools_to_anthropic(
+pub fn translate_openai_tools_to_anthropic(
     tools: serde_json::Value,
 ) -> Option<Vec<serde_json::Value>> {
     let arr = tools.as_array()?;
@@ -271,7 +271,7 @@ pub(crate) fn translate_openai_tools_to_anthropic(
 /// Returns None for unrecognised shapes — caller's value is discarded
 /// rather than forwarded verbatim, since the OpenAI shape would 400
 /// the Anthropic upstream.
-pub(crate) fn translate_openai_tool_choice_to_anthropic(
+pub fn translate_openai_tool_choice_to_anthropic(
     v: serde_json::Value,
 ) -> Option<serde_json::Value> {
     match v {
@@ -361,7 +361,7 @@ pub fn translate_anthropic_tool_choice_to_openai(
 
 /// Non-streaming response shape from `/v1/messages`.
 #[derive(Debug, Deserialize)]
-pub(crate) struct AnthropicResponse {
+pub struct AnthropicResponse {
     pub id: String,
     pub model: String,
     #[serde(default)]
@@ -374,7 +374,7 @@ pub(crate) struct AnthropicResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
-pub(crate) enum AnthropicResponseBlock {
+pub enum AnthropicResponseBlock {
     #[serde(rename = "text")]
     Text { text: String },
     /// Anthropic's `tool_use` content block. The model is asking to
@@ -401,7 +401,7 @@ pub(crate) enum AnthropicResponseBlock {
 }
 
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct AnthropicUsage {
+pub struct AnthropicUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
     /// Tokens written to the prompt cache (1.25× input rate). Optional
@@ -413,7 +413,7 @@ pub(crate) struct AnthropicUsage {
     pub cache_read_input_tokens: u32,
 }
 
-pub(crate) fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
+pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
     let text = raw
         .content
         .iter()
@@ -516,7 +516,7 @@ fn map_stop_reason(raw: Option<&str>) -> FinishReason {
 /// quietly dropped by the Bridge.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
-pub(crate) enum AnthropicStreamEvent {
+pub enum AnthropicStreamEvent {
     #[serde(rename = "message_start")]
     MessageStart {
         message: AnthropicStreamStartMessage,
@@ -538,14 +538,14 @@ pub(crate) enum AnthropicStreamEvent {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct AnthropicStreamStartMessage {
+pub struct AnthropicStreamStartMessage {
     pub id: String,
     pub model: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
-pub(crate) enum AnthropicStreamDelta {
+pub enum AnthropicStreamDelta {
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
     #[serde(other)]
@@ -553,13 +553,13 @@ pub(crate) enum AnthropicStreamDelta {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct AnthropicStreamMessageDelta {
+pub struct AnthropicStreamMessageDelta {
     #[serde(default)]
     pub stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct AnthropicStreamUsage {
+pub struct AnthropicStreamUsage {
     #[serde(default)]
     pub output_tokens: Option<u32>,
 }
@@ -568,7 +568,7 @@ pub(crate) struct AnthropicStreamUsage {
 /// tagged with the message id/model even though only the first event
 /// carries them.
 #[derive(Debug, Default)]
-pub(crate) struct StreamState {
+pub struct StreamState {
     pub id: String,
     pub model: String,
 }

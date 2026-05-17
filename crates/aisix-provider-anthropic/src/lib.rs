@@ -13,7 +13,7 @@
 #![deny(rust_2018_idioms)]
 
 mod bridge;
-mod wire;
+pub mod wire;
 
 pub use bridge::{AnthropicBridge, ANTHROPIC_DEFAULT_BASE, ANTHROPIC_VERSION};
 
