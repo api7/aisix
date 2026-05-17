@@ -9,6 +9,23 @@
 //! 2. deserialisation is strict where *we* read it (responses), loose
 //!    where *they* read it (requests) — i.e. we accept extra fields
 //!    from upstream but don't invent params.
+//!
+//! # Public surface
+//!
+//! The request/response/stream-chunk types and their conversion helpers
+//! are `pub` (not `pub(crate)`) because **sibling provider crates** in
+//! this workspace reuse them — Azure OpenAI Service's wire shape is
+//! literally OpenAI chat-completions, so the
+//! [`aisix-provider-azure-openai`](crate::aisix_provider_azure_openai)
+//! crate parses Azure responses through these same types (Azure's
+//! `prompt_filter_results` / `content_filter_results` extensions pass
+//! through because none of the types set `deny_unknown_fields`). Future
+//! OpenAI-compatible bridges (additional self-hosted endpoints, etc.)
+//! follow the same pattern. The visibility is **not a public-SDK
+//! stability promise**; it's an internal workspace contract. Embedding
+//! types stay `pub(crate)` because they're scoped to
+//! [`OpenAiBridge`](crate::OpenAiBridge) only until a sibling crate
+//! needs them.
 
 use aisix_gateway::{
     ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest,
