@@ -83,6 +83,7 @@ policy-scope tuple) owns one `KeyState`
 ([`limiter.rs:32-50`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/limiter.rs#L32)):
 
 ```rust
+// Source has bare fields; the trailing comments are this page's gloss.
 struct KeyState {
     rpm: FixedWindowCounter,    // 60s window, incremented in phase 1
     rpd: FixedWindowCounter,    // 86400s window, incremented in phase 1
@@ -214,7 +215,7 @@ Three things happen atomically under the per-key mutex:
 - `committed = true` so the `Drop` impl doesn't double-release.
 
 The non-streaming chat handler calls this directly
-([`crates/aisix-proxy/src/chat.rs:903`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/chat.rs#L903))
+([`crates/aisix-proxy/src/chat.rs:906`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/chat.rs#L906))
 with the upstream's reported `total_tokens`. The streaming path
 is different — it's the subject of [the next section](#streaming-the-deferred-phase-2).
 
@@ -269,7 +270,7 @@ splits phase 2 into two halves:
 
 1. **Immediately after upstream `chat_stream` succeeds**, capture
    the layer keys and **drop** the reservation
-   ([`chat.rs:535-539`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/chat.rs#L535)):
+   ([`chat.rs:536-537`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/chat.rs#L536-L537)):
 
    ```rust
    let post_stream_keys = reservation.keys();
@@ -282,7 +283,7 @@ splits phase 2 into two halves:
 2. **When the SSE stream terminates upstream** — i.e. the
    completion callback fires with the parsed usage block — the
    handler retroactively accounts for the tokens
-   ([`chat.rs:578-581`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/chat.rs#L578)):
+   ([`chat.rs:577-579`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/chat.rs#L577-L579)):
 
    ```rust
    for key in &post_stream_keys {
@@ -293,8 +294,9 @@ splits phase 2 into two halves:
    `add_tokens_post_stream`
    ([`limiter.rs:147-156`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/limiter.rs#L147))
    is a tokens-only update that lazily initialises the per-key
-   state if it has been evicted, and is a no-op when `tokens ==
-   0` (an empty stream doesn't pollute the table).
+   state if it has not been seen yet (e.g. first request after a
+   restart), and is a no-op when `tokens == 0` (an empty stream
+   doesn't pollute the table).
 
 ### Why this exists: issue #108
 
@@ -372,28 +374,36 @@ calendar boundary.
 
 Every successful chat response gets `x-ratelimit-*` headers
 populated by `inject_ratelimit_headers`
-([`crates/aisix-proxy/src/render.rs:132-185`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/render.rs#L132)),
+([`crates/aisix-proxy/src/render.rs:145-192`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/render.rs#L145-L192)),
 called from the handler
-([`chat.rs:144-146`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/chat.rs#L144))
+([`chat.rs:144-146`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/chat.rs#L144-L146))
 *after* `commit_tokens` so the counters reflect the just-completed
 request:
 
 ```
 x-ratelimit-limit-requests:       N
 x-ratelimit-remaining-requests:   N - used
-x-ratelimit-reset-requests:       <seconds until next minute>
+x-ratelimit-reset-requests:       <seconds until next minute>s   # e.g. 47s
 x-ratelimit-limit-tokens:         N
 x-ratelimit-remaining-tokens:     N - used
-x-ratelimit-reset-tokens:         <seconds until next minute>
-x-ratelimit-limit-concurrent:     N
-x-ratelimit-remaining-concurrent: N - in_flight
+x-ratelimit-reset-tokens:         <seconds until next minute>s   # e.g. 47s
+x-ratelimit-limit-concurrent:     N                              # gateway extension
+x-ratelimit-remaining-concurrent: N - in_flight                  # gateway extension
 ```
 
-The header names follow OpenAI's documented convention so that
-OpenAI-SDK clients (which already parse these) get rate-limit
-visibility without code changes. Only headers whose corresponding
-limit is configured (non-`None`) are emitted; unconfigured limits
-stay absent rather than emitting an `Inf` sentinel.
+The `requests`, `tokens`, and `reset-*` headers follow OpenAI's
+documented convention so OpenAI-SDK clients (which already parse
+these) get rate-limit visibility without code changes. The
+`concurrent` headers are a gateway-specific extension in the same
+`x-ratelimit-*` namespace — OpenAI does not define a concurrency
+header — added so the same SDK code path that watches the request
+budget can also see in-flight slots. The reset values carry an
+`s` suffix on the wire (`"47s"`, not `"47"`); the `format!("{}s",
+…)` is in
+[`render.rs:169`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/render.rs#L169).
+Only headers whose corresponding limit is configured (non-`None`)
+are emitted; unconfigured limits stay absent rather than emitting
+an `Inf` sentinel.
 
 `Limiter::peek`
 ([`limiter.rs:107-131`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/limiter.rs#L107))
@@ -487,10 +497,10 @@ End-to-end isolation across callers is verified in
 - **[Snapshot and Watch](snapshot-and-watch.md)** — the
   `RateLimit` and `RateLimitPolicy` configuration on the
   snapshot that every `pre_commit` call reads from.
-- **[Protocol Translation](protocol-translation.md)** — how the
-  streaming TPM completion fires from the SSE terminal chunk
-  regardless of the upstream's native protocol.
+- A sibling page, `protocol-translation.md` (forthcoming), covers
+  how the streaming TPM completion fires from the SSE terminal
+  chunk regardless of the upstream's native protocol.
 - OpenAI's
   [rate-limit headers spec](https://platform.openai.com/docs/guides/rate-limits)
-  — the header naming convention `inject_ratelimit_headers`
-  follows.
+  — the request/token/reset header naming convention that
+  `inject_ratelimit_headers` follows.
