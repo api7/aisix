@@ -55,23 +55,28 @@ talks to etcd; nothing else takes a lock.
 
 ## Read path: one atomic Acquire load
 
-Inside a chat handler, the model lookup is literally three lines
-([`crates/aisix-proxy/src/models.rs:57`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/models.rs#L57)):
+The hot path is the chat-completions handler. The model lookup at
+the top of the request is the canonical shape every other
+snapshot-using handler follows
+([`crates/aisix-proxy/src/chat.rs:387`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/chat.rs#L387)):
 
 ```rust
-let snapshot = state.snapshot.load();          // Arc<AisixSnapshot>, atomic
-let model    = snapshot.models.get_by_name(name)?;
-// snapshot stays live for the rest of the request, even if a
+let snapshot = state.snapshot.load();
+let virtual_entry = snapshot
+    .models
+    .get_by_name(&req.model)
+    .ok_or_else(|| (None, None, ProxyError::ModelNotFound(req.model.clone())))?;
+// `snapshot` stays live for the rest of the request, even if a
 // concurrent supervisor apply has already replaced the handle's
 // pointer with a new snapshot — Arc keeps the old one alive
 // until this handler drops it.
 ```
 
-`load()` is a single `Ordering::Acquire` load on the underlying
-`ArcSwap<S>` ([`snapshot.rs:145`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-core/src/snapshot.rs#L145)).
-No spin, no fence, no memory allocator call. On x86 it compiles
-down to a single `MOV` plus the Arc refcount bump (one
-`fetch_add(1, Relaxed)`).
+`load()` returns a fresh `Arc<S>` without taking any lock
+([`snapshot.rs:145`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-core/src/snapshot.rs#L145)
+delegates to [`ArcSwap::load_full`](https://docs.rs/arc-swap/latest/arc_swap/struct.ArcSwapAny.html#method.load_full),
+which uses a hybrid hazard-pointer scheme to publish the read
+without blocking writers or other readers).
 
 The `Arc<AisixSnapshot>` the handler holds is *immutable* for its
 lifetime. The supervisor cannot mutate a snapshot a handler is
@@ -87,14 +92,14 @@ everything ArcSwap was chosen to avoid:
 
 | Property | `Arc<RwLock<S>>` | `ArcSwap<S>` |
 |---|---|---|
-| Read cost | uncontended: ~30ns CAS pair; contended: kernel wait | one Acquire load + one Arc refcount bump |
+| Read cost | uncontended: atomic CAS pair; contended: blocks on writer (and kernel-wait under contention) | atomic load, no blocking |
 | Writer starvation | possible (constant readers) | impossible (writer publishes asynchronously) |
 | Holding a read past an `await` | requires `RwLockReadGuard` to be `Send` and not crossing yields | trivial: `Arc<S>` is `Send + Sync` |
 | Memory while writers active | one copy | two copies briefly (old reader-held + new published) |
 
 The Arc refcount bump on every read is the cost paid for the
-write-side wins. At our scale (~1k–10k req/s per DP node), this is
-a non-event compared to the request body parse.
+write-side wins. It is dominated by the request body parse and
+upstream TLS handshake on any realistic workload.
 
 ArcSwap also makes the writer side simpler: the supervisor doesn't
 need to coordinate with readers, doesn't wait for any reader to
@@ -127,7 +132,7 @@ sequenceDiagram
     Note over h: DP can serve immediately
   end
 
-  sup->>etcd: connect (5s × 5)
+  sup->>etcd: connect (ExpBackoff 1s→60s on failure)
   sup->>etcd: load_all(prefix)
   etcd-->>sup: revision R0, entries
   sup->>ldr: build_snapshot(entries)
@@ -158,8 +163,9 @@ Three apply paths, all going through the same `SnapshotHandle`:
   — builds a tiny one-entry snapshot via the loader (which runs the
   same schema + parse the bootstrap path uses), then merges into a
   fresh clone of the current snapshot. Schema-rejected entries
-  never reach the live snapshot; they're routed to `dpmgr_rejected_resources`
-  via the heartbeat path so cp-api can surface them in the dashboard.
+  never reach the live snapshot; they surface as
+  [`rejected_resources`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-server/src/heartbeat.rs#L181)
+  on the next heartbeat so cp-api can show them in the dashboard.
 - **`apply_delete`** ([`supervisor.rs:399`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs#L399))
   — clones the current snapshot, removes the entry from the right
   `ResourceTable`, publishes.
@@ -185,9 +191,9 @@ holds `Arc<ResourceEntry<T>>` — the per-entry `Arc` count gets
 bumped, but the entry payload (Model, ApiKey, etc.) is never
 duplicated. For a typical org with 50 models, 200 api_keys, 10
 provider_keys, the per-apply allocation is dominated by the two
-`DashMap` shards' worth of pointer-bumps. We've measured ~30µs for
-a steady-state clone on a 1k-entry snapshot — under the latency
-floor of any LLM upstream call.
+`DashMap` shards' worth of pointer-bumps. At typical configuration
+sizes the clone completes well under the latency floor of any LLM
+upstream call; the supervisor task is never on the hot path.
 
 ### Why RCU, not load-mutate-store
 
@@ -237,9 +243,15 @@ kind here means the watch path silently drops events of that kind
 even though the loader and the proxy both know about them. The
 test `all_three_tables_are_independent`
 ([`models/snapshot.rs:88`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-core/src/models/snapshot.rs#L88))
-covers the "table count is what we expect" invariant; adding a new
-resource kind is a three-place change (model struct, snapshot
-field, merge loop) and the test catches the third.
+gives a sanity check that the three foundational tables (models,
+api_keys, provider_keys) stay shard-independent; it does **not**
+cover the newer tables (guardrails, cache_policies,
+observability_exporters, rate_limit_policies). Adding a new
+resource kind is still a three-place change (model struct,
+snapshot field, merge loop) — reviewers should treat the merge-loop
+hop as the easy-to-miss step and verify by hand. A 7-table
+invariant test that catches a missing merge entry is filed as a
+follow-up.
 
 ## Per-kind `ResourceTable` and the dual index
 
@@ -287,19 +299,23 @@ overwriting.
 The supervisor's watch stream stays open; events stop arriving.
 The DP keeps serving from the last published snapshot. `WatchStatus`
 ([`supervisor.rs:46`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs#L46))
-exposes `last_apply_age` to `/admin/v1/health`, so operators see
-the freshness gap. The cache file on disk is the same data the
-in-memory snapshot reflects, so even a DP restart during partition
-boots into the cached state and keeps serving.
+exposes the apply age (serialised as `snapshot_age_seconds` on the
+wire — see
+[`health_handler.rs:63`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-admin/src/health_handler.rs#L63))
+to `/admin/v1/health`, so operators see the freshness gap. The
+cache file on disk is the same data the in-memory snapshot
+reflects, so even a DP restart during partition boots into the
+cached state and keeps serving.
 
 ### etcd compaction
 
 If the supervisor reconnects after being away long enough for etcd
 to compact the watch revision, the watch returns a `Compacted`
-event. The supervisor responds with a full `load_all` resync
-([`supervisor.rs:485`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs#L485))
-and uses `store()` to wholesale-replace the snapshot. The
-revision counter resets to the new etcd revision.
+event. The supervisor responds by restarting its cycle — calling
+`load_all` ([`supervisor.rs:593`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs#L593))
+and then `apply_resync` ([`supervisor.rs:485`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs#L485))
+to wholesale-replace the snapshot via `store()`. The revision
+counter resets to the new etcd revision.
 
 ### Transport failure / reconnect
 
@@ -329,22 +345,25 @@ load is roughly:
 mem ≈ size_of(snapshot) × (1 + ⌈in-flight requests / new-snapshot interval⌉)
 ```
 
-For a typical config (1k entries × ~1KB per entry = 1MB snapshot)
-and 500 concurrent requests with a new snapshot every 10ms, you'd
-see ~50 snapshots pinned briefly. That's 50MB of transient memory
-— invisible against the DP's per-request buffers and HTTP/2 pool.
+Pinned snapshots get reclaimed as in-flight requests finish. In
+the steady state the holdover is bounded by how many publishes
+happen during the lifetime of an outstanding request — etcd writes
+are operator-driven, not request-driven, so real-world write rates
+are sub-Hz and the holdover collapses to one or two snapshots.
 
-In a runaway scenario (etcd writes per second exceeds request
-duration), the holdover could grow. We've never observed this in
-practice — etcd writes are operator-driven, not request-driven, so
-real-world write rates are sub-Hz.
+In a runaway scenario (publishes faster than request duration),
+the holdover could grow until the slowest in-flight reader
+returns. We have not observed this in practice; if it ever
+materialises, the supervisor's apply rate is the operator-visible
+lever to throttle.
 
 ## Operational observability
 
 Three things to look at when the DP seems stale:
 
-1. **`/admin/v1/health`** surfaces `last_apply_age` from
-   `WatchStatus` ([`supervisor.rs:82`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs#L82)).
+1. **`/admin/v1/health`** surfaces `snapshot_age_seconds` derived
+   from `WatchStatus::snapshot()`
+   ([`supervisor.rs:93`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs#L93)).
    A non-trivial age (minutes) means the supervisor isn't getting
    events.
 2. **`/admin/openapi.json`** does *not* include this; it's a
@@ -354,10 +373,10 @@ Three things to look at when the DP seems stale:
    process and inspect the file, you can see exactly which etcd
    state it would resume from.
 
-For an automated alert, plot `(now - last_apply_age)` and alert
-when it exceeds the expected control-plane write quiet period. The
-supervisor also logs every event apply at info level when
-`access_log` is enabled.
+For an automated alert, scrape `snapshot_age_seconds` from
+`/admin/v1/health` and alert when it exceeds the expected
+control-plane write quiet period. The supervisor also logs every
+event apply at info level when `access_log` is enabled.
 
 ## What this design does not do
 
@@ -375,8 +394,8 @@ supervisor also logs every event apply at info level when
   schema fails ⇒ entry rejected ⇒ never enters the snapshot. The
   proxy never sees a half-valid Model with a missing field. The
   rejected entry surfaces through the
-  [`rejected_resources`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs#L320)
-  channel to cp-api.
+  [`rejected_resources`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-server/src/heartbeat.rs#L181)
+  field of the heartbeat payload to cp-api.
 
 ## Further reading
 
