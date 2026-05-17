@@ -401,7 +401,12 @@ const RESOURCE_SCHEMAS: &[(&str, &str)] = &[
 /// Build the merged OpenAPI document on first call and cache for the
 /// process lifetime. The result is what `GET /admin/openapi.json`
 /// serves; the constants above hold only the input fragments.
-fn merged_openapi() -> &'static str {
+///
+/// `pub(crate)` so [`crate::build_router`] can pre-warm it at startup
+/// — `OnceLock::get_or_init` panics here would otherwise surface only
+/// on the first `/admin/openapi.json` request, well after boot, which
+/// is a worse ops failure mode than crashing immediately.
+pub(crate) fn merged_openapi() -> &'static str {
     static CELL: OnceLock<String> = OnceLock::new();
     CELL.get_or_init(|| {
         let mut doc: Value =

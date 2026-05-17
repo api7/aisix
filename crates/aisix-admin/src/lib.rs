@@ -57,6 +57,12 @@ use axum::routing::{get, post};
 use axum::{http::StatusCode, response::Response, Router};
 
 pub fn build_router(state: AdminState) -> Router {
+    // Eagerly build the merged OpenAPI doc so any panic in schema
+    // parsing surfaces at boot, not at first `/admin/openapi.json`
+    // request. `merged_openapi` caches into an `OnceLock`; the
+    // subsequent handler call is a free lookup.
+    let _ = openapi::merged_openapi();
+
     Router::new()
         .route("/livez", get(livez))
         .route("/metrics", get(metrics_handler))
