@@ -1,28 +1,28 @@
 //! aisix-provider-azure-openai — Azure OpenAI Service provider bridge.
 //!
-//! **Skeleton crate** for issue #302 Phase F. Registers as the family
-//! bridge for [`Adapter::AzureOpenai`] in the gateway Hub. The actual
-//! deployment-keyed dispatch is TODO and filled by follow-up PRs:
+//! Family bridge for [`Adapter::AzureOpenai`] in the gateway Hub.
 //!
-//! - [ ] D6.1 — `api-key` header auth (NOT `Authorization: Bearer`)
-//! - [ ] D6.2 — Azure URL pattern:
+//! ## Status (issue #302 Phase F)
+//!
+//! - [x] D6.1 — `api-key` header auth (NOT `Authorization: Bearer`)
+//! - [x] D6.2 — Azure URL pattern:
 //!   `https://<resource>.openai.azure.com/openai/deployments/<deployment>/chat/completions?api-version=<version>`
-//! - [ ] D6.3 — `upstream_id` parsing as `<deployment-name>` rather
-//!   than OpenAI model id (e.g. customer's deployment "prod-gpt4o" maps
-//!   to whichever underlying OpenAI model their Azure tenancy
-//!   provisioned)
-//! - [ ] D6.4 — `api_version` parameter handling (Azure pins it via
-//!   query string; the cp-api side ships it in `provider_key.api_base`
-//!   or a dedicated field)
-//! - [ ] D6.5 — Content filter response: Azure injects
-//!   `prompt_filter_results` / `content_filter_results` into responses;
-//!   the bridge must surface these without confusing the OpenAI-shape
-//!   translation
-//!
-//! For now the bridge's `chat()` / `chat_stream()` return a clear
-//! `BridgeError::Config(...)` so a misconfigured `provider: "azure"`
-//! row in the kine catalog surfaces a 501 / 502 with an actionable
-//! message rather than silently dropping the dispatch.
+//! - [x] D6.3 — Deployment-keyed dispatch from `Model.model_name`
+//!   (operator-pinned deployment name, NOT the customer-facing
+//!   display name in `req.model`)
+//! - [x] D6.5 — Content-filter response tolerance: Azure adds
+//!   `prompt_filter_results` / `content_filter_results` to the OpenAI
+//!   chat-completions response. The reused `OpenAiResponse` /
+//!   `OpenAiStreamChunk` parsers ignore unknown fields by default
+//!   (no `deny_unknown_fields`), so the extension passes through
+//!   without breaking decoding.
+//! - [ ] D6.4 — Per-PK `api_version` override. Today the bridge pins
+//!   `AzureUpstreamRef::DEFAULT_API_VERSION` (GA). Follow-up will
+//!   accept an explicit version from `provider_key.api_base` query
+//!   string or a dedicated PK field.
+//! - [ ] D6.6 — AAD Bearer auth as a second auth scheme. Today the
+//!   bridge supports api-key only (the common case). AAD support will
+//!   land alongside the cp-api `auth_scheme` field becoming routable.
 //!
 //! # Why Azure-OpenAI is a separate bridge (not OpenAiBridge::with_name)
 //!
@@ -43,8 +43,7 @@
 //!    The bridge needs to either pass them through or strip them.
 //!
 //! These are exactly the cases #302 §3 carves a separate
-//! [`Adapter::AzureOpenai`] for. See LiteLLM `azure/`:
-//! <https://github.com/BerriAI/litellm/tree/main/litellm/llms/azure>.
+//! [`Adapter::AzureOpenai`] for.
 //!
 //! # References
 //!
@@ -54,8 +53,10 @@
 //!   <https://learn.microsoft.com/en-us/azure/ai-services/openai/api-version-deprecation>
 //! - Content filtering response fields —
 //!   <https://learn.microsoft.com/en-us/azure/ai-services/openai/concepts/content-filter>
-//! - LiteLLM `azure/` reference impl —
-//!   <https://github.com/BerriAI/litellm/tree/main/litellm/llms/azure>
+//! - Azure OpenAI Python SDK (canonical wire-shape reference for
+//!   request building, streaming chunk parsing, and content-filter
+//!   field handling) —
+//!   <https://github.com/openai/openai-python/blob/main/src/openai/lib/azure.py>
 
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]

@@ -13,6 +13,6 @@
 
 mod bridge;
 pub mod overrides;
-mod wire;
+pub mod wire;
 
 pub use bridge::{OpenAiBridge, OPENAI_DEFAULT_BASE};

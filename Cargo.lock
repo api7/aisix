@@ -219,11 +219,19 @@ version = "0.1.0"
 dependencies = [
  "aisix-core",
  "aisix-gateway",
+ "aisix-provider-openai",
+ "async-stream",
  "async-trait",
+ "bytes",
+ "futures",
+ "http 1.4.0",
+ "reqwest",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
