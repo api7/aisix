@@ -25,6 +25,30 @@ types (e.g. `Adapter`, `RoutingTarget`, `TelemetryTags`) live in the
 `definitions/` section of the parent resource — no cross-file `$ref` is
 emitted.
 
+File names use the snake_case singular form of the Rust type
+(`api_key.schema.json`, `provider_key.schema.json`). The corresponding
+etcd key prefix uses the plural `Resource::kind()` value
+(`api_keys`, `provider_keys`); the two naming conventions are
+deliberately distinct because the schema file is a per-type artifact
+while the etcd prefix groups a collection of instances.
+
+## Forward-compatibility
+
+Three top-level resources intentionally **omit**
+`additionalProperties: false`:
+
+- `guardrail.schema.json` — the discriminated-union `kind` field uses
+  serde's `flatten + tag` pattern, which is incompatible with a strict
+  outer deny; strict typo-rejection happens earlier via
+  `aisix-core::models::schema::validate_guardrail`.
+- `cache_policy.schema.json` — cp-api may ship forward-compat fields
+  ahead of a DP rollout, e.g. a new backend variant.
+- `observability_exporter.schema.json` — same forward-compat reason as
+  `cache_policy`.
+
+Downstream consumers that default to strict validation should permit
+unknown keys for these three resources; the other six are strict.
+
 ## Regenerating
 
 After modifying any resource struct in `crates/aisix-core/src/models/`,
