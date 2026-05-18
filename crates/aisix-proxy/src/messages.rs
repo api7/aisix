@@ -66,15 +66,31 @@ pub async fn messages(
     };
     let Json(mut body) = match body {
         Ok(j) => j,
-        Err(_rej) => {
-            // Audit MEDIUM-1: `JsonRejection::body_text()` carries
-            // axum's internal phrasing (`"Failed to deserialize the
-            // JSON body into the target type: …"`); replacing with
-            // a stable, customer-friendly phrase avoids future
-            // axum-version drift from leaking implementation
-            // details into the Anthropic envelope.
-            return ProxyError::InvalidRequest("invalid JSON request body".into())
-                .into_anthropic_response();
+        Err(rej) => {
+            use axum::extract::rejection::JsonRejection;
+            // Audit MEDIUM-1: replace `JsonRejection::body_text()`
+            // with stable customer-friendly phrases — axum's internal
+            // wording could drift between releases and silently leak
+            // into the customer-facing envelope.
+            //
+            // Audit MEDIUM-A (3rd audit): discriminate
+            // `BytesRejection` (DefaultBodyLimit fired during read)
+            // from JSON parse errors. Chunked oversize-body callers
+            // (no Content-Length, so `enforce_request_body_limit`
+            // can't decide on the declared size) reach this rejection
+            // when the per-extractor cap fires — they MUST surface as
+            // 413 request_too_large per Anthropic SDK ErrorType
+            // taxonomy, not 400 invalid_request_error. The Claude SDK
+            // branches on `error.type=="request_too_large"` to mark
+            // requests as "non-retriable cap exceeded"; folding it
+            // into 400 breaks that retry-policy signal.
+            return match rej {
+                JsonRejection::BytesRejection(_) => ProxyError::RequestTooLarge {
+                    limit_bytes: state.request_body_limit_bytes,
+                },
+                _ => ProxyError::InvalidRequest("invalid JSON request body".into()),
+            }
+            .into_anthropic_response();
         }
     };
     let started = Instant::now();

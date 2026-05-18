@@ -180,7 +180,15 @@ async fn enforce_request_body_limit(
     // `bool` rather than holding a borrow into `request`, so the
     // `request.into_body()` move on the drain path doesn't conflict
     // with the captured value (audit HIGH-3 follow-up).
-    let is_anthropic_path = request.uri().path() == "/v1/messages";
+    //
+    // Audit LOW-A (3rd audit): `/v1/messages/` (trailing slash) also
+    // routes to the Anthropic handler via axum's path normalization,
+    // but an exact-match check would miss it. The official Anthropic
+    // SDK never appends a trailing slash so real-world exposure is
+    // near-zero, but non-SDK callers (curl, custom clients) could
+    // hit it. Accept both forms.
+    let path = request.uri().path();
+    let is_anthropic_path = path == "/v1/messages" || path == "/v1/messages/";
     let render = |e: ProxyError| -> Response {
         if is_anthropic_path {
             e.into_anthropic_response()
@@ -712,6 +720,92 @@ mod tests {
         // OpenAI-only fields must be absent.
         assert!(v["error"].get("code").is_none());
         assert!(v["error"].get("param").is_none());
+    }
+
+    /// Audit MEDIUM-A (3rd audit) on #343: when the caller streams an
+    /// oversize body without a declared Content-Length, the
+    /// `enforce_request_body_limit` middleware skips its early reject
+    /// (no length to compare), and the `Json<Value>` extractor's
+    /// `DefaultBodyLimit` cap fires during read. That produces a
+    /// `JsonRejection::BytesRejection`, which the handler MUST map
+    /// to `RequestTooLarge` (413 + `error.type=="request_too_large"`)
+    /// rather than `InvalidRequest` (400 + `"invalid_request_error"`)
+    /// — the Claude SDK branches on `error.type=="request_too_large"`
+    /// to mark requests as "non-retriable cap exceeded"; folding it
+    /// into 400 breaks the retry-policy signal.
+    #[tokio::test]
+    async fn streaming_oversize_body_on_v1_messages_returns_413_request_too_large() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        // Build a streaming body that yields > 1 MiB chunk-by-chunk
+        // with NO upstream-set Content-Length. The middleware can't
+        // decide on size and will pass through; the per-extractor
+        // `DefaultBodyLimit` cap (set to `request_body_limit_bytes`
+        // in `build_router`) fires on the read, surfacing as
+        // `JsonRejection::BytesRejection`.
+        let chunk = vec![b'x'; 200 * 1024]; // 200 KiB per chunk
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let body = Body::from_stream(stream);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            // Intentionally NO Content-Length.
+            .body(body)
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "streaming-oversize must surface as 413 request_too_large, NOT 400 invalid_request_error",
+        );
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(
+            v["error"]["type"], "request_too_large",
+            "Anthropic-canonical 413 → request_too_large; mistakenly folding into invalid_request_error \
+             breaks the Claude SDK's retry-policy branch",
+        );
+    }
+
+    /// Audit LOW-A (3rd audit) on #343: the path-match guard in
+    /// `enforce_request_body_limit` must accept both `/v1/messages`
+    /// and `/v1/messages/` (trailing slash) — axum's path
+    /// normalization routes both to the Anthropic handler, but a
+    /// strict `==` check on the bare form would miss the trailing-
+    /// slash variant. SDKs don't add the slash; non-SDK callers
+    /// (curl, custom clients) might.
+    #[tokio::test]
+    async fn oversize_body_on_v1_messages_trailing_slash_still_anthropic_envelope() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let oversized = 2 * 1024 * 1024;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages/")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .header("content-length", oversized.to_string())
+            .body(Body::from(
+                r#"{"model":"my-gpt4","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["type"], "error",
+            "trailing-slash /v1/messages/ must still emit Anthropic envelope",
+        );
+        assert_eq!(v["error"]["type"], "request_too_large");
     }
 
     /// Companion to the above: duplicate Content-Length on /v1/messages
