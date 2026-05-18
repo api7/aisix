@@ -25,9 +25,17 @@ pub enum Provider {
     Anthropic,
     Google,
     Deepseek,
-    /// Cohere — currently exposed for `/v1/rerank` only (#213 Phase 1).
-    /// Cohere's chat / generate APIs are not OpenAI-compatible; a
-    /// future bridge implementation can extend coverage.
+    /// Cohere — `/v1/rerank` (native, via `aisix-proxy::rerank`) and
+    /// chat/completions / embeddings (via `OpenAiBridge::with_name("cohere")`
+    /// against `https://api.cohere.com/compatibility/v1`, per
+    /// <https://docs.cohere.com/reference/chat>). Chat-compat is the
+    /// OpenAI-shape namespace Cohere ships alongside its native
+    /// `/v1/chat`. Chat-compat coverage today: the `command-r` /
+    /// `command-a` family per
+    /// <https://docs.cohere.com/v2/docs/compatibility-api>; legacy
+    /// `command` / `command-light` / `command-nightly` go to native
+    /// (not yet bridged) and will return upstream 400 if configured
+    /// against the chat-compat path.
     Cohere,
     /// Jina AI — currently exposed for `/v1/rerank` only (#213 Phase 2).
     /// Jina's rerank wire shape is identity-mapped to the OpenAI-compat

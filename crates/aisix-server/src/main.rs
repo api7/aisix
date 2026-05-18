@@ -1087,4 +1087,39 @@ mod tests {
         let err = derive_cp_etcd_url(&m).unwrap_err();
         assert!(err.to_string().contains("cp_base_url"), "unexpected: {err}");
     }
+
+    /// `build_hub()` must register `Provider::Cohere` against the
+    /// `with_name("cohere")` variant of [`OpenAiBridge`] — the only
+    /// thing that ties the Provider enum to the chat-compat URL
+    /// (closes #332). A regression that registered `OpenAiBridge::new()`
+    /// (default name = `"openai"`) or omitted the registration would
+    /// flip the bridge label on metrics and (more importantly) the
+    /// `default_base()` fallback, silently routing Cohere chat to
+    /// OpenAI's host.
+    #[test]
+    fn build_hub_registers_cohere_chat_compat_variant() {
+        let hub = build_hub();
+        let bridge = hub
+            .get(aisix_core::Provider::Cohere)
+            .expect("Provider::Cohere must have a Hub bridge registered for chat-compat");
+        assert_eq!(
+            bridge.name(),
+            "cohere",
+            "Hub.register(Provider::Cohere, …) MUST use OpenAiBridge::with_name(\"cohere\") — \
+             a `with_name(\"openai\")` fallback would route Cohere chat to OpenAI's host",
+        );
+    }
+
+    /// Companion to the cohere check above: Jina deliberately stays
+    /// rerank-only per #213 Phase 2. A future PR that flips Jina to
+    /// chat-compat must update this assertion deliberately.
+    #[test]
+    fn build_hub_does_not_register_jina_for_chat() {
+        let hub = build_hub();
+        assert!(
+            hub.get(aisix_core::Provider::Jina).is_none(),
+            "Provider::Jina is rerank-only (#213 Phase 2); a Hub registration here would \
+             silently route /v1/chat/completions on Jina to whichever bridge name was picked",
+        );
+    }
 }
