@@ -66,8 +66,15 @@ pub async fn messages(
     };
     let Json(mut body) = match body {
         Ok(j) => j,
-        Err(rej) => {
-            return ProxyError::InvalidRequest(rej.body_text()).into_anthropic_response();
+        Err(_rej) => {
+            // Audit MEDIUM-1: `JsonRejection::body_text()` carries
+            // axum's internal phrasing (`"Failed to deserialize the
+            // JSON body into the target type: …"`); replacing with
+            // a stable, customer-friendly phrase avoids future
+            // axum-version drift from leaking implementation
+            // details into the Anthropic envelope.
+            return ProxyError::InvalidRequest("invalid JSON request body".into())
+                .into_anthropic_response();
         }
     };
     let started = Instant::now();
