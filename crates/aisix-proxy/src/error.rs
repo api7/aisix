@@ -192,14 +192,16 @@ impl ProxyError {
 
 /// Build the customer-visible envelope for an upstream HTTP error.
 ///
-/// **Same-wire 4xx (OpenAI upstream → OpenAI client)**: forward parsed
-/// fields verbatim. Issue #322's main path — OpenAI SDK clients
-/// depend on `error.code` (`rate_limit_exceeded` vs `insufficient_quota`
-/// etc.) to drive retry strategy.
+/// **4xx**: delegate to [`crate::error_translate::render_openai_envelope`],
+/// which (a) passes OpenAI-wire fields verbatim, (b) translates
+/// Anthropic / Bedrock / Vertex / AzureOpenAI taxonomy via per-wire
+/// tables so the OpenAI-shape `error.type` and `error.code` carry the
+/// retry semantics SDKs depend on.
 ///
-/// **5xx or non-JSON body or cross-wire**: emit the legacy generic
-/// `upstream_error` envelope. Cross-wire translation lands in commit 2
-/// of this fix.
+/// **5xx or non-JSON body or `UpstreamWire::Unknown`**: emit the
+/// legacy generic `upstream_error` envelope. Upstream 5xx internal
+/// detail (engine names, queue depth, ARNs in raw AWS messages) stays
+/// operator-internal; the gateway returns a 502 with a generic body.
 fn render_bridge_upstream_envelope(
     status: u16,
     message: &str,
@@ -207,20 +209,10 @@ fn render_bridge_upstream_envelope(
     wire: aisix_gateway::UpstreamWire,
 ) -> ErrorEnvelope {
     let is_4xx = (400..500).contains(&status);
-    if is_4xx && matches!(wire, aisix_gateway::UpstreamWire::OpenAI) {
-        if let Some(view) = parsed {
-            return ErrorEnvelope {
-                error: ErrorBody {
-                    message: view.message.clone().unwrap_or_else(|| message.to_string()),
-                    kind: view
-                        .kind
-                        .clone()
-                        .unwrap_or_else(|| "upstream_error".to_string()),
-                    param: view.param.clone(),
-                    code: view.code.clone(),
-                },
-            };
-        }
+    if is_4xx && !matches!(wire, aisix_gateway::UpstreamWire::Unknown) {
+        return ErrorEnvelope {
+            error: crate::error_translate::render_openai_envelope(parsed, wire, message),
+        };
     }
     ErrorEnvelope::new(message.to_string(), "upstream_error")
 }

@@ -34,6 +34,7 @@ pub(crate) mod cooldown;
 mod dispatch;
 mod embeddings;
 mod error;
+mod error_translate;
 pub mod health;
 mod http_client;
 mod images;
@@ -892,9 +893,13 @@ mod tests {
         assert!(v["error"]["message"].is_string());
     }
 
-    /// Cross-provider 4xx pass-through: Anthropic upstream 400 reaches
-    /// the client as 400 + OpenAI-shape envelope (status flows from
-    /// `BridgeError::UpstreamStatus.http_status()` 4xx branch).
+    /// Cross-provider 4xx translation: Anthropic upstream 400 reaches
+    /// the OpenAI-client side with the OpenAI-shape `error.type` /
+    /// `error.code` derived from Anthropic's `error.type` via the
+    /// translation table in [`crate::error_translate`]. Anthropic
+    /// `invalid_request_error` maps to OpenAI `invalid_request_error`
+    /// (taxonomy overlap — same token); other Anthropic types like
+    /// `rate_limit_error` map to distinct OpenAI tokens.
     #[tokio::test]
     async fn upstream_anthropic_400_passes_through_with_openai_envelope() {
         use aisix_provider_anthropic::AnthropicBridge;
@@ -902,8 +907,9 @@ mod tests {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
-            .respond_with(ResponseTemplate::new(400).set_body_string(
-                r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad input"}}"#,
+            .respond_with(ResponseTemplate::new(400).set_body_raw(
+                br#"{"type":"error","error":{"type":"invalid_request_error","message":"bad input"}}"#.as_slice(),
+                "application/json",
             ))
             .mount(&upstream)
             .await;
@@ -933,7 +939,60 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let v: serde_json::Value =
             serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
-        assert_eq!(v["error"]["type"], "upstream_error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["message"], "bad input");
+        // Anthropic `invalid_request_error` doesn't derive an OpenAI
+        // string code — translation table emits `code: null`.
+        assert!(v["error"].get("code").is_none() || v["error"]["code"].is_null());
+    }
+
+    /// Issue #322 cross-wire contract: Anthropic upstream `rate_limit_error`
+    /// must translate to OpenAI `rate_limit_exceeded` (both as
+    /// `error.type` and `error.code`) so OpenAI SDK retry logic that
+    /// switches on `error.code` recognises the rate-limit failure
+    /// regardless of which upstream the gateway routed to.
+    #[tokio::test]
+    async fn upstream_anthropic_rate_limit_translates_to_openai_rate_limit_exceeded() {
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(429).set_body_raw(
+                br#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#.as_slice(),
+                "application/json",
+            ))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(matrix_anthropic_pk(&upstream.uri()));
+        snap.models.insert(anthropic_model_entry("my-claude"));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-claude"]));
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "my-claude",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
+        assert_eq!(v["error"]["type"], "rate_limit_exceeded");
+        assert_eq!(v["error"]["code"], "rate_limit_exceeded");
+        assert_eq!(v["error"]["message"], "slow down");
     }
 
     /// Garbage upstream body (200 + non-JSON) must surface as 502 with
