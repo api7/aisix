@@ -139,7 +139,7 @@ In this mode:
 
 ## Playground
 
-The playground is an in-process proxy endpoint that lets you exercise model rows without configuring a caller-side API key — useful for smoke-testing a new model row from inside the admin surface.
+The playground is an in-process proxy endpoint mounted on the admin listener that forwards requests to the proxy router so model rows can be smoke-tested without a network hop. Auth uses a proxy API key (not the admin key); the full proxy middleware stack — auth, rate limit, bridge, guardrails — still runs.
 
 There are two different playground concepts:
 
