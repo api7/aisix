@@ -160,7 +160,12 @@ pub async fn messages(
                 elapsed,
                 AnthropicUsageMetrics::default(),
             );
-            err.into_response()
+            // /v1/messages must return Anthropic-shape error envelope
+            // `{type:"error", error:{type, message}}` so Claude SDKs
+            // can parse it — closes #336. The DP-stable taxonomy
+            // (`upstream_error`, `invalid_api_key`, …) is preserved
+            // on the nested `error.type` per ai-gateway#327.
+            err.into_anthropic_response()
         }
     }
 }
@@ -1403,6 +1408,84 @@ data: [DONE]\n\n";
         });
         let resp = app.oneshot(make_req(body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// /v1/messages must emit the Anthropic-shape error envelope
+    /// `{type:"error", error:{type, message}}` on upstream 5xx —
+    /// closes #336. The Claude SDK's strict envelope parser branches
+    /// on `body.type === "error"` (anthropic-sdk-python
+    /// `_response.py::_to_api_error`); the prior OpenAI-shape
+    /// envelope made the SDK fall through to a generic exception.
+    /// Inner `error.type` stays on the DP-stable taxonomy per
+    /// ai-gateway#327.
+    #[tokio::test]
+    async fn upstream_error_emits_anthropic_shape_error_envelope() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("engine internal panic"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({
+            "model": "claude-haiku",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 10
+        });
+        let resp = app.oneshot(make_req(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Anthropic envelope discriminator.
+        assert_eq!(env["type"], "error");
+        // Inner error.type carries DP-stable taxonomy.
+        assert_eq!(env["error"]["type"], "upstream_error");
+        // 5xx body redaction is preserved — upstream internals stay
+        // in operator logs.
+        let msg = env["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            !msg.contains("engine internal panic"),
+            "upstream 5xx body must be redacted on the Anthropic envelope, got: {msg}",
+        );
+        // The redacted message must still surface the upstream status.
+        assert!(
+            msg.contains("500"),
+            "redacted message must keep the upstream status code, got: {msg}",
+        );
+        // Anthropic envelope has no `error.code` / `error.param` —
+        // those are OpenAI-only fields.
+        assert!(env["error"].get("code").is_none());
+        assert!(env["error"].get("param").is_none());
+    }
+
+    /// Same Anthropic-envelope check on a non-bridge error path —
+    /// ModelNotFound. Pre-#336 this returned `{error:{message,type}}`
+    /// (OpenAI shape) on `/v1/messages`, breaking Claude SDKs.
+    #[tokio::test]
+    async fn unknown_model_emits_anthropic_shape_error_envelope() {
+        let snap = new_snap_anthropic("http://unused");
+        snap.apikeys.insert(apikey_entry(&["claude-haiku"]));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({
+            "model": "claude-haiku",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 10
+        });
+        let resp = app.oneshot(make_req(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(env["type"], "error");
+        assert_eq!(env["error"]["type"], "model_not_found");
+        // Anthropic envelope has no `error.code` / `error.param`.
+        assert!(env["error"].get("code").is_none());
+        assert!(env["error"].get("param").is_none());
     }
 
     #[tokio::test]

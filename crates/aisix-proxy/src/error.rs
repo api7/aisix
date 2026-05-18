@@ -1,21 +1,44 @@
-//! OpenAI-compatible error envelope used by every proxy endpoint.
+//! Error envelopes for the proxy endpoints.
 //!
-//! OpenAI's clients expect this exact shape (spec §3):
+//! Two on-the-wire envelope shapes — one per inbound protocol:
 //!
-//! ```json
-//! {
-//!   "error": {
-//!     "message": "…",
-//!     "type": "invalid_request_error",
-//!     "param": null,
-//!     "code": null
+//! - **OpenAI** (default, used by `/v1/chat/completions` and every other
+//!   non-Anthropic endpoint) — spec §3 shape:
+//!
+//!   ```json
+//!   {
+//!     "error": {
+//!       "message": "…",
+//!       "type": "invalid_request_error",
+//!       "param": null,
+//!       "code": null
+//!     }
 //!   }
-//! }
-//! ```
+//!   ```
+//!
+//! - **Anthropic** (used by `/v1/messages` — closes #336). Per
+//!   <https://docs.anthropic.com/en/api/errors>:
+//!
+//!   ```json
+//!   {
+//!     "type": "error",
+//!     "error": {
+//!       "type": "…",
+//!       "message": "…"
+//!     }
+//!   }
+//!   ```
+//!
+//!   The nested `error.type` continues to carry the DP's stable
+//!   taxonomy (`upstream_error`, `invalid_api_key`, etc. — per
+//!   ai-gateway#327) so SDKs that branch on it stay portable; only
+//!   the outer envelope shape differs.
 //!
 //! `ProxyError` is the internal error taxonomy; it implements
-//! `IntoResponse` so handlers can `?`-propagate without touching
-//! JSON shape boilerplate.
+//! `IntoResponse` for the OpenAI shape so non-Anthropic handlers
+//! `?`-propagate without ceremony. `/v1/messages` calls
+//! [`ProxyError::into_anthropic_response`] explicitly so the
+//! Anthropic shape lands on its responses.
 
 use aisix_gateway::BridgeError;
 use aisix_ratelimit::RateLimitError;
@@ -245,6 +268,64 @@ impl IntoResponse for ProxyError {
     }
 }
 
+/// Anthropic-shape error envelope serialized on the wire.
+///
+/// Matches the shape Anthropic SDKs parse — `body.type === "error"`
+/// is the discriminator the official SDK branches on
+/// (anthropic-sdk-python `_response.py::_to_api_error`). The nested
+/// `error.type` carries the DP's stable taxonomy (the same string
+/// the OpenAI envelope's `error.type` carries), so SDKs that branch
+/// on the inner type still see the gateway-normalized value
+/// (e.g. `"upstream_error"` per ai-gateway#327).
+#[derive(Debug, Serialize, Clone)]
+struct AnthropicErrorEnvelope {
+    /// Top-level discriminator. Always `"error"` for error envelopes.
+    #[serde(rename = "type")]
+    discriminator: &'static str,
+    error: AnthropicErrorBody,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct AnthropicErrorBody {
+    #[serde(rename = "type")]
+    kind: String,
+    message: String,
+}
+
+impl ProxyError {
+    /// Render this error as an Anthropic-shape `{type:"error", error:
+    /// {type, message}}` HTTP response. Used by `/v1/messages` so the
+    /// Anthropic SDK's strict envelope parser can read the error.
+    ///
+    /// Behavior is the same as [`Self::into_response`] for status,
+    /// retry-after, and the inner `type` taxonomy — only the JSON
+    /// shape differs. Reuses [`Self::envelope`] for the 4xx/5xx
+    /// classification + upstream-message redaction logic so the two
+    /// envelope renderers can't drift on those rules.
+    pub fn into_anthropic_response(self) -> Response {
+        let status = self.status();
+        let retry_after = self.retry_after_secs();
+        // Delegate to the existing OpenAI envelope builder for the
+        // safe-message and kind logic (5xx body redaction, 4xx
+        // upstream taxonomy translation, etc.) then re-wrap.
+        let openai_env = self.envelope();
+        let anth_body = AnthropicErrorEnvelope {
+            discriminator: "error",
+            error: AnthropicErrorBody {
+                kind: openai_env.error.kind,
+                message: openai_env.error.message,
+            },
+        };
+        let mut response = (status, Json(anth_body)).into_response();
+        if let Some(secs) = retry_after {
+            if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+                response.headers_mut().insert("retry-after", value);
+            }
+        }
+        response
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +381,88 @@ mod tests {
         assert_eq!(json["error"]["type"], "model_not_found");
         assert!(json["error"].get("param").is_none());
         assert!(json["error"].get("code").is_none());
+    }
+
+    // ─── Anthropic envelope (#336) ────────────────────────────────────
+    //
+    // /v1/messages must emit `{type:"error", error:{type, message}}`
+    // — the Anthropic-SDK strict envelope discriminator
+    // (anthropic-sdk-python `_response.py::_to_api_error`). These tests
+    // assert the wire shape AND that the DP-stable inner `error.type`
+    // taxonomy (`upstream_error`, `invalid_api_key`, …) is preserved
+    // unchanged from the OpenAI envelope per ai-gateway#327.
+
+    use axum::body::to_bytes;
+
+    async fn body_to_json(resp: Response) -> serde_json::Value {
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn anthropic_envelope_shape_top_level_type_error_discriminator() {
+        let err = ProxyError::ModelNotFound("claude-x".into());
+        let resp = err.into_anthropic_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = body_to_json(resp).await;
+        assert_eq!(
+            json["type"], "error",
+            "top-level discriminator must be the literal string \"error\"",
+        );
+        assert_eq!(
+            json["error"]["type"], "model_not_found",
+            "inner error.type carries the DP-stable taxonomy unchanged",
+        );
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("claude-x"),
+            "error message must surface the missing model id",
+        );
+        // Anthropic envelope has NO `error.code` / `error.param` —
+        // those are OpenAI-only fields. Verify they're absent.
+        assert!(json["error"].get("code").is_none());
+        assert!(json["error"].get("param").is_none());
+    }
+
+    #[tokio::test]
+    async fn anthropic_envelope_preserves_dp_taxonomy_on_bridge_5xx() {
+        // 5xx collapse contract from ai-gateway#322/#327 — message is
+        // redacted, inner type is `upstream_error`. Anthropic envelope
+        // must carry the same taxonomy on the inner type.
+        let bridge_err = BridgeError::upstream_status(503, "engine internal panic");
+        let err = ProxyError::Bridge(bridge_err);
+        let resp = err.into_anthropic_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let json = body_to_json(resp).await;
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "upstream_error");
+        // 5xx body redaction must apply — upstream internals stay in
+        // operator logs, not customer envelopes.
+        let msg = json["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            !msg.contains("engine internal panic"),
+            "upstream 5xx body must be redacted from the Anthropic envelope, got: {msg}",
+        );
+        assert!(
+            msg.contains("503"),
+            "redacted message must still surface the upstream status, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_envelope_carries_retry_after_on_rate_limit() {
+        // Anthropic SDK honors the `Retry-After` header on 429
+        // (anthropic-sdk-python `_base_client.py::_should_retry`).
+        // The Anthropic envelope renderer must propagate it the same
+        // way the OpenAI envelope renderer does.
+        let err = ProxyError::AllCandidatesUnavailable {
+            retry_after_secs: Some(7),
+        };
+        let resp = err.into_anthropic_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after = resp.headers().get("retry-after").expect("retry-after set");
+        assert_eq!(retry_after.to_str().unwrap(), "7");
     }
 }
