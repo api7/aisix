@@ -147,7 +147,7 @@ Recommended pattern:
 
 ## `observability`
 
-Use `observability` to set process-wide telemetry knobs: service name, log level, and (in future releases) access-log gating, Prometheus exporter control, and OTLP exporters. Today only `service_name` and `log_level` are consulted at runtime; the remaining keys are recognized in the schema and reserved for upcoming releases — setting them is harmless but currently has no effect.
+Use `observability` to set process-wide telemetry knobs: service name, log level, Prometheus exporter control, and (in future releases) access-log gating and OTLP exporters. Today `service_name`, `log_level`, and the `metrics.prometheus.*` block are consulted at runtime; the remaining keys are recognized in the schema and reserved for upcoming releases — setting them is harmless but currently has no effect.
 
 Important fields:
 
@@ -156,8 +156,8 @@ Important fields:
 | `service_name` | service-name attribute on the tracing subscriber initialised at boot | `"aisix"` | wired |
 | `log_level` | fallback `EnvFilter` directive when `RUST_LOG` is not set in the environment | `"info"` | wired |
 | `access_log` | reserved field; access logs are currently emitted by every proxy handler regardless of this setting | `true` | reserved (not yet consulted) |
-| `metrics.prometheus.enabled` | reserved field; the Prometheus exporter is currently mounted unconditionally on the admin listener | `true` | reserved (not yet consulted) |
-| `metrics.prometheus.path` | reserved field; the admin Prometheus path is currently hardcoded to `/metrics` | `"/metrics"` | reserved (not yet consulted) |
+| `metrics.prometheus.enabled` | controls whether the admin listener mounts the Prometheus scrape endpoint; when `false`, no `/metrics` route is registered | `true` | wired |
+| `metrics.prometheus.path` | mount path for the Prometheus scrape endpoint when `metrics.prometheus.enabled` is `true`; values without a leading slash are normalised by prepending one, and an empty value falls back to `/metrics` | `"/metrics"` | wired |
 | `metrics.otlp.enabled` | reserved field; no OTLP metrics export pipeline is installed in the current release | `false` | reserved (not yet wired) |
 | `metrics.otlp.endpoint` | reserved field; see `metrics.otlp.enabled` | none | reserved (not yet wired) |
 | `tracing.otlp.enabled` | enabling this validates the endpoint at boot and emits a startup log line; the OTLP traces pipeline itself is deferred to a future release | `false` | partial (validation only) |
