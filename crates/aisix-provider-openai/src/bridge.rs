@@ -61,6 +61,18 @@ const DEEPSEEK_DEFAULT_BASE: &str = "https://api.deepseek.com";
 /// dispatches to Google's OpenAI-compatible Gemini endpoint.
 const GOOGLE_DEFAULT_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
 
+/// Fallback host for the `cohere`-named variant of this bridge, so a
+/// `with_name("cohere")` instance without an explicit `api_base`
+/// dispatches to Cohere's [OpenAI-compatible chat
+/// endpoint](https://docs.cohere.com/reference/chat) at
+/// `/compatibility/v1`. Cohere's native chat surface (`/v1/chat`) has a
+/// different wire shape; the `/compatibility/v1` namespace mirrors the
+/// OpenAI `/chat/completions` shape verbatim, so `OpenAiBridge` can
+/// serve it directly. `Provider::Cohere.default_base_url()` returns
+/// the bare host because the rerank path (`/v1/rerank`) builds its own
+/// URL — that constant stays as-is.
+const COHERE_DEFAULT_BASE: &str = "https://api.cohere.com/compatibility/v1";
+
 /// Path suffixes the bridge appends to `api_base` when building upstream
 /// URLs. If an operator accidentally pastes the full upstream URL into
 /// `api_base` (e.g. `https://api.openai.com/v1/chat/completions`),
@@ -108,6 +120,7 @@ impl OpenAiBridge {
         match self.name {
             "deepseek" => DEEPSEEK_DEFAULT_BASE,
             "google" => GOOGLE_DEFAULT_BASE,
+            "cohere" => COHERE_DEFAULT_BASE,
             _ => OPENAI_DEFAULT_BASE,
         }
     }
@@ -184,6 +197,7 @@ fn normalize_api_base(base: &str, provider: &str) -> String {
     match provider {
         "openai" => normalize_canonical_openai(stripped),
         "deepseek" => normalize_canonical_deepseek(stripped),
+        "cohere" => normalize_canonical_cohere(stripped),
         _ => stripped.to_string(),
     }
 }
@@ -215,6 +229,28 @@ fn normalize_canonical_deepseek(base: &str) -> String {
         let with_v1 = format!("{host}/v1");
         if base == with_v1 {
             return host.to_string();
+        }
+    }
+    base.to_string()
+}
+
+/// Canonical Cohere hosts.
+const COHERE_CANONICAL_HOSTS: &[&str] = &["https://api.cohere.com", "http://api.cohere.com"];
+
+/// Add the `/compatibility/v1` segment if and only if the operator
+/// pasted the bare canonical Cohere host. The Cohere rerank endpoint
+/// at `/v1/rerank` builds its own URL outside this bridge — that path
+/// continues to use the bare host. For chat completions Cohere serves
+/// an OpenAI-shape envelope at `/compatibility/v1/chat/completions`
+/// (per <https://docs.cohere.com/reference/chat>), so the bridge
+/// synthesizes the right prefix when the operator left it off.
+///
+/// Anything past the host root is left as-is — corporate proxies and
+/// alternative deployments win.
+fn normalize_canonical_cohere(base: &str) -> String {
+    for host in COHERE_CANONICAL_HOSTS {
+        if base == *host {
+            return format!("{host}/compatibility/v1");
         }
     }
     base.to_string()
@@ -1142,6 +1178,97 @@ data: [DONE]\n\n";
             bridge.resolve_base(&ctx),
             "https://generativelanguage.googleapis.com/v1beta/openai",
         );
+    }
+
+    /// `with_name("cohere")` default must target Cohere's
+    /// OpenAI-compatible `/compatibility/v1` namespace rather than
+    /// falling through to OpenAI's host. The dashboard placeholder
+    /// (`https://api.cohere.com`) is the rerank path; for chat the
+    /// bridge synthesizes the right suffix (closes #332).
+    #[test]
+    fn cohere_default_base_targets_compatibility_v1() {
+        let bridge = OpenAiBridge::new().with_name("cohere");
+        let pk: ProviderKey = serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
+        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
+        assert_eq!(
+            bridge.resolve_base(&ctx),
+            "https://api.cohere.com/compatibility/v1",
+        );
+    }
+
+    /// Operators copy-paste the bare canonical Cohere host
+    /// (`https://api.cohere.com`) from rerank docs / the dashboard
+    /// placeholder. For chat the bridge synthesizes
+    /// `/compatibility/v1` so a misconfigured-but-recoverable
+    /// `api_base` still routes to Cohere's chat-compat endpoint.
+    /// Non-canonical hosts (corporate proxies) pass through verbatim
+    /// — operator-intent on a custom host wins.
+    #[test]
+    fn cohere_api_base_tolerance_bare_host_synthesizes_compatibility_prefix() {
+        let bridge = OpenAiBridge::new().with_name("cohere");
+        let canonical = "https://api.cohere.com/compatibility/v1";
+
+        for form in [
+            "https://api.cohere.com",
+            "https://api.cohere.com/",
+            "https://api.cohere.com/compatibility/v1",
+            "https://api.cohere.com/compatibility/v1/",
+            "https://api.cohere.com/compatibility/v1/chat/completions",
+        ] {
+            let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_with_base(form)));
+            assert_eq!(
+                bridge.resolve_base(&ctx),
+                canonical,
+                "form {form:?} should normalize to {canonical}",
+            );
+        }
+
+        // Non-canonical host passes through after suffix stripping.
+        let custom = "https://proxy.acme.internal/cohere-chat";
+        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_with_base(custom)));
+        assert_eq!(
+            bridge.resolve_base(&ctx),
+            custom,
+            "non-canonical host must NOT be rewritten",
+        );
+    }
+
+    /// End-to-end chat flow through the `cohere`-named bridge:
+    /// outbound URL matches the chat-compat namespace and the
+    /// OpenAI envelope round-trips without translation. Pins the
+    /// contract Hub.register relies on.
+    #[tokio::test]
+    async fn cohere_chat_compat_round_trips_openai_envelope() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer cohere-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-cohere",
+                "model": "command-r",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hello from cohere"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+            })))
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new().with_name("cohere");
+        let pk_json = format!(
+            r#"{{"display_name":"cohere-prod","secret":"cohere-key","api_base":"{}"}}"#,
+            server.uri()
+        );
+        let pk: Arc<ProviderKey> = Arc::new(serde_json::from_str(&pk_json).unwrap());
+        let ctx = BridgeContext::new("rid", sample_model(), pk);
+        let resp = bridge.chat(&req(), &ctx).await.unwrap();
+
+        assert_eq!(resp.id, "cmpl-cohere");
+        assert_eq!(resp.message.role, Role::Assistant);
+        assert_eq!(resp.message.content, "hello from cohere");
+        assert_eq!(resp.usage.total_tokens, 7);
     }
 
     /// For Gemini and any future `with_name` variant, the bridge does not
