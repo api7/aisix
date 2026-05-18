@@ -246,14 +246,19 @@ pub async fn capture_upstream_error_http(
         .unwrap_or(false)
         .then(|| parse(&body))
         .flatten()
-        // Truncate `parsed.message` at the same cap as the outer
-        // `message`. Otherwise a 60 KB upstream `error.message` would
-        // reach the customer envelope verbatim — the cap exists
-        // exactly to prevent that.
+        // Truncate every parsed string at the same cap as the outer
+        // `message`. Otherwise a hostile or buggy upstream emitting a
+        // 60 KB `error.message` / `error.code` / `error.type` /
+        // `error.param` would reach the customer envelope verbatim —
+        // the cap exists exactly to prevent that. AWS exception codes
+        // / Anthropic types / OpenAI codes are bounded vocabulary in
+        // practice but the cap applies defensively.
         .map(|mut v| {
-            v.message = v
-                .message
-                .map(|m| truncate_lossy(&m, MAX_UPSTREAM_ERROR_MESSAGE_BYTES));
+            let cap = MAX_UPSTREAM_ERROR_MESSAGE_BYTES;
+            v.message = v.message.map(|m| truncate_lossy(&m, cap));
+            v.kind = v.kind.map(|k| truncate_lossy(&k, cap));
+            v.code = v.code.map(|c| truncate_lossy(&c, cap));
+            v.param = v.param.map(|p| truncate_lossy(&p, cap));
             v
         });
     let message = parsed

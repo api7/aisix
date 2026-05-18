@@ -1351,6 +1351,35 @@ mod tests {
         }
     }
 
+    /// Audit fix (PR #323 follow-up): the `inner_error` casing
+    /// variant is what most Azure docs show, but Azure ALSO emits
+    /// `innererror` (smushed) on some endpoints. Both must be
+    /// recognised by the parser.
+    #[tokio::test]
+    async fn chat_400_with_innererror_smushed_casing_also_lifts_kind() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_raw(
+                br#"{"error":{"code":"invalid_request_error","message":"blocked","innererror":{"code":"ResponsibleAIPolicyViolation"}}}"#.as_slice(),
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        let bridge =
+            AzureOpenAiBridge::new().with_url_override(mock_chat_url(&server.uri(), "gpt4o-prod"));
+        let ctx = canonical_test_ctx();
+        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        match err {
+            BridgeError::UpstreamStatus { parsed, .. } => {
+                let parsed = parsed.expect("innererror parsed");
+                assert_eq!(parsed.kind.as_deref(), Some("ResponsibleAIPolicyViolation"));
+            }
+            other => panic!("expected UpstreamStatus, got {other:?}"),
+        }
+    }
+
     /// Audit fix (PR #323 MEDIUM-2): structured-parse path —
     /// Azure-specific `inner_error.code = ResponsibleAIPolicyViolation`
     /// must surface as `parsed.kind`, not be flattened under the outer
