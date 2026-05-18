@@ -45,7 +45,7 @@ An `API Key` is the caller-facing credential used to access the gateway.
 
 Current data-plane behavior is based on `key_hash`, not plaintext storage. The proxy hashes the incoming bearer token and resolves it against the stored `key_hash`.
 
-This means you cannot retrieve the plaintext bearer after creation — capture the value returned at create time, and if you lose it, use `POST /admin/v1/apikeys/:id/rotate` to issue a new one.
+The plaintext bearer is chosen (or generated) by the caller and SHA-256-hashed locally before submission — the gateway never sees or returns the plaintext at create time, only the stored `key_hash`. The one endpoint that emits a server-generated plaintext is `POST /admin/v1/apikeys/:id/rotate`, which returns the new plaintext exactly once in its response under a `plaintext` field; capture it then, because subsequent reads only include the hash.
 
 An API key also carries:
 
@@ -119,7 +119,7 @@ Important current boundary:
 
 ## Observability Exporter
 
-An `Observability Exporter` ships telemetry (metrics, traces, request logs) from the gateway to an external backend over an OTLP-compatible endpoint (Grafana Tempo / Loki, Honeycomb, Langfuse via OTLP, and so on). Configure one when you want gateway request and response data forwarded to your existing observability stack.
+An `Observability Exporter` ships per-request span telemetry — derived from gateway `UsageEvent` records — to an OTLP/HTTP-compatible backend (Grafana Tempo, Honeycomb, Langfuse via OTLP, and so on). Configure one when you want a per-request trace of gateway proxy activity forwarded to your existing tracing backend.
 
 ## Environment
 

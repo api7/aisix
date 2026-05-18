@@ -147,24 +147,24 @@ Recommended pattern:
 
 ## `observability`
 
-Use `observability` to configure process-wide telemetry: service name, log level, access logs, Prometheus metrics, and OTLP metrics and tracing exporters.
+Use `observability` to set process-wide telemetry knobs: service name, log level, and (in future releases) access-log gating, Prometheus exporter control, and OTLP exporters. Today only `service_name` and `log_level` are consulted at runtime; the remaining keys are recognized in the schema and reserved for upcoming releases — setting them is harmless but currently has no effect.
 
 Important fields:
 
-| Field | Description | Default |
-| --- | --- | --- |
-| `service_name` | service-name attribute attached to every metric, log, and span emitted by the process | `"aisix"` |
-| `log_level` | minimum log level (`error` / `warn` / `info` / `debug` / `trace`) | `"info"` |
-| `access_log` | emit a structured access-log line for every proxy request | `true` |
-| `metrics.prometheus.enabled` | scrape-style Prometheus exporter | `true` |
-| `metrics.prometheus.path` | HTTP path the Prometheus exporter is served on | `"/metrics"` |
-| `metrics.otlp.enabled` | push-style OTLP metrics exporter | `false` |
-| `metrics.otlp.endpoint` | OTLP/gRPC collector endpoint, e.g. `"http://otel-collector:4317"` | none |
-| `tracing.otlp.enabled` | push-style OTLP traces exporter | `false` |
-| `tracing.otlp.endpoint` | OTLP/gRPC collector endpoint for traces | none |
-| `tracing.otlp.sample_ratio` | head-based sampling ratio applied at span creation | `1.0` |
+| Field | Description | Default | Status |
+| --- | --- | --- | --- |
+| `service_name` | service-name attribute on the tracing subscriber initialised at boot | `"aisix"` | wired |
+| `log_level` | fallback `EnvFilter` directive when `RUST_LOG` is not set in the environment | `"info"` | wired |
+| `access_log` | reserved field; access logs are currently emitted by every proxy handler regardless of this setting | `true` | reserved (not yet consulted) |
+| `metrics.prometheus.enabled` | reserved field; the Prometheus exporter is currently mounted unconditionally on the admin listener | `true` | reserved (not yet consulted) |
+| `metrics.prometheus.path` | reserved field; the admin Prometheus path is currently hardcoded to `/metrics` | `"/metrics"` | reserved (not yet consulted) |
+| `metrics.otlp.enabled` | reserved field; no OTLP metrics export pipeline is installed in the current release | `false` | reserved (not yet wired) |
+| `metrics.otlp.endpoint` | reserved field; see `metrics.otlp.enabled` | none | reserved (not yet wired) |
+| `tracing.otlp.enabled` | enabling this validates the endpoint at boot and emits a startup log line; the OTLP traces pipeline itself is deferred to a future release | `false` | partial (validation only) |
+| `tracing.otlp.endpoint` | OTLP/gRPC collector endpoint for traces; validated at boot when `tracing.otlp.enabled` is `true` | none | partial (validation only) |
+| `tracing.otlp.sample_ratio` | head-based sampling ratio reserved for the future OTLP traces pipeline | `1.0` | reserved (not yet wired) |
 
-Bootstrap observability settings are process-wide. They are different from dynamic `ObservabilityExporter` rows, which control data-plane telemetry fan-out for request events. For per-row dynamic exporters added at runtime via the admin API, see [Observability Exporters](observability-exporters.md).
+Bootstrap observability settings are process-wide. They are different from dynamic `ObservabilityExporter` rows, which control per-request span fan-out via OTLP/HTTP at runtime. For per-row dynamic exporters added at runtime via the admin API, see [Observability Exporters](observability-exporters.md).
 
 ## `cache`
 
