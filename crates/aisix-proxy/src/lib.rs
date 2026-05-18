@@ -724,14 +724,18 @@ mod tests {
         assert_eq!(v["error"]["type"], "upstream_error");
     }
 
-    /// Issue #322: when an OpenAI upstream returns a coded 4xx with the
-    /// standard `{error:{message,type,code,param}}` envelope, every
-    /// field reaches the customer verbatim. SDKs that switch on
-    /// `error.code` to decide retry strategy depend on this — flattening
-    /// to a generic `upstream_error` envelope silently downgrades their
-    /// retry intelligence.
+    /// Issues #322 + #327: when an OpenAI upstream returns a coded
+    /// 4xx with the standard `{error:{message,type,code,param}}`
+    /// envelope, the gateway:
+    /// - preserves `message`, `code`, and `param` verbatim so SDK
+    ///   retry logic that branches on `error.code` keeps working;
+    /// - normalises `error.type` to the DP-stable token
+    ///   `"upstream_error"`, hiding the upstream's private taxonomy
+    ///   from the customer (the upstream `type` here —
+    ///   `"upstream_test_fixture"` — is mock-llm's internal label
+    ///   and must not bleed through).
     #[tokio::test]
-    async fn upstream_openai_4xx_forwards_full_envelope_per_issue_322() {
+    async fn upstream_openai_4xx_forwards_code_and_param_but_normalises_type_per_issue_327() {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
@@ -761,7 +765,12 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 2048).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["message"], "upstream forced 429");
-        assert_eq!(v["error"]["type"], "upstream_test_fixture");
+        // Per #327: `error.type` is the DP-stable taxonomy, NOT the
+        // upstream's `type`. The upstream's `upstream_test_fixture`
+        // token must NOT leak to the customer envelope.
+        assert_eq!(v["error"]["type"], "upstream_error");
+        // Per #322: `error.code` and `error.param` ARE preserved so
+        // SDK retry logic can branch on the granular code.
         assert_eq!(v["error"]["code"], "forced_429");
         assert_eq!(v["error"]["param"], "model");
     }
@@ -905,15 +914,13 @@ mod tests {
         assert!(v["error"]["message"].is_string());
     }
 
-    /// Cross-provider 4xx translation: Anthropic upstream 400 reaches
-    /// the OpenAI-client side with the OpenAI-shape `error.type` /
-    /// `error.code` derived from Anthropic's `error.type` via the
-    /// translation table in [`crate::error_translate`]. Anthropic
-    /// `invalid_request_error` maps to OpenAI `invalid_request_error`
-    /// (taxonomy overlap — same token); other Anthropic types like
-    /// `rate_limit_error` map to distinct OpenAI tokens.
+    /// Cross-provider 4xx forwarding (issue #327): Anthropic upstream
+    /// 400 reaches the OpenAI-client side with `error.type` normalised
+    /// to the DP-stable `"upstream_error"` token — Anthropic's private
+    /// taxonomy (`invalid_request_error`, `authentication_error`, etc.)
+    /// must not bleed through.
     #[tokio::test]
-    async fn upstream_anthropic_400_passes_through_with_openai_envelope() {
+    async fn upstream_anthropic_400_normalises_type_to_upstream_error() {
         use aisix_provider_anthropic::AnthropicBridge;
 
         let upstream = MockServer::start().await;
@@ -951,20 +958,22 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let v: serde_json::Value =
             serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
-        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["type"], "upstream_error");
         assert_eq!(v["error"]["message"], "bad input");
         // Anthropic `invalid_request_error` doesn't derive an OpenAI
         // string code — translation table emits `code: null`.
         assert!(v["error"].get("code").is_none() || v["error"]["code"].is_null());
     }
 
-    /// Issue #322 cross-wire contract: Anthropic upstream `rate_limit_error`
-    /// must translate to OpenAI `rate_limit_exceeded` (both as
-    /// `error.type` and `error.code`) so OpenAI SDK retry logic that
-    /// switches on `error.code` recognises the rate-limit failure
-    /// regardless of which upstream the gateway routed to.
+    /// Issue #322 + #327 cross-wire contract: Anthropic upstream
+    /// `rate_limit_error` must derive OpenAI `error.code =
+    /// rate_limit_exceeded` (so SDK retry logic that switches on
+    /// `error.code` recognises the rate-limit failure regardless of
+    /// upstream), while `error.type` stays as the DP-stable
+    /// `"upstream_error"` (per #327, Anthropic's `rate_limit_error`
+    /// token must not bleed through).
     #[tokio::test]
-    async fn upstream_anthropic_rate_limit_translates_to_openai_rate_limit_exceeded() {
+    async fn upstream_anthropic_rate_limit_derives_openai_rate_limit_exceeded_code() {
         use aisix_provider_anthropic::AnthropicBridge;
 
         let upstream = MockServer::start().await;
@@ -1002,7 +1011,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let v: serde_json::Value =
             serde_json::from_slice(&to_bytes(resp.into_body(), 1024).await.unwrap()).unwrap();
-        assert_eq!(v["error"]["type"], "rate_limit_exceeded");
+        // Per #327: `error.type` is the DP-stable token, never the
+        // upstream's. Per #322: `error.code` is the derived OpenAI
+        // string code so SDK retry logic fires correctly.
+        assert_eq!(v["error"]["type"], "upstream_error");
         assert_eq!(v["error"]["code"], "rate_limit_exceeded");
         assert_eq!(v["error"]["message"], "slow down");
     }
