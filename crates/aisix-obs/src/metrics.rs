@@ -20,8 +20,9 @@
 //! installed, so tests can spin up isolated instances per case.
 
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle, PrometheusRecorder};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// Metric names (public so the admin `/metrics` handler and tests can
@@ -41,6 +42,7 @@ pub const M_LLM_TTFT: &str = "aisix_llm_time_to_first_token_seconds";
 pub const M_PROXY_IN_FLIGHT: &str = "aisix_proxy_in_flight_requests";
 pub const M_PROXY_REQUESTS_TOTAL: &str = "aisix_proxy_requests_total";
 pub const M_PROXY_FAILED_REQUESTS_TOTAL: &str = "aisix_proxy_failed_requests_total";
+pub const M_PROXY_REQUEST_DURATION: &str = "aisix_proxy_request_duration_seconds";
 pub const M_DEPLOYMENT_REQUESTS_TOTAL: &str = "aisix_deployment_requests_total";
 pub const M_DEPLOYMENT_SUCCESS_TOTAL: &str = "aisix_deployment_success_responses_total";
 pub const M_DEPLOYMENT_FAILURE_TOTAL: &str = "aisix_deployment_failure_responses_total";
@@ -72,7 +74,7 @@ pub struct Metrics {
 struct MetricsInner {
     recorder: PrometheusRecorder,
     handle: PrometheusHandle,
-    proxy_in_flight: AtomicI64,
+    proxy_in_flight: Mutex<HashMap<(String, String), i64>>,
 }
 
 impl std::fmt::Debug for Metrics {
@@ -92,7 +94,7 @@ impl Metrics {
             inner: Arc::new(MetricsInner {
                 recorder,
                 handle,
-                proxy_in_flight: AtomicI64::new(0),
+                proxy_in_flight: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -155,7 +157,14 @@ impl Metrics {
     }
 
     pub fn increment_proxy_in_flight(&self, endpoint: &str, inbound_protocol: &str) {
-        let value = self.inner.proxy_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        let value = {
+            let mut counters = self.inner.proxy_in_flight.lock().expect("lock in-flight");
+            let value = counters
+                .entry((endpoint.to_string(), inbound_protocol.to_string()))
+                .or_insert(0);
+            *value += 1;
+            *value
+        };
         metrics::with_local_recorder(&self.inner.recorder, || {
             metrics::gauge!(
                 M_PROXY_IN_FLIGHT,
@@ -167,12 +176,17 @@ impl Metrics {
     }
 
     pub fn decrement_proxy_in_flight(&self, endpoint: &str, inbound_protocol: &str) {
-        let value = self
-            .inner
-            .proxy_in_flight
-            .fetch_sub(1, Ordering::Relaxed)
-            .saturating_sub(1)
-            .max(0);
+        let value = {
+            let mut counters = self.inner.proxy_in_flight.lock().expect("lock in-flight");
+            let key = (endpoint.to_string(), inbound_protocol.to_string());
+            let value = counters.entry(key.clone()).or_insert(0);
+            *value = (*value - 1).max(0);
+            let current = *value;
+            if current == 0 {
+                counters.remove(&key);
+            }
+            current
+        };
         metrics::with_local_recorder(&self.inner.recorder, || {
             metrics::gauge!(
                 M_PROXY_IN_FLIGHT,
@@ -187,7 +201,7 @@ impl Metrics {
         metrics::with_local_recorder(&self.inner.recorder, || {
             labels.record_request_counter(M_PROXY_REQUESTS_TOTAL);
             metrics::histogram!(
-                M_LLM_REQUEST_DURATION,
+                M_PROXY_REQUEST_DURATION,
                 "endpoint" => labels.endpoint.to_string(),
                 "inbound_protocol" => labels.inbound_protocol.to_string(),
                 "provider" => labels.provider.to_string(),

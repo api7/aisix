@@ -27,7 +27,7 @@ The Prometheus integration also emits LiteLLM-category equivalents under AISIX-n
 
 - usage and cost: `aisix_llm_input_tokens_total`, `aisix_llm_output_tokens_total`, `aisix_llm_total_tokens_total`, `aisix_llm_spend_total`
 - request volume and latency: `aisix_llm_requests_total`, `aisix_llm_request_duration_seconds`, `aisix_llm_api_latency_seconds`, `aisix_llm_time_to_first_token_seconds`
-- proxy health: `aisix_proxy_requests_total`, `aisix_proxy_failed_requests_total`, `aisix_proxy_in_flight_requests`
+- proxy health: `aisix_proxy_requests_total`, `aisix_proxy_failed_requests_total`, `aisix_proxy_request_duration_seconds`, `aisix_proxy_in_flight_requests`
 - quotas and budgets: `aisix_ratelimit_remaining_requests`, `aisix_ratelimit_remaining_tokens`, and budget gauges when the control plane returns budget detail fields; `aisix_budget_details_present` tells scrapers whether the current budget response carried those optional fields
 - deployment and routing: `aisix_deployment_*` and `aisix_routing_*` metric families when the request path has those events
 - exporter/cache health: Redis, usage-event drop, and OTLP fan-out drop/failure counters
