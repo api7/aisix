@@ -29,10 +29,17 @@
 //!   }
 //!   ```
 //!
-//!   The nested `error.type` continues to carry the DP's stable
-//!   taxonomy (`upstream_error`, `invalid_api_key`, etc. — per
-//!   ai-gateway#327) so SDKs that branch on it stay portable; only
-//!   the outer envelope shape differs.
+//!   The nested `error.type` maps from HTTP status onto the
+//!   Anthropic SDK's strict `ErrorType` literal
+//!   (`invalid_request_error` / `authentication_error` /
+//!   `permission_error` / `not_found_error` / `request_too_large` /
+//!   `rate_limit_error` / `timeout_error` / `overloaded_error` /
+//!   `api_error`). Diverges from the OpenAI envelope's DP-stable
+//!   taxonomy because the Anthropic SDK's `ErrorType` is a strict
+//!   literal — emitting `"upstream_error"` would silently break
+//!   customers branching on `e.body['error']['type']`. See
+//!   [`anthropic_kind_from_status`] for the LiteLLM-aligned mapping
+//!   table.
 //!
 //! `ProxyError` is the internal error taxonomy; it implements
 //! `IntoResponse` for the OpenAI shape so non-Anthropic handlers
@@ -292,27 +299,76 @@ struct AnthropicErrorBody {
     message: String,
 }
 
+/// Map an HTTP status code to the Anthropic-canonical `error.type`
+/// string (the SDK's `ErrorType` literal at
+/// `anthropic-sdk-python/src/anthropic/types/shared/error_type.py`).
+///
+/// This deliberately diverges from the DP-stable OpenAI-shape inner
+/// taxonomy (`upstream_error`, `model_not_found`, …) because the
+/// Anthropic SDK's `ErrorType` is a strict `Literal[...]` — non-
+/// canonical strings on `error.type` are static-type violations for
+/// any customer doing `isinstance(e, anthropic.RateLimitError)` plus
+/// `e.body['error']['type'] == 'rate_limit_error'`. Per CLAUDE.md §7
+/// reference-implementation rule, this mapping mirrors LiteLLM's
+/// `anthropic_interface/exceptions/exception_mapping_utils.py`
+/// status-to-type table verbatim — divergence from the established
+/// ecosystem here would silently break Claude SDK users.
+///
+/// (The OpenAI envelope's inner `error.type` keeps the DP-stable
+/// strings per ai-gateway#327; that contract is unchanged on
+/// `/v1/chat/completions`.)
+fn anthropic_kind_from_status(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 | 422 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        503 => "overloaded_error",
+        // 408 timeout maps to `timeout_error` in the SDK literal; the
+        // gateway doesn't emit 408 today (timeouts surface as 502 via
+        // the Bridge), but the case is kept for completeness.
+        408 => "timeout_error",
+        // 500 / 502 / 504-599 plus anything outside the recognised
+        // codes fall back to `api_error` — the SDK literal's catch-all
+        // for generic upstream / server faults.
+        _ => "api_error",
+    }
+}
+
 impl ProxyError {
     /// Render this error as an Anthropic-shape `{type:"error", error:
     /// {type, message}}` HTTP response. Used by `/v1/messages` so the
-    /// Anthropic SDK's strict envelope parser can read the error.
+    /// Anthropic SDK's envelope parser sees a shape the official
+    /// SDK + LiteLLM both treat as canonical.
     ///
-    /// Behavior is the same as [`Self::into_response`] for status,
-    /// retry-after, and the inner `type` taxonomy — only the JSON
-    /// shape differs. Reuses [`Self::envelope`] for the 4xx/5xx
-    /// classification + upstream-message redaction logic so the two
-    /// envelope renderers can't drift on those rules.
+    /// **Inner `error.type` policy:** maps from the HTTP status code
+    /// to the Anthropic SDK's `ErrorType` literal via
+    /// [`anthropic_kind_from_status`] — NOT the DP-stable OpenAI-shape
+    /// inner taxonomy. The Anthropic SDK's `ErrorType` is a strict
+    /// `Literal[...]`, so emitting DP-internal strings like
+    /// `"upstream_error"` would break customers branching on
+    /// `error.type`. The DP-stable taxonomy is preserved on the
+    /// OpenAI envelope only (ai-gateway#327); the Anthropic envelope
+    /// follows ecosystem convention.
+    ///
+    /// Reuses [`Self::envelope`] for the 4xx/5xx message-classification
+    /// and upstream-message redaction logic so the two envelope
+    /// renderers can't drift on those rules.
     pub fn into_anthropic_response(self) -> Response {
         let status = self.status();
         let retry_after = self.retry_after_secs();
-        // Delegate to the existing OpenAI envelope builder for the
-        // safe-message and kind logic (5xx body redaction, 4xx
-        // upstream taxonomy translation, etc.) then re-wrap.
+        let kind = anthropic_kind_from_status(status).to_string();
+        // Reuse OpenAI envelope only for the SAFE-MESSAGE logic
+        // (5xx body redaction, 4xx upstream-message pass-through).
+        // The inner type is overwritten to the Anthropic-canonical
+        // string above.
         let openai_env = self.envelope();
         let anth_body = AnthropicErrorEnvelope {
             discriminator: "error",
             error: AnthropicErrorBody {
-                kind: openai_env.error.kind,
+                kind,
                 message: openai_env.error.message,
             },
         };
@@ -399,20 +455,45 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    #[tokio::test]
-    async fn anthropic_envelope_shape_top_level_type_error_discriminator() {
-        let err = ProxyError::ModelNotFound("claude-x".into());
-        let resp = err.into_anthropic_response();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    /// Shared envelope-shape assertion used across every Anthropic
+    /// envelope test below — keeps the contract surface tight against
+    /// a future regression that flipped any single error variant back
+    /// to the OpenAI envelope.
+    async fn assert_anthropic_envelope(
+        resp: Response,
+        expected_status: StatusCode,
+        expected_kind: &str,
+    ) -> serde_json::Value {
+        assert_eq!(resp.status(), expected_status);
         let json = body_to_json(resp).await;
         assert_eq!(
             json["type"], "error",
-            "top-level discriminator must be the literal string \"error\"",
+            "top-level discriminator must be the literal string \"error\""
         );
         assert_eq!(
-            json["error"]["type"], "model_not_found",
-            "inner error.type carries the DP-stable taxonomy unchanged",
+            json["error"]["type"], expected_kind,
+            "inner error.type must follow Anthropic SDK ErrorType literal"
         );
+        assert!(
+            json["error"]["message"].is_string(),
+            "error.message must be present and a string"
+        );
+        assert!(
+            json["error"].get("code").is_none(),
+            "OpenAI-only field `code` must be absent from the Anthropic envelope"
+        );
+        assert!(
+            json["error"].get("param").is_none(),
+            "OpenAI-only field `param` must be absent from the Anthropic envelope"
+        );
+        json
+    }
+
+    #[tokio::test]
+    async fn anthropic_envelope_404_maps_to_not_found_error() {
+        let err = ProxyError::ModelNotFound("claude-x".into());
+        let resp = err.into_anthropic_response();
+        let json = assert_anthropic_envelope(resp, StatusCode::NOT_FOUND, "not_found_error").await;
         assert!(
             json["error"]["message"]
                 .as_str()
@@ -420,26 +501,93 @@ mod tests {
                 .contains("claude-x"),
             "error message must surface the missing model id",
         );
-        // Anthropic envelope has NO `error.code` / `error.param` —
-        // those are OpenAI-only fields. Verify they're absent.
-        assert!(json["error"].get("code").is_none());
-        assert!(json["error"].get("param").is_none());
     }
 
     #[tokio::test]
-    async fn anthropic_envelope_preserves_dp_taxonomy_on_bridge_5xx() {
-        // 5xx collapse contract from ai-gateway#322/#327 — message is
-        // redacted, inner type is `upstream_error`. Anthropic envelope
-        // must carry the same taxonomy on the inner type.
+    async fn anthropic_envelope_401_maps_to_authentication_error() {
+        let err = ProxyError::MissingAuth;
+        let resp = err.into_anthropic_response();
+        assert_anthropic_envelope(resp, StatusCode::UNAUTHORIZED, "authentication_error").await;
+    }
+
+    #[tokio::test]
+    async fn anthropic_envelope_403_maps_to_permission_error() {
+        let err = ProxyError::ModelForbidden("gpt-4o".into());
+        let resp = err.into_anthropic_response();
+        assert_anthropic_envelope(resp, StatusCode::FORBIDDEN, "permission_error").await;
+    }
+
+    #[tokio::test]
+    async fn anthropic_envelope_400_maps_to_invalid_request_error() {
+        let err = ProxyError::InvalidRequest("`max_tokens` is required".into());
+        let resp = err.into_anthropic_response();
+        assert_anthropic_envelope(resp, StatusCode::BAD_REQUEST, "invalid_request_error").await;
+    }
+
+    #[tokio::test]
+    async fn anthropic_envelope_413_maps_to_request_too_large() {
+        let err = ProxyError::RequestTooLarge {
+            limit_bytes: 1_048_576,
+        };
+        let resp = err.into_anthropic_response();
+        assert_anthropic_envelope(resp, StatusCode::PAYLOAD_TOO_LARGE, "request_too_large").await;
+    }
+
+    #[tokio::test]
+    async fn anthropic_envelope_422_content_filter_maps_to_invalid_request_error() {
+        // Content-filter rejections share 422 with the OpenAI side;
+        // Anthropic-canonical 422 maps to `invalid_request_error`
+        // (no dedicated content-filter type in the SDK literal).
+        let err = ProxyError::ContentFiltered("request blocked by content policy".into());
+        let resp = err.into_anthropic_response();
+        assert_anthropic_envelope(
+            resp,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_request_error",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn anthropic_envelope_429_budget_exceeded_maps_to_rate_limit_error() {
+        let err = ProxyError::BudgetExceeded("ak-1".into());
+        let resp = err.into_anthropic_response();
+        assert_anthropic_envelope(resp, StatusCode::TOO_MANY_REQUESTS, "rate_limit_error").await;
+    }
+
+    #[tokio::test]
+    async fn anthropic_envelope_503_all_candidates_unavailable_maps_to_overloaded_error() {
+        let err = ProxyError::AllCandidatesUnavailable {
+            retry_after_secs: Some(7),
+        };
+        let resp = err.into_anthropic_response();
+        assert_anthropic_envelope(resp, StatusCode::SERVICE_UNAVAILABLE, "overloaded_error").await;
+    }
+
+    #[tokio::test]
+    async fn anthropic_envelope_503_carries_retry_after_header() {
+        // Anthropic SDK honors the `Retry-After` header on 503 + 429
+        // (anthropic-sdk-python `_base_client.py::_should_retry`).
+        // The Anthropic envelope renderer must propagate it the same
+        // way the OpenAI envelope renderer does.
+        let err = ProxyError::AllCandidatesUnavailable {
+            retry_after_secs: Some(42),
+        };
+        let resp = err.into_anthropic_response();
+        let retry_after = resp.headers().get("retry-after").expect("retry-after set");
+        assert_eq!(retry_after.to_str().unwrap(), "42");
+    }
+
+    #[tokio::test]
+    async fn anthropic_envelope_bridge_5xx_maps_to_api_error_with_message_redacted() {
+        // 5xx collapse contract from ai-gateway#322/#327 — upstream
+        // body redacted, customer sees a generic 502 wrapped in the
+        // Anthropic-shape envelope with `error.type = "api_error"`
+        // (Anthropic's catch-all for upstream/server failure).
         let bridge_err = BridgeError::upstream_status(503, "engine internal panic");
         let err = ProxyError::Bridge(bridge_err);
         let resp = err.into_anthropic_response();
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-        let json = body_to_json(resp).await;
-        assert_eq!(json["type"], "error");
-        assert_eq!(json["error"]["type"], "upstream_error");
-        // 5xx body redaction must apply — upstream internals stay in
-        // operator logs, not customer envelopes.
+        let json = assert_anthropic_envelope(resp, StatusCode::BAD_GATEWAY, "api_error").await;
         let msg = json["error"]["message"].as_str().unwrap_or("");
         assert!(
             !msg.contains("engine internal panic"),
@@ -452,17 +600,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anthropic_envelope_carries_retry_after_on_rate_limit() {
-        // Anthropic SDK honors the `Retry-After` header on 429
-        // (anthropic-sdk-python `_base_client.py::_should_retry`).
-        // The Anthropic envelope renderer must propagate it the same
-        // way the OpenAI envelope renderer does.
-        let err = ProxyError::AllCandidatesUnavailable {
-            retry_after_secs: Some(7),
-        };
+    async fn anthropic_envelope_bridge_429_maps_to_rate_limit_error() {
+        // Upstream 429 passes through verbatim status; Anthropic-side
+        // `error.type` maps to `rate_limit_error`. The upstream
+        // message is preserved on 4xx (vs 5xx redaction).
+        let bridge_err = BridgeError::upstream_status(429, "rate limited by anthropic");
+        let err = ProxyError::Bridge(bridge_err);
         let resp = err.into_anthropic_response();
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let retry_after = resp.headers().get("retry-after").expect("retry-after set");
-        assert_eq!(retry_after.to_str().unwrap(), "7");
+        let json =
+            assert_anthropic_envelope(resp, StatusCode::TOO_MANY_REQUESTS, "rate_limit_error")
+                .await;
+        // 4xx message pass-through.
+        let msg = json["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("rate limited"),
+            "4xx upstream message must pass through to Anthropic envelope, got: {msg}",
+        );
     }
 }
