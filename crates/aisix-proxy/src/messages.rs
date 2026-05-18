@@ -69,6 +69,8 @@ pub async fn messages(
         Ok(DispatchOutcome {
             response,
             provider_label,
+            provider_key_id,
+            upstream_model,
             metrics,
         }) => {
             let elapsed = started.elapsed();
@@ -94,12 +96,13 @@ pub async fn messages(
                 inbound_protocol: "anthropic",
                 provider: &provider_label,
                 model: &model_name,
+                upstream_model: &upstream_model,
+                provider_key_id: &provider_key_id,
                 api_key_id: &api_key_id,
                 team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
                 owner_id: auth.key().owner_id.as_deref().unwrap_or("unknown"),
                 status,
                 outcome,
-                ..RequestLabels::default()
             };
             state.metrics.record_proxy_request(labels, elapsed);
             state.metrics.record_llm_request(labels, elapsed);
@@ -110,6 +113,8 @@ pub async fn messages(
                 &api_key_id,
                 &provider_label,
                 &model_name,
+                &provider_key_id,
+                &upstream_model,
                 auth.key().team_id.as_deref(),
                 auth.key().owner_id.as_deref(),
                 status,
@@ -147,6 +152,8 @@ pub async fn messages(
                 &api_key_id,
                 "unknown",
                 &model_name,
+                "unknown",
+                "unknown",
                 auth.key().team_id.as_deref(),
                 auth.key().owner_id.as_deref(),
                 status,
@@ -333,6 +340,8 @@ async fn dispatch(
         Ok(DispatchOutcome {
             response,
             provider_label,
+            provider_key_id: pk_entry.id.clone(),
+            upstream_model: upstream_model.clone(),
             metrics: AnthropicUsageMetrics::default(),
         })
     } else {
@@ -367,6 +376,8 @@ async fn dispatch(
         Ok(DispatchOutcome {
             response: Json(json_body).into_response(),
             provider_label,
+            provider_key_id: pk_entry.id.clone(),
+            upstream_model,
             metrics,
         })
     }
@@ -478,6 +489,8 @@ async fn cross_provider_dispatch(
     let pk_arc = Arc::new(provider_key.clone());
     let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
     let provider_label = format!("{provider:?}").to_lowercase();
+    let provider_key_id = model.provider_key_id.as_deref().unwrap_or("unknown");
+    let upstream_model = model.upstream_model().unwrap_or("unknown").to_string();
 
     if is_stream {
         let upstream = bridge.chat_stream(&chat, &ctx).await.map_err(|err| {
@@ -518,6 +531,8 @@ async fn cross_provider_dispatch(
         return Ok(DispatchOutcome {
             response,
             provider_label,
+            provider_key_id: provider_key_id.to_string(),
+            upstream_model,
             metrics: AnthropicUsageMetrics::default(),
         });
     }
@@ -546,6 +561,8 @@ async fn cross_provider_dispatch(
     Ok(DispatchOutcome {
         response: Json(json).into_response(),
         provider_label,
+        provider_key_id: provider_key_id.to_string(),
+        upstream_model,
         metrics,
     })
 }
@@ -600,6 +617,8 @@ fn build_anthropic_sse_stream(
 struct DispatchOutcome {
     response: Response,
     provider_label: String,
+    provider_key_id: String,
+    upstream_model: String,
     metrics: AnthropicUsageMetrics,
 }
 
@@ -635,6 +654,8 @@ fn emit_anthropic_usage_event(
     api_key_id: &str,
     provider: &str,
     model: &str,
+    provider_key_id: &str,
+    upstream_model: &str,
     team_id: Option<&str>,
     owner_id: Option<&str>,
     status_code: u16,
@@ -670,10 +691,11 @@ fn emit_anthropic_usage_event(
             inbound_protocol: "anthropic",
             provider,
             model,
+            upstream_model,
+            provider_key_id,
             api_key_id,
             team_id: team_id.unwrap_or("unknown"),
             owner_id: owner_id.unwrap_or("unknown"),
-            ..UsageLabels::default()
         },
         LlmUsage {
             input_tokens: metrics.prompt_tokens,

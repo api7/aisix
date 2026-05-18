@@ -31,7 +31,7 @@ pub const M_REQUESTS_TOTAL: &str = "aisix_requests_total";
 pub const M_REQUEST_DURATION: &str = "aisix_request_duration_seconds";
 pub const M_RATELIMIT_REJECTIONS: &str = "aisix_ratelimit_rejections_total";
 pub const M_TOKENS_CONSUMED: &str = "aisix_tokens_consumed_total";
-pub const M_LLM_SPEND_TOTAL: &str = "aisix_llm_spend_total";
+pub const M_LLM_SPEND_MICRO_USD_TOTAL: &str = "aisix_llm_spend_micro_usd_total";
 pub const M_LLM_INPUT_TOKENS_TOTAL: &str = "aisix_llm_input_tokens_total";
 pub const M_LLM_OUTPUT_TOKENS_TOTAL: &str = "aisix_llm_output_tokens_total";
 pub const M_LLM_TOTAL_TOKENS_TOTAL: &str = "aisix_llm_total_tokens_total";
@@ -225,7 +225,7 @@ impl Metrics {
         metrics::with_local_recorder(&self.inner.recorder, || {
             labels.record_request_counter(M_LLM_REQUESTS_TOTAL);
             metrics::histogram!(
-                M_LLM_API_LATENCY,
+                M_LLM_REQUEST_DURATION,
                 "endpoint" => labels.endpoint.to_string(),
                 "inbound_protocol" => labels.inbound_protocol.to_string(),
                 "provider" => labels.provider.to_string(),
@@ -257,7 +257,7 @@ impl Metrics {
                 labels.record_counter(M_LLM_TOTAL_TOKENS_TOTAL, u64::from(usage.total_tokens));
             }
             if usage.spend_usd > 0.0 {
-                labels.record_counter_f64(M_LLM_SPEND_TOTAL, usage.spend_usd);
+                labels.record_spend_usd(usage.spend_usd);
             }
         });
     }
@@ -506,9 +506,16 @@ impl UsageLabels<'_> {
         .increment(value);
     }
 
-    fn record_counter_f64(&self, metric: &'static str, value: f64) {
-        metrics::gauge!(
-            metric,
+    fn record_spend_usd(&self, value: f64) {
+        if !value.is_finite() || value <= 0.0 {
+            return;
+        }
+        let micro_usd = (value * 1_000_000.0).round();
+        if micro_usd <= 0.0 {
+            return;
+        }
+        metrics::counter!(
+            M_LLM_SPEND_MICRO_USD_TOTAL,
             "endpoint" => self.endpoint.to_string(),
             "inbound_protocol" => self.inbound_protocol.to_string(),
             "provider" => self.provider.to_string(),
@@ -519,7 +526,7 @@ impl UsageLabels<'_> {
             "team_id" => self.team_id.to_string(),
             "owner_id" => self.owner_id.to_string(),
         )
-        .increment(value);
+        .increment(micro_usd as u64);
     }
 }
 
@@ -786,7 +793,8 @@ mod tests {
         assert!(rendered.contains(M_LLM_INPUT_TOKENS_TOTAL));
         assert!(rendered.contains(M_LLM_OUTPUT_TOKENS_TOTAL));
         assert!(rendered.contains(M_LLM_TOTAL_TOKENS_TOTAL));
-        assert!(rendered.contains(M_LLM_SPEND_TOTAL));
+        assert!(rendered.contains(M_LLM_SPEND_MICRO_USD_TOTAL));
+        assert!(rendered.contains(M_LLM_REQUEST_DURATION));
         assert!(rendered.contains(M_LLM_TTFT));
         assert!(rendered.contains("endpoint=\"/v1/chat/completions\""));
         assert!(rendered.contains("team_id=\"team-1\""));

@@ -273,6 +273,8 @@ struct Success {
     provider_request_id: String,
     /// Resolved model the provider actually billed.
     provider_model_version: String,
+    provider_key_id: String,
+    upstream_model: String,
     /// finish_reason / stop_reason as the upstream returned it. Empty
     /// for streaming (no terminal event yet) and cache hits.
     finish_reason: String,
@@ -567,6 +569,8 @@ async fn dispatch(
         let owner_id_for_metrics = auth.key().owner_id.clone();
         let provider_for_metrics = format!("{provider:?}").to_lowercase();
         let model_for_metrics = req.model.clone();
+        let provider_key_id_for_metrics = pk_entry.id.clone();
+        let upstream_model_for_metrics = model.upstream_model().unwrap_or("unknown").to_string();
         let bypass_reason_for_telem = bypass_reason.clone().unwrap_or_default();
         // Per #204: pass the gateway's guardrail chain so the
         // streaming path can run output guardrails at end-of-stream
@@ -650,10 +654,11 @@ async fn dispatch(
                         inbound_protocol: "openai",
                         provider: &provider_for_metrics,
                         model: &model_for_metrics,
+                        upstream_model: &upstream_model_for_metrics,
+                        provider_key_id: &provider_key_id_for_metrics,
                         api_key_id: &api_key_id_for_telem,
                         team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
                         owner_id: owner_id_for_metrics.as_deref().unwrap_or("unknown"),
-                        ..UsageLabels::default()
                     },
                     LlmUsage {
                         input_tokens: comp.prompt_tokens,
@@ -668,10 +673,11 @@ async fn dispatch(
                         inbound_protocol: "openai",
                         provider: &provider_for_metrics,
                         model: &model_for_metrics,
+                        upstream_model: &upstream_model_for_metrics,
+                        provider_key_id: &provider_key_id_for_metrics,
                         api_key_id: &api_key_id_for_telem,
                         team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
                         owner_id: owner_id_for_metrics.as_deref().unwrap_or("unknown"),
-                        ..UsageLabels::default()
                     },
                     Duration::from_millis(u64::from(comp.ttft_ms)),
                 );
@@ -697,6 +703,8 @@ async fn dispatch(
             cache_read_tokens: 0,
             provider_request_id: String::new(),
             provider_model_version: String::new(),
+            provider_key_id: pk_entry.id.clone(),
+            upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
             finish_reason: String::new(),
             bypass_reason: bypass_reason.clone(),
             // Streaming responses aren't cached at this layer — see
@@ -785,6 +793,16 @@ async fn dispatch(
                     .provider
                     .map(|p| format!("{p:?}").to_lowercase())
                     .unwrap_or_else(|| "unknown".into());
+                let provider_key_id = attempt_models[0]
+                    .model
+                    .provider_key_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".into());
+                let upstream_model = attempt_models[0]
+                    .model
+                    .upstream_model()
+                    .unwrap_or("unknown")
+                    .to_string();
                 let mut response = Json(render_response(now, cached)).into_response();
                 response
                     .headers_mut()
@@ -806,6 +824,8 @@ async fn dispatch(
                     // so we leave these blank deliberately.
                     provider_request_id: String::new(),
                     provider_model_version: String::new(),
+                    provider_key_id,
+                    upstream_model,
                     finish_reason: String::new(),
                     // Cache hits don't burn cost on our side (we already
                     // paid the upstream price the first time around).
@@ -835,6 +855,8 @@ async fn dispatch(
     // (non-429 4xx) errors stop immediately.
     let mut last_err: Option<BridgeError> = None;
     let mut chosen_provider: Option<String> = None;
+    let mut chosen_provider_key_id: Option<String> = None;
+    let mut chosen_upstream_model: Option<String> = None;
     let mut upstream: Option<aisix_gateway::ChatResponse> = None;
     let retries = virtual_entry
         .value
@@ -885,6 +907,9 @@ async fn dispatch(
                     state.health.record_success(&model.display_name);
                     state.runtime_status.mark_healthy(&attempt.id);
                     chosen_provider = Some(format!("{provider:?}").to_lowercase());
+                    chosen_provider_key_id = Some(pk_entry.id.clone());
+                    chosen_upstream_model =
+                        Some(model.upstream_model().unwrap_or("unknown").to_string());
                     upstream = Some(resp);
                     break;
                 }
@@ -938,6 +963,8 @@ async fn dispatch(
         return Err(with_model(ProxyError::Bridge(err)));
     };
     let provider_name = chosen_provider.unwrap_or_else(|| "unknown".into());
+    let provider_key_id = chosen_provider_key_id.unwrap_or_else(|| "unknown".into());
+    let upstream_model = chosen_upstream_model.unwrap_or_else(|| "unknown".into());
 
     // Output guardrail. Tokens still count against quota — the upstream
     // already burned them — so commit before the check, and refuse the
@@ -1060,6 +1087,8 @@ async fn dispatch(
         cache_read_tokens,
         provider_request_id,
         provider_model_version,
+        provider_key_id,
+        upstream_model,
         finish_reason,
         cost_usd,
         bypass_reason,
@@ -1187,12 +1216,13 @@ fn record_success(
         inbound_protocol: "openai",
         provider,
         model,
+        upstream_model: &s.upstream_model,
+        provider_key_id: &s.provider_key_id,
         api_key_id,
         team_id: team_id.unwrap_or("unknown"),
         owner_id: owner_id.unwrap_or("unknown"),
         status,
         outcome,
-        ..RequestLabels::default()
     };
     metrics.record_proxy_request(request_labels, elapsed);
     metrics.record_llm_request(request_labels, elapsed);
@@ -1205,10 +1235,11 @@ fn record_success(
             inbound_protocol: "openai",
             provider,
             model,
+            upstream_model: &s.upstream_model,
+            provider_key_id: &s.provider_key_id,
             api_key_id,
             team_id: team_id.unwrap_or("unknown"),
             owner_id: owner_id.unwrap_or("unknown"),
-            ..UsageLabels::default()
         },
         LlmUsage {
             input_tokens: s.prompt_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,

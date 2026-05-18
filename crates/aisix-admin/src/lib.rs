@@ -152,10 +152,25 @@ pub fn build_router(state: AdminState) -> Router {
         );
 
     if state.prometheus.enabled {
-        router = router.route(&state.prometheus.path, get(metrics_handler));
+        router = router.route(
+            &normalized_prometheus_path(&state.prometheus.path),
+            get(metrics_handler),
+        );
     }
 
     router.with_state(state)
+}
+
+fn normalized_prometheus_path(path: &str) -> String {
+    let path = path.trim();
+    if path.is_empty() {
+        return "/metrics".to_string();
+    }
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
 }
 
 async fn livez(
@@ -361,6 +376,30 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = run(
+            app,
+            Request::builder()
+                .uri("/internal/prom")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_normalizes_configured_path() {
+        use aisix_core::config::PrometheusConfig;
+        use aisix_obs::Metrics;
+
+        let state = build_state()
+            .with_metrics(Arc::new(Metrics::new(false)))
+            .with_prometheus_config(PrometheusConfig {
+                enabled: true,
+                path: "internal/prom".into(),
+            });
+        let app = build_router(state);
 
         let resp = run(
             app,

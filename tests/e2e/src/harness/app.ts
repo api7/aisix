@@ -12,7 +12,7 @@ import { harnessRequest } from "./http.js";
 export interface AppOverrides {
   /** Inserted into `admin.admin_keys`. Defaults to a fresh random key. */
   adminKey?: string;
-  /** Whether to enable Prometheus on `/metrics`. Defaults to true. */
+  /** Whether to enable the Prometheus scrape endpoint. Defaults to true. */
   prometheus?: boolean;
   /** Prometheus scrape path. Defaults to `/metrics`. */
   prometheusPath?: string;
