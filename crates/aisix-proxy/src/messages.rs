@@ -68,6 +68,7 @@ pub async fn messages(
         Ok(j) => j,
         Err(rej) => {
             use axum::extract::rejection::JsonRejection;
+            use axum::http::StatusCode;
             // Audit MEDIUM-1: replace `JsonRejection::body_text()`
             // with stable customer-friendly phrases — axum's internal
             // wording could drift between releases and silently leak
@@ -80,14 +81,42 @@ pub async fn messages(
             // can't decide on the declared size) reach this rejection
             // when the per-extractor cap fires — they MUST surface as
             // 413 request_too_large per Anthropic SDK ErrorType
-            // taxonomy, not 400 invalid_request_error. The Claude SDK
-            // branches on `error.type=="request_too_large"` to mark
-            // requests as "non-retriable cap exceeded"; folding it
-            // into 400 breaks that retry-policy signal.
+            // taxonomy, not 400 invalid_request_error.
+            //
+            // Audit MEDIUM-B (4th audit): `BytesRejection` is a
+            // composite rejection — its inner `FailedToBufferBody`
+            // has TWO variants: `LengthLimitError` (status
+            // PAYLOAD_TOO_LARGE — real cap exceeded) and
+            // `UnknownBodyError` (status BAD_REQUEST — transport-
+            // side body-read failure, e.g. peer reset mid-body, hyper
+            // decoder error). The earlier `BytesRejection(_)` blanket
+            // arm mis-labelled transport failures as
+            // `request_too_large`, breaking the Claude SDK's
+            // non-retriable-cap branch (which assumes a true cap
+            // hit). Discriminate via the rejection's own `.status()`
+            // method (exposed by axum's composite_rejection macro,
+            // recursively delegated to the inner variant's
+            // `define_rejection! #[status = ...]`).
+            //
+            // `JsonRejection` is `#[non_exhaustive]` (axum-core
+            // 0.5.6 macros.rs:157), so the fallback `_` arm catches
+            // both today's `JsonDataError` / `JsonSyntaxError` /
+            // `MissingJsonContentType` AND any future variant axum
+            // adds — defaulting to 400 `invalid_request_error` until
+            // each new variant gets an explicit policy decision.
             return match rej {
-                JsonRejection::BytesRejection(_) => ProxyError::RequestTooLarge {
-                    limit_bytes: state.request_body_limit_bytes,
-                },
+                JsonRejection::BytesRejection(inner)
+                    if inner.status() == StatusCode::PAYLOAD_TOO_LARGE =>
+                {
+                    ProxyError::RequestTooLarge {
+                        limit_bytes: state.request_body_limit_bytes,
+                    }
+                }
+                JsonRejection::BytesRejection(_) => {
+                    // UnknownBodyError or any future composite arm —
+                    // transport-side failure, NOT a size cap.
+                    ProxyError::InvalidRequest("failed to read request body".into())
+                }
                 _ => ProxyError::InvalidRequest("invalid JSON request body".into()),
             }
             .into_anthropic_response();
