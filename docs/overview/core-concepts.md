@@ -12,9 +12,9 @@ A `Model` is the resource clients target through the gateway.
 
 For direct models, a model includes:
 
-- `display_name`
+- `display_name` — the alias your callers send as the API request's `model` field
 - `provider`
-- `model_name`
+- `model_name` — the upstream model ID the gateway forwards to the provider (for example, `"gpt-4o"`)
 - `provider_key_id`
 - optional timeout, rate limit, and cost metadata
 
@@ -44,6 +44,8 @@ Current provider key fields include:
 An `API Key` is the caller-facing credential used to access the gateway.
 
 Current data-plane behavior is based on `key_hash`, not plaintext storage. The proxy hashes the incoming bearer token and resolves it against the stored `key_hash`.
+
+This means you cannot retrieve the plaintext bearer after creation — capture the value returned at create time, and if you lose it, use `POST /admin/v1/apikeys/:id/rotate` to issue a new one.
 
 An API key also carries:
 
@@ -117,9 +119,7 @@ Important current boundary:
 
 ## Observability Exporter
 
-An `Observability Exporter` is a resource that configures external telemetry export from the gateway.
-
-Use this concept when documenting external metrics, traces, or event forwarding behavior.
+An `Observability Exporter` ships telemetry (metrics, traces, request logs) from the gateway to an external backend over an OTLP-compatible endpoint (Grafana Tempo / Loki, Honeycomb, Langfuse via OTLP, and so on). Configure one when you want gateway request and response data forwarded to your existing observability stack.
 
 ## Environment
 
