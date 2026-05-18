@@ -4,7 +4,7 @@ description: Official documentation for AISIX AI Gateway and AISIX Cloud, includ
 sidebar_position: 1
 ---
 
-AISIX AI Gateway is an AI gateway for platform engineers and AI agent developers who need a consistent way to route, govern, and observe LLM traffic across multiple providers. AISIX Cloud extends that gateway with a managed control plane and managed data-plane workflows.
+AISIX AI Gateway is an AI [gateway](overview/glossary.md#gateway) for platform engineers and AI agent developers who need a consistent way to route, govern, and observe LLM traffic across multiple providers. [AISIX Cloud](overview/glossary.md#aisix-cloud) extends that gateway with a managed [control plane](overview/glossary.md#control-plane) and managed [data-plane](overview/glossary.md#data-plane) workflows.
 
 This documentation set is organized for two primary audiences:
 
@@ -25,7 +25,7 @@ This documentation set is organized for two primary audiences:
 - Continue with [First Model, First Key, First Request](quickstart/first-model-first-key-first-request.md).
 - Use [OpenAI SDK Quickstart](quickstart/openai-sdk.md) if you already have an OpenAI client.
 - Use [Anthropic SDK Quickstart](quickstart/anthropic-sdk.md) if you need the Anthropic-style `messages` API.
-- If you are evaluating the managed control plane, use the [Deployment Modes](overview/deployment-modes.md) and [Roadmap](roadmap.md) pages first.
+- If you signed up for AISIX Cloud and want to point a hosted control plane at your own gateway, follow the [Deployment Modes](overview/deployment-modes.md) and [Roadmap](roadmap.md) pages. If you want to run everything locally on your own machine, start with the [Self-Hosted Quickstart](quickstart/self-hosted.md) instead.
 - For current Cloud bootstrap behavior, review [AISIX Cloud Managed Data Plane Quickstart](quickstart/aisix-cloud-managed-dp.md).
 
 ### I want to integrate an SDK or client
@@ -87,7 +87,7 @@ The gateway currently exposes these client-facing routes:
 - `POST /v1/audio/translations`
 - `POST /v1/audio/speech`
 - `POST /v1/images/generations`
-- `ANY /passthrough/:provider/*rest`
+- `ANY /passthrough/:provider/*rest` (`ANY` here means the route accepts every HTTP verb: GET, POST, PUT, DELETE, etc.)
 
 Start with [OpenAI-Compatible API](integration/openai-compatible-api.md) and the [Reference](reference/proxy-api-reference.md) section.
 

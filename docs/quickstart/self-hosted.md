@@ -9,7 +9,7 @@ This guide shows how to start a self-hosted AISIX AI Gateway instance with the l
 ## Prerequisites
 
 - Docker
-- a reachable etcd instance
+- a reachable [etcd](../overview/glossary.md#etcd) instance
 
 ## Step 1: Start etcd
 
@@ -28,7 +28,7 @@ docker run -d \
 
 ## Step 2: Create a bootstrap config
 
-Create a local `config.yaml` based on the example config.
+Create a local `config.yaml` based on the example config. Place this file in the repo root — Step 3's `cargo run` looks for `config.yaml` relative to your current working directory.
 
 ```yaml title="config.yaml" {2-7,9-14}
 etcd:
@@ -56,13 +56,15 @@ cache:
   backend: "memory"
 ```
 
+`YOUR_ADMIN_KEY` is any opaque secret string of your choice — there is no format constraint, the auth layer is a string-equality check. Callers send it as `Authorization: Bearer <key>` against the admin listener; rotate by editing `config.yaml` and restarting the gateway.
+
 ## Step 3: Start the gateway
 
 ```bash title="Build and run locally"
 cargo run -p aisix-server --bin aisix -- --config config.yaml
 ```
 
-In another terminal, you should now have:
+Keep the gateway running. Open a new terminal for the next steps; the gateway must continue running in the original terminal to handle the requests below. In that new terminal, you should now have:
 
 - proxy listener on `http://127.0.0.1:3000`
 - admin listener on `http://127.0.0.1:3001`

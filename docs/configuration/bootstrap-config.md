@@ -204,7 +204,7 @@ Do not try to mix the two mental models in one deployment.
 
 ## `bedrock_endpoint_url`
 
-Use `bedrock_endpoint_url` only when you need a deployment-wide override for Bedrock guardrail traffic.
+Use `bedrock_endpoint_url` only when you need a deployment-wide override for Bedrock guardrail traffic. Skip this field unless you actively use the AWS Bedrock guardrail integration (`kind: bedrock` on a [Guardrail](../overview/glossary.md#guardrail) row); it overrides the default Bedrock endpoint for all such traffic in this deployment.
 
 This is a deployment concern, not a per-guardrail-row field.
 

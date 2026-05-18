@@ -14,9 +14,9 @@ Use it when:
 
 Use this page after you have already created:
 
-- a provider key
+- a [provider key](../overview/glossary.md#provider-key)
 - a model alias
-- a caller-facing API key
+- a caller-facing [API key](../overview/glossary.md#api-key)
 
 If you have not done that yet, start with [First Model, First Key, First Request](first-model-first-key-first-request.md).
 
@@ -35,6 +35,12 @@ What does **not** change:
 - you still receive OpenAI-style JSON or SSE chunks
 
 ## Install The SDK
+
+All three steps below run from the same project directory. Create one first:
+
+```bash title="Create the demo project directory"
+mkdir aisix-openai-demo && cd aisix-openai-demo
+```
 
 ```bash title="Install openai"
 npm install openai
@@ -106,7 +112,9 @@ for await (const chunk of stream) {
 }
 ```
 
-Run with `AISIX_API_KEY=sk-demo-caller node openai-sdk-streaming.mjs`.
+```bash title="Run the streaming example"
+AISIX_API_KEY=sk-demo-caller node openai-sdk-streaming.mjs
+```
 
 ## When To Use This Quickstart
 

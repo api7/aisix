@@ -4,7 +4,7 @@ description: Learn what AISIX AI Gateway is, what problems it solves, and how it
 sidebar_position: 1
 ---
 
-AISIX AI Gateway is an AI gateway that sits between your applications and upstream LLM providers. It gives platform teams a single operational layer for routing, governing, and observing model traffic without forcing application teams to manage every provider integration directly.
+AISIX AI Gateway is an AI [gateway](glossary.md#gateway) that sits between your applications and upstream LLM providers. It gives platform teams a single operational layer for routing, governing, and observing model traffic without forcing application teams to manage every provider integration directly.
 
 ## What Problems It Solves
 
@@ -95,7 +95,7 @@ You run the gateway directly and manage bootstrap configuration, dynamic resourc
 
 ### AISIX Cloud Managed Data Plane
 
-AISIX Cloud adds a managed control plane for environments, certificates, and Cloud workflows while the data plane still runs as AISIX AI Gateway.
+[AISIX Cloud](glossary.md#aisix-cloud) adds a managed [control plane](glossary.md#control-plane) for environments, certificates, and Cloud workflows while the [data plane](glossary.md#data-plane) still runs as AISIX AI Gateway.
 
 See [Deployment Modes](deployment-modes.md) for the comparison.
 

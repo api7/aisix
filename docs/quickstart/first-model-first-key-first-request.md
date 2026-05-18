@@ -4,7 +4,7 @@ description: Create a provider key, model, and API key through the AISIX AI Gate
 sidebar_position: 11
 ---
 
-This guide shows how to move from a running self-hosted gateway to a working end-to-end request. You will create:
+This guide shows how to move from a running self-hosted [gateway](../overview/glossary.md#gateway) to a working end-to-end request. You will create:
 
 - one `ProviderKey`
 - one `Model`
@@ -22,16 +22,16 @@ Then you will verify that the new configuration is visible on the proxy surface.
 
 The standalone gateway uses:
 
-- **provider keys** to store upstream credentials and optional base URLs
+- **[provider keys](../overview/glossary.md#provider-key)** to store upstream credentials and optional base URLs
 - **models** to expose operator-defined model aliases on the proxy surface
-- **API keys** to control which callers can access which models
+- **[API keys](../overview/glossary.md#api-key)** to control which callers can access which models
 
 ## Step 1: Create a Provider Key
 
 Create a provider key that points at your upstream provider.
 
 :::warning Production credentials
-The standalone gateway stores `secret` as plaintext under the etcd `prefix` you configured in [`config.yaml`](self-hosted.md#step-2-create-a-bootstrap-config). For production, front etcd with encryption-at-rest, or use AISIX Cloud's managed [Provider Key Rotation](../cloud/provider-key-rotation.md), which holds the secret in the control plane and projects only what each environment needs.
+The standalone gateway stores `secret` as plaintext under the [etcd](../overview/glossary.md#etcd) `prefix` you configured in [`config.yaml`](self-hosted.md#step-2-create-a-bootstrap-config). For production, front etcd with encryption-at-rest, or use [AISIX Cloud](../overview/glossary.md#aisix-cloud)'s managed [Provider Key Rotation](../cloud/provider-key-rotation.md), which holds the secret in the [control plane](../overview/glossary.md#control-plane) and projects only what each environment needs.
 :::
 
 ```bash title="Create a provider key"
@@ -63,11 +63,25 @@ The admin envelope returns a `ResourceEntry` shape:
 }
 ```
 
-Capture the returned `id`. You will use it as `provider_key_id` when creating the model.
+Capture the returned `id`. You will use it as `provider_key_id` when creating the model. Two ways to capture it:
+
+```bash title="Capture the id (jq path)"
+PROVIDER_KEY_ID=$(curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
+  -H "Authorization: Bearer YOUR_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"display_name":"openai-upstream","secret":"YOUR_PROVIDER_API_KEY","api_base":"https://api.openai.com/v1"}' \
+  | jq -r .id)
+```
+
+If `jq` is not installed (`apt install jq` or `brew install jq`), copy the `id` field by eye from the response and paste it wherever the steps below say `YOUR_PROVIDER_KEY_ID`. The same pattern applies to the model `id` and API-key `id` captures in the next two steps.
 
 ## Step 2: Create a Model
 
 Create a model alias that the proxy will expose to callers.
+
+:::tip
+This guide uses `gpt-4o-mini` to minimize evaluation costs. Swap in any chat-completions-compatible model supported by your upstream provider.
+:::
 
 ```bash title="Create a model"
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
@@ -76,7 +90,7 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
   -d '{
     "display_name": "gpt-4o-prod",
     "provider": "openai",
-    "model_name": "gpt-4o",
+    "model_name": "gpt-4o-mini",
     "provider_key_id": "YOUR_PROVIDER_KEY_ID"
   }'
 ```

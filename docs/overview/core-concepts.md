@@ -8,7 +8,7 @@ This page defines the core objects and terms used across AISIX AI Gateway and AI
 
 ## Model
 
-A `Model` is the resource clients target through the gateway.
+A `Model` is the resource clients target through the [gateway](glossary.md#gateway).
 
 For direct models, a model includes:
 
@@ -57,7 +57,7 @@ An empty `allowed_models` list denies access to every model. A wildcard entry `"
 
 ## Rate Limit Policy
 
-A `RateLimitPolicy` is a standalone rate-limit rule stored in etcd. Each policy targets a single subject through `(scope, scope_ref)`:
+A `RateLimitPolicy` is a standalone rate-limit rule stored in [etcd](glossary.md#etcd). Each policy targets a single subject through `(scope, scope_ref)`:
 
 - `api_key` — match by `ApiKey` entry id
 - `model` — match by `Model` entry id
@@ -85,7 +85,7 @@ A `Guardrail` is a request or response policy object applied by the gateway.
 Current schema supports:
 
 - `keyword`
-- `bedrock`
+- `bedrock` (the codename for the AWS Bedrock guardrails integration — see the Guardrails reference for setup)
 
 Important current boundary:
 
@@ -123,7 +123,7 @@ Use this concept when documenting external metrics, traces, or event forwarding 
 
 ## Environment
 
-An `Environment` is a first-class AISIX Cloud control-plane concept.
+An `Environment` is a first-class [AISIX Cloud](glossary.md#aisix-cloud) [control-plane](glossary.md#control-plane) concept.
 
 The managed data plane watches configuration scoped to its environment. In Cloud mode, projection rules ensure the data plane only sees the resources intended for that environment.
 
@@ -138,6 +138,8 @@ In this mode:
 - control-plane communication uses mTLS-authenticated `/dp/*` endpoints
 
 ## Playground
+
+The playground is an in-process proxy endpoint that lets you exercise model rows without configuring a caller-side API key — useful for smoke-testing a new model row from inside the admin surface.
 
 There are two different playground concepts:
 
