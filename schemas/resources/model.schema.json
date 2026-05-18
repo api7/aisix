@@ -295,7 +295,7 @@
           ]
         },
         {
-          "description": "Together.ai — OpenAI-compat at `https://api.together.xyz/v1`.",
+          "description": "Together.ai — OpenAI-compat at `https://api.together.ai/v1`.",
           "type": "string",
           "enum": [
             "togetherai"
@@ -313,13 +313,6 @@
           "type": "string",
           "enum": [
             "perplexity"
-          ]
-        },
-        {
-          "description": "xAI Grok — OpenAI-compat at `https://api.x.ai/v1`.",
-          "type": "string",
-          "enum": [
-            "xai"
           ]
         },
         {

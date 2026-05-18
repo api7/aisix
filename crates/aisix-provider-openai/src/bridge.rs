@@ -86,14 +86,15 @@ const GROQ_DEFAULT_BASE: &str = "https://api.groq.com/openai/v1";
 // Per https://docs.mistral.ai/api/
 const MISTRAL_DEFAULT_BASE: &str = "https://api.mistral.ai/v1";
 // Per https://docs.together.ai/docs/openai-api-compatibility
-const TOGETHERAI_DEFAULT_BASE: &str = "https://api.together.xyz/v1";
+const TOGETHERAI_DEFAULT_BASE: &str = "https://api.together.ai/v1";
 // Per https://docs.fireworks.ai/getting-started/quickstart
 const FIREWORKS_AI_DEFAULT_BASE: &str = "https://api.fireworks.ai/inference/v1";
 // Per https://docs.perplexity.ai/api-reference/chat-completions-post
 // (chat endpoint is at the host root, NOT /v1).
 const PERPLEXITY_DEFAULT_BASE: &str = "https://api.perplexity.ai";
-// Per https://docs.x.ai/docs/api-reference
-const XAI_DEFAULT_BASE: &str = "https://api.x.ai/v1";
+// xAI Grok scoped out: not in cp-api adapter_map.yaml today (#335
+// swapped xai → google for Featured rank 8); follow-up will add it
+// after the catalog catches up.
 // Per https://platform.moonshot.cn/docs/api/chat
 const MOONSHOTAI_DEFAULT_BASE: &str = "https://api.moonshot.cn/v1";
 // Per https://help.aliyun.com/zh/dashscope/developer-reference/compatibility-of-openai-with-dashscope
@@ -161,7 +162,6 @@ impl OpenAiBridge {
             "togetherai" => TOGETHERAI_DEFAULT_BASE,
             "fireworks-ai" => FIREWORKS_AI_DEFAULT_BASE,
             "perplexity" => PERPLEXITY_DEFAULT_BASE,
-            "xai" => XAI_DEFAULT_BASE,
             "moonshotai" => MOONSHOTAI_DEFAULT_BASE,
             "alibaba" => ALIBABA_DEFAULT_BASE,
             "zhipuai" => ZHIPUAI_DEFAULT_BASE,
@@ -1330,10 +1330,9 @@ data: [DONE]\n\n";
         let expected = [
             ("groq", "https://api.groq.com/openai/v1"),
             ("mistral", "https://api.mistral.ai/v1"),
-            ("togetherai", "https://api.together.xyz/v1"),
+            ("togetherai", "https://api.together.ai/v1"),
             ("fireworks-ai", "https://api.fireworks.ai/inference/v1"),
             ("perplexity", "https://api.perplexity.ai"),
-            ("xai", "https://api.x.ai/v1"),
             ("moonshotai", "https://api.moonshot.cn/v1"),
             (
                 "alibaba",

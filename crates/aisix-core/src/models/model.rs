@@ -61,7 +61,7 @@ pub enum Provider {
     Groq,
     /// Mistral AI — OpenAI-compat at `https://api.mistral.ai/v1`.
     Mistral,
-    /// Together.ai — OpenAI-compat at `https://api.together.xyz/v1`.
+    /// Together.ai — OpenAI-compat at `https://api.together.ai/v1`.
     Togetherai,
     /// Fireworks AI — OpenAI-compat at `https://api.fireworks.ai/inference/v1`.
     /// Wire id is the hyphenated `fireworks-ai` (matches the
@@ -71,8 +71,13 @@ pub enum Provider {
     /// Perplexity — OpenAI-compat at `https://api.perplexity.ai`
     /// (chat lives at the host root).
     Perplexity,
-    /// xAI Grok — OpenAI-compat at `https://api.x.ai/v1`.
-    Xai,
+    // xAI Grok was scoped out of this PR after audit: `xai` is not in
+    // AISIX-Cloud's `internal/cpapi/adapter_map/adapter_map.yaml`
+    // Featured table (PR #335 swapped xai → google for rank 8), so
+    // adding `Provider::Xai` here without a catalog entry would leave
+    // a DP variant cp-api can't write to. Tracked as a separate
+    // follow-up: add xai to adapter_map.yaml first, then a one-line
+    // Provider::Xai DP-side commit will follow.
     /// Moonshot AI (Kimi) — OpenAI-compat at `https://api.moonshot.cn/v1`.
     Moonshotai,
     /// Alibaba Cloud DashScope — OpenAI-compat at
@@ -106,10 +111,9 @@ impl Provider {
             // url is the vendor's documented OpenAI-compat endpoint.
             Self::Groq => "https://api.groq.com/openai/v1",
             Self::Mistral => "https://api.mistral.ai/v1",
-            Self::Togetherai => "https://api.together.xyz/v1",
+            Self::Togetherai => "https://api.together.ai/v1",
             Self::FireworksAi => "https://api.fireworks.ai/inference/v1",
             Self::Perplexity => "https://api.perplexity.ai",
-            Self::Xai => "https://api.x.ai/v1",
             Self::Moonshotai => "https://api.moonshot.cn/v1",
             Self::Alibaba => "https://dashscope.aliyuncs.com/compatible-mode/v1",
             Self::Zhipuai => "https://open.bigmodel.cn/api/paas/v4",
@@ -135,7 +139,6 @@ impl Provider {
             Self::Togetherai => "togetherai",
             Self::FireworksAi => "fireworks-ai",
             Self::Perplexity => "perplexity",
-            Self::Xai => "xai",
             Self::Moonshotai => "moonshotai",
             Self::Alibaba => "alibaba",
             Self::Zhipuai => "zhipuai",
@@ -216,7 +219,6 @@ impl From<Provider> for Adapter {
             | Provider::Togetherai
             | Provider::FireworksAi
             | Provider::Perplexity
-            | Provider::Xai
             | Provider::Moonshotai
             | Provider::Alibaba
             | Provider::Zhipuai
@@ -706,5 +708,46 @@ mod tests {
             "https://api.cohere.com"
         );
         assert_eq!(Provider::Jina.default_base_url(), "https://api.jina.ai");
+    }
+
+    /// Every `Provider` variant must have a non-empty `default_base_url`,
+    /// `as_str`, and an `Adapter::from` arm. A regression that added a
+    /// new variant but forgot to update one of the three would compile
+    /// fine but silently break dispatch downstream — this iterator-based
+    /// test makes the regression class explicit (audit MEDIUM-2 on
+    /// PR #345).
+    #[test]
+    fn every_provider_variant_has_default_base_url_as_str_and_adapter() {
+        let variants = [
+            Provider::Openai,
+            Provider::Anthropic,
+            Provider::Google,
+            Provider::Deepseek,
+            Provider::Cohere,
+            Provider::Jina,
+            // Long-tail OpenAI-adapter providers (#60 P2-A).
+            Provider::Groq,
+            Provider::Mistral,
+            Provider::Togetherai,
+            Provider::FireworksAi,
+            Provider::Perplexity,
+            Provider::Moonshotai,
+            Provider::Alibaba,
+            Provider::Zhipuai,
+            Provider::Baseten,
+            Provider::Huggingface,
+            Provider::Cerebras,
+        ];
+        for v in variants {
+            let url = v.default_base_url();
+            assert!(
+                url.starts_with("https://"),
+                "{v:?}: default_base_url must be an https URL, got {url:?}",
+            );
+            let id = v.as_str();
+            assert!(!id.is_empty(), "{v:?}: as_str must be non-empty");
+            // Adapter::from must compile and return some variant.
+            let _: Adapter = Adapter::from(v);
+        }
     }
 }

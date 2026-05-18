@@ -825,10 +825,8 @@ fn build_hub() -> Hub {
         Provider::Perplexity,
         Arc::new(OpenAiBridge::new().with_name("perplexity")),
     );
-    hub.register(
-        Provider::Xai,
-        Arc::new(OpenAiBridge::new().with_name("xai")),
-    );
+    // Provider::Xai scoped out — see model.rs comment on the Xai
+    // variant (deferred until cp-api adapter_map adds the entry).
     hub.register(
         Provider::Moonshotai,
         Arc::new(OpenAiBridge::new().with_name("moonshotai")),
@@ -1198,7 +1196,6 @@ mod tests {
             (aisix_core::Provider::Togetherai, "togetherai"),
             (aisix_core::Provider::FireworksAi, "fireworks-ai"),
             (aisix_core::Provider::Perplexity, "perplexity"),
-            (aisix_core::Provider::Xai, "xai"),
             (aisix_core::Provider::Moonshotai, "moonshotai"),
             (aisix_core::Provider::Alibaba, "alibaba"),
             (aisix_core::Provider::Zhipuai, "zhipuai"),
