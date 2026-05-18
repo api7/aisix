@@ -11,6 +11,7 @@
 //! wire an etcd-backed impl and tests can use `InMemoryStore` via the
 //! same type.
 
+use aisix_core::config::PrometheusConfig;
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AdminConfig, AisixSnapshot};
 use aisix_etcd::WatchStatus;
@@ -27,6 +28,7 @@ pub struct AdminState {
     pub admin_keys: Arc<[String]>,
     pub store: Arc<dyn ConfigStore>,
     pub metrics: Option<Arc<Metrics>>,
+    pub prometheus: PrometheusConfig,
     /// Shared in-process health tracker from the proxy. Used by the
     /// `/admin/v1/health` endpoint to report per-model health status.
     pub health_tracker: Option<Arc<HealthTracker>>,
@@ -59,6 +61,7 @@ impl AdminState {
             admin_keys: Arc::from(cfg.admin_keys.clone()),
             store,
             metrics: None,
+            prometheus: PrometheusConfig::default(),
             health_tracker: None,
             runtime_status_tracker: None,
             watch_status: None,
@@ -80,6 +83,11 @@ impl AdminState {
     /// requests from both surfaces.
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    pub fn with_prometheus_config(mut self, prometheus: PrometheusConfig) -> Self {
+        self.prometheus = prometheus;
         self
     }
 

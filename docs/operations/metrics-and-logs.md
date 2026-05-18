@@ -10,11 +10,29 @@ Use them together. No single signal tells the whole story.
 
 ## Metrics
 
-`GET /metrics` on the admin listener is the Prometheus scrape endpoint.
+`GET /metrics` on the admin listener is the default Prometheus scrape endpoint. Operators can change it with `observability.metrics.prometheus.path`, or disable the endpoint with `observability.metrics.prometheus.enabled: false`.
 
 This endpoint is unauthenticated by design on the private admin listener.
 
 Treat `/metrics` as infrastructure-facing, not as a public diagnostics surface.
+
+AISIX exposes native metric names with the `aisix_` prefix. Existing compatibility series remain:
+
+- `aisix_requests_total`
+- `aisix_request_duration_seconds`
+- `aisix_ratelimit_rejections_total`
+- `aisix_tokens_consumed_total`
+
+The Prometheus integration also emits LiteLLM-category equivalents under AISIX-native names:
+
+- usage and cost: `aisix_llm_input_tokens_total`, `aisix_llm_output_tokens_total`, `aisix_llm_total_tokens_total`, `aisix_llm_spend_total`
+- request volume and latency: `aisix_llm_requests_total`, `aisix_llm_request_duration_seconds`, `aisix_llm_api_latency_seconds`, `aisix_llm_time_to_first_token_seconds`
+- proxy health: `aisix_proxy_requests_total`, `aisix_proxy_failed_requests_total`, `aisix_proxy_in_flight_requests`
+- quotas and budgets: `aisix_ratelimit_remaining_requests`, `aisix_ratelimit_remaining_tokens`, and budget gauges when the control plane returns budget detail fields
+- deployment and routing: `aisix_deployment_*` and `aisix_routing_*` metric families when the request path has those events
+- exporter/cache health: Redis, usage-event drop, and OTLP fan-out drop/failure counters
+
+Labels are limited to values the data plane has reliably: `endpoint`, `inbound_protocol`, `provider`, `model`, `upstream_model`, `provider_key_id`, `api_key_id`, `team_id`, `owner_id`, `status`, and `outcome`. User email, team alias, and end-user labels are not fabricated by the data plane.
 
 ## Access Logs And Usage Signals
 

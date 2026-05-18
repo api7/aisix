@@ -15,6 +15,7 @@
 
 use dashmap::DashMap;
 use serde::Deserialize;
+use serde_json::Value;
 use std::time::{Duration, Instant};
 
 const CACHE_TTL: Duration = Duration::from_secs(5);
@@ -43,6 +44,15 @@ pub struct Decision {
     pub allowed: bool,
     pub fail_mode: FailMode,
     pub reason: Option<String>,
+    pub budget: Option<BudgetDetails>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BudgetDetails {
+    pub limit_usd: Option<f64>,
+    pub spent_usd: Option<f64>,
+    pub remaining_usd: Option<f64>,
+    pub reset_seconds: Option<u64>,
 }
 
 impl Decision {
@@ -51,6 +61,7 @@ impl Decision {
             allowed: true,
             fail_mode: FailMode::Open,
             reason: None,
+            budget: None,
         }
     }
 }
@@ -170,6 +181,7 @@ impl BudgetClient {
             allowed: false,
             fail_mode: FailMode::Sticky,
             reason: Some("cp-api unreachable and no cached decision".to_string()),
+            budget: None,
         }
     }
 
@@ -204,16 +216,19 @@ fn apply_fail_mode(prev: &Decision) -> Decision {
             allowed: true,
             fail_mode: FailMode::Open,
             reason: None,
+            budget: prev.budget.clone(),
         },
         FailMode::Closed => Decision {
             allowed: false,
             fail_mode: FailMode::Closed,
             reason: Some("cp-api unreachable; fail_mode=closed".to_string()),
+            budget: prev.budget.clone(),
         },
         FailMode::Sticky => Decision {
             allowed: false,
             fail_mode: FailMode::Sticky,
             reason: Some("cp-api unreachable; cached decision stale".to_string()),
+            budget: prev.budget.clone(),
         },
     }
 }
@@ -244,12 +259,34 @@ struct WireDecision {
     fail_mode: String,
     #[serde(default)]
     reason: Option<WireReason>,
+    #[serde(default)]
+    budget: Option<WireBudget>,
 }
 
 #[derive(Debug, Deserialize)]
 struct WireReason {
     #[serde(default)]
     message: String,
+    #[serde(default)]
+    limit_usd: Option<Value>,
+    #[serde(default)]
+    spent_usd: Option<Value>,
+    #[serde(default)]
+    remaining_usd: Option<Value>,
+    #[serde(default, alias = "period_resets_at")]
+    reset_seconds: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireBudget {
+    #[serde(default, alias = "max_usd")]
+    limit_usd: Option<Value>,
+    #[serde(default)]
+    spent_usd: Option<Value>,
+    #[serde(default)]
+    remaining_usd: Option<Value>,
+    #[serde(default, alias = "period_resets_at")]
+    reset_seconds: Option<Value>,
 }
 
 async fn fetch_decision(
@@ -265,6 +302,18 @@ async fn fetch_decision(
         .await?
         .error_for_status()?;
     let wire: WireDecision = resp.json().await?;
+    let reason_budget = wire.reason.as_ref().map(|r| BudgetDetails {
+        limit_usd: value_as_f64(r.limit_usd.as_ref()),
+        spent_usd: value_as_f64(r.spent_usd.as_ref()),
+        remaining_usd: value_as_f64(r.remaining_usd.as_ref()),
+        reset_seconds: value_as_u64(r.reset_seconds.as_ref()),
+    });
+    let top_budget = wire.budget.as_ref().map(|b| BudgetDetails {
+        limit_usd: value_as_f64(b.limit_usd.as_ref()),
+        spent_usd: value_as_f64(b.spent_usd.as_ref()),
+        remaining_usd: value_as_f64(b.remaining_usd.as_ref()),
+        reset_seconds: value_as_u64(b.reset_seconds.as_ref()),
+    });
     let reason = wire.reason.and_then(|r| {
         if r.message.is_empty() {
             None
@@ -276,7 +325,24 @@ async fn fetch_decision(
         allowed: wire.allow,
         fail_mode: FailMode::parse(&wire.fail_mode),
         reason,
+        budget: top_budget.or(reason_budget),
     })
+}
+
+fn value_as_f64(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn value_as_u64(value: Option<&Value>) -> Option<u64> {
+    match value? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -307,6 +373,37 @@ mod tests {
         let d = c.check("k-1").await;
         assert!(d.allowed);
         assert_eq!(d.fail_mode, FailMode::Sticky);
+    }
+
+    #[tokio::test]
+    async fn live_client_parses_optional_budget_details() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/dp/budget_check"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "allow": true,
+                "fail_mode": "sticky",
+                "budget": {
+                    "limit_usd": "10.5",
+                    "spent_usd": 4.25,
+                    "remaining_usd": "6.25",
+                    "reset_seconds": 3600
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let c = BudgetClient::new(server.uri(), reqwest::Client::new());
+        let d = c.check("k-1").await;
+        assert_eq!(
+            d.budget,
+            Some(BudgetDetails {
+                limit_usd: Some(10.5),
+                spent_usd: Some(4.25),
+                remaining_usd: Some(6.25),
+                reset_seconds: Some(3600),
+            })
+        );
     }
 
     #[tokio::test]

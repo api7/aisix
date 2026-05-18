@@ -70,6 +70,10 @@ observability:
   service_name: "aisix"
   log_level: "info"
   access_log: true
+  metrics:
+    prometheus:
+      enabled: true
+      path: "/metrics"
 
 cache:
   backend: "memory"
@@ -156,6 +160,8 @@ Use `observability` to configure:
 - OTLP metrics and tracing exporters
 
 Bootstrap observability settings are process-wide. They are different from dynamic `ObservabilityExporter` rows, which control data-plane telemetry fan-out for request events.
+
+`observability.metrics.prometheus.enabled` controls whether the admin listener mounts the Prometheus scrape endpoint. `observability.metrics.prometheus.path` controls the mounted path and defaults to `/metrics`.
 
 ## `cache`
 

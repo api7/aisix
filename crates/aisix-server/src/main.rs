@@ -452,6 +452,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             Arc::new(EtcdConfigStore::new(admin_client, etcd_prefix.clone()));
         let admin_state = AdminState::new(snapshot_handle.clone(), admin_store, &cfg.admin)
             .with_metrics(metrics.clone())
+            .with_prometheus_config(cfg.observability.metrics.prometheus.clone())
             // Share the health tracker so /admin/v1/health reflects live
             // per-model upstream failure counts.
             .with_health_tracker(health_tracker)

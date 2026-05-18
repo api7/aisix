@@ -22,7 +22,10 @@ use aisix_core::ObservabilityConfig;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 pub use access_log::AccessLog;
-pub use metrics::{Metrics, RequestOutcome};
+pub use metrics::{
+    BudgetGauges, BudgetLabels, DeploymentLabels, DeploymentState, LlmUsage, Metrics,
+    RequestLabels, RequestOutcome, UsageLabels,
+};
 pub use otlp::{install_otlp_tracer, shutdown_otlp, OtlpError, OtlpHandle};
 pub use otlp_http_sink::OtlpHttpFanOut;
 pub use usage::{UsageEvent, UsageSink};

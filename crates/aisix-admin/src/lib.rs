@@ -63,9 +63,8 @@ pub fn build_router(state: AdminState) -> Router {
     // subsequent handler call is a free lookup.
     let _ = openapi::merged_openapi();
 
-    Router::new()
+    let mut router = Router::new()
         .route("/livez", get(livez))
-        .route("/metrics", get(metrics_handler))
         // OpenAPI scalar UI is unauthenticated like /metrics — admin
         // listener is private in production.
         .route("/admin/openapi.json", get(openapi::openapi_json))
@@ -150,8 +149,13 @@ pub fn build_router(state: AdminState) -> Router {
         .route(
             "/playground/chat/completions",
             post(playground_handler::playground_chat_completions),
-        )
-        .with_state(state)
+        );
+
+    if state.prometheus.enabled {
+        router = router.route(&state.prometheus.path, get(metrics_handler));
+    }
+
+    router.with_state(state)
 }
 
 async fn livez(
@@ -333,6 +337,60 @@ mod tests {
             .unwrap();
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_uses_configured_path() {
+        use aisix_core::config::PrometheusConfig;
+        use aisix_obs::Metrics;
+
+        let state = build_state()
+            .with_metrics(Arc::new(Metrics::new(false)))
+            .with_prometheus_config(PrometheusConfig {
+                enabled: true,
+                path: "/internal/prom".into(),
+            });
+        let app = build_router(state);
+
+        let resp = run(
+            app.clone(),
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let resp = run(
+            app,
+            Request::builder()
+                .uri("/internal/prom")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_can_be_disabled() {
+        use aisix_core::config::PrometheusConfig;
+        use aisix_obs::Metrics;
+
+        let state = build_state()
+            .with_metrics(Arc::new(Metrics::new(false)))
+            .with_prometheus_config(PrometheusConfig {
+                enabled: false,
+                path: "/metrics".into(),
+            });
+        let app = build_router(state);
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

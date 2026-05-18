@@ -26,7 +26,7 @@
 //! side can handle them consistently regardless of which endpoint was used.
 
 use aisix_core::models::Provider;
-use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
+use aisix_obs::{AccessLog, LlmUsage, RequestOutcome, UsageEvent, UsageLabels};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -93,6 +93,10 @@ pub async fn messages(
                 &request_id,
                 &model_id,
                 &api_key_id,
+                &provider_label,
+                &model_name,
+                auth.key().team_id.as_deref(),
+                auth.key().owner_id.as_deref(),
                 status,
                 elapsed,
                 metrics,
@@ -126,6 +130,10 @@ pub async fn messages(
                 &request_id,
                 &model_id,
                 &api_key_id,
+                "unknown",
+                &model_name,
+                auth.key().team_id.as_deref(),
+                auth.key().owner_id.as_deref(),
                 status,
                 elapsed,
                 AnthropicUsageMetrics::default(),
@@ -604,11 +612,16 @@ struct AnthropicUsageMetrics {
 /// to an Anthropic upstream skips the call — the upstream byte stream
 /// isn't parsed in-flight, so token counts aren't available; that
 /// path's UsageEvent emission is tracked as follow-up work.
+#[allow(clippy::too_many_arguments)]
 fn emit_anthropic_usage_event(
     state: &ProxyState,
     request_id: &str,
     model_id: &str,
     api_key_id: &str,
+    provider: &str,
+    model: &str,
+    team_id: Option<&str>,
+    owner_id: Option<&str>,
     status_code: u16,
     elapsed: Duration,
     metrics: AnthropicUsageMetrics,
@@ -636,6 +649,26 @@ fn emit_anthropic_usage_event(
     state
         .otlp_fan_out
         .fan_out(&event, exporters.iter().map(|e| &e.value));
+    state.metrics.record_llm_usage(
+        UsageLabels {
+            endpoint: "/v1/messages",
+            inbound_protocol: "anthropic",
+            provider,
+            model,
+            api_key_id,
+            team_id: team_id.unwrap_or("unknown"),
+            owner_id: owner_id.unwrap_or("unknown"),
+            ..UsageLabels::default()
+        },
+        LlmUsage {
+            input_tokens: metrics.prompt_tokens,
+            output_tokens: metrics.completion_tokens,
+            total_tokens: metrics
+                .prompt_tokens
+                .saturating_add(metrics.completion_tokens),
+            spend_usd: 0.0,
+        },
+    );
 }
 
 fn emit_access_log(

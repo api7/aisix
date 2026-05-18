@@ -19,7 +19,7 @@
 use aisix_cache::CacheKey;
 use aisix_gateway::{BridgeContext, BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
-use aisix_obs::{AccessLog, Metrics, RequestOutcome, UsageEvent};
+use aisix_obs::{AccessLog, LlmUsage, Metrics, RequestOutcome, UsageEvent, UsageLabels};
 use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -86,6 +86,9 @@ pub async fn chat_completions(
                 &state.metrics,
                 &success.provider,
                 &model_name,
+                &api_key_id,
+                auth.key().team_id.as_deref(),
+                auth.key().owner_id.as_deref(),
                 status,
                 &success,
                 elapsed,
@@ -143,6 +146,12 @@ pub async fn chat_completions(
             let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
             if let Some(rl_status) = state.limiter.peek(&api_key_id, &rl_limits) {
                 crate::render::inject_ratelimit_headers(&mut success.response, &rl_status);
+                state.metrics.set_rate_limit_remaining(
+                    &api_key_id,
+                    &model_name,
+                    rl_status.rpm_remaining(),
+                    rl_status.tpm_remaining(),
+                );
             }
             // Correlation / routing headers.
             if let Ok(v) = axum::http::HeaderValue::try_from(request_id.as_str()) {
@@ -437,6 +446,21 @@ async fn dispatch(
     // Budget pre-check via cp-api. The DP no longer owns budget state;
     // cp-api returns a cached/live decision per api_key.
     let decision = state.budgets.check(&auth.entry.id).await;
+    if let Some(budget) = decision.budget.as_ref() {
+        state.metrics.set_budget_gauges(
+            aisix_obs::BudgetLabels {
+                api_key_id: &auth.entry.id,
+                team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
+                owner_id: auth.key().owner_id.as_deref().unwrap_or("unknown"),
+            },
+            aisix_obs::BudgetGauges {
+                limit_usd: budget.limit_usd,
+                spent_usd: budget.spent_usd,
+                remaining_usd: budget.remaining_usd,
+                reset_seconds: budget.reset_seconds,
+            },
+        );
+    }
     if !decision.allowed {
         return Err(with_model(ProxyError::BudgetExceeded(
             decision.reason.unwrap_or_else(|| auth.entry.id.clone()),
@@ -543,9 +567,14 @@ async fn dispatch(
         // return (the non-streaming path's spot) would record zeros.
         let limiter = Arc::clone(&state.limiter);
         let state_for_telem = state.clone();
+        let metrics_for_stream = state.metrics.clone();
         let request_id_for_telem = request_id.to_string();
         let model_id_for_telem = model_id.clone();
         let api_key_id_for_telem = auth.entry.id.clone();
+        let team_id_for_metrics = auth.key().team_id.clone();
+        let owner_id_for_metrics = auth.key().owner_id.clone();
+        let provider_for_metrics = format!("{provider:?}").to_lowercase();
+        let model_for_metrics = req.model.clone();
         let bypass_reason_for_telem = bypass_reason.clone().unwrap_or_default();
         // Per #204: pass the gateway's guardrail chain so the
         // streaming path can run output guardrails at end-of-stream
@@ -622,6 +651,37 @@ async fn dispatch(
                     },
                     /* cost_usd */ 0.0,
                     comp.guardrail_blocked,
+                );
+                metrics_for_stream.record_llm_usage(
+                    UsageLabels {
+                        endpoint: "/v1/chat/completions",
+                        inbound_protocol: "openai",
+                        provider: &provider_for_metrics,
+                        model: &model_for_metrics,
+                        api_key_id: &api_key_id_for_telem,
+                        team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
+                        owner_id: owner_id_for_metrics.as_deref().unwrap_or("unknown"),
+                        ..UsageLabels::default()
+                    },
+                    LlmUsage {
+                        input_tokens: comp.prompt_tokens,
+                        output_tokens: comp.completion_tokens,
+                        total_tokens: comp.total_tokens.min(u64::from(u32::MAX)) as u32,
+                        spend_usd: 0.0,
+                    },
+                );
+                metrics_for_stream.record_time_to_first_token(
+                    UsageLabels {
+                        endpoint: "/v1/chat/completions",
+                        inbound_protocol: "openai",
+                        provider: &provider_for_metrics,
+                        model: &model_for_metrics,
+                        api_key_id: &api_key_id_for_telem,
+                        team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
+                        owner_id: owner_id_for_metrics.as_deref().unwrap_or("unknown"),
+                        ..UsageLabels::default()
+                    },
+                    Duration::from_millis(u64::from(comp.ttft_ms)),
                 );
             },
         );
@@ -1116,10 +1176,14 @@ fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_success(
     metrics: &Metrics,
     provider: &str,
     model: &str,
+    api_key_id: &str,
+    team_id: Option<&str>,
+    owner_id: Option<&str>,
     status: u16,
     s: &Success,
     elapsed: Duration,
@@ -1129,6 +1193,24 @@ fn record_success(
     if let Some(total) = s.total_tokens {
         metrics.record_tokens(provider, model, total);
     }
+    metrics.record_llm_usage(
+        UsageLabels {
+            endpoint: "/v1/chat/completions",
+            inbound_protocol: "openai",
+            provider,
+            model,
+            api_key_id,
+            team_id: team_id.unwrap_or("unknown"),
+            owner_id: owner_id.unwrap_or("unknown"),
+            ..UsageLabels::default()
+        },
+        LlmUsage {
+            input_tokens: s.prompt_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
+            output_tokens: s.completion_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
+            total_tokens: s.total_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
+            spend_usd: s.cost_usd,
+        },
+    );
 }
 
 /// Push one telemetry event onto the CP-side sink **and** fan it out
