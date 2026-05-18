@@ -271,7 +271,8 @@ where
 /// is intentionally left `None`.
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-    let body = resp.bytes().await.unwrap_or_default();
+    let body =
+        aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
     let kind = parse_vertex_error_status(&body);
     let message = match status.as_u16() {
         401 | 403 => "upstream authentication failed".to_string(),
@@ -1425,7 +1426,11 @@ mod tests {
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
             BridgeError::UpstreamStatus {
-                status, message, ..
+                status,
+                message,
+                wire,
+                parsed,
+                ..
             } => {
                 assert_eq!(status, 403);
                 assert!(
@@ -1433,6 +1438,68 @@ mod tests {
                         && !message.contains("Permission denied on project"),
                     "upstream body must not leak project id; got message={message:?}"
                 );
+                // Audit fix (PR #323 MEDIUM-2): pin the wire tag so a
+                // refactor that breaks the cross-wire translation
+                // pipeline fails this test loudly. parsed.message
+                // must stay None for operator-taxonomy redaction.
+                assert_eq!(wire, aisix_gateway::UpstreamWire::Vertex);
+                if let Some(view) = parsed {
+                    assert!(
+                        view.message.is_none(),
+                        "vertex must NOT surface upstream message (project ids leak); \
+                         got {:?}",
+                        view.message
+                    );
+                }
+            }
+            other => panic!("expected UpstreamStatus, got {other:?}"),
+        }
+    }
+
+    /// Audit fix (PR #323 MEDIUM-2): structured-parse path — upstream
+    /// returns a Vertex envelope with `error.status` set; the bridge
+    /// must extract it as `parsed.kind` for the cross-wire translation
+    /// layer to derive an OpenAI `code`. `parsed.message` stays `None`
+    /// (operator project ids leak otherwise).
+    #[tokio::test]
+    async fn chat_gemini_429_populates_parsed_kind_from_grpc_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": {
+                    "code": 429,
+                    "message": "Quota exceeded for project my-secret-proj",
+                    "status": "RESOURCE_EXHAUSTED"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        match err {
+            BridgeError::UpstreamStatus {
+                status,
+                message,
+                wire,
+                parsed,
+                ..
+            } => {
+                assert_eq!(status, 429);
+                assert_eq!(wire, aisix_gateway::UpstreamWire::Vertex);
+                assert!(
+                    !message.contains("my-secret-proj"),
+                    "must not leak project id; got {message:?}"
+                );
+                let parsed = parsed.expect("status field parsed into view");
+                assert_eq!(parsed.kind.as_deref(), Some("RESOURCE_EXHAUSTED"));
+                assert!(parsed.message.is_none());
             }
             other => panic!("expected UpstreamStatus, got {other:?}"),
         }

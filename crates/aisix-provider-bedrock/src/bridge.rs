@@ -1339,6 +1339,8 @@ mod tests {
                 status,
                 message,
                 retry_after,
+                wire,
+                parsed,
                 ..
             } => {
                 assert_eq!(status, 429);
@@ -1356,6 +1358,20 @@ mod tests {
                     Some(std::time::Duration::from_secs(42)),
                     "Retry-After must reach BridgeError::UpstreamStatus"
                 );
+                // Audit fix (PR #323 MEDIUM-2): pin `wire` so a
+                // refactor that breaks cross-wire translation fails
+                // here. `parsed.kind` should carry the AWS exception
+                // name (the SDK derives this from `__type` /
+                // X-Amzn-ErrorType). `parsed.message` stays None for
+                // operator-taxonomy redaction (ARNs, account ids).
+                assert_eq!(wire, aisix_gateway::UpstreamWire::Bedrock);
+                if let Some(view) = parsed {
+                    assert!(
+                        view.message.is_none(),
+                        "bedrock must NOT surface upstream message; got {:?}",
+                        view.message
+                    );
+                }
             }
             other => panic!("expected UpstreamStatus with retry_after, got {other:?}"),
         }

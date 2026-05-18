@@ -245,7 +245,17 @@ pub async fn capture_upstream_error_http(
         .map(content_type_is_json)
         .unwrap_or(false)
         .then(|| parse(&body))
-        .flatten();
+        .flatten()
+        // Truncate `parsed.message` at the same cap as the outer
+        // `message`. Otherwise a 60 KB upstream `error.message` would
+        // reach the customer envelope verbatim — the cap exists
+        // exactly to prevent that.
+        .map(|mut v| {
+            v.message = v
+                .message
+                .map(|m| truncate_lossy(&m, MAX_UPSTREAM_ERROR_MESSAGE_BYTES));
+            v
+        });
     let message = parsed
         .as_ref()
         .and_then(|v| v.message.clone())
@@ -264,7 +274,12 @@ pub async fn capture_upstream_error_http(
 /// during read surface as an empty buffer — the caller falls through
 /// to a parse-failure path and emits the generic `upstream_error`
 /// envelope, which matches the pre-fix behaviour for that edge.
-async fn read_body_capped(resp: reqwest::Response, limit: usize) -> bytes::Bytes {
+///
+/// Public so non-OpenAI / non-Anthropic bridges (Vertex, Azure) can
+/// enforce the same cap when they need a custom parse path (e.g.
+/// extracting only `kind` from the upstream envelope while suppressing
+/// the `message` for operator-taxonomy redaction).
+pub async fn read_body_capped(resp: reqwest::Response, limit: usize) -> bytes::Bytes {
     use futures::StreamExt;
     let mut buf = bytes::BytesMut::with_capacity(limit.min(16 * 1024));
     let mut stream = resp.bytes_stream();

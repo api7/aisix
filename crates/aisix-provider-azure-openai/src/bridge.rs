@@ -286,7 +286,8 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
 /// the outer code is the generic `invalid_request_error`.
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-    let body = resp.bytes().await.unwrap_or_default();
+    let body =
+        aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
     let kind = parse_azure_error_code(&body);
     let message = match status.as_u16() {
         401 | 403 => "upstream authentication failed".to_string(),
@@ -1347,6 +1348,45 @@ mod tests {
                 );
             }
             other => panic!("expected UpstreamStatus with retry_after, got {other:?}"),
+        }
+    }
+
+    /// Audit fix (PR #323 MEDIUM-2): structured-parse path —
+    /// Azure-specific `inner_error.code = ResponsibleAIPolicyViolation`
+    /// must surface as `parsed.kind`, not be flattened under the outer
+    /// `error.code`. `wire: AzureOpenAI` must be set so the
+    /// translation layer picks the Azure-aware code map.
+    /// `parsed.message` stays `None` (deployment id leak).
+    #[tokio::test]
+    async fn chat_400_with_inner_error_responsible_ai_lifts_kind() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_raw(
+                br#"{"error":{"code":"invalid_request_error","message":"blocked","inner_error":{"code":"ResponsibleAIPolicyViolation"}}}"#.as_slice(),
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        let bridge =
+            AzureOpenAiBridge::new().with_url_override(mock_chat_url(&server.uri(), "gpt4o-prod"));
+        let ctx = canonical_test_ctx();
+        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        match err {
+            BridgeError::UpstreamStatus {
+                status,
+                wire,
+                parsed,
+                ..
+            } => {
+                assert_eq!(status, 400);
+                assert_eq!(wire, aisix_gateway::UpstreamWire::AzureOpenAI);
+                let parsed = parsed.expect("inner_error parsed");
+                assert_eq!(parsed.kind.as_deref(), Some("ResponsibleAIPolicyViolation"));
+                assert!(parsed.message.is_none());
+            }
+            other => panic!("expected UpstreamStatus, got {other:?}"),
         }
     }
 
