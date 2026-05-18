@@ -83,7 +83,7 @@ Example response shape:
       "allowed_models": ["gpt-4o-prod"]
     }
   },
-  "plaintext": "sk-abcd1234ef567890"
+  "plaintext": "sk-550e8400e29b41d4a716446655440000"
 }
 ```
 
