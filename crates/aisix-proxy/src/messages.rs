@@ -26,7 +26,7 @@
 //! side can handle them consistently regardless of which endpoint was used.
 
 use aisix_core::models::Provider;
-use aisix_obs::{AccessLog, LlmUsage, RequestOutcome, UsageEvent, UsageLabels};
+use aisix_obs::{AccessLog, LlmUsage, RequestLabels, RequestOutcome, UsageEvent, UsageLabels};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -88,6 +88,21 @@ pub async fn messages(
                 RequestOutcome::from_status(status),
                 elapsed,
             );
+            let outcome = RequestOutcome::from_status(status);
+            let labels = RequestLabels {
+                endpoint: "/v1/messages",
+                inbound_protocol: "anthropic",
+                provider: &provider_label,
+                model: &model_name,
+                api_key_id: &api_key_id,
+                team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
+                owner_id: auth.key().owner_id.as_deref().unwrap_or("unknown"),
+                status,
+                outcome,
+                ..RequestLabels::default()
+            };
+            state.metrics.record_proxy_request(labels, elapsed);
+            state.metrics.record_llm_request(labels, elapsed);
             emit_anthropic_usage_event(
                 &state,
                 &request_id,

@@ -134,13 +134,14 @@ pub(crate) async fn enforce<'a>(
     model_rl: Option<&ModelRateLimit>,
 ) -> Result<MultiReservation<'a, aisix_ratelimit::SystemClock>, ProxyError> {
     let decision = state.budgets.check(&auth.entry.id).await;
+    let budget_labels = aisix_obs::BudgetLabels {
+        api_key_id: &auth.entry.id,
+        team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
+        owner_id: auth.key().owner_id.as_deref().unwrap_or("unknown"),
+    };
     if let Some(budget) = decision.budget.as_ref() {
         state.metrics.set_budget_gauges(
-            aisix_obs::BudgetLabels {
-                api_key_id: &auth.entry.id,
-                team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-                owner_id: auth.key().owner_id.as_deref().unwrap_or("unknown"),
-            },
+            budget_labels,
             aisix_obs::BudgetGauges {
                 limit_usd: budget.limit_usd,
                 spent_usd: budget.spent_usd,
@@ -148,6 +149,8 @@ pub(crate) async fn enforce<'a>(
                 reset_seconds: budget.reset_seconds,
             },
         );
+    } else {
+        state.metrics.clear_budget_gauges(budget_labels);
     }
     if !decision.allowed {
         return Err(ProxyError::BudgetExceeded(

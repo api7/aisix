@@ -19,7 +19,9 @@
 use aisix_cache::CacheKey;
 use aisix_gateway::{BridgeContext, BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
-use aisix_obs::{AccessLog, LlmUsage, Metrics, RequestOutcome, UsageEvent, UsageLabels};
+use aisix_obs::{
+    AccessLog, LlmUsage, Metrics, RequestLabels, RequestOutcome, UsageEvent, UsageLabels,
+};
 use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -447,19 +449,9 @@ async fn dispatch(
     // cp-api returns a cached/live decision per api_key.
     let decision = state.budgets.check(&auth.entry.id).await;
     if let Some(budget) = decision.budget.as_ref() {
-        state.metrics.set_budget_gauges(
-            aisix_obs::BudgetLabels {
-                api_key_id: &auth.entry.id,
-                team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-                owner_id: auth.key().owner_id.as_deref().unwrap_or("unknown"),
-            },
-            aisix_obs::BudgetGauges {
-                limit_usd: budget.limit_usd,
-                spent_usd: budget.spent_usd,
-                remaining_usd: budget.remaining_usd,
-                reset_seconds: budget.reset_seconds,
-            },
-        );
+        record_budget_gauges(&state.metrics, auth, Some(budget));
+    } else {
+        record_budget_gauges(&state.metrics, auth, None);
     }
     if !decision.allowed {
         return Err(with_model(ProxyError::BudgetExceeded(
@@ -1190,6 +1182,20 @@ fn record_success(
 ) {
     let outcome = RequestOutcome::from_status(status);
     metrics.record_request(provider, model, status, outcome, elapsed);
+    let request_labels = RequestLabels {
+        endpoint: "/v1/chat/completions",
+        inbound_protocol: "openai",
+        provider,
+        model,
+        api_key_id,
+        team_id: team_id.unwrap_or("unknown"),
+        owner_id: owner_id.unwrap_or("unknown"),
+        status,
+        outcome,
+        ..RequestLabels::default()
+    };
+    metrics.record_proxy_request(request_labels, elapsed);
+    metrics.record_llm_request(request_labels, elapsed);
     if let Some(total) = s.total_tokens {
         metrics.record_tokens(provider, model, total);
     }
@@ -1211,6 +1217,31 @@ fn record_success(
             spend_usd: s.cost_usd,
         },
     );
+}
+
+fn record_budget_gauges(
+    metrics: &Metrics,
+    auth: &AuthenticatedKey,
+    budget: Option<&crate::budget::BudgetDetails>,
+) {
+    let labels = aisix_obs::BudgetLabels {
+        api_key_id: &auth.entry.id,
+        team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
+        owner_id: auth.key().owner_id.as_deref().unwrap_or("unknown"),
+    };
+    if let Some(budget) = budget {
+        metrics.set_budget_gauges(
+            labels,
+            aisix_obs::BudgetGauges {
+                limit_usd: budget.limit_usd,
+                spent_usd: budget.spent_usd,
+                remaining_usd: budget.remaining_usd,
+                reset_seconds: budget.reset_seconds,
+            },
+        );
+    } else {
+        metrics.clear_budget_gauges(labels);
+    }
 }
 
 /// Push one telemetry event onto the CP-side sink **and** fan it out

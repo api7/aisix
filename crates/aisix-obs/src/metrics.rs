@@ -54,6 +54,7 @@ pub const M_BUDGET_LIMIT_USD: &str = "aisix_budget_limit_usd";
 pub const M_BUDGET_SPENT_USD: &str = "aisix_budget_spent_usd";
 pub const M_BUDGET_REMAINING_USD: &str = "aisix_budget_remaining_usd";
 pub const M_BUDGET_RESET_SECONDS: &str = "aisix_budget_reset_seconds";
+pub const M_BUDGET_DETAILS_PRESENT: &str = "aisix_budget_details_present";
 pub const M_REDIS_FAILURES_TOTAL: &str = "aisix_redis_failures_total";
 pub const M_USAGE_EVENT_DROPS_TOTAL: &str = "aisix_usage_event_drops_total";
 pub const M_OTLP_FANOUT_DROPS_TOTAL: &str = "aisix_otlp_fanout_drops_total";
@@ -127,15 +128,6 @@ impl Metrics {
             )
             .record(duration.as_secs_f64());
         });
-        let labels = RequestLabels {
-            provider,
-            model,
-            status,
-            outcome,
-            ..RequestLabels::default()
-        };
-        self.record_proxy_request(labels, duration);
-        self.record_llm_request(labels, duration);
     }
 
     pub fn record_ratelimit_rejection(&self, scope: &str) {
@@ -346,6 +338,7 @@ impl Metrics {
 
     pub fn set_budget_gauges(&self, labels: BudgetLabels<'_>, budget: BudgetGauges) {
         metrics::with_local_recorder(&self.inner.recorder, || {
+            labels.record_gauge(M_BUDGET_DETAILS_PRESENT, 1.0);
             if let Some(value) = budget.limit_usd {
                 labels.record_gauge(M_BUDGET_LIMIT_USD, value);
             }
@@ -358,6 +351,12 @@ impl Metrics {
             if let Some(value) = budget.reset_seconds {
                 labels.record_gauge(M_BUDGET_RESET_SECONDS, value as f64);
             }
+        });
+    }
+
+    pub fn clear_budget_gauges(&self, labels: BudgetLabels<'_>) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            labels.record_gauge(M_BUDGET_DETAILS_PRESENT, 0.0);
         });
     }
 

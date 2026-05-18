@@ -27,39 +27,12 @@ describe("prometheus metrics e2e", () => {
     if (!etcdReachable) return;
 
     upstream = await startOpenAiUpstream({
-      nonStreamBody: {
-        id: "chatcmpl-prom-1",
-        object: "chat.completion",
-        created: Math.floor(Date.now() / 1000),
-        model: "gpt-4o-mini",
-        choices: [
-          {
-            index: 0,
-            message: { role: "assistant", content: "hello" },
-            finish_reason: "stop",
-          },
-        ],
-        usage: { prompt_tokens: 11, completion_tokens: 13, total_tokens: 24 },
-      },
+      nonStreamBody: responseBody(),
     });
     app = await spawnApp();
     admin = new AdminClient(app.adminUrl, app.adminKey);
 
-    const pk = await admin.createProviderKey({
-      display_name: "prometheus-openai",
-      secret: "sk-mock",
-      api_base: `${upstream.baseUrl}/v1`,
-    });
-    await admin.createModel({
-      display_name: "prometheus-gpt",
-      provider: "openai",
-      model_name: "gpt-4o-mini",
-      provider_key_id: pk.id,
-    });
-    await admin.createApiKey({
-      key_hash: CALLER_KEY_HASH,
-      allowed_models: ["prometheus-gpt"],
-    });
+    await configureOpenAi(admin, upstream, "prometheus-gpt");
   });
 
   afterAll(async () => {
@@ -98,8 +71,106 @@ describe("prometheus metrics e2e", () => {
     expect(text).toContain("aisix_llm_output_tokens_total");
     expect(text).toContain("aisix_llm_total_tokens_total");
     expect(text).toContain("aisix_proxy_in_flight_requests");
-    expect(text).toContain('endpoint="/v1/chat/completions"');
+    expect(text).toMatch(
+      /aisix_proxy_requests_total\{[^}]*endpoint="\/v1\/chat\/completions"[^}]*model="prometheus-gpt"[^}]*status="200"/,
+    );
+    expect(text).toMatch(
+      /aisix_llm_requests_total\{[^}]*endpoint="\/v1\/chat\/completions"[^}]*model="prometheus-gpt"[^}]*status="200"/,
+    );
     expect(text).toContain('team_id="unknown"');
     expect(text).toContain('owner_id="unknown"');
   });
+
+  test("custom prometheus path is used for scrapes", async (ctx) => {
+    if (!etcdReachable) {
+      ctx.skip();
+      return;
+    }
+
+    const customUpstream = await startOpenAiUpstream({
+      nonStreamBody: responseBody(),
+    });
+    const customApp = await spawnApp({ prometheusPath: "/custom-metrics" });
+    try {
+      const customAdmin = new AdminClient(customApp.adminUrl, customApp.adminKey);
+      await configureOpenAi(customAdmin, customUpstream, "prometheus-custom-gpt");
+      const proxy = new ProxyClient(customApp.proxyUrl, CALLER_PLAINTEXT);
+      await waitConfigPropagation(async () => {
+        const probe = await proxy.chat({
+          model: "prometheus-custom-gpt",
+          messages: [{ role: "user", content: "ready" }],
+        });
+        return probe.status === 200;
+      });
+
+      const defaultScrape = await fetch(`${customApp.adminUrl}/metrics`);
+      expect(defaultScrape.status).toBe(404);
+
+      const scrape = await fetch(`${customApp.adminUrl}/custom-metrics`);
+      expect(scrape.status).toBe(200);
+      const text = await scrape.text();
+      expect(text).toMatch(
+        /aisix_proxy_requests_total\{[^}]*endpoint="\/v1\/chat\/completions"[^}]*model="prometheus-custom-gpt"/,
+      );
+      expect(text).toContain("aisix_llm_total_tokens_total");
+    } finally {
+      await customApp.exit();
+      await customUpstream.close();
+    }
+  });
+
+  test("disabled prometheus endpoint is not mounted", async (ctx) => {
+    if (!etcdReachable) {
+      ctx.skip();
+      return;
+    }
+
+    const disabledApp = await spawnApp({ prometheus: false });
+    try {
+      const scrape = await fetch(`${disabledApp.adminUrl}/metrics`);
+      expect(scrape.status).toBe(404);
+      expect(await scrape.text()).not.toContain("aisix_");
+    } finally {
+      await disabledApp.exit();
+    }
+  });
 });
+
+function responseBody() {
+  return {
+    id: "chatcmpl-prom-1",
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: "gpt-4o-mini",
+    choices: [
+      {
+        index: 0,
+        message: { role: "assistant", content: "hello" },
+        finish_reason: "stop",
+      },
+    ],
+    usage: { prompt_tokens: 11, completion_tokens: 13, total_tokens: 24 },
+  };
+}
+
+async function configureOpenAi(
+  admin: AdminClient,
+  upstream: OpenAiUpstream,
+  modelName: string,
+) {
+  const pk = await admin.createProviderKey({
+    display_name: `${modelName}-pk`,
+    secret: "sk-mock",
+    api_base: `${upstream.baseUrl}/v1`,
+  });
+  await admin.createModel({
+    display_name: modelName,
+    provider: "openai",
+    model_name: "gpt-4o-mini",
+    provider_key_id: pk.id,
+  });
+  await admin.createApiKey({
+    key_hash: CALLER_KEY_HASH,
+    allowed_models: [modelName],
+  });
+}

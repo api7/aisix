@@ -14,6 +14,8 @@ export interface AppOverrides {
   adminKey?: string;
   /** Whether to enable Prometheus on `/metrics`. Defaults to true. */
   prometheus?: boolean;
+  /** Prometheus scrape path. Defaults to `/metrics`. */
+  prometheusPath?: string;
   /** Extra raw config keys merged into the YAML at the top level. */
   extra?: Record<string, unknown>;
 }
@@ -66,7 +68,10 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
       log_level: "warn",
       access_log: false,
       metrics: {
-        prometheus: { enabled: overrides.prometheus ?? true, path: "/metrics" },
+        prometheus: {
+          enabled: overrides.prometheus ?? true,
+          path: overrides.prometheusPath ?? "/metrics",
+        },
         otlp: { enabled: false, endpoint: "http://127.0.0.1:4317" },
       },
       tracing: { otlp: { enabled: false, endpoint: "http://127.0.0.1:4317", sample_ratio: 1 } },
