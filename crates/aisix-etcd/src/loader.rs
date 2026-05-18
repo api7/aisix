@@ -351,7 +351,7 @@ mod tests {
     fn schema_failure_is_counted() {
         let entries = vec![raw(
             "/aisix/models/bad-provider",
-            br#"{"display_name":"x","provider":"mistral","model_name":"large","provider_key_id":"pk-1"}"#,
+            br#"{"display_name":"x","provider":"this-is-not-a-provider-id","model_name":"large","provider_key_id":"pk-1"}"#,
             1,
         )];
         let (_snap, stats) = build_snapshot("/aisix", &entries);
@@ -404,7 +404,7 @@ mod tests {
     fn rejection_records_schema_failure() {
         let entries = vec![raw(
             "/aisix/models/bad",
-            br#"{"display_name":"x","provider":"mistral","model_name":"l","provider_key_id":"pk"}"#,
+            br#"{"display_name":"x","provider":"this-is-not-a-provider-id","model_name":"l","provider_key_id":"pk"}"#,
             1,
         )];
         let (_snap, stats) = build_snapshot("/aisix", &entries);
