@@ -225,6 +225,25 @@ async fn dispatch(
         *m = Value::String(upstream_model.clone());
     }
 
+    // Apply the PK's `request.*` override block to the outbound
+    // body. Mirrors the OpenAI dispatch path's `prepare_outbound_body`
+    // in `crates/aisix-provider-openai/src/bridge.rs:317-323`. The
+    // OpenAI bridge applies the same primitives via the Hub dispatch,
+    // but the Anthropic-passthrough path bypasses the Hub and builds
+    // the request directly here — without this block the override
+    // pipeline silently no-ops on `/v1/messages` (issue #302 §5
+    // contract; tracked as ai-gateway#335 for the gap-as-shipped).
+    //
+    // Apply order matches §5: renames → constraints → defaults. Each
+    // primitive is a no-op when its configured map is empty.
+    if let Some(r) = pk_entry.value.request.as_ref() {
+        aisix_provider_openai::overrides::apply_param_renames(body, &r.param_renames);
+        if let Some(constraints) = &r.param_constraints {
+            aisix_provider_openai::overrides::apply_param_constraints(body, constraints);
+        }
+        aisix_provider_openai::overrides::apply_default_body_fields(body, &r.default_body_fields);
+    }
+
     // Build the target URL. build_v1_url tolerates the rare case
     // where the customer mistakenly puts `/v1` in the Anthropic
     // api_base (the dashboard placeholder uses the OpenAI form, so
@@ -238,14 +257,41 @@ async fn dispatch(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Build the outbound HeaderMap explicitly so the PK's
+    // `request.default_headers` block can inject operator-supplied
+    // headers via the shared apply pipeline. The bridge-owned
+    // headers (x-api-key, anthropic-version, content-type,
+    // x-aisix-request-id) are inserted FIRST — `apply_default_headers`
+    // skips keys already present + the reserved auth-header blacklist
+    // (`x-api-key` is in `RESERVED_DEFAULT_HEADERS`), so operator
+    // headers can never clobber auth here (ai-gateway#337).
+    let mut headers = axum::http::HeaderMap::new();
+    let api_key_hv = HeaderValue::from_str(api_key).map_err(|e| {
+        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+            "api key contains invalid header chars: {e}"
+        )))
+    })?;
+    headers.insert(HeaderName::from_static("x-api-key"), api_key_hv);
+    headers.insert(
+        HeaderName::from_static("anthropic-version"),
+        HeaderValue::from_static(ANTHROPIC_VERSION),
+    );
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let rid_hv = HeaderValue::from_str(request_id).map_err(|e| {
+        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+            "request_id contains invalid header chars: {e}"
+        )))
+    })?;
+    headers.insert(HeaderName::from_static("x-aisix-request-id"), rid_hv);
+    if let Some(r) = pk_entry.value.request.as_ref() {
+        aisix_provider_openai::overrides::apply_default_headers(&mut headers, &r.default_headers);
+    }
+
     let client = crate::http_client::client();
-    let req_builder = client
-        .post(&url)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .header("content-type", "application/json")
-        .header("x-aisix-request-id", request_id)
-        .json(body);
+    let req_builder = client.post(&url).headers(headers).json(body);
 
     let upstream_resp = req_builder
         .send()
@@ -912,6 +958,244 @@ mod tests {
         // Verify mock received the request (meaning the model field was
         // rewritten and the call was forwarded).
         upstream.verify().await;
+    }
+
+    // ─── /v1/messages × Anthropic passthrough × RequestOverrides ──────
+    //
+    // The four override primitives the OpenAI bridge applies on every
+    // outbound chat request (param_renames / param_constraints /
+    // default_body_fields / default_headers) must apply identically on
+    // the Anthropic passthrough path too. These tests boot a mock
+    // upstream that strict-matches the EXPECTED outbound body shape /
+    // header after each override is applied — if the override silently
+    // no-ops the matcher rejects the request and wiremock 404s, which
+    // surfaces as a non-200 status here.
+    //
+    // Issue refs: ai-gateway#335 (`apply_param_constraints` not wired
+    // on /v1/messages), ai-gateway#337 (same gap for
+    // `apply_default_headers`). Same site / same fix covers
+    // `param_renames` and `default_body_fields`.
+
+    /// Build an Anthropic ProviderKey JSON with the given request
+    /// override block. Mirrors `anthropic_pk` plus a `request: {...}`
+    /// field that round-trips through serde.
+    fn anthropic_pk_with_request_overrides(
+        api_base: &str,
+        request_overrides: serde_json::Value,
+    ) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = serde_json::json!({
+            "display_name": "anthropic-up",
+            "secret": "sk-ant-test",
+            "api_base": api_base,
+            "request": request_overrides,
+        });
+        let pk: aisix_core::ProviderKey = serde_json::from_value(json).unwrap();
+        ResourceEntry::new(ANTHROPIC_PK_ID, pk, 1)
+    }
+
+    fn new_snap_anthropic_with_overrides(
+        api_base: &str,
+        request_overrides: serde_json::Value,
+    ) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(anthropic_pk_with_request_overrides(
+                api_base,
+                request_overrides,
+            ));
+        snap
+    }
+
+    #[tokio::test]
+    async fn anthropic_passthrough_applies_param_renames() {
+        // ai-gateway#335 / #337 root cause: messages.rs bypassed the
+        // override apply pipeline. This test verifies the rename
+        // primitive now fires on outbound. mock-llm matcher is
+        // strict on body — the rename MUST be applied or wiremock
+        // returns 404.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"max_tokens_to_sample": 100}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic_with_overrides(
+            &upstream.uri(),
+            serde_json::json!({
+                "param_renames": {"max_tokens": "max_tokens_to_sample"}
+            }),
+        );
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({
+            "model": "claude-haiku",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100
+        });
+        let resp = app.oneshot(make_req(body)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "rename must rewrite max_tokens → max_tokens_to_sample on outbound"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_passthrough_clamps_temperature_via_param_constraints() {
+        // ai-gateway#335: caller temperature 0.9 with override max 0.5
+        // must arrive upstream as 0.5. The mock body matcher strict-
+        // checks temperature == 0.5 — wiremock 404s on mismatch.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"temperature": 0.5}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic_with_overrides(
+            &upstream.uri(),
+            serde_json::json!({
+                "param_constraints": {"temperature_max": 0.5}
+            }),
+        );
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({
+            "model": "claude-haiku",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+            "temperature": 0.9
+        });
+        let resp = app.oneshot(make_req(body)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "temperature must clamp from 0.9 to 0.5 on outbound"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_passthrough_fills_default_body_fields_when_caller_omits() {
+        // ai-gateway#335 sibling: caller omits top_p, override
+        // populates it on outbound.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"top_p": 0.9}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic_with_overrides(
+            &upstream.uri(),
+            serde_json::json!({
+                "default_body_fields": {"top_p": 0.9}
+            }),
+        );
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({
+            "model": "claude-haiku",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100
+        });
+        let resp = app.oneshot(make_req(body)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "missing top_p must be filled with override default 0.9"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_passthrough_injects_default_headers() {
+        // ai-gateway#337: operator-injected custom header reaches
+        // upstream. Strict header matcher on wiremock surfaces a 404
+        // on miss.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-tenant-id", "acme-prod-42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic_with_overrides(
+            &upstream.uri(),
+            serde_json::json!({
+                "default_headers": {"x-tenant-id": "acme-prod-42"}
+            }),
+        );
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({
+            "model": "claude-haiku",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100
+        });
+        let resp = app.oneshot(make_req(body)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "operator-injected x-tenant-id header must reach upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_passthrough_default_headers_cannot_overwrite_x_api_key() {
+        // Defense-in-depth: `x-api-key` is in
+        // `aisix_provider_openai::overrides::RESERVED_DEFAULT_HEADERS`
+        // — even if cp-api validation slips and lets the operator
+        // register a default_headers entry with `x-api-key`, the apply
+        // function MUST drop it so the PK's secret remains the auth
+        // value upstream sees.
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            // Strict: must match the PK's secret, NOT the override value.
+            .and(header("x-api-key", "sk-ant-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic_with_overrides(
+            &upstream.uri(),
+            serde_json::json!({
+                "default_headers": {"x-api-key": "sk-attacker-hijack"}
+            }),
+        );
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({
+            "model": "claude-haiku",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100
+        });
+        let resp = app.oneshot(make_req(body)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "reserved x-api-key header must NOT be overwritten by default_headers"
+        );
     }
 
     #[tokio::test]

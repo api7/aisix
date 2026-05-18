@@ -14,10 +14,16 @@ aisix-gateway = { path = "../aisix-gateway" }
 # /v1/messages handler reaches into the Anthropic wire helpers
 # (parse_inbound_request / chat_response_into_anthropic_json /
 # AnthropicSseEncoder) so it can translate Anthropic-protocol
-# requests into ChatFormat for any upstream and back. This is the
-# only provider crate the proxy depends on directly — others stay
-# behind the Bridge trait.
+# requests into ChatFormat for any upstream and back. The
+# Anthropic-passthrough branch also reaches into aisix-provider-openai's
+# `overrides::apply_*` primitives so the PK `request.*` block (param
+# renames, constraints, default body fields, default headers) takes
+# effect on outbound `/v1/messages` requests — without this the
+# override pipeline silently no-ops on the Anthropic path (#335 /
+# #337). These two crates are the only provider crates the proxy
+# depends on directly — others stay behind the Bridge trait.
 aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
+aisix-provider-openai = { path = "../aisix-provider-openai" }
 aisix-obs = { path = "../aisix-obs" }
 aisix-ratelimit = { path = "../aisix-ratelimit" }
 aisix-cache = { path = "../aisix-cache" }
@@ -52,7 +58,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
-aisix-provider-openai = { path = "../aisix-provider-openai" }
-# aisix-provider-anthropic moved to [dependencies] so the /v1/messages
-# handler can use its inbound wire helpers in non-test builds too.
+# aisix-provider-anthropic + aisix-provider-openai moved to
+# [dependencies] so the /v1/messages handler can use their primitives
+# in non-test builds too.
 wiremock.workspace = true
