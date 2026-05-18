@@ -73,6 +73,40 @@ const GOOGLE_DEFAULT_BASE: &str = "https://generativelanguage.googleapis.com/v1b
 /// URL — that constant stays as-is.
 const COHERE_DEFAULT_BASE: &str = "https://api.cohere.com/compatibility/v1";
 
+// ─── Long-tail OpenAI-adapter provider default base URLs (#60 P2-A) ──
+//
+// Each constant is the vendor's documented OpenAI-compat chat
+// endpoint. Operators can override per-PK via `api_base`; these
+// constants only cover the degenerate config path where no api_base
+// is set on the resource. URLs sourced from each vendor's official
+// docs cited inline.
+//
+// Per https://console.groq.com/docs/openai
+const GROQ_DEFAULT_BASE: &str = "https://api.groq.com/openai/v1";
+// Per https://docs.mistral.ai/api/
+const MISTRAL_DEFAULT_BASE: &str = "https://api.mistral.ai/v1";
+// Per https://docs.together.ai/docs/openai-api-compatibility
+const TOGETHERAI_DEFAULT_BASE: &str = "https://api.together.xyz/v1";
+// Per https://docs.fireworks.ai/getting-started/quickstart
+const FIREWORKS_AI_DEFAULT_BASE: &str = "https://api.fireworks.ai/inference/v1";
+// Per https://docs.perplexity.ai/api-reference/chat-completions-post
+// (chat endpoint is at the host root, NOT /v1).
+const PERPLEXITY_DEFAULT_BASE: &str = "https://api.perplexity.ai";
+// Per https://docs.x.ai/docs/api-reference
+const XAI_DEFAULT_BASE: &str = "https://api.x.ai/v1";
+// Per https://platform.moonshot.cn/docs/api/chat
+const MOONSHOTAI_DEFAULT_BASE: &str = "https://api.moonshot.cn/v1";
+// Per https://help.aliyun.com/zh/dashscope/developer-reference/compatibility-of-openai-with-dashscope
+const ALIBABA_DEFAULT_BASE: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+// Per https://www.bigmodel.cn/dev/api (OpenAI-compat at /api/paas/v4)
+const ZHIPUAI_DEFAULT_BASE: &str = "https://open.bigmodel.cn/api/paas/v4";
+// Per https://docs.baseten.co/development/model-apis/openai-clients
+const BASETEN_DEFAULT_BASE: &str = "https://inference.baseten.co/v1";
+// Per https://huggingface.co/docs/inference-providers/index#openai-compatible-api
+const HUGGINGFACE_DEFAULT_BASE: &str = "https://router.huggingface.co/v1";
+// Per https://inference-docs.cerebras.ai/api-reference/openai-compatibility
+const CEREBRAS_DEFAULT_BASE: &str = "https://api.cerebras.ai/v1";
+
 /// Path suffixes the bridge appends to `api_base` when building upstream
 /// URLs. If an operator accidentally pastes the full upstream URL into
 /// `api_base` (e.g. `https://api.openai.com/v1/chat/completions`),
@@ -121,6 +155,19 @@ impl OpenAiBridge {
             "deepseek" => DEEPSEEK_DEFAULT_BASE,
             "google" => GOOGLE_DEFAULT_BASE,
             "cohere" => COHERE_DEFAULT_BASE,
+            // Long-tail OpenAI-adapter providers (#60 P2-A).
+            "groq" => GROQ_DEFAULT_BASE,
+            "mistral" => MISTRAL_DEFAULT_BASE,
+            "togetherai" => TOGETHERAI_DEFAULT_BASE,
+            "fireworks-ai" => FIREWORKS_AI_DEFAULT_BASE,
+            "perplexity" => PERPLEXITY_DEFAULT_BASE,
+            "xai" => XAI_DEFAULT_BASE,
+            "moonshotai" => MOONSHOTAI_DEFAULT_BASE,
+            "alibaba" => ALIBABA_DEFAULT_BASE,
+            "zhipuai" => ZHIPUAI_DEFAULT_BASE,
+            "baseten" => BASETEN_DEFAULT_BASE,
+            "huggingface" => HUGGINGFACE_DEFAULT_BASE,
+            "cerebras" => CEREBRAS_DEFAULT_BASE,
             _ => OPENAI_DEFAULT_BASE,
         }
     }
@@ -1269,6 +1316,65 @@ data: [DONE]\n\n";
         assert_eq!(resp.message.role, Role::Assistant);
         assert_eq!(resp.message.content, "hello from cohere");
         assert_eq!(resp.usage.total_tokens, 7);
+    }
+
+    /// Each long-tail OpenAI-adapter provider's `with_name(...)` variant
+    /// (#60 P2-A) must fall back to the vendor-specific default base
+    /// when the operator left `api_base` empty on the PK. A regression
+    /// that lost the arm for any single variant would silently route
+    /// that provider's chat traffic to OpenAI's API host —
+    /// catastrophically leaking the customer's tokens AND the
+    /// upstream's vendor identity.
+    #[test]
+    fn long_tail_with_name_variants_default_base_targets_vendor_endpoint() {
+        let expected = [
+            ("groq", "https://api.groq.com/openai/v1"),
+            ("mistral", "https://api.mistral.ai/v1"),
+            ("togetherai", "https://api.together.xyz/v1"),
+            ("fireworks-ai", "https://api.fireworks.ai/inference/v1"),
+            ("perplexity", "https://api.perplexity.ai"),
+            ("xai", "https://api.x.ai/v1"),
+            ("moonshotai", "https://api.moonshot.cn/v1"),
+            (
+                "alibaba",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            ),
+            ("zhipuai", "https://open.bigmodel.cn/api/paas/v4"),
+            ("baseten", "https://inference.baseten.co/v1"),
+            ("huggingface", "https://router.huggingface.co/v1"),
+            ("cerebras", "https://api.cerebras.ai/v1"),
+        ];
+        for (name, expected_base) in expected {
+            let bridge = OpenAiBridge::new().with_name(name);
+            let pk: ProviderKey =
+                serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
+            let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
+            assert_eq!(
+                bridge.resolve_base(&ctx),
+                expected_base,
+                "with_name(\"{name}\") must fall back to {expected_base} when api_base is unset; \
+                 a missing arm silently routes the provider to OpenAI's API host"
+            );
+        }
+    }
+
+    /// Operator-supplied `api_base` always wins. The long-tail
+    /// providers don't get the canonical-host synthesis tolerance
+    /// that openai / deepseek / cohere have, because their URL
+    /// conventions vary (some have `/v1`, some `/openai/v1`, some
+    /// `/inference/v1`, some `/api/paas/v4`) — the bridge can't
+    /// guess. Operators paste the documented URL on the dashboard.
+    /// This test pins that override semantic.
+    #[test]
+    fn long_tail_with_name_variants_respect_operator_api_base() {
+        let bridge = OpenAiBridge::new().with_name("groq");
+        let custom = "https://corporate-proxy.acme.internal/groq";
+        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_with_base(custom)));
+        assert_eq!(
+            bridge.resolve_base(&ctx),
+            custom,
+            "operator-supplied api_base must pass through for long-tail providers"
+        );
     }
 
     /// For Gemini and any future `with_name` variant, the bridge does not

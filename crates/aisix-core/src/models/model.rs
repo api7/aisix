@@ -44,6 +44,53 @@ pub enum Provider {
     /// verbatim with no transform. Jina's chat / embeddings APIs are
     /// out of scope for this phase.
     Jina,
+    // ─── OpenAI-adapter long-tail providers (#60 P2-A) ────────────────
+    //
+    // The 11 variants below all expose an OpenAI-compatible chat
+    // completions surface and route through `OpenAiBridge::with_name`
+    // — the same dispatch path Deepseek / Google already use. Default
+    // base URLs are sourced from each vendor's official OpenAI-compat
+    // documentation; operators can override via `ProviderKey.api_base`.
+    //
+    // serde casing is `lowercase` (inherited from the parent enum) so
+    // each variant's wire id is its single-token lowercase form. The
+    // `fireworks-ai` variant carries an explicit `#[serde(rename)]`
+    // because its catalog id (per models.dev) is hyphenated and would
+    // not survive the default lowercase rule.
+    /// Groq — OpenAI-compat at `https://api.groq.com/openai/v1`.
+    Groq,
+    /// Mistral AI — OpenAI-compat at `https://api.mistral.ai/v1`.
+    Mistral,
+    /// Together.ai — OpenAI-compat at `https://api.together.xyz/v1`.
+    Togetherai,
+    /// Fireworks AI — OpenAI-compat at `https://api.fireworks.ai/inference/v1`.
+    /// Wire id is the hyphenated `fireworks-ai` (matches the
+    /// models.dev catalog id used by cp-api's adapter_map).
+    #[serde(rename = "fireworks-ai")]
+    FireworksAi,
+    /// Perplexity — OpenAI-compat at `https://api.perplexity.ai`
+    /// (chat lives at the host root).
+    Perplexity,
+    /// xAI Grok — OpenAI-compat at `https://api.x.ai/v1`.
+    Xai,
+    /// Moonshot AI (Kimi) — OpenAI-compat at `https://api.moonshot.cn/v1`.
+    Moonshotai,
+    /// Alibaba Cloud DashScope — OpenAI-compat at
+    /// `https://dashscope.aliyuncs.com/compatible-mode/v1`.
+    Alibaba,
+    /// Zhipu AI (智谱) — OpenAI-compat at
+    /// `https://open.bigmodel.cn/api/paas/v4`.
+    Zhipuai,
+    /// Baseten — OpenAI-compat at `https://inference.baseten.co/v1`.
+    /// Per <https://docs.baseten.co/development/model-apis/openai-clients>,
+    /// model APIs are exposed at this host root.
+    Baseten,
+    /// Hugging Face — OpenAI-compat router at
+    /// `https://router.huggingface.co/v1` per
+    /// <https://huggingface.co/docs/inference-providers/en/index#openai-compatible-api>.
+    Huggingface,
+    /// Cerebras Inference — OpenAI-compat at `https://api.cerebras.ai/v1`.
+    Cerebras,
 }
 
 impl Provider {
@@ -55,6 +102,20 @@ impl Provider {
             Self::Deepseek => "https://api.deepseek.com",
             Self::Cohere => "https://api.cohere.com",
             Self::Jina => "https://api.jina.ai",
+            // Long-tail OpenAI-adapter providers (#60 P2-A) — each
+            // url is the vendor's documented OpenAI-compat endpoint.
+            Self::Groq => "https://api.groq.com/openai/v1",
+            Self::Mistral => "https://api.mistral.ai/v1",
+            Self::Togetherai => "https://api.together.xyz/v1",
+            Self::FireworksAi => "https://api.fireworks.ai/inference/v1",
+            Self::Perplexity => "https://api.perplexity.ai",
+            Self::Xai => "https://api.x.ai/v1",
+            Self::Moonshotai => "https://api.moonshot.cn/v1",
+            Self::Alibaba => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            Self::Zhipuai => "https://open.bigmodel.cn/api/paas/v4",
+            Self::Baseten => "https://inference.baseten.co/v1",
+            Self::Huggingface => "https://router.huggingface.co/v1",
+            Self::Cerebras => "https://api.cerebras.ai/v1",
         }
     }
 
@@ -66,6 +127,21 @@ impl Provider {
             Self::Deepseek => "deepseek",
             Self::Cohere => "cohere",
             Self::Jina => "jina",
+            // Long-tail OpenAI-adapter providers (#60 P2-A). The
+            // wire id matches the catalog id used by cp-api's
+            // adapter_map / models.dev.
+            Self::Groq => "groq",
+            Self::Mistral => "mistral",
+            Self::Togetherai => "togetherai",
+            Self::FireworksAi => "fireworks-ai",
+            Self::Perplexity => "perplexity",
+            Self::Xai => "xai",
+            Self::Moonshotai => "moonshotai",
+            Self::Alibaba => "alibaba",
+            Self::Zhipuai => "zhipuai",
+            Self::Baseten => "baseten",
+            Self::Huggingface => "huggingface",
+            Self::Cerebras => "cerebras",
         }
     }
 }
@@ -133,6 +209,20 @@ impl From<Provider> for Adapter {
             Provider::Deepseek => Adapter::Openai,
             Provider::Cohere => Adapter::Openai,
             Provider::Jina => Adapter::Openai,
+            // All long-tail variants (#60 P2-A) expose OpenAI-compat
+            // chat surfaces and route through OpenAiBridge.
+            Provider::Groq
+            | Provider::Mistral
+            | Provider::Togetherai
+            | Provider::FireworksAi
+            | Provider::Perplexity
+            | Provider::Xai
+            | Provider::Moonshotai
+            | Provider::Alibaba
+            | Provider::Zhipuai
+            | Provider::Baseten
+            | Provider::Huggingface
+            | Provider::Cerebras => Adapter::Openai,
         }
     }
 }

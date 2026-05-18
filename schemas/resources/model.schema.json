@@ -279,6 +279,90 @@
           "enum": [
             "jina"
           ]
+        },
+        {
+          "description": "Groq — OpenAI-compat at `https://api.groq.com/openai/v1`.",
+          "type": "string",
+          "enum": [
+            "groq"
+          ]
+        },
+        {
+          "description": "Mistral AI — OpenAI-compat at `https://api.mistral.ai/v1`.",
+          "type": "string",
+          "enum": [
+            "mistral"
+          ]
+        },
+        {
+          "description": "Together.ai — OpenAI-compat at `https://api.together.xyz/v1`.",
+          "type": "string",
+          "enum": [
+            "togetherai"
+          ]
+        },
+        {
+          "description": "Fireworks AI — OpenAI-compat at `https://api.fireworks.ai/inference/v1`. Wire id is the hyphenated `fireworks-ai` (matches the models.dev catalog id used by cp-api's adapter_map).",
+          "type": "string",
+          "enum": [
+            "fireworks-ai"
+          ]
+        },
+        {
+          "description": "Perplexity — OpenAI-compat at `https://api.perplexity.ai` (chat lives at the host root).",
+          "type": "string",
+          "enum": [
+            "perplexity"
+          ]
+        },
+        {
+          "description": "xAI Grok — OpenAI-compat at `https://api.x.ai/v1`.",
+          "type": "string",
+          "enum": [
+            "xai"
+          ]
+        },
+        {
+          "description": "Moonshot AI (Kimi) — OpenAI-compat at `https://api.moonshot.cn/v1`.",
+          "type": "string",
+          "enum": [
+            "moonshotai"
+          ]
+        },
+        {
+          "description": "Alibaba Cloud DashScope — OpenAI-compat at `https://dashscope.aliyuncs.com/compatible-mode/v1`.",
+          "type": "string",
+          "enum": [
+            "alibaba"
+          ]
+        },
+        {
+          "description": "Zhipu AI (智谱) — OpenAI-compat at `https://open.bigmodel.cn/api/paas/v4`.",
+          "type": "string",
+          "enum": [
+            "zhipuai"
+          ]
+        },
+        {
+          "description": "Baseten — OpenAI-compat at `https://inference.baseten.co/v1`. Per <https://docs.baseten.co/development/model-apis/openai-clients>, model APIs are exposed at this host root.",
+          "type": "string",
+          "enum": [
+            "baseten"
+          ]
+        },
+        {
+          "description": "Hugging Face — OpenAI-compat router at `https://router.huggingface.co/v1` per <https://huggingface.co/docs/inference-providers/en/index#openai-compatible-api>.",
+          "type": "string",
+          "enum": [
+            "huggingface"
+          ]
+        },
+        {
+          "description": "Cerebras Inference — OpenAI-compat at `https://api.cerebras.ai/v1`.",
+          "type": "string",
+          "enum": [
+            "cerebras"
+          ]
         }
       ]
     },
