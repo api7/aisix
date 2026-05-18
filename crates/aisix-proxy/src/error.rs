@@ -32,8 +32,13 @@ pub struct ErrorEnvelope {
 #[derive(Debug, Serialize, Clone)]
 pub struct ErrorBody {
     pub message: String,
+    /// `error.type` token. Was `&'static str` before #322 — widened to
+    /// owned `String` because the type can now reflect an upstream-
+    /// derived OpenAI taxonomy token (`rate_limit_exceeded`,
+    /// `insufficient_quota`, …) when the error_translate layer maps a
+    /// non-OpenAI upstream to OpenAI shape.
     #[serde(rename = "type")]
-    pub kind: &'static str,
+    pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub param: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,11 +46,11 @@ pub struct ErrorBody {
 }
 
 impl ErrorEnvelope {
-    pub fn new(message: impl Into<String>, kind: &'static str) -> Self {
+    pub fn new(message: impl Into<String>, kind: impl Into<String>) -> Self {
         Self {
             error: ErrorBody {
                 message: message.into(),
-                kind,
+                kind: kind.into(),
                 param: None,
                 code: None,
             },
@@ -155,12 +160,69 @@ impl ProxyError {
     }
 
     pub fn envelope(&self) -> ErrorEnvelope {
+        // Bridge-surface upstream errors get special handling: the
+        // bridge has best-effort-parsed the upstream envelope into a
+        // structured [`UpstreamErrorView`], and for same-wire 4xx
+        // (OpenAI upstream + OpenAI client) we forward the parsed
+        // fields directly instead of wrapping them inside the
+        // gateway's generic `upstream_error` envelope.
+        //
+        // 5xx and non-JSON bodies fall back to the generic envelope —
+        // upstream internal-server-error detail (engine names, queue
+        // depth, etc.) is operator-internal and must not bleed through.
+        // Cross-wire translation (Anthropic / Bedrock / Vertex / Azure
+        // → OpenAI shape) ships in a follow-up via `error_translate`.
+        if let ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamStatus {
+            status,
+            message,
+            parsed,
+            wire,
+            ..
+        }) = self
+        {
+            return render_bridge_upstream_envelope(*status, message, parsed.as_deref(), *wire);
+        }
         let env = ErrorEnvelope::new(self.to_string(), self.kind());
         match self {
             ProxyError::BudgetExceeded(_) => env.with_code("budget_exceeded"),
             _ => env,
         }
     }
+}
+
+/// Build the customer-visible envelope for an upstream HTTP error.
+///
+/// **Same-wire 4xx (OpenAI upstream → OpenAI client)**: forward parsed
+/// fields verbatim. Issue #322's main path — OpenAI SDK clients
+/// depend on `error.code` (`rate_limit_exceeded` vs `insufficient_quota`
+/// etc.) to drive retry strategy.
+///
+/// **5xx or non-JSON body or cross-wire**: emit the legacy generic
+/// `upstream_error` envelope. Cross-wire translation lands in commit 2
+/// of this fix.
+fn render_bridge_upstream_envelope(
+    status: u16,
+    message: &str,
+    parsed: Option<&aisix_gateway::UpstreamErrorView>,
+    wire: aisix_gateway::UpstreamWire,
+) -> ErrorEnvelope {
+    let is_4xx = (400..500).contains(&status);
+    if is_4xx && matches!(wire, aisix_gateway::UpstreamWire::OpenAI) {
+        if let Some(view) = parsed {
+            return ErrorEnvelope {
+                error: ErrorBody {
+                    message: view.message.clone().unwrap_or_else(|| message.to_string()),
+                    kind: view
+                        .kind
+                        .clone()
+                        .unwrap_or_else(|| "upstream_error".to_string()),
+                    param: view.param.clone(),
+                    code: view.code.clone(),
+                },
+            };
+        }
+    }
+    ErrorEnvelope::new(message.to_string(), "upstream_error")
 }
 
 impl IntoResponse for ProxyError {

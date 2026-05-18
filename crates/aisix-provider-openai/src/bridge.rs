@@ -237,21 +237,46 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
 }
 
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
-    let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-    let message = resp.text().await.unwrap_or_default();
-    BridgeError::upstream_status_with_retry_after(
-        status.as_u16(),
-        truncate(&message, 1024),
-        retry_after,
+    aisix_gateway::capture_upstream_error_http(
+        status,
+        resp,
+        aisix_gateway::UpstreamWire::OpenAI,
+        parse_openai_error_envelope,
     )
+    .await
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..n])
+/// Parse the canonical OpenAI error envelope:
+///
+/// ```json
+/// {"error": {"message": "...", "type": "...", "code": "...", "param": "..."}}
+/// ```
+///
+/// Returns `None` when the body is not JSON of that shape; the caller
+/// falls back to the truncated raw body string for the `message` field
+/// and emits a generic `upstream_error` envelope.
+///
+/// Reference: <https://platform.openai.com/docs/guides/error-codes/api-errors>
+fn parse_openai_error_envelope(body: &[u8]) -> Option<aisix_gateway::UpstreamErrorView> {
+    #[derive(serde::Deserialize)]
+    struct Outer {
+        error: Inner,
     }
+    #[derive(serde::Deserialize)]
+    struct Inner {
+        message: Option<String>,
+        #[serde(rename = "type")]
+        kind: Option<String>,
+        code: Option<String>,
+        param: Option<String>,
+    }
+    let outer: Outer = serde_json::from_slice(body).ok()?;
+    Some(aisix_gateway::UpstreamErrorView {
+        kind: outer.error.kind,
+        message: outer.error.message,
+        code: outer.error.code,
+        param: outer.error.param,
+    })
 }
 
 /// Wrap a future in the optional deadline. `None` → no timeout.

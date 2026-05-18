@@ -270,16 +270,24 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
 /// **Audit M1 — sensitive-info redaction:** Azure error envelopes
 /// (`{"error": {"code": "...", "message": "..."}}`) often include the
 /// operator-defined deployment id (e.g. "The API deployment for this
-/// resource does not exist.") or the resource hostname. Surfacing
-/// these verbatim to a downstream API caller leaks operator-internal
-/// taxonomy, so we map the status to a canned phrase here. The full
-/// upstream body still lives in the DP-side request log via
-/// `request_id` (tracing in callers), accessible to operators but not
-/// to customers.
+/// resource does not exist.") or the resource hostname. The
+/// customer-visible `message` stays a canned phrase. We do read
+/// `error.code` into [`UpstreamErrorView::kind`] — these are a small
+/// closed set of Azure-defined tokens (`DeploymentNotFound`,
+/// `content_filter`, …), stable taxonomy rather than operator data —
+/// so the envelope-translation layer can derive an OpenAI `code`.
+/// [`UpstreamErrorView::message`] stays `None`.
+///
+/// Azure-specific quirk: content-policy violations nest under
+/// `error.inner_error.code` *or* `error.innererror.code` (Azure emits
+/// both casings depending on endpoint).
+/// `"ResponsibleAIPolicyViolation"` on the inner code overrides the
+/// outer `code` so the gateway can recognise the policy hit even when
+/// the outer code is the generic `invalid_request_error`.
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-    // Drain the body to free the connection, but ignore the content.
-    let _ = resp.text().await;
+    let body = resp.bytes().await.unwrap_or_default();
+    let kind = parse_azure_error_code(&body);
     let message = match status.as_u16() {
         401 | 403 => "upstream authentication failed".to_string(),
         404 => "upstream deployment or model not found".to_string(),
@@ -287,10 +295,56 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
         409 => "upstream conflict".to_string(),
         413 => "upstream request entity too large".to_string(),
         429 => "upstream rate limited".to_string(),
-        500..=599 => format!("upstream returned {}", status.as_u16()),
         _ => format!("upstream returned {}", status.as_u16()),
     };
-    BridgeError::upstream_status_with_retry_after(status.as_u16(), message, retry_after)
+    let parsed = kind.as_ref().map(|_| {
+        Box::new(aisix_gateway::UpstreamErrorView {
+            kind: kind.clone(),
+            message: None,
+            code: None,
+            param: None,
+        })
+    });
+    BridgeError::UpstreamStatus {
+        status: status.as_u16(),
+        message,
+        parsed,
+        wire: aisix_gateway::UpstreamWire::AzureOpenAI,
+        retry_after,
+    }
+}
+
+/// Extract the Azure error code from the envelope, applying the
+/// `inner_error` / `innererror` content-policy quirk.
+fn parse_azure_error_code(body: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Outer {
+        error: Inner,
+    }
+    #[derive(serde::Deserialize)]
+    struct Inner {
+        code: Option<String>,
+        #[serde(rename = "inner_error")]
+        inner_error: Option<InnerInner>,
+        innererror: Option<InnerInner>,
+    }
+    #[derive(serde::Deserialize)]
+    struct InnerInner {
+        code: Option<String>,
+    }
+    let outer: Outer = serde_json::from_slice(body).ok()?;
+    let inner_code = outer
+        .error
+        .inner_error
+        .as_ref()
+        .or(outer.error.innererror.as_ref())
+        .and_then(|i| i.code.clone());
+    // Content-policy violation on `inner_error` overrides the outer
+    // generic code.
+    if inner_code.as_deref() == Some("ResponsibleAIPolicyViolation") {
+        return inner_code;
+    }
+    outer.error.code
 }
 
 /// Wrap a future in the optional deadline. `None` → no timeout.
@@ -1283,6 +1337,7 @@ mod tests {
                 status,
                 retry_after,
                 message,
+                ..
             } => {
                 assert_eq!(status, 429);
                 assert_eq!(retry_after, Some(std::time::Duration::from_secs(30)));

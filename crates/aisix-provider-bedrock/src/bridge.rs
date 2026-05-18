@@ -384,7 +384,14 @@ fn map_sdk_error(
 fn map_service_error(
     svc: ServiceError<InvokeModelError, aws_smithy_runtime_api::http::Response>,
 ) -> BridgeError {
-    let raw = svc.into_raw();
+    // SECURITY: AWS error messages embed operator-internal taxonomy
+    // (ARNs, region, account id, IAM role names). The canned status-
+    // keyed phrase reaches the customer; the parsed view surfaces only
+    // the AWS error CODE (e.g. "ThrottlingException") for the
+    // error_translate layer to translate to OpenAI / Anthropic shape.
+    // `parsed.message` is intentionally left `None`.
+    let kind = svc.err().meta().code().map(str::to_string);
+    let raw = svc.raw();
     let status = raw.status().as_u16();
     // Convert smithy HeaderMap → http::HeaderMap so we can reuse the
     // gateway-level `parse_retry_after` helper. Headers with invalid
@@ -404,12 +411,21 @@ fn map_service_error(
         404 => "upstream model not found".to_string(),
         408 => "upstream request timeout".to_string(),
         429 => "upstream rate limited".to_string(),
-        500..=599 => format!("upstream returned {status}"),
         _ => format!("upstream returned {status}"),
     };
+    let parsed = kind.as_ref().map(|k| {
+        Box::new(aisix_gateway::UpstreamErrorView {
+            kind: Some(k.clone()),
+            message: None,
+            code: None,
+            param: None,
+        })
+    });
     BridgeError::UpstreamStatus {
         status,
         message,
+        parsed,
+        wire: aisix_gateway::UpstreamWire::Bedrock,
         retry_after,
     }
 }
@@ -1323,6 +1339,7 @@ mod tests {
                 status,
                 message,
                 retry_after,
+                ..
             } => {
                 assert_eq!(status, 429);
                 assert_eq!(message, "upstream rate limited");

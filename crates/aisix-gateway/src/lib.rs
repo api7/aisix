@@ -25,7 +25,11 @@ pub mod chat;
 pub mod hub;
 pub mod sse;
 
-pub use bridge::{parse_retry_after, Bridge, BridgeContext, BridgeError, ChatChunkStream};
+pub use bridge::{
+    capture_upstream_error_http, parse_retry_after, Bridge, BridgeContext, BridgeError,
+    ChatChunkStream, UpstreamErrorView, UpstreamWire, MAX_UPSTREAM_ERROR_BODY_BYTES,
+    MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
+};
 pub use chat::{
     ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest,
     EmbeddingResponse, EmbeddingUsage, FinishReason, Role, UsageStats,

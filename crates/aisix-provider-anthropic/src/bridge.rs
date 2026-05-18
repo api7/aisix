@@ -131,21 +131,44 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
 }
 
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
-    let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-    let message = resp.text().await.unwrap_or_default();
-    BridgeError::upstream_status_with_retry_after(
-        status.as_u16(),
-        truncate(&message, 1024),
-        retry_after,
+    aisix_gateway::capture_upstream_error_http(
+        status,
+        resp,
+        aisix_gateway::UpstreamWire::Anthropic,
+        parse_anthropic_error_envelope,
     )
+    .await
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..n])
+/// Parse the Anthropic error envelope:
+///
+/// ```json
+/// {"type": "error", "error": {"type": "...", "message": "..."}}
+/// ```
+///
+/// Anthropic does not carry `code` or `param` fields — those stay
+/// `None`. The translation table at render time derives an OpenAI
+/// `code` from `kind` when crossing wire formats.
+///
+/// Reference: <https://docs.anthropic.com/en/api/errors>
+fn parse_anthropic_error_envelope(body: &[u8]) -> Option<aisix_gateway::UpstreamErrorView> {
+    #[derive(serde::Deserialize)]
+    struct Outer {
+        error: Inner,
     }
+    #[derive(serde::Deserialize)]
+    struct Inner {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+        message: Option<String>,
+    }
+    let outer: Outer = serde_json::from_slice(body).ok()?;
+    Some(aisix_gateway::UpstreamErrorView {
+        kind: outer.error.kind,
+        message: outer.error.message,
+        code: None,
+        param: None,
+    })
 }
 
 async fn with_deadline<T, F>(
@@ -371,10 +394,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
-            .respond_with(
-                ResponseTemplate::new(400)
-                    .set_body_string(r#"{"error":{"type":"invalid_request","message":"bad"}}"#),
-            )
+            .respond_with(ResponseTemplate::new(400).set_body_raw(
+                r#"{"error":{"type":"invalid_request","message":"bad"}}"#.as_bytes(),
+                "application/json",
+            ))
             .mount(&server)
             .await;
 
@@ -383,10 +406,19 @@ mod tests {
         let err = bridge.chat(&req(), &ctx).await.unwrap_err();
         match err {
             BridgeError::UpstreamStatus {
-                status, message, ..
+                status,
+                message,
+                parsed,
+                ..
             } => {
                 assert_eq!(status, 400);
-                assert!(message.contains("invalid_request"));
+                // After #322: bridge parses Anthropic envelope into a
+                // structured view; `message` is now the upstream's
+                // `error.message`, not the raw JSON body.
+                assert_eq!(message, "bad");
+                let parsed = parsed.expect("envelope parsed");
+                assert_eq!(parsed.kind.as_deref(), Some("invalid_request"));
+                assert_eq!(parsed.message.as_deref(), Some("bad"));
             }
             other => panic!("unexpected: {other:?}"),
         }

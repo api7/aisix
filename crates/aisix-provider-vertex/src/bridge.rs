@@ -262,10 +262,17 @@ where
 ///
 /// **Audit-aware:** Vertex error envelopes (`{"error": {"code":
 /// 403, "message": "Permission denied for project foo-bar-prod"}}`)
-/// leak operator project ids. We map to canned status-keyed phrases.
+/// leak operator project ids. The customer-visible `message` is a
+/// canned status-keyed phrase. We *do* read the upstream's
+/// `error.status` (a gRPC canonical code such as `"RESOURCE_EXHAUSTED"`)
+/// into [`UpstreamErrorView::kind`] so the envelope-translation layer
+/// can derive an OpenAI `code` — that token is a stable taxonomy
+/// label, not operator-internal data. [`UpstreamErrorView::message`]
+/// is intentionally left `None`.
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     let retry_after = aisix_gateway::parse_retry_after(resp.headers());
-    let _ = resp.text().await; // drain body, discard content
+    let body = resp.bytes().await.unwrap_or_default();
+    let kind = parse_vertex_error_status(&body);
     let message = match status.as_u16() {
         401 | 403 => "upstream authentication failed".to_string(),
         404 => "upstream model or endpoint not found".to_string(),
@@ -273,7 +280,40 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
         429 => "upstream rate limited".to_string(),
         _ => format!("upstream returned {}", status.as_u16()),
     };
-    BridgeError::upstream_status_with_retry_after(status.as_u16(), message, retry_after)
+    let parsed = kind.as_ref().map(|_| {
+        Box::new(aisix_gateway::UpstreamErrorView {
+            kind: kind.clone(),
+            message: None,
+            code: None,
+            param: None,
+        })
+    });
+    BridgeError::UpstreamStatus {
+        status: status.as_u16(),
+        message,
+        parsed,
+        wire: aisix_gateway::UpstreamWire::Vertex,
+        retry_after,
+    }
+}
+
+/// Extract just the `error.status` field (the gRPC canonical code) from
+/// a Vertex error body. The body shape is
+/// `{"error": {"code": int, "message": "...", "status": "...", "details": [...]}}`
+/// per <https://cloud.google.com/apis/design/errors>. Returns `None`
+/// when the body is not JSON of that shape — we intentionally do not
+/// surface `error.message` (it embeds operator project ids).
+fn parse_vertex_error_status(body: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Outer {
+        error: Inner,
+    }
+    #[derive(serde::Deserialize)]
+    struct Inner {
+        status: Option<String>,
+    }
+    let outer: Outer = serde_json::from_slice(body).ok()?;
+    outer.error.status
 }
 
 #[async_trait]

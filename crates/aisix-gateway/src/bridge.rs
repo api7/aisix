@@ -23,6 +23,63 @@ use std::time::Duration;
 
 use crate::chat::{ChatChunk, ChatFormat, ChatResponse, EmbeddingRequest, EmbeddingResponse};
 
+/// Maximum number of bytes read from an upstream error response body
+/// before attempting JSON envelope parse. Bounds memory and parser cost
+/// when an upstream returns something pathological (an HTML error page
+/// from a fronting WAF, or an unexpectedly large debug dump).
+pub const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// Maximum length of the human-readable `message` string carried inside
+/// [`BridgeError::UpstreamStatus`]. The full body is parsed into
+/// [`UpstreamErrorView`] when JSON-shaped; the truncated string is the
+/// fallback shown to clients when parsing fails.
+pub const MAX_UPSTREAM_ERROR_MESSAGE_BYTES: usize = 1024;
+
+/// Which wire format the upstream that produced this error speaks. The
+/// envelope-rendering layer uses this together with [`UpstreamErrorView`]
+/// to decide whether the upstream `kind` / `code` can be forwarded
+/// verbatim or needs translation to the client's wire shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamWire {
+    /// OpenAI-compatible envelope: `{error:{message,type,code,param}}`.
+    OpenAI,
+    /// Anthropic envelope: `{type:"error",error:{type,message}}`.
+    Anthropic,
+    /// Azure OpenAI envelope: OpenAI-like with `error.inner_error.code`
+    /// quirks for content policy violations.
+    AzureOpenAI,
+    /// AWS Bedrock structured error from the strongly-typed SDK; `kind`
+    /// carries the AWS exception code (e.g. `"ThrottlingException"`).
+    Bedrock,
+    /// Vertex AI envelope: `{error:{code:int,message,status}}` where
+    /// `status` is the canonical gRPC code string.
+    Vertex,
+    /// Wire format unknown / not applicable (tests, synthesised errors,
+    /// the legacy convenience constructors). Renders as the generic
+    /// `upstream_error` envelope with no translation attempt.
+    Unknown,
+}
+
+/// Structured view of an upstream error envelope, populated by each
+/// bridge after best-effort parsing of its provider's known shape.
+/// `None` everywhere means parsing failed (non-JSON body, malformed
+/// JSON, or unfamiliar envelope shape); callers fall back to the
+/// truncated raw message on [`BridgeError::UpstreamStatus::message`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpstreamErrorView {
+    /// Provider-native error-type token, unchanged from the upstream
+    /// envelope (e.g. Anthropic `"rate_limit_error"`, OpenAI
+    /// `"rate_limit_exceeded"`, Bedrock `"ThrottlingException"`).
+    pub kind: Option<String>,
+    /// Human-readable upstream message, post-parse.
+    pub message: Option<String>,
+    /// OpenAI envelope only. Other providers populate via the
+    /// translation table at render time.
+    pub code: Option<String>,
+    /// OpenAI envelope only.
+    pub param: Option<String>,
+}
+
 /// Context carried through the whole request lifecycle.
 ///
 /// The proxy layer fills this in after it has authenticated the request
@@ -77,10 +134,21 @@ pub enum BridgeError {
     /// backoff hints. Bridges that cannot parse the header (or where
     /// the header is absent) leave this `None`; the cooldown layer
     /// falls back to its configured default in that case.
+    /// `message` is a best-effort human-readable string for logs and
+    /// the fallback envelope when [`parsed`] is `None`. When [`parsed`]
+    /// is `Some`, the envelope-rendering layer (`error_translate`) uses
+    /// the structured fields and [`wire`] to produce a client-shape
+    /// envelope; `message` is kept around for logs and as a
+    /// last-resort fallback if a parsed field is missing.
     #[error("upstream returned HTTP {status}: {message}")]
     UpstreamStatus {
         status: u16,
         message: String,
+        /// Boxed to keep [`BridgeError`] small enough that
+        /// `Result<_, ProxyError>` doesn't trip `clippy::result_large_err`
+        /// once the four optional envelope fields are added.
+        parsed: Option<Box<UpstreamErrorView>>,
+        wire: UpstreamWire,
         retry_after: Option<Duration>,
     },
     #[error("upstream returned an unparseable body: {0}")]
@@ -94,18 +162,21 @@ pub enum BridgeError {
 }
 
 impl BridgeError {
-    /// Convenience constructor for upstream status errors when no
-    /// `Retry-After` is available. Keeps existing call sites readable.
+    /// Convenience constructor for synthesised upstream errors (tests,
+    /// cooldown fixtures) where no real upstream envelope is involved.
+    /// Sets [`UpstreamWire::Unknown`] and `parsed: None`.
     pub fn upstream_status(status: u16, message: impl Into<String>) -> Self {
         Self::UpstreamStatus {
             status,
             message: message.into(),
+            parsed: None,
+            wire: UpstreamWire::Unknown,
             retry_after: None,
         }
     }
 
-    /// Convenience constructor for upstream status errors that carry
-    /// a parsed `Retry-After` hint.
+    /// Convenience constructor for synthesised upstream errors that
+    /// carry a parsed `Retry-After` hint. See [`upstream_status`].
     pub fn upstream_status_with_retry_after(
         status: u16,
         message: impl Into<String>,
@@ -114,6 +185,8 @@ impl BridgeError {
         Self::UpstreamStatus {
             status,
             message: message.into(),
+            parsed: None,
+            wire: UpstreamWire::Unknown,
             retry_after,
         }
     }
@@ -137,6 +210,99 @@ pub fn parse_retry_after(headers: &http::HeaderMap) -> Option<Duration> {
     let raw = headers.get(http::header::RETRY_AFTER)?.to_str().ok()?;
     let seconds: u64 = raw.trim().parse().ok()?;
     Some(Duration::from_secs(seconds))
+}
+
+/// Drain an upstream error response (capped at
+/// [`MAX_UPSTREAM_ERROR_BODY_BYTES`]) and produce a
+/// [`BridgeError::UpstreamStatus`] with a best-effort parsed view of
+/// the envelope.
+///
+/// The `parse` closure runs only when the response declares an
+/// `application/json` content-type — this guards against fronting WAFs
+/// or load balancers returning HTML error pages that would otherwise be
+/// fed to a JSON parser and either fail expensively or surface
+/// nonsensical fragments.
+///
+/// `parse` returning `None` is treated as "envelope shape unknown"; the
+/// fallback in that case is the truncated raw body string in
+/// [`BridgeError::UpstreamStatus::message`], same as for non-JSON
+/// bodies.
+pub async fn capture_upstream_error_http(
+    status: http::StatusCode,
+    resp: reqwest::Response,
+    wire: UpstreamWire,
+    parse: impl FnOnce(&[u8]) -> Option<UpstreamErrorView>,
+) -> BridgeError {
+    let retry_after = parse_retry_after(resp.headers());
+    let content_type = resp
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_ascii_lowercase);
+    let body = read_body_capped(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    let parsed = content_type
+        .as_deref()
+        .map(content_type_is_json)
+        .unwrap_or(false)
+        .then(|| parse(&body))
+        .flatten();
+    let message = parsed
+        .as_ref()
+        .and_then(|v| v.message.clone())
+        .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
+    BridgeError::UpstreamStatus {
+        status: status.as_u16(),
+        message: truncate_lossy(&message, MAX_UPSTREAM_ERROR_MESSAGE_BYTES),
+        parsed: parsed.map(Box::new),
+        wire,
+        retry_after,
+    }
+}
+
+/// Read the response body, stopping after `limit` bytes. Used to bound
+/// upstream-error parsing cost regardless of `Content-Length`. Errors
+/// during read surface as an empty buffer — the caller falls through
+/// to a parse-failure path and emits the generic `upstream_error`
+/// envelope, which matches the pre-fix behaviour for that edge.
+async fn read_body_capped(resp: reqwest::Response, limit: usize) -> bytes::Bytes {
+    use futures::StreamExt;
+    let mut buf = bytes::BytesMut::with_capacity(limit.min(16 * 1024));
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else { break };
+        let remaining = limit.saturating_sub(buf.len());
+        if remaining == 0 {
+            break;
+        }
+        let take = chunk.len().min(remaining);
+        buf.extend_from_slice(&chunk[..take]);
+        if buf.len() >= limit {
+            break;
+        }
+    }
+    buf.freeze()
+}
+
+/// Content-Type token starts with `application/json` (RFC 7231 §3.1.1.1
+/// allows a trailing `; charset=…` parameter, so a prefix match is the
+/// right shape here — exact equality misses `application/json; charset=utf-8`).
+fn content_type_is_json(ct: &str) -> bool {
+    let ct = ct.trim_start();
+    ct.starts_with("application/json")
+}
+
+/// Truncate a string to at most `max` bytes, splitting only on a UTF-8
+/// boundary. Appends an ellipsis when truncation occurred so log
+/// readers can tell the message was cut.
+fn truncate_lossy(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 impl BridgeError {
