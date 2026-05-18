@@ -286,9 +286,13 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
 /// the outer code is the generic `invalid_request_error`.
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     let retry_after = aisix_gateway::parse_retry_after(resp.headers());
+    let is_json = aisix_gateway::response_is_json(&resp);
     let body =
         aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
-    let kind = parse_azure_error_code(&body);
+    // Skip the serde parse on non-JSON bodies (HTML error page from a
+    // load-balancer / front door). Same guard as
+    // `capture_upstream_error_http`.
+    let kind = is_json.then(|| parse_azure_error_code(&body)).flatten();
     let message = match status.as_u16() {
         401 | 403 => "upstream authentication failed".to_string(),
         404 => "upstream deployment or model not found".to_string(),
@@ -298,11 +302,18 @@ async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeEr
         429 => "upstream rate limited".to_string(),
         _ => format!("upstream returned {}", status.as_u16()),
     };
-    let parsed = kind.as_ref().map(|_| {
+    // Azure's envelope only has a single `error.code` field (no
+    // separate `type`). Downstream OpenAI clients expect both
+    // `error.type` AND `error.code` — populate both `kind` and `code`
+    // from the upstream token so the translation layer can either
+    // pass it through (for OpenAI-compat tokens like
+    // `rate_limit_exceeded`) or override with a derived code (for
+    // Azure-specific tokens like `DeploymentNotFound`).
+    let parsed = kind.as_ref().map(|k| {
         Box::new(aisix_gateway::UpstreamErrorView {
-            kind: kind.clone(),
+            kind: Some(k.clone()),
             message: None,
-            code: None,
+            code: Some(k.clone()),
             param: None,
         })
     });
@@ -1348,6 +1359,75 @@ mod tests {
                 );
             }
             other => panic!("expected UpstreamStatus with retry_after, got {other:?}"),
+        }
+    }
+
+    /// Copilot review (PR #323): Azure's envelope only has `error.code`
+    /// (no separate `type`). For OpenAI-compatible tokens that Azure
+    /// inherits unchanged (e.g. `rate_limit_exceeded`), the bridge
+    /// must populate BOTH `parsed.kind` AND `parsed.code` from the
+    /// upstream — otherwise the downstream OpenAI client receives
+    /// `error.type=rate_limit_exceeded` but `error.code=null`, which
+    /// is exactly the SDK-retry-logic break that issue #322 calls out.
+    #[tokio::test]
+    async fn chat_429_preserves_openai_compatible_code_for_sdk_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_raw(
+                br#"{"error":{"code":"rate_limit_exceeded","message":"slow down"}}"#.as_slice(),
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        let bridge =
+            AzureOpenAiBridge::new().with_url_override(mock_chat_url(&server.uri(), "gpt4o-prod"));
+        let ctx = canonical_test_ctx();
+        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        match err {
+            BridgeError::UpstreamStatus { parsed, .. } => {
+                let parsed = parsed.expect("envelope parsed");
+                assert_eq!(parsed.kind.as_deref(), Some("rate_limit_exceeded"));
+                assert_eq!(
+                    parsed.code.as_deref(),
+                    Some("rate_limit_exceeded"),
+                    "OpenAI-compat code must flow through view.code for SDK retry"
+                );
+            }
+            other => panic!("expected UpstreamStatus, got {other:?}"),
+        }
+    }
+
+    /// Copilot review (PR #323): when upstream returns a non-JSON
+    /// body (HTML error page from Azure Front Door, etc.), the parser
+    /// must skip the serde attempt rather than try to deserialize
+    /// `<html>...</html>` as JSON. Same content-type guard as
+    /// `capture_upstream_error_http`.
+    #[tokio::test]
+    async fn chat_400_non_json_body_skips_envelope_parse() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/openai/deployments/gpt4o-prod/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_raw(
+                b"<html><body>403 Forbidden by Front Door</body></html>".as_slice(),
+                "text/html",
+            ))
+            .mount(&server)
+            .await;
+        let bridge =
+            AzureOpenAiBridge::new().with_url_override(mock_chat_url(&server.uri(), "gpt4o-prod"));
+        let ctx = canonical_test_ctx();
+        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        match err {
+            BridgeError::UpstreamStatus { parsed, .. } => {
+                assert!(
+                    parsed.is_none(),
+                    "non-JSON body must not produce a parsed view; got {parsed:?}"
+                );
+            }
+            other => panic!("expected UpstreamStatus, got {other:?}"),
         }
     }
 

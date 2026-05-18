@@ -808,18 +808,18 @@ mod tests {
     }
 
     /// Issue #322 sanity check on the 5xx branch: upstream 5xx still
-    /// collapses to 502 with the generic envelope — we do NOT pass
-    /// through upstream 5xx bodies even when JSON-shaped. This keeps
-    /// upstream internal-server-error details from leaking to the
-    /// client (the 4xx→4xx passthrough is the customer-facing
-    /// contract; 5xx is operator-internal).
+    /// collapses to 502 with the generic envelope AND the upstream
+    /// `error.message` is suppressed. Engine names / shard ids / queue
+    /// depth routinely appear in upstream 5xx bodies (in this fixture:
+    /// "engine offline shard 47") — those are operator-internal and
+    /// must not bleed through to the customer envelope.
     #[tokio::test]
-    async fn upstream_openai_5xx_with_json_envelope_still_collapses_to_502() {
+    async fn upstream_openai_5xx_with_json_envelope_collapses_and_redacts_message() {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(503).set_body_raw(
-                br#"{"error":{"message":"internal","type":"server_error","code":"engine_overloaded"}}"#.as_slice(),
+                br#"{"error":{"message":"engine offline shard 47","type":"server_error","code":"engine_overloaded"}}"#.as_slice(),
                 "application/json",
             ))
             .mount(&upstream)
@@ -844,6 +844,18 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 2048).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "upstream_error");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(
+            !msg.contains("engine offline") && !msg.contains("shard 47"),
+            "upstream 5xx `error.message` must NOT leak to customer; got: {msg:?}"
+        );
+        // Upstream `code` (engine_overloaded) must also not pass
+        // through on 5xx.
+        assert!(
+            v["error"].get("code").is_none() || v["error"]["code"].is_null(),
+            "upstream 5xx `error.code` must not pass through; got code={:?}",
+            v["error"]["code"]
+        );
     }
 
     /// Cross-provider contract: Anthropic upstream 5xx → client sees an

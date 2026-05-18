@@ -198,10 +198,15 @@ impl ProxyError {
 /// tables so the OpenAI-shape `error.type` and `error.code` carry the
 /// retry semantics SDKs depend on.
 ///
-/// **5xx or non-JSON body or `UpstreamWire::Unknown`**: emit the
-/// legacy generic `upstream_error` envelope. Upstream 5xx internal
-/// detail (engine names, queue depth, ARNs in raw AWS messages) stays
-/// operator-internal; the gateway returns a 502 with a generic body.
+/// **5xx**: emit a canned `upstream returned {status}` message under
+/// `type: upstream_error`. Upstream 5xx bodies routinely embed
+/// operator-internal detail (engine names, shard ids, queue depth,
+/// ARNs in raw AWS messages) — surfacing them to the customer leaks
+/// internal taxonomy. The full upstream body remains in operator
+/// logs via tracing.
+///
+/// **`UpstreamWire::Unknown`** (cooldown fixtures / synthesised
+/// errors): legacy generic envelope.
 fn render_bridge_upstream_envelope(
     status: u16,
     message: &str,
@@ -214,7 +219,15 @@ fn render_bridge_upstream_envelope(
             error: crate::error_translate::render_openai_envelope(parsed, wire, message),
         };
     }
-    ErrorEnvelope::new(message.to_string(), "upstream_error")
+    let safe_message = if (500..600).contains(&status) {
+        // Suppress upstream `error.message` on 5xx — engine names /
+        // shard ids / ARNs commonly appear here and are not customer
+        // information.
+        format!("upstream returned {status}")
+    } else {
+        message.to_string()
+    };
+    ErrorEnvelope::new(safe_message, "upstream_error")
 }
 
 impl IntoResponse for ProxyError {

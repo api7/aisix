@@ -271,9 +271,13 @@ where
 /// is intentionally left `None`.
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     let retry_after = aisix_gateway::parse_retry_after(resp.headers());
+    let is_json = aisix_gateway::response_is_json(&resp);
     let body =
         aisix_gateway::read_body_capped(resp, aisix_gateway::MAX_UPSTREAM_ERROR_BODY_BYTES).await;
-    let kind = parse_vertex_error_status(&body);
+    // Skip the serde parse on non-JSON bodies (HTML / text error pages
+    // from a fronting WAF or load balancer). Same guard as
+    // `capture_upstream_error_http`.
+    let kind = is_json.then(|| parse_vertex_error_status(&body)).flatten();
     let message = match status.as_u16() {
         401 | 403 => "upstream authentication failed".to_string(),
         404 => "upstream model or endpoint not found".to_string(),
@@ -1451,6 +1455,40 @@ mod tests {
                         view.message
                     );
                 }
+            }
+            other => panic!("expected UpstreamStatus, got {other:?}"),
+        }
+    }
+
+    /// Copilot review (PR #323): non-JSON body (HTML error page from a
+    /// fronting load balancer) must NOT trigger serde parsing — the
+    /// bridge applies the same content-type guard as
+    /// `capture_upstream_error_http`.
+    #[tokio::test]
+    async fn chat_gemini_non_json_body_skips_envelope_parse() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403).set_body_raw(
+                b"<html><body>403 Forbidden</body></html>".as_slice(),
+                "text/html",
+            ))
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        match err {
+            BridgeError::UpstreamStatus { parsed, .. } => {
+                assert!(
+                    parsed.is_none(),
+                    "non-JSON body must skip parser; got {parsed:?}"
+                );
             }
             other => panic!("expected UpstreamStatus, got {other:?}"),
         }

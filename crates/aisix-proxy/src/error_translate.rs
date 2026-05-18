@@ -69,13 +69,19 @@ pub(crate) fn render_openai_envelope(
         message,
         kind,
         param: view.param.clone(),
-        // Same-wire OpenAI/Azure preserve any upstream-supplied code.
-        // Other wires get a derived code (or `None` when no clean
-        // OpenAI counterpart exists) — the upstream's `code` field is
-        // either absent (Anthropic, Bedrock, Vertex) or operator-leaky
-        // (Vertex numeric codes embed internal taxonomy).
+        // - OpenAI same-wire: pass through the upstream's `code` verbatim.
+        // - AzureOpenAI: prefer the derived code when the translation
+        //   table has an explicit mapping (e.g. `DeploymentNotFound`
+        //   → `model_not_found`), otherwise pass through the upstream
+        //   `code` (Azure shares OpenAI's taxonomy for the bulk of
+        //   codes, so `rate_limit_exceeded` etc. should flow through).
+        // - Anthropic / Bedrock / Vertex: the upstream `code` field is
+        //   either absent or operator-leaky (Vertex numeric codes
+        //   embed internal taxonomy) — only the derived code reaches
+        //   the customer.
         code: match wire {
-            UpstreamWire::OpenAI | UpstreamWire::AzureOpenAI => view.code.clone().or(derived_code),
+            UpstreamWire::OpenAI => view.code.clone(),
+            UpstreamWire::AzureOpenAI => derived_code.or_else(|| view.code.clone()),
             _ => derived_code,
         },
     }

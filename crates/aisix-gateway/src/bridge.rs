@@ -288,17 +288,21 @@ pub async fn read_body_capped(resp: reqwest::Response, limit: usize) -> bytes::B
     use futures::StreamExt;
     let mut buf = bytes::BytesMut::with_capacity(limit.min(16 * 1024));
     let mut stream = resp.bytes_stream();
+    // Continue draining the stream past `limit` so the underlying
+    // hyper connection can be returned to reqwest's keep-alive pool.
+    // Stopping the iteration mid-stream taints the connection and
+    // forces a new TCP handshake on the next upstream call — a real
+    // cost when an upstream is flapping and producing a burst of
+    // error responses. The extra reads only discard bytes; memory
+    // stays bounded by `limit`.
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else { break };
-        let remaining = limit.saturating_sub(buf.len());
-        if remaining == 0 {
-            break;
+        if buf.len() >= limit {
+            continue;
         }
+        let remaining = limit - buf.len();
         let take = chunk.len().min(remaining);
         buf.extend_from_slice(&chunk[..take]);
-        if buf.len() >= limit {
-            break;
-        }
     }
     buf.freeze()
 }
@@ -306,9 +310,24 @@ pub async fn read_body_capped(resp: reqwest::Response, limit: usize) -> bytes::B
 /// Content-Type token starts with `application/json` (RFC 7231 §3.1.1.1
 /// allows a trailing `; charset=…` parameter, so a prefix match is the
 /// right shape here — exact equality misses `application/json; charset=utf-8`).
-fn content_type_is_json(ct: &str) -> bool {
+///
+/// Public so non-OpenAI / non-Anthropic bridges (Vertex, Azure) can
+/// apply the same JSON-only guard when they need a custom parse path
+/// that doesn't route through [`capture_upstream_error_http`].
+pub fn content_type_is_json(ct: &str) -> bool {
     let ct = ct.trim_start();
     ct.starts_with("application/json")
+}
+
+/// Convenience: read the `Content-Type` header from a [`reqwest::Response`]
+/// and decide whether it's `application/json` per [`content_type_is_json`].
+/// Returns `false` when the header is missing or non-ASCII.
+pub fn response_is_json(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| content_type_is_json(&ct.to_ascii_lowercase()))
+        .unwrap_or(false)
 }
 
 /// Truncate a string to at most `max` bytes, splitting only on a UTF-8
