@@ -42,7 +42,6 @@ Not every field or shape present in the schema should be interpreted as equally 
 
 Examples:
 
-- the typed `ApiKey` model and admin OpenAPI mention `max_budget_usd`, but the current standalone admin write validator rejects it and standalone hard-stop budget behavior is not the current documented default
 - `Model.rate_limit` and `ApiKey.rate_limit` are both enforced today, alongside scope-matched `RateLimitPolicy` rows. See [Rate Limits](../configuration/rate-limits.md) for the layer order and the AND-combination semantics.
 - `Model.background_model_check` exists in schema, but it only applies to direct models and its runtime effect is surfaced through `/admin/v1/models/status`
 - `Guardrail.kind = bedrock` exists in schema, but current generally reliable runtime behavior is strongest on `keyword`
