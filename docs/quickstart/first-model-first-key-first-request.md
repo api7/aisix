@@ -63,7 +63,7 @@ The admin envelope returns a `ResourceEntry` shape:
 }
 ```
 
-Capture the returned `id` for use as `provider_key_id` in the next step. If you have `jq` installed, run the create with capture in one shot:
+Capture the returned `id` for use as `provider_key_id` in the next step — copy it by eye from the response above, or use this jq-capturing form **instead of** the curl above (running both creates a duplicate `display_name` and the second POST returns 409):
 
 ```bash title="Create and capture the id in one shot"
 PROVIDER_KEY_ID=$(curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
@@ -73,7 +73,7 @@ PROVIDER_KEY_ID=$(curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys 
   | jq -r .id)
 ```
 
-(Pick the with-`jq` or without-`jq` form, not both — running both creates a duplicate `display_name` and the second POST returns 409.) The same pattern applies to the model `id` and API-key `id` captures in the next two steps.
+The same pattern applies to the model `id` and API-key `id` captures in the next two steps.
 
 :::warning
 The `secret` field is returned as plaintext in this response. Treat the command output as sensitive — avoid pasting it into shared documents, issue trackers, or chat. The admin API also returns the plaintext on subsequent `GET /admin/v1/provider_keys/:id` calls, so the same handling applies any time you read this resource.
