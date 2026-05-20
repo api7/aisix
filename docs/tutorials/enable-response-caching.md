@@ -16,7 +16,7 @@ You end with one enabled `CachePolicy` and a reproducible header-level proof tha
 
 ## How It Works
 
-The proxy keys each request on a fingerprint built from the resolved model alias, the caller key, and the request body. When an enabled `CachePolicy` matches the request, the proxy:
+The proxy keys each request on a fingerprint built from the resolved model alias and the normalized request body (messages, `temperature`, `top_p`, `max_tokens`, plus any tool-calling extras such as `tools`, `tool_choice`, `response_format`, `seed`, `stop`, `presence_penalty`, `frequency_penalty`). **The caller key is intentionally excluded from the cache fingerprint** — two different callers asking the same prompt to the same model alias hit the same cache entry, so the second caller may see the first caller's cached response. When designing what to cache, treat prompts as crossing caller boundaries: prompts and responses that should not be visible to other callers in your deployment should not be cached. When an enabled `CachePolicy` matches the request, the proxy:
 
 1. computes the fingerprint
 2. looks up the cache
@@ -116,7 +116,7 @@ curl -sSi -X POST http://127.0.0.1:3000/v1/chat/completions \
 
 ## What Just Happened
 
-The proxy hashed the resolved model alias, caller key, and request body for each request. The first call missed the cache and went to the upstream; the second call had the same fingerprint and hit the cache; the third call had a different prompt and therefore a different fingerprint, so it missed again. The upstream saw only two calls instead of three.
+The proxy hashed the resolved model alias and the request body for each request. The first call missed the cache and went to the upstream; the second call had the same fingerprint and hit the cache; the third call had a different prompt and therefore a different fingerprint, so it missed again. The upstream saw only two calls instead of three.
 
 This contract is exercised by `tests/e2e/src/cases/cache-policy-e2e.test.ts` (identical-request hit) and `tests/e2e/src/cases/cache-scenarios-e2e.test.ts` (different-prompt miss). Both tests assert the `x-aisix-cache` header values and the upstream `receivedRequests.length` count — the cache header is a published contract that cp-api and the dashboard's `/logs` view depend on.
 
