@@ -8,7 +8,10 @@ AISIX AI Gateway uses a shared proxy error envelope across its client-facing pro
 
 Use this page to understand what a caller should do after a failed request, not just what status code was returned.
 
-**Exception:** errors on `POST /v1/messages` use the Anthropic-shape envelope instead of the OpenAI envelope — see [Anthropic Messages — Error Shape](anthropic-messages.md#error-shape) for the shape and the gateway's emitted type-string subset.
+**Exceptions:**
+
+- errors on `POST /v1/messages` use the Anthropic-shape envelope instead of the OpenAI envelope — see [Anthropic Messages — Error Shape](anthropic-messages.md#error-shape) for the shape and the gateway's emitted type-string subset.
+- errors on `ANY /passthrough/:provider/*rest` are forwarded from the upstream provider verbatim (status code + body) after the proxy's own auth and provider resolution complete, so the body shape depends on the upstream — see [Provider Passthrough](passthrough.md) and the Endpoint-Specific Notes section below.
 
 ## Error Envelope
 

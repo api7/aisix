@@ -33,7 +33,10 @@ Current proxy error `type` values include:
 
 These values appear in the proxy's OpenAI-compatible error envelope.
 
-Note: this section describes the OpenAI-shape error envelope used by every proxy endpoint **except** `POST /v1/messages`. The `/v1/messages` endpoint uses the Anthropic-shape envelope `{type:"error", error:{type, message}}` (real Anthropic upstream also carries an optional `request_id:"req_..."` field; the gateway currently omits it) and emits a different set of type strings — `invalid_request_error` (400/422), `authentication_error` (401), `permission_error` (403), `not_found_error` (404), `request_too_large` (413), `rate_limit_error` (429), `overloaded_error` (503), and `api_error` (all other 4xx/5xx). The mapping also includes `timeout_error` for 408 but that path is currently unreachable. See the [Anthropic Messages integration page](../integration/anthropic-messages.md#error-shape) for the per-status mapping and notes on the wider Anthropic-canonical type set.
+Note: this section describes the OpenAI-shape error envelope used by gateway-generated errors on the OpenAI-shape proxy endpoints. Two endpoint surfaces are exceptions:
+
+- `POST /v1/messages` uses the Anthropic-shape envelope `{type:"error", error:{type, message}}` (real Anthropic upstream also carries an optional `request_id:"req_..."` field; the gateway currently omits it) and emits a different set of type strings — `invalid_request_error` (400/422), `authentication_error` (401), `permission_error` (403), `not_found_error` (404), `request_too_large` (413), `rate_limit_error` (429), `overloaded_error` (503), and `api_error` (all other 4xx/5xx). The mapping also includes `timeout_error` for 408 but that path is currently unreachable. See the [Anthropic Messages integration page](../integration/anthropic-messages.md#error-shape) for the per-status mapping and notes on the wider Anthropic-canonical type set.
+- `ANY /passthrough/:provider/*rest` forwards the upstream provider's status code and body verbatim after the proxy's own auth and provider resolution complete, so the error body shape there depends on the upstream — see [Provider Passthrough](../integration/passthrough.md).
 
 ## Proxy Status Boundaries
 
