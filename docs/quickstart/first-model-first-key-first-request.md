@@ -15,7 +15,7 @@ Then you will verify that the new configuration is visible on the proxy surface.
 ## Prerequisites
 
 - A running gateway from the [Self-Hosted Quickstart](self-hosted.md)
-- An API key from an upstream provider (OpenAI, Anthropic, Google, DeepSeek, or another supported provider). If you do not have one, sign up at the provider (for example, <https://platform.openai.com/api-keys> — paid; pay-as-you-go starts around $5). The key looks like `sk-...` (or the provider equivalent) and is what you will paste into the `YOUR_PROVIDER_API_KEY` placeholder in Step 1.
+- An API key from an upstream provider (OpenAI, Anthropic, Google, DeepSeek, or another supported provider). The key looks like `sk-...` and is what you will paste into the `YOUR_PROVIDER_API_KEY` placeholder in Step 1. If you do not have one, sign up at the provider (for example, <https://platform.openai.com/api-keys>).
 - Your admin key from the bootstrap config
 
 ## What This Quickstart Configures

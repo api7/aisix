@@ -82,7 +82,7 @@ Current runtime boundary:
 - bootstrap config can wire a Redis backend at process start
 - the dynamic `CachePolicy.backend` field should still be treated conservatively because broader Redis support boundaries are still being expanded
 
-Note: the per-policy `backend` field is currently parsed and stored on the `CachePolicy` row but is not consulted by the runtime proxy. The proxy uses the cache backend selected via bootstrap-config (`cache.backend`) regardless of what each policy specifies. The field is preserved for forward compatibility; do not depend on it to override the runtime backend.
+Note: the per-policy `backend` field is parsed and stored on the `CachePolicy` row but is not consulted by the runtime proxy — the proxy always uses the bootstrap-config (`cache.backend`) backend regardless of what each policy specifies. The field is preserved for forward compatibility; do not depend on it to override the runtime backend.
 
 ## Operator Guidance
 

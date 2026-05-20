@@ -77,7 +77,7 @@ Current semantics:
 
 - only direct models may carry `background_model_check`
 - routing models reject `background_model_check`
-- `ignore_statuses` records the last probe result without marking the model unhealthy. If omitted, **no** probe statuses are ignored — a 408 or 429 probe response would mark the model unhealthy. Set this field explicitly to skip those statuses. For most deployments, `ignore_statuses: [408, 429]` is a reasonable starting point — it tolerates transient upstream timeouts (408) and rate-limit responses (429) during probes without flapping the model unhealthy.
+- `ignore_statuses` records the last probe result without marking the model unhealthy. If omitted, **no** statuses are ignored — a 408 or 429 probe response would mark the model unhealthy. For most deployments, `[408, 429]` is a reasonable starting point.
 - `stale_after_seconds` is a safety valve for old unhealthy probe state when the checker stops refreshing
 - `interval_seconds` has a minimum of `5`; `timeout_seconds`, `max_tokens`, and `stale_after_seconds` have a minimum of `1`
 
@@ -160,7 +160,7 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
 - `provider` currently supports `openai`, `anthropic`, `google`, `deepseek`, `cohere`, and `jina`.
 - `provider_key_id` must reference an existing `ProviderKey` resource.
 - `timeout` is in milliseconds. `0` or omission means no timeout.
-- `cost` stores pricing metadata. AISIX Cloud's cp-api recomputes cost server-side from its pricing catalog when emitting usage events and consumes this field at that layer. The standalone OSS proxy does not consult this field at request time and always emits `cost_usd=0.0` in its own usage events; pricing-aware budget enforcement requires the AISIX Cloud control plane.
+- `cost` stores pricing metadata that AISIX Cloud's cp-api consumes when emitting usage events. The standalone OSS proxy does not consult this field at request time and always emits `cost_usd=0.0`; pricing-aware budget enforcement requires the AISIX Cloud control plane.
 - `background_model_check` drives direct-model runtime unhealthy state and the `/admin/v1/models/status` view.
 - `cooldown` drives direct-model request-path cooldown and is also surfaced through `/admin/v1/models/status`.
 
