@@ -16,7 +16,13 @@ You end with one enabled `CachePolicy` and a reproducible header-level proof tha
 
 ## How It Works
 
-The proxy keys each request on a fingerprint built from the resolved model alias and the normalized request body (messages, `temperature`, `top_p`, `max_tokens`, plus any other top-level request fields the proxy doesn't pre-process — including tool-calling fields such as `tools`, `tool_choice`, `response_format`, `seed`, `stop`, `presence_penalty`, `frequency_penalty`, and any future OpenAI-shape fields that arrive through `ChatFormat::extra`). **The caller key is intentionally excluded from the cache fingerprint** — two different callers asking the same prompt to the same model alias hit the same cache entry, so the second caller may see the first caller's cached response. When designing what to cache, treat prompts as crossing caller boundaries: prompts and responses that should not be visible to other callers in your deployment should not be cached. When an enabled `CachePolicy` matches the request, the proxy:
+The proxy keys each request on a fingerprint built from the resolved model alias and the normalized request body — `messages`, `temperature`, `top_p`, `max_tokens`, and any other top-level request fields (tool-calling fields, future OpenAI-shape fields, anything the proxy doesn't pre-process).
+
+**The caller key is intentionally excluded from the fingerprint.** Two callers asking the same prompt to the same model alias hit the same cache entry, so the second caller sees the first caller's cached response.
+
+Treat prompts as crossing caller boundaries: don't cache content that shouldn't be visible to other callers in your deployment.
+
+When an enabled `CachePolicy` matches the request, the proxy:
 
 1. computes the fingerprint
 2. looks up the cache
