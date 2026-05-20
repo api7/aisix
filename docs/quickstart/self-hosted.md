@@ -8,8 +8,9 @@ This guide shows how to start a self-hosted AISIX AI Gateway instance with the l
 
 ## Prerequisites
 
+- **Rust 1.93 or newer with `cargo`.** Install via [rustup](https://rustup.rs) (for example, `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`) and verify with `cargo --version`. The repo pins this version through `rust-toolchain.toml`, so `rustup` will install the right channel automatically the first time you run `cargo` in the working tree.
 - Docker
-- a reachable [etcd](../overview/glossary.md#etcd) instance
+- A reachable [etcd](../overview/glossary.md#etcd) instance
 
 ## Step 1: Start etcd
 
@@ -63,6 +64,8 @@ cache:
 ```bash title="Build and run locally"
 cargo run -p aisix-server --bin aisix -- --config config.yaml
 ```
+
+The first time you run this, `cargo` will compile several hundred dependencies before the gateway starts, which typically takes 3–5 minutes on common hardware. Subsequent runs are incremental and much faster.
 
 Keep the gateway running. Open a new terminal for the next steps; the gateway must continue running in the original terminal to handle the requests below. In that new terminal, you should now have:
 

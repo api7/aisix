@@ -63,17 +63,21 @@ The admin envelope returns a `ResourceEntry` shape:
 }
 ```
 
-Capture the returned `id`. You will use it as `provider_key_id` when creating the model. Two ways to capture it:
+Capture the returned `id`. You will use it as `provider_key_id` when creating the model. Two ways to do this — **pick one**, don't run both (running both would create a duplicate ProviderKey and the admin API would reject the second one as a duplicate `display_name`):
 
-```bash title="Capture the id (jq path)"
-PROVIDER_KEY_ID=$(curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
-  -H "Authorization: Bearer YOUR_ADMIN_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"display_name":"openai-upstream","secret":"YOUR_PROVIDER_API_KEY","api_base":"https://api.openai.com/v1"}' \
-  | jq -r .id)
-```
+- **Option A — `jq` variant of the create above**: if you have `jq` available (`apt install jq` or `brew install jq`), use this variant *instead of* the curl shown earlier. It runs the same POST exactly once and captures the `id` straight into a shell variable:
 
-If `jq` is not installed (`apt install jq` or `brew install jq`), copy the `id` field by eye from the response and paste it wherever the steps below say `YOUR_PROVIDER_KEY_ID`. The same pattern applies to the model `id` and API-key `id` captures in the next two steps.
+  ```bash title="Create and capture the id in one shot"
+  PROVIDER_KEY_ID=$(curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
+    -H "Authorization: Bearer YOUR_ADMIN_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"display_name":"openai-upstream","secret":"YOUR_PROVIDER_API_KEY","api_base":"https://api.openai.com/v1"}' \
+    | jq -r .id)
+  ```
+
+- **Option B — jq-free**: if you already ran the curl above, copy the `id` field by eye from that response and paste it wherever the steps below say `YOUR_PROVIDER_KEY_ID`.
+
+The same pattern applies to the model `id` and API-key `id` captures in the next two steps.
 
 ## Step 2: Create a Model
 
