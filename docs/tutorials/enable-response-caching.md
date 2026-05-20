@@ -84,7 +84,7 @@ x-aisix-cache: miss
 
 ## Step 3: Send The Same Request Again — Cache Hit
 
-Repeat the **exact same** request body, model alias, and bearer:
+Repeat the request with the same body and model alias:
 
 ```bash title="Second call — should report cache hit"
 curl -sSi -X POST http://127.0.0.1:3000/v1/chat/completions \
