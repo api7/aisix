@@ -57,8 +57,6 @@ cache:
   backend: "memory"
 ```
 
-`YOUR_ADMIN_KEY` is any opaque secret string of your choice — there is no format constraint, the auth layer is a string-equality check. Callers send it as `Authorization: Bearer <key>` against the admin listener; rotate by editing `config.yaml` and restarting the gateway.
-
 ## Step 3: Start the gateway
 
 ```bash title="Build and run locally"
@@ -67,7 +65,7 @@ cargo run -p aisix-server --bin aisix -- --config config.yaml
 
 The first time you run this, `cargo` will compile several hundred dependencies before the gateway starts, which typically takes 3–5 minutes on common hardware. Subsequent runs are incremental and much faster.
 
-Keep the gateway running. Open a new terminal for the next steps; the gateway must continue running in the original terminal to handle the requests below. In that new terminal, you should now have:
+Keep this terminal running. In a new terminal, you should now have:
 
 - proxy listener on `http://127.0.0.1:3000`
 - admin listener on `http://127.0.0.1:3001`

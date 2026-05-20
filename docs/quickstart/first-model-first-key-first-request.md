@@ -63,21 +63,17 @@ The admin envelope returns a `ResourceEntry` shape:
 }
 ```
 
-Capture the returned `id`. You will use it as `provider_key_id` when creating the model. Two ways to do this — **pick one**, don't run both (running both would create a duplicate ProviderKey and the admin API would reject the second one as a duplicate `display_name`):
+Capture the returned `id` for use as `provider_key_id` in the next step. If you have `jq` installed, run the create with capture in one shot:
 
-- **Option A — `jq` variant of the create above**: if you have `jq` available (`apt install jq` or `brew install jq`), use this variant *instead of* the curl shown earlier. It runs the same POST exactly once and captures the `id` straight into a shell variable:
+```bash title="Create and capture the id in one shot"
+PROVIDER_KEY_ID=$(curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
+  -H "Authorization: Bearer YOUR_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"display_name":"openai-upstream","secret":"YOUR_PROVIDER_API_KEY","api_base":"https://api.openai.com/v1"}' \
+  | jq -r .id)
+```
 
-  ```bash title="Create and capture the id in one shot"
-  PROVIDER_KEY_ID=$(curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
-    -H "Authorization: Bearer YOUR_ADMIN_KEY" \
-    -H "Content-Type: application/json" \
-    -d '{"display_name":"openai-upstream","secret":"YOUR_PROVIDER_API_KEY","api_base":"https://api.openai.com/v1"}' \
-    | jq -r .id)
-  ```
-
-- **Option B — jq-free**: if you already ran the curl above, copy the `id` field by eye from that response and paste it wherever the steps below say `YOUR_PROVIDER_KEY_ID`.
-
-The same pattern applies to the model `id` and API-key `id` captures in the next two steps.
+(Pick the with-`jq` or without-`jq` form, not both — running both creates a duplicate `display_name` and the second POST returns 409.) The same pattern applies to the model `id` and API-key `id` captures in the next two steps.
 
 :::warning
 The `secret` field is returned as plaintext in this response. Treat the command output as sensitive — avoid pasting it into shared documents, issue trackers, or chat. The admin API also returns the plaintext on subsequent `GET /admin/v1/provider_keys/:id` calls, so the same handling applies any time you read this resource.
