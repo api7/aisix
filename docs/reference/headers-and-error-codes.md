@@ -33,6 +33,8 @@ Current proxy error `type` values include:
 
 These values appear in the proxy's OpenAI-compatible error envelope.
 
+Note: this section describes the OpenAI-shape error envelope used by every proxy endpoint **except** `POST /v1/messages`. The `/v1/messages` endpoint uses the Anthropic-shape envelope `{type:"error", error:{type, message}, request_id:"req_..."}` and emits a different set of type strings — `invalid_request_error` (400/422), `authentication_error` (401), `permission_error` (403), `not_found_error` (404), `request_too_large` (413), `rate_limit_error` (429), `overloaded_error` (503), and `api_error` (all other 4xx/5xx). The mapping also includes `timeout_error` for 408 but that path is currently unreachable. See the [Anthropic Messages integration page](../integration/anthropic-messages.md#error-shape) for the per-status mapping and notes on the wider Anthropic-canonical type set.
+
 ## Proxy Status Boundaries
 
 - `400` invalid request

@@ -112,7 +112,7 @@ If you depend on advanced Anthropic-only content block behavior, prefer models w
 - `401` means the AISIX caller API key is missing or invalid
 - `403` means the key cannot access the requested model alias
 - `404` means the model alias is not present in the current snapshot
-- errors still use the gateway's OpenAI-compatible proxy error envelope
+- errors on `/v1/messages` use the Anthropic-shape envelope your Claude SDK already expects: `{type:"error", error:{type, message}, request_id:"req_..."}`. The gateway currently emits `invalid_request_error`, `authentication_error`, `permission_error`, `not_found_error`, `request_too_large`, `rate_limit_error`, `overloaded_error`, and `api_error` (catch-all). For the full Anthropic-canonical type list (one type — `billing_error` for 402 — is folded into `api_error` by this gateway), see the [Errors and retries integration page](../integration/errors-and-retries.md) and Anthropic's [Errors documentation](https://platform.claude.com/docs/en/api/errors)
 
 ## Troubleshooting
 
