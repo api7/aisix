@@ -44,6 +44,38 @@ When diagnosing managed bootstrap, think certificate bundle, trust roots, and mT
 
 Do not start with bearer-token assumptions unless your deployment intentionally uses a legacy or self-managed path.
 
+## Runtime Configuration Notes
+
+`AISIX_MANAGED__CP_BASE_URL` must point at the control-plane
+data-plane-manager endpoint that serves `/dp/heartbeat`,
+`/dp/telemetry`, `/dp/rotate-cert`, and `/dp/budget_check`.
+
+For example:
+
+- `https://dpm.example.com:7944` for an externally reachable DPM
+- `https://dpm:7944` when the DP joins the AISIX Cloud Compose network
+
+Do not use the browser-facing dashboard/cp-api origin such as
+`http://api:8080`; that service does not own the `/dp/*` heartbeat
+surface.
+
+The DP accepts either inline PEM values:
+
+- `AISIX_MANAGED__CP_CERT_PEM`
+- `AISIX_MANAGED__CP_KEY_PEM`
+- `AISIX_MANAGED__CP_CA_PEM`
+
+or file paths:
+
+- `AISIX_MANAGED__CP_CERT_FILE`
+- `AISIX_MANAGED__CP_KEY_FILE`
+- `AISIX_MANAGED__CP_CA_FILE`
+
+If file paths are used from a container, make sure the process user can
+read those files and can write the runtime state directory
+`/var/lib/aisix`. The state directory contains the persisted mTLS
+bundle and sidecar files such as the DP identity used on restart.
+
 ## Troubleshooting
 
 ### The data plane never appears healthy in Cloud

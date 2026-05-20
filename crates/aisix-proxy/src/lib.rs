@@ -172,6 +172,30 @@ async fn enforce_request_body_limit(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    // /v1/messages must emit the Anthropic-shape error envelope
+    // (closes #336). The middleware runs BEFORE the handler so the
+    // handler's `into_anthropic_response()` would never see the
+    // rejection — capture the inbound path here and use it to pick
+    // the envelope shape on the reject paths below. Captured as
+    // `bool` rather than holding a borrow into `request`, so the
+    // `request.into_body()` move on the drain path doesn't conflict
+    // with the captured value (audit HIGH-3 follow-up).
+    //
+    // Audit LOW-A (3rd audit): `/v1/messages/` (trailing slash) also
+    // routes to the Anthropic handler via axum's path normalization,
+    // but an exact-match check would miss it. The official Anthropic
+    // SDK never appends a trailing slash so real-world exposure is
+    // near-zero, but non-SDK callers (curl, custom clients) could
+    // hit it. Accept both forms.
+    let path = request.uri().path();
+    let is_anthropic_path = path == "/v1/messages" || path == "/v1/messages/";
+    let render = |e: ProxyError| -> Response {
+        if is_anthropic_path {
+            e.into_anthropic_response()
+        } else {
+            e.into_response()
+        }
+    };
     // RFC 9110 §8.6 — a server SHOULD reject a request that carries
     // duplicate or conflicting `Content-Length` values rather than
     // act on the first one (which is a request-smuggling vector).
@@ -181,8 +205,9 @@ async fn enforce_request_body_limit(
         .iter();
     let first = content_lengths.next();
     if content_lengths.next().is_some() {
-        return ProxyError::InvalidRequest("conflicting Content-Length headers".into())
-            .into_response();
+        return render(ProxyError::InvalidRequest(
+            "conflicting Content-Length headers".into(),
+        ));
     }
     if let Some(declared) = first
         .and_then(|v| v.to_str().ok())
@@ -194,10 +219,9 @@ async fn enforce_request_body_limit(
             // the socket while the client is still writing, and the client
             // sees EPIPE/ECONNRESET instead of the 413.
             drain_body(request.into_body()).await;
-            return ProxyError::RequestTooLarge {
+            return render(ProxyError::RequestTooLarge {
                 limit_bytes: state.request_body_limit_bytes,
-            }
-            .into_response();
+            });
         }
     }
     next.run(request).await
@@ -657,6 +681,165 @@ mod tests {
             message.contains("limit"),
             "413 message should reference the limit; got {message:?}"
         );
+    }
+
+    /// Audit HIGH-3 (#343): the body-limit middleware runs BEFORE
+    /// the `/v1/messages` handler, so its rejection path must emit
+    /// the Anthropic-shape envelope rather than the OpenAI-shape
+    /// envelope — otherwise the Claude SDK's strict parser falls
+    /// through to a generic exception. Same contract as the handler-
+    /// side `into_anthropic_response()` for #336.
+    #[tokio::test]
+    async fn oversize_body_on_v1_messages_returns_anthropic_envelope_request_too_large() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let oversized = 2 * 1024 * 1024;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .header("content-length", oversized.to_string())
+            .body(Body::from(
+                r#"{"model":"my-gpt4","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Anthropic-shape envelope per docs.anthropic.com/en/api/errors:
+        // `{ "type": "error", "error": { "type": "...", "message": "..." } }`.
+        assert_eq!(v["type"], "error", "Anthropic top-level discriminator");
+        assert_eq!(
+            v["error"]["type"], "request_too_large",
+            "413 → Anthropic-canonical request_too_large per status-to-type mapping",
+        );
+        // OpenAI-only fields must be absent.
+        assert!(v["error"].get("code").is_none());
+        assert!(v["error"].get("param").is_none());
+    }
+
+    /// Audit MEDIUM-A (3rd audit) on #343: when the caller streams an
+    /// oversize body without a declared Content-Length, the
+    /// `enforce_request_body_limit` middleware skips its early reject
+    /// (no length to compare), and the `Json<Value>` extractor's
+    /// `DefaultBodyLimit` cap fires during read. That produces a
+    /// `JsonRejection::BytesRejection`, which the handler MUST map
+    /// to `RequestTooLarge` (413 + `error.type=="request_too_large"`)
+    /// rather than `InvalidRequest` (400 + `"invalid_request_error"`)
+    /// — the Claude SDK branches on `error.type=="request_too_large"`
+    /// to mark requests as "non-retriable cap exceeded"; folding it
+    /// into 400 breaks the retry-policy signal.
+    #[tokio::test]
+    async fn streaming_oversize_body_on_v1_messages_returns_413_request_too_large() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        // Build a streaming body that yields > 1 MiB chunk-by-chunk
+        // with NO upstream-set Content-Length. The middleware can't
+        // decide on size and will pass through; the per-extractor
+        // `DefaultBodyLimit` cap (set to `request_body_limit_bytes`
+        // in `build_router`) fires on the read, surfacing as
+        // `JsonRejection::BytesRejection`.
+        let chunk = vec![b'x'; 200 * 1024]; // 200 KiB per chunk
+        let stream =
+            futures::stream::iter((0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
+        let body = Body::from_stream(stream);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            // Intentionally NO Content-Length.
+            .body(body)
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "streaming-oversize must surface as 413 request_too_large, NOT 400 invalid_request_error",
+        );
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(
+            v["error"]["type"], "request_too_large",
+            "Anthropic-canonical 413 → request_too_large; mistakenly folding into invalid_request_error \
+             breaks the Claude SDK's retry-policy branch",
+        );
+    }
+
+    /// Audit LOW-A (3rd audit) on #343: the path-match guard in
+    /// `enforce_request_body_limit` must accept both `/v1/messages`
+    /// and `/v1/messages/` (trailing slash) — axum's path
+    /// normalization routes both to the Anthropic handler, but a
+    /// strict `==` check on the bare form would miss the trailing-
+    /// slash variant. SDKs don't add the slash; non-SDK callers
+    /// (curl, custom clients) might.
+    #[tokio::test]
+    async fn oversize_body_on_v1_messages_trailing_slash_still_anthropic_envelope() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let oversized = 2 * 1024 * 1024;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages/")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .header("content-length", oversized.to_string())
+            .body(Body::from(
+                r#"{"model":"my-gpt4","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["type"], "error",
+            "trailing-slash /v1/messages/ must still emit Anthropic envelope",
+        );
+        assert_eq!(v["error"]["type"], "request_too_large");
+    }
+
+    /// Companion to the above: duplicate Content-Length on /v1/messages
+    /// also emits Anthropic envelope. Smuggling-rejection path runs
+    /// in the same middleware as the body-limit reject.
+    #[tokio::test]
+    async fn duplicate_content_length_on_v1_messages_returns_anthropic_envelope() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let body =
+            r#"{"model":"my-gpt4","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}"#;
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        req.headers_mut().append(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(body.len()),
+        );
+        req.headers_mut().append(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(body.len() + 1),
+        );
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
     }
 
     /// Issue #159 audit MEDIUM-3: duplicate `Content-Length` headers

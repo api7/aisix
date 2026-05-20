@@ -532,11 +532,17 @@ mod tests {
 
     #[tokio::test]
     async fn create_model_with_invalid_provider_prefix_is_400_schema_error() {
+        // `mistral` was the original sentinel for "unknown provider"
+        // (rejected by the legacy 6-value allowlist). Since
+        // ai-gateway#345 first-classed 11 long-tail variants, mistral
+        // is now valid — use a string that's NOT in the post-#345
+        // 17-value list so the negative-test still pins the
+        // schema-rejection path.
         let app = build_router(build_state());
         let body = json!({
             "display_name": "x",
-            "provider": "mistral",
-            "model_name": "large",
+            "provider": "this-is-not-a-provider-id",
+            "model_name": "x",
             "provider_key_id": "11111111-1111-1111-1111-111111111111"
         });
         let resp = run(app, auth_req("POST", "/admin/v1/models", Some(body))).await;

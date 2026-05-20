@@ -1130,7 +1130,7 @@ mod tests {
 
     const BAD_PROVIDER_MODEL: &[u8] = br#"{
         "display_name":"x",
-        "provider":"mistral",
+        "provider":"this-is-not-a-provider-id",
         "model_name":"l",
         "provider_key_id":"pk"
     }"#;

@@ -117,7 +117,7 @@ fn model_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "display_name":    { "type": "string", "minLength": 1 },
-            "provider":        { "type": "string", "enum": ["openai","anthropic","google","deepseek","cohere","jina"] },
+            "provider":        { "type": "string", "enum": ["openai","anthropic","google","deepseek","cohere","jina","groq","mistral","togetherai","fireworks-ai","perplexity","moonshotai","alibaba","zhipuai","baseten","huggingface","cerebras"] },
             "model_name":      { "type": "string", "minLength": 1 },
             "provider_key_id": { "type": "string", "minLength": 1 },
             "timeout":         { "type": "integer", "minimum": 0 },
@@ -582,10 +582,14 @@ mod tests {
 
     #[test]
     fn model_unknown_provider_value_fails() {
+        // `mistral` USED to be an unknown provider (rejected by the
+        // 6-value allowlist) but is now first-class on the Hub via
+        // ai-gateway#345. Use a value that's NOT in the post-#345
+        // enum so the negative test still pins the rejection path.
         let v = json!({
             "display_name": "x",
-            "provider": "mistral",
-            "model_name": "large",
+            "provider": "this-is-not-a-provider-id",
+            "model_name": "x",
             "provider_key_id": "pk-1"
         });
         assert!(validate_model(&v).is_err());

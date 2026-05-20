@@ -4,7 +4,7 @@ description: Official documentation for AISIX AI Gateway and AISIX Cloud, includ
 sidebar_position: 1
 ---
 
-AISIX AI Gateway is an AI [gateway](overview/glossary.md#gateway) for platform engineers and AI agent developers who need a consistent way to route, govern, and observe LLM traffic across multiple providers. [AISIX Cloud](overview/glossary.md#aisix-cloud) extends that gateway with a managed [control plane](overview/glossary.md#control-plane) and managed [data-plane](overview/glossary.md#data-plane) workflows.
+AISIX AI Gateway is an AI [gateway](overview/glossary.md#gateway) for platform engineers and AI agent developers who need a consistent way to route, govern, and observe LLM traffic across multiple providers. [AISIX Cloud](overview/glossary.md#aisix-cloud) extends that gateway with a managed [control plane](overview/glossary.md#control-plane) and managed [data plane](overview/glossary.md#data-plane) workflows.
 
 This documentation set is organized for two primary audiences:
 

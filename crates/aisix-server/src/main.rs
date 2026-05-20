@@ -766,12 +766,20 @@ fn load_heartbeat_config_from_disk(
 /// Hub. The Hub is created once at startup; future dynamic reload
 /// lands behind the same `register()` call.
 ///
-/// `Provider::Cohere` and `Provider::Jina` are intentionally NOT
-/// registered: per #213 Phases 1–2 they are exposed only via
-/// `/v1/rerank`, which is a verbatim HTTP forward (`aisix-proxy::
-/// rerank`) and bypasses the Bridge trait entirely. A bridge for
-/// either provider would be needed only when chat completions /
-/// embeddings on those providers are added.
+/// `Provider::Jina` is intentionally NOT registered: per #213 Phase 2
+/// Jina is exposed only via `/v1/rerank`, which is a verbatim HTTP
+/// forward (`aisix-proxy::rerank`) and bypasses the Bridge trait
+/// entirely.
+///
+/// `Provider::Cohere` is registered against the OpenAI-compatible
+/// chat endpoint at `https://api.cohere.com/compatibility/v1` (per
+/// <https://docs.cohere.com/reference/chat>). Cohere's rerank surface
+/// at `/v1/rerank` continues to bypass the Bridge via
+/// `aisix-proxy::rerank` — the bridge here only serves `chat/completions`,
+/// `embeddings`, and the other OpenAI-shape endpoints the bridge
+/// supports. The chat-compat namespace gives an exact OpenAI envelope
+/// shape so `OpenAiBridge::with_name("cohere")` can serve it directly
+/// (closes #332).
 fn build_hub() -> Hub {
     let hub = Hub::new();
     hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
@@ -783,6 +791,65 @@ fn build_hub() -> Hub {
     hub.register(
         Provider::Deepseek,
         Arc::new(OpenAiBridge::new().with_name("deepseek")),
+    );
+    hub.register(
+        Provider::Cohere,
+        Arc::new(OpenAiBridge::new().with_name("cohere")),
+    );
+
+    // Long-tail OpenAI-adapter providers (#60 P2-A). All 11 expose an
+    // OpenAI-compatible chat completions surface and route through
+    // `OpenAiBridge::with_name`. Default base URLs sourced from each
+    // vendor's official OpenAI-compat docs (see
+    // `crates/aisix-provider-openai/src/bridge.rs` constants for
+    // citations). Operators can override per-PK via `api_base`; the
+    // `with_name` here drives both the metric label and the
+    // `default_base()` fallback when api_base is unset.
+    hub.register(
+        Provider::Groq,
+        Arc::new(OpenAiBridge::new().with_name("groq")),
+    );
+    hub.register(
+        Provider::Mistral,
+        Arc::new(OpenAiBridge::new().with_name("mistral")),
+    );
+    hub.register(
+        Provider::Togetherai,
+        Arc::new(OpenAiBridge::new().with_name("togetherai")),
+    );
+    hub.register(
+        Provider::FireworksAi,
+        Arc::new(OpenAiBridge::new().with_name("fireworks-ai")),
+    );
+    hub.register(
+        Provider::Perplexity,
+        Arc::new(OpenAiBridge::new().with_name("perplexity")),
+    );
+    // Provider::Xai scoped out — see model.rs comment on the Xai
+    // variant (deferred until cp-api adapter_map adds the entry).
+    hub.register(
+        Provider::Moonshotai,
+        Arc::new(OpenAiBridge::new().with_name("moonshotai")),
+    );
+    hub.register(
+        Provider::Alibaba,
+        Arc::new(OpenAiBridge::new().with_name("alibaba")),
+    );
+    hub.register(
+        Provider::Zhipuai,
+        Arc::new(OpenAiBridge::new().with_name("zhipuai")),
+    );
+    hub.register(
+        Provider::Baseten,
+        Arc::new(OpenAiBridge::new().with_name("baseten")),
+    );
+    hub.register(
+        Provider::Huggingface,
+        Arc::new(OpenAiBridge::new().with_name("huggingface")),
+    );
+    hub.register(
+        Provider::Cerebras,
+        Arc::new(OpenAiBridge::new().with_name("cerebras")),
     );
 
     // Family bridges (issue #302 Phase A/D two-tier dispatch). The
@@ -1074,5 +1141,82 @@ mod tests {
         let m = managed_with_urls(Some(""), None);
         let err = derive_cp_etcd_url(&m).unwrap_err();
         assert!(err.to_string().contains("cp_base_url"), "unexpected: {err}");
+    }
+
+    /// `build_hub()` must register `Provider::Cohere` against the
+    /// `with_name("cohere")` variant of [`OpenAiBridge`] — the only
+    /// thing that ties the Provider enum to the chat-compat URL
+    /// (closes #332). A regression that registered `OpenAiBridge::new()`
+    /// (default name = `"openai"`) or omitted the registration would
+    /// flip the bridge label on metrics and (more importantly) the
+    /// `default_base()` fallback, silently routing Cohere chat to
+    /// OpenAI's host.
+    #[test]
+    fn build_hub_registers_cohere_chat_compat_variant() {
+        let hub = build_hub();
+        let bridge = hub
+            .get(aisix_core::Provider::Cohere)
+            .expect("Provider::Cohere must have a Hub bridge registered for chat-compat");
+        assert_eq!(
+            bridge.name(),
+            "cohere",
+            "Hub.register(Provider::Cohere, …) MUST use OpenAiBridge::with_name(\"cohere\") — \
+             a `with_name(\"openai\")` fallback would route Cohere chat to OpenAI's host",
+        );
+    }
+
+    /// Companion to the cohere check above: Jina deliberately stays
+    /// rerank-only per #213 Phase 2. A future PR that flips Jina to
+    /// chat-compat must update this assertion deliberately.
+    #[test]
+    fn build_hub_does_not_register_jina_for_chat() {
+        let hub = build_hub();
+        assert!(
+            hub.get(aisix_core::Provider::Jina).is_none(),
+            "Provider::Jina is rerank-only (#213 Phase 2); a Hub registration here would \
+             silently route /v1/chat/completions on Jina to whichever bridge name was picked",
+        );
+    }
+
+    /// `build_hub()` must register every long-tail OpenAI-adapter
+    /// provider (#60 P2-A) with the matching `with_name(...)` bridge
+    /// variant. A regression that registered the default
+    /// `OpenAiBridge::new()` (name = `"openai"`) on any of these would
+    /// silently route the provider's chat traffic to OpenAI's API
+    /// host via `default_base()`, leaking customer tokens to OpenAI.
+    #[test]
+    fn build_hub_registers_long_tail_openai_adapter_variants() {
+        let hub = build_hub();
+        // (Provider, expected bridge name as set by `with_name`).
+        // The name must match the wire id (`Provider::as_str()`)
+        // so metrics labels + default_base lookups stay aligned.
+        let expected = [
+            (aisix_core::Provider::Groq, "groq"),
+            (aisix_core::Provider::Mistral, "mistral"),
+            (aisix_core::Provider::Togetherai, "togetherai"),
+            (aisix_core::Provider::FireworksAi, "fireworks-ai"),
+            (aisix_core::Provider::Perplexity, "perplexity"),
+            (aisix_core::Provider::Moonshotai, "moonshotai"),
+            (aisix_core::Provider::Alibaba, "alibaba"),
+            (aisix_core::Provider::Zhipuai, "zhipuai"),
+            (aisix_core::Provider::Baseten, "baseten"),
+            (aisix_core::Provider::Huggingface, "huggingface"),
+            (aisix_core::Provider::Cerebras, "cerebras"),
+        ];
+        for (provider, expected_name) in expected {
+            let bridge = hub.get(provider).unwrap_or_else(|| {
+                panic!(
+                    "Provider::{provider:?} must have a Hub bridge registered (#60 P2-A); \
+                     a missing registration would 503 the customer's chat traffic"
+                )
+            });
+            assert_eq!(
+                bridge.name(),
+                expected_name,
+                "Provider::{provider:?} bridge name must match the wire id — \
+                 a mismatch silently routes traffic to OpenAI's host via the \
+                 OpenAiBridge::default_base() fallback when api_base is unset",
+            );
+        }
     }
 }

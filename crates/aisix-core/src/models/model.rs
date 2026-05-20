@@ -25,9 +25,17 @@ pub enum Provider {
     Anthropic,
     Google,
     Deepseek,
-    /// Cohere — currently exposed for `/v1/rerank` only (#213 Phase 1).
-    /// Cohere's chat / generate APIs are not OpenAI-compatible; a
-    /// future bridge implementation can extend coverage.
+    /// Cohere — `/v1/rerank` (native, via `aisix-proxy::rerank`) and
+    /// chat/completions / embeddings (via `OpenAiBridge::with_name("cohere")`
+    /// against `https://api.cohere.com/compatibility/v1`, per
+    /// <https://docs.cohere.com/reference/chat>). Chat-compat is the
+    /// OpenAI-shape namespace Cohere ships alongside its native
+    /// `/v1/chat`. Chat-compat coverage today: the `command-r` /
+    /// `command-a` family per
+    /// <https://docs.cohere.com/v2/docs/compatibility-api>; legacy
+    /// `command` / `command-light` / `command-nightly` go to native
+    /// (not yet bridged) and will return upstream 400 if configured
+    /// against the chat-compat path.
     Cohere,
     /// Jina AI — currently exposed for `/v1/rerank` only (#213 Phase 2).
     /// Jina's rerank wire shape is identity-mapped to the OpenAI-compat
@@ -36,6 +44,58 @@ pub enum Provider {
     /// verbatim with no transform. Jina's chat / embeddings APIs are
     /// out of scope for this phase.
     Jina,
+    // ─── OpenAI-adapter long-tail providers (#60 P2-A) ────────────────
+    //
+    // The 11 variants below all expose an OpenAI-compatible chat
+    // completions surface and route through `OpenAiBridge::with_name`
+    // — the same dispatch path Deepseek / Google already use. Default
+    // base URLs are sourced from each vendor's official OpenAI-compat
+    // documentation; operators can override via `ProviderKey.api_base`.
+    //
+    // serde casing is `lowercase` (inherited from the parent enum) so
+    // each variant's wire id is its single-token lowercase form. The
+    // `fireworks-ai` variant carries an explicit `#[serde(rename)]`
+    // because its catalog id (per models.dev) is hyphenated and would
+    // not survive the default lowercase rule.
+    /// Groq — OpenAI-compat at `https://api.groq.com/openai/v1`.
+    Groq,
+    /// Mistral AI — OpenAI-compat at `https://api.mistral.ai/v1`.
+    Mistral,
+    /// Together.ai — OpenAI-compat at `https://api.together.ai/v1`.
+    Togetherai,
+    /// Fireworks AI — OpenAI-compat at `https://api.fireworks.ai/inference/v1`.
+    /// Wire id is the hyphenated `fireworks-ai` (matches the
+    /// models.dev catalog id used by cp-api's adapter_map).
+    #[serde(rename = "fireworks-ai")]
+    FireworksAi,
+    /// Perplexity — OpenAI-compat at `https://api.perplexity.ai`
+    /// (chat lives at the host root).
+    Perplexity,
+    // xAI Grok was scoped out of this PR after audit: `xai` is not in
+    // AISIX-Cloud's `internal/cpapi/adapter_map/adapter_map.yaml`
+    // Featured table (PR #335 swapped xai → google for rank 8), so
+    // adding `Provider::Xai` here without a catalog entry would leave
+    // a DP variant cp-api can't write to. Tracked as a separate
+    // follow-up: add xai to adapter_map.yaml first, then a one-line
+    // Provider::Xai DP-side commit will follow.
+    /// Moonshot AI (Kimi) — OpenAI-compat at `https://api.moonshot.cn/v1`.
+    Moonshotai,
+    /// Alibaba Cloud DashScope — OpenAI-compat at
+    /// `https://dashscope.aliyuncs.com/compatible-mode/v1`.
+    Alibaba,
+    /// Zhipu AI (智谱) — OpenAI-compat at
+    /// `https://open.bigmodel.cn/api/paas/v4`.
+    Zhipuai,
+    /// Baseten — OpenAI-compat at `https://inference.baseten.co/v1`.
+    /// Per <https://docs.baseten.co/development/model-apis/openai-clients>,
+    /// model APIs are exposed at this host root.
+    Baseten,
+    /// Hugging Face — OpenAI-compat router at
+    /// `https://router.huggingface.co/v1` per
+    /// <https://huggingface.co/docs/inference-providers/en/index#openai-compatible-api>.
+    Huggingface,
+    /// Cerebras Inference — OpenAI-compat at `https://api.cerebras.ai/v1`.
+    Cerebras,
 }
 
 impl Provider {
@@ -47,6 +107,19 @@ impl Provider {
             Self::Deepseek => "https://api.deepseek.com",
             Self::Cohere => "https://api.cohere.com",
             Self::Jina => "https://api.jina.ai",
+            // Long-tail OpenAI-adapter providers (#60 P2-A) — each
+            // url is the vendor's documented OpenAI-compat endpoint.
+            Self::Groq => "https://api.groq.com/openai/v1",
+            Self::Mistral => "https://api.mistral.ai/v1",
+            Self::Togetherai => "https://api.together.ai/v1",
+            Self::FireworksAi => "https://api.fireworks.ai/inference/v1",
+            Self::Perplexity => "https://api.perplexity.ai",
+            Self::Moonshotai => "https://api.moonshot.cn/v1",
+            Self::Alibaba => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            Self::Zhipuai => "https://open.bigmodel.cn/api/paas/v4",
+            Self::Baseten => "https://inference.baseten.co/v1",
+            Self::Huggingface => "https://router.huggingface.co/v1",
+            Self::Cerebras => "https://api.cerebras.ai/v1",
         }
     }
 
@@ -58,6 +131,20 @@ impl Provider {
             Self::Deepseek => "deepseek",
             Self::Cohere => "cohere",
             Self::Jina => "jina",
+            // Long-tail OpenAI-adapter providers (#60 P2-A). The
+            // wire id matches the catalog id used by cp-api's
+            // adapter_map / models.dev.
+            Self::Groq => "groq",
+            Self::Mistral => "mistral",
+            Self::Togetherai => "togetherai",
+            Self::FireworksAi => "fireworks-ai",
+            Self::Perplexity => "perplexity",
+            Self::Moonshotai => "moonshotai",
+            Self::Alibaba => "alibaba",
+            Self::Zhipuai => "zhipuai",
+            Self::Baseten => "baseten",
+            Self::Huggingface => "huggingface",
+            Self::Cerebras => "cerebras",
         }
     }
 }
@@ -125,6 +212,19 @@ impl From<Provider> for Adapter {
             Provider::Deepseek => Adapter::Openai,
             Provider::Cohere => Adapter::Openai,
             Provider::Jina => Adapter::Openai,
+            // All long-tail variants (#60 P2-A) expose OpenAI-compat
+            // chat surfaces and route through OpenAiBridge.
+            Provider::Groq
+            | Provider::Mistral
+            | Provider::Togetherai
+            | Provider::FireworksAi
+            | Provider::Perplexity
+            | Provider::Moonshotai
+            | Provider::Alibaba
+            | Provider::Zhipuai
+            | Provider::Baseten
+            | Provider::Huggingface
+            | Provider::Cerebras => Adapter::Openai,
         }
     }
 }
@@ -608,5 +708,46 @@ mod tests {
             "https://api.cohere.com"
         );
         assert_eq!(Provider::Jina.default_base_url(), "https://api.jina.ai");
+    }
+
+    /// Every `Provider` variant must have a non-empty `default_base_url`,
+    /// `as_str`, and an `Adapter::from` arm. A regression that added a
+    /// new variant but forgot to update one of the three would compile
+    /// fine but silently break dispatch downstream — this iterator-based
+    /// test makes the regression class explicit (audit MEDIUM-2 on
+    /// PR #345).
+    #[test]
+    fn every_provider_variant_has_default_base_url_as_str_and_adapter() {
+        let variants = [
+            Provider::Openai,
+            Provider::Anthropic,
+            Provider::Google,
+            Provider::Deepseek,
+            Provider::Cohere,
+            Provider::Jina,
+            // Long-tail OpenAI-adapter providers (#60 P2-A).
+            Provider::Groq,
+            Provider::Mistral,
+            Provider::Togetherai,
+            Provider::FireworksAi,
+            Provider::Perplexity,
+            Provider::Moonshotai,
+            Provider::Alibaba,
+            Provider::Zhipuai,
+            Provider::Baseten,
+            Provider::Huggingface,
+            Provider::Cerebras,
+        ];
+        for v in variants {
+            let url = v.default_base_url();
+            assert!(
+                url.starts_with("https://"),
+                "{v:?}: default_base_url must be an https URL, got {url:?}",
+            );
+            let id = v.as_str();
+            assert!(!id.is_empty(), "{v:?}: as_str must be non-empty");
+            // Adapter::from must compile and return some variant.
+            let _: Adapter = Adapter::from(v);
+        }
     }
 }

@@ -54,6 +54,30 @@ In managed mode, the data plane is started with environment variables for:
 - `AISIX_MANAGED__CP_KEY_PEM`
 - `AISIX_MANAGED__CP_CA_PEM`
 
+`AISIX_MANAGED__CP_BASE_URL` is the data-plane manager `/dp/*` mTLS
+surface, for example `https://dpm.example.com:7944` or
+`https://dpm:7944` inside the AISIX Cloud Compose network. Do not point
+it at the browser dashboard or cp-api origin such as
+`http://api:8080`; heartbeat is always built as
+`<CP_BASE_URL>/dp/heartbeat`.
+
+For deployments that should not inline PEM material into environment
+variables, use the file-based equivalents instead:
+
+- `AISIX_MANAGED__CP_CERT_FILE`
+- `AISIX_MANAGED__CP_KEY_FILE`
+- `AISIX_MANAGED__CP_CA_FILE`
+
+The inline and file variants are mutually exclusive for each cert/key/CA
+pair.
+
+The data plane persists the issued mTLS bundle, `dp_id`, and runtime
+state under `/var/lib/aisix` by default. If the container runs as a
+non-default user and reads bind-mounted PEM files, make `/var/lib/aisix`
+writable by that same user, for example by mounting a host-owned state
+directory there. Mounting only the `mtls` subdirectory is not enough
+because the process also writes sidecar files next to it.
+
 The managed data plane then uses the same single binary, but follows the managed bootstrap path instead of binding the standalone admin surface.
 
 In other words:
@@ -94,6 +118,11 @@ Start with:
 - `AISIX_MANAGED__CP_BASE_URL`
 - `AISIX_MANAGED__CP_ETCD_ENDPOINT`
 - trust chain in `AISIX_MANAGED__CP_CA_PEM`
+- writable state directory for `/var/lib/aisix`
+
+If logs show `/dp/heartbeat` returning 404, `CP_BASE_URL` usually points
+at the wrong service. It should point at the DPM mTLS endpoint, not the
+cp-api/dashboard origin.
 
 ### The data plane starts but does not receive configuration
 

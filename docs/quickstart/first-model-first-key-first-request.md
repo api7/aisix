@@ -15,7 +15,7 @@ Then you will verify that the new configuration is visible on the proxy surface.
 ## Prerequisites
 
 - A running gateway from the [Self-Hosted Quickstart](self-hosted.md)
-- A reachable upstream OpenAI-compatible endpoint
+- An API key from an upstream provider (OpenAI, Anthropic, Google, DeepSeek, or another supported provider). If you do not have one, sign up at the provider (for example, <https://platform.openai.com/api-keys> — paid; pay-as-you-go starts around $5). The key looks like `sk-...` (or the provider equivalent) and is what you will paste into the `YOUR_PROVIDER_API_KEY` placeholder in Step 1.
 - Your admin key from the bootstrap config
 
 ## What This Quickstart Configures
@@ -78,6 +78,10 @@ Capture the returned `id`. You will use it as `provider_key_id` when creating th
 - **Option B — jq-free**: if you already ran the curl above, copy the `id` field by eye from that response and paste it wherever the steps below say `YOUR_PROVIDER_KEY_ID`.
 
 The same pattern applies to the model `id` and API-key `id` captures in the next two steps.
+
+:::warning
+The `secret` field is returned as plaintext in this response. Treat the command output as sensitive — avoid pasting it into shared documents, issue trackers, or chat. The admin API also returns the plaintext on subsequent `GET /admin/v1/provider_keys/:id` calls, so the same handling applies any time you read this resource.
+:::
 
 ## Step 2: Create a Model
 

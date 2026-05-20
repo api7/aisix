@@ -20,6 +20,11 @@ Use this page after you have already created:
 
 If you have not done that yet, start with [First Model, First Key, First Request](first-model-first-key-first-request.md).
 
+## Prerequisites
+
+- A running gateway with at least one configured provider key, model alias, and caller-facing API key (see the prior quickstart pages).
+- **Node.js 18 or newer with `npm`.** Install from <https://nodejs.org> or via [nvm](https://github.com/nvm-sh/nvm) and verify with `node --version && npm --version`. The official OpenAI SDK used below requires Node.js 18+.
+
 ## What Changes In The SDK
 
 Point the SDK at the gateway instead of the upstream provider:
@@ -36,7 +41,7 @@ What does **not** change:
 
 ## Install The SDK
 
-All three steps below run from the same project directory. Create one first:
+All commands below run from the same project directory. Create one first:
 
 ```bash title="Create the demo project directory"
 mkdir aisix-openai-demo && cd aisix-openai-demo

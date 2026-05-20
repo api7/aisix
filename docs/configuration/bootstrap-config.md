@@ -93,14 +93,14 @@ This section is the source of truth for where the gateway reads dynamic configur
 
 Important fields:
 
-| Field | Description |
-| --- | --- |
-| `endpoints` | etcd endpoints the gateway should connect to |
-| `prefix` | base resource namespace, usually `/aisix` |
-| `env_id` | optional environment scope for env-scoped keys |
-| `dial_timeout_ms` | connection timeout |
-| `request_timeout_ms` | request timeout |
-| `tls` | optional etcd TLS or mTLS configuration |
+| Field | Description | Default |
+| --- | --- | --- |
+| `endpoints` | etcd endpoints the gateway should connect to | required |
+| `prefix` | base resource namespace, usually `/aisix` | `"/aisix"` |
+| `env_id` | optional environment scope for env-scoped keys | `""` (legacy / unscoped) |
+| `dial_timeout_ms` | connection timeout | `5000` |
+| `request_timeout_ms` | request timeout | `5000` |
+| `tls` | optional etcd TLS or mTLS configuration | none |
 
 Operator guidance:
 
@@ -116,11 +116,11 @@ This is the only listener your callers need for model traffic.
 
 Important fields:
 
-| Field | Description |
-| --- | --- |
-| `addr` | proxy listener address |
-| `request_body_limit_bytes` | request-body limit enforced by the proxy listener |
-| `tls` | optional TLS certificate and key for the proxy listener |
+| Field | Description | Default |
+| --- | --- | --- |
+| `addr` | proxy listener address | required |
+| `request_body_limit_bytes` | request-body limit enforced by the proxy listener | `10485760` (10 MiB) |
+| `tls` | optional TLS certificate and key for the proxy listener | none |
 
 Recommended pattern:
 
@@ -135,11 +135,11 @@ In standalone mode, this listener owns the write path for dynamic resources.
 
 Important fields:
 
-| Field | Description |
-| --- | --- |
-| `addr` | admin listener address |
-| `admin_keys` | static admin keys accepted by the admin auth layer |
-| `tls` | optional TLS certificate and key for the admin listener |
+| Field | Description | Default |
+| --- | --- | --- |
+| `addr` | admin listener address | `"127.0.0.1:0"` (intentionally non-routable; standalone deployments must override) |
+| `admin_keys` | static admin keys accepted by the admin auth layer | `[]` (must be non-empty for standalone) |
+| `tls` | optional TLS certificate and key for the admin listener | none |
 
 Admin keys are static bootstrap configuration. They are not stored in the dynamic `ApiKey` table.
 
@@ -151,15 +151,24 @@ Recommended pattern:
 
 ## `observability`
 
-Use `observability` to configure:
+Use `observability` to set process-wide telemetry knobs: service name, log level, Prometheus exporter control, and (in future releases) access-log gating and OTLP exporters. Today `service_name`, `log_level`, and the `metrics.prometheus.*` block are consulted at runtime; the remaining keys are recognized in the schema and reserved for upcoming releases — setting them is harmless but currently has no effect.
 
-- service name
-- log level
-- access logs
-- Prometheus metrics
-- OTLP metrics and tracing exporters
+Important fields:
 
-Bootstrap observability settings are process-wide. They are different from dynamic `ObservabilityExporter` rows, which control data-plane telemetry fan-out for request events.
+| Field | Description | Default | Status |
+| --- | --- | --- | --- |
+| `service_name` | service-name attribute on the tracing subscriber initialised at boot | `"aisix"` | wired |
+| `log_level` | fallback `EnvFilter` directive when `RUST_LOG` is not set in the environment | `"info"` | wired |
+| `access_log` | reserved field; access logs are currently emitted by every proxy handler regardless of this setting | `true` | reserved (not yet consulted) |
+| `metrics.prometheus.enabled` | controls whether the admin listener mounts the Prometheus scrape endpoint; when `false`, no `/metrics` route is registered | `true` | wired |
+| `metrics.prometheus.path` | mount path for the Prometheus scrape endpoint when `metrics.prometheus.enabled` is `true`; values without a leading slash are normalised by prepending one, and an empty value falls back to `/metrics` | `"/metrics"` | wired |
+| `metrics.otlp.enabled` | reserved field; no OTLP metrics export pipeline is installed in the current release | `false` | reserved (not yet wired) |
+| `metrics.otlp.endpoint` | reserved field; see `metrics.otlp.enabled` | none | reserved (not yet wired) |
+| `tracing.otlp.enabled` | enabling this validates the endpoint at boot and emits a startup log line; the OTLP traces pipeline itself is deferred to a future release | `false` | partial (validation only) |
+| `tracing.otlp.endpoint` | OTLP/gRPC collector endpoint for traces; validated at boot when `tracing.otlp.enabled` is `true` | none | partial (validation only) |
+| `tracing.otlp.sample_ratio` | head-based sampling ratio reserved for the future OTLP traces pipeline | `1.0` | reserved (not yet wired) |
+
+Bootstrap observability settings are process-wide. They are different from dynamic `ObservabilityExporter` rows, which control per-request span fan-out via OTLP/HTTP at runtime. For per-row dynamic exporters added at runtime via the admin API, see [Observability Exporters](observability-exporters.md).
 
 `observability.metrics.prometheus.enabled` controls whether the admin listener mounts the Prometheus scrape endpoint. `observability.metrics.prometheus.path` controls the mounted path and defaults to `/metrics`.
 
@@ -167,10 +176,12 @@ Bootstrap observability settings are process-wide. They are different from dynam
 
 Use `cache` to choose the bootstrap cache backend.
 
-Current backend selection supports:
+Important fields:
 
-- `memory`
-- `redis`
+| Field | Description | Default |
+| --- | --- | --- |
+| `backend` | which cache backend the process uses (`memory` or `redis`) | `memory` |
+| `redis` | Redis connection block (`url`, optional `mode`); only consulted when `backend: redis` | none |
 
 `memory` is the default path. `redis` has runtime backend selection and connection logic, but the broader cache docs and support boundaries are still being expanded.
 

@@ -73,7 +73,7 @@ The current admin router exposes:
 
 Think about these routes in three groups:
 
-- public operator helpers: health, metrics, and OpenAPI discovery
+- public operator helpers: livez, metrics, and OpenAPI discovery
 - CRUD resources: models, API keys, provider keys, guardrails, cache policies, exporters
 - convenience operator workflow: the in-process playground
 

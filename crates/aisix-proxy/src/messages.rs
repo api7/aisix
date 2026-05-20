@@ -22,8 +22,16 @@
 //! Both paths share the same auth, model lookup, allowed_models check,
 //! access-log emission, metrics labels, and health tracker hooks.
 //!
-//! Errors use the standard OpenAI-style envelope so clients on the proxy
-//! side can handle them consistently regardless of which endpoint was used.
+//! Errors use the Anthropic-shape envelope
+//! `{type:"error", error:{type, message}}` (per
+//! <https://docs.anthropic.com/en/api/errors>) so Claude SDKs and the
+//! official `anthropic-sdk-python` envelope parser see a wire shape they
+//! recognise. The inner `error.type` follows the Anthropic SDK's strict
+//! `ErrorType` literal — `authentication_error` / `rate_limit_error` /
+//! `api_error` / etc. — NOT the OpenAI envelope's DP-stable taxonomy.
+//! See [`crate::error::ProxyError::into_anthropic_response`] for the
+//! status-to-type mapping. (`/v1/chat/completions` continues to emit
+//! the OpenAI-shape envelope with its DP-stable taxonomy.)
 
 use aisix_core::models::Provider;
 use aisix_obs::{AccessLog, LlmUsage, RequestLabels, RequestOutcome, UsageEvent, UsageLabels};
@@ -44,9 +52,76 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 pub async fn messages(
     State(state): State<ProxyState>,
-    auth: AuthenticatedKey,
-    Json(mut body): Json<Value>,
+    auth: Result<AuthenticatedKey, ProxyError>,
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    // Catch extractor rejections (auth fail / malformed JSON) HERE
+    // and re-wrap as Anthropic envelope. Without this, axum's default
+    // `IntoResponse for ProxyError` emits the OpenAI shape, which the
+    // Claude SDK can't parse on a /v1/messages 401/400 response
+    // (#336). Same envelope policy as dispatch-side errors below.
+    let auth = match auth {
+        Ok(a) => a,
+        Err(e) => return e.into_anthropic_response(),
+    };
+    let Json(mut body) = match body {
+        Ok(j) => j,
+        Err(rej) => {
+            use axum::extract::rejection::JsonRejection;
+            use axum::http::StatusCode;
+            // Audit MEDIUM-1: replace `JsonRejection::body_text()`
+            // with stable customer-friendly phrases — axum's internal
+            // wording could drift between releases and silently leak
+            // into the customer-facing envelope.
+            //
+            // Audit MEDIUM-A (3rd audit): discriminate
+            // `BytesRejection` (DefaultBodyLimit fired during read)
+            // from JSON parse errors. Chunked oversize-body callers
+            // (no Content-Length, so `enforce_request_body_limit`
+            // can't decide on the declared size) reach this rejection
+            // when the per-extractor cap fires — they MUST surface as
+            // 413 request_too_large per Anthropic SDK ErrorType
+            // taxonomy, not 400 invalid_request_error.
+            //
+            // Audit MEDIUM-B (4th audit): `BytesRejection` is a
+            // composite rejection — its inner `FailedToBufferBody`
+            // has TWO variants: `LengthLimitError` (status
+            // PAYLOAD_TOO_LARGE — real cap exceeded) and
+            // `UnknownBodyError` (status BAD_REQUEST — transport-
+            // side body-read failure, e.g. peer reset mid-body, hyper
+            // decoder error). The earlier `BytesRejection(_)` blanket
+            // arm mis-labelled transport failures as
+            // `request_too_large`, breaking the Claude SDK's
+            // non-retriable-cap branch (which assumes a true cap
+            // hit). Discriminate via the rejection's own `.status()`
+            // method (exposed by axum's composite_rejection macro,
+            // recursively delegated to the inner variant's
+            // `define_rejection! #[status = ...]`).
+            //
+            // `JsonRejection` is `#[non_exhaustive]` (axum-core
+            // 0.5.6 macros.rs:157), so the fallback `_` arm catches
+            // both today's `JsonDataError` / `JsonSyntaxError` /
+            // `MissingJsonContentType` AND any future variant axum
+            // adds — defaulting to 400 `invalid_request_error` until
+            // each new variant gets an explicit policy decision.
+            return match rej {
+                JsonRejection::BytesRejection(inner)
+                    if inner.status() == StatusCode::PAYLOAD_TOO_LARGE =>
+                {
+                    ProxyError::RequestTooLarge {
+                        limit_bytes: state.request_body_limit_bytes,
+                    }
+                }
+                JsonRejection::BytesRejection(_) => {
+                    // UnknownBodyError or any future composite arm —
+                    // transport-side failure, NOT a size cap.
+                    ProxyError::InvalidRequest("failed to read request body".into())
+                }
+                _ => ProxyError::InvalidRequest("invalid JSON request body".into()),
+            }
+            .into_anthropic_response();
+        }
+    };
     let started = Instant::now();
     let request_id = format!("msg-{}", Uuid::new_v4());
     let api_key_id = auth.entry.id.clone();
@@ -160,7 +235,12 @@ pub async fn messages(
                 elapsed,
                 AnthropicUsageMetrics::default(),
             );
-            err.into_response()
+            // /v1/messages must return Anthropic-shape error envelope
+            // `{type:"error", error:{type, message}}` so Claude SDKs
+            // can parse it — closes #336. The DP-stable taxonomy
+            // (`upstream_error`, `invalid_api_key`, …) is preserved
+            // on the nested `error.type` per ai-gateway#327.
+            err.into_anthropic_response()
         }
     }
 }
@@ -792,6 +872,7 @@ mod tests {
     use aisix_provider_anthropic::AnthropicBridge;
     use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
+    use axum::response::Response;
     use std::sync::Arc;
     use tower::ServiceExt;
     use wiremock::matchers::{header, method, path};
@@ -1214,7 +1295,9 @@ mod tests {
             ))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // Anthropic envelope: 401 → authentication_error (#336).
+        assert_anthropic_error_envelope(resp, StatusCode::UNAUTHORIZED, "authentication_error")
+            .await;
     }
 
     #[tokio::test]
@@ -1230,7 +1313,8 @@ mod tests {
             "max_tokens": 10
         });
         let resp = app.oneshot(make_req(body)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // Anthropic envelope: 403 → permission_error (#336).
+        assert_anthropic_error_envelope(resp, StatusCode::FORBIDDEN, "permission_error").await;
     }
 
     #[tokio::test]
@@ -1245,7 +1329,8 @@ mod tests {
             "max_tokens": 10
         });
         let resp = app.oneshot(make_req(body)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Anthropic envelope: 404 → not_found_error (#336).
+        assert_anthropic_error_envelope(resp, StatusCode::NOT_FOUND, "not_found_error").await;
     }
 
     /// Cross-provider path: client speaks Anthropic protocol but the
@@ -1402,7 +1487,103 @@ data: [DONE]\n\n";
             "max_tokens": 10
         });
         let resp = app.oneshot(make_req(body)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // 5xx upstream → 502 BadGateway → api_error per Anthropic
+        // SDK ErrorType literal (#336).
+        assert_anthropic_error_envelope(resp, StatusCode::BAD_GATEWAY, "api_error").await;
+    }
+
+    /// /v1/messages must emit the Anthropic-shape error envelope
+    /// `{type:"error", error:{type, message}}` on every error site —
+    /// closes #336. The pre-#336 OpenAI-shape envelope on /v1/messages
+    /// made the Claude SDK fall through to a generic exception that
+    /// dumped the entire body to the message field, losing the
+    /// structured error context that drives retry / fallback logic.
+    ///
+    /// Inner `error.type` follows the Anthropic SDK's `ErrorType`
+    /// literal (NOT the OpenAI envelope's DP-stable taxonomy) so
+    /// customers branching on `e.body['error']['type']` against
+    /// Anthropic-canonical strings stay portable. See
+    /// `crate::error::anthropic_kind_from_status` for the
+    /// LiteLLM-aligned status→type mapping.
+    /// Strict envelope-shape helper used across every error-path
+    /// test below — keeps regression coverage tight against a flip
+    /// back to OpenAI shape (audit HIGH-2).
+    async fn assert_anthropic_error_envelope(
+        resp: Response,
+        expected_status: StatusCode,
+        expected_kind: &str,
+    ) -> serde_json::Value {
+        assert_eq!(resp.status(), expected_status);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            env["type"], "error",
+            "top-level discriminator must be \"error\""
+        );
+        assert_eq!(
+            env["error"]["type"], expected_kind,
+            "inner error.type must follow Anthropic SDK ErrorType literal"
+        );
+        assert!(env["error"]["message"].is_string());
+        assert!(
+            env["error"].get("code").is_none(),
+            "OpenAI-only field `code` must be absent"
+        );
+        assert!(
+            env["error"].get("param").is_none(),
+            "OpenAI-only field `param` must be absent"
+        );
+        env
+    }
+
+    #[tokio::test]
+    async fn upstream_5xx_emits_anthropic_envelope_api_error() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("engine internal panic"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({
+            "model": "claude-haiku",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 10
+        });
+        let resp = app.oneshot(make_req(body)).await.unwrap();
+        // 5xx upstream → 502 BadGateway via Bridge collapse; status
+        // maps to `api_error` per Anthropic SDK ErrorType literal.
+        let env = assert_anthropic_error_envelope(resp, StatusCode::BAD_GATEWAY, "api_error").await;
+        // 5xx body redaction is preserved.
+        let msg = env["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            !msg.contains("engine internal panic"),
+            "upstream 5xx body must be redacted on the Anthropic envelope, got: {msg}",
+        );
+        assert!(
+            msg.contains("500"),
+            "redacted message must surface the upstream status, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_model_emits_anthropic_envelope_not_found_error() {
+        let snap = new_snap_anthropic("http://unused");
+        snap.apikeys.insert(apikey_entry(&["claude-haiku"]));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({
+            "model": "claude-haiku",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 10
+        });
+        let resp = app.oneshot(make_req(body)).await.unwrap();
+        assert_anthropic_error_envelope(resp, StatusCode::NOT_FOUND, "not_found_error").await;
     }
 
     #[tokio::test]
@@ -1416,8 +1597,10 @@ data: [DONE]\n\n";
             "max_tokens": 10
         });
         let resp = app.oneshot(make_req(body)).await.unwrap();
-        // 400 Bad Request — `model` field missing.
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // 400 Bad Request — `model` field missing. Anthropic
+        // envelope: 400 → invalid_request_error (#336).
+        assert_anthropic_error_envelope(resp, StatusCode::BAD_REQUEST, "invalid_request_error")
+            .await;
     }
 
     // ─── Cross-protocol matrix (Anthropic inbound × non-Anthropic) ─
