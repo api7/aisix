@@ -55,7 +55,22 @@ The caller still uses the gateway API key, not the upstream Anthropic provider k
 
 ## Error Shape
 
-Proxy errors on `/v1/messages` use the Anthropic-shape envelope `{type:"error", error:{type, message}}` — Claude SDKs expect this shape from the Anthropic wire. (Real Anthropic upstream responses also carry an optional `request_id:"req_..."` field; the gateway currently omits it, emitting the canonical-but-minimal envelope above.) The error type strings the gateway currently emits are `invalid_request_error` (400, 422), `authentication_error` (401), `permission_error` (403), `not_found_error` (404), `request_too_large` (413), `rate_limit_error` (429), `overloaded_error` (503), and `api_error` (all other 4xx/5xx). The mapping also contains `timeout_error` for 408, but that path is currently unreachable — the gateway's internal timeouts surface as 502 via the Bridge and fold into `api_error`. The canonical Anthropic spec includes one additional type — `billing_error` (402) — that real Anthropic upstream may emit but this gateway currently folds into `api_error`; for cross-upstream-compatible client error handling, treat unknown type strings as recoverable per Anthropic's [Errors documentation](https://platform.claude.com/docs/en/api/errors).
+Proxy errors on `/v1/messages` use the Anthropic-shape envelope `{type:"error", error:{type, message}}`. Real Anthropic upstream responses also carry an optional `request_id` field; the gateway omits it.
+
+The gateway emits these `error.type` strings:
+
+- `invalid_request_error` (400, 422)
+- `authentication_error` (401)
+- `permission_error` (403)
+- `not_found_error` (404)
+- `request_too_large` (413)
+- `rate_limit_error` (429)
+- `overloaded_error` (503)
+- `api_error` — all other 4xx/5xx (including 402, which Anthropic's canonical spec maps to `billing_error`)
+
+The map also contains `timeout_error` for 408, currently unreachable — internal timeouts surface as 502 via the Bridge.
+
+See Anthropic's [Errors documentation](https://platform.claude.com/docs/en/api/errors) for the canonical type list.
 
 ## When To Use `/v1/messages`
 
