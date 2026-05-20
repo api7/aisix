@@ -151,7 +151,7 @@ Recommended pattern:
 
 ## `observability`
 
-Use `observability` to set process-wide telemetry knobs. Today `service_name`, `log_level`, and the `metrics.prometheus.*` block are consulted at runtime; the remaining keys parse into the schema but currently have no runtime effect.
+Use `observability` to set process-wide telemetry knobs. Today `service_name`, `log_level`, and the `metrics.prometheus.*` block are consulted at runtime; the other fields have varying current behavior — see the `Status` column below.
 
 Important fields:
 
