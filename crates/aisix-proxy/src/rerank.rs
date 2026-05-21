@@ -16,10 +16,10 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::Value;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 
 use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
+use crate::request_id::new_request_id;
 use crate::state::ProxyState;
 
 pub async fn rerank(
@@ -28,7 +28,7 @@ pub async fn rerank(
     Json(mut body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let request_id = format!("rerank-{}", Uuid::new_v4());
+    let request_id = new_request_id();
     let api_key_id = auth.entry.id.clone();
 
     let model_name = body

@@ -29,10 +29,10 @@ use axum::http::{header, HeaderMap, HeaderValue, Method};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 
 use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
+use crate::request_id::new_request_id;
 use crate::state::ProxyState;
 
 /// Provider defaults indexed by provider-prefix string.
@@ -103,7 +103,7 @@ pub async fn passthrough(
     req: Request,
 ) -> Response {
     let started = Instant::now();
-    let request_id = format!("pt-{}", Uuid::new_v4());
+    let request_id = new_request_id();
     let api_key_id = auth.entry.id.clone();
     let method = req.method().clone();
     let path = format!("/passthrough/{provider}/{rest}");

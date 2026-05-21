@@ -23,10 +23,10 @@ use axum::Json;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
 
 use crate::auth::AuthenticatedKey;
 use crate::error::{ErrorEnvelope, ProxyError};
+use crate::request_id::new_request_id;
 use crate::state::ProxyState;
 
 pub async fn completions(
@@ -35,7 +35,7 @@ pub async fn completions(
     Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
-    let request_id = format!("cmp-{}", Uuid::new_v4());
+    let request_id = new_request_id();
     let api_key_id = auth.entry.id.clone();
     let model_name = body
         .get("model")

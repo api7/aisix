@@ -43,6 +43,7 @@ mod models;
 mod passthrough;
 mod quota;
 mod render;
+mod request_id;
 mod rerank;
 mod responses;
 mod routing;

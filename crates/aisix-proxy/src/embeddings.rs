@@ -23,10 +23,10 @@ use axum::Json;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
 
 use crate::auth::AuthenticatedKey;
 use crate::error::{ErrorEnvelope, ProxyError};
+use crate::request_id::new_request_id;
 use crate::state::ProxyState;
 
 /// The request body accepted by `POST /v1/embeddings`.
@@ -67,7 +67,7 @@ pub async fn embeddings(
     Json(body): Json<EmbeddingRequestBody>,
 ) -> Response {
     let started = Instant::now();
-    let request_id = format!("emb-{}", Uuid::new_v4());
+    let request_id = new_request_id();
     let api_key_id = auth.entry.id.clone();
     let model_name = body.model.clone();
 
