@@ -729,7 +729,7 @@ async fn cross_provider_dispatch(
         cache_read_tokens: resp.usage.cache_read_tokens,
         provider_request_id: resp.id.clone(),
         provider_model_version: resp.model.clone(),
-        finish_reason: format!("{:?}", resp.finish_reason).to_lowercase(),
+        finish_reason: finish_reason_label(&resp.finish_reason),
         ttft_ms: 0,
     };
     let json = chat_response_into_anthropic_json(&resp, model_name);
@@ -781,7 +781,7 @@ fn build_anthropic_sse_stream(
                         comp.provider_model_version = chunk.model.clone();
                     }
                     if let Some(fr) = chunk.finish_reason.as_ref() {
-                        comp.finish_reason = format!("{fr:?}").to_lowercase();
+                        comp.finish_reason = finish_reason_label(fr);
                     }
                     if let Some(u) = chunk.usage.as_ref() {
                         comp.prompt_tokens = comp.prompt_tokens.max(u.prompt_tokens);
@@ -815,6 +815,17 @@ fn build_anthropic_sse_stream(
         }
     };
     axum::body::Body::from_stream(stream)
+}
+
+fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
+    use aisix_gateway::FinishReason;
+    match reason {
+        FinishReason::Stop => "stop".into(),
+        FinishReason::Length => "length".into(),
+        FinishReason::ContentFilter => "content_filter".into(),
+        FinishReason::ToolCalls => "tool_calls".into(),
+        FinishReason::Other(s) => s.clone(),
+    }
 }
 
 #[derive(Default)]
@@ -1022,6 +1033,26 @@ mod tests {
     const OPENAI_PK_ID: &str = "22222222-2222-2222-2222-222222222222";
     const GOOGLE_PK_ID: &str = "33333333-3333-3333-3333-333333333333";
     const DEEPSEEK_PK_ID: &str = "44444444-4444-4444-4444-444444444444";
+
+    #[test]
+    fn finish_reason_label_uses_wire_names() {
+        use aisix_gateway::FinishReason;
+
+        assert_eq!(super::finish_reason_label(&FinishReason::Stop), "stop");
+        assert_eq!(super::finish_reason_label(&FinishReason::Length), "length");
+        assert_eq!(
+            super::finish_reason_label(&FinishReason::ContentFilter),
+            "content_filter"
+        );
+        assert_eq!(
+            super::finish_reason_label(&FinishReason::ToolCalls),
+            "tool_calls"
+        );
+        assert_eq!(
+            super::finish_reason_label(&FinishReason::Other("custom".into())),
+            "custom"
+        );
+    }
 
     fn anthropic_model(name: &str) -> ResourceEntry<Model> {
         let json = format!(
