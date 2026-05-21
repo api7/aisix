@@ -427,6 +427,92 @@ mod tests {
         assert!(stats.rejections.is_empty());
     }
 
+    // ---- provider_key schema coverage (issue api7/AISIX-Cloud#398
+    //      Tier 3 "DP loader schema check") ----------------------
+    //
+    // Pins the ProviderKey loader path. The existing tests above
+    // cover only `models` and `api_keys` shapes — the
+    // `provider_keys` branch at L175 was unverified for either
+    // happy-path acceptance or for Adapter family extra-config
+    // rejection (the gap the audit on #398 originally flagged).
+
+    const VALID_PROVIDER_KEY: &[u8] = br#"{
+        "display_name": "openai-mock",
+        "secret": "sk-test-not-real",
+        "api_base": "http://mock-llm:8000/v1",
+        "provider": "openai"
+    }"#;
+
+    #[test]
+    fn provider_key_happy_path_accepts() {
+        let entries = vec![raw(
+            "/aisix/provider_keys/pk-1",
+            VALID_PROVIDER_KEY,
+            1,
+        )];
+        let (snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 1);
+        assert_eq!(snap.provider_keys.len(), 1);
+        assert!(stats.rejections.is_empty());
+    }
+
+    #[test]
+    fn provider_key_aws_region_payload_currently_rejected() {
+        // Documents the current gap: an `amazon-bedrock`
+        // provider_key payload must carry `aws_region` per
+        // adapter_map.yaml:30, but the ProviderKey struct in
+        // `aisix-core::models::provider_key` is
+        // `#[serde(deny_unknown_fields)]` and has no `aws_region`
+        // field. Today the loader REJECTS the entry, so a customer
+        // creating a Bedrock provider_key via cp-api never sees
+        // the row reach the DP. Tracked as a follow-up to Adapter
+        // family e2e coverage (Tier 3 + Tier 4-7 in #398).
+        //
+        // When ProviderKey gains adapter-family extra-config fields
+        // (or an `extra: HashMap<String,Value>` escape hatch), this
+        // test should flip to assert `accepted=1` instead.
+        let entries = vec![raw(
+            "/aisix/provider_keys/pk-bedrock",
+            br#"{"display_name":"bedrock-pk","secret":"x","provider":"amazon-bedrock","aws_region":"us-east-1"}"#,
+            1,
+        )];
+        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 0);
+        assert_eq!(stats.schema_rejected, 1);
+        assert_eq!(stats.rejections.len(), 1);
+        assert_eq!(stats.rejections[0].kind, RejectionKind::SchemaFailed);
+    }
+
+    #[test]
+    fn provider_key_gcp_project_payload_currently_rejected() {
+        // Same gap as aws_region: `google-vertex` needs
+        // gcp_project + gcp_region per adapter_map.yaml. Today the
+        // loader rejects.
+        let entries = vec![raw(
+            "/aisix/provider_keys/pk-vertex",
+            br#"{"display_name":"vertex-pk","secret":"x","provider":"google-vertex","gcp_project":"my-proj","gcp_region":"us-central1"}"#,
+            1,
+        )];
+        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 0);
+        assert_eq!(stats.schema_rejected, 1);
+    }
+
+    #[test]
+    fn provider_key_azure_resource_payload_currently_rejected() {
+        // Same gap as aws_region: `azure` needs
+        // azure_resource_name + api_version per adapter_map.yaml.
+        // Today the loader rejects.
+        let entries = vec![raw(
+            "/aisix/provider_keys/pk-azure",
+            br#"{"display_name":"azure-pk","secret":"x","provider":"azure","azure_resource_name":"my-azure","api_version":"2024-02-01"}"#,
+            1,
+        )];
+        let (_snap, stats) = build_snapshot("/aisix", &entries);
+        assert_eq!(stats.accepted, 0);
+        assert_eq!(stats.schema_rejected, 1);
+    }
+
     #[test]
     fn one_bad_entry_does_not_abort_the_batch() {
         let entries = vec![
