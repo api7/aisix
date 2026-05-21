@@ -121,6 +121,50 @@ The `Retry-After` value on the `fail` path is a coarse fixed hint. By the time t
 - keep target aliases explicit and easy to reason about
 - set `retries` and `max_fallbacks` intentionally so resilience does not create surprise cost or latency
 
+## Response Shape
+
+Routing keeps the caller's view of the response stable across failover.
+
+### `response.model`
+
+`response.model` always echoes the **model name the caller put on the request** — for a routing model that is the routing alias itself, not the underlying target's display name and not the upstream provider's raw id.
+
+```http
+POST /v1/chat/completions
+{ "model": "failover-group-XYZ", ... }
+```
+
+```json title="Response body"
+{
+  "id": "chatcmpl-...",
+  "model": "failover-group-XYZ",
+  ...
+}
+```
+
+This holds whether the response came from `targets[0]` on the happy path or from a later target after failover. A cross-provider routing group (e.g. mixing an OpenAI target with an Anthropic target) never leaks the underlying provider's vocabulary into `response.model`.
+
+Direct (non-routing) models follow the same contract — `response.model` echoes the caller's requested name.
+
+### `x-aisix-served-by`
+
+The proxy emits an `x-aisix-served-by` response header on every routing-model response. The value is the display name of the target that actually served the request.
+
+```http title="Response headers"
+x-aisix-served-by: gpt-4o-secondary
+```
+
+After failover, the value reflects the target whose attempt succeeded — not the target that was tried first and failed. The header is the wire-level signal for "did failover fire, and which target won."
+
+The header applies to successful `/v1/chat/completions` responses. It is **absent** in these cases:
+
+- **Direct (non-routing) models.** The body's `response.model` already names the served model, so the header would be redundant — its presence is itself the routing signal.
+- **Cache hits.** A stored response is decoupled from whichever target produced it on the original miss; surfacing a stale name would lie. Operators inspecting routing must look at `x-aisix-cache` first.
+- **Error responses** (e.g. failover exhausted, every target unhealthy). No target served the request, so there is no name to report.
+- **Other endpoints.** The Anthropic-shape `/v1/messages` path is on a separate code path and does not currently emit this header.
+
+If a routing target's `display_name` contains bytes that are not valid HTTP header values (CR/LF or non-visible-ASCII), the header is omitted and the DP logs a `tracing::warn!` carrying the offending name. Rename the target with operator-side tools to restore the header.
+
 ## Troubleshooting
 
 ### Traffic never reaches the secondary target
@@ -130,6 +174,17 @@ That may be expected if the primary target is healthy and your strategy is `fail
 ### A request fails on one target and does not fall back
 
 Check whether the failure is retryable. Upstream `4xx` responses do not trigger cross-target retry.
+
+### `response.model` shows the routing alias, not the target that served
+
+That is the documented contract — see [Response Shape](#response-shape). Read `x-aisix-served-by` to learn which target actually served the request.
+
+### `x-aisix-served-by` is missing on a routing-model response
+
+Check the response headers first:
+
+- `x-aisix-cache: hit` — header is intentionally absent on cache hits.
+- DP logs for a `tracing::warn!` mentioning `target_display_name` — your target's display name contains characters that are not valid in an HTTP header value. Rename the target.
 
 ## Related Pages
 
