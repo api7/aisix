@@ -158,12 +158,31 @@ pub async fn chat_completions(
             // the request — see AISIX-Cloud#410. Only emitted when a
             // routing group was the entry point (direct models would
             // just echo `req.model`, which the body already carries).
+            //
+            // `HeaderValue::try_from` rejects CR/LF and non-visible
+            // ASCII (RFC 7230) — correct from a response-splitting
+            // standpoint, but if a routing target's `display_name`
+            // carries such bytes the header is silently absent and
+            // a customer debugging failover would see the same wire
+            // shape as a direct-model response. Surface the rejection
+            // in DP logs so operators can rename the offending target.
             if let Some(target) = success.served_by_target.as_deref() {
-                if let Ok(v) = axum::http::HeaderValue::try_from(target) {
-                    success
-                        .response
-                        .headers_mut()
-                        .insert("x-aisix-served-by", v);
+                match axum::http::HeaderValue::try_from(target) {
+                    Ok(v) => {
+                        success
+                            .response
+                            .headers_mut()
+                            .insert("x-aisix-served-by", v);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target_display_name = %target,
+                            error = %err,
+                            "target display_name is not a valid HTTP header value; \
+                             omitting x-aisix-served-by — rename the target to use \
+                             only visible ASCII (no CR/LF, no non-ASCII characters)"
+                        );
+                    }
                 }
             }
             success.response
@@ -359,6 +378,68 @@ impl CacheStatus {
             CacheStatus::Miss => "miss",
             CacheStatus::Hit => "hit",
         }
+    }
+}
+
+/// Compute the value of [`Success::served_by_target`] for a request.
+///
+/// Centralises the "should we surface routing identity?" policy so
+/// the same rule applies on every dispatch branch (non-streaming
+/// success, streaming success, cache hit). The rule is:
+///
+/// - Routing-group request **and** an attempt won → `Some(target)`.
+/// - Anything else (direct model, no winner, cache hit) → `None`.
+///
+/// `None` is the wire signal "this was not a routing request" — the
+/// `x-aisix-served-by` response header is emitted only when the
+/// returned `Option` is `Some`, so its presence alone tells callers
+/// that failover routing fired. Direct-model responses must never
+/// carry the header.
+fn served_by_target_for_routing(
+    is_routing_request: bool,
+    served_target: Option<String>,
+) -> Option<String> {
+    if is_routing_request {
+        served_target
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod served_by_target_tests {
+    use super::served_by_target_for_routing;
+
+    #[test]
+    fn direct_model_returns_none_even_when_a_target_was_captured() {
+        // A direct model still walks the attempt loop (with one
+        // candidate), so `served_target` may be `Some`. The routing
+        // flag is what gates header emission — direct models must
+        // never carry `x-aisix-served-by`.
+        assert_eq!(
+            served_by_target_for_routing(false, Some("gpt-4-direct".into())),
+            None,
+        );
+    }
+
+    #[test]
+    fn direct_model_with_no_target_is_none() {
+        assert_eq!(served_by_target_for_routing(false, None), None);
+    }
+
+    #[test]
+    fn routing_request_passes_winning_target_through() {
+        assert_eq!(
+            served_by_target_for_routing(true, Some("healthy-target".into())),
+            Some("healthy-target".into()),
+        );
+    }
+
+    #[test]
+    fn routing_request_with_no_winner_is_none() {
+        // All targets failed: header omitted. The caller is already
+        // surfacing an error response; routing identity is moot.
+        assert_eq!(served_by_target_for_routing(true, None), None);
     }
 }
 
@@ -740,13 +821,13 @@ async fn dispatch(
             telemetry_handled_by_stream: true,
             // Streaming attempts only `targets[0]` (no mid-stream
             // fallback), so on the routing path the served target is
-            // unambiguously the first one. For direct models the
-            // header would just echo `req.model`, so skip it.
-            served_by_target: if virtual_entry.value.routing.is_some() {
-                Some(model.display_name.clone())
-            } else {
-                None
-            },
+            // unambiguously the first one. The helper enforces the
+            // "direct model → None" rule consistently with the
+            // non-streaming and cache paths.
+            served_by_target: served_by_target_for_routing(
+                virtual_entry.value.routing.is_some(),
+                Some(model.display_name.clone()),
+            ),
         });
     }
 
@@ -1117,16 +1198,14 @@ async fn dispatch(
             .insert(CACHE_HEADER, HeaderValue::from_static("miss"));
     }
 
-    // Surface the winning target's display name only when this was a
-    // routing request. For a direct model the served target's display
-    // name equals `req.model`, so the header would just echo the body —
-    // skip it to keep the wire signal informative (header present =>
-    // routing happened).
-    let served_by_target = if virtual_entry.value.routing.is_some() {
-        chosen_target_display_name
-    } else {
-        None
-    };
+    // Header presence is the wire signal for "routing happened" —
+    // see `served_by_target_for_routing`. The helper covers all
+    // three branches (non-streaming, streaming, cache hit) with the
+    // same policy so a refactor can't silently flip one of them.
+    let served_by_target = served_by_target_for_routing(
+        virtual_entry.value.routing.is_some(),
+        chosen_target_display_name,
+    );
 
     Ok(Success {
         response,
