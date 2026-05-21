@@ -45,6 +45,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
+use crate::request_id::new_request_id;
 use crate::state::ProxyState;
 
 /// Anthropic API version header value injected on every forwarded request.
@@ -123,7 +124,7 @@ pub async fn messages(
         }
     };
     let started = Instant::now();
-    let request_id = format!("msg-{}", Uuid::new_v4());
+    let request_id = new_request_id();
     let api_key_id = auth.entry.id.clone();
 
     let model_name = body
