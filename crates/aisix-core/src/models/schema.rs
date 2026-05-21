@@ -647,6 +647,26 @@ mod tests {
         }
     }
 
+    /// `maxLength: 64` bounds Prometheus label cardinality. The
+    /// longest real models.dev catalog id today is ~19 chars; the
+    /// cap is generous but finite. A regression that drops the cap
+    /// would let a crafted ~10KB vendor string flow into metric
+    /// labels.
+    #[test]
+    fn model_rejects_provider_string_over_maxlength() {
+        let too_long = "a".repeat(65);
+        let v = json!({
+            "display_name": "x",
+            "provider": too_long,
+            "model_name": "x",
+            "provider_key_id": "pk-1"
+        });
+        assert!(
+            validate_model(&v).is_err(),
+            "provider string > 64 chars MUST be rejected (Prometheus cardinality guard)",
+        );
+    }
+
     #[test]
     fn model_rejects_empty_provider_string() {
         let v = json!({
