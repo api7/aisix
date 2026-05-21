@@ -948,20 +948,22 @@ fn emit_anthropic_usage_event(
             spend_usd: 0.0,
         },
     );
-    state.metrics.record_time_to_first_token(
-        UsageLabels {
-            endpoint: "/v1/messages",
-            inbound_protocol: "anthropic",
-            provider,
-            model,
-            upstream_model,
-            provider_key_id,
-            api_key_id,
-            team_id: team_id.unwrap_or("unknown"),
-            owner_id: owner_id.unwrap_or("unknown"),
-        },
-        Duration::from_millis(u64::from(metrics.ttft_ms)),
-    );
+    if metrics.ttft_ms > 0 {
+        state.metrics.record_time_to_first_token(
+            UsageLabels {
+                endpoint: "/v1/messages",
+                inbound_protocol: "anthropic",
+                provider,
+                model,
+                upstream_model,
+                provider_key_id,
+                api_key_id,
+                team_id: team_id.unwrap_or("unknown"),
+                owner_id: owner_id.unwrap_or("unknown"),
+            },
+            Duration::from_millis(u64::from(metrics.ttft_ms)),
+        );
+    }
 }
 
 fn emit_access_log(
