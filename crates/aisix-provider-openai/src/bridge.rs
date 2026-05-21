@@ -537,6 +537,7 @@ impl Bridge for OpenAiBridge {
         let client = self.client.clone();
         let started = Instant::now();
         let request_id = ctx.request_id.clone();
+        let bridge_name = self.name;
 
         with_deadline(ctx.deadline, started, async move {
             let resp = client
@@ -544,6 +545,7 @@ impl Bridge for OpenAiBridge {
                 .header(header::AUTHORIZATION, format!("Bearer {key}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("x-aisix-request-id", &request_id)
+                .header("x-aisix-bridge", bridge_name)
                 .json(&body)
                 .send()
                 .await
@@ -585,6 +587,7 @@ impl Bridge for OpenAiBridge {
         let client = self.client.clone();
         let started = Instant::now();
         let request_id = ctx.request_id.clone();
+        let bridge_name = self.name;
 
         with_deadline(ctx.deadline, started, async move {
             let resp = client
@@ -592,6 +595,7 @@ impl Bridge for OpenAiBridge {
                 .header(header::AUTHORIZATION, format!("Bearer {key}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("x-aisix-request-id", &request_id)
+                .header("x-aisix-bridge", bridge_name)
                 .json(&outbound)
                 .send()
                 .await
@@ -631,6 +635,7 @@ impl Bridge for OpenAiBridge {
         let client = self.client.clone();
         let started = Instant::now();
         let request_id = ctx.request_id.clone();
+        let bridge_name = self.name;
 
         with_deadline(ctx.deadline, started, async move {
             let resp = client
@@ -638,6 +643,7 @@ impl Bridge for OpenAiBridge {
                 .header(header::AUTHORIZATION, format!("Bearer {key}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .header("x-aisix-request-id", &request_id)
+                .header("x-aisix-bridge", bridge_name)
                 .json(&outbound)
                 .send()
                 .await
@@ -1563,6 +1569,34 @@ data: [DONE]\n\n";
 
     /// Defense-in-depth: a `default_headers` block that tries to set
     /// `authorization` must NOT clobber the bridge's own auth header.
+    /// `x-aisix-bridge` is inserted by the bridge before
+    /// `apply_default_headers` runs, and is also listed in
+    /// `RESERVED_DEFAULT_HEADERS`. A PK `default_headers` block that
+    /// tries to overwrite it must be ignored — the bridge value wins.
+    #[tokio::test]
+    async fn chat_default_headers_cannot_override_x_aisix_bridge() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            // The bridge's own name ("openai") must win, not the
+            // operator-supplied "attacker-override".
+            .and(header("x-aisix-bridge", "openai"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_chat_response()))
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let pk = pk_with_overrides(
+            &server.uri(),
+            r#""request": {"default_headers": {"x-aisix-bridge": "attacker-override"}}"#,
+        );
+        let ctx = BridgeContext::new("req-1", sample_model(), pk);
+        bridge
+            .chat(&req(), &ctx)
+            .await
+            .expect("bridge name must survive the default_headers merge");
+    }
+
     /// The outbound request must carry `Bearer sk-test`, not the
     /// override value.
     #[tokio::test]

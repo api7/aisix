@@ -139,6 +139,7 @@ const RESERVED_DEFAULT_HEADERS: &[&str] = &[
     "api-key",              // Azure OpenAI key
     "x-amz-security-token", // AWS SigV4 session header (Bedrock)
     "x-amz-date",           // AWS SigV4 timestamp (Bedrock)
+    "x-aisix-bridge",       // diagnostic bridge-name tag set by OpenAiBridge (AISIX-Cloud#368)
 ];
 
 /// Apply `request.default_headers` to an outbound `HeaderMap`.
