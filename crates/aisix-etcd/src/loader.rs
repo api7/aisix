@@ -349,9 +349,12 @@ mod tests {
 
     #[test]
     fn schema_failure_is_counted() {
+        // After #302 Phase A `provider` is a free-form string. Use a
+        // genuine schema violation (empty `display_name`) to keep the
+        // rejection-path test meaningful.
         let entries = vec![raw(
-            "/aisix/models/bad-provider",
-            br#"{"display_name":"x","provider":"this-is-not-a-provider-id","model_name":"large","provider_key_id":"pk-1"}"#,
+            "/aisix/models/bad-shape",
+            br#"{"display_name":"","provider":"openai","model_name":"large","provider_key_id":"pk-1"}"#,
             1,
         )];
         let (_snap, stats) = build_snapshot("/aisix", &entries);
@@ -404,7 +407,7 @@ mod tests {
     fn rejection_records_schema_failure() {
         let entries = vec![raw(
             "/aisix/models/bad",
-            br#"{"display_name":"x","provider":"this-is-not-a-provider-id","model_name":"l","provider_key_id":"pk"}"#,
+            br#"{"display_name":"","provider":"openai","model_name":"l","provider_key_id":"pk"}"#,
             1,
         )];
         let (_snap, stats) = build_snapshot("/aisix", &entries);

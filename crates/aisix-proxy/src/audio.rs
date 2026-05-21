@@ -297,7 +297,7 @@ async fn multipart_dispatch(
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
     let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?;
 
-    let base = crate::dispatch::resolve_base_url(provider, &pk_entry.value);
+    let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
     // build_v1_url owns the /v1 prefix; callers pass the suffix
     // (e.g. `/audio/transcriptions`) so this code is agnostic to
     // whether the customer's api_base ends in /v1 or not.
@@ -420,7 +420,7 @@ async fn speech_dispatch(
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
     let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?;
 
-    let base = crate::dispatch::resolve_base_url(provider, &pk_entry.value);
+    let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
     let provider_label = format!("{provider:?}").to_lowercase();
 
     // Rewrite model field.
@@ -525,7 +525,7 @@ fn emit_access_log(
 // from there to avoid creating multiple global Clients.
 #[cfg(test)]
 mod tests {
-    use aisix_core::models::Provider;
+
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ApiKey, Model, ProxyConfig};
@@ -574,8 +574,9 @@ mod tests {
     }
 
     fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
-        let json =
-            format!(r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}"}}"#);
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+        );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
     }
@@ -597,7 +598,7 @@ mod tests {
 
     fn build_app(snap: AisixSnapshot) -> axum::Router {
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let handle = SnapshotHandle::new(snap);
         crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache())
     }

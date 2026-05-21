@@ -509,8 +509,13 @@ async fn dispatch(
     // single bad provider doesn't take down the whole request.
     if attempt_models.len() == 1 {
         let only = &attempt_models[0].model;
-        let provider = crate::dispatch::require_provider(only).map_err(with_model)?;
-        if state.hub.get(provider).is_none() {
+        let _provider = crate::dispatch::require_provider(only).map_err(with_model)?;
+        // Pre-flight the PK-based two-tier dispatch so a missing
+        // family/specialized bridge surfaces as 503 here, before
+        // we commit to a long upstream call.
+        let pk_entry =
+            crate::dispatch::resolve_provider_key(&snapshot, only).map_err(with_model)?;
+        if crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value).is_none() {
             return Err(with_model(ProxyError::ProviderUnavailable));
         }
     }
@@ -534,7 +539,7 @@ async fn dispatch(
         let provider = crate::dispatch::require_provider(model).map_err(with_model)?;
         let pk_entry =
             crate::dispatch::resolve_provider_key(&snapshot, model).map_err(with_model)?;
-        let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, provider)
+        let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
             .ok_or_else(|| with_model(ProxyError::ProviderUnavailable))?;
         let model_arc = Arc::new(model.clone());
         let pk_arc = Arc::new(pk_entry.value.clone());
@@ -786,7 +791,8 @@ async fn dispatch(
                 let provider_label = attempt_models[0]
                     .model
                     .provider
-                    .map(|p| format!("{p:?}").to_lowercase())
+                    .as_deref()
+                    .map(|p| p.to_ascii_lowercase())
                     .unwrap_or_else(|| "unknown".into());
                 let provider_key_id = attempt_models[0]
                     .model
@@ -868,7 +874,7 @@ async fn dispatch(
 
     for attempt in &attempt_models {
         let model = &attempt.model;
-        let Some(provider) = model.provider else {
+        let Some(provider) = model.provider.as_deref() else {
             last_err = Some(BridgeError::Config("model has no provider".into()));
             continue;
         };
@@ -885,8 +891,7 @@ async fn dispatch(
         // → adapter family) first; fall back to the legacy
         // Provider-keyed registry when the new fields aren't filled in
         // on this PK yet. See crate::dispatch::resolve_bridge.
-        let Some(bridge) = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, provider)
-        else {
+        let Some(bridge) = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value) else {
             last_err = Some(BridgeError::Config(
                 "no bridge registered for provider".into(),
             ));
@@ -901,7 +906,7 @@ async fn dispatch(
                 Ok(resp) => {
                     state.health.record_success(&model.display_name);
                     state.runtime_status.mark_healthy(&attempt.id);
-                    chosen_provider = Some(format!("{provider:?}").to_lowercase());
+                    chosen_provider = Some(provider.to_ascii_lowercase());
                     chosen_provider_key_id = Some(pk_entry.id.clone());
                     chosen_upstream_model =
                         Some(model.upstream_model().unwrap_or("unknown").to_string());

@@ -1,58 +1,51 @@
 //! The [`Hub`] dispatches `ChatFormat` requests to the matching
-//! [`Bridge`] based on the target Model's `Provider` enum.
+//! [`Bridge`] based on the target [`ProviderKey`]'s vendor identity and
+//! wire-shape adapter. There is no per-`Provider`-enum lookup — vendor
+//! identity is an open string (`ProviderKey.provider`) and routing
+//! falls through a closed 5-value `Adapter` family enum.
 //!
 //! Hubs are constructed once at startup (spec §1 step 7 — before the
-//! proxy router is built) and hold an `Arc<dyn Bridge>` per provider.
-//! Lookups are `O(1)` — a 4-entry hashmap keyed on the Provider enum.
+//! proxy router is built) and hold:
 //!
-//! There is no fallback logic here — that is the proxy layer's job and
-//! lands in its own PR. The Hub exists purely to resolve Provider →
-//! Bridge cheaply and consistently.
-//!
-//! # Two-tier dispatch skeleton (issue #302 Phase A)
-//!
-//! In addition to the existing `Provider`-keyed registry, the Hub now
-//! also carries two forward-looking maps keyed by [`ProviderKey`]
-//! fields introduced in Phase A:
-//!
-//! - `family_bridges` — keyed on `Adapter` (wire shape: `openai`,
-//!   `anthropic`, `bedrock`, `vertex`, `azure-openai`). The default
-//!   bridge for any provider that matches that wire shape.
 //! - `specialized_bridges` — keyed on `ProviderKey.provider` (vendor
-//!   string, e.g. `"deepseek"`, `"jina"`). Used when a specific vendor
-//!   needs handling that diverges from its wire-shape default.
+//!   string, e.g. `"deepseek"`, `"cohere"`). Used when a specific
+//!   vendor needs handling that diverges from its wire-shape default
+//!   (e.g. DeepSeek's `reasoning_content` lift, Cohere's chat-compat
+//!   namespace).
+//! - `family_bridges` — keyed on [`Adapter`] (wire shape: `openai`,
+//!   `anthropic`, `bedrock`, `vertex`, `azure-openai`). The default
+//!   bridge for any vendor whose `ProviderKey.adapter` matches that
+//!   wire shape and has no specialized override.
 //!
 //! [`Hub::dispatch_two_tier`] looks up specialized first, then falls
-//! back to the family bridge. It is **not consumed by any caller** in
-//! this PR — `build_hub()` does not register family/specialized
-//! bridges and the proxy path continues to dispatch through the
-//! existing `Provider`-keyed `get()`. The new methods exist so future
-//! Phase A / Phase D sub-PRs can wire dispatch through them without
-//! re-touching this file.
+//! back to the family bridge. A new catalog vendor admitted by cp-api
+//! works without a DP code change: the family bridge for its adapter
+//! handles the request using `ProviderKey.api_base` for the upstream.
+//!
+//! Closes the dispatch half of api7/AISIX-Cloud#302 Phase A and the
+//! routing half of api7/AISIX-Cloud#417.
 
-use aisix_core::models::{Adapter, Provider, ProviderKey};
+use aisix_core::models::{Adapter, ProviderKey};
 use dashmap::DashMap;
 use std::sync::Arc;
 
 use crate::bridge::Bridge;
 
-/// Registry of providers → bridges.
+/// Registry of vendor strings + adapter families → bridges.
 ///
 /// `DashMap` lets us register bridges after construction (useful for tests
 /// and for future dynamic-reload scenarios) without taking out a lock on
 /// the lookup path.
 #[derive(Default)]
 pub struct Hub {
-    bridges: DashMap<Provider, Arc<dyn Bridge>>,
-    /// Wire-shape default bridges. Keyed on [`Adapter`]. Phase A
-    /// skeleton — empty until follow-up PRs register the per-family
-    /// default bridge. See module docs.
+    /// Wire-shape default bridges. Keyed on [`Adapter`] — the closed
+    /// 5-value protocol family enum. Every catalog vendor whose
+    /// `ProviderKey.adapter` matches one of these resolves here if
+    /// no specialized override is registered.
     family_bridges: DashMap<Adapter, Arc<dyn Bridge>>,
     /// Vendor-specific override bridges. Keyed on
-    /// `ProviderKey.provider` (vendor string). Phase A skeleton —
-    /// empty until follow-up PRs register specialized handlers for
-    /// vendors that diverge from their wire-shape default. See module
-    /// docs.
+    /// `ProviderKey.provider` (vendor string). Used when a specific
+    /// vendor needs handling that diverges from its wire-shape default.
     specialized_bridges: DashMap<String, Arc<dyn Bridge>>,
 }
 
@@ -61,51 +54,41 @@ impl Hub {
         Self::default()
     }
 
-    /// Register a bridge for a provider. Overwrites any previous entry,
-    /// which is what we want during live reconfigure — the etcd watcher
-    /// can swap a broken bridge without tearing down the Hub.
-    pub fn register(&self, provider: Provider, bridge: Arc<dyn Bridge>) {
-        self.bridges.insert(provider, bridge);
-    }
-
-    pub fn get(&self, provider: Provider) -> Option<Arc<dyn Bridge>> {
-        self.bridges.get(&provider).map(|r| r.clone())
-    }
-
-    pub fn providers(&self) -> Vec<Provider> {
-        self.bridges.iter().map(|r| *r.key()).collect()
-    }
-
-    pub fn len(&self) -> usize {
-        self.bridges.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bridges.is_empty()
-    }
-
     /// Register the family-tier (wire-shape default) bridge for an
-    /// [`Adapter`]. Phase A skeleton — see module docs.
-    ///
-    /// Overwrites any previous entry for the same adapter, matching
-    /// the live-reconfigure semantics of [`Hub::register`].
+    /// [`Adapter`]. Overwrites any previous entry for the same adapter,
+    /// matching live-reconfigure semantics.
     pub fn register_family(&self, adapter: Adapter, bridge: Arc<dyn Bridge>) {
         self.family_bridges.insert(adapter, bridge);
     }
 
     /// Register a specialized (vendor-specific) bridge keyed on the
-    /// `ProviderKey.provider` vendor string. Phase A skeleton — see
-    /// module docs.
-    ///
-    /// Overwrites any previous entry for the same vendor key.
+    /// `ProviderKey.provider` vendor string. Overwrites any previous
+    /// entry for the same vendor key.
     pub fn register_specialized(&self, provider: impl Into<String>, bridge: Arc<dyn Bridge>) {
         self.specialized_bridges.insert(provider.into(), bridge);
+    }
+
+    /// Look up a specialized vendor bridge by its `ProviderKey.provider`
+    /// vendor string. Used by handlers (chat preflight, background
+    /// model checks) that need to confirm a vendor has a registered
+    /// bridge without committing to a full dispatch. Returns `None`
+    /// when no specialized override is registered — callers should
+    /// then fall through to `family_bridge_for` for the catalog
+    /// default path.
+    pub fn get_specialized(&self, provider: &str) -> Option<Arc<dyn Bridge>> {
+        self.specialized_bridges.get(provider).map(|r| r.clone())
+    }
+
+    /// Look up a family bridge by [`Adapter`]. Mirrors
+    /// [`Hub::get_specialized`] for the family tier.
+    pub fn family_bridge_for(&self, adapter: Adapter) -> Option<Arc<dyn Bridge>> {
+        self.family_bridges.get(&adapter).map(|r| r.clone())
     }
 
     /// Two-tier dispatch: specialized vendor bridge first, then the
     /// adapter-family default. Returns `None` if neither is registered
     /// — the caller decides how to report a missing bridge so this
-    /// layer stays panic-free. Phase A skeleton — see module docs.
+    /// layer stays panic-free.
     pub fn dispatch_two_tier(&self, pk: &ProviderKey) -> Option<Arc<dyn Bridge>> {
         if let Some(b) = self.specialized_bridges.get(&pk.provider) {
             return Some(b.clone());
@@ -124,7 +107,6 @@ impl std::fmt::Debug for Hub {
             .map(|r| r.key().clone())
             .collect();
         f.debug_struct("Hub")
-            .field("providers", &self.providers())
             .field("families", &families)
             .field("specialized", &specialized)
             .finish()
@@ -174,50 +156,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn empty_hub_returns_none_for_any_provider() {
-        let hub = Hub::new();
-        assert!(hub.is_empty());
-        assert!(hub.get(Provider::Openai).is_none());
-    }
-
-    #[test]
-    fn register_and_get_round_trip() {
-        let hub = Hub::new();
-        hub.register(
-            Provider::Openai,
-            Arc::new(StubBridge {
-                name: "stub-openai",
-            }),
-        );
-        let b = hub.get(Provider::Openai).unwrap();
-        assert_eq!(b.name(), "stub-openai");
-    }
-
-    #[test]
-    fn register_overwrites_previous_bridge_for_same_provider() {
-        let hub = Hub::new();
-        hub.register(Provider::Openai, Arc::new(StubBridge { name: "v1" }));
-        hub.register(Provider::Openai, Arc::new(StubBridge { name: "v2" }));
-        assert_eq!(hub.len(), 1);
-        assert_eq!(hub.get(Provider::Openai).unwrap().name(), "v2");
-    }
-
-    #[test]
-    fn providers_returns_all_registered_keys() {
-        let hub = Hub::new();
-        hub.register(Provider::Openai, Arc::new(StubBridge { name: "a" }));
-        hub.register(Provider::Anthropic, Arc::new(StubBridge { name: "b" }));
-        let mut ps = hub.providers();
-        ps.sort_by_key(|p| format!("{p:?}"));
-        assert_eq!(ps.len(), 2);
-    }
-
     #[tokio::test]
     async fn registered_bridge_is_callable() {
         let hub = Hub::new();
-        hub.register(Provider::Openai, Arc::new(StubBridge { name: "stub" }));
-        let bridge = hub.get(Provider::Openai).unwrap();
+        hub.register_specialized("openai", Arc::new(StubBridge { name: "stub" }));
+        let bridge = hub.get_specialized("openai").unwrap();
 
         let m = std::sync::Arc::new(
             serde_json::from_str::<aisix_core::Model>(
@@ -239,7 +182,7 @@ mod tests {
         assert_eq!(resp.finish_reason, FinishReason::Stop);
     }
 
-    // ---- two-tier dispatch (issue #302 Phase A skeleton) ----
+    // ---- two-tier dispatch (issue #302 Phase A) ----
 
     /// Build a `ProviderKey` carrying just the vendor + adapter fields
     /// the two-tier dispatcher reads. JSON deserialization matches the
@@ -353,10 +296,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_provider_registry_is_unaffected_by_two_tier_maps() {
-        // Registering only on the new tiers must not satisfy a lookup
-        // through the legacy `Provider`-keyed API, and vice versa.
-        // Co-existence is the explicit contract of this skeleton PR.
+    fn specialized_and_family_tiers_are_independent() {
+        // A registration on one tier must not surface in the other.
         let hub = Hub::new();
         hub.register_family(Adapter::Openai, Arc::new(StubBridge { name: "family" }));
         hub.register_specialized(
@@ -365,20 +306,16 @@ mod tests {
                 name: "specialized",
             }),
         );
-        assert!(hub.get(Provider::Openai).is_none());
-        assert!(hub.is_empty());
-
-        hub.register(Provider::Openai, Arc::new(StubBridge { name: "legacy" }));
-        // Legacy bump touches only the Provider-keyed map.
-        assert_eq!(hub.get(Provider::Openai).unwrap().name(), "legacy");
-        assert_eq!(hub.len(), 1);
-        // Two-tier maps still resolve their own registrations
-        // independently.
+        // Direct lookups return their own tier only.
         assert_eq!(
-            hub.dispatch_two_tier(&pk("deepseek", Some("openai")))
-                .unwrap()
-                .name(),
+            hub.family_bridge_for(Adapter::Openai).unwrap().name(),
+            "family"
+        );
+        assert_eq!(
+            hub.get_specialized("deepseek").unwrap().name(),
             "specialized"
         );
+        assert!(hub.family_bridge_for(Adapter::Anthropic).is_none());
+        assert!(hub.get_specialized("openai").is_none());
     }
 }

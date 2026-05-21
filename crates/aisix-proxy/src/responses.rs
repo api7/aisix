@@ -12,7 +12,6 @@
 //! Only OpenAI models support this endpoint. Non-OpenAI models receive a
 //! 400 with an explanatory message.
 
-use aisix_core::models::Provider;
 use aisix_obs::{AccessLog, RequestOutcome};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
@@ -115,7 +114,7 @@ async fn dispatch(
     let model = &model_entry.value;
 
     // Responses API is only available for OpenAI.
-    if model.provider != Some(Provider::Openai) {
+    if model.provider.as_deref() != Some("openai") {
         return Err(ProxyError::InvalidRequest(format!(
             "model `{model_name}` is not an OpenAI provider; /v1/responses requires OpenAI"
         )));
@@ -130,7 +129,7 @@ async fn dispatch(
         *m = Value::String(upstream_model.clone());
     }
 
-    let base = crate::dispatch::resolve_base_url(Provider::Openai, &pk_entry.value);
+    let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
     // build_v1_url tolerates both `https://api.openai.com` (provider
     // default) and `https://api.openai.com/v1` (the OpenAI-SDK form
     // the dashboard's provider-keys placeholder pre-fills). Without
@@ -253,7 +252,7 @@ fn emit_access_log(
 
 #[cfg(test)]
 mod tests {
-    use aisix_core::models::Provider;
+
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ApiKey, Model, ProxyConfig};
@@ -294,15 +293,16 @@ mod tests {
     }
 
     fn openai_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
-        let json =
-            format!(r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}"}}"#);
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+        );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(OPENAI_PK_ID, pk, 1)
     }
 
     fn anthropic_pk() -> ResourceEntry<aisix_core::ProviderKey> {
         let pk: aisix_core::ProviderKey =
-            serde_json::from_str(r#"{"display_name":"anthropic-up","secret":"sk-ant-test"}"#)
+            serde_json::from_str(r#"{"display_name":"anthropic-up","secret":"sk-ant-test","provider":"anthropic","adapter":"anthropic"}"#)
                 .unwrap();
         ResourceEntry::new(ANTHROPIC_PK_ID, pk, 1)
     }
@@ -330,7 +330,7 @@ mod tests {
 
     fn build_app(snap: AisixSnapshot) -> axum::Router {
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let handle = SnapshotHandle::new(snap);
         crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache())
     }

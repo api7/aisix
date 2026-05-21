@@ -173,7 +173,8 @@ async fn dispatch(
         .find(|e| {
             e.value
                 .provider
-                .map(|p| p.as_str().eq_ignore_ascii_case(&provider_lower))
+                .as_deref()
+                .map(|p| p.eq_ignore_ascii_case(&provider_lower))
                 .unwrap_or(false)
         })
         .ok_or_else(|| {
@@ -497,15 +498,16 @@ mod tests {
     }
 
     fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
-        let json =
-            format!(r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}"}}"#);
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+        );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
     }
 
     fn anthropic_provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"anthropic-up","secret":"sk-ant-test","api_base":"{api_base}"}}"#
+            r#"{{"display_name":"anthropic-up","secret":"sk-ant-test","api_base":"{api_base}","provider":"anthropic","adapter":"anthropic"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)

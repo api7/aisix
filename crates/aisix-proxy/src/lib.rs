@@ -264,7 +264,7 @@ async fn livez(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aisix_core::models::Provider;
+
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ApiKey, Model, ProxyConfig};
@@ -327,7 +327,7 @@ mod tests {
 
     fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let cfg = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-upstream","api_base":"{api_base}"}}"#
+            r#"{{"display_name":"openai-up","secret":"sk-upstream","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&cfg).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
@@ -444,7 +444,7 @@ mod tests {
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let app = build_router(build_state(snap, hub));
 
@@ -579,7 +579,7 @@ mod tests {
     #[tokio::test]
     async fn model_not_in_allowed_list_returns_403() {
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         // ApiKey allows only "other-model", the caller asks for "my-gpt4".
         let snap = seed_snapshot("my-gpt4", &["other-model"], "http://unused");
         let app = build_router(build_state(snap, hub));
@@ -912,7 +912,7 @@ mod tests {
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let app = build_router(build_state(snap, hub));
 
@@ -939,7 +939,7 @@ mod tests {
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let app = build_router(build_state(snap, hub));
 
@@ -982,7 +982,7 @@ mod tests {
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let app = build_router(build_state(snap, hub));
 
@@ -1028,7 +1028,7 @@ mod tests {
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let app = build_router(build_state(snap, hub));
 
@@ -1070,7 +1070,7 @@ mod tests {
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let app = build_router(build_state(snap, hub));
 
@@ -1126,7 +1126,7 @@ mod tests {
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-claude"]));
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
         let app = build_router(build_state(snap, hub));
 
         let body = serde_json::json!({
@@ -1175,7 +1175,7 @@ mod tests {
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-claude"]));
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
         let app = build_router(build_state(snap, hub));
 
         let body = serde_json::json!({
@@ -1228,7 +1228,7 @@ mod tests {
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-claude"]));
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
         let app = build_router(build_state(snap, hub));
 
         let body = serde_json::json!({
@@ -1268,7 +1268,7 @@ mod tests {
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let app = build_router(build_state(snap, hub));
 
@@ -1327,7 +1327,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let app = build_router(build_state(snap, hub));
 
@@ -1403,7 +1403,7 @@ data: <not valid json>\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let app = build_router(build_state(snap, hub));
 
@@ -1514,7 +1514,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(
             KeywordBlocklist::output_only(vec![KeywordRule::literal("secret-string")]),
@@ -1615,7 +1615,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot_with_limits(
             "my-gpt4",
             &["my-gpt4"],
@@ -1692,7 +1692,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot_with_limits(
             "my-gpt4",
             &["my-gpt4"],
@@ -1757,7 +1757,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot_with_limits(
             "my-gpt4",
             &["my-gpt4"],
@@ -1819,7 +1819,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot_with_limits(
             "my-gpt4",
             &["my-gpt4"],
@@ -1873,7 +1873,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
 
         let state = build_state(snap, hub);
@@ -1928,7 +1928,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot_with_limits(
             "my-gpt4",
             &["my-gpt4"],
@@ -1982,7 +1982,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         // Cache gate opens only when an enabled policy exists in
         // snapshot. Without this seed step the test would 200 but
@@ -2057,7 +2057,7 @@ data: [DONE]\n\n";
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         seed_cache_policy(&snap, "test-cache");
         let state = build_state_with_cache(snap, hub).with_usage_sink(UsageSink::new(tx));
@@ -2123,7 +2123,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         seed_cache_policy(&snap, "test-cache");
         let state = build_state_with_cache(snap, hub);
@@ -2184,7 +2184,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         // The api key + model are named "my-gpt4"; the policy below
         // pins applies_to to a different model name so no request in
         // this test matches.
@@ -2247,7 +2247,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         // The disabled policy applies_to="all" (would match every
         // request), but `enabled: false` MUST cause the find-first-
@@ -2306,7 +2306,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         seed_cache_policy_with_applies_to(&snap, "scoped", "model:my-gpt4");
         let state = build_state_with_cache(snap, hub);
@@ -2362,7 +2362,7 @@ data: [DONE]\n\n";
 
     fn pk_entry_with_id(pk_id: &str, api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let cfg = format!(
-            r#"{{"display_name":"openai-{pk_id}","secret":"sk-upstream","api_base":"{api_base}"}}"#
+            r#"{{"display_name":"openai-{pk_id}","secret":"sk-upstream","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&cfg).unwrap();
         ResourceEntry::new(pk_id, pk, 1)
@@ -2422,7 +2422,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
 
         let snap = AisixSnapshot::new();
         snap.provider_keys
@@ -2492,7 +2492,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
 
         let snap = AisixSnapshot::new();
         snap.provider_keys
@@ -2565,7 +2565,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
 
         let snap = AisixSnapshot::new();
         snap.provider_keys
@@ -2640,7 +2640,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
 
         let snap = AisixSnapshot::new();
         snap.provider_keys
@@ -2724,7 +2724,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
 
         let snap = AisixSnapshot::new();
         snap.provider_keys
@@ -2797,7 +2797,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
 
         let snap = AisixSnapshot::new();
         snap.provider_keys
@@ -2874,7 +2874,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
 
         let snap = AisixSnapshot::new();
         snap.provider_keys
@@ -2947,7 +2947,7 @@ data: [DONE]\n\n";
         // Routing references a Model that isn't in the snapshot — this
         // is a misconfiguration and should surface as a clean 400.
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
 
         let snap = AisixSnapshot::new();
         snap.models.insert(routing_entry(
@@ -2998,7 +2998,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot_with_limits(
             "my-gpt4",
             &["my-gpt4"],
@@ -3066,7 +3066,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
 
         let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(KeywordBlocklist::new(
@@ -3128,7 +3128,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(KeywordBlocklist::new(
             vec![KeywordRule::literal("forbidden-token")],
@@ -3187,7 +3187,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
 
         let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(
@@ -3269,7 +3269,7 @@ data: [DONE]\n\n";
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(
             KeywordBlocklist::output_only(vec![KeywordRule::literal("secret-string")]),
@@ -3353,7 +3353,7 @@ data: [DONE]\n\n";
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
         let app = build_router(state);
@@ -3426,7 +3426,7 @@ data: [DONE]\n\n";
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
         let app = build_router(state);
@@ -3514,7 +3514,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
 
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
         let state = build_state(snap, hub).with_budget_client(Arc::new(BudgetClient::new(
@@ -3598,24 +3598,44 @@ data: [DONE]\n\n";
         id: &'static str,
         secret: &str,
         api_base: &str,
+        provider: &str,
+        adapter: &str,
     ) -> ResourceEntry<aisix_core::ProviderKey> {
         let cfg = format!(
-            r#"{{"display_name":"matrix-up","secret":"{secret}","api_base":"{api_base}"}}"#
+            r#"{{"display_name":"matrix-up","secret":"{secret}","api_base":"{api_base}","provider":"{provider}","adapter":"{adapter}"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&cfg).unwrap();
         ResourceEntry::new(id, pk, 1)
     }
 
     fn matrix_anthropic_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
-        matrix_pk_entry(MATRIX_ANTHROPIC_PK_ID, "sk-ant-test", api_base)
+        matrix_pk_entry(
+            MATRIX_ANTHROPIC_PK_ID,
+            "sk-ant-test",
+            api_base,
+            "anthropic",
+            "anthropic",
+        )
     }
 
     fn matrix_gemini_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
-        matrix_pk_entry(MATRIX_GOOGLE_PK_ID, "ya29-test", api_base)
+        matrix_pk_entry(
+            MATRIX_GOOGLE_PK_ID,
+            "ya29-test",
+            api_base,
+            "google",
+            "openai",
+        )
     }
 
     fn matrix_deepseek_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
-        matrix_pk_entry(MATRIX_DEEPSEEK_PK_ID, "sk-deepseek", api_base)
+        matrix_pk_entry(
+            MATRIX_DEEPSEEK_PK_ID,
+            "sk-deepseek",
+            api_base,
+            "deepseek",
+            "openai",
+        )
     }
 
     /// (OpenAI inbound) × (Anthropic upstream) × (non-streaming).
@@ -3648,7 +3668,7 @@ data: [DONE]\n\n";
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-claude"]));
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
         let app = build_router(build_state(snap, hub));
 
         let body = serde_json::json!({
@@ -3709,7 +3729,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-claude"]));
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
         let app = build_router(build_state(snap, hub));
 
         let body = serde_json::json!({
@@ -3777,10 +3797,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-gemini"]));
         let hub = Arc::new(Hub::new());
-        hub.register(
-            Provider::Google,
-            Arc::new(OpenAiBridge::new().with_name("google")),
-        );
+        hub.register_specialized("google", Arc::new(OpenAiBridge::new().with_name("google")));
         let app = build_router(build_state(snap, hub));
 
         let body = serde_json::json!({
@@ -3834,8 +3851,8 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-deepseek"]));
         let hub = Arc::new(Hub::new());
-        hub.register(
-            Provider::Deepseek,
+        hub.register_specialized(
+            "deepseek",
             Arc::new(OpenAiBridge::new().with_name("deepseek")),
         );
         let app = build_router(build_state(snap, hub));

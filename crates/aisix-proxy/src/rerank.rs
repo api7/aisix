@@ -122,7 +122,7 @@ async fn dispatch(
     // unchanged.
     let provider_label = model
         .provider
-        .map(|p| p.as_str().to_string())
+        .clone()
         .unwrap_or_else(|| "unknown".to_string());
 
     // Per #168 + #213 Phases 1–2: `/v1/rerank` accepts OpenAI-,
@@ -354,8 +354,9 @@ mod tests {
     }
 
     fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
-        let json =
-            format!(r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}"}}"#);
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+        );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
     }
@@ -516,7 +517,7 @@ mod tests {
         // The gateway's `build_v1_url` produces `/v1/rerank` correctly
         // for both `https://api.jina.ai` and `https://api.jina.ai/v1`.
         let pk_json = format!(
-            r#"{{"display_name":"jina-up","secret":"jina_mock_secret","api_base":"{}"}}"#,
+            r#"{{"display_name":"jina-up","secret":"jina_mock_secret","api_base":"{}","provider":"jina"}}"#,
             upstream.uri()
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
@@ -592,7 +593,7 @@ mod tests {
         // gateway's `build_v1_url` appends /v1/rerank correctly for
         // both `https://api.cohere.com` and `https://api.cohere.com/v1`.
         let pk_json = format!(
-            r#"{{"display_name":"cohere-up","secret":"sk-cohere-mock","api_base":"{}"}}"#,
+            r#"{{"display_name":"cohere-up","secret":"sk-cohere-mock","api_base":"{}","provider":"cohere","adapter":"openai"}}"#,
             upstream.uri()
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();

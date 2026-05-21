@@ -78,8 +78,7 @@ pub async fn list_models(
             let owned_by = snapshot
                 .models
                 .get_by_name(name)
-                .and_then(|e| e.value.provider)
-                .map(|p| p.as_str().to_string())
+                .and_then(|e| e.value.provider.as_ref().cloned())
                 .unwrap_or_else(|| "aisix".to_string());
 
             ModelObject {
@@ -102,7 +101,7 @@ pub async fn list_models(
 
 #[cfg(test)]
 mod tests {
-    use aisix_core::models::Provider;
+
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ApiKey, Model, ProxyConfig};
@@ -123,7 +122,7 @@ mod tests {
 
     fn build_app(snapshot: AisixSnapshot) -> Router {
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let handle = SnapshotHandle::new(snapshot);
         crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache())
     }
@@ -145,7 +144,7 @@ mod tests {
 
     fn provider_key_entry() -> ResourceEntry<aisix_core::ProviderKey> {
         let pk: aisix_core::ProviderKey =
-            serde_json::from_str(r#"{"display_name":"openai-up","secret":"sk-up"}"#).unwrap();
+            serde_json::from_str(r#"{"display_name":"openai-up","secret":"sk-up","provider":"openai","adapter":"openai"}"#).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
     }
 

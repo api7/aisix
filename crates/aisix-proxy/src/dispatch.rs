@@ -19,7 +19,6 @@
 
 use std::sync::Arc;
 
-use aisix_core::models::Provider;
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, Model, ProviderKey};
 use aisix_gateway::{Bridge, Hub};
@@ -28,41 +27,19 @@ use crate::error::ProxyError;
 
 /// Resolve the Bridge to dispatch this request through.
 ///
-/// Tries the two-tier dispatch first (specialized vendor → adapter
-/// family), and falls back to the legacy `Provider`-keyed registry if
-/// neither tier matches. This is the Phase D cutover join point: new
-/// `ProviderKey` payloads carrying `adapter` and `provider` hit the
-/// two-tier path; pre-cutover payloads (`adapter: None`, empty
-/// `provider`) fall through to the legacy registry unchanged.
+/// Sole path is `Hub::dispatch_two_tier`: specialized vendor first,
+/// then adapter family. The legacy `Provider`-keyed registry is gone
+/// — vendor identity flows through `ProviderKey.provider` (open
+/// string) + `ProviderKey.adapter` (closed 5-value enum), so any
+/// catalog provider cp-api admits (xai, openrouter, future long-tail)
+/// resolves without DP knowing the vendor name at compile time.
 ///
-/// Returns `None` only when both layers miss — i.e. the operator has no
-/// bridge wired for this request at all.
-pub(crate) fn resolve_bridge(
-    hub: &Hub,
-    provider_key: &ProviderKey,
-    provider: Provider,
-) -> Option<Arc<dyn Bridge>> {
-    if let Some(bridge) = hub.dispatch_two_tier(provider_key) {
-        return Some(bridge);
-    }
-    // Legacy fallback. Emit a tracing::debug! when the PK carries the
-    // new-shape fields (`provider` or `adapter`) but the two-tier path
-    // still missed — post-cutover this is the early signal that a
-    // specialized Bridge name was misregistered (typo, runtime
-    // unregister) or that the adapter map missed an entry. Pre-cutover
-    // PKs (empty provider + adapter: None) take the silent path because
-    // they're the dominant case.
-    let pk_carries_new_fields = !provider_key.provider.is_empty() || provider_key.adapter.is_some();
-    if pk_carries_new_fields {
-        tracing::debug!(
-            target: "aisix_proxy::dispatch",
-            pk_provider = %provider_key.provider,
-            pk_adapter = ?provider_key.adapter,
-            legacy_provider = ?provider,
-            "two-tier dispatch missed for new-shape ProviderKey; falling back to legacy hub.get"
-        );
-    }
-    hub.get(provider)
+/// Returns `None` when the ProviderKey carries no `adapter` (a
+/// pre-Phase-A row that escaped the schema migration) AND no
+/// specialized bridge is registered for its vendor string. Caller
+/// surfaces this as 503 "no dispatch path".
+pub(crate) fn resolve_bridge(hub: &Hub, provider_key: &ProviderKey) -> Option<Arc<dyn Bridge>> {
+    hub.dispatch_two_tier(provider_key)
 }
 
 /// Look up the `ProviderKey` a given `Model` references. Returns a
@@ -87,9 +64,13 @@ pub(crate) fn resolve_provider_key(
     })
 }
 
-/// Required `provider` for a non-routing Model. 400 if absent.
-pub(crate) fn require_provider(model: &Model) -> Result<Provider, ProxyError> {
-    model.provider.ok_or_else(|| {
+/// Required `provider` (vendor id, free-form string) for a non-routing
+/// Model. 400 if absent. Dispatch routing reads
+/// `ProviderKey.adapter` + `ProviderKey.provider` — this helper just
+/// confirms the Model has a non-routing shape and returns the vendor
+/// id for telemetry / logs.
+pub(crate) fn require_provider(model: &Model) -> Result<&str, ProxyError> {
+    model.provider.as_deref().ok_or_else(|| {
         ProxyError::InvalidRequest(format!(
             "model {:?} has no provider (routing models can't be dispatched directly)",
             model.display_name
@@ -159,10 +140,15 @@ fn strip_endpoint_suffix(base: &str) -> &str {
 /// pasting the full upstream URL into `api_base` by stripping any
 /// trailing endpoint suffix — see [`API_BASE_ENDPOINT_SUFFIXES`] for
 /// the full list and [`build_v1_url`] for the matching `/v1` synthesis.
-pub(crate) fn resolve_base_url(provider: Provider, provider_key: &ProviderKey) -> String {
+pub(crate) fn resolve_base_url(provider_key: &ProviderKey) -> Result<String, ProxyError> {
     match provider_key.api_base.as_deref() {
-        Some(b) if !b.trim().is_empty() => strip_endpoint_suffix(b.trim()).to_string(),
-        _ => provider.default_base_url().to_string(),
+        Some(b) if !b.trim().is_empty() => Ok(strip_endpoint_suffix(b.trim()).to_string()),
+        _ => Err(ProxyError::InvalidRequest(format!(
+            "provider_key {:?} has no api_base — cp-api must populate api_base \
+             for every catalog vendor (the DP does not enumerate per-vendor \
+             default URLs)",
+            provider_key.display_name
+        ))),
     }
 }
 
@@ -229,7 +215,7 @@ mod tests {
     fn snapshot_with(provider_key_id: &str) -> AisixSnapshot {
         let snap = AisixSnapshot::new();
         let pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"openai-prod","secret":"sk-x","api_base":"https://proxy.example.com/v1"}"#,
+            r#"{"display_name":"openai-prod","secret":"sk-x","api_base":"https://proxy.example.com/v1","provider":"openai","adapter":"openai"}"#,
         )
         .unwrap();
         snap.provider_keys
@@ -295,7 +281,7 @@ mod tests {
     #[test]
     fn require_provider_returns_provider_for_direct_model() {
         let m = direct_model("pk-1");
-        assert_eq!(require_provider(&m).unwrap(), Provider::Openai);
+        assert_eq!(require_provider(&m).unwrap(), "openai");
     }
 
     #[test]
@@ -309,15 +295,28 @@ mod tests {
         let snap = snapshot_with("pk-1");
         let m = direct_model("pk-1");
         let pk_entry = resolve_provider_key(&snap, &m).unwrap();
-        let base = resolve_base_url(Provider::Openai, &pk_entry.value);
+        let base = resolve_base_url(&pk_entry.value).unwrap();
         assert_eq!(base, "https://proxy.example.com/v1");
     }
 
+    /// Empty `api_base` on the PK is now an error — the DP no longer
+    /// fabricates per-vendor defaults. cp-api populates api_base for
+    /// every catalog vendor (handlers.go createProviderKey gate +
+    /// featured `default_base_url`); refusing here turns any cp-api
+    /// admission gap into a loud 400 instead of a silent mis-route.
     #[test]
-    fn resolve_base_url_falls_back_to_provider_default_when_override_blank() {
+    fn resolve_base_url_errors_when_api_base_missing() {
         let pk: ProviderKey = serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
-        let base = resolve_base_url(Provider::Anthropic, &pk);
-        assert_eq!(base, Provider::Anthropic.default_base_url());
+        let err = resolve_base_url(&pk).unwrap_err();
+        match err {
+            ProxyError::InvalidRequest(msg) => {
+                assert!(
+                    msg.contains("api_base"),
+                    "error must mention api_base; got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
     }
 
     fn pk_with_base(api_base: &str) -> ProviderKey {
@@ -363,7 +362,7 @@ mod tests {
         ];
         for (paste, endpoint) in cases {
             let pk = pk_with_base(paste);
-            let base = resolve_base_url(Provider::Openai, &pk);
+            let base = resolve_base_url(&pk).unwrap();
             let url = build_v1_url(&base, endpoint);
             let expected = format!("https://api.openai.com/v1{endpoint}");
             assert_eq!(
@@ -384,7 +383,7 @@ mod tests {
             "https://api.deepseek.com/embeddings",
         ] {
             let pk = pk_with_base(paste);
-            let base = resolve_base_url(Provider::Deepseek, &pk);
+            let base = resolve_base_url(&pk).unwrap();
             let url = build_v1_url(&base, "/chat/completions");
             assert_eq!(
                 url, "https://api.deepseek.com/v1/chat/completions",
@@ -406,7 +405,7 @@ mod tests {
             "https://api.anthropic.com/v1/messages/",
         ] {
             let pk = pk_with_base(paste);
-            let base = resolve_base_url(Provider::Anthropic, &pk);
+            let base = resolve_base_url(&pk).unwrap();
             assert_eq!(
                 build_v1_url(&base, "/messages"),
                 "https://api.anthropic.com/v1/messages",
@@ -422,14 +421,14 @@ mod tests {
     fn resolve_base_url_passes_non_canonical_hosts_through() {
         let pk = pk_with_base("https://proxy.example.com/openai-shim");
         assert_eq!(
-            resolve_base_url(Provider::Openai, &pk),
+            resolve_base_url(&pk).unwrap(),
             "https://proxy.example.com/openai-shim",
         );
 
         // Suffix stripping still applies on non-canonical hosts —
         // operator pasting the full upstream URL is still recovered.
         let pk = pk_with_base("https://proxy.example.com/openai-shim/v1/responses");
-        let base = resolve_base_url(Provider::Openai, &pk);
+        let base = resolve_base_url(&pk).unwrap();
         assert_eq!(
             build_v1_url(&base, "/responses"),
             "https://proxy.example.com/openai-shim/v1/responses",
@@ -440,7 +439,7 @@ mod tests {
     #[test]
     fn resolve_base_url_trims_whitespace_and_endpoint_suffix() {
         let pk = pk_with_base("  https://api.openai.com/v1/chat/completions/  ");
-        let base = resolve_base_url(Provider::Openai, &pk);
+        let base = resolve_base_url(&pk).unwrap();
         assert_eq!(
             build_v1_url(&base, "/chat/completions"),
             "https://api.openai.com/v1/chat/completions",
@@ -599,10 +598,10 @@ mod tests {
                 }),
             );
             hub.register_family(Adapter::Openai, Arc::new(StubBridge { name: "family" }));
-            hub.register(Provider::Openai, Arc::new(StubBridge { name: "legacy" }));
+            hub.register_specialized("openai", Arc::new(StubBridge { name: "legacy" }));
 
             let pk = pk_with_provider_and_adapter("deepseek", Some("openai"));
-            let bridge = resolve_bridge(&hub, &pk, Provider::Openai).unwrap();
+            let bridge = resolve_bridge(&hub, &pk).unwrap();
             assert_eq!(bridge.name(), "specialized");
         }
 
@@ -610,33 +609,33 @@ mod tests {
         fn family_hit_when_specialized_misses() {
             let hub = Hub::new();
             hub.register_family(Adapter::Openai, Arc::new(StubBridge { name: "family" }));
-            hub.register(Provider::Openai, Arc::new(StubBridge { name: "legacy" }));
+            hub.register_specialized("openai", Arc::new(StubBridge { name: "legacy" }));
 
             // pk.provider = "unknown-vendor" → no specialized; pk.adapter
             // = Openai → family hit.
             let pk = pk_with_provider_and_adapter("unknown-vendor", Some("openai"));
-            let bridge = resolve_bridge(&hub, &pk, Provider::Openai).unwrap();
+            let bridge = resolve_bridge(&hub, &pk).unwrap();
             assert_eq!(bridge.name(), "family");
         }
 
+        /// Phase A drops the legacy `Provider`-keyed registry. A PK
+        /// with empty `provider` AND `adapter: None` has nothing to
+        /// dispatch on — caller surfaces 503. The old legacy fallback
+        /// test (`legacy_fallback_when_both_new_tiers_miss`) is gone
+        /// because there's no legacy tier left.
         #[test]
-        fn legacy_fallback_when_both_new_tiers_miss() {
+        fn none_when_neither_tier_matches() {
             let hub = Hub::new();
-            // No family / specialized registered — only legacy.
-            hub.register(Provider::Openai, Arc::new(StubBridge { name: "legacy" }));
-
-            // Today's on-disk PK shape: empty provider + adapter: None.
-            // The two-tier path returns None on both layers; legacy serves.
+            hub.register_specialized("openai", Arc::new(StubBridge { name: "vendor" }));
             let pk = pk_with_provider_and_adapter("", None);
-            let bridge = resolve_bridge(&hub, &pk, Provider::Openai).unwrap();
-            assert_eq!(bridge.name(), "legacy");
+            assert!(resolve_bridge(&hub, &pk).is_none());
         }
 
         #[test]
         fn none_when_nothing_registered() {
             let hub = Hub::new();
             let pk = pk_with_provider_and_adapter("", None);
-            assert!(resolve_bridge(&hub, &pk, Provider::Openai).is_none());
+            assert!(resolve_bridge(&hub, &pk).is_none());
         }
     }
 }
