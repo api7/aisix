@@ -445,11 +445,7 @@ mod tests {
 
     #[test]
     fn provider_key_happy_path_accepts() {
-        let entries = vec![raw(
-            "/aisix/provider_keys/pk-1",
-            VALID_PROVIDER_KEY,
-            1,
-        )];
+        let entries = vec![raw("/aisix/provider_keys/pk-1", VALID_PROVIDER_KEY, 1)];
         let (snap, stats) = build_snapshot("/aisix", &entries);
         assert_eq!(stats.accepted, 1);
         assert_eq!(snap.provider_keys.len(), 1);
