@@ -141,13 +141,14 @@ pub async fn messages(
         .unwrap_or_default();
     drop(snapshot);
 
-    match dispatch(&state, &auth, &mut body, &request_id).await {
+    match dispatch(&state, &auth, &mut body, &request_id, started).await {
         Ok(DispatchOutcome {
             response,
             provider_label,
             provider_key_id,
             upstream_model,
             metrics,
+            usage_handled_by_stream,
         }) => {
             let elapsed = started.elapsed();
             let status = response.status().as_u16();
@@ -182,21 +183,23 @@ pub async fn messages(
             };
             state.metrics.record_proxy_request(labels, elapsed);
             state.metrics.record_llm_request(labels, elapsed);
-            emit_anthropic_usage_event(
-                &state,
-                &request_id,
-                &model_id,
-                &api_key_id,
-                &provider_label,
-                &model_name,
-                &provider_key_id,
-                &upstream_model,
-                auth.key().team_id.as_deref(),
-                auth.key().owner_id.as_deref(),
-                status,
-                elapsed,
-                metrics,
-            );
+            if !usage_handled_by_stream {
+                emit_anthropic_usage_event(
+                    &state,
+                    &request_id,
+                    &model_id,
+                    &api_key_id,
+                    &provider_label,
+                    &model_name,
+                    &provider_key_id,
+                    &upstream_model,
+                    auth.key().team_id.as_deref(),
+                    auth.key().owner_id.as_deref(),
+                    status,
+                    elapsed,
+                    metrics,
+                );
+            }
             response
         }
         Err(err) => {
@@ -251,6 +254,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     body: &mut Value,
     request_id: &str,
+    started: Instant,
 ) -> Result<DispatchOutcome, ProxyError> {
     let snapshot = state.snapshot.load();
 
@@ -293,6 +297,10 @@ async fn dispatch(
             &pk_entry.value,
             &model_name,
             request_id,
+            started,
+            &auth.entry.id,
+            auth.key().team_id.clone(),
+            auth.key().owner_id.clone(),
         )
         .await;
     }
@@ -470,6 +478,7 @@ async fn dispatch(
             provider_key_id: pk_entry.id.clone(),
             upstream_model: upstream_model.clone(),
             metrics: AnthropicUsageMetrics::default(),
+            usage_handled_by_stream: false,
         })
     } else {
         // Non-streaming: deserialise and re-serialise as JSON. Decode
@@ -506,6 +515,7 @@ async fn dispatch(
             provider_key_id: pk_entry.id.clone(),
             upstream_model,
             metrics,
+            usage_handled_by_stream: false,
         })
     }
 }
@@ -548,6 +558,7 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        ttft_ms: 0,
     }
 }
 
@@ -571,6 +582,10 @@ async fn cross_provider_dispatch(
     provider_key: &aisix_core::ProviderKey,
     model_name: &str,
     request_id: &str,
+    started: Instant,
+    api_key_id: &str,
+    team_id: Option<String>,
+    owner_id: Option<String>,
 ) -> Result<DispatchOutcome, ProxyError> {
     use aisix_gateway::{Bridge, BridgeContext};
     use aisix_provider_anthropic::{
@@ -633,7 +648,44 @@ async fn cross_provider_dispatch(
 
         let message_id = format!("msg_{}", Uuid::new_v4().simple());
         let encoder = AnthropicSseEncoder::new(message_id, model_name, 0);
-        let sse_body = build_anthropic_sse_stream(upstream, encoder);
+        let state_for_telem = state.clone();
+        let request_id_for_telem = request_id.to_string();
+        let model_id_for_telem = model_id.to_string();
+        let api_key_id_for_telem = api_key_id.to_string();
+        let provider_for_telem = provider_label.clone();
+        let model_for_telem = model_name.to_string();
+        let provider_key_id_for_telem = provider_key_id.to_string();
+        let upstream_model_for_telem = upstream_model.clone();
+        let team_id_for_telem = team_id;
+        let owner_id_for_telem = owner_id;
+        let started_for_telem = started;
+        let sse_body = build_anthropic_sse_stream(upstream, encoder, started, move |comp| {
+            let metrics = AnthropicUsageMetrics {
+                prompt_tokens: comp.prompt_tokens,
+                completion_tokens: comp.completion_tokens,
+                cache_creation_tokens: comp.cache_creation_tokens,
+                cache_read_tokens: comp.cache_read_tokens,
+                provider_request_id: comp.provider_request_id,
+                provider_model_version: comp.provider_model_version,
+                finish_reason: comp.finish_reason,
+                ttft_ms: comp.ttft_ms,
+            };
+            emit_anthropic_usage_event(
+                &state_for_telem,
+                &request_id_for_telem,
+                &model_id_for_telem,
+                &api_key_id_for_telem,
+                &provider_for_telem,
+                &model_for_telem,
+                &provider_key_id_for_telem,
+                &upstream_model_for_telem,
+                team_id_for_telem.as_deref(),
+                owner_id_for_telem.as_deref(),
+                200,
+                started_for_telem.elapsed(),
+                metrics,
+            );
+        });
 
         let mut response = axum::response::Response::new(sse_body);
         response.headers_mut().insert(
@@ -649,18 +701,13 @@ async fn cross_provider_dispatch(
                 .headers_mut()
                 .insert(HeaderName::from_static("x-aisix-request-id"), hv);
         }
-        // Streaming cross-provider: token usage is only known once
-        // the bridge stream finishes. The encoder pumps chunks but
-        // we don't keep a handle into it; emitting tokens for this
-        // path requires plumbing a sink through `build_anthropic_sse_stream`.
-        // Punted to follow-up: token-less event so dashboard Logs
-        // sees the request, finish_reason / token counts come later.
         return Ok(DispatchOutcome {
             response,
             provider_label,
             provider_key_id: provider_key_id.to_string(),
             upstream_model,
             metrics: AnthropicUsageMetrics::default(),
+            usage_handled_by_stream: true,
         });
     }
 
@@ -683,6 +730,7 @@ async fn cross_provider_dispatch(
         provider_request_id: resp.id.clone(),
         provider_model_version: resp.model.clone(),
         finish_reason: format!("{:?}", resp.finish_reason).to_lowercase(),
+        ttft_ms: 0,
     };
     let json = chat_response_into_anthropic_json(&resp, model_name);
     Ok(DispatchOutcome {
@@ -691,6 +739,7 @@ async fn cross_provider_dispatch(
         provider_key_id: provider_key_id.to_string(),
         upstream_model,
         metrics,
+        usage_handled_by_stream: false,
     })
 }
 
@@ -702,15 +751,45 @@ async fn cross_provider_dispatch(
 fn build_anthropic_sse_stream(
     upstream: aisix_gateway::ChatChunkStream,
     encoder: aisix_provider_anthropic::AnthropicSseEncoder,
+    started: Instant,
+    on_complete: impl FnOnce(AnthropicStreamCompletion) + Send + 'static,
 ) -> axum::body::Body {
     use futures::StreamExt;
 
     let mut encoder = encoder;
     let stream = async_stream::stream! {
+        let mut guard = CompleteAnthropicStreamOnDrop {
+            slot: Some((on_complete, AnthropicStreamCompletion::default())),
+        };
         let mut upstream = upstream;
+        let mut first_chunk_seen = false;
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => {
+                    if !first_chunk_seen
+                        && (chunk.delta.content.is_some() || chunk.delta.tool_calls.is_some())
+                    {
+                        first_chunk_seen = true;
+                        guard.comp().ttft_ms =
+                            started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                    }
+                    let comp = guard.comp();
+                    if !chunk.id.is_empty() {
+                        comp.provider_request_id = chunk.id.clone();
+                    }
+                    if !chunk.model.is_empty() {
+                        comp.provider_model_version = chunk.model.clone();
+                    }
+                    if let Some(fr) = chunk.finish_reason.as_ref() {
+                        comp.finish_reason = format!("{fr:?}").to_lowercase();
+                    }
+                    if let Some(u) = chunk.usage.as_ref() {
+                        comp.prompt_tokens = comp.prompt_tokens.max(u.prompt_tokens);
+                        comp.completion_tokens = comp.completion_tokens.max(u.completion_tokens);
+                        comp.cache_creation_tokens =
+                            comp.cache_creation_tokens.max(u.cache_creation_tokens);
+                        comp.cache_read_tokens = comp.cache_read_tokens.max(u.cache_read_tokens);
+                    }
                     for ev in encoder.next_events(&chunk) {
                         yield Ok::<_, std::io::Error>(bytes::Bytes::from(ev.to_sse_string()));
                     }
@@ -738,6 +817,40 @@ fn build_anthropic_sse_stream(
     axum::body::Body::from_stream(stream)
 }
 
+#[derive(Default)]
+struct AnthropicStreamCompletion {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cache_creation_tokens: u32,
+    cache_read_tokens: u32,
+    provider_request_id: String,
+    provider_model_version: String,
+    finish_reason: String,
+    ttft_ms: u32,
+}
+
+struct CompleteAnthropicStreamOnDrop<F: FnOnce(AnthropicStreamCompletion)> {
+    slot: Option<(F, AnthropicStreamCompletion)>,
+}
+
+impl<F: FnOnce(AnthropicStreamCompletion)> CompleteAnthropicStreamOnDrop<F> {
+    fn comp(&mut self) -> &mut AnthropicStreamCompletion {
+        &mut self
+            .slot
+            .as_mut()
+            .expect("stream completion guard accessed after drop")
+            .1
+    }
+}
+
+impl<F: FnOnce(AnthropicStreamCompletion)> Drop for CompleteAnthropicStreamOnDrop<F> {
+    fn drop(&mut self) {
+        if let Some((f, c)) = self.slot.take() {
+            f(c);
+        }
+    }
+}
+
 /// What `dispatch` produces alongside the wire response: enough
 /// metadata for the outer wrapper to emit a UsageEvent with the
 /// proper token counts and provider-detail fields.
@@ -747,6 +860,7 @@ struct DispatchOutcome {
     provider_key_id: String,
     upstream_model: String,
     metrics: AnthropicUsageMetrics,
+    usage_handled_by_stream: bool,
 }
 
 /// Bundle of optional fields a UsageEvent emit-call wants when the
@@ -761,6 +875,7 @@ struct AnthropicUsageMetrics {
     provider_request_id: String,
     provider_model_version: String,
     finish_reason: String,
+    ttft_ms: u32,
 }
 
 /// Emit a UsageEvent for a `/v1/messages` request. Mirrors
@@ -769,10 +884,9 @@ struct AnthropicUsageMetrics {
 /// from the upstream provider label.
 ///
 /// Called from `messages()` once dispatch has produced a Response and
-/// (for non-streaming) we know the token counts. Streaming passthrough
-/// to an Anthropic upstream skips the call — the upstream byte stream
-/// isn't parsed in-flight, so token counts aren't available; that
-/// path's UsageEvent emission is tracked as follow-up work.
+/// (for non-streaming) we know the token counts. Cross-provider
+/// streaming calls invoke it from the stream completion callback after
+/// observing the upstream chunks.
 #[allow(clippy::too_many_arguments)]
 fn emit_anthropic_usage_event(
     state: &ProxyState,
@@ -803,6 +917,7 @@ fn emit_anthropic_usage_event(
         provider_request_id: metrics.provider_request_id,
         provider_model_version: metrics.provider_model_version,
         finish_reason: metrics.finish_reason,
+        ttft_ms: metrics.ttft_ms,
         inbound_protocol: "anthropic".to_string(),
         ..Default::default()
     };
@@ -832,6 +947,20 @@ fn emit_anthropic_usage_event(
                 .saturating_add(metrics.completion_tokens),
             spend_usd: 0.0,
         },
+    );
+    state.metrics.record_time_to_first_token(
+        UsageLabels {
+            endpoint: "/v1/messages",
+            inbound_protocol: "anthropic",
+            provider,
+            model,
+            upstream_model,
+            provider_key_id,
+            api_key_id,
+            team_id: team_id.unwrap_or("unknown"),
+            owner_id: owner_id.unwrap_or("unknown"),
+        },
+        Duration::from_millis(u64::from(metrics.ttft_ms)),
     );
 }
 
@@ -1466,6 +1595,71 @@ data: [DONE]\n\n";
         assert!(body.contains("event: message_delta"));
         assert!(body.contains("\"stop_reason\":\"end_turn\""));
         assert!(body.contains("event: message_stop"));
+    }
+
+    #[tokio::test]
+    async fn non_anthropic_streaming_records_anthropic_usage_event_with_ttft() {
+        use aisix_obs::UsageSink;
+        use aisix_provider_openai::OpenAiBridge;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"cmpl-359\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-359\",\"object\":\"chat.completion.chunk\",\"created\":1715000000,\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":4,\"total_tokens\":17}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_delay(std::time::Duration::from_millis(20))
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("my-claude-alias"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
+        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-claude-alias",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+            "stream": true,
+        });
+        let resp = app.oneshot(make_req(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let streamed = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(streamed.contains("event: message_stop"));
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("usage event sender dropped");
+        assert_eq!(event.inbound_protocol, "anthropic");
+        assert_eq!(event.prompt_tokens, 13);
+        assert_eq!(event.completion_tokens, 4);
+        assert_eq!(event.provider_request_id, "cmpl-359");
+        assert_eq!(event.provider_model_version, "gpt-4o-2024-08-06");
+        assert_eq!(event.finish_reason, "stop");
+        assert!(
+            event.ttft_ms > 0,
+            "streaming /v1/messages telemetry must record TTFT"
+        );
+        assert!(rx.try_recv().is_err(), "usage event should be emitted once");
     }
 
     #[tokio::test]
