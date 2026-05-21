@@ -574,6 +574,7 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
 /// 4. For streaming: bridge.chat_stream → AnthropicSseEncoder pumps
 ///    each ChatChunk through the message_start / content_block_* /
 ///    message_* state machine and writes SSE bytes
+#[allow(clippy::too_many_arguments)]
 async fn cross_provider_dispatch(
     state: &ProxyState,
     body: &Value,
