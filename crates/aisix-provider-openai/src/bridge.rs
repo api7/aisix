@@ -411,17 +411,25 @@ fn prepare_outbound_body<T: serde::Serialize>(
 }
 
 /// Build the base outbound `HeaderMap` (Authorization, Content-Type,
-/// x-aisix-request-id, and optionally Accept: text/event-stream for
-/// streaming calls), then merge any `default_headers` the PK carries.
+/// x-aisix-request-id, x-aisix-bridge, and optionally Accept: text/event-stream
+/// for streaming calls), then merge any `default_headers` the PK carries.
 /// Bridge-owned headers are inserted before the merge so
 /// [`apply_default_headers`] cannot overwrite them — the
 /// `if headers.contains_key(&parsed_name)` guard inside
 /// `apply_default_headers` plus the [`RESERVED_DEFAULT_HEADERS`] list
 /// gives two layers of defense against an operator-supplied
 /// `default_headers` accidentally clobbering auth.
+///
+/// `bridge_name` is set from [`OpenAiBridge::name`] and written as
+/// `X-AISIX-Bridge: <bridge_name>` on every outbound request. Tests
+/// capturing this header via mock-llm's `/_internal/captured-requests`
+/// can assert that `Hub.register(Provider::X, OpenAiBridge::with_name("Y"))`
+/// used the correct `with_name` value — catching a typo that pure
+/// routing assertions would miss (closes #368).
 fn build_request_headers(
     api_key_str: &str,
     request_id: &str,
+    bridge_name: &'static str,
     sse: bool,
     request: Option<&RequestOverrides>,
 ) -> Result<HeaderMap, BridgeError> {
@@ -437,6 +445,16 @@ fn build_request_headers(
         BridgeError::Config(format!("request_id contains invalid header chars: {e}"))
     })?;
     headers.insert(HeaderName::from_static("x-aisix-request-id"), rid);
+    // Diagnostic header: which OpenAI-compat bridge variant dispatched this
+    // request. Captured by mock-llm / real upstreams alike; allows e2e tests
+    // to assert Hub.register wiring without reading DP source (closes #368).
+    // Inserted before apply_default_headers so the operator cannot override it
+    // via PK default_headers (the contains_key guard in apply_default_headers
+    // skips any key already present in the map).
+    headers.insert(
+        HeaderName::from_static("x-aisix-bridge"),
+        HeaderValue::from_static(bridge_name),
+    );
     if sse {
         headers.insert(
             header::ACCEPT,
@@ -474,6 +492,7 @@ impl Bridge for OpenAiBridge {
         let headers = build_request_headers(
             key,
             &ctx.request_id,
+            self.name,
             false,
             ctx.provider_key.request.as_ref(),
         )?;
@@ -655,6 +674,7 @@ impl Bridge for OpenAiBridge {
         let headers = build_request_headers(
             key,
             &ctx.request_id,
+            self.name,
             true,
             ctx.provider_key.request.as_ref(),
         )?;
@@ -1777,5 +1797,81 @@ data: [DONE]\n";
         let ctx = sample_ctx(&server.uri());
         let resp = bridge.chat(&req(), &ctx).await.unwrap();
         assert_eq!(resp.id, "cmpl-1");
+    }
+
+    // ----------- issue #368: X-AISIX-Bridge outbound header -----------
+    //
+    // Pins that `build_request_headers` emits `x-aisix-bridge: <name>`
+    // for the bridge variant in use. The wiremock matcher fails the
+    // request (→ 404 fallthrough) if the header is absent or wrong,
+    // which is how a Hub.register typo would manifest in an e2e test
+    // that captures the header from mock-llm's
+    // `/_internal/captured-requests`.
+
+    /// `OpenAiBridge::new()` (default "openai" name) sends
+    /// `x-aisix-bridge: openai` on outbound chat requests.
+    #[tokio::test]
+    async fn chat_emits_x_aisix_bridge_openai_for_default_bridge() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("x-aisix-bridge", "openai"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_chat_response()))
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        // Header match is part of the mock — 404 if absent/wrong.
+        bridge.chat(&req(), &ctx).await.unwrap();
+    }
+
+    /// `OpenAiBridge::new().with_name("perplexity")` sends
+    /// `x-aisix-bridge: perplexity`. Catches a Hub.register typo like
+    /// `OpenAiBridge::new().with_name("groq")` registered under
+    /// `Provider::Perplexity` — the wrong header value would cause the
+    /// wiremock matcher to fall through to a 404 in an e2e test.
+    #[tokio::test]
+    async fn chat_emits_x_aisix_bridge_for_with_name_variant() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("x-aisix-bridge", "perplexity"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_chat_response()))
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new().with_name("perplexity");
+        let ctx = sample_ctx(&server.uri());
+        bridge.chat(&req(), &ctx).await.unwrap();
+    }
+
+    /// Same contract for the streaming path: `chat_stream` also sets
+    /// `x-aisix-bridge` on the outbound SSE request.
+    #[tokio::test]
+    async fn chat_stream_emits_x_aisix_bridge_for_with_name_variant() {
+        use futures::StreamExt;
+
+        let server = MockServer::start().await;
+        let sse = "data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("x-aisix-bridge", "groq"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new().with_name("groq");
+        let ctx = sample_ctx(&server.uri());
+        let mut stream = bridge.chat_stream(&req(), &ctx).await.unwrap();
+        // Drain the stream to completion — the mock match already verified
+        // the header was present (404 fallthrough if it was missing).
+        while let Some(r) = stream.next().await {
+            r.unwrap();
+        }
     }
 }
