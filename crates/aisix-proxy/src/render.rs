@@ -5,6 +5,27 @@
 //! upstream types — those describe what we *received*, while these
 //! describe what we *emit*. Keeping them separate means a client-facing
 //! schema change doesn't ripple into every provider adapter.
+//!
+//! ## `model` field contract (AISIX-Cloud#410)
+//!
+//! `response.model` is always the **customer-facing model name** the
+//! caller put on the request — for a direct model that's the model's
+//! display name; for a routing group that's the group name. It is
+//! never the upstream provider's raw id (e.g. `gpt-4o`) and never the
+//! routing target's display name. This keeps two contracts stable:
+//!
+//! 1. **Symmetric with direct models.** A request to `failover-group-X`
+//!    sees `model: "failover-group-X"` back, exactly the same shape as
+//!    a request to a direct model already produced before this PR.
+//! 2. **Failover-stable and provider-agnostic.** Customer dashboards
+//!    keyed on `response.model` don't flap when a target rotates out,
+//!    and a cross-provider routing group never leaks `gpt-4o` vs
+//!    `claude-3-5-sonnet` into the client's vocabulary.
+//!
+//! When the caller wants to know *which* target actually served the
+//! request (cost attribution, "did my failover fire?", A/B analysis),
+//! the proxy emits an `x-aisix-served-by` response header carrying
+//! the winning target's display name. See `chat::chat_completions`.
 
 use aisix_gateway::{ChatChunk, ChatResponse, FinishReason, Role};
 use serde::Serialize;
@@ -84,12 +105,19 @@ pub struct RenderedDelta {
     pub reasoning_content: Option<String>,
 }
 
-pub fn render_response(created_unix_ts: i64, resp: ChatResponse) -> ChatCompletion {
+pub fn render_response(
+    created_unix_ts: i64,
+    resp: ChatResponse,
+    client_facing_model: &str,
+) -> ChatCompletion {
+    // `resp.model` is whatever the upstream returned (`gpt-4o`,
+    // `claude-3-5-sonnet-20241022`, etc.). The wire-level contract is
+    // to echo the customer's requested name — see module-level docs.
     ChatCompletion {
         id: resp.id,
         object: "chat.completion",
         created: created_unix_ts,
-        model: resp.model,
+        model: client_facing_model.to_string(),
         choices: vec![NonStreamChoice {
             index: 0,
             message: RenderedMessage {
@@ -109,12 +137,20 @@ pub fn render_response(created_unix_ts: i64, resp: ChatResponse) -> ChatCompleti
     }
 }
 
-pub fn render_chunk(created_unix_ts: i64, chunk: ChatChunk) -> ChatCompletionChunk {
+pub fn render_chunk(
+    created_unix_ts: i64,
+    chunk: ChatChunk,
+    client_facing_model: &str,
+) -> ChatCompletionChunk {
+    // Same contract as `render_response`: every chunk's `model` field
+    // carries the customer's requested name, not the upstream's raw id.
+    // Re-stamping has to happen per-chunk; missing one chunk leaks the
+    // upstream id mid-stream.
     ChatCompletionChunk {
         id: chunk.id,
         object: "chat.completion.chunk",
         created: created_unix_ts,
-        model: chunk.model,
+        model: client_facing_model.to_string(),
         choices: vec![StreamChoice {
             index: 0,
             delta: RenderedDelta {
@@ -224,7 +260,7 @@ mod tests {
             finish_reason: FinishReason::Stop,
             usage: UsageStats::new(3, 2),
         };
-        let out = render_response(42, r);
+        let out = render_response(42, r, "m");
         let json = serde_json::to_value(&out).unwrap();
         assert_eq!(json["object"], "chat.completion");
         assert_eq!(json["created"], 42);
@@ -232,6 +268,29 @@ mod tests {
         assert_eq!(json["choices"][0]["message"]["role"], "assistant");
         assert_eq!(json["choices"][0]["message"]["content"], "hello");
         assert_eq!(json["usage"]["total_tokens"], 5);
+    }
+
+    /// Pins the AISIX-Cloud#410 contract: when the upstream returns one
+    /// model id but the customer requested a different name (alias /
+    /// routing-group name), `response.model` must echo the customer's
+    /// requested name, not the upstream's raw id.
+    #[test]
+    fn render_response_uses_client_facing_model_not_upstream_raw() {
+        let r = ChatResponse {
+            id: "cmpl-1".into(),
+            // Upstream raw — e.g. what OpenAI returned for a routing
+            // target inside `failover-group-XXX`.
+            model: "gpt-4o".into(),
+            message: ChatMessage::assistant("hi"),
+            finish_reason: FinishReason::Stop,
+            usage: UsageStats::default(),
+        };
+        let out = render_response(0, r, "failover-group-XXX");
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(
+            json["model"], "failover-group-XXX",
+            "wire `model` echoes the customer's requested name"
+        );
     }
 
     #[test]
@@ -248,13 +307,34 @@ mod tests {
             finish_reason: None,
             usage: None,
         };
-        let out = render_chunk(1, chunk);
+        let out = render_chunk(1, chunk, "m");
         let json = serde_json::to_value(&out).unwrap();
         assert_eq!(json["object"], "chat.completion.chunk");
         assert_eq!(json["choices"][0]["delta"]["content"], "hi");
         // finish_reason / usage must be absent (not null).
         assert!(json["choices"][0].get("finish_reason").is_none());
         assert!(json.get("usage").is_none());
+    }
+
+    /// Streaming counterpart of the #410 contract — re-stamp the
+    /// client-facing name onto every chunk, not just the first.
+    #[test]
+    fn render_chunk_uses_client_facing_model_not_upstream_raw() {
+        let chunk = ChatChunk {
+            id: "c".into(),
+            model: "gpt-4o".into(),
+            delta: aisix_gateway::ChatDelta {
+                role: None,
+                content: Some("hi".into()),
+                tool_calls: None,
+                reasoning_content: None,
+            },
+            finish_reason: None,
+            usage: None,
+        };
+        let out = render_chunk(0, chunk, "failover-group-XXX");
+        let json = serde_json::to_value(&out).unwrap();
+        assert_eq!(json["model"], "failover-group-XXX");
     }
 
     #[test]
@@ -266,7 +346,7 @@ mod tests {
             finish_reason: FinishReason::Other("weird".into()),
             usage: UsageStats::default(),
         };
-        let out = render_response(0, r);
+        let out = render_response(0, r, "m");
         let json = serde_json::to_value(&out).unwrap();
         assert_eq!(json["choices"][0]["finish_reason"], "weird");
     }

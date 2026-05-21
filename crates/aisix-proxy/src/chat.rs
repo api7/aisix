@@ -154,6 +154,18 @@ pub async fn chat_completions(
             if let Ok(v) = axum::http::HeaderValue::try_from(request_id.as_str()) {
                 success.response.headers_mut().insert("x-aisix-call-id", v);
             }
+            // `x-aisix-served-by` exposes which routing target served
+            // the request — see AISIX-Cloud#410. Only emitted when a
+            // routing group was the entry point (direct models would
+            // just echo `req.model`, which the body already carries).
+            if let Some(target) = success.served_by_target.as_deref() {
+                if let Ok(v) = axum::http::HeaderValue::try_from(target) {
+                    success
+                        .response
+                        .headers_mut()
+                        .insert("x-aisix-served-by", v);
+                }
+            }
             success.response
         }
         Err((resolved_model_id, charge, err)) => {
@@ -304,6 +316,22 @@ struct Success {
     /// pattern: DP records tokens, cp-api owns pricing). See #88.
     cache_hit_saved_input_tokens: u32,
     cache_hit_saved_output_tokens: u32,
+    /// Display name of the routing target that actually served this
+    /// request (AISIX-Cloud#410). Surfaces in the `x-aisix-served-by`
+    /// response header so callers can tell which target inside a
+    /// routing group won the failover loop.
+    ///
+    /// `None` in three cases:
+    ///   - Direct (non-routing) model — `display_name` of the served
+    ///     target equals `req.model`, so the header would be redundant.
+    ///   - Cache hit — we don't know which target produced the stored
+    ///     response. Re-stamping a stale name would lie.
+    ///   - Streaming response from a routing group with no failover —
+    ///     the streaming path attempts only `targets[0]` (no mid-stream
+    ///     fallback), so the value would always be `targets[0]`. The
+    ///     header is set in that case below; this comment documents
+    ///     the policy, not an absence.
+    served_by_target: Option<String>,
 }
 
 /// Cache decision attached to every successful request. Wire shape
@@ -592,6 +620,7 @@ async fn dispatch(
             now,
             stream_guardrail,
             started,
+            req.model.clone(),
             move |comp: StreamCompletion| {
                 // Rate-limit accounting (TPM cap) for all layers.
                 for key in &post_stream_keys {
@@ -709,6 +738,15 @@ async fn dispatch(
             cache_hit_saved_input_tokens: 0,
             cache_hit_saved_output_tokens: 0,
             telemetry_handled_by_stream: true,
+            // Streaming attempts only `targets[0]` (no mid-stream
+            // fallback), so on the routing path the served target is
+            // unambiguously the first one. For direct models the
+            // header would just echo `req.model`, so skip it.
+            served_by_target: if virtual_entry.value.routing.is_some() {
+                Some(model.display_name.clone())
+            } else {
+                None
+            },
         });
     }
 
@@ -798,7 +836,7 @@ async fn dispatch(
                     .upstream_model()
                     .unwrap_or("unknown")
                     .to_string();
-                let mut response = Json(render_response(now, cached)).into_response();
+                let mut response = Json(render_response(now, cached, &req.model)).into_response();
                 response
                     .headers_mut()
                     .insert(CACHE_HEADER, HeaderValue::from_static("hit"));
@@ -836,6 +874,11 @@ async fn dispatch(
                     cache_hit_saved_input_tokens: prompt.try_into().unwrap_or(u32::MAX),
                     cache_hit_saved_output_tokens: completion.try_into().unwrap_or(u32::MAX),
                     telemetry_handled_by_stream: false,
+                    // Cache hits don't carry routing-target identity:
+                    // the stored response is decoupled from whichever
+                    // target produced it on the original miss. See the
+                    // `served_by_target` field docs on `Success`.
+                    served_by_target: None,
                 });
             }
             Ok(None) => {}
@@ -852,6 +895,10 @@ async fn dispatch(
     let mut chosen_provider: Option<String> = None;
     let mut chosen_provider_key_id: Option<String> = None;
     let mut chosen_upstream_model: Option<String> = None;
+    // Display name of the target whose attempt finally succeeded. Used
+    // to populate the `x-aisix-served-by` response header for routing
+    // requests (AISIX-Cloud#410). Stays `None` until an attempt wins.
+    let mut chosen_target_display_name: Option<String> = None;
     let mut upstream: Option<aisix_gateway::ChatResponse> = None;
     let retries = virtual_entry
         .value
@@ -905,6 +952,7 @@ async fn dispatch(
                     chosen_provider_key_id = Some(pk_entry.id.clone());
                     chosen_upstream_model =
                         Some(model.upstream_model().unwrap_or("unknown").to_string());
+                    chosen_target_display_name = Some(model.display_name.clone());
                     upstream = Some(resp);
                     break;
                 }
@@ -1059,7 +1107,7 @@ async fn dispatch(
         }
     }
 
-    let mut response = Json(render_response(now, upstream)).into_response();
+    let mut response = Json(render_response(now, upstream, &req.model)).into_response();
     if matches!(cache_status, CacheStatus::Miss) {
         // Miss header only when the cache was actually consulted —
         // policy-disabled requests have no cache header at all so a
@@ -1068,6 +1116,17 @@ async fn dispatch(
             .headers_mut()
             .insert(CACHE_HEADER, HeaderValue::from_static("miss"));
     }
+
+    // Surface the winning target's display name only when this was a
+    // routing request. For a direct model the served target's display
+    // name equals `req.model`, so the header would just echo the body —
+    // skip it to keep the wire signal informative (header present =>
+    // routing happened).
+    let served_by_target = if virtual_entry.value.routing.is_some() {
+        chosen_target_display_name
+    } else {
+        None
+    };
 
     Ok(Success {
         response,
@@ -1093,6 +1152,7 @@ async fn dispatch(
         cache_hit_saved_input_tokens: 0,
         cache_hit_saved_output_tokens: 0,
         telemetry_handled_by_stream: false,
+        served_by_target,
     })
 }
 
@@ -1531,6 +1591,10 @@ fn build_sse_stream<F>(
     created: i64,
     output_guardrail: Option<StreamGuardrailContext>,
     started: Instant,
+    // Customer-facing model name (alias / routing group), re-stamped
+    // onto every SSE chunk's `model` field per AISIX-Cloud#410. Owned
+    // so it can move into the `async_stream::stream!` closure.
+    client_facing_model: String,
     on_complete: F,
 ) -> impl Stream<Item = Result<Event, Infallible>>
 where
@@ -1630,7 +1694,7 @@ where
                             comp.cache_read_tokens = u.cache_read_tokens;
                         }
                     }
-                    let rendered = render_chunk(created, chunk);
+                    let rendered = render_chunk(created, chunk, &client_facing_model);
                     match serde_json::to_string(&rendered) {
                         Ok(json) => Event::default().data(json),
                         Err(err) => {
