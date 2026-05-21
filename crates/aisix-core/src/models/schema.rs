@@ -117,7 +117,12 @@ fn model_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "display_name":    { "type": "string", "minLength": 1 },
-            "provider":        { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9_-]*$" },
+            // `provider` is the open vendor identity (models.dev catalog id
+            // — e.g. `openai`, `xai`, `wafer.ai`). The pattern accepts the
+            // dot character because at least one real models.dev id
+            // (`wafer.ai`) contains it; rejecting `.` would re-create the
+            // #417 bug class for that vendor.
+            "provider":        { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9._-]*$" },
             "model_name":      { "type": "string", "minLength": 1 },
             "provider_key_id": { "type": "string", "minLength": 1 },
             "timeout":         { "type": "integer", "minimum": 0 },
@@ -588,7 +593,20 @@ mod tests {
     /// `minLength: 1`.
     #[test]
     fn model_accepts_arbitrary_provider_string() {
-        for provider in ["openai", "xai", "openrouter", "this-is-some-new-vendor"] {
+        // Every real models.dev catalog id must pass. `wafer.ai` is
+        // the load-bearing example: one real vendor has a dot in its
+        // id, so the schema pattern must accept `.` — rejecting it
+        // would re-create the #417 bug class for that vendor.
+        // `fireworks-ai` is the canonical hyphenated example.
+        for provider in [
+            "openai",
+            "xai",
+            "openrouter",
+            "wafer.ai",
+            "fireworks-ai",
+            "togetherai",
+            "this-is-some-new-vendor",
+        ] {
             let v = json!({
                 "display_name": "x",
                 "provider": provider,
@@ -598,6 +616,34 @@ mod tests {
             validate_model(&v).unwrap_or_else(|err| {
                 panic!("provider {provider:?} should validate after #302 Phase A; got {err:?}")
             });
+        }
+    }
+
+    /// Pattern guards against log-injection / cardinality explosion.
+    /// Each rejected case here is a string the round-1 audit listed
+    /// as a concern.
+    #[test]
+    fn model_rejects_provider_strings_outside_pattern() {
+        for bad in [
+            "\nfake_log_line",
+            "openai\nline2",
+            "with space",
+            "UPPER",
+            ".leading-dot",
+            "-leading-hyphen",
+            "_leading-underscore",
+            "trailing-byte\0",
+        ] {
+            let v = json!({
+                "display_name": "x",
+                "provider": bad,
+                "model_name": "x",
+                "provider_key_id": "pk-1"
+            });
+            assert!(
+                validate_model(&v).is_err(),
+                "provider {bad:?} MUST be rejected by the pattern guard",
+            );
         }
     }
 

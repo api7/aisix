@@ -58,6 +58,19 @@ pub(crate) fn resolve_bridge(
     if provider_key.provider.is_empty() && provider_key.adapter.is_none() {
         if let Some(mp) = model_provider {
             if !mp.is_empty() {
+                // Emit a tracing::warn! so an operator (or SREs reading
+                // logs) can detect un-migrated PK rows still in the
+                // wild. The "one-cycle" deprecation promise is only
+                // enforceable if dispatching through the shim is
+                // observable.
+                tracing::warn!(
+                    target: "aisix_proxy::dispatch",
+                    pk_display_name = %provider_key.display_name,
+                    model_provider = %mp,
+                    "compat shim: pre-Phase-A PK row (empty `provider` + `adapter: None`) \
+                     dispatched via Model.provider fallback — re-save this PK to remove the \
+                     legacy code path"
+                );
                 return hub.get_specialized(mp);
             }
         }
@@ -685,8 +698,16 @@ mod tests {
         /// two-tier path and miss authoritatively if nothing matches.
         /// A future PR that drops `Adapter::Openai` family must FAIL
         /// the test below, not get rescued by the compat shim.
+        ///
+        /// This test pins the regression vector exactly: PK has
+        /// `provider:"vendor-without-specialized"` + `adapter:Some(Openai)`,
+        /// hub has NO `Adapter::Openai` family registered. The
+        /// two-tier path returns None on both layers. The compat
+        /// shim must NOT rescue this because `provider` is non-empty.
+        /// If a future PR drops `Adapter::Openai` family registration
+        /// in `build_hub()`, this test fires.
         #[test]
-        fn compat_shim_does_not_fire_for_post_phase_a_pk() {
+        fn compat_shim_does_not_rescue_missing_family_for_post_phase_a_pk() {
             let hub = Hub::new();
             hub.register_specialized(
                 "openai",
@@ -694,11 +715,16 @@ mod tests {
                     name: "specialized-openai",
                 }),
             );
-            // Post-Phase-A PK: `provider:"xai"` + `adapter: None`
-            // (specialized miss; no Adapter::Openai family registered;
-            // compat shim must NOT fire because `provider` is non-empty).
-            let pk = pk_with_provider_and_adapter("xai", None);
-            assert!(resolve_bridge(&hub, &pk, Some("openai")).is_none());
+            // `vendor-without-specialized` is not registered as
+            // specialized; `Adapter::Openai` is not registered as
+            // family. Compat shim must not fire because `provider`
+            // is non-empty.
+            let pk = pk_with_provider_and_adapter("vendor-without-specialized", Some("openai"));
+            assert!(
+                resolve_bridge(&hub, &pk, Some("openai")).is_none(),
+                "compat shim MUST NOT rescue a missing Adapter::Openai family — \
+                 provider is non-empty, so post-Phase-A path is authoritative",
+            );
         }
     }
 }
