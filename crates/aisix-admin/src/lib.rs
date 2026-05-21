@@ -914,8 +914,16 @@ mod tests {
 
         let resp_a = task_a.await.unwrap();
         let resp_b = task_b.await.unwrap();
-        assert_eq!(resp_a.status(), StatusCode::OK, "concurrent rotation a must succeed");
-        assert_eq!(resp_b.status(), StatusCode::OK, "concurrent rotation b must succeed");
+        assert_eq!(
+            resp_a.status(),
+            StatusCode::OK,
+            "concurrent rotation a must succeed"
+        );
+        assert_eq!(
+            resp_b.status(),
+            StatusCode::OK,
+            "concurrent rotation b must succeed"
+        );
 
         let body_a = body_json(resp_a).await;
         let body_b = body_json(resp_b).await;
@@ -924,9 +932,15 @@ mod tests {
         let rev_a = body_a["entry"]["revision"].as_u64().unwrap();
         let rev_b = body_b["entry"]["revision"].as_u64().unwrap();
 
-        assert_ne!(plain_a, plain_b, "two rotations must yield distinct plaintexts");
+        assert_ne!(
+            plain_a, plain_b,
+            "two rotations must yield distinct plaintexts"
+        );
         assert!(rev_a >= 2 && rev_b >= 2);
-        assert_ne!(rev_a, rev_b, "concurrent rotations must produce distinct revisions");
+        assert_ne!(
+            rev_a, rev_b,
+            "concurrent rotations must produce distinct revisions"
+        );
 
         // Final stored state matches the winner (highest revision).
         // The loser's plaintext must NOT still be admitted — that
@@ -939,9 +953,20 @@ mod tests {
         )
         .await;
         let final_entry = body_json(resp).await;
-        let final_hash = final_entry["value"]["key_hash"].as_str().unwrap().to_string();
-        let winner_plain = if rev_a > rev_b { plain_a.clone() } else { plain_b.clone() };
-        let loser_plain = if rev_a > rev_b { plain_b.clone() } else { plain_a.clone() };
+        let final_hash = final_entry["value"]["key_hash"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let winner_plain = if rev_a > rev_b {
+            plain_a.clone()
+        } else {
+            plain_b.clone()
+        };
+        let loser_plain = if rev_a > rev_b {
+            plain_b.clone()
+        } else {
+            plain_a.clone()
+        };
         assert_eq!(
             final_hash,
             aisix_core::ApiKey::hash_bearer(&winner_plain),
