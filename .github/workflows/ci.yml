@@ -193,6 +193,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: coverage-unit, path: cov/unit }
       - uses: actions/download-artifact@v4
+        # The e2e job invokes `pnpm test` which is `vitest run` with no
+        # `--coverage` flag, so `tests/e2e/coverage/lcov.info` is never
+        # written and no `coverage-e2e` artifact is produced. The upload
+        # step at ~L182 has `if-no-files-found: ignore` so the absence
+        # is silent. Until the e2e job actually emits coverage (tracked
+        # follow-up), this download must remain soft — otherwise the
+        # coverage-gate hard-fails every run on `Artifact not found`.
+        continue-on-error: true
         with: { name: coverage-e2e, path: cov/e2e }
       - name: merge + threshold
         run: |
