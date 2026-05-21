@@ -1175,10 +1175,20 @@ mod tests {
     }
 
     /// `build_hub()` MUST register `Adapter::Anthropic` as a family
-    /// bridge for symmetry with `Adapter::Openai`.
+    /// bridge for symmetry with `Adapter::Openai`. The Anthropic
+    /// family bridge serves any Anthropic-compat vendor cp-api admits.
     #[test]
     fn build_hub_registers_anthropic_family_bridge() {
         let hub = build_hub();
+        // Tighten: assert the dispatch comes from the family tier,
+        // not from an accidentally-registered specialized bridge.
+        // The bare vendor string `"some-anthropic-compat"` is not in
+        // the specialized list, so `dispatch_two_tier` must fall
+        // through to the `Adapter::Anthropic` family registration.
+        assert!(
+            hub.get_specialized("some-anthropic-compat").is_none(),
+            "`some-anthropic-compat` must not be specialized; the test must exercise the family tier"
+        );
         let pk: aisix_core::ProviderKey = serde_json::from_str(
             r#"{"display_name":"anth-compat-pk","secret":"sk-test","provider":"some-anthropic-compat","adapter":"anthropic","api_base":"https://example.com"}"#,
         )
@@ -1186,6 +1196,10 @@ mod tests {
         let bridge = hub
             .dispatch_two_tier(&pk)
             .unwrap_or_else(|| panic!("Adapter::Anthropic family bridge must be registered"));
-        assert_eq!(bridge.name(), "anthropic");
+        assert_eq!(
+            bridge.name(),
+            "anthropic",
+            "family Anthropic bridge MUST be the bare `AnthropicBridge::new()`",
+        );
     }
 }

@@ -27,19 +27,42 @@ use crate::error::ProxyError;
 
 /// Resolve the Bridge to dispatch this request through.
 ///
-/// Sole path is `Hub::dispatch_two_tier`: specialized vendor first,
-/// then adapter family. The legacy `Provider`-keyed registry is gone
-/// — vendor identity flows through `ProviderKey.provider` (open
-/// string) + `ProviderKey.adapter` (closed 5-value enum), so any
-/// catalog provider cp-api admits (xai, openrouter, future long-tail)
-/// resolves without DP knowing the vendor name at compile time.
+/// Primary path: `Hub::dispatch_two_tier` — specialized vendor first
+/// (keyed on `ProviderKey.provider`), then adapter family (keyed on
+/// `ProviderKey.adapter`). Vendor identity is an open string;
+/// adapter is the closed 5-value enum. Any catalog vendor cp-api
+/// admits (xai, openrouter, future long-tail) resolves through the
+/// family fallthrough without a DP code change.
 ///
-/// Returns `None` when the ProviderKey carries no `adapter` (a
-/// pre-Phase-A row that escaped the schema migration) AND no
-/// specialized bridge is registered for its vendor string. Caller
-/// surfaces this as 503 "no dispatch path".
-pub(crate) fn resolve_bridge(hub: &Hub, provider_key: &ProviderKey) -> Option<Arc<dyn Bridge>> {
-    hub.dispatch_two_tier(provider_key)
+/// Compat shim: pre-Phase-A `ProviderKey` rows still on disk have
+/// empty `provider` AND `adapter: None`. For those, fall back to
+/// the specialized registry keyed on `Model.provider`. This keeps
+/// existing on-disk data routable through the upgrade cycle. Once
+/// cp-api has backfilled every PK with `provider` + `adapter`,
+/// the fallback path becomes unreachable and can be removed.
+///
+/// Returns `None` when the two-tier path AND the compat fallback
+/// both miss — caller surfaces this as 503 "no dispatch path".
+pub(crate) fn resolve_bridge(
+    hub: &Hub,
+    provider_key: &ProviderKey,
+    model_provider: Option<&str>,
+) -> Option<Arc<dyn Bridge>> {
+    if let Some(b) = hub.dispatch_two_tier(provider_key) {
+        return Some(b);
+    }
+    // One-cycle compat for pre-Phase-A PK rows. cp-api now writes
+    // `provider` + `adapter` for every PK row; once any pre-cutover
+    // rows have been re-saved (or the operator's etcd has been wiped
+    // and reseeded), this `if` body becomes unreachable.
+    if provider_key.provider.is_empty() && provider_key.adapter.is_none() {
+        if let Some(mp) = model_provider {
+            if !mp.is_empty() {
+                return hub.get_specialized(mp);
+            }
+        }
+    }
+    None
 }
 
 /// Look up the `ProviderKey` a given `Model` references. Returns a
@@ -601,7 +624,7 @@ mod tests {
             hub.register_specialized("openai", Arc::new(StubBridge { name: "legacy" }));
 
             let pk = pk_with_provider_and_adapter("deepseek", Some("openai"));
-            let bridge = resolve_bridge(&hub, &pk).unwrap();
+            let bridge = resolve_bridge(&hub, &pk, None).unwrap();
             assert_eq!(bridge.name(), "specialized");
         }
 
@@ -614,28 +637,68 @@ mod tests {
             // pk.provider = "unknown-vendor" → no specialized; pk.adapter
             // = Openai → family hit.
             let pk = pk_with_provider_and_adapter("unknown-vendor", Some("openai"));
-            let bridge = resolve_bridge(&hub, &pk).unwrap();
+            let bridge = resolve_bridge(&hub, &pk, None).unwrap();
             assert_eq!(bridge.name(), "family");
         }
 
-        /// Phase A drops the legacy `Provider`-keyed registry. A PK
-        /// with empty `provider` AND `adapter: None` has nothing to
-        /// dispatch on — caller surfaces 503. The old legacy fallback
-        /// test (`legacy_fallback_when_both_new_tiers_miss`) is gone
-        /// because there's no legacy tier left.
+        /// A PK with empty `provider` AND `adapter: None` plus no
+        /// `Model.provider` to fall back on has nothing to dispatch
+        /// on — caller surfaces 503.
         #[test]
-        fn none_when_neither_tier_matches() {
+        fn none_when_neither_tier_matches_and_no_model_compat() {
             let hub = Hub::new();
             hub.register_specialized("openai", Arc::new(StubBridge { name: "vendor" }));
             let pk = pk_with_provider_and_adapter("", None);
-            assert!(resolve_bridge(&hub, &pk).is_none());
+            assert!(resolve_bridge(&hub, &pk, None).is_none());
         }
 
         #[test]
         fn none_when_nothing_registered() {
             let hub = Hub::new();
             let pk = pk_with_provider_and_adapter("", None);
-            assert!(resolve_bridge(&hub, &pk).is_none());
+            assert!(resolve_bridge(&hub, &pk, None).is_none());
+        }
+
+        /// One-cycle compat for pre-Phase-A PK rows. A PK with empty
+        /// `provider` AND `adapter: None` (on-disk shape pre-cutover)
+        /// resolves through the specialized registry keyed on the
+        /// Model's vendor string, so existing data stays routable
+        /// across the upgrade without forcing operators to re-save
+        /// every PK first.
+        #[test]
+        fn legacy_pk_with_empty_fields_falls_back_to_model_provider() {
+            let hub = Hub::new();
+            hub.register_specialized(
+                "openai",
+                Arc::new(StubBridge {
+                    name: "specialized-openai",
+                }),
+            );
+            // Pre-Phase-A PK shape: no `provider`, no `adapter`.
+            let pk = pk_with_provider_and_adapter("", None);
+            let bridge = resolve_bridge(&hub, &pk, Some("openai")).unwrap();
+            assert_eq!(bridge.name(), "specialized-openai");
+        }
+
+        /// Compat shim must NOT fire when the PK carries either
+        /// `provider` or `adapter` — those rows go through the
+        /// two-tier path and miss authoritatively if nothing matches.
+        /// A future PR that drops `Adapter::Openai` family must FAIL
+        /// the test below, not get rescued by the compat shim.
+        #[test]
+        fn compat_shim_does_not_fire_for_post_phase_a_pk() {
+            let hub = Hub::new();
+            hub.register_specialized(
+                "openai",
+                Arc::new(StubBridge {
+                    name: "specialized-openai",
+                }),
+            );
+            // Post-Phase-A PK: `provider:"xai"` + `adapter: None`
+            // (specialized miss; no Adapter::Openai family registered;
+            // compat shim must NOT fire because `provider` is non-empty).
+            let pk = pk_with_provider_and_adapter("xai", None);
+            assert!(resolve_bridge(&hub, &pk, Some("openai")).is_none());
         }
     }
 }

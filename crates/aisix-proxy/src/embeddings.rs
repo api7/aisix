@@ -136,8 +136,9 @@ async fn dispatch(
     let provider = crate::dispatch::require_provider(model)?;
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
 
-    let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
-        .ok_or(ProxyError::ProviderUnavailable)?;
+    let bridge =
+        crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, model.provider.as_deref())
+            .ok_or(ProxyError::ProviderUnavailable)?;
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
@@ -172,7 +173,7 @@ async fn dispatch(
             // EmbeddingResponse.usage; thread it through so TPM works
             // here even though other handlers commit 0.
             reservation.commit_tokens(embed_resp.usage.total_tokens as u64);
-            let provider_label = format!("{provider:?}").to_lowercase();
+            let provider_label = provider.to_ascii_lowercase();
             Ok((Json(embed_resp).into_response(), provider_label))
         }
         Err(BridgeError::Config(msg)) if msg.contains("does not support embeddings") => {
@@ -183,7 +184,7 @@ async fn dispatch(
             let env = ErrorEnvelope::new(msg, "not_implemented");
             Ok((
                 (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
-                format!("{provider:?}").to_lowercase(),
+                provider.to_ascii_lowercase(),
             ))
         }
         Err(e) => {

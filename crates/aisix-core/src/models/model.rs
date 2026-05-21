@@ -92,25 +92,10 @@ pub enum Adapter {
     AzureOpenai,
 }
 
-impl From<Provider> for Adapter {
-    /// Map the first-class `Provider` variants onto the `Adapter`
-    /// wire-shape set. Long-tail vendors no longer go through this —
-    /// they're free-form strings on `ProviderKey.provider` + cp-api
-    /// projects `adapter` directly.
-    fn from(provider: Provider) -> Self {
-        match provider {
-            Provider::Openai => Adapter::Openai,
-            Provider::Anthropic => Adapter::Anthropic,
-            // `Provider::Google` calls Gemini's OpenAI-compat endpoint
-            // (`/v1beta/openai`); the wire shape is `openai`. A future
-            // native Vertex AI dispatch would migrate this arm.
-            Provider::Google => Adapter::Openai,
-            Provider::Deepseek => Adapter::Openai,
-            Provider::Cohere => Adapter::Openai,
-            Provider::Jina => Adapter::Openai,
-        }
-    }
-}
+// `From<Provider> for Adapter` removed: post-#302 Phase A nothing in
+// production reads it. Adapter identity lives on `ProviderKey.adapter`
+// directly, projected by cp-api per adapter_map.yaml. The legacy
+// Model.provider → Adapter mapping has no caller.
 
 /// Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
@@ -493,21 +478,9 @@ mod tests {
         assert_eq!(bg.ignore_statuses, vec![408, 429]);
     }
 
-    #[test]
-    fn adapter_from_provider_covers_every_variant() {
-        // Every Provider variant must map to a defined Adapter. This
-        // test exists to fail the build if a new Provider is added
-        // without an explicit From arm — the match in `From<Provider>`
-        // is exhaustive so the real safety net is the compiler, but
-        // pinning the chosen Adapter per variant guards against a
-        // future edit silently changing the mapping.
-        assert_eq!(Adapter::from(Provider::Openai), Adapter::Openai);
-        assert_eq!(Adapter::from(Provider::Anthropic), Adapter::Anthropic);
-        assert_eq!(Adapter::from(Provider::Google), Adapter::Openai);
-        assert_eq!(Adapter::from(Provider::Deepseek), Adapter::Openai);
-        assert_eq!(Adapter::from(Provider::Cohere), Adapter::Openai);
-        assert_eq!(Adapter::from(Provider::Jina), Adapter::Openai);
-    }
+    // `adapter_from_provider_covers_every_variant` removed alongside
+    // the `From<Provider> for Adapter` impl — both are dead post-#302
+    // Phase A. ProviderKey.adapter carries the Adapter directly.
 
     #[test]
     fn adapter_serializes_to_kebab_case_wire_strings() {
@@ -589,7 +562,6 @@ mod tests {
         for v in variants {
             let id = v.as_str();
             assert!(!id.is_empty(), "{v:?}: as_str must be non-empty");
-            let _: Adapter = Adapter::from(v);
         }
     }
 }

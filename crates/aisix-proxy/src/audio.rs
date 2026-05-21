@@ -302,7 +302,7 @@ async fn multipart_dispatch(
     // (e.g. `/audio/transcriptions`) so this code is agnostic to
     // whether the customer's api_base ends in /v1 or not.
     let url = crate::dispatch::build_v1_url(&base, upstream_path);
-    let provider_label = format!("{provider:?}").to_lowercase();
+    let provider_label = provider.to_ascii_lowercase();
 
     // Rebuild the multipart form with `model` rewritten.
     let mut form = multipart::Form::new();
@@ -421,7 +421,7 @@ async fn speech_dispatch(
     let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?;
 
     let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
-    let provider_label = format!("{provider:?}").to_lowercase();
+    let provider_label = provider.to_ascii_lowercase();
 
     // Rewrite model field.
     if let Some(m) = body.get_mut("model") {

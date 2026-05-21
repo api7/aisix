@@ -116,14 +116,15 @@ async fn dispatch(
     let provider = crate::dispatch::require_provider(model)?;
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
 
-    let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
-        .ok_or(ProxyError::ProviderUnavailable)?;
+    let bridge =
+        crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, model.provider.as_deref())
+            .ok_or(ProxyError::ProviderUnavailable)?;
 
     let model_arc = Arc::new(model.clone());
     let pk_arc = Arc::new(pk_entry.value.clone());
     let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
 
-    let provider_label = format!("{provider:?}").to_lowercase();
+    let provider_label = provider.to_ascii_lowercase();
 
     match bridge.complete(&body, &ctx).await {
         Ok(resp_json) => Ok((Json(resp_json).into_response(), provider_label)),
