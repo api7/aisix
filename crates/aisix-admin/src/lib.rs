@@ -821,6 +821,139 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    // ---- coverage of issue api7/AISIX-Cloud#398 Addendum.B "admin
+    // /apikeys/:id/rotate" — race window + auth-bypass surface.
+
+    // Rotation is admin-authenticated: no Bearer admin-secret header
+    // means 401 BEFORE touching the etcd store. This pins the
+    // contract so a future "accidental open endpoint" refactor
+    // can't ship undetected.
+    #[tokio::test]
+    async fn rotate_apikey_requires_admin_auth() {
+        let state = build_state();
+
+        // Create the key with auth so we have a valid id to target.
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req(
+                "POST",
+                "/admin/v1/apikeys",
+                Some(apikey_payload("sk-original", &["my-model"])),
+            ),
+        )
+        .await;
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        // Now hit /rotate WITHOUT the admin Bearer header.
+        let app = build_router(state);
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/admin/v1/apikeys/{id}/rotate"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "rotate must require admin auth — unauthenticated callers must NOT be able to invalidate or replace an api_key",
+        );
+    }
+
+    // Two concurrent rotations against the same key must serialize
+    // cleanly: both calls succeed, the store ends in a consistent
+    // state with revisions monotonically increasing past 1, and the
+    // final stored hash matches the winner's plaintext (not a torn
+    // write).
+    //
+    // This pins the rotation race-window concern from #398
+    // Addendum.B: "rotation race window (new + old both admit
+    // simultaneously)". Atomicity comes from the store's RwLock; a
+    // refactor to an etcd-backed store without CAS semantics would
+    // regress this test.
+    #[tokio::test]
+    async fn concurrent_rotate_apikey_serializes_atomically() {
+        let state = build_state();
+
+        // Create.
+        let app = build_router(state.clone());
+        let resp = run(
+            app,
+            auth_req(
+                "POST",
+                "/admin/v1/apikeys",
+                Some(apikey_payload("sk-original", &["my-model"])),
+            ),
+        )
+        .await;
+        let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+        // Fire two rotations concurrently. Each rotation is one
+        // PUT to the in-memory ConfigStore, so the RwLock serializes
+        // them; both should succeed with monotonically-increasing
+        // revisions.
+        let app_a = build_router(state.clone());
+        let app_b = build_router(state.clone());
+        let id_a = id.clone();
+        let id_b = id.clone();
+
+        let task_a = tokio::spawn(async move {
+            run(
+                app_a,
+                auth_req("POST", &format!("/admin/v1/apikeys/{id_a}/rotate"), None),
+            )
+            .await
+        });
+        let task_b = tokio::spawn(async move {
+            run(
+                app_b,
+                auth_req("POST", &format!("/admin/v1/apikeys/{id_b}/rotate"), None),
+            )
+            .await
+        });
+
+        let resp_a = task_a.await.unwrap();
+        let resp_b = task_b.await.unwrap();
+        assert_eq!(resp_a.status(), StatusCode::OK, "concurrent rotation a must succeed");
+        assert_eq!(resp_b.status(), StatusCode::OK, "concurrent rotation b must succeed");
+
+        let body_a = body_json(resp_a).await;
+        let body_b = body_json(resp_b).await;
+        let plain_a = body_a["plaintext"].as_str().unwrap().to_string();
+        let plain_b = body_b["plaintext"].as_str().unwrap().to_string();
+        let rev_a = body_a["entry"]["revision"].as_u64().unwrap();
+        let rev_b = body_b["entry"]["revision"].as_u64().unwrap();
+
+        assert_ne!(plain_a, plain_b, "two rotations must yield distinct plaintexts");
+        assert!(rev_a >= 2 && rev_b >= 2);
+        assert_ne!(rev_a, rev_b, "concurrent rotations must produce distinct revisions");
+
+        // Final stored state matches the winner (highest revision).
+        // The loser's plaintext must NOT still be admitted — that
+        // would be the "new + old both admit" race the audit warned
+        // about.
+        let app = build_router(state);
+        let resp = run(
+            app,
+            auth_req("GET", &format!("/admin/v1/apikeys/{id}"), None),
+        )
+        .await;
+        let final_entry = body_json(resp).await;
+        let final_hash = final_entry["value"]["key_hash"].as_str().unwrap().to_string();
+        let winner_plain = if rev_a > rev_b { plain_a.clone() } else { plain_b.clone() };
+        let loser_plain = if rev_a > rev_b { plain_b.clone() } else { plain_a.clone() };
+        assert_eq!(
+            final_hash,
+            aisix_core::ApiKey::hash_bearer(&winner_plain),
+            "final stored hash must match the highest-revision rotation winner",
+        );
+        assert_ne!(
+            final_hash,
+            aisix_core::ApiKey::hash_bearer(&loser_plain),
+            "loser plaintext must NOT match the final stored hash — that would be a race-window admit",
+        );
+    }
+
     #[tokio::test]
     async fn apikey_crud_follows_the_same_flow() {
         let state = build_state();
