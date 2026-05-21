@@ -136,10 +136,6 @@ jobs:
     name: e2e (vitest) + coverage
     needs: [build-bin]
     runs-on: ubicloud-standard-2
-    # Soft gate while the harness stabilises across CI runners (etcd
-    # service startup, port detection, undici quirks). Flip to `false`
-    # once we have ~5 consecutive green runs on main.
-    continue-on-error: true
     services:
       etcd:
         image: quay.io/coreos/etcd:v3.5.15
@@ -197,7 +193,6 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: coverage-unit, path: cov/unit }
       - uses: actions/download-artifact@v4
-        continue-on-error: true
         with: { name: coverage-e2e, path: cov/e2e }
       - name: merge + threshold
         run: |
@@ -211,8 +206,7 @@ jobs:
           threshold=${COVERAGE_THRESHOLD:-90}
           awk -v p="$pct" -v t="$threshold" 'BEGIN { exit (p+0 < t+0) }' || {
             echo "::error::Coverage ${pct}% below threshold ${threshold}%"
-            # soft during scaffold milestones; flip to `exit 1` at PR #5.
-            exit 0
+            exit 1
           }
       - uses: actions/upload-artifact@v4
         with:
