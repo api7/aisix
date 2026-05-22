@@ -57,7 +57,7 @@ The entry handler
 ([`crates/aisix-proxy/src/messages.rs:45-136`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L45))
 parses the body, resolves the model, runs auth and quota, and
 hits the branch at
-[`messages.rs:176`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L176):
+[`messages.rs:290`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L290):
 
 ```rust
 if model.provider.as_deref() != Some("anthropic") {

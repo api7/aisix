@@ -185,18 +185,30 @@ pub struct Model {
     /// dispatch reads `ProviderKey.adapter` + `ProviderKey.provider`
     /// via `Hub::dispatch_two_tier`, so a new long-tail vendor admitted
     /// by cp-api works without a DP code change. `Model.provider` is
-    /// additionally consumed by three specific paths:
+    /// additionally consumed by:
     ///
-    /// 1. `/v1/messages` Anthropic-vs-cross-provider branch
-    ///    (`crates/aisix-proxy/src/messages.rs::messages_handler`).
+    /// 1. Anti-misdispatch gates that reject cross-provider routing
+    ///    for endpoints whose wire shape is vendor-specific:
+    ///    - `/v1/messages` (`crates/aisix-proxy/src/messages.rs:290`)
+    ///      — non-anthropic Models go through `cross_provider_dispatch`.
+    ///    - `/v1/responses` (`crates/aisix-proxy/src/responses.rs:117`)
+    ///      — non-openai Models rejected with 400.
+    ///    - `/v1/images/generations`
+    ///      (`crates/aisix-proxy/src/images.rs:124`) — non-openai
+    ///      Models rejected with 400.
     /// 2. `/v1/rerank` vendor gate + access-log label
-    ///    (`crates/aisix-proxy/src/rerank.rs`); Cohere/Jina each have
-    ///    a native rerank surface that bypasses the Bridge trait, so
-    ///    this path stays keyed on `Model.provider`.
-    /// 3. The one-cycle compat shim in
-    ///    `crates/aisix-proxy/src/dispatch.rs::resolve_bridge` that
-    ///    rescues pre-Phase-A on-disk PK rows (empty `provider` + None
-    ///    `adapter`) by falling back to `hub.get_specialized(Model.provider)`.
+    ///    (`crates/aisix-proxy/src/rerank.rs:125,145`); Cohere/Jina
+    ///    each have a native rerank surface that bypasses the Bridge
+    ///    trait, so this path stays keyed on `Model.provider`.
+    /// 3. Telemetry / access-log labels via
+    ///    `dispatch::require_provider()` on every bridge-dispatching
+    ///    endpoint (chat, completions, embeddings, images, audio,
+    ///    rerank).
+    /// 4. The one-cycle compat shim in
+    ///    `crates/aisix-proxy/src/dispatch.rs::resolve_bridge` (called
+    ///    by every bridge-dispatching endpoint) that rescues pre-
+    ///    Phase-A on-disk PK rows (empty `provider` + `None` `adapter`)
+    ///    by falling back to `hub.get_specialized(Model.provider)`.
     ///
     /// `None` for routing models.
     ///
