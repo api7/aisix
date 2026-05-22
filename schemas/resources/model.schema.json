@@ -51,14 +51,10 @@
       ]
     },
     "provider": {
-      "description": "Upstream provider. None for routing models (the router picks a target whose own `provider` is used at dispatch time).",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/Provider"
-        },
-        {
-          "type": "null"
-        }
+      "description": "Upstream vendor identity, free-form string (e.g. `\"openai\"`, `\"xai\"`, `\"openrouter\"`, any models.dev catalog id). Carried through to telemetry / logs but **not consumed by dispatch** — routing reads `ProviderKey.adapter` + `ProviderKey.provider` instead, so a new long-tail vendor admitted by cp-api works without a DP code change. None for routing models.\n\nCloses the schema-validation half of api7/AISIX-Cloud#417 and the dispatch half of api7/AISIX-Cloud#302 Phase A.",
+      "type": [
+        "string",
+        "null"
       ]
     },
     "provider_key_id": {
@@ -250,111 +246,6 @@
           "type": "string",
           "enum": [
             "original_order"
-          ]
-        }
-      ]
-    },
-    "Provider": {
-      "description": "Supported upstream providers.",
-      "oneOf": [
-        {
-          "type": "string",
-          "enum": [
-            "openai",
-            "anthropic",
-            "google",
-            "deepseek"
-          ]
-        },
-        {
-          "description": "Cohere — `/v1/rerank` (native, via `aisix-proxy::rerank`) and chat/completions / embeddings (via `OpenAiBridge::with_name(\"cohere\")` against `https://api.cohere.com/compatibility/v1`, per <https://docs.cohere.com/reference/chat>). Chat-compat is the OpenAI-shape namespace Cohere ships alongside its native `/v1/chat`. Chat-compat coverage today: the `command-r` / `command-a` family per <https://docs.cohere.com/v2/docs/compatibility-api>; legacy `command` / `command-light` / `command-nightly` go to native (not yet bridged) and will return upstream 400 if configured against the chat-compat path.",
-          "type": "string",
-          "enum": [
-            "cohere"
-          ]
-        },
-        {
-          "description": "Jina AI — currently exposed for `/v1/rerank` only (#213 Phase 2). Jina's rerank wire shape is identity-mapped to the OpenAI-compat shape (`{model, query, documents, top_n}` with Bearer auth at `https://api.jina.ai/v1/rerank`), so the gateway forwards verbatim with no transform. Jina's chat / embeddings APIs are out of scope for this phase.",
-          "type": "string",
-          "enum": [
-            "jina"
-          ]
-        },
-        {
-          "description": "Groq — OpenAI-compat at `https://api.groq.com/openai/v1`.",
-          "type": "string",
-          "enum": [
-            "groq"
-          ]
-        },
-        {
-          "description": "Mistral AI — OpenAI-compat at `https://api.mistral.ai/v1`.",
-          "type": "string",
-          "enum": [
-            "mistral"
-          ]
-        },
-        {
-          "description": "Together.ai — OpenAI-compat at `https://api.together.ai/v1`.",
-          "type": "string",
-          "enum": [
-            "togetherai"
-          ]
-        },
-        {
-          "description": "Fireworks AI — OpenAI-compat at `https://api.fireworks.ai/inference/v1`. Wire id is the hyphenated `fireworks-ai` (matches the models.dev catalog id used by cp-api's adapter_map).",
-          "type": "string",
-          "enum": [
-            "fireworks-ai"
-          ]
-        },
-        {
-          "description": "Perplexity — OpenAI-compat at `https://api.perplexity.ai` (chat lives at the host root).",
-          "type": "string",
-          "enum": [
-            "perplexity"
-          ]
-        },
-        {
-          "description": "Moonshot AI (Kimi) — OpenAI-compat at `https://api.moonshot.cn/v1`.",
-          "type": "string",
-          "enum": [
-            "moonshotai"
-          ]
-        },
-        {
-          "description": "Alibaba Cloud DashScope — OpenAI-compat at `https://dashscope.aliyuncs.com/compatible-mode/v1`.",
-          "type": "string",
-          "enum": [
-            "alibaba"
-          ]
-        },
-        {
-          "description": "Zhipu AI (智谱) — OpenAI-compat at `https://open.bigmodel.cn/api/paas/v4`.",
-          "type": "string",
-          "enum": [
-            "zhipuai"
-          ]
-        },
-        {
-          "description": "Baseten — OpenAI-compat at `https://inference.baseten.co/v1`. Per <https://docs.baseten.co/development/model-apis/openai-clients>, model APIs are exposed at this host root.",
-          "type": "string",
-          "enum": [
-            "baseten"
-          ]
-        },
-        {
-          "description": "Hugging Face — OpenAI-compat router at `https://router.huggingface.co/v1` per <https://huggingface.co/docs/inference-providers/en/index#openai-compatible-api>.",
-          "type": "string",
-          "enum": [
-            "huggingface"
-          ]
-        },
-        {
-          "description": "Cerebras Inference — OpenAI-compat at `https://api.cerebras.ai/v1`.",
-          "type": "string",
-          "enum": [
-            "cerebras"
           ]
         }
       ]

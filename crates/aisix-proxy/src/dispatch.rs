@@ -19,7 +19,6 @@
 
 use std::sync::Arc;
 
-use aisix_core::models::Provider;
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, Model, ProviderKey};
 use aisix_gateway::{Bridge, Hub};
@@ -28,41 +27,55 @@ use crate::error::ProxyError;
 
 /// Resolve the Bridge to dispatch this request through.
 ///
-/// Tries the two-tier dispatch first (specialized vendor → adapter
-/// family), and falls back to the legacy `Provider`-keyed registry if
-/// neither tier matches. This is the Phase D cutover join point: new
-/// `ProviderKey` payloads carrying `adapter` and `provider` hit the
-/// two-tier path; pre-cutover payloads (`adapter: None`, empty
-/// `provider`) fall through to the legacy registry unchanged.
+/// Primary path: `Hub::dispatch_two_tier` — specialized vendor first
+/// (keyed on `ProviderKey.provider`), then adapter family (keyed on
+/// `ProviderKey.adapter`). Vendor identity is an open string;
+/// adapter is the closed 5-value enum. Any catalog vendor cp-api
+/// admits (xai, openrouter, future long-tail) resolves through the
+/// family fallthrough without a DP code change.
 ///
-/// Returns `None` only when both layers miss — i.e. the operator has no
-/// bridge wired for this request at all.
+/// Compat shim: pre-Phase-A `ProviderKey` rows still on disk have
+/// empty `provider` AND `adapter: None`. For those, fall back to
+/// the specialized registry keyed on `Model.provider`. This keeps
+/// existing on-disk data routable through the upgrade cycle. Once
+/// cp-api has backfilled every PK with `provider` + `adapter`,
+/// the fallback path becomes unreachable and can be removed.
+///
+/// Returns `None` when the two-tier path AND the compat fallback
+/// both miss — caller surfaces this as 503 "no dispatch path".
 pub(crate) fn resolve_bridge(
     hub: &Hub,
     provider_key: &ProviderKey,
-    provider: Provider,
+    model_provider: Option<&str>,
 ) -> Option<Arc<dyn Bridge>> {
-    if let Some(bridge) = hub.dispatch_two_tier(provider_key) {
-        return Some(bridge);
+    if let Some(b) = hub.dispatch_two_tier(provider_key) {
+        return Some(b);
     }
-    // Legacy fallback. Emit a tracing::debug! when the PK carries the
-    // new-shape fields (`provider` or `adapter`) but the two-tier path
-    // still missed — post-cutover this is the early signal that a
-    // specialized Bridge name was misregistered (typo, runtime
-    // unregister) or that the adapter map missed an entry. Pre-cutover
-    // PKs (empty provider + adapter: None) take the silent path because
-    // they're the dominant case.
-    let pk_carries_new_fields = !provider_key.provider.is_empty() || provider_key.adapter.is_some();
-    if pk_carries_new_fields {
-        tracing::debug!(
-            target: "aisix_proxy::dispatch",
-            pk_provider = %provider_key.provider,
-            pk_adapter = ?provider_key.adapter,
-            legacy_provider = ?provider,
-            "two-tier dispatch missed for new-shape ProviderKey; falling back to legacy hub.get"
-        );
+    // One-cycle compat for pre-Phase-A PK rows. cp-api now writes
+    // `provider` + `adapter` for every PK row; once any pre-cutover
+    // rows have been re-saved (or the operator's etcd has been wiped
+    // and reseeded), this `if` body becomes unreachable.
+    if provider_key.provider.is_empty() && provider_key.adapter.is_none() {
+        if let Some(mp) = model_provider {
+            if !mp.is_empty() {
+                // Emit a tracing::warn! so an operator (or SREs reading
+                // logs) can detect un-migrated PK rows still in the
+                // wild. The "one-cycle" deprecation promise is only
+                // enforceable if dispatching through the shim is
+                // observable.
+                tracing::warn!(
+                    target: "aisix_proxy::dispatch",
+                    pk_display_name = %provider_key.display_name,
+                    model_provider = %mp,
+                    "compat shim: pre-Phase-A PK row (empty `provider` + `adapter: None`) \
+                     dispatched via Model.provider fallback — re-save this PK to remove the \
+                     legacy code path"
+                );
+                return hub.get_specialized(mp);
+            }
+        }
     }
-    hub.get(provider)
+    None
 }
 
 /// Look up the `ProviderKey` a given `Model` references. Returns a
@@ -87,9 +100,13 @@ pub(crate) fn resolve_provider_key(
     })
 }
 
-/// Required `provider` for a non-routing Model. 400 if absent.
-pub(crate) fn require_provider(model: &Model) -> Result<Provider, ProxyError> {
-    model.provider.ok_or_else(|| {
+/// Required `provider` (vendor id, free-form string) for a non-routing
+/// Model. 400 if absent. Dispatch routing reads
+/// `ProviderKey.adapter` + `ProviderKey.provider` — this helper just
+/// confirms the Model has a non-routing shape and returns the vendor
+/// id for telemetry / logs.
+pub(crate) fn require_provider(model: &Model) -> Result<&str, ProxyError> {
+    model.provider.as_deref().ok_or_else(|| {
         ProxyError::InvalidRequest(format!(
             "model {:?} has no provider (routing models can't be dispatched directly)",
             model.display_name
@@ -159,10 +176,15 @@ fn strip_endpoint_suffix(base: &str) -> &str {
 /// pasting the full upstream URL into `api_base` by stripping any
 /// trailing endpoint suffix — see [`API_BASE_ENDPOINT_SUFFIXES`] for
 /// the full list and [`build_v1_url`] for the matching `/v1` synthesis.
-pub(crate) fn resolve_base_url(provider: Provider, provider_key: &ProviderKey) -> String {
+pub(crate) fn resolve_base_url(provider_key: &ProviderKey) -> Result<String, ProxyError> {
     match provider_key.api_base.as_deref() {
-        Some(b) if !b.trim().is_empty() => strip_endpoint_suffix(b.trim()).to_string(),
-        _ => provider.default_base_url().to_string(),
+        Some(b) if !b.trim().is_empty() => Ok(strip_endpoint_suffix(b.trim()).to_string()),
+        _ => Err(ProxyError::InvalidRequest(format!(
+            "provider_key {:?} has no api_base — cp-api must populate api_base \
+             for every catalog vendor (the DP does not enumerate per-vendor \
+             default URLs)",
+            provider_key.display_name
+        ))),
     }
 }
 
@@ -229,7 +251,7 @@ mod tests {
     fn snapshot_with(provider_key_id: &str) -> AisixSnapshot {
         let snap = AisixSnapshot::new();
         let pk: ProviderKey = serde_json::from_str(
-            r#"{"display_name":"openai-prod","secret":"sk-x","api_base":"https://proxy.example.com/v1"}"#,
+            r#"{"display_name":"openai-prod","secret":"sk-x","api_base":"https://proxy.example.com/v1","provider":"openai","adapter":"openai"}"#,
         )
         .unwrap();
         snap.provider_keys
@@ -295,7 +317,7 @@ mod tests {
     #[test]
     fn require_provider_returns_provider_for_direct_model() {
         let m = direct_model("pk-1");
-        assert_eq!(require_provider(&m).unwrap(), Provider::Openai);
+        assert_eq!(require_provider(&m).unwrap(), "openai");
     }
 
     #[test]
@@ -309,15 +331,28 @@ mod tests {
         let snap = snapshot_with("pk-1");
         let m = direct_model("pk-1");
         let pk_entry = resolve_provider_key(&snap, &m).unwrap();
-        let base = resolve_base_url(Provider::Openai, &pk_entry.value);
+        let base = resolve_base_url(&pk_entry.value).unwrap();
         assert_eq!(base, "https://proxy.example.com/v1");
     }
 
+    /// Empty `api_base` on the PK is now an error — the DP no longer
+    /// fabricates per-vendor defaults. cp-api populates api_base for
+    /// every catalog vendor (handlers.go createProviderKey gate +
+    /// featured `default_base_url`); refusing here turns any cp-api
+    /// admission gap into a loud 400 instead of a silent mis-route.
     #[test]
-    fn resolve_base_url_falls_back_to_provider_default_when_override_blank() {
+    fn resolve_base_url_errors_when_api_base_missing() {
         let pk: ProviderKey = serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
-        let base = resolve_base_url(Provider::Anthropic, &pk);
-        assert_eq!(base, Provider::Anthropic.default_base_url());
+        let err = resolve_base_url(&pk).unwrap_err();
+        match err {
+            ProxyError::InvalidRequest(msg) => {
+                assert!(
+                    msg.contains("api_base"),
+                    "error must mention api_base; got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
     }
 
     fn pk_with_base(api_base: &str) -> ProviderKey {
@@ -363,7 +398,7 @@ mod tests {
         ];
         for (paste, endpoint) in cases {
             let pk = pk_with_base(paste);
-            let base = resolve_base_url(Provider::Openai, &pk);
+            let base = resolve_base_url(&pk).unwrap();
             let url = build_v1_url(&base, endpoint);
             let expected = format!("https://api.openai.com/v1{endpoint}");
             assert_eq!(
@@ -384,7 +419,7 @@ mod tests {
             "https://api.deepseek.com/embeddings",
         ] {
             let pk = pk_with_base(paste);
-            let base = resolve_base_url(Provider::Deepseek, &pk);
+            let base = resolve_base_url(&pk).unwrap();
             let url = build_v1_url(&base, "/chat/completions");
             assert_eq!(
                 url, "https://api.deepseek.com/v1/chat/completions",
@@ -406,7 +441,7 @@ mod tests {
             "https://api.anthropic.com/v1/messages/",
         ] {
             let pk = pk_with_base(paste);
-            let base = resolve_base_url(Provider::Anthropic, &pk);
+            let base = resolve_base_url(&pk).unwrap();
             assert_eq!(
                 build_v1_url(&base, "/messages"),
                 "https://api.anthropic.com/v1/messages",
@@ -422,14 +457,14 @@ mod tests {
     fn resolve_base_url_passes_non_canonical_hosts_through() {
         let pk = pk_with_base("https://proxy.example.com/openai-shim");
         assert_eq!(
-            resolve_base_url(Provider::Openai, &pk),
+            resolve_base_url(&pk).unwrap(),
             "https://proxy.example.com/openai-shim",
         );
 
         // Suffix stripping still applies on non-canonical hosts —
         // operator pasting the full upstream URL is still recovered.
         let pk = pk_with_base("https://proxy.example.com/openai-shim/v1/responses");
-        let base = resolve_base_url(Provider::Openai, &pk);
+        let base = resolve_base_url(&pk).unwrap();
         assert_eq!(
             build_v1_url(&base, "/responses"),
             "https://proxy.example.com/openai-shim/v1/responses",
@@ -440,7 +475,7 @@ mod tests {
     #[test]
     fn resolve_base_url_trims_whitespace_and_endpoint_suffix() {
         let pk = pk_with_base("  https://api.openai.com/v1/chat/completions/  ");
-        let base = resolve_base_url(Provider::Openai, &pk);
+        let base = resolve_base_url(&pk).unwrap();
         assert_eq!(
             build_v1_url(&base, "/chat/completions"),
             "https://api.openai.com/v1/chat/completions",
@@ -599,10 +634,10 @@ mod tests {
                 }),
             );
             hub.register_family(Adapter::Openai, Arc::new(StubBridge { name: "family" }));
-            hub.register(Provider::Openai, Arc::new(StubBridge { name: "legacy" }));
+            hub.register_specialized("openai", Arc::new(StubBridge { name: "legacy" }));
 
             let pk = pk_with_provider_and_adapter("deepseek", Some("openai"));
-            let bridge = resolve_bridge(&hub, &pk, Provider::Openai).unwrap();
+            let bridge = resolve_bridge(&hub, &pk, None).unwrap();
             assert_eq!(bridge.name(), "specialized");
         }
 
@@ -610,33 +645,86 @@ mod tests {
         fn family_hit_when_specialized_misses() {
             let hub = Hub::new();
             hub.register_family(Adapter::Openai, Arc::new(StubBridge { name: "family" }));
-            hub.register(Provider::Openai, Arc::new(StubBridge { name: "legacy" }));
+            hub.register_specialized("openai", Arc::new(StubBridge { name: "legacy" }));
 
             // pk.provider = "unknown-vendor" → no specialized; pk.adapter
             // = Openai → family hit.
             let pk = pk_with_provider_and_adapter("unknown-vendor", Some("openai"));
-            let bridge = resolve_bridge(&hub, &pk, Provider::Openai).unwrap();
+            let bridge = resolve_bridge(&hub, &pk, None).unwrap();
             assert_eq!(bridge.name(), "family");
         }
 
+        /// A PK with empty `provider` AND `adapter: None` plus no
+        /// `Model.provider` to fall back on has nothing to dispatch
+        /// on — caller surfaces 503.
         #[test]
-        fn legacy_fallback_when_both_new_tiers_miss() {
+        fn none_when_neither_tier_matches_and_no_model_compat() {
             let hub = Hub::new();
-            // No family / specialized registered — only legacy.
-            hub.register(Provider::Openai, Arc::new(StubBridge { name: "legacy" }));
-
-            // Today's on-disk PK shape: empty provider + adapter: None.
-            // The two-tier path returns None on both layers; legacy serves.
+            hub.register_specialized("openai", Arc::new(StubBridge { name: "vendor" }));
             let pk = pk_with_provider_and_adapter("", None);
-            let bridge = resolve_bridge(&hub, &pk, Provider::Openai).unwrap();
-            assert_eq!(bridge.name(), "legacy");
+            assert!(resolve_bridge(&hub, &pk, None).is_none());
         }
 
         #[test]
         fn none_when_nothing_registered() {
             let hub = Hub::new();
             let pk = pk_with_provider_and_adapter("", None);
-            assert!(resolve_bridge(&hub, &pk, Provider::Openai).is_none());
+            assert!(resolve_bridge(&hub, &pk, None).is_none());
+        }
+
+        /// One-cycle compat for pre-Phase-A PK rows. A PK with empty
+        /// `provider` AND `adapter: None` (on-disk shape pre-cutover)
+        /// resolves through the specialized registry keyed on the
+        /// Model's vendor string, so existing data stays routable
+        /// across the upgrade without forcing operators to re-save
+        /// every PK first.
+        #[test]
+        fn legacy_pk_with_empty_fields_falls_back_to_model_provider() {
+            let hub = Hub::new();
+            hub.register_specialized(
+                "openai",
+                Arc::new(StubBridge {
+                    name: "specialized-openai",
+                }),
+            );
+            // Pre-Phase-A PK shape: no `provider`, no `adapter`.
+            let pk = pk_with_provider_and_adapter("", None);
+            let bridge = resolve_bridge(&hub, &pk, Some("openai")).unwrap();
+            assert_eq!(bridge.name(), "specialized-openai");
+        }
+
+        /// Compat shim must NOT fire when the PK carries either
+        /// `provider` or `adapter` — those rows go through the
+        /// two-tier path and miss authoritatively if nothing matches.
+        /// A future PR that drops `Adapter::Openai` family must FAIL
+        /// the test below, not get rescued by the compat shim.
+        ///
+        /// This test pins the regression vector exactly: PK has
+        /// `provider:"vendor-without-specialized"` + `adapter:Some(Openai)`,
+        /// hub has NO `Adapter::Openai` family registered. The
+        /// two-tier path returns None on both layers. The compat
+        /// shim must NOT rescue this because `provider` is non-empty.
+        /// If a future PR drops `Adapter::Openai` family registration
+        /// in `build_hub()`, this test fires.
+        #[test]
+        fn compat_shim_does_not_rescue_missing_family_for_post_phase_a_pk() {
+            let hub = Hub::new();
+            hub.register_specialized(
+                "openai",
+                Arc::new(StubBridge {
+                    name: "specialized-openai",
+                }),
+            );
+            // `vendor-without-specialized` is not registered as
+            // specialized; `Adapter::Openai` is not registered as
+            // family. Compat shim must not fire because `provider`
+            // is non-empty.
+            let pk = pk_with_provider_and_adapter("vendor-without-specialized", Some("openai"));
+            assert!(
+                resolve_bridge(&hub, &pk, Some("openai")).is_none(),
+                "compat shim MUST NOT rescue a missing Adapter::Openai family — \
+                 provider is non-empty, so post-Phase-A path is authoritative",
+            );
         }
     }
 }

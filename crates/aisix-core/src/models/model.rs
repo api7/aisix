@@ -17,7 +17,21 @@ use super::rate_limit::RateLimit;
 use super::routing::Routing;
 use crate::resource::Resource;
 
-/// Supported upstream providers.
+/// First-class upstream provider variants with specialized DP handling.
+///
+/// Kept narrow on purpose: only vendors whose code path diverges from
+/// the wire-shape default (`Adapter`-family bridge) live here. Every
+/// other catalog vendor cp-api admits (xai, openrouter, groq, mistral,
+/// fireworks-ai, perplexity, together, moonshot, alibaba, zhipu,
+/// baseten, huggingface, cerebras, …) flows through the `Adapter`
+/// family bridge without a DP enum variant — closes api7/AISIX-Cloud#302
+/// Phase A and api7/AISIX-Cloud#417.
+///
+/// Wire identity on `ProviderKey.provider` / `Model.provider` is a
+/// free-form string (`Option<String>`); this enum is reserved for the
+/// few code paths that still match on a fixed vendor set
+/// (Cohere/Jina native rerank, Anthropic-shape `/v1/messages` cross-
+/// provider routing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
@@ -28,101 +42,19 @@ pub enum Provider {
     /// Cohere — `/v1/rerank` (native, via `aisix-proxy::rerank`) and
     /// chat/completions / embeddings (via `OpenAiBridge::with_name("cohere")`
     /// against `https://api.cohere.com/compatibility/v1`, per
-    /// <https://docs.cohere.com/reference/chat>). Chat-compat is the
-    /// OpenAI-shape namespace Cohere ships alongside its native
-    /// `/v1/chat`. Chat-compat coverage today: the `command-r` /
-    /// `command-a` family per
-    /// <https://docs.cohere.com/v2/docs/compatibility-api>; legacy
-    /// `command` / `command-light` / `command-nightly` go to native
-    /// (not yet bridged) and will return upstream 400 if configured
-    /// against the chat-compat path.
+    /// <https://docs.cohere.com/reference/chat>).
     Cohere,
     /// Jina AI — currently exposed for `/v1/rerank` only (#213 Phase 2).
     /// Jina's rerank wire shape is identity-mapped to the OpenAI-compat
     /// shape (`{model, query, documents, top_n}` with Bearer auth at
     /// `https://api.jina.ai/v1/rerank`), so the gateway forwards
-    /// verbatim with no transform. Jina's chat / embeddings APIs are
-    /// out of scope for this phase.
+    /// verbatim with no transform.
     Jina,
-    // ─── OpenAI-adapter long-tail providers (#60 P2-A) ────────────────
-    //
-    // The 11 variants below all expose an OpenAI-compatible chat
-    // completions surface and route through `OpenAiBridge::with_name`
-    // — the same dispatch path Deepseek / Google already use. Default
-    // base URLs are sourced from each vendor's official OpenAI-compat
-    // documentation; operators can override via `ProviderKey.api_base`.
-    //
-    // serde casing is `lowercase` (inherited from the parent enum) so
-    // each variant's wire id is its single-token lowercase form. The
-    // `fireworks-ai` variant carries an explicit `#[serde(rename)]`
-    // because its catalog id (per models.dev) is hyphenated and would
-    // not survive the default lowercase rule.
-    /// Groq — OpenAI-compat at `https://api.groq.com/openai/v1`.
-    Groq,
-    /// Mistral AI — OpenAI-compat at `https://api.mistral.ai/v1`.
-    Mistral,
-    /// Together.ai — OpenAI-compat at `https://api.together.ai/v1`.
-    Togetherai,
-    /// Fireworks AI — OpenAI-compat at `https://api.fireworks.ai/inference/v1`.
-    /// Wire id is the hyphenated `fireworks-ai` (matches the
-    /// models.dev catalog id used by cp-api's adapter_map).
-    #[serde(rename = "fireworks-ai")]
-    FireworksAi,
-    /// Perplexity — OpenAI-compat at `https://api.perplexity.ai`
-    /// (chat lives at the host root).
-    Perplexity,
-    // xAI Grok was scoped out of this PR after audit: `xai` is not in
-    // AISIX-Cloud's `internal/cpapi/adapter_map/adapter_map.yaml`
-    // Featured table (PR #335 swapped xai → google for rank 8), so
-    // adding `Provider::Xai` here without a catalog entry would leave
-    // a DP variant cp-api can't write to. Tracked as a separate
-    // follow-up: add xai to adapter_map.yaml first, then a one-line
-    // Provider::Xai DP-side commit will follow.
-    /// Moonshot AI (Kimi) — OpenAI-compat at `https://api.moonshot.cn/v1`.
-    Moonshotai,
-    /// Alibaba Cloud DashScope — OpenAI-compat at
-    /// `https://dashscope.aliyuncs.com/compatible-mode/v1`.
-    Alibaba,
-    /// Zhipu AI (智谱) — OpenAI-compat at
-    /// `https://open.bigmodel.cn/api/paas/v4`.
-    Zhipuai,
-    /// Baseten — OpenAI-compat at `https://inference.baseten.co/v1`.
-    /// Per <https://docs.baseten.co/development/model-apis/openai-clients>,
-    /// model APIs are exposed at this host root.
-    Baseten,
-    /// Hugging Face — OpenAI-compat router at
-    /// `https://router.huggingface.co/v1` per
-    /// <https://huggingface.co/docs/inference-providers/en/index#openai-compatible-api>.
-    Huggingface,
-    /// Cerebras Inference — OpenAI-compat at `https://api.cerebras.ai/v1`.
-    Cerebras,
 }
 
 impl Provider {
-    pub const fn default_base_url(self) -> &'static str {
-        match self {
-            Self::Openai => "https://api.openai.com",
-            Self::Anthropic => "https://api.anthropic.com",
-            Self::Google => "https://generativelanguage.googleapis.com/v1beta/openai",
-            Self::Deepseek => "https://api.deepseek.com",
-            Self::Cohere => "https://api.cohere.com",
-            Self::Jina => "https://api.jina.ai",
-            // Long-tail OpenAI-adapter providers (#60 P2-A) — each
-            // url is the vendor's documented OpenAI-compat endpoint.
-            Self::Groq => "https://api.groq.com/openai/v1",
-            Self::Mistral => "https://api.mistral.ai/v1",
-            Self::Togetherai => "https://api.together.ai/v1",
-            Self::FireworksAi => "https://api.fireworks.ai/inference/v1",
-            Self::Perplexity => "https://api.perplexity.ai",
-            Self::Moonshotai => "https://api.moonshot.cn/v1",
-            Self::Alibaba => "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            Self::Zhipuai => "https://open.bigmodel.cn/api/paas/v4",
-            Self::Baseten => "https://inference.baseten.co/v1",
-            Self::Huggingface => "https://router.huggingface.co/v1",
-            Self::Cerebras => "https://api.cerebras.ai/v1",
-        }
-    }
-
+    /// Stable wire identity for this first-class variant. Matches the
+    /// models.dev catalog id cp-api stores on `ProviderKey.provider`.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Openai => "openai",
@@ -131,20 +63,6 @@ impl Provider {
             Self::Deepseek => "deepseek",
             Self::Cohere => "cohere",
             Self::Jina => "jina",
-            // Long-tail OpenAI-adapter providers (#60 P2-A). The
-            // wire id matches the catalog id used by cp-api's
-            // adapter_map / models.dev.
-            Self::Groq => "groq",
-            Self::Mistral => "mistral",
-            Self::Togetherai => "togetherai",
-            Self::FireworksAi => "fireworks-ai",
-            Self::Perplexity => "perplexity",
-            Self::Moonshotai => "moonshotai",
-            Self::Alibaba => "alibaba",
-            Self::Zhipuai => "zhipuai",
-            Self::Baseten => "baseten",
-            Self::Huggingface => "huggingface",
-            Self::Cerebras => "cerebras",
         }
     }
 }
@@ -174,60 +92,10 @@ pub enum Adapter {
     AzureOpenai,
 }
 
-impl From<Provider> for Adapter {
-    /// Mapping from the current `Provider` enum onto the `Adapter`
-    /// wire-shape set, for use during the issue #302 Phase A skeleton
-    /// stage. This mapping is **not** wired into dispatch in this PR;
-    /// it exists as a forward-looking reference that follow-up Phase A
-    /// PRs will consume when migrating entities, the Hub, and Bridges
-    /// onto `Adapter`.
-    ///
-    /// Rationale per variant:
-    ///
-    /// - `Openai` / `Anthropic`: direct equivalents.
-    /// - `Google` → `Vertex`: forward-looking choice for the Phase A
-    ///   migration target. **Note:** this intentionally diverges from
-    ///   the current runtime behavior — `Provider::Google` today calls
-    ///   the Gemini Generative Language API via its OpenAI-compatible
-    ///   endpoint (`/v1beta/openai`), which is an `openai`-shaped
-    ///   wire. Any downstream PR that flips dispatch onto `Adapter`
-    ///   MUST either also migrate the Google bridge to native Vertex
-    ///   AI request encoding, or revisit this arm before merging — a
-    ///   silent flip would change the wire shape sent to Google
-    ///   upstreams. See issue #302 Phase A for the migration plan.
-    /// - `Deepseek` → `Openai`: DeepSeek exposes an OpenAI-compatible
-    ///   chat completions endpoint, so the adapter shape is `openai`.
-    /// - `Cohere` → `Openai`: the gateway currently talks to Cohere's
-    ///   OpenAI-compatible endpoints (#213 Phase 1 — rerank-only),
-    ///   so the wire adapter is `openai`. A native Cohere adapter is
-    ///   not part of this skeleton.
-    /// - `Jina` → `Openai`: Jina's rerank is identity-mapped to the
-    ///   OpenAI-compat rerank shape (#213 Phase 2), so the wire
-    ///   adapter is `openai`.
-    fn from(provider: Provider) -> Self {
-        match provider {
-            Provider::Openai => Adapter::Openai,
-            Provider::Anthropic => Adapter::Anthropic,
-            Provider::Google => Adapter::Vertex,
-            Provider::Deepseek => Adapter::Openai,
-            Provider::Cohere => Adapter::Openai,
-            Provider::Jina => Adapter::Openai,
-            // All long-tail variants (#60 P2-A) expose OpenAI-compat
-            // chat surfaces and route through OpenAiBridge.
-            Provider::Groq
-            | Provider::Mistral
-            | Provider::Togetherai
-            | Provider::FireworksAi
-            | Provider::Perplexity
-            | Provider::Moonshotai
-            | Provider::Alibaba
-            | Provider::Zhipuai
-            | Provider::Baseten
-            | Provider::Huggingface
-            | Provider::Cerebras => Adapter::Openai,
-        }
-    }
-}
+// `From<Provider> for Adapter` removed: post-#302 Phase A nothing in
+// production reads it. Adapter identity lives on `ProviderKey.adapter`
+// directly, projected by cp-api per adapter_map.yaml. The legacy
+// Model.provider → Adapter mapping has no caller.
 
 /// Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
@@ -361,10 +229,17 @@ pub struct Model {
     /// the dashboard model list. `Resource::name()` returns this.
     pub display_name: String,
 
-    /// Upstream provider. None for routing models (the router picks
-    /// a target whose own `provider` is used at dispatch time).
+    /// Upstream vendor identity, free-form string (e.g. `"openai"`,
+    /// `"xai"`, `"openrouter"`, any models.dev catalog id). Carried
+    /// through to telemetry / logs but **not consumed by dispatch** —
+    /// routing reads `ProviderKey.adapter` + `ProviderKey.provider`
+    /// instead, so a new long-tail vendor admitted by cp-api works
+    /// without a DP code change. None for routing models.
+    ///
+    /// Closes the schema-validation half of api7/AISIX-Cloud#417 and
+    /// the dispatch half of api7/AISIX-Cloud#302 Phase A.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<Provider>,
+    pub provider: Option<String>,
 
     /// Upstream model id sent to the provider (e.g. "gpt-4o",
     /// "claude-sonnet-4-5"). None for routing models.
@@ -460,7 +335,7 @@ mod tests {
     fn deserialises_spec_sample() {
         let m: Model = serde_json::from_str(sample_json()).unwrap();
         assert_eq!(m.display_name, "my-gpt4");
-        assert_eq!(m.provider, Some(Provider::Openai));
+        assert_eq!(m.provider.as_deref(), Some("openai"));
         assert_eq!(m.model_name.as_deref(), Some("gpt-4o"));
         assert_eq!(
             m.provider_key_id.as_deref(),
@@ -603,21 +478,9 @@ mod tests {
         assert_eq!(bg.ignore_statuses, vec![408, 429]);
     }
 
-    #[test]
-    fn adapter_from_provider_covers_every_variant() {
-        // Every Provider variant must map to a defined Adapter. This
-        // test exists to fail the build if a new Provider is added
-        // without an explicit From arm — the match in `From<Provider>`
-        // is exhaustive so the real safety net is the compiler, but
-        // pinning the chosen Adapter per variant guards against a
-        // future edit silently changing the mapping.
-        assert_eq!(Adapter::from(Provider::Openai), Adapter::Openai);
-        assert_eq!(Adapter::from(Provider::Anthropic), Adapter::Anthropic);
-        assert_eq!(Adapter::from(Provider::Google), Adapter::Vertex);
-        assert_eq!(Adapter::from(Provider::Deepseek), Adapter::Openai);
-        assert_eq!(Adapter::from(Provider::Cohere), Adapter::Openai);
-        assert_eq!(Adapter::from(Provider::Jina), Adapter::Openai);
-    }
+    // `adapter_from_provider_covers_every_variant` removed alongside
+    // the `From<Provider> for Adapter` impl — both are dead post-#302
+    // Phase A. ProviderKey.adapter carries the Adapter directly.
 
     #[test]
     fn adapter_serializes_to_kebab_case_wire_strings() {
@@ -681,43 +544,13 @@ mod tests {
         assert!(serde_json::from_str::<Adapter>("\"azure_openai\"").is_err());
     }
 
+    /// Every first-class `Provider` variant must have a non-empty
+    /// `as_str` wire id and a working `Adapter::from` arm. A
+    /// regression that added a new variant but forgot to update
+    /// either would compile fine but silently break dispatch
+    /// downstream.
     #[test]
-    fn provider_default_urls_are_stable() {
-        assert_eq!(
-            Provider::Openai.default_base_url(),
-            "https://api.openai.com"
-        );
-        assert_eq!(
-            Provider::Anthropic.default_base_url(),
-            "https://api.anthropic.com"
-        );
-        assert_eq!(
-            Provider::Google.default_base_url(),
-            "https://generativelanguage.googleapis.com/v1beta/openai"
-        );
-        assert_eq!(
-            Provider::Deepseek.default_base_url(),
-            "https://api.deepseek.com"
-        );
-        // #213 Phase 1 / Phase 2: rerank-only providers. Per audit
-        // LOW-3 on PR #229 — pin these too so a regression that
-        // swaps the host (e.g. Jina's `https://api.jina.ai` →
-        // `https://api.jina.com`) fails at the unit level.
-        assert_eq!(
-            Provider::Cohere.default_base_url(),
-            "https://api.cohere.com"
-        );
-        assert_eq!(Provider::Jina.default_base_url(), "https://api.jina.ai");
-    }
-
-    /// Every `Provider` variant must have a non-empty `default_base_url`,
-    /// `as_str`, and an `Adapter::from` arm. A regression that added a
-    /// new variant but forgot to update one of the three would compile
-    /// fine but silently break dispatch downstream — this iterator-based
-    /// test makes the regression class explicit (audit MEDIUM-2 on
-    /// PR #345).
-    #[test]
-    fn every_provider_variant_has_default_base_url_as_str_and_adapter() {
+    fn every_provider_variant_has_as_str_and_adapter() {
         let variants = [
             Provider::Openai,
             Provider::Anthropic,
@@ -725,29 +558,10 @@ mod tests {
             Provider::Deepseek,
             Provider::Cohere,
             Provider::Jina,
-            // Long-tail OpenAI-adapter providers (#60 P2-A).
-            Provider::Groq,
-            Provider::Mistral,
-            Provider::Togetherai,
-            Provider::FireworksAi,
-            Provider::Perplexity,
-            Provider::Moonshotai,
-            Provider::Alibaba,
-            Provider::Zhipuai,
-            Provider::Baseten,
-            Provider::Huggingface,
-            Provider::Cerebras,
         ];
         for v in variants {
-            let url = v.default_base_url();
-            assert!(
-                url.starts_with("https://"),
-                "{v:?}: default_base_url must be an https URL, got {url:?}",
-            );
             let id = v.as_str();
             assert!(!id.is_empty(), "{v:?}: as_str must be non-empty");
-            // Adapter::from must compile and return some variant.
-            let _: Adapter = Adapter::from(v);
         }
     }
 }

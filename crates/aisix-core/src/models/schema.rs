@@ -117,7 +117,12 @@ fn model_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "display_name":    { "type": "string", "minLength": 1 },
-            "provider":        { "type": "string", "enum": ["openai","anthropic","google","deepseek","cohere","jina","groq","mistral","togetherai","fireworks-ai","perplexity","moonshotai","alibaba","zhipuai","baseten","huggingface","cerebras"] },
+            // `provider` is the open vendor identity (models.dev catalog id
+            // — e.g. `openai`, `xai`, `wafer.ai`). The pattern accepts the
+            // dot character because at least one real models.dev id
+            // (`wafer.ai`) contains it; rejecting `.` would re-create the
+            // #417 bug class for that vendor.
+            "provider":        { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9._-]*$" },
             "model_name":      { "type": "string", "minLength": 1 },
             "provider_key_id": { "type": "string", "minLength": 1 },
             "timeout":         { "type": "integer", "minimum": 0 },
@@ -580,19 +585,100 @@ mod tests {
         assert!(err.message.to_lowercase().contains("display_name"));
     }
 
+    /// Closed-enum on `provider` was the cause of api7/AISIX-Cloud#417
+    /// — any catalog vendor not in the DP enum (`xai`, `openrouter`,
+    /// future long-tail) failed schema validation at snapshot load
+    /// and silently disappeared from dispatch. Phase A opened the
+    /// field to a free-form string; the only invariant left is
+    /// `minLength: 1`.
     #[test]
-    fn model_unknown_provider_value_fails() {
-        // `mistral` USED to be an unknown provider (rejected by the
-        // 6-value allowlist) but is now first-class on the Hub via
-        // ai-gateway#345. Use a value that's NOT in the post-#345
-        // enum so the negative test still pins the rejection path.
+    fn model_accepts_arbitrary_provider_string() {
+        // Every real models.dev catalog id must pass. `wafer.ai` is
+        // the load-bearing example: one real vendor has a dot in its
+        // id, so the schema pattern must accept `.` — rejecting it
+        // would re-create the #417 bug class for that vendor.
+        // `fireworks-ai` is the canonical hyphenated example.
+        for provider in [
+            "openai",
+            "xai",
+            "openrouter",
+            "wafer.ai",
+            "fireworks-ai",
+            "togetherai",
+            "this-is-some-new-vendor",
+        ] {
+            let v = json!({
+                "display_name": "x",
+                "provider": provider,
+                "model_name": "x",
+                "provider_key_id": "pk-1"
+            });
+            validate_model(&v).unwrap_or_else(|err| {
+                panic!("provider {provider:?} should validate after #302 Phase A; got {err:?}")
+            });
+        }
+    }
+
+    /// Pattern guards against log-injection / cardinality explosion.
+    /// Each rejected case here is a string the round-1 audit listed
+    /// as a concern.
+    #[test]
+    fn model_rejects_provider_strings_outside_pattern() {
+        for bad in [
+            "\nfake_log_line",
+            "openai\nline2",
+            "with space",
+            "UPPER",
+            ".leading-dot",
+            "-leading-hyphen",
+            "_leading-underscore",
+            "trailing-byte\0",
+        ] {
+            let v = json!({
+                "display_name": "x",
+                "provider": bad,
+                "model_name": "x",
+                "provider_key_id": "pk-1"
+            });
+            assert!(
+                validate_model(&v).is_err(),
+                "provider {bad:?} MUST be rejected by the pattern guard",
+            );
+        }
+    }
+
+    /// `maxLength: 64` bounds Prometheus label cardinality. The
+    /// longest real models.dev catalog id today is ~19 chars; the
+    /// cap is generous but finite. A regression that drops the cap
+    /// would let a crafted ~10KB vendor string flow into metric
+    /// labels.
+    #[test]
+    fn model_rejects_provider_string_over_maxlength() {
+        let too_long = "a".repeat(65);
         let v = json!({
             "display_name": "x",
-            "provider": "this-is-not-a-provider-id",
+            "provider": too_long,
             "model_name": "x",
             "provider_key_id": "pk-1"
         });
-        assert!(validate_model(&v).is_err());
+        assert!(
+            validate_model(&v).is_err(),
+            "provider string > 64 chars MUST be rejected (Prometheus cardinality guard)",
+        );
+    }
+
+    #[test]
+    fn model_rejects_empty_provider_string() {
+        let v = json!({
+            "display_name": "x",
+            "provider": "",
+            "model_name": "x",
+            "provider_key_id": "pk-1"
+        });
+        assert!(
+            validate_model(&v).is_err(),
+            "empty `provider` must fail (minLength: 1)"
+        );
     }
 
     #[test]

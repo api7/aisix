@@ -531,17 +531,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_model_with_invalid_provider_prefix_is_400_schema_error() {
-        // `mistral` was the original sentinel for "unknown provider"
-        // (rejected by the legacy 6-value allowlist). Since
-        // ai-gateway#345 first-classed 11 long-tail variants, mistral
-        // is now valid — use a string that's NOT in the post-#345
-        // 17-value list so the negative-test still pins the
-        // schema-rejection path.
+    async fn create_model_with_empty_display_name_is_400_schema_error() {
+        // After #302 Phase A `provider` is a free-form string — any
+        // catalog vendor cp-api admits flows through. The schema
+        // still rejects empty `display_name` (`minLength: 1`), which
+        // is what we exercise here as the canonical "bad input → 400"
+        // path. The old "unknown provider rejected" assertion is
+        // intentionally retired: the whole point of #302 Phase A is
+        // that the DP no longer enumerates vendors.
         let app = build_router(build_state());
         let body = json!({
-            "display_name": "x",
-            "provider": "this-is-not-a-provider-id",
+            "display_name": "",
+            "provider": "openai",
             "model_name": "x",
             "provider_key_id": "11111111-1111-1111-1111-111111111111"
         });

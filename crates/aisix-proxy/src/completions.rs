@@ -116,14 +116,15 @@ async fn dispatch(
     let provider = crate::dispatch::require_provider(model)?;
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
 
-    let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, provider)
-        .ok_or(ProxyError::ProviderUnavailable)?;
+    let bridge =
+        crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, model.provider.as_deref())
+            .ok_or(ProxyError::ProviderUnavailable)?;
 
     let model_arc = Arc::new(model.clone());
     let pk_arc = Arc::new(pk_entry.value.clone());
     let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
 
-    let provider_label = format!("{provider:?}").to_lowercase();
+    let provider_label = provider.to_ascii_lowercase();
 
     match bridge.complete(&body, &ctx).await {
         Ok(resp_json) => Ok((Json(resp_json).into_response(), provider_label)),
@@ -172,7 +173,7 @@ fn emit_access_log(
 
 #[cfg(test)]
 mod tests {
-    use aisix_core::models::Provider;
+
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ApiKey, Model, ProxyConfig};
@@ -208,8 +209,9 @@ mod tests {
     }
 
     fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
-        let json =
-            format!(r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}"}}"#);
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+        );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
     }
@@ -231,7 +233,7 @@ mod tests {
 
     fn build_app(snap: AisixSnapshot) -> axum::Router {
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let handle = SnapshotHandle::new(snap);
         crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache())
     }

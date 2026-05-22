@@ -1128,9 +1128,13 @@ mod tests {
     // different successful apply_put does not hide an unrelated
     // rejection, and (4) fixing/deleting the rejected key clears it.
 
+    // Schema rejection bait: empty `display_name` violates the
+    // `minLength: 1` invariant. After #302 Phase A the `provider`
+    // field is free-form string, so we trigger rejection via a
+    // different required-field shape.
     const BAD_PROVIDER_MODEL: &[u8] = br#"{
-        "display_name":"x",
-        "provider":"this-is-not-a-provider-id",
+        "display_name":"",
+        "provider":"openai",
         "model_name":"l",
         "provider_key_id":"pk"
     }"#;

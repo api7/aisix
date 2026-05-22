@@ -107,10 +107,35 @@ fn normalize_api_base(base: &str) -> String {
     trimmed.to_string()
 }
 
-fn resolve_base(ctx: &BridgeContext) -> String {
+fn resolve_base(ctx: &BridgeContext) -> Result<String, BridgeError> {
     match ctx.provider_key.api_base.as_deref() {
-        Some(b) if !b.trim().is_empty() => normalize_api_base(b.trim()),
-        _ => ANTHROPIC_DEFAULT_BASE.to_string(),
+        Some(b) if !b.trim().is_empty() => Ok(normalize_api_base(b.trim())),
+        _ => {
+            // Family-bridge safety: when `AnthropicBridge` is the
+            // family registration (registered via
+            // `register_family(Adapter::Anthropic, ...)`) AND the
+            // dispatching `ProviderKey.provider` identifies a vendor
+            // that ISN'T anthropic, refuse to fall back to
+            // `ANTHROPIC_DEFAULT_BASE` — that would silently route the
+            // vendor's API key to `api.anthropic.com`. Mirrors the
+            // OpenAI-family guard in
+            // `crates/aisix-provider-openai/src/bridge.rs::resolve_base`.
+            //
+            // Pre-Phase-A rows (empty `ProviderKey.provider`) fall
+            // through to the historical default-base path unchanged.
+            let pk_vendor_raw = ctx.provider_key.provider.as_str();
+            let pk_vendor_normalized = pk_vendor_raw.trim().to_ascii_lowercase();
+            if !pk_vendor_normalized.is_empty() && pk_vendor_normalized != "anthropic" {
+                return Err(BridgeError::Config(format!(
+                    "provider_key for vendor {pk_vendor_raw:?} has no api_base set; \
+                     the Anthropic-family bridge refuses to fall back to api.anthropic.com \
+                     to avoid routing {pk_vendor_raw:?}'s API key to Anthropic. cp-api \
+                     must populate api_base for every catalog vendor via adapter_map / \
+                     provider_metadata.api_base_url."
+                )));
+            }
+            Ok(ANTHROPIC_DEFAULT_BASE.to_string())
+        }
     }
 }
 
@@ -201,7 +226,7 @@ impl Bridge for AnthropicBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
-        let base = resolve_base(ctx);
+        let base = resolve_base(ctx)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -245,7 +270,7 @@ impl Bridge for AnthropicBridge {
         req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
-        let base = resolve_base(ctx);
+        let base = resolve_base(ctx)?;
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
@@ -571,7 +596,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let pk_default: ProviderKey =
             serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_default));
-        assert!(!resolve_base(&ctx).is_empty());
+        assert!(!resolve_base(&ctx).unwrap().is_empty());
 
         // api_base override: trailing slash stripped.
         let pk_override: ProviderKey = serde_json::from_str(
@@ -579,7 +604,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         )
         .unwrap();
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_override));
-        assert_eq!(resolve_base(&ctx), "https://proxy.example.com");
+        assert_eq!(resolve_base(&ctx).unwrap(), "https://proxy.example.com");
     }
 
     fn pk_with_base(api_base: &str) -> ProviderKey {
@@ -606,7 +631,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             let pk = pk_with_base(form);
             let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
             assert_eq!(
-                resolve_base(&ctx),
+                resolve_base(&ctx).unwrap(),
                 canonical,
                 "form {form:?} should normalize to {canonical}",
             );
@@ -627,7 +652,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         ] {
             let pk = pk_with_base(form);
             let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
-            assert_eq!(resolve_base(&ctx), canonical);
+            assert_eq!(resolve_base(&ctx).unwrap(), canonical);
         }
     }
 }

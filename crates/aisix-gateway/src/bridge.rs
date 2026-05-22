@@ -459,7 +459,6 @@ pub trait Bridge: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aisix_core::models::Provider;
 
     #[test]
     fn timeout_maps_to_504() {
@@ -570,6 +569,6 @@ mod tests {
     #[test]
     fn sample_model_resolves_to_openai() {
         let m = sample_model();
-        assert_eq!(m.provider, Some(Provider::Openai));
+        assert_eq!(m.provider.as_deref(), Some("openai"));
     }
 }

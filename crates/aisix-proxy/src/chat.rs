@@ -699,8 +699,15 @@ async fn dispatch(
     // single bad provider doesn't take down the whole request.
     if attempt_models.len() == 1 {
         let only = &attempt_models[0].model;
-        let provider = crate::dispatch::require_provider(only).map_err(with_model)?;
-        if state.hub.get(provider).is_none() {
+        let _provider = crate::dispatch::require_provider(only).map_err(with_model)?;
+        // Pre-flight the PK-based two-tier dispatch so a missing
+        // family/specialized bridge surfaces as 503 here, before
+        // we commit to a long upstream call.
+        let pk_entry =
+            crate::dispatch::resolve_provider_key(&snapshot, only).map_err(with_model)?;
+        if crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, only.provider.as_deref())
+            .is_none()
+        {
             return Err(with_model(ProxyError::ProviderUnavailable));
         }
     }
@@ -724,8 +731,9 @@ async fn dispatch(
         let provider = crate::dispatch::require_provider(model).map_err(with_model)?;
         let pk_entry =
             crate::dispatch::resolve_provider_key(&snapshot, model).map_err(with_model)?;
-        let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, provider)
-            .ok_or_else(|| with_model(ProxyError::ProviderUnavailable))?;
+        let bridge =
+            crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, model.provider.as_deref())
+                .ok_or_else(|| with_model(ProxyError::ProviderUnavailable))?;
         let model_arc = Arc::new(model.clone());
         let pk_arc = Arc::new(pk_entry.value.clone());
         let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
@@ -770,7 +778,7 @@ async fn dispatch(
         let api_key_id_for_telem = auth.entry.id.clone();
         let team_id_for_metrics = auth.key().team_id.clone();
         let owner_id_for_metrics = auth.key().owner_id.clone();
-        let provider_for_metrics = format!("{provider:?}").to_lowercase();
+        let provider_for_metrics = provider.to_ascii_lowercase();
         let model_for_metrics = req.model.clone();
         let provider_key_id_for_metrics = pk_entry.id.clone();
         let upstream_model_for_metrics = model.upstream_model().unwrap_or("unknown").to_string();
@@ -909,7 +917,7 @@ async fn dispatch(
             Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
         return Ok(Success {
             response: response.into_response(),
-            provider: format!("{provider:?}").to_lowercase(),
+            provider: provider.to_ascii_lowercase(),
             model_id: model_id.clone(),
             // Token totals are populated on the SSE stream's terminal
             // chunk and forwarded into telemetry from on_complete; the
@@ -1023,7 +1031,8 @@ async fn dispatch(
                 let provider_label = attempt_models[0]
                     .model
                     .provider
-                    .map(|p| format!("{p:?}").to_lowercase())
+                    .as_deref()
+                    .map(|p| p.to_ascii_lowercase())
                     .unwrap_or_else(|| "unknown".into());
                 let provider_key_id = attempt_models[0]
                     .model
@@ -1118,7 +1127,7 @@ async fn dispatch(
 
     for attempt in &attempt_models {
         let model = &attempt.model;
-        let Some(provider) = model.provider else {
+        let Some(provider) = model.provider.as_deref() else {
             last_err = Some(BridgeError::Config("model has no provider".into()));
             continue;
         };
@@ -1131,11 +1140,16 @@ async fn dispatch(
                 continue;
             }
         };
-        // Phase D cutover join point: try two-tier (specialized vendor
-        // → adapter family) first; fall back to the legacy
-        // Provider-keyed registry when the new fields aren't filled in
-        // on this PK yet. See crate::dispatch::resolve_bridge.
-        let Some(bridge) = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, provider)
+        // Two-tier dispatch via `Hub::dispatch_two_tier`: specialized
+        // vendor (ProviderKey.provider) first, then adapter family
+        // (ProviderKey.adapter). The legacy `Provider`-keyed registry
+        // is gone after #302 Phase A. `resolve_bridge` carries a
+        // one-cycle compat shim for pre-Phase-A PK rows that still
+        // have empty `provider` and `adapter: None` on disk — those
+        // resolve via `Model.provider` (passed below). Once cp-api
+        // has backfilled every PK, the shim becomes unreachable.
+        let Some(bridge) =
+            crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, model.provider.as_deref())
         else {
             last_err = Some(BridgeError::Config(
                 "no bridge registered for provider".into(),
@@ -1160,7 +1174,7 @@ async fn dispatch(
                 Ok(resp) => {
                     state.health.record_success(&model.display_name);
                     state.runtime_status.mark_healthy(&attempt.id);
-                    chosen_provider = Some(format!("{provider:?}").to_lowercase());
+                    chosen_provider = Some(provider.to_ascii_lowercase());
                     chosen_provider_key_id = Some(pk_entry.id.clone());
                     chosen_upstream_model =
                         Some(model.upstream_model().unwrap_or("unknown").to_string());

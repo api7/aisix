@@ -23,7 +23,7 @@ mod telemetry;
 
 use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore};
 use aisix_cache::{Cache, MemoryCache, RedisCache};
-use aisix_core::models::{Adapter, Provider};
+use aisix_core::models::Adapter;
 use aisix_core::{CacheBackend, Config, EtcdConfig, EtcdTlsConfig};
 use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor};
 use aisix_gateway::Hub;
@@ -782,103 +782,62 @@ fn load_heartbeat_config_from_disk(
 /// (closes #332).
 fn build_hub() -> Hub {
     let hub = Hub::new();
-    hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
-    hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
-    hub.register(
-        Provider::Google,
-        Arc::new(OpenAiBridge::new().with_name("google")),
-    );
-    hub.register(
-        Provider::Deepseek,
-        Arc::new(OpenAiBridge::new().with_name("deepseek")),
-    );
-    hub.register(
-        Provider::Cohere,
-        Arc::new(OpenAiBridge::new().with_name("cohere")),
-    );
 
-    // Long-tail OpenAI-adapter providers (#60 P2-A). All 11 expose an
-    // OpenAI-compatible chat completions surface and route through
-    // `OpenAiBridge::with_name`. Default base URLs sourced from each
-    // vendor's official OpenAI-compat docs (see
-    // `crates/aisix-provider-openai/src/bridge.rs` constants for
-    // citations). Operators can override per-PK via `api_base`; the
-    // `with_name` here drives both the metric label and the
-    // `default_base()` fallback when api_base is unset.
-    hub.register(
-        Provider::Groq,
-        Arc::new(OpenAiBridge::new().with_name("groq")),
-    );
-    hub.register(
-        Provider::Mistral,
-        Arc::new(OpenAiBridge::new().with_name("mistral")),
-    );
-    hub.register(
-        Provider::Togetherai,
-        Arc::new(OpenAiBridge::new().with_name("togetherai")),
-    );
-    hub.register(
-        Provider::FireworksAi,
-        Arc::new(OpenAiBridge::new().with_name("fireworks-ai")),
-    );
-    hub.register(
-        Provider::Perplexity,
-        Arc::new(OpenAiBridge::new().with_name("perplexity")),
-    );
-    // Provider::Xai scoped out — see model.rs comment on the Xai
-    // variant (deferred until cp-api adapter_map adds the entry).
-    hub.register(
-        Provider::Moonshotai,
-        Arc::new(OpenAiBridge::new().with_name("moonshotai")),
-    );
-    hub.register(
-        Provider::Alibaba,
-        Arc::new(OpenAiBridge::new().with_name("alibaba")),
-    );
-    hub.register(
-        Provider::Zhipuai,
-        Arc::new(OpenAiBridge::new().with_name("zhipuai")),
-    );
-    hub.register(
-        Provider::Baseten,
-        Arc::new(OpenAiBridge::new().with_name("baseten")),
-    );
-    hub.register(
-        Provider::Huggingface,
-        Arc::new(OpenAiBridge::new().with_name("huggingface")),
-    );
-    hub.register(
-        Provider::Cerebras,
-        Arc::new(OpenAiBridge::new().with_name("cerebras")),
-    );
-
-    // Family bridges (issue #302 Phase A/D two-tier dispatch). The
-    // legacy `Provider`-keyed register() above stays the live
-    // dispatch path until cp-api stops emitting the legacy enum
-    // field; this only adds the new-schema-keyed lookup so a
-    // catalog row with `adapter: "<wire>"` can resolve to a real
-    // bridge instead of falling through to the legacy fallback.
+    // ─── Family bridges (closed 5-value Adapter enum) ────────────────
     //
-    // All non-OpenAI-compat adapters are SKELETON bridges today —
-    // they return a clear `BridgeError::Config` referencing
-    // api7/AISIX-Cloud#302 Phases E/F/G. Registering them now lets
-    // the dispatch path light up the moment cp-api starts shipping
-    // adapter strings, instead of having the catalog be permanently
-    // inaccessible.
+    // Catches every catalog vendor whose `ProviderKey.adapter` matches
+    // one of these. Any new long-tail OpenAI-compat vendor cp-api
+    // admits (xai, openrouter, cerebras, moonshotai, …) routes here
+    // through `Hub::dispatch_two_tier` without a DP code change.
     //
-    // CUTOVER CAUTION: cp-api today blocks the catalog providers
-    // these bridges serve (`google-vertex`, `azure`, `amazon-bedrock`)
-    // at createProviderKey via `isSupportedProvider` (handlers.go).
-    // The moment that gate is loosened — which Phase B is actively
-    // enabling — every chat through one of those provider_keys will
-    // route here and hit a NOT-IMPLEMENTED skeleton, taking the
-    // matching catalog from "works via OpenAI-compat" to "500: not
-    // implemented" in a single cp-api flip. The cutover order MUST
-    // be: per-adapter dispatch PR (D5.2 / D6.1 / D7.1) → cp-api flip
-    // catalog for that adapter.
+    // CUTOVER CAUTION (non-openai families): cp-api admits
+    // `google-vertex`, `azure`, `amazon-bedrock` Provider Keys via
+    // its adapter_map (#302 Phase B). The Vertex / Azure / Bedrock
+    // bridges below are functional implementations (Phases E/F/G).
+    hub.register_family(Adapter::Openai, Arc::new(OpenAiBridge::new()));
+    hub.register_family(Adapter::Anthropic, Arc::new(AnthropicBridge::new()));
     hub.register_family(Adapter::Vertex, Arc::new(VertexBridge::new()));
     hub.register_family(Adapter::AzureOpenai, Arc::new(AzureOpenAiBridge::new()));
     hub.register_family(Adapter::Bedrock, Arc::new(BedrockBridge::new()));
+
+    // ─── Specialized vendor bridges (open string, vendor identity) ───
+    //
+    // Override the family default for vendors whose handling diverges
+    // from the wire-shape baseline. Each vendor is keyed on its
+    // models.dev catalog id, matching `ProviderKey.provider`.
+    //
+    // - `google`: OpenAI-compat Gemini at `/v1beta/openai` (matches
+    //   `OpenAiBridge::default` but tagged for metrics + log labels).
+    // - `deepseek`: OpenAI-compat with `delta.reasoning_content` lift
+    //   for the R1 family (the `with_name` value drives the metric
+    //   label so dashboards can slice DeepSeek-specific reasoning
+    //   traffic).
+    // - `cohere`: chat-compat namespace at `/compatibility/v1`. cp-api
+    //   stores Cohere's PK with `adapter: "openai"` and the bridge
+    //   here handles the chat path; the `/v1/rerank` native path is
+    //   keyed off `ProviderKey.provider == "cohere"` in
+    //   `crates/aisix-proxy/src/rerank.rs`.
+    //
+    // Every other catalog vendor (groq, mistral, xai, openrouter,
+    // fireworks-ai, perplexity, moonshotai, alibaba, zhipuai,
+    // baseten, huggingface, cerebras, togetherai, plus the long
+    // tail) falls through to `Adapter::Openai` family above. The DP
+    // does NOT enumerate them. cp-api populates `api_base` from
+    // adapter_map's `default_base_url` or `provider_metadata.api_base_url`.
+    // First-class vendors with their canonical metric labels. `openai`
+    // / `anthropic` shadow the family bridge — same bridge instance,
+    // explicit registration here keeps test fixtures and pre-Phase-A
+    // payloads (which carry `provider` but may not yet carry
+    // `adapter`) routing correctly without falling through to the
+    // None branch in `dispatch_two_tier`.
+    hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+    hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+    hub.register_specialized("google", Arc::new(OpenAiBridge::new().with_name("google")));
+    hub.register_specialized(
+        "deepseek",
+        Arc::new(OpenAiBridge::new().with_name("deepseek")),
+    );
+    hub.register_specialized("cohere", Arc::new(OpenAiBridge::new().with_name("cohere")));
 
     hub
 }
@@ -1146,77 +1105,101 @@ mod tests {
     /// `build_hub()` must register `Provider::Cohere` against the
     /// `with_name("cohere")` variant of [`OpenAiBridge`] — the only
     /// thing that ties the Provider enum to the chat-compat URL
-    /// (closes #332). A regression that registered `OpenAiBridge::new()`
-    /// (default name = `"openai"`) or omitted the registration would
-    /// flip the bridge label on metrics and (more importantly) the
-    /// `default_base()` fallback, silently routing Cohere chat to
-    /// OpenAI's host.
+    /// `build_hub()` must register `cohere` as a specialized bridge
+    /// against `OpenAiBridge::with_name("cohere")` so chat-compat
+    /// traffic carries the right metric label and resolves through
+    /// the chat-compat namespace (closes #332).
     #[test]
     fn build_hub_registers_cohere_chat_compat_variant() {
         let hub = build_hub();
         let bridge = hub
-            .get(aisix_core::Provider::Cohere)
-            .expect("Provider::Cohere must have a Hub bridge registered for chat-compat");
+            .get_specialized("cohere")
+            .expect("cohere must have a specialized bridge for chat-compat");
         assert_eq!(
             bridge.name(),
             "cohere",
-            "Hub.register(Provider::Cohere, …) MUST use OpenAiBridge::with_name(\"cohere\") — \
-             a `with_name(\"openai\")` fallback would route Cohere chat to OpenAI's host",
+            "specialized cohere bridge MUST be `OpenAiBridge::with_name(\"cohere\")` so \
+             the metric label is `cohere` and dashboards keep working",
         );
     }
 
-    /// Companion to the cohere check above: Jina deliberately stays
-    /// rerank-only per #213 Phase 2. A future PR that flips Jina to
-    /// chat-compat must update this assertion deliberately.
+    /// `build_hub()` must NOT register `jina` as a specialized chat
+    /// bridge. Jina is rerank-only (#213 Phase 2) — its
+    /// `/v1/chat/completions` traffic falls through to the family
+    /// bridge `Adapter::Openai`, which is fine because the chat
+    /// envelope is OpenAI-shaped if cp-api populates `adapter`.
+    /// Registering a specialized Jina chat bridge here would
+    /// silently change the metric label / behavior on a future
+    /// `provider: "jina"` chat request.
     #[test]
     fn build_hub_does_not_register_jina_for_chat() {
         let hub = build_hub();
         assert!(
-            hub.get(aisix_core::Provider::Jina).is_none(),
-            "Provider::Jina is rerank-only (#213 Phase 2); a Hub registration here would \
-             silently route /v1/chat/completions on Jina to whichever bridge name was picked",
+            hub.get_specialized("jina").is_none(),
+            "jina is rerank-only (#213 Phase 2); a specialized chat bridge here would \
+             change the metric label silently on the first jina chat request",
         );
     }
 
-    /// `build_hub()` must register every long-tail OpenAI-adapter
-    /// provider (#60 P2-A) with the matching `with_name(...)` bridge
-    /// variant. A regression that registered the default
-    /// `OpenAiBridge::new()` (name = `"openai"`) on any of these would
-    /// silently route the provider's chat traffic to OpenAI's API
-    /// host via `default_base()`, leaking customer tokens to OpenAI.
+    /// `build_hub()` MUST register `Adapter::Openai` as a family
+    /// bridge so any catalog vendor admitted by cp-api with
+    /// `adapter: "openai"` (xai, openrouter, groq, mistral, etc. —
+    /// every models.dev long-tail) resolves through the family
+    /// fallthrough. Without it, dispatch returns None and the
+    /// customer sees a 503. Closes the dispatch half of
+    /// api7/AISIX-Cloud#417.
     #[test]
-    fn build_hub_registers_long_tail_openai_adapter_variants() {
+    fn build_hub_registers_openai_family_bridge_for_long_tail_catalog_vendors() {
         let hub = build_hub();
-        // (Provider, expected bridge name as set by `with_name`).
-        // The name must match the wire id (`Provider::as_str()`)
-        // so metrics labels + default_base lookups stay aligned.
-        let expected = [
-            (aisix_core::Provider::Groq, "groq"),
-            (aisix_core::Provider::Mistral, "mistral"),
-            (aisix_core::Provider::Togetherai, "togetherai"),
-            (aisix_core::Provider::FireworksAi, "fireworks-ai"),
-            (aisix_core::Provider::Perplexity, "perplexity"),
-            (aisix_core::Provider::Moonshotai, "moonshotai"),
-            (aisix_core::Provider::Alibaba, "alibaba"),
-            (aisix_core::Provider::Zhipuai, "zhipuai"),
-            (aisix_core::Provider::Baseten, "baseten"),
-            (aisix_core::Provider::Huggingface, "huggingface"),
-            (aisix_core::Provider::Cerebras, "cerebras"),
-        ];
-        for (provider, expected_name) in expected {
-            let bridge = hub.get(provider).unwrap_or_else(|| {
-                panic!(
-                    "Provider::{provider:?} must have a Hub bridge registered (#60 P2-A); \
-                     a missing registration would 503 the customer's chat traffic"
-                )
-            });
-            assert_eq!(
-                bridge.name(),
-                expected_name,
-                "Provider::{provider:?} bridge name must match the wire id — \
-                 a mismatch silently routes traffic to OpenAI's host via the \
-                 OpenAiBridge::default_base() fallback when api_base is unset",
-            );
-        }
+        // Synthesize a PK for a vendor that's NOT in the specialized
+        // registrations above (e.g. xai). It must resolve via the
+        // family bridge.
+        let pk: aisix_core::ProviderKey = serde_json::from_str(
+            r#"{"display_name":"xai-pk","secret":"sk-test","provider":"xai","adapter":"openai","api_base":"https://api.x.ai/v1"}"#,
+        )
+        .unwrap();
+        let bridge = hub.dispatch_two_tier(&pk).unwrap_or_else(|| {
+            panic!(
+                "Adapter::Openai family bridge must be registered so any catalog \
+                 vendor admitted by cp-api with `adapter: \"openai\"` resolves \
+                 through the family fallthrough — a missing family bridge \
+                 re-introduces api7/AISIX-Cloud#417"
+            )
+        });
+        assert_eq!(
+            bridge.name(),
+            "openai",
+            "OpenAI family bridge MUST be the bare `OpenAiBridge::new()` so it \
+             dispatches through `ProviderKey.api_base` for any vendor",
+        );
+    }
+
+    /// `build_hub()` MUST register `Adapter::Anthropic` as a family
+    /// bridge for symmetry with `Adapter::Openai`. The Anthropic
+    /// family bridge serves any Anthropic-compat vendor cp-api admits.
+    #[test]
+    fn build_hub_registers_anthropic_family_bridge() {
+        let hub = build_hub();
+        // Tighten: assert the dispatch comes from the family tier,
+        // not from an accidentally-registered specialized bridge.
+        // The bare vendor string `"some-anthropic-compat"` is not in
+        // the specialized list, so `dispatch_two_tier` must fall
+        // through to the `Adapter::Anthropic` family registration.
+        assert!(
+            hub.get_specialized("some-anthropic-compat").is_none(),
+            "`some-anthropic-compat` must not be specialized; the test must exercise the family tier"
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(
+            r#"{"display_name":"anth-compat-pk","secret":"sk-test","provider":"some-anthropic-compat","adapter":"anthropic","api_base":"https://example.com"}"#,
+        )
+        .unwrap();
+        let bridge = hub
+            .dispatch_two_tier(&pk)
+            .unwrap_or_else(|| panic!("Adapter::Anthropic family bridge must be registered"));
+        assert_eq!(
+            bridge.name(),
+            "anthropic",
+            "family Anthropic bridge MUST be the bare `AnthropicBridge::new()`",
+        );
     }
 }

@@ -33,7 +33,6 @@
 //! status-to-type mapping. (`/v1/chat/completions` continues to emit
 //! the OpenAI-shape envelope with its DP-stable taxonomy.)
 
-use aisix_core::models::Provider;
 use aisix_obs::{AccessLog, LlmUsage, RequestLabels, RequestOutcome, UsageEvent, UsageLabels};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
@@ -288,7 +287,7 @@ async fn dispatch(
     // The Anthropic-upstream branch below stays as a byte-for-byte
     // passthrough to preserve features (cache_control, thinking
     // blocks, …) the cross-provider path can't lossily round-trip.
-    if model.provider != Some(Provider::Anthropic) {
+    if model.provider.as_deref() != Some("anthropic") {
         return cross_provider_dispatch(
             state,
             body,
@@ -337,7 +336,7 @@ async fn dispatch(
     // where the customer mistakenly puts `/v1` in the Anthropic
     // api_base (the dashboard placeholder uses the OpenAI form, so
     // this is a copy-paste hazard).
-    let base = crate::dispatch::resolve_base_url(Provider::Anthropic, &pk_entry.value);
+    let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
     let url = crate::dispatch::build_v1_url(&base, "/messages");
 
     // Check if the request wants streaming.
@@ -596,11 +595,15 @@ async fn cross_provider_dispatch(
     };
     use std::sync::Arc;
 
-    let provider = model.provider.ok_or_else(|| {
-        ProxyError::InvalidRequest(format!("model `{model_name}` has no provider prefix"))
-    })?;
+    let provider = model
+        .provider
+        .as_deref()
+        .ok_or_else(|| {
+            ProxyError::InvalidRequest(format!("model `{model_name}` has no provider prefix"))
+        })?
+        .to_string();
     let bridge: Arc<dyn Bridge> =
-        crate::dispatch::resolve_bridge(&state.hub, provider_key, provider)
+        crate::dispatch::resolve_bridge(&state.hub, provider_key, model.provider.as_deref())
             .ok_or(ProxyError::ProviderUnavailable)?;
 
     // Parse the Anthropic-shape body into the gateway's normalised
@@ -631,7 +634,7 @@ async fn cross_provider_dispatch(
     let model_arc = Arc::new(model.clone());
     let pk_arc = Arc::new(provider_key.clone());
     let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
-    let provider_label = format!("{provider:?}").to_lowercase();
+    let provider_label = provider.to_ascii_lowercase();
     let provider_key_id = model.provider_key_id.as_deref().unwrap_or("unknown");
     let upstream_model = model.upstream_model().unwrap_or("unknown").to_string();
 
@@ -1012,7 +1015,7 @@ fn emit_access_log(
 
 #[cfg(test)]
 mod tests {
-    use aisix_core::models::Provider;
+
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ApiKey, Model, ProxyConfig};
@@ -1087,7 +1090,7 @@ mod tests {
 
     fn anthropic_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"anthropic-up","secret":"sk-ant-test","api_base":"{api_base}"}}"#
+            r#"{{"display_name":"anthropic-up","secret":"sk-ant-test","api_base":"{api_base}","provider":"anthropic","adapter":"anthropic"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(ANTHROPIC_PK_ID, pk, 1)
@@ -1095,7 +1098,7 @@ mod tests {
 
     fn openai_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"openai-up","secret":"sk-openai-test","api_base":"{api_base}"}}"#
+            r#"{{"display_name":"openai-up","secret":"sk-openai-test","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(OPENAI_PK_ID, pk, 1)
@@ -1124,7 +1127,7 @@ mod tests {
 
     fn build_app(snap: AisixSnapshot) -> axum::Router {
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
         let handle = SnapshotHandle::new(snap);
         crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache())
     }
@@ -1536,8 +1539,8 @@ mod tests {
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let handle = SnapshotHandle::new(snap);
         let app = crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache());
 
@@ -1598,8 +1601,8 @@ data: [DONE]\n\n";
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let handle = SnapshotHandle::new(snap);
         let app = crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache());
 
@@ -1662,8 +1665,8 @@ data: [DONE]\n\n";
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let handle = SnapshotHandle::new(snap);
         let state = crate::ProxyState::new(handle, hub, &cfg())
             .without_cache()
@@ -1864,7 +1867,7 @@ data: [DONE]\n\n";
 
     fn gemini_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"gemini-up","secret":"ya29-test","api_base":"{api_base}"}}"#
+            r#"{{"display_name":"gemini-up","secret":"ya29-test","api_base":"{api_base}","provider":"google","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(GOOGLE_PK_ID, pk, 1)
@@ -1872,7 +1875,7 @@ data: [DONE]\n\n";
 
     fn deepseek_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
-            r#"{{"display_name":"deepseek-up","secret":"sk-deepseek","api_base":"{api_base}"}}"#
+            r#"{{"display_name":"deepseek-up","secret":"sk-deepseek","api_base":"{api_base}","provider":"deepseek","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(DEEPSEEK_PK_ID, pk, 1)
@@ -1923,11 +1926,8 @@ data: [DONE]\n\n";
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
-        hub.register(
-            Provider::Google,
-            Arc::new(OpenAiBridge::new().with_name("google")),
-        );
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        hub.register_specialized("google", Arc::new(OpenAiBridge::new().with_name("google")));
         let handle = SnapshotHandle::new(snap);
         let app = crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache());
 
@@ -1974,9 +1974,9 @@ data: [DONE]\n\n";
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
-        hub.register(
-            Provider::Deepseek,
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        hub.register_specialized(
+            "deepseek",
             Arc::new(OpenAiBridge::new().with_name("deepseek")),
         );
         let handle = SnapshotHandle::new(snap);
@@ -2045,7 +2045,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     /// OpenAi-compat `/chat/completions` endpoint with OpenAi-shape
     /// SSE deltas, so the assertion shape is identical.
     async fn assert_anthropic_streams_through_openai_compat_upstream(
-        bridge_provider: Provider,
+        bridge_provider: &str,
         bridge: Arc<dyn aisix_gateway::Bridge>,
         model_entry: ResourceEntry<Model>,
         model_name: &str,
@@ -2073,8 +2073,12 @@ data: [DONE]\n\n";
             .provider_key_id
             .clone()
             .expect("matrix fixtures must reference a provider_key_id");
+        // The PK's vendor identity must match `bridge_provider` so
+        // `dispatch_two_tier` hits the specialized bridge this test
+        // registered. `adapter: "openai"` is right for both gemini
+        // and deepseek (OpenAI-compat wire shapes).
         let pk_json = format!(
-            r#"{{"display_name":"matrix-up","secret":"k","api_base":"{}"}}"#,
+            r#"{{"display_name":"matrix-up","secret":"k","api_base":"{}","provider":"{bridge_provider}","adapter":"openai"}}"#,
             upstream.uri()
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
@@ -2085,8 +2089,8 @@ data: [DONE]\n\n";
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Anthropic, Arc::new(AnthropicBridge::new()));
-        hub.register(bridge_provider, bridge);
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        hub.register_specialized(bridge_provider, bridge);
         let handle = SnapshotHandle::new(snap);
         let app = crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache());
 
@@ -2121,7 +2125,7 @@ data: [DONE]\n\n";
     async fn matrix_anthropic_in_gemini_upstream_streaming() {
         use aisix_provider_openai::OpenAiBridge;
         assert_anthropic_streams_through_openai_compat_upstream(
-            Provider::Google,
+            "google",
             Arc::new(OpenAiBridge::new().with_name("google")),
             // Placeholder; helper rebuilds with the wiremock uri.
             gemini_model("my-claude-via-gemini"),
@@ -2134,7 +2138,7 @@ data: [DONE]\n\n";
     async fn matrix_anthropic_in_deepseek_upstream_streaming() {
         use aisix_provider_openai::OpenAiBridge;
         assert_anthropic_streams_through_openai_compat_upstream(
-            Provider::Deepseek,
+            "deepseek",
             Arc::new(OpenAiBridge::new().with_name("deepseek")),
             deepseek_model("my-claude-via-ds"),
             "my-claude-via-ds",

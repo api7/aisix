@@ -102,12 +102,11 @@ async fn check_direct_model(
     cfg: &BackgroundModelCheck,
     request_id: &str,
 ) -> Result<(), BridgeError> {
-    let provider =
+    let _provider =
         dispatch::require_provider(model).map_err(|e| BridgeError::Config(e.to_string()))?;
     let pk_entry = dispatch::resolve_provider_key(snapshot, model)
         .map_err(|e| BridgeError::Config(e.to_string()))?;
-    let bridge = hub
-        .get(provider)
+    let bridge = dispatch::resolve_bridge(hub, &pk_entry.value, model.provider.as_deref())
         .ok_or_else(|| BridgeError::Config("no bridge registered for provider".into()))?;
 
     let req = ChatFormat {
@@ -140,7 +139,7 @@ fn background_status_code(err: &BridgeError) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aisix_core::models::Provider;
+
     use aisix_core::resource::ResourceEntry;
     use aisix_provider_openai::OpenAiBridge;
     use reqwest::Client;
@@ -158,7 +157,7 @@ mod tests {
 
     fn provider_key_entry(id: &str, api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let cfg = format!(
-            r#"{{"display_name":"pk-{id}","secret":"sk-upstream","api_base":"{api_base}"}}"#
+            r#"{{"display_name":"pk-{id}","secret":"sk-upstream","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&cfg).unwrap();
         ResourceEntry::new(id, pk, 1)
@@ -200,7 +199,7 @@ mod tests {
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snapshot = Arc::new(AisixSnapshot::new());
         snapshot
             .provider_keys
@@ -231,7 +230,7 @@ mod tests {
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snapshot = Arc::new(AisixSnapshot::new());
         snapshot
             .provider_keys

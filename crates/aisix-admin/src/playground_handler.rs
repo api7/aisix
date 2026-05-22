@@ -49,7 +49,7 @@ pub async fn playground_chat_completions(
 
 #[cfg(test)]
 mod tests {
-    use aisix_core::models::Provider;
+
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AdminConfig, AisixSnapshot, ApiKey, Model, ProxyConfig};
@@ -97,8 +97,9 @@ mod tests {
     }
 
     fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
-        let json =
-            format!(r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}"}}"#);
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+        );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
     }
@@ -119,7 +120,7 @@ mod tests {
 
         let snapshot = SnapshotHandle::new(snap);
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let proxy_state = ProxyState::new(snapshot.clone(), hub, &proxy_cfg()).without_cache();
         let proxy_router = aisix_proxy::build_router(proxy_state);
 
