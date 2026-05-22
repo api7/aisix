@@ -29,6 +29,20 @@
 
 use serde::Serialize;
 
+/// One upstream attempt made while serving a routing-model request.
+/// This intentionally carries only low-sensitivity operational fields:
+/// target name, per-target attempt index, status/error class, and outcome.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RoutingAttemptEvent {
+    pub model: String,
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    pub success: bool,
+}
+
 /// One usage event. Emitted at end-of-request (success / upstream error /
 /// guardrail block) per chat completion. Field shape pinned to the
 /// cp-api wire (snake_case via serde).
@@ -187,6 +201,26 @@ pub struct UsageEvent {
     /// the wire = legacy DP image; cp-api stores empty as NULL.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub inbound_protocol: String,
+
+    /// Display name of the routing target that ultimately served the
+    /// request. Empty for direct-model requests, cache hits, and routing
+    /// requests where every candidate failed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub served_by_model: String,
+
+    /// Number of upstream attempts made for a routing-model request.
+    /// Zero means routing did not run or no upstream attempt was made.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub routing_attempt_count: u32,
+
+    /// Number of times routing moved from one target model to another.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub routing_fallback_count: u32,
+
+    /// Per-attempt routing trace for debugging failover. Omitted for
+    /// direct-model requests and cache hits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routing_attempts: Vec<RoutingAttemptEvent>,
 }
 
 #[inline]
@@ -345,6 +379,46 @@ mod tests {
         assert!(json.contains(r#""provider_model_version":"gpt-4o-2024-08-06""#));
         assert!(json.contains(r#""finish_reason":"stop""#));
         assert!(json.contains(r#""ttft_ms":123"#));
+    }
+
+    #[test]
+    fn routing_fields_serialise_only_when_present() {
+        let ev = UsageEvent {
+            request_id: "req-routing".into(),
+            served_by_model: "secondary".into(),
+            routing_attempt_count: 3,
+            routing_fallback_count: 1,
+            routing_attempts: vec![
+                RoutingAttemptEvent {
+                    model: "primary".into(),
+                    attempt: 1,
+                    status: Some(502),
+                    error: "upstream_status".into(),
+                    success: false,
+                },
+                RoutingAttemptEvent {
+                    model: "secondary".into(),
+                    attempt: 1,
+                    status: Some(200),
+                    error: String::new(),
+                    success: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""served_by_model":"secondary""#));
+        assert!(json.contains(r#""routing_attempt_count":3"#));
+        assert!(json.contains(r#""routing_fallback_count":1"#));
+        assert!(json.contains(r#""routing_attempts""#));
+        assert!(json.contains(r#""model":"primary""#));
+        assert!(json.contains(r#""error":"upstream_status""#));
+
+        let empty = serde_json::to_string(&UsageEvent::default()).unwrap();
+        assert!(!empty.contains("served_by_model"));
+        assert!(!empty.contains("routing_attempt_count"));
+        assert!(!empty.contains("routing_fallback_count"));
+        assert!(!empty.contains("routing_attempts"));
     }
 
     fn sample_event(id: &str) -> UsageEvent {

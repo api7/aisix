@@ -20,6 +20,10 @@ pub struct AccessLog<'a> {
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
     pub request_id: &'a str,
+    pub served_by_model: Option<&'a str>,
+    pub routing_attempt_count: Option<u32>,
+    pub routing_fallback_count: Option<u32>,
+    pub routing_attempts: Option<&'a str>,
 }
 
 impl AccessLog<'_> {
@@ -40,6 +44,10 @@ impl AccessLog<'_> {
             completion_tokens = self.completion_tokens,
             total_tokens = self.total_tokens,
             request_id = self.request_id,
+            served_by_model = self.served_by_model,
+            routing_attempt_count = self.routing_attempt_count,
+            routing_fallback_count = self.routing_fallback_count,
+            routing_attempts = self.routing_attempts,
             "proxy request completed",
         );
     }
@@ -101,6 +109,10 @@ mod tests {
                 completion_tokens: Some(1),
                 total_tokens: Some(3),
                 request_id: "req-abc",
+                served_by_model: Some("fallback-target"),
+                routing_attempt_count: Some(2),
+                routing_fallback_count: Some(1),
+                routing_attempts: Some(r#"[{"model":"primary","success":false},{"model":"fallback-target","success":true}]"#),
             }
             .emit();
         });
@@ -113,6 +125,13 @@ mod tests {
         assert!(out.contains("provider=\"openai\"") || out.contains("provider=openai"));
         assert!(out.contains("total_tokens=3"));
         assert!(out.contains("request_id=\"req-abc\"") || out.contains("request_id=req-abc"));
+        assert!(
+            out.contains("served_by_model=\"fallback-target\"")
+                || out.contains("served_by_model=fallback-target")
+        );
+        assert!(out.contains("routing_attempt_count=2"));
+        assert!(out.contains("routing_fallback_count=1"));
+        assert!(out.contains("routing_attempts="));
     }
 
     #[test]
@@ -138,6 +157,10 @@ mod tests {
                 completion_tokens: None,
                 total_tokens: None,
                 request_id: "req-xyz",
+                served_by_model: None,
+                routing_attempt_count: None,
+                routing_fallback_count: None,
+                routing_attempts: None,
             }
             .emit();
         });
