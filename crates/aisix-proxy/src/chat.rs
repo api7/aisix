@@ -1664,11 +1664,15 @@ fn emit_usage_event(
         // Source struct is `aisix_core::TelemetryTags`; the wire
         // shape is flat strings + a bool, with skip_serializing_if
         // covering legacy PKs that pre-date attribution.
-        provider_kind: tags.kind.unwrap_or_default(),
+        // Each operator-defined string is run through `sanitize_tag`
+        // as defence-in-depth against log/JSON injection downstream
+        // (PR #382 audit MEDIUM-3; admission-side cap tracked
+        // separately).
+        provider_kind: sanitize_tag(tags.kind.unwrap_or_default()),
         provider_featured: tags.featured,
-        branded_provider: tags.branded_provider.unwrap_or_default(),
-        pk_label: tags.pk_label.unwrap_or_default(),
-        byo_label: tags.byo_label.unwrap_or_default(),
+        branded_provider: sanitize_tag(tags.branded_provider.unwrap_or_default()),
+        pk_label: sanitize_tag(tags.pk_label.unwrap_or_default()),
+        byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
     };
     state.usage_sink.try_emit(event.clone());
     // Per-env OTLP/HTTP fan-out. The snapshot's exporter table is
@@ -1679,6 +1683,36 @@ fn emit_usage_event(
     state
         .otlp_fan_out
         .fan_out(&event, exporters.iter().map(|e| &e.value));
+}
+
+/// Defence-in-depth sanitiser for operator-defined `ProviderKey
+/// .telemetry_tags` string fields before they hit the wire.
+///
+/// Tag values are operator-controlled (set via the dashboard's
+/// provider-key form, persisted in etcd). A malicious operator with
+/// PK-write privileges could craft a label like
+/// `"production\u{0a}injected-internal-key: secret"` that, while
+/// safely JSON-escaped on this gateway↔cp-api hop, may forge log
+/// lines or muddle downstream consumers (cp-api logs, dashboards,
+/// log-aggregation pipelines) if any of them ever uses
+/// non-strict line-oriented parsing.
+///
+/// We mitigate two ways:
+///   1. Strip ASCII control characters (`\n`, `\r`, `\0`, etc.)
+///   2. Cap length at 256 chars
+///
+/// The right place to enforce this in depth is at PK admission
+/// (cp-api / dashboard validation on `display_name` / tag fields).
+/// This sanitiser is a belt-and-suspenders guard on the emit side
+/// — it cannot prevent a malicious tag from being *stored*, but it
+/// can prevent the stored value from corrupting downstream logs.
+///
+/// PR #382 audit MEDIUM-3.
+pub(crate) fn sanitize_tag(s: String) -> String {
+    if s.is_empty() {
+        return s;
+    }
+    s.chars().filter(|c| !c.is_control()).take(256).collect()
 }
 
 /// Provider-detail bundle for `emit_usage_event`. Grouped here so the
@@ -2406,5 +2440,46 @@ mod filter_tests {
             }
             _ => panic!("expected Selected for cooldown-only"),
         }
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tag_tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_tag_empty_stays_empty() {
+        assert_eq!(sanitize_tag(String::new()), "");
+    }
+
+    #[test]
+    fn sanitize_tag_strips_newlines_carriage_returns_and_nul() {
+        // Injection attempt: a label that, if echoed verbatim into a
+        // line-oriented log on the cp-api side, would forge an
+        // "injected-internal-key: secret" line. Sanitiser must strip
+        // all control chars including \r and \0.
+        let evil = "production\ninjected-internal-key: secret\r\0".to_string();
+        let safe = sanitize_tag(evil);
+        assert!(!safe.contains('\n'));
+        assert!(!safe.contains('\r'));
+        assert!(!safe.contains('\0'));
+        // Visible chars survive untouched.
+        assert!(safe.starts_with("production"));
+        assert!(safe.contains("injected-internal-key: secret"));
+    }
+
+    #[test]
+    fn sanitize_tag_caps_length_at_256() {
+        let huge = "a".repeat(10_000);
+        let safe = sanitize_tag(huge);
+        assert_eq!(safe.len(), 256);
+    }
+
+    #[test]
+    fn sanitize_tag_preserves_normal_ascii_and_unicode() {
+        // Real-world labels include hyphens, slashes, spaces, and
+        // non-ASCII (operator might label a team in their language).
+        let normal = "team-α / prod-east-1".to_string();
+        assert_eq!(sanitize_tag(normal.clone()), normal);
     }
 }

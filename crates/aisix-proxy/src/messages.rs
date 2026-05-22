@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::auth::AuthenticatedKey;
+use crate::chat::sanitize_tag;
 use crate::error::ProxyError;
 use crate::request_id::new_request_id;
 use crate::state::ProxyState;
@@ -918,6 +919,20 @@ fn emit_anthropic_usage_event(
     elapsed: Duration,
     metrics: AnthropicUsageMetrics,
 ) {
+    // Per-PK telemetry attribution (#302 M17 / AISIX-Cloud#436).
+    // Same shape as chat.rs's emit_usage_event — look up the
+    // resolved ProviderKey from the live snapshot and copy its
+    // `telemetry_tags` into wire fields. Empty `provider_key_id`
+    // (pre-dispatch error path) bypasses the lookup → wire NULL.
+    let snap = state.snapshot.load();
+    let tags = if !provider_key_id.is_empty() {
+        snap.provider_keys
+            .get_by_id(provider_key_id)
+            .map(|e| e.value.telemetry_tags.clone())
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
     let event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -934,10 +949,14 @@ fn emit_anthropic_usage_event(
         finish_reason: metrics.finish_reason,
         ttft_ms: metrics.ttft_ms,
         inbound_protocol: "anthropic".to_string(),
+        provider_kind: sanitize_tag(tags.kind.unwrap_or_default()),
+        provider_featured: tags.featured,
+        branded_provider: sanitize_tag(tags.branded_provider.unwrap_or_default()),
+        pk_label: sanitize_tag(tags.pk_label.unwrap_or_default()),
+        byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
         ..Default::default()
     };
     state.usage_sink.try_emit(event.clone());
-    let snap = state.snapshot.load();
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
