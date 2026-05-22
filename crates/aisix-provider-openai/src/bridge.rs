@@ -1070,7 +1070,29 @@ data: [DONE]\n\n";
     #[test]
     fn family_bridge_refuses_non_openai_vendor_with_empty_api_base() {
         let bridge = OpenAiBridge::new();
-        for vendor in ["openrouter", "xai", "OpenRouter", " openrouter "] {
+        // Vendor list spans:
+        // - Long-tail openai-compat catalog vendors that always need a
+        //   populated `api_base` (xai, openrouter, groq, mistral,
+        //   perplexity).
+        // - The three vendors that #379's clean cut deleted dedicated
+        //   `register_specialized` entries for, so they now route only
+        //   through the family bridge (google, deepseek, cohere) — the
+        //   bridge must refuse if cp-api ever ships them with empty
+        //   `api_base`.
+        // - Cased + whitespace variants to pin that the guard does
+        //   trim + lowercase normalization before matching `"openai"`.
+        for vendor in [
+            "openrouter",
+            "xai",
+            "groq",
+            "mistral",
+            "perplexity",
+            "google",
+            "deepseek",
+            "cohere",
+            "OpenRouter",
+            " openrouter ",
+        ] {
             let pk: ProviderKey = serde_json::from_str(&format!(
                 r#"{{"display_name":"x","secret":"k","provider":"{vendor}","adapter":"openai"}}"#
             ))

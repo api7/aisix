@@ -3642,6 +3642,7 @@ data: [DONE]\n\n";
     const MATRIX_ANTHROPIC_PK_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const MATRIX_GOOGLE_PK_ID: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
     const MATRIX_DEEPSEEK_PK_ID: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    const MATRIX_COHERE_PK_ID: &str = "dddddddd-dddd-dddd-dddd-dddddddddddd";
 
     fn anthropic_model_entry(name: &str) -> ResourceEntry<Model> {
         let cfg = format!(
@@ -3677,6 +3678,18 @@ data: [DONE]\n\n";
             }}"#
         );
         ResourceEntry::new("model-deepseek-1", serde_json::from_str(&cfg).unwrap(), 1)
+    }
+
+    fn cohere_model_entry(name: &str) -> ResourceEntry<Model> {
+        let cfg = format!(
+            r#"{{
+                "display_name": "{name}",
+                "provider": "cohere",
+                "model_name": "command-r",
+                "provider_key_id": "{MATRIX_COHERE_PK_ID}"
+            }}"#
+        );
+        ResourceEntry::new("model-cohere-1", serde_json::from_str(&cfg).unwrap(), 1)
     }
 
     fn matrix_pk_entry(
@@ -3719,6 +3732,16 @@ data: [DONE]\n\n";
             "sk-deepseek",
             api_base,
             "deepseek",
+            "openai",
+        )
+    }
+
+    fn matrix_cohere_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        matrix_pk_entry(
+            MATRIX_COHERE_PK_ID,
+            "cohere-key",
+            api_base,
+            "cohere",
             "openai",
         )
     }
@@ -3963,5 +3986,74 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             "Hello from DeepSeek!"
         );
         assert_eq!(v["usage"]["total_tokens"], 13);
+    }
+
+    /// (OpenAI inbound) × (Cohere chat-compat upstream). Cohere serves
+    /// an OpenAI-shape envelope at `/compatibility/v1/chat/completions`
+    /// per <https://docs.cohere.com/reference/chat>; cp-api stores the
+    /// Cohere PK with `adapter: "openai"` and `api_base` pointing at
+    /// `https://api.cohere.com/compatibility/v1`. The integration test
+    /// pins that an inbound OpenAI request resolves through the
+    /// `Adapter::Openai` family bridge (no specialized "cohere"
+    /// registration in this Hub) and round-trips Cohere's OpenAI-shape
+    /// response.
+    ///
+    /// Backfills coverage lost when the #379 clean cut deleted the
+    /// `cohere_chat_compat_round_trips_openai_envelope` unit test
+    /// (which exercised `OpenAiBridge::with_name("cohere")`, a code
+    /// path that no longer exists).
+    #[tokio::test]
+    async fn matrix_openai_in_cohere_chat_compat_non_streaming() {
+        use aisix_core::Adapter;
+        use aisix_provider_openai::OpenAiBridge;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer cohere-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-cohere",
+                "model": "command-r",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Hello from Cohere!"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        // PK `api_base` points at the wiremock root the way cp-api's
+        // adapter_map points real Cohere PKs at `…/compatibility/v1`.
+        snap.provider_keys.insert(matrix_cohere_pk(&upstream.uri()));
+        snap.models.insert(cohere_model_entry("my-cohere"));
+        snap.apikeys
+            .insert(apikey_entry("sk-caller", &["my-cohere"]));
+        let hub = Arc::new(Hub::new());
+        // Family-only registration — NO `register_specialized("cohere", …)`.
+        // The whole point of the test is to prove the family bridge
+        // serves Cohere chat-compat without a vendor-specific entry.
+        hub.register_family(Adapter::Openai, Arc::new(OpenAiBridge::new()));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "my-cohere",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], "Hello from Cohere!");
+        assert_eq!(v["usage"]["total_tokens"], 7);
     }
 }

@@ -55,21 +55,27 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_base: Option<String>,
 
-    /// Vendor identity (e.g. `"deepseek"`, `"openai"`). Introduced as a
-    /// skeleton for issue #302 Phase A. Empty in this PR — no dispatch
-    /// path consumes it yet; the field exists so future Phase A sub-PRs
-    /// can populate it without an on-disk schema break. Old payloads
-    /// that omit `provider` continue to deserialize via
-    /// `#[serde(default)]`.
+    /// Vendor identity (e.g. `"deepseek"`, `"openai"`, any models.dev
+    /// catalog id). Post-#302 Phase A this is the primary specialized-
+    /// dispatch key consumed by `Hub::dispatch_two_tier` (specialized
+    /// lookup tier) and by both family bridges' `resolve_base` safety
+    /// guard (the guard rejects an empty `api_base` for any vendor
+    /// whose identity doesn't match the family's canonical vendor).
+    /// Empty for pre-Phase-A on-disk rows still in etcd — those route
+    /// via the compat shim in `aisix-proxy::dispatch::resolve_bridge`
+    /// that falls back to `Model.provider`. Old payloads that omit
+    /// `provider` continue to deserialize via `#[serde(default)]`.
     #[serde(default)]
     pub provider: String,
 
     /// Wire-shape adapter (`openai` / `anthropic` / `bedrock` /
-    /// `vertex` / `azure-openai`). Introduced as a skeleton for issue
-    /// #302 Phase A. `None` in this PR — no dispatch path consumes it
-    /// yet; the field exists so future Phase A sub-PRs can populate it
-    /// without an on-disk schema break. Old payloads that omit
-    /// `adapter` continue to deserialize via `#[serde(default)]`.
+    /// `vertex` / `azure-openai`). Post-#302 Phase A this is the
+    /// family-fallback dispatch key for `Hub::dispatch_two_tier` when
+    /// the specialized lookup misses; long-tail OpenAI-compat vendors
+    /// (xai, openrouter, groq, …) reach the right bridge through this
+    /// path without a DP code change. `None` for pre-Phase-A on-disk
+    /// rows — those dispatch via the compat shim. Old payloads that
+    /// omit `adapter` continue to deserialize via `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<Adapter>,
 
