@@ -55,7 +55,22 @@ The caller still uses the gateway API key, not the upstream Anthropic provider k
 
 ## Error Shape
 
-Even on the Anthropic-style endpoint, proxy errors still use the gateway's OpenAI-compatible error envelope so client-side proxy handling stays consistent.
+Proxy errors on `/v1/messages` use the Anthropic-shape envelope `{type:"error", error:{type, message}}`. Real Anthropic upstream responses also carry an optional `request_id` field; the gateway omits it.
+
+The gateway emits these `error.type` strings:
+
+- `invalid_request_error` (400, 422)
+- `authentication_error` (401)
+- `permission_error` (403)
+- `not_found_error` (404)
+- `request_too_large` (413)
+- `rate_limit_error` (429)
+- `overloaded_error` (503)
+- `api_error` — all other 4xx/5xx (including 402, which Anthropic's canonical spec maps to `billing_error`)
+
+The map also contains `timeout_error` for 408, currently unreachable — internal timeouts surface as 502 via the Bridge.
+
+See Anthropic's [Errors documentation](https://platform.claude.com/docs/en/api/errors) for the canonical type list.
 
 ## When To Use `/v1/messages`
 

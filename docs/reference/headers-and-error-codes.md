@@ -33,6 +33,11 @@ Current proxy error `type` values include:
 
 These values appear in the proxy's OpenAI-compatible error envelope.
 
+This list covers gateway-generated errors on the OpenAI-shape proxy endpoints. Two surfaces are exceptions:
+
+- `POST /v1/messages` — uses the Anthropic-shape envelope with its own type-string set. See [Anthropic Messages — Error Shape](../integration/anthropic-messages.md#error-shape).
+- `ANY /passthrough/:provider/*rest` — forwards the upstream provider's status code and body verbatim after proxy auth + provider resolution. See [Provider Passthrough](../integration/passthrough.md).
+
 ## Proxy Status Boundaries
 
 - `400` invalid request

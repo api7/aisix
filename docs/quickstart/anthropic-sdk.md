@@ -112,7 +112,7 @@ If you depend on advanced Anthropic-only content block behavior, prefer models w
 - `401` means the AISIX caller API key is missing or invalid
 - `403` means the key cannot access the requested model alias
 - `404` means the model alias is not present in the current snapshot
-- errors still use the gateway's OpenAI-compatible proxy error envelope
+- errors on `/v1/messages` use the Anthropic-shape envelope `{type:"error", error:{type, message}}` — see [Anthropic Messages — Error Shape](../integration/anthropic-messages.md#error-shape) for the gateway's emitted type strings and how they map to Anthropic's canonical set
 
 ## Troubleshooting
 
