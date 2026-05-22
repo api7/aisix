@@ -54,6 +54,12 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 interface ProviderCase {
   readonly provider: "anthropic" | "google" | "deepseek";
+  // Post-#302 Phase A wire-shape adapter cp-api stamps on the PK
+  // alongside `provider`. `Hub::dispatch_two_tier` routes to the
+  // `Adapter::Anthropic` family bridge for `"anthropic"` and to
+  // `Adapter::Openai` for every OpenAI-compat vendor (google +
+  // deepseek here, plus any long-tail vendor cp-api admits later).
+  readonly adapter: "openai" | "anthropic";
   readonly upstreamModelId: string;
   readonly displayName: string;
   // The wire shape the upstream sends back on a 400. Each provider
@@ -76,6 +82,7 @@ interface ProviderCase {
 const CASES: ReadonlyArray<ProviderCase> = [
   {
     provider: "anthropic",
+    adapter: "anthropic",
     upstreamModelId: "claude-3-5-haiku-20241022",
     displayName: "err-norm-anthropic",
     // Anthropic native 400 per
@@ -94,6 +101,7 @@ const CASES: ReadonlyArray<ProviderCase> = [
   },
   {
     provider: "google",
+    adapter: "openai",
     upstreamModelId: "gemini-2.0-flash",
     displayName: "err-norm-google",
     // The google bridge talks to Google's OpenAI-compatibility
@@ -114,6 +122,7 @@ const CASES: ReadonlyArray<ProviderCase> = [
   },
   {
     provider: "deepseek",
+    adapter: "openai",
     upstreamModelId: "deepseek-chat",
     displayName: "err-norm-deepseek",
     // DeepSeek is OpenAI-compatible per
@@ -177,6 +186,13 @@ describe("error envelope normalization e2e: provider-native 4xx → OpenAI-shape
         display_name: `${tc.displayName}-pk`,
         secret: "sk-mock",
         api_base: `${upstream.baseUrl}${tc.apiBaseSuffix}`,
+        // Post-#302 Phase A: `Hub::dispatch_two_tier` needs the PK
+        // to carry both `provider` (vendor identity, open string)
+        // and `adapter` (closed 5-value enum) so the dispatch hits
+        // the right family bridge. cp-api writes these for every
+        // PK row in production; the test mirrors that contract.
+        provider: tc.provider,
+        adapter: tc.adapter,
       });
       await admin.createModel({
         display_name: tc.displayName,
