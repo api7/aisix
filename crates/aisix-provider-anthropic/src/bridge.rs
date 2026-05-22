@@ -119,12 +119,25 @@ fn resolve_base(ctx: &BridgeContext) -> Result<String, BridgeError> {
             let pk_vendor_raw = ctx.provider_key.provider.as_str();
             let pk_vendor_normalized = pk_vendor_raw.trim().to_ascii_lowercase();
             if !pk_vendor_normalized.is_empty() && pk_vendor_normalized != "anthropic" {
+                // Operator-facing detail (route, provider topology,
+                // remediation steps) goes to logs only — keep the
+                // customer-visible 500 body short and free of
+                // internal-product taxonomy (cp-api / adapter_map /
+                // provider_metadata field names are not part of any
+                // wire contract a customer should depend on).
+                tracing::error!(
+                    target: "aisix_provider_anthropic::bridge",
+                    pk_display_name = %ctx.provider_key.display_name,
+                    pk_vendor = %pk_vendor_raw,
+                    "provider_key has no api_base; family bridge refusing fallback to \
+                     api.anthropic.com. Operator action: populate `api_base` on the \
+                     ProviderKey resource (managed deployments: via adapter_map / \
+                     provider_metadata.api_base_url on the control plane; standalone: \
+                     directly on the resource)."
+                );
                 return Err(BridgeError::Config(format!(
-                    "provider_key for vendor {pk_vendor_raw:?} has no api_base set; \
-                     the Anthropic-family bridge refuses to fall back to api.anthropic.com \
-                     to avoid routing {pk_vendor_raw:?}'s API key to Anthropic. cp-api \
-                     must populate api_base for every catalog vendor via adapter_map / \
-                     provider_metadata.api_base_url."
+                    "provider_key for vendor {pk_vendor_raw:?} has no upstream base URL \
+                     configured"
                 )));
             }
             Ok(ANTHROPIC_DEFAULT_BASE.to_string())
@@ -647,5 +660,71 @@ data: {\"type\":\"message_stop\"}\n\n";
             let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
             assert_eq!(resolve_base(&ctx).unwrap(), canonical);
         }
+    }
+
+    /// Family-bridge safety: when `AnthropicBridge` serves a non-anthropic
+    /// vendor with empty `api_base` it MUST refuse rather than fall back
+    /// to `ANTHROPIC_DEFAULT_BASE` — that fallback would silently route
+    /// the vendor's API key to `api.anthropic.com`. Mirror of the OpenAI
+    /// guard in `crates/aisix-provider-openai/src/bridge.rs`.
+    #[test]
+    fn family_bridge_refuses_non_anthropic_vendor_with_empty_api_base() {
+        for vendor in [
+            "bedrock-anthropic",
+            "vertex-anthropic",
+            "BedrockAnthropic",
+            " bedrock-anthropic ",
+        ] {
+            let pk: ProviderKey = serde_json::from_str(&format!(
+                r#"{{"display_name":"x","secret":"k","provider":"{vendor}","adapter":"anthropic"}}"#
+            ))
+            .unwrap();
+            let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
+            let err = resolve_base(&ctx).unwrap_err();
+            match err {
+                BridgeError::Config(msg) => {
+                    assert!(
+                        msg.contains("base URL") && msg.contains(vendor.trim()),
+                        "vendor {vendor:?}: error must name vendor + base URL; got: {msg}",
+                    );
+                    // Sensitive-info-leakage guard: internal product
+                    // taxonomy must not leak into the customer-visible
+                    // 500 body. Those identifiers go to tracing only.
+                    for forbidden in ["cp-api", "adapter_map", "provider_metadata"] {
+                        assert!(
+                            !msg.contains(forbidden),
+                            "vendor {vendor:?}: error body must not leak \
+                             internal-product taxonomy {forbidden:?}; got: {msg}",
+                        );
+                    }
+                }
+                other => panic!("vendor {vendor:?}: expected BridgeError::Config, got {other:?}"),
+            }
+        }
+    }
+
+    /// Pure-anthropic PK without `api_base` falls back to
+    /// `ANTHROPIC_DEFAULT_BASE` — the historical legacy behavior. The
+    /// safety check above only fires for non-anthropic vendors.
+    #[test]
+    fn family_bridge_allows_anthropic_vendor_with_empty_api_base() {
+        let pk: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"a","secret":"sk-a","provider":"anthropic","adapter":"anthropic"}"#,
+        )
+        .unwrap();
+        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
+        assert_eq!(resolve_base(&ctx).unwrap(), ANTHROPIC_DEFAULT_BASE);
+    }
+
+    /// Pre-Phase-A PK carries an empty `provider` string. The safety
+    /// check must NOT fire here — those rows route via the compat
+    /// shim in `crates/aisix-proxy/src/dispatch.rs::resolve_bridge`
+    /// to the specialized "anthropic" bridge. The bridge itself must
+    /// tolerate the legacy shape so the compat path doesn't 500.
+    #[test]
+    fn family_bridge_allows_legacy_empty_provider_with_empty_api_base() {
+        let pk: ProviderKey = serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
+        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
+        assert_eq!(resolve_base(&ctx).unwrap(), ANTHROPIC_DEFAULT_BASE);
     }
 }

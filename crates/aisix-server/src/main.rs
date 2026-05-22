@@ -774,7 +774,7 @@ fn load_heartbeat_config_from_disk(
 /// cp-api stores Cohere's PK with `adapter: "openai"` and `api_base`
 /// pointing at `https://api.cohere.com/compatibility/v1` (per
 /// <https://docs.cohere.com/reference/chat>). Cohere's `/v1/rerank`
-/// native surface is keyed off `ProviderKey.provider == "cohere"` in
+/// native surface is keyed off `Model.provider == "cohere"` in
 /// `crates/aisix-proxy/src/rerank.rs` and bypasses the Bridge.
 fn build_hub() -> Hub {
     let hub = Hub::new();
@@ -1170,6 +1170,49 @@ mod tests {
             bridge.name(),
             "anthropic",
             "family Anthropic bridge MUST be the bare `AnthropicBridge::new()`",
+        );
+    }
+
+    /// `build_hub()` MUST keep `register_specialized("openai", …)` so
+    /// `crates/aisix-proxy/src/dispatch.rs::resolve_bridge`'s
+    /// compat-shim fallback (`hub.get_specialized(Model.provider)`)
+    /// resolves a pre-Phase-A PK row (empty `provider`, no `adapter`).
+    /// A future PR that drops this registration prematurely — before
+    /// cp-api has re-saved every legacy PK — would silently 503 those
+    /// rows. This test pins the shim contract end-to-end against the
+    /// real `build_hub()` registry (not a stub Hub), so it fails the
+    /// moment the registration disappears.
+    #[test]
+    fn build_hub_compat_shim_resolves_pre_phase_a_openai_pk() {
+        let hub = build_hub();
+        let bridge = hub
+            .get_specialized("openai")
+            .expect("openai compat shim must dispatch pre-Phase-A PK rows");
+        assert_eq!(
+            bridge.name(),
+            "openai",
+            "specialized 'openai' compat shim MUST be `OpenAiBridge::new()` \
+             (returning bridge name 'openai') so pre-Phase-A PK rows with \
+             empty `provider` + no `adapter` resolve via \
+             `dispatch::resolve_bridge`'s `hub.get_specialized(Model.provider)` \
+             fallback",
+        );
+    }
+
+    /// Parallel of the openai compat-shim test, for the Anthropic side.
+    #[test]
+    fn build_hub_compat_shim_resolves_pre_phase_a_anthropic_pk() {
+        let hub = build_hub();
+        let bridge = hub
+            .get_specialized("anthropic")
+            .expect("anthropic compat shim must dispatch pre-Phase-A PK rows");
+        assert_eq!(
+            bridge.name(),
+            "anthropic",
+            "specialized 'anthropic' compat shim MUST be `AnthropicBridge::new()` \
+             so pre-Phase-A PK rows with empty `provider` + no `adapter` resolve \
+             via `dispatch::resolve_bridge`'s `hub.get_specialized(Model.provider)` \
+             fallback",
         );
     }
 }

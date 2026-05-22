@@ -113,12 +113,25 @@ impl OpenAiBridge {
                 let pk_vendor_raw = ctx.provider_key.provider.as_str();
                 let pk_vendor_normalized = pk_vendor_raw.trim().to_ascii_lowercase();
                 if !pk_vendor_normalized.is_empty() && pk_vendor_normalized != "openai" {
+                    // Operator-facing detail (route, provider topology,
+                    // remediation steps) goes to logs only — keep the
+                    // customer-visible 500 body short and free of
+                    // internal-product taxonomy (cp-api / adapter_map /
+                    // provider_metadata field names are not part of any
+                    // wire contract a customer should depend on).
+                    tracing::error!(
+                        target: "aisix_provider_openai::bridge",
+                        pk_display_name = %ctx.provider_key.display_name,
+                        pk_vendor = %pk_vendor_raw,
+                        "provider_key has no api_base; family bridge refusing fallback to \
+                         api.openai.com. Operator action: populate `api_base` on the \
+                         ProviderKey resource (managed deployments: via adapter_map / \
+                         provider_metadata.api_base_url on the control plane; standalone: \
+                         directly on the resource)."
+                    );
                     return Err(BridgeError::Config(format!(
-                        "provider_key for vendor {pk_vendor_raw:?} has no api_base set; \
-                         the OpenAI bridge refuses to fall back to api.openai.com to avoid \
-                         routing {pk_vendor_raw:?}'s API key to OpenAI. cp-api must populate \
-                         api_base for every catalog vendor via adapter_map / \
-                         provider_metadata.api_base_url."
+                        "provider_key for vendor {pk_vendor_raw:?} has no upstream base URL \
+                         configured"
                     )));
                 }
                 return Ok(OPENAI_DEFAULT_BASE.to_string());
@@ -153,14 +166,15 @@ fn strip_known_endpoint(base: &str) -> &str {
     trimmed
 }
 
-/// Provider-aware `api_base` normalization for the OpenAI-compatible
-/// bridge.
+/// `api_base` normalization for the OpenAI-compatible family bridge.
 ///
-/// Normalization is intentionally **conservative**: it only adjusts
-/// `/v1` segments for the canonical upstream host of each provider.
-/// Corporate proxies, alternative deployments, and test mocks pass
-/// through verbatim after suffix stripping — the operator's path on
-/// a non-canonical host is trusted as-is.
+/// Normalization is intentionally **conservative**: it only
+/// synthesizes the `/v1` segment when the operator pasted the bare
+/// canonical `https://api.openai.com` host (a common copy-paste
+/// habit). Corporate proxies, alternative deployments, and every
+/// non-OpenAI vendor's upstream host pass through verbatim after
+/// suffix stripping — the operator's path on a non-canonical host
+/// is trusted as-is.
 ///
 /// See [`OpenAiBridge::resolve_base`] for accepted forms.
 fn normalize_api_base(base: &str) -> String {
@@ -1085,9 +1099,19 @@ data: [DONE]\n\n";
             match err {
                 BridgeError::Config(msg) => {
                     assert!(
-                        msg.contains("api_base") && msg.contains(vendor.trim()),
-                        "vendor {vendor:?}: error must name vendor + api_base; got: {msg}",
+                        msg.contains("base URL") && msg.contains(vendor.trim()),
+                        "vendor {vendor:?}: error must name vendor + base URL; got: {msg}",
                     );
+                    // Sensitive-info-leakage guard: internal product
+                    // taxonomy must not leak into the customer-visible
+                    // 500 body. Those identifiers go to tracing only.
+                    for forbidden in ["cp-api", "adapter_map", "provider_metadata"] {
+                        assert!(
+                            !msg.contains(forbidden),
+                            "vendor {vendor:?}: error body must not leak \
+                             internal-product taxonomy {forbidden:?}; got: {msg}",
+                        );
+                    }
                 }
                 other => panic!("vendor {vendor:?}: expected BridgeError::Config, got {other:?}"),
             }
