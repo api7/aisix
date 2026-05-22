@@ -221,11 +221,60 @@ pub struct UsageEvent {
     /// direct-model requests and cache hits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routing_attempts: Vec<RoutingAttemptEvent>,
+
+    // ─── ProviderKey telemetry attribution (#302 M17 / AISIX-Cloud#436) ───
+    //
+    // Mirrors `aisix_core::models::provider_key::TelemetryTags` 1:1 so
+    // cp-api can slice usage events by who-paid-what (catalog vs BYO),
+    // featured / community attribution, and operator-defined per-PK
+    // labels. Sourced at request dispatch time from the resolved
+    // `ProviderKey.telemetry_tags`; all five default to empty / false
+    // for backward compat with legacy PK rows that pre-date Phase A.
+    //
+    // Empty / false on the wire maps to NULL on the cp-api side via
+    // `skip_serializing_if` — `dpmgr_usage_events` columns are
+    // nullable so legacy events written by older DP images don't
+    // require a migration.
+    /// `"catalog"` for first-party curated providers, `"byo"` for
+    /// bring-your-own. Empty when the resolved ProviderKey predates
+    /// telemetry attribution.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider_kind: String,
+
+    /// Whether this ProviderKey is in the dashboard's "Featured"
+    /// surface. Defaults to false; cp-api treats false as "not
+    /// featured OR unknown" — slicing should not rely on this single
+    /// bit alone for catalog/community segmentation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub provider_featured: bool,
+
+    /// Branded provider slug for catalog entries (e.g. `"openai"`,
+    /// `"anthropic"`). Empty for BYO and legacy rows.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub branded_provider: String,
+
+    /// Operator-defined label for this provider key (e.g.
+    /// `"production"`, `"shared-test"`). Catalog-side only — BYO
+    /// rows use `byo_label`. Empty when the operator did not set one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pk_label: String,
+
+    /// Operator-defined label for BYO entries (e.g. an internal team
+    /// name). Empty for catalog rows. Mutually exclusive with
+    /// `pk_label` by convention; cp-api projection emits one or the
+    /// other based on `provider_kind`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub byo_label: String,
 }
 
 #[inline]
 fn is_zero_u32(n: &u32) -> bool {
     *n == 0
+}
+
+#[inline]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Cheap clonable handle the proxy hands to request handlers. Backed
@@ -352,6 +401,57 @@ mod tests {
         assert!(!json.contains("provider_model_version"));
         assert!(!json.contains("finish_reason"));
         assert!(!json.contains("ttft_ms"));
+        // ProviderKey telemetry tag wire-compat (#302 M17 /
+        // AISIX-Cloud#436). Pre-attribution DP images would emit
+        // empty / false defaults, which must NOT appear on the wire.
+        assert!(!json.contains("provider_kind"));
+        assert!(!json.contains("provider_featured"));
+        assert!(!json.contains("branded_provider"));
+        assert!(!json.contains("pk_label"));
+        assert!(!json.contains("byo_label"));
+    }
+
+    #[test]
+    fn telemetry_tag_fields_serialise_when_set() {
+        // Catalog PK with operator-defined pk_label. Mirrors the
+        // shape cp-api projects via mustMarshalProviderKeyKV (kind +
+        // featured + branded_provider + pk_label, byo_label empty).
+        let ev = UsageEvent {
+            request_id: "req-tags-catalog".into(),
+            provider_kind: "catalog".into(),
+            provider_featured: true,
+            branded_provider: "openai".into(),
+            pk_label: "production".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"provider_kind\":\"catalog\""));
+        assert!(json.contains("\"provider_featured\":true"));
+        assert!(json.contains("\"branded_provider\":\"openai\""));
+        assert!(json.contains("\"pk_label\":\"production\""));
+        // byo_label stays out — catalog PK doesn't use it.
+        assert!(!json.contains("byo_label"));
+    }
+
+    #[test]
+    fn telemetry_tag_fields_byo_variant_serialises() {
+        // BYO PK with operator-defined byo_label. Per cp-api's
+        // mustMarshalProviderKeyKV the catalog/BYO branches are
+        // mutually exclusive — pk_label stays empty here.
+        let ev = UsageEvent {
+            request_id: "req-tags-byo".into(),
+            provider_kind: "byo".into(),
+            provider_featured: false,
+            byo_label: "internal-vllm".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"provider_kind\":\"byo\""));
+        assert!(json.contains("\"byo_label\":\"internal-vllm\""));
+        // featured=false skipped, branded_provider+pk_label stay empty.
+        assert!(!json.contains("provider_featured"));
+        assert!(!json.contains("branded_provider"));
+        assert!(!json.contains("pk_label"));
     }
 
     #[test]
