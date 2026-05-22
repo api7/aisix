@@ -420,16 +420,16 @@ struct Success {
     /// response header so callers can tell which target inside a
     /// routing group won the failover loop.
     ///
-    /// `None` in three cases:
+    /// `None` in two cases:
     ///   - Direct (non-routing) model — `display_name` of the served
     ///     target equals `req.model`, so the header would be redundant.
     ///   - Cache hit — we don't know which target produced the stored
     ///     response. Re-stamping a stale name would lie.
-    ///   - Streaming response from a routing group with no failover —
-    ///     the streaming path attempts only `targets[0]` (no mid-stream
-    ///     fallback), so the value would always be `targets[0]`. The
-    ///     header is set in that case below; this comment documents
-    ///     the policy, not an absence.
+    ///
+    /// Streaming routing responses still set this to the selected target.
+    /// The streaming path attempts only that target and does not fail over
+    /// mid-stream, but the header remains useful because callers asked for
+    /// the routing group's display name.
     served_by_target: Option<String>,
     routing: RoutingTelemetry,
 }
