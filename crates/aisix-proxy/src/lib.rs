@@ -2635,6 +2635,69 @@ data: [DONE]\n\n";
     }
 
     #[tokio::test]
+    async fn streaming_routing_records_failed_initial_attempt() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("stream unavailable"))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-primary", &upstream.uri()));
+        snap.models
+            .insert(model_entry_with_id("m-primary", "primary", "pk-primary"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary"],
+            None,
+            None,
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+        let body = serde_json::json!({
+            "model": "smart",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("sender dropped");
+        assert_eq!(event.served_by_model, "");
+        assert_eq!(event.routing_attempt_count, 1);
+        assert_eq!(event.routing_fallback_count, 0);
+        assert_eq!(event.routing_attempts.len(), 1);
+        assert_eq!(event.routing_attempts[0].model, "primary");
+        assert_eq!(event.routing_attempts[0].attempt, 1);
+        assert_eq!(event.routing_attempts[0].status, Some(502));
+        assert_eq!(event.routing_attempts[0].error, "upstream_status");
+        assert!(!event.routing_attempts[0].success);
+    }
+
+    #[tokio::test]
     async fn routing_can_retry_and_failover_on_429_when_enabled() {
         let ratelimited_upstream = MockServer::start().await;
         Mock::given(method("POST"))

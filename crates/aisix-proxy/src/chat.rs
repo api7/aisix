@@ -729,10 +729,28 @@ async fn dispatch(
         let model_arc = Arc::new(model.clone());
         let pk_arc = Arc::new(pk_entry.value.clone());
         let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
-        let upstream = bridge
-            .chat_stream(req, &ctx)
-            .await
-            .map_err(|e| with_model(ProxyError::Bridge(e)))?;
+        let upstream = match bridge.chat_stream(req, &ctx).await {
+            Ok(upstream) => upstream,
+            Err(err) => {
+                let routing = if virtual_entry.value.routing.is_some() {
+                    RoutingTelemetry {
+                        served_by_model: String::new(),
+                        attempt_count: 1,
+                        fallback_count: 0,
+                        attempts: vec![RoutingAttemptEvent {
+                            model: model.display_name.clone(),
+                            attempt: 1,
+                            status: routing_error_status(&err),
+                            error: routing_error_class(&err).to_string(),
+                            success: false,
+                        }],
+                    }
+                } else {
+                    RoutingTelemetry::default()
+                };
+                return Err(with_model(ProxyError::Bridge(err)).with_routing(routing));
+            }
+        };
         // Drop the reservation now: concurrency releases on all layers.
         // RPM was already counted by pre_commit. TPM is updated
         // retroactively on stream-end by `add_tokens_post_stream`.
