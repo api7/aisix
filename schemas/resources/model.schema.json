@@ -51,7 +51,7 @@
       ]
     },
     "provider": {
-      "description": "Upstream vendor identity, free-form string (e.g. `\"openai\"`, `\"xai\"`, `\"openrouter\"`, any models.dev catalog id). Carried through to telemetry / logs but **not consumed by dispatch** — routing reads `ProviderKey.adapter` + `ProviderKey.provider` instead, so a new long-tail vendor admitted by cp-api works without a DP code change. None for routing models.\n\nCloses the schema-validation half of api7/AISIX-Cloud#417 and the dispatch half of api7/AISIX-Cloud#302 Phase A.",
+      "description": "Upstream vendor identity, free-form string (e.g. `\"openai\"`, `\"xai\"`, `\"openrouter\"`, any models.dev catalog id). Primary dispatch reads `ProviderKey.adapter` + `ProviderKey.provider` via `Hub::dispatch_two_tier`, so a new long-tail vendor admitted by cp-api works without a DP code change. `Model.provider` is additionally consumed by three specific paths:\n\n1. `/v1/messages` Anthropic-vs-cross-provider branch (`crates/aisix-proxy/src/messages.rs::messages_handler`). 2. `/v1/rerank` vendor gate + access-log label (`crates/aisix-proxy/src/rerank.rs`); Cohere/Jina each have a native rerank surface that bypasses the Bridge trait, so this path stays keyed on `Model.provider`. 3. The one-cycle compat shim in `crates/aisix-proxy/src/dispatch.rs::resolve_bridge` that rescues pre-Phase-A on-disk PK rows (empty `provider` + None `adapter`) by falling back to `hub.get_specialized(Model.provider)`.\n\n`None` for routing models.\n\nCloses the schema-validation half of api7/AISIX-Cloud#417 and the dispatch half of api7/AISIX-Cloud#302 Phase A.",
       "type": [
         "string",
         "null"
