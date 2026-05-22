@@ -2647,7 +2647,7 @@ data: [DONE]\n\n";
             .await;
 
         let hub = Arc::new(Hub::new());
-        hub.register(Provider::Openai, Arc::new(openai_test_bridge()));
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
 
         let snap = AisixSnapshot::new();
         snap.provider_keys
