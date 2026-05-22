@@ -1,9 +1,10 @@
 //! `Model` entity — the routing target users reference from API requests.
 //!
-//! A Model has a user-chosen unique `display_name`, an explicit
-//! `provider` enum, an upstream `model_name` (e.g. "gpt-4o"), and a
-//! `provider_key_id` referencing a [`ProviderKey`] entry that supplies
-//! the secret + optional `api_base` override.
+//! A Model has a user-chosen unique `display_name`, an open vendor
+//! string `provider` (e.g. `"openai"`, `"xai"`), an upstream
+//! `model_name` (e.g. `"gpt-4o"`), and a `provider_key_id` referencing
+//! a [`ProviderKey`] entry that supplies the secret + optional
+//! `api_base` override.
 //!
 //! Routing models — virtual routers that pick a target Model per request
 //! — set `routing` instead of `provider`/`model_name`/`provider_key_id`.
@@ -17,71 +18,26 @@ use super::rate_limit::RateLimit;
 use super::routing::Routing;
 use crate::resource::Resource;
 
-/// First-class upstream provider variants with specialized DP handling.
-///
-/// Kept narrow on purpose: only vendors whose code path diverges from
-/// the wire-shape default (`Adapter`-family bridge) live here. Every
-/// other catalog vendor cp-api admits (xai, openrouter, groq, mistral,
-/// fireworks-ai, perplexity, together, moonshot, alibaba, zhipu,
-/// baseten, huggingface, cerebras, …) flows through the `Adapter`
-/// family bridge without a DP enum variant — closes api7/AISIX-Cloud#302
-/// Phase A and api7/AISIX-Cloud#417.
-///
-/// Wire identity on `ProviderKey.provider` / `Model.provider` is a
-/// free-form string (`Option<String>`); this enum is reserved for the
-/// few code paths that still match on a fixed vendor set
-/// (Cohere/Jina native rerank, Anthropic-shape `/v1/messages` cross-
-/// provider routing).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum Provider {
-    Openai,
-    Anthropic,
-    Google,
-    Deepseek,
-    /// Cohere — `/v1/rerank` (native, via `aisix-proxy::rerank`) and
-    /// chat/completions / embeddings (via `OpenAiBridge::with_name("cohere")`
-    /// against `https://api.cohere.com/compatibility/v1`, per
-    /// <https://docs.cohere.com/reference/chat>).
-    Cohere,
-    /// Jina AI — currently exposed for `/v1/rerank` only (#213 Phase 2).
-    /// Jina's rerank wire shape is identity-mapped to the OpenAI-compat
-    /// shape (`{model, query, documents, top_n}` with Bearer auth at
-    /// `https://api.jina.ai/v1/rerank`), so the gateway forwards
-    /// verbatim with no transform.
-    Jina,
-}
-
-impl Provider {
-    /// Stable wire identity for this first-class variant. Matches the
-    /// models.dev catalog id cp-api stores on `ProviderKey.provider`.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Openai => "openai",
-            Self::Anthropic => "anthropic",
-            Self::Google => "google",
-            Self::Deepseek => "deepseek",
-            Self::Cohere => "cohere",
-            Self::Jina => "jina",
-        }
-    }
-}
+// `Provider` enum removed as part of #302 Phase A clean cut. Vendor
+// identity is an open string on `ProviderKey.provider` /
+// `Model.provider` — DP no longer enumerates vendors at compile time.
+// Code paths that need vendor-aware dispatch (rerank, messages
+// cross-provider routing) compare the string directly.
 
 /// Wire-shape adapter used to talk to an upstream. This is the closed
 /// set of upstream protocols the gateway knows how to encode against —
 /// distinct from a vendor identity (which is captured separately on
-/// `ProviderKey`).
+/// `ProviderKey.provider` as an open string).
 ///
-/// Introduced as a skeleton for issue #302 Phase A. This type is purely
-/// additive in this PR: nothing in the gateway dispatches off `Adapter`
-/// yet, no entity field is changed, and `Provider` continues to drive
-/// all runtime behavior. Follow-up PRs in Phase A migrate entities and
-/// the Hub to consume `Adapter` directly.
+/// Post-#302 Phase A clean cut, dispatch is two-tier: the Hub looks up
+/// a specialized bridge by the open `ProviderKey.provider` string
+/// first, then falls back to the closed `Adapter` family bridge. Any
+/// new long-tail OpenAI-compat vendor cp-api admits (xai, openrouter,
+/// cerebras, …) routes through the `Adapter::Openai` family bridge
+/// without a DP code change.
 ///
 /// Note on serde casing: `Adapter` uses `kebab-case` so the `AzureOpenai`
-/// variant serializes as `"azure-openai"`. This intentionally differs
-/// from `Provider`'s `lowercase` casing, which produced no hyphens
-/// because all current `Provider` names are single tokens.
+/// variant serializes as `"azure-openai"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Adapter {
@@ -91,11 +47,6 @@ pub enum Adapter {
     Vertex,
     AzureOpenai,
 }
-
-// `From<Provider> for Adapter` removed: post-#302 Phase A nothing in
-// production reads it. Adapter identity lives on `ProviderKey.adapter`
-// directly, projected by cp-api per adapter_map.yaml. The legacy
-// Model.provider → Adapter mapping has no caller.
 
 /// Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
@@ -544,24 +495,8 @@ mod tests {
         assert!(serde_json::from_str::<Adapter>("\"azure_openai\"").is_err());
     }
 
-    /// Every first-class `Provider` variant must have a non-empty
-    /// `as_str` wire id and a working `Adapter::from` arm. A
-    /// regression that added a new variant but forgot to update
-    /// either would compile fine but silently break dispatch
-    /// downstream.
-    #[test]
-    fn every_provider_variant_has_as_str_and_adapter() {
-        let variants = [
-            Provider::Openai,
-            Provider::Anthropic,
-            Provider::Google,
-            Provider::Deepseek,
-            Provider::Cohere,
-            Provider::Jina,
-        ];
-        for v in variants {
-            let id = v.as_str();
-            assert!(!id.is_empty(), "{v:?}: as_str must be non-empty");
-        }
-    }
+    // `every_provider_variant_has_as_str_and_adapter` removed —
+    // the `Provider` enum it pinned no longer exists post-#302
+    // Phase A. Vendor identity is now a free-form string on
+    // `ProviderKey.provider` / `Model.provider`.
 }

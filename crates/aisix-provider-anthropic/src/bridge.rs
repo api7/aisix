@@ -40,7 +40,6 @@ pub const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
 
 pub struct AnthropicBridge {
     client: Client,
-    name: &'static str,
     api_version: &'static str,
 }
 
@@ -52,14 +51,8 @@ impl AnthropicBridge {
     pub fn with_client(client: Client) -> Self {
         Self {
             client,
-            name: "anthropic",
             api_version: ANTHROPIC_VERSION,
         }
-    }
-
-    pub fn with_name(mut self, name: &'static str) -> Self {
-        self.name = name;
-        self
     }
 
     pub fn with_api_version(mut self, v: &'static str) -> Self {
@@ -218,7 +211,7 @@ where
 #[async_trait]
 impl Bridge for AnthropicBridge {
     fn name(&self) -> &'static str {
-        self.name
+        "anthropic"
     }
 
     async fn chat(

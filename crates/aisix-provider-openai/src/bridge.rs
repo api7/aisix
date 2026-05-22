@@ -45,68 +45,12 @@ use crate::wire::{
     OpenAiStreamChunk,
 };
 
-/// Fallback OpenAI host used when the Model doesn't set `api_base` and
-/// the Provider enum's default is also missing. In practice an operator
-/// configures `api_base: "https://api.openai.com/v1"` on the Model so
-/// this constant only covers degenerate config paths.
+/// Default OpenAI upstream host. Used only when `ProviderKey.api_base`
+/// is empty AND the dispatching PK identifies the openai vendor — the
+/// family-bridge safety guard in `resolve_base` refuses this fallback
+/// for any non-openai vendor (would otherwise leak the vendor's API
+/// key to api.openai.com).
 pub const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
-
-/// Fallback host for the `deepseek`-named variant of this bridge, so a
-/// `with_name("deepseek")` instance without an explicit `api_base`
-/// dispatches to DeepSeek rather than OpenAI.
-const DEEPSEEK_DEFAULT_BASE: &str = "https://api.deepseek.com";
-
-/// Fallback host for the `google`-named variant of this bridge, so a
-/// `with_name("google")` instance without an explicit `api_base`
-/// dispatches to Google's OpenAI-compatible Gemini endpoint.
-const GOOGLE_DEFAULT_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/openai";
-
-/// Fallback host for the `cohere`-named variant of this bridge, so a
-/// `with_name("cohere")` instance without an explicit `api_base`
-/// dispatches to Cohere's [OpenAI-compatible chat
-/// endpoint](https://docs.cohere.com/reference/chat) at
-/// `/compatibility/v1`. Cohere's native chat surface (`/v1/chat`) has a
-/// different wire shape; the `/compatibility/v1` namespace mirrors the
-/// OpenAI `/chat/completions` shape verbatim, so `OpenAiBridge` can
-/// serve it directly. `Provider::Cohere.default_base_url()` returns
-/// the bare host because the rerank path (`/v1/rerank`) builds its own
-/// URL — that constant stays as-is.
-const COHERE_DEFAULT_BASE: &str = "https://api.cohere.com/compatibility/v1";
-
-// ─── Long-tail OpenAI-adapter provider default base URLs (#60 P2-A) ──
-//
-// Each constant is the vendor's documented OpenAI-compat chat
-// endpoint. Operators can override per-PK via `api_base`; these
-// constants only cover the degenerate config path where no api_base
-// is set on the resource. URLs sourced from each vendor's official
-// docs cited inline.
-//
-// Per https://console.groq.com/docs/openai
-const GROQ_DEFAULT_BASE: &str = "https://api.groq.com/openai/v1";
-// Per https://docs.mistral.ai/api/
-const MISTRAL_DEFAULT_BASE: &str = "https://api.mistral.ai/v1";
-// Per https://docs.together.ai/docs/openai-api-compatibility
-const TOGETHERAI_DEFAULT_BASE: &str = "https://api.together.ai/v1";
-// Per https://docs.fireworks.ai/getting-started/quickstart
-const FIREWORKS_AI_DEFAULT_BASE: &str = "https://api.fireworks.ai/inference/v1";
-// Per https://docs.perplexity.ai/api-reference/chat-completions-post
-// (chat endpoint is at the host root, NOT /v1).
-const PERPLEXITY_DEFAULT_BASE: &str = "https://api.perplexity.ai";
-// xAI Grok scoped out: not in cp-api adapter_map.yaml today (#335
-// swapped xai → google for Featured rank 8); follow-up will add it
-// after the catalog catches up.
-// Per https://platform.moonshot.cn/docs/api/chat
-const MOONSHOTAI_DEFAULT_BASE: &str = "https://api.moonshot.cn/v1";
-// Per https://help.aliyun.com/zh/dashscope/developer-reference/compatibility-of-openai-with-dashscope
-const ALIBABA_DEFAULT_BASE: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
-// Per https://www.bigmodel.cn/dev/api (OpenAI-compat at /api/paas/v4)
-const ZHIPUAI_DEFAULT_BASE: &str = "https://open.bigmodel.cn/api/paas/v4";
-// Per https://docs.baseten.co/development/model-apis/openai-clients
-const BASETEN_DEFAULT_BASE: &str = "https://inference.baseten.co/v1";
-// Per https://huggingface.co/docs/inference-providers/index#openai-compatible-api
-const HUGGINGFACE_DEFAULT_BASE: &str = "https://router.huggingface.co/v1";
-// Per https://inference-docs.cerebras.ai/api-reference/openai-compatibility
-const CEREBRAS_DEFAULT_BASE: &str = "https://api.cerebras.ai/v1";
 
 /// Path suffixes the bridge appends to `api_base` when building upstream
 /// URLs. If an operator accidentally pastes the full upstream URL into
@@ -124,7 +68,6 @@ const OPENAI_ENDPOINT_SUFFIXES: &[&str] = &[
 
 pub struct OpenAiBridge {
     client: Client,
-    name: &'static str,
 }
 
 impl OpenAiBridge {
@@ -133,43 +76,7 @@ impl OpenAiBridge {
     }
 
     pub fn with_client(client: Client) -> Self {
-        Self {
-            client,
-            name: "openai",
-        }
-    }
-
-    /// Same transport but a caller-chosen `name()` — used by OpenAI-compat
-    /// providers (DeepSeek, Gemini-OAI) so their metrics labels are distinct.
-    pub fn with_name(mut self, name: &'static str) -> Self {
-        self.name = name;
-        self
-    }
-
-    /// Default upstream base for this bridge variant. The bridge factory
-    /// wraps with `with_name("deepseek")` / `with_name("google")` to
-    /// retarget; the default base follows the same retargeting so a
-    /// degenerate config (no `api_base` on the Model) still reaches the
-    /// right host.
-    fn default_base(&self) -> &'static str {
-        match self.name {
-            "deepseek" => DEEPSEEK_DEFAULT_BASE,
-            "google" => GOOGLE_DEFAULT_BASE,
-            "cohere" => COHERE_DEFAULT_BASE,
-            // Long-tail OpenAI-adapter providers (#60 P2-A).
-            "groq" => GROQ_DEFAULT_BASE,
-            "mistral" => MISTRAL_DEFAULT_BASE,
-            "togetherai" => TOGETHERAI_DEFAULT_BASE,
-            "fireworks-ai" => FIREWORKS_AI_DEFAULT_BASE,
-            "perplexity" => PERPLEXITY_DEFAULT_BASE,
-            "moonshotai" => MOONSHOTAI_DEFAULT_BASE,
-            "alibaba" => ALIBABA_DEFAULT_BASE,
-            "zhipuai" => ZHIPUAI_DEFAULT_BASE,
-            "baseten" => BASETEN_DEFAULT_BASE,
-            "huggingface" => HUGGINGFACE_DEFAULT_BASE,
-            "cerebras" => CEREBRAS_DEFAULT_BASE,
-            _ => OPENAI_DEFAULT_BASE,
-        }
+        Self { client }
     }
 
     /// Resolve `ProviderKey.api_base` into the canonical base URL the
@@ -181,60 +88,43 @@ impl OpenAiBridge {
     /// - accidental endpoint suffix (e.g. `/chat/completions` pasted
     ///   along with the host)
     /// - bare canonical OpenAI host without `/v1` (the bridge adds it)
-    /// - canonical DeepSeek host with an extra `/v1` segment (the
-    ///   bridge strips it — DeepSeek serves OpenAI-compatible endpoints
-    ///   at the host root)
     ///
-    /// `/v1` synthesis and stripping happens **only for the canonical
-    /// upstream host of each provider**. Corporate proxies, alternative
-    /// deployments, and any non-default path the operator chose on
-    /// purpose pass through unchanged after suffix stripping — the
-    /// operator's intent on a non-canonical host wins.
+    /// `/v1` synthesis happens **only for the canonical OpenAI host**.
+    /// Corporate proxies, alternative deployments, and any non-default
+    /// path the operator chose on purpose pass through unchanged after
+    /// suffix stripping — the operator's intent on a non-canonical
+    /// host wins.
     ///
-    /// For the `gemini` variant and any future `with_name` variant, the
-    /// path is left as-is after suffix stripping — Gemini's `/v1beta/openai`
-    /// prefix is non-trivial and operators typically copy-paste the full
-    /// form.
+    /// Family-bridge safety: when the dispatching `ProviderKey.provider`
+    /// identifies a vendor that ISN'T openai AND `api_base` is empty,
+    /// the bridge refuses to fall back to `OPENAI_DEFAULT_BASE` — that
+    /// would silently route the vendor's API key to `api.openai.com`.
+    /// Closes the openrouter / xai / future-long-tail half of
+    /// api7/AISIX-Cloud#417. cp-api must populate `api_base` for every
+    /// catalog vendor via adapter_map / provider_metadata.api_base_url.
     fn resolve_base(&self, ctx: &BridgeContext) -> Result<String, BridgeError> {
         let raw = match ctx.provider_key.api_base.as_deref() {
             Some(b) if !b.trim().is_empty() => b.trim().to_string(),
             _ => {
-                // Family-bridge safety: when this `OpenAiBridge` is the
-                // bare family registration (`name == "openai"`,
-                // registered via `register_family(Adapter::Openai, ...)`)
-                // AND the dispatching `ProviderKey.provider` identifies
-                // a vendor that ISN'T openai, refuse to fall back to
-                // `OPENAI_DEFAULT_BASE` — that would silently route the
-                // vendor's API key to `api.openai.com`. Closes the
-                // openrouter / xai / future-long-tail half of
-                // api7/AISIX-Cloud#417.
-                //
-                // Legacy named bridges (`with_name("groq")`,
-                // `with_name("cohere")`, …) have their own
-                // `default_base()` arm that points at the right host,
-                // so the guard only fires for the family-bridge path.
-                //
-                // Pre-Phase-A rows (empty `ProviderKey.provider`)
-                // fall through to the historical default-base path
-                // unchanged.
+                // Vendor identity is the open-string `ProviderKey.provider`.
+                // Normalize (trim + ascii_lowercase) before comparing so a
+                // crafted PK with `"OpenAI"` / `"openai "` cannot bypass
+                // the guard.
                 let pk_vendor_raw = ctx.provider_key.provider.as_str();
                 let pk_vendor_normalized = pk_vendor_raw.trim().to_ascii_lowercase();
-                if self.name == "openai"
-                    && !pk_vendor_normalized.is_empty()
-                    && pk_vendor_normalized != "openai"
-                {
+                if !pk_vendor_normalized.is_empty() && pk_vendor_normalized != "openai" {
                     return Err(BridgeError::Config(format!(
                         "provider_key for vendor {pk_vendor_raw:?} has no api_base set; \
-                         the OpenAI-family bridge refuses to fall back to api.openai.com \
-                         to avoid routing {pk_vendor_raw:?}'s API key to OpenAI. cp-api \
-                         must populate api_base for every catalog vendor via adapter_map / \
+                         the OpenAI bridge refuses to fall back to api.openai.com to avoid \
+                         routing {pk_vendor_raw:?}'s API key to OpenAI. cp-api must populate \
+                         api_base for every catalog vendor via adapter_map / \
                          provider_metadata.api_base_url."
                     )));
                 }
-                return Ok(self.default_base().to_string());
+                return Ok(OPENAI_DEFAULT_BASE.to_string());
             }
         };
-        Ok(normalize_api_base(&raw, self.name))
+        Ok(normalize_api_base(&raw))
     }
 }
 
@@ -273,14 +163,9 @@ fn strip_known_endpoint(base: &str) -> &str {
 /// a non-canonical host is trusted as-is.
 ///
 /// See [`OpenAiBridge::resolve_base`] for accepted forms.
-fn normalize_api_base(base: &str, provider: &str) -> String {
+fn normalize_api_base(base: &str) -> String {
     let stripped = strip_known_endpoint(base);
-    match provider {
-        "openai" => normalize_canonical_openai(stripped),
-        "deepseek" => normalize_canonical_deepseek(stripped),
-        "cohere" => normalize_canonical_cohere(stripped),
-        _ => stripped.to_string(),
-    }
+    normalize_canonical_openai(stripped)
 }
 
 /// Canonical OpenAI hosts. Both schemes covered for ops convenience —
@@ -294,44 +179,6 @@ fn normalize_canonical_openai(base: &str) -> String {
     for host in OPENAI_CANONICAL_HOSTS {
         if base == *host {
             return format!("{host}/v1");
-        }
-    }
-    base.to_string()
-}
-
-/// Canonical DeepSeek hosts.
-const DEEPSEEK_CANONICAL_HOSTS: &[&str] = &["https://api.deepseek.com", "http://api.deepseek.com"];
-
-/// Strip the `/v1` segment when the operator added it on the canonical
-/// DeepSeek host (a common copy-paste habit from OpenAI conventions).
-/// DeepSeek serves OpenAI-compatible endpoints at the host root.
-fn normalize_canonical_deepseek(base: &str) -> String {
-    for host in DEEPSEEK_CANONICAL_HOSTS {
-        let with_v1 = format!("{host}/v1");
-        if base == with_v1 {
-            return host.to_string();
-        }
-    }
-    base.to_string()
-}
-
-/// Canonical Cohere hosts.
-const COHERE_CANONICAL_HOSTS: &[&str] = &["https://api.cohere.com", "http://api.cohere.com"];
-
-/// Add the `/compatibility/v1` segment if and only if the operator
-/// pasted the bare canonical Cohere host. The Cohere rerank endpoint
-/// at `/v1/rerank` builds its own URL outside this bridge — that path
-/// continues to use the bare host. For chat completions Cohere serves
-/// an OpenAI-shape envelope at `/compatibility/v1/chat/completions`
-/// (per <https://docs.cohere.com/reference/chat>), so the bridge
-/// synthesizes the right prefix when the operator left it off.
-///
-/// Anything past the host root is left as-is — corporate proxies and
-/// alternative deployments win.
-fn normalize_canonical_cohere(base: &str) -> String {
-    for host in COHERE_CANONICAL_HOSTS {
-        if base == *host {
-            return format!("{host}/compatibility/v1");
         }
     }
     base.to_string()
@@ -454,12 +301,13 @@ fn prepare_outbound_body<T: serde::Serialize>(
 /// gives two layers of defense against an operator-supplied
 /// `default_headers` accidentally clobbering auth.
 ///
-/// `bridge_name` is set from [`OpenAiBridge::name`] and written as
-/// `X-AISIX-Bridge: <bridge_name>` on every outbound request. Tests
-/// capturing this header via mock-llm's `/_internal/captured-requests`
-/// can assert that `Hub.register(Provider::X, OpenAiBridge::with_name("Y"))`
-/// used the correct `with_name` value — catching a typo that pure
-/// routing assertions would miss (closes #368).
+/// `bridge_name` is the static name returned by [`Bridge::name`] for
+/// the family bridge that dispatched the request (e.g. `"openai"`,
+/// `"anthropic"`), written as `X-AISIX-Bridge: <bridge_name>` on every
+/// outbound request. Tests capturing this header via mock-llm's
+/// `/_internal/captured-requests` can assert which family bridge
+/// handled the call — catching mis-routing that pure response-shape
+/// assertions would miss.
 fn build_request_headers(
     api_key_str: &str,
     request_id: &str,
@@ -504,7 +352,7 @@ fn build_request_headers(
 #[async_trait]
 impl Bridge for OpenAiBridge {
     fn name(&self) -> &'static str {
-        self.name
+        "openai"
     }
 
     async fn chat(
@@ -526,7 +374,7 @@ impl Bridge for OpenAiBridge {
         let headers = build_request_headers(
             key,
             &ctx.request_id,
-            self.name,
+            "openai",
             false,
             ctx.provider_key.request.as_ref(),
         )?;
@@ -571,7 +419,7 @@ impl Bridge for OpenAiBridge {
         let client = self.client.clone();
         let started = Instant::now();
         let request_id = ctx.request_id.clone();
-        let bridge_name = self.name;
+        let bridge_name = "openai";
 
         with_deadline(ctx.deadline, started, async move {
             let resp = client
@@ -621,7 +469,7 @@ impl Bridge for OpenAiBridge {
         let client = self.client.clone();
         let started = Instant::now();
         let request_id = ctx.request_id.clone();
-        let bridge_name = self.name;
+        let bridge_name = "openai";
 
         with_deadline(ctx.deadline, started, async move {
             let resp = client
@@ -669,7 +517,7 @@ impl Bridge for OpenAiBridge {
         let client = self.client.clone();
         let started = Instant::now();
         let request_id = ctx.request_id.clone();
-        let bridge_name = self.name;
+        let bridge_name = "openai";
 
         with_deadline(ctx.deadline, started, async move {
             let resp = client
@@ -714,7 +562,7 @@ impl Bridge for OpenAiBridge {
         let headers = build_request_headers(
             key,
             &ctx.request_id,
-            self.name,
+            "openai",
             true,
             ctx.provider_key.request.as_ref(),
         )?;
@@ -751,7 +599,7 @@ impl Bridge for OpenAiBridge {
             .response
             .as_ref()
             .and_then(|r| r.stream_done_marker);
-        let bridge_name = self.name;
+        let bridge_name = "openai";
         let request_id_for_log = ctx.request_id.clone();
 
         let byte_stream = resp.bytes_stream();
@@ -1313,229 +1161,26 @@ data: [DONE]\n\n";
         }
     }
 
-    /// DeepSeek serves OpenAI-compatible paths at the host root; pasting
-    /// `/v1` (a common copy-paste habit from OpenAI) must be tolerated.
+    /// A non-canonical host (corporate proxy, alternative deployment,
+    /// any vendor that isn't api.openai.com) passes through verbatim
+    /// after endpoint-suffix stripping. The family bridge no longer
+    /// synthesizes vendor-specific URL prefixes — operators paste the
+    /// documented URL on the dashboard.
     #[test]
-    fn deepseek_api_base_tolerance_bare_host_and_v1_form() {
-        let bridge = OpenAiBridge::new().with_name("deepseek");
-        let canonical = "https://api.deepseek.com";
+    fn non_openai_host_passes_through_verbatim_after_suffix_strip() {
+        let bridge = OpenAiBridge::new();
 
-        for form in [
-            "https://api.deepseek.com",
-            "https://api.deepseek.com/",
-            "https://api.deepseek.com/v1",
-            "https://api.deepseek.com/v1/",
-            "https://api.deepseek.com/chat/completions",
-        ] {
-            let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_with_base(form)));
-            assert_eq!(
-                bridge.resolve_base(&ctx).unwrap(),
-                canonical,
-                "form {form:?} should normalize to {canonical}",
-            );
-        }
-    }
-
-    /// DeepSeek without an explicit api_base must default to the DeepSeek
-    /// host, not the OpenAI host. Regression for a long-standing default
-    /// fallback bug exposed during the api_base tolerance work.
-    #[test]
-    fn deepseek_default_base_targets_deepseek_not_openai() {
-        let bridge = OpenAiBridge::new().with_name("deepseek");
-        let pk: ProviderKey = serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
-        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
-        assert_eq!(
-            bridge.resolve_base(&ctx).unwrap(),
-            "https://api.deepseek.com"
-        );
-    }
-
-    /// Gemini default must target the OpenAI-compatible `/v1beta/openai`
-    /// path rather than falling through to the OpenAI host.
-    #[test]
-    fn gemini_default_base_targets_gemini_v1beta_openai() {
-        let bridge = OpenAiBridge::new().with_name("google");
-        let pk: ProviderKey = serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
-        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
-        assert_eq!(
-            bridge.resolve_base(&ctx).unwrap(),
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-        );
-    }
-
-    /// `with_name("cohere")` default must target Cohere's
-    /// OpenAI-compatible `/compatibility/v1` namespace rather than
-    /// falling through to OpenAI's host. The dashboard placeholder
-    /// (`https://api.cohere.com`) is the rerank path; for chat the
-    /// bridge synthesizes the right suffix (closes #332).
-    #[test]
-    fn cohere_default_base_targets_compatibility_v1() {
-        let bridge = OpenAiBridge::new().with_name("cohere");
-        let pk: ProviderKey = serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
-        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
-        assert_eq!(
-            bridge.resolve_base(&ctx).unwrap(),
-            "https://api.cohere.com/compatibility/v1",
-        );
-    }
-
-    /// Operators copy-paste the bare canonical Cohere host
-    /// (`https://api.cohere.com`) from rerank docs / the dashboard
-    /// placeholder. For chat the bridge synthesizes
-    /// `/compatibility/v1` so a misconfigured-but-recoverable
-    /// `api_base` still routes to Cohere's chat-compat endpoint.
-    /// Non-canonical hosts (corporate proxies) pass through verbatim
-    /// — operator-intent on a custom host wins.
-    #[test]
-    fn cohere_api_base_tolerance_bare_host_synthesizes_compatibility_prefix() {
-        let bridge = OpenAiBridge::new().with_name("cohere");
-        let canonical = "https://api.cohere.com/compatibility/v1";
-
-        for form in [
-            "https://api.cohere.com",
-            "https://api.cohere.com/",
-            "https://api.cohere.com/compatibility/v1",
-            "https://api.cohere.com/compatibility/v1/",
-            "https://api.cohere.com/compatibility/v1/chat/completions",
-        ] {
-            let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_with_base(form)));
-            assert_eq!(
-                bridge.resolve_base(&ctx).unwrap(),
-                canonical,
-                "form {form:?} should normalize to {canonical}",
-            );
-        }
-
-        // Non-canonical host passes through after suffix stripping.
-        let custom = "https://proxy.acme.internal/cohere-chat";
-        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_with_base(custom)));
-        assert_eq!(
-            bridge.resolve_base(&ctx).unwrap(),
-            custom,
-            "non-canonical host must NOT be rewritten",
-        );
-    }
-
-    /// End-to-end chat flow through the `cohere`-named bridge:
-    /// outbound URL matches the chat-compat namespace and the
-    /// OpenAI envelope round-trips without translation. Pins the
-    /// contract Hub.register relies on.
-    #[tokio::test]
-    async fn cohere_chat_compat_round_trips_openai_envelope() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .and(header("authorization", "Bearer cohere-key"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": "cmpl-cohere",
-                "model": "command-r",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "hello from cohere"},
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
-            })))
-            .mount(&server)
-            .await;
-
-        let bridge = OpenAiBridge::new().with_name("cohere");
-        let pk_json = format!(
-            r#"{{"display_name":"cohere-prod","secret":"cohere-key","api_base":"{}"}}"#,
-            server.uri()
-        );
-        let pk: Arc<ProviderKey> = Arc::new(serde_json::from_str(&pk_json).unwrap());
-        let ctx = BridgeContext::new("rid", sample_model(), pk);
-        let resp = bridge.chat(&req(), &ctx).await.unwrap();
-
-        assert_eq!(resp.id, "cmpl-cohere");
-        assert_eq!(resp.message.role, Role::Assistant);
-        assert_eq!(resp.message.content, "hello from cohere");
-        assert_eq!(resp.usage.total_tokens, 7);
-    }
-
-    /// Each long-tail OpenAI-adapter provider's `with_name(...)` variant
-    /// (#60 P2-A) must fall back to the vendor-specific default base
-    /// when the operator left `api_base` empty on the PK. A regression
-    /// that lost the arm for any single variant would silently route
-    /// that provider's chat traffic to OpenAI's API host —
-    /// catastrophically leaking the customer's tokens AND the
-    /// upstream's vendor identity.
-    #[test]
-    fn long_tail_with_name_variants_default_base_targets_vendor_endpoint() {
-        let expected = [
-            ("groq", "https://api.groq.com/openai/v1"),
-            ("mistral", "https://api.mistral.ai/v1"),
-            ("togetherai", "https://api.together.ai/v1"),
-            ("fireworks-ai", "https://api.fireworks.ai/inference/v1"),
-            ("perplexity", "https://api.perplexity.ai"),
-            ("moonshotai", "https://api.moonshot.cn/v1"),
-            (
-                "alibaba",
-                "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            ),
-            ("zhipuai", "https://open.bigmodel.cn/api/paas/v4"),
-            ("baseten", "https://inference.baseten.co/v1"),
-            ("huggingface", "https://router.huggingface.co/v1"),
-            ("cerebras", "https://api.cerebras.ai/v1"),
-        ];
-        for (name, expected_base) in expected {
-            let bridge = OpenAiBridge::new().with_name(name);
-            let pk: ProviderKey =
-                serde_json::from_str(r#"{"display_name":"x","secret":"k"}"#).unwrap();
-            let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
-            assert_eq!(
-                bridge.resolve_base(&ctx).unwrap(),
-                expected_base,
-                "with_name(\"{name}\") must fall back to {expected_base} when api_base is unset; \
-                 a missing arm silently routes the provider to OpenAI's API host"
-            );
-        }
-    }
-
-    /// Operator-supplied `api_base` always wins. The long-tail
-    /// providers don't get the canonical-host synthesis tolerance
-    /// that openai / deepseek / cohere have, because their URL
-    /// conventions vary (some have `/v1`, some `/openai/v1`, some
-    /// `/inference/v1`, some `/api/paas/v4`) — the bridge can't
-    /// guess. Operators paste the documented URL on the dashboard.
-    /// This test pins that override semantic.
-    #[test]
-    fn long_tail_with_name_variants_respect_operator_api_base() {
-        let bridge = OpenAiBridge::new().with_name("groq");
-        let custom = "https://corporate-proxy.acme.internal/groq";
-        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_with_base(custom)));
-        assert_eq!(
-            bridge.resolve_base(&ctx).unwrap(),
-            custom,
-            "operator-supplied api_base must pass through for long-tail providers"
-        );
-    }
-
-    /// For Gemini and any future `with_name` variant, the bridge does not
-    /// synthesize a `/v1beta/openai` prefix — the path is non-trivial. It
-    /// still strips an accidentally-pasted endpoint suffix.
-    #[test]
-    fn gemini_api_base_strips_endpoint_suffix_but_does_not_synthesize_prefix() {
-        let bridge = OpenAiBridge::new().with_name("google");
-
-        // Canonical form passes through.
-        let canonical = "https://generativelanguage.googleapis.com/v1beta/openai";
-        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_with_base(canonical)));
-        assert_eq!(bridge.resolve_base(&ctx).unwrap(), canonical);
-
-        // Endpoint suffix is stripped.
+        // Endpoint suffix is stripped on any host.
         let with_suffix =
             "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+        let canonical = "https://generativelanguage.googleapis.com/v1beta/openai";
         let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_with_base(with_suffix)));
         assert_eq!(bridge.resolve_base(&ctx).unwrap(), canonical);
 
-        // Bare host is left as-is — the operator's responsibility to
-        // include the unusual prefix. (See provider-keys.md for the
-        // per-provider truth table.)
-        let bare = "https://generativelanguage.googleapis.com";
-        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_with_base(bare)));
-        assert_eq!(bridge.resolve_base(&ctx).unwrap(), bare);
+        // Corporate proxy: pass-through.
+        let custom = "https://corporate-proxy.acme.internal/groq";
+        let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk_with_base(custom)));
+        assert_eq!(bridge.resolve_base(&ctx).unwrap(), custom);
     }
 
     // ----------- issue #302 §5 wire-in: RequestOverrides -----------
@@ -1970,37 +1615,17 @@ data: [DONE]\n";
         bridge.chat(&req(), &ctx).await.unwrap();
     }
 
-    /// `OpenAiBridge::new().with_name("perplexity")` sends
-    /// `x-aisix-bridge: perplexity`. Catches a Hub.register typo like
-    /// `OpenAiBridge::new().with_name("groq")` registered under
-    /// `Provider::Perplexity` — the wrong header value would cause the
-    /// wiremock matcher to fall through to a 404 in an e2e test.
+    /// Streaming path also sets `x-aisix-bridge: openai` on the
+    /// outbound SSE request.
     #[tokio::test]
-    async fn chat_emits_x_aisix_bridge_for_with_name_variant() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .and(header("x-aisix-bridge", "perplexity"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(ok_chat_response()))
-            .mount(&server)
-            .await;
-
-        let bridge = OpenAiBridge::new().with_name("perplexity");
-        let ctx = sample_ctx(&server.uri());
-        bridge.chat(&req(), &ctx).await.unwrap();
-    }
-
-    /// Same contract for the streaming path: `chat_stream` also sets
-    /// `x-aisix-bridge` on the outbound SSE request.
-    #[tokio::test]
-    async fn chat_stream_emits_x_aisix_bridge_for_with_name_variant() {
+    async fn chat_stream_emits_x_aisix_bridge_openai() {
         use futures::StreamExt;
 
         let server = MockServer::start().await;
         let sse = "data: {\"id\":\"cmpl-s\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(header("x-aisix-bridge", "groq"))
+            .and(header("x-aisix-bridge", "openai"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("content-type", "text/event-stream")
@@ -2009,7 +1634,7 @@ data: [DONE]\n";
             .mount(&server)
             .await;
 
-        let bridge = OpenAiBridge::new().with_name("groq");
+        let bridge = OpenAiBridge::new();
         let ctx = sample_ctx(&server.uri());
         let mut stream = bridge.chat_stream(&req(), &ctx).await.unwrap();
         // Drain the stream to completion — the mock match already verified

@@ -112,14 +112,15 @@ async fn dispatch(
 
     // Provider routing key, derived from `model.provider` as a
     // lowercase string. Per #302 Phase A this dispatch path
-    // identifies Cohere/Jina by string rather than by `Provider`
-    // enum variant so that, when the `Provider` enum is later
-    // collapsed into the closed `Adapter` set, this file does not
-    // depend on variants (`Provider::Cohere`, `Provider::Jina`)
-    // that are slated for removal. The string values
-    // ("openai", "cohere", "jina") are the same labels emitted in
-    // metrics/access logs today, so dashboards keep working
-    // unchanged.
+    // identifies Cohere/Jina by their models.dev catalog id rather
+    // than by a closed enum variant — the `Provider` enum was
+    // collapsed into the open `ProviderKey.provider` string and
+    // closed 5-value `Adapter` set, and rerank's vendor-specific
+    // wire shape (Cohere/Jina each have a native rerank surface)
+    // doesn't fit either of those, so it stays keyed on the
+    // catalog string. The string values ("openai", "cohere",
+    // "jina") are the same labels emitted in metrics/access logs
+    // today, so dashboards keep working unchanged.
     let provider_label = model
         .provider
         .clone()
@@ -252,12 +253,13 @@ async fn dispatch(
 
 /// Default upstream host for the rerank-supporting providers,
 /// keyed by the lowercase provider string. Per #302 Phase A this
-/// is intentionally a string-keyed match (not a `Provider` enum
-/// match) so the file does not depend on `Provider::Cohere` /
-/// `Provider::Jina` variants that are slated for removal. The
-/// `{"openai", "cohere", "jina"}` set mirrors the rerank gate in
-/// `dispatch`; any other string returns `None` and the caller
-/// falls back to OpenAI's host.
+/// is a string-keyed match: the `Provider` enum has been replaced
+/// with the open `ProviderKey.provider` string, and rerank's
+/// vendor-specific wire shapes (Cohere and Jina each have a
+/// native rerank surface) don't fit the closed 5-value `Adapter`
+/// set the family bridges use. The `{"openai", "cohere", "jina"}`
+/// set mirrors the rerank gate in `dispatch`; any other string
+/// returns `None` and the caller falls back to OpenAI's host.
 fn default_base_for_provider(provider: &str) -> Option<String> {
     match provider {
         "openai" => Some("https://api.openai.com".to_string()),

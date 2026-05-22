@@ -19,7 +19,7 @@
       ]
     },
     "api_base": {
-      "description": "Override for the upstream base URL. Empty/None means the provider default applies (see `Provider::default_base_url`).",
+      "description": "Override for the upstream base URL. Empty/None is rejected by the family bridges for any vendor whose identity isn't `\"openai\"` — see `OpenAiBridge::resolve_base` for the safety guard that prevents a missing api_base from silently routing non-OpenAI traffic to `api.openai.com`. cp-api populates this from `adapter_map.yaml`'s `default_base_url` / `provider_metadata.api_base_url`.",
       "type": [
         "string",
         "null"
@@ -75,7 +75,7 @@
   "additionalProperties": false,
   "definitions": {
     "Adapter": {
-      "description": "Wire-shape adapter used to talk to an upstream. This is the closed set of upstream protocols the gateway knows how to encode against — distinct from a vendor identity (which is captured separately on `ProviderKey`).\n\nIntroduced as a skeleton for issue #302 Phase A. This type is purely additive in this PR: nothing in the gateway dispatches off `Adapter` yet, no entity field is changed, and `Provider` continues to drive all runtime behavior. Follow-up PRs in Phase A migrate entities and the Hub to consume `Adapter` directly.\n\nNote on serde casing: `Adapter` uses `kebab-case` so the `AzureOpenai` variant serializes as `\"azure-openai\"`. This intentionally differs from `Provider`'s `lowercase` casing, which produced no hyphens because all current `Provider` names are single tokens.",
+      "description": "Wire-shape adapter used to talk to an upstream. This is the closed set of upstream protocols the gateway knows how to encode against — distinct from a vendor identity (which is captured separately on `ProviderKey.provider` as an open string).\n\nPost-#302 Phase A clean cut, dispatch is two-tier: the Hub looks up a specialized bridge by the open `ProviderKey.provider` string first, then falls back to the closed `Adapter` family bridge. Any new long-tail OpenAI-compat vendor cp-api admits (xai, openrouter, cerebras, …) routes through the `Adapter::Openai` family bridge without a DP code change.\n\nNote on serde casing: `Adapter` uses `kebab-case` so the `AzureOpenai` variant serializes as `\"azure-openai\"`.",
       "type": "string",
       "enum": [
         "openai",

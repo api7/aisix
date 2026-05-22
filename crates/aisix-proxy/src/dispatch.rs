@@ -191,9 +191,10 @@ pub(crate) fn resolve_base_url(provider_key: &ProviderKey) -> Result<String, Pro
 /// Build a `/v1`-prefixed upstream URL while tolerating either
 /// convention for the configured `api_base`:
 ///
-/// * `https://api.openai.com` builds `…/v1/<path>` — the provider
-///   default convention used by `Provider::Openai.default_base_url()`
-///   and `aisix-proxy`'s pre-existing handlers.
+/// * `https://api.openai.com` builds `…/v1/<path>` — the bare-host
+///   convention `OpenAiBridge::resolve_base` synthesizes when the
+///   operator leaves the trailing `/v1` off (the same form
+///   `aisix-proxy`'s pre-existing handlers use directly).
 /// * `https://api.openai.com/v1` also builds `…/v1/<path>` — the
 ///   OpenAI SDK convention every published example uses, and the
 ///   exact placeholder the dashboard's provider-keys form pre-fills.
@@ -488,8 +489,8 @@ mod tests {
 
     #[test]
     fn build_v1_url_appends_v1_when_base_lacks_it() {
-        // Provider-default convention (Provider::Openai.default_base_url()
-        // returns `https://api.openai.com`, no /v1).
+        // Bare-host convention: the operator pasted
+        // `https://api.openai.com` without the trailing `/v1`.
         assert_eq!(
             build_v1_url("https://api.openai.com", "/responses"),
             "https://api.openai.com/v1/responses",

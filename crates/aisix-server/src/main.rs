@@ -766,20 +766,16 @@ fn load_heartbeat_config_from_disk(
 /// Hub. The Hub is created once at startup; future dynamic reload
 /// lands behind the same `register()` call.
 ///
-/// `Provider::Jina` is intentionally NOT registered: per #213 Phase 2
-/// Jina is exposed only via `/v1/rerank`, which is a verbatim HTTP
-/// forward (`aisix-proxy::rerank`) and bypasses the Bridge trait
-/// entirely.
+/// Jina is intentionally NOT registered: per #213 Phase 2 Jina is
+/// exposed only via `/v1/rerank`, which is a verbatim HTTP forward
+/// (`aisix-proxy::rerank`) and bypasses the Bridge trait entirely.
 ///
-/// `Provider::Cohere` is registered against the OpenAI-compatible
-/// chat endpoint at `https://api.cohere.com/compatibility/v1` (per
-/// <https://docs.cohere.com/reference/chat>). Cohere's rerank surface
-/// at `/v1/rerank` continues to bypass the Bridge via
-/// `aisix-proxy::rerank` — the bridge here only serves `chat/completions`,
-/// `embeddings`, and the other OpenAI-shape endpoints the bridge
-/// supports. The chat-compat namespace gives an exact OpenAI envelope
-/// shape so `OpenAiBridge::with_name("cohere")` can serve it directly
-/// (closes #332).
+/// Cohere chat is served by the `Adapter::Openai` family bridge —
+/// cp-api stores Cohere's PK with `adapter: "openai"` and `api_base`
+/// pointing at `https://api.cohere.com/compatibility/v1` (per
+/// <https://docs.cohere.com/reference/chat>). Cohere's `/v1/rerank`
+/// native surface is keyed off `ProviderKey.provider == "cohere"` in
+/// `crates/aisix-proxy/src/rerank.rs` and bypasses the Bridge.
 fn build_hub() -> Hub {
     let hub = Hub::new();
 
@@ -800,44 +796,22 @@ fn build_hub() -> Hub {
     hub.register_family(Adapter::AzureOpenai, Arc::new(AzureOpenAiBridge::new()));
     hub.register_family(Adapter::Bedrock, Arc::new(BedrockBridge::new()));
 
-    // ─── Specialized vendor bridges (open string, vendor identity) ───
+    // ─── Specialized vendor bridges (one-cycle compat shim) ──────────
     //
-    // Override the family default for vendors whose handling diverges
-    // from the wire-shape baseline. Each vendor is keyed on its
-    // models.dev catalog id, matching `ProviderKey.provider`.
+    // Pre-Phase-A ProviderKeys on disk may carry `provider` but no
+    // `adapter` field (cp-api started writing `adapter` at the same
+    // commit as Phase A — older rows haven't been resaved). Without
+    // these explicit specialized registrations, `dispatch_two_tier`
+    // would fall through to the None branch and 503 those PKs.
     //
-    // - `google`: OpenAI-compat Gemini at `/v1beta/openai` (matches
-    //   `OpenAiBridge::default` but tagged for metrics + log labels).
-    // - `deepseek`: OpenAI-compat with `delta.reasoning_content` lift
-    //   for the R1 family (the `with_name` value drives the metric
-    //   label so dashboards can slice DeepSeek-specific reasoning
-    //   traffic).
-    // - `cohere`: chat-compat namespace at `/compatibility/v1`. cp-api
-    //   stores Cohere's PK with `adapter: "openai"` and the bridge
-    //   here handles the chat path; the `/v1/rerank` native path is
-    //   keyed off `ProviderKey.provider == "cohere"` in
-    //   `crates/aisix-proxy/src/rerank.rs`.
-    //
-    // Every other catalog vendor (groq, mistral, xai, openrouter,
-    // fireworks-ai, perplexity, moonshotai, alibaba, zhipuai,
-    // baseten, huggingface, cerebras, togetherai, plus the long
-    // tail) falls through to `Adapter::Openai` family above. The DP
-    // does NOT enumerate them. cp-api populates `api_base` from
-    // adapter_map's `default_base_url` or `provider_metadata.api_base_url`.
-    // First-class vendors with their canonical metric labels. `openai`
-    // / `anthropic` shadow the family bridge — same bridge instance,
-    // explicit registration here keeps test fixtures and pre-Phase-A
-    // payloads (which carry `provider` but may not yet carry
-    // `adapter`) routing correctly without falling through to the
-    // None branch in `dispatch_two_tier`.
+    // Only `openai` and `anthropic` are registered — every other
+    // vendor only existed in the catalog post-Phase-A (Phase A added
+    // them as long-tail OpenAI-compat) and is guaranteed to have
+    // `adapter` populated, so the family bridge above already covers
+    // them. Once cp-api has resaved all pre-Phase-A rows these two
+    // entries become safe to delete.
     hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
     hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-    hub.register_specialized("google", Arc::new(OpenAiBridge::new().with_name("google")));
-    hub.register_specialized(
-        "deepseek",
-        Arc::new(OpenAiBridge::new().with_name("deepseek")),
-    );
-    hub.register_specialized("cohere", Arc::new(OpenAiBridge::new().with_name("cohere")));
 
     hub
 }
@@ -1102,24 +1076,20 @@ mod tests {
         assert!(err.to_string().contains("cp_base_url"), "unexpected: {err}");
     }
 
-    /// `build_hub()` must register `Provider::Cohere` against the
-    /// `with_name("cohere")` variant of [`OpenAiBridge`] — the only
-    /// thing that ties the Provider enum to the chat-compat URL
-    /// `build_hub()` must register `cohere` as a specialized bridge
-    /// against `OpenAiBridge::with_name("cohere")` so chat-compat
-    /// traffic carries the right metric label and resolves through
-    /// the chat-compat namespace (closes #332).
+    /// `build_hub()` must NOT register `cohere` as a specialized chat
+    /// bridge. Post-#302 Phase A, Cohere's chat surface is served by
+    /// the `Adapter::Openai` family bridge: cp-api stores Cohere's PK
+    /// with `adapter: "openai"` and `api_base: "https://api.cohere.com/compatibility/v1"`
+    /// (per <https://docs.cohere.com/reference/chat>). A specialized
+    /// chat bridge here would re-introduce the vendor-enumeration
+    /// pattern the clean cut deleted.
     #[test]
-    fn build_hub_registers_cohere_chat_compat_variant() {
+    fn build_hub_does_not_register_cohere_as_specialized_chat_bridge() {
         let hub = build_hub();
-        let bridge = hub
-            .get_specialized("cohere")
-            .expect("cohere must have a specialized bridge for chat-compat");
-        assert_eq!(
-            bridge.name(),
-            "cohere",
-            "specialized cohere bridge MUST be `OpenAiBridge::with_name(\"cohere\")` so \
-             the metric label is `cohere` and dashboards keep working",
+        assert!(
+            hub.get_specialized("cohere").is_none(),
+            "cohere chat must fall through to `Adapter::Openai` family — \
+             a specialized chat registration re-introduces the deleted vendor-enumeration pattern",
         );
     }
 

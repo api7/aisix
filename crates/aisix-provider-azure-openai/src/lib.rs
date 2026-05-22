@@ -24,7 +24,7 @@
 //!   bridge supports api-key only (the common case). AAD support will
 //!   land alongside the cp-api `auth_scheme` field becoming routable.
 //!
-//! # Why Azure-OpenAI is a separate bridge (not OpenAiBridge::with_name)
+//! # Why Azure-OpenAI is a separate `Adapter::AzureOpenai` family bridge
 //!
 //! 1. **Auth header differs** — Azure uses `api-key: <key>`, not
 //!    `Authorization: Bearer <key>`. The OpenAiBridge's header-builder

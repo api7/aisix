@@ -3850,14 +3850,15 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert!(body.contains("data: [DONE]"));
     }
 
-    /// (OpenAI inbound) × (Gemini upstream). Gemini's bridge is a
-    /// thin wrapper around the OpenAi-compat `/chat/completions`
-    /// endpoint, so the upstream wire is OpenAI-shape — but the
-    /// `Hub.get(Provider::Google)` lookup must still resolve to the
-    /// Gemini-specific bridge instance (different metrics label,
-    /// different default base URL behavior).
+    /// (OpenAI inbound) × (Gemini upstream). Gemini is served by the
+    /// `Adapter::Openai` family bridge — cp-api stores the Gemini PK
+    /// with `adapter: "openai"` and `api_base` pointing at Google's
+    /// `/v1beta/openai` compat endpoint. The integration test pins
+    /// that an inbound OpenAI request resolves through the family
+    /// bridge and round-trips Gemini's OpenAI-shape response.
     #[tokio::test]
     async fn matrix_openai_in_gemini_upstream_non_streaming() {
+        use aisix_core::Adapter;
         use aisix_provider_openai::OpenAiBridge;
 
         let upstream = MockServer::start().await;
@@ -3882,7 +3883,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-gemini"]));
         let hub = Arc::new(Hub::new());
-        hub.register_specialized("google", Arc::new(OpenAiBridge::new().with_name("google")));
+        hub.register_family(Adapter::Openai, Arc::new(OpenAiBridge::new()));
         let app = build_router(build_state(snap, hub));
 
         let body = serde_json::json!({
@@ -3904,12 +3905,15 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(v["usage"]["total_tokens"], 9);
     }
 
-    /// (OpenAI inbound) × (DeepSeek upstream). Mirrors the Gemini
-    /// case: DeepSeek's bridge is OpenAi-compat with Bearer auth +
-    /// a different `name()` for metrics. The integration test pins
-    /// that `Provider::Deepseek` resolves correctly.
+    /// (OpenAI inbound) × (DeepSeek upstream). DeepSeek is served by
+    /// the `Adapter::Openai` family bridge — cp-api stores the
+    /// DeepSeek PK with `adapter: "openai"` and `api_base` pointing
+    /// at `https://api.deepseek.com`. The integration test pins
+    /// that an inbound OpenAI request resolves through the family
+    /// bridge and round-trips DeepSeek's OpenAI-shape response.
     #[tokio::test]
     async fn matrix_openai_in_deepseek_upstream_non_streaming() {
+        use aisix_core::Adapter;
         use aisix_provider_openai::OpenAiBridge;
 
         let upstream = MockServer::start().await;
@@ -3936,10 +3940,7 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         snap.apikeys
             .insert(apikey_entry("sk-caller", &["my-deepseek"]));
         let hub = Arc::new(Hub::new());
-        hub.register_specialized(
-            "deepseek",
-            Arc::new(OpenAiBridge::new().with_name("deepseek")),
-        );
+        hub.register_family(Adapter::Openai, Arc::new(OpenAiBridge::new()));
         let app = build_router(build_state(snap, hub));
 
         let body = serde_json::json!({
