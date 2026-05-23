@@ -30,6 +30,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::{Stream, StreamExt};
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1895,6 +1896,9 @@ struct StreamCompletion {
     /// never crossed the wire. Issue #419.
     chunks_delivered: u32,
 }
+
+/// Parameters needed to run output-guardrail evaluation at
+/// end-of-stream. Per #204 the streaming path used to skip output
 /// guardrails entirely — a `kind: "keyword"` deny-list could be
 /// trivially bypassed by setting `stream: true`. Buffer-then-check
 /// is the right cadence for blocking guardrails (per-chunk evaluation
@@ -1926,6 +1930,19 @@ struct CompleteOnDrop<F: FnOnce(StreamCompletion)> {
     /// natural drop is also safe (we don't currently use that, but
     /// it leaves the door open).
     slot: Option<(F, StreamCompletion)>,
+    /// Shared counter of SSE events that crossed the wire to the
+    /// consumer. Written by `DeliveryCounter` on each `poll_next ->
+    /// Ready(Some(_))`. Read at Drop time to gate completion-side
+    /// counters (issue #419).
+    ///
+    /// Why a shared atomic rather than a field on `StreamCompletion`
+    /// incremented post-yield: `async_stream::stream!` resumes
+    /// post-yield code only on the **next** consumer poll, so a
+    /// consumer that pulls N chunks then disconnects leaves the
+    /// counter at N-1, not N. Counting at the wrapper's `poll_next`
+    /// returning `Ready(Some(_))` is exact — that's the moment the
+    /// item handed to the consumer.
+    delivered: Arc<AtomicU32>,
 }
 
 impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
@@ -1941,6 +1958,10 @@ impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
 impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
     fn drop(&mut self) {
         if let Some((f, mut c)) = self.slot.take() {
+            // Snapshot the wire-delivered count for telemetry visibility
+            // AND for the cost-leak gate below.
+            let delivered = self.delivered.load(Ordering::Relaxed);
+            c.chunks_delivered = delivered;
             // Issue #419 — cost-leak gate. If the consumer disconnected
             // before any chunk was delivered (e.g. AbortController.abort()
             // mid-`upstream.next().await`, or axum dropped the response
@@ -1950,7 +1971,7 @@ impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
             // completion-side counters but keep `prompt_tokens` (the
             // prompt was processed by upstream regardless, and the
             // industry contract is "prompts always billed").
-            if c.chunks_delivered == 0 {
+            if delivered == 0 {
                 c.completion_tokens = 0;
                 c.reasoning_tokens = 0;
                 c.cache_creation_tokens = 0;
@@ -1976,7 +1997,14 @@ fn build_sse_stream<F>(
 where
     F: FnOnce(StreamCompletion) + Send + 'static,
 {
-    async_stream::stream! {
+    // Shared counter for delivered SSE events. Written by the
+    // `DeliveryCounter` wrapper below on each `poll_next ->
+    // Ready(Some(_))`; read by `CompleteOnDrop::drop` to gate
+    // completion-side counters when the consumer disconnected before
+    // any chunk reached the wire (#419).
+    let delivered = Arc::new(AtomicU32::new(0));
+    let delivered_for_drop = Arc::clone(&delivered);
+    let inner = async_stream::stream! {
         // Hold on_complete + the running StreamCompletion accumulator
         // inside a Drop guard so on_complete fires even on client-
         // disconnect cancellation. See `CompleteOnDrop` above for the
@@ -1984,6 +2012,7 @@ where
         // yield only runs on consumer pulls.
         let mut guard = CompleteOnDrop {
             slot: Some((on_complete, StreamCompletion::default())),
+            delivered: delivered_for_drop,
         };
         futures::pin_mut!(upstream);
         // Per #204: accumulate the assistant's content across chunks
@@ -2090,12 +2119,11 @@ where
                 }
             };
             yield Ok::<_, Infallible>(ev);
-            // Issue #419 — post-yield. async_stream::stream! suspends
-            // at `yield`; this line runs only when the consumer pulls
-            // the next item, which means the previously yielded
-            // event was actually retrieved. Saturating-add caps at
-            // u32::MAX so an unbounded-length stream doesn't wrap.
-            guard.comp().chunks_delivered = guard.comp().chunks_delivered.saturating_add(1);
+            // Delivery is counted by the outer DeliveryCounter wrapper
+            // at poll_next time, not here — async_stream's yield
+            // suspends BEFORE the consumer has actually pulled, so
+            // a post-yield increment under-counts by 1 on every
+            // abort path (#419, audit follow-up).
         }
         // Per #204: run the output guardrail on the accumulated
         // assistant content BEFORE emitting `[DONE]`. Buffer-then-
@@ -2193,6 +2221,42 @@ where
         // drops at the suspension point inside the loop; Drop fires
         // there with whatever StreamCompletion has been captured up
         // to that point.
+    };
+    DeliveryCounter {
+        inner: Box::pin(inner),
+        delivered,
+    }
+}
+
+/// Stream wrapper that increments `delivered` on every `poll_next ->
+/// Ready(Some(_))`. This is the canonical "consumer actually received
+/// this item" signal — it fires AT the moment axum's SSE driver pulls
+/// the event off. Pair with `CompleteOnDrop` so the Drop guard can
+/// read the exact count even on mid-stream cancellation. Issue #419.
+///
+/// The inner stream is `Pin<Box<dyn Stream<...> + Send>>` so this
+/// wrapper itself is `Unpin` and avoids the `forbid(unsafe_code)`
+/// pin-projection dance. The boxing is per-request and negligible
+/// against the rest of the chat-completion hot path.
+struct DeliveryCounter<T> {
+    inner: std::pin::Pin<Box<dyn Stream<Item = T> + Send>>,
+    delivered: Arc<AtomicU32>,
+}
+
+impl<T> Stream for DeliveryCounter<T> {
+    type Item = T;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(item)) => {
+                self.delivered.fetch_add(1, Ordering::Relaxed);
+                std::task::Poll::Ready(Some(item))
+            }
+            other => other,
+        }
     }
 }
 
@@ -2529,22 +2593,25 @@ mod complete_on_drop_tests {
     //! who aborted mid-await was still billed for tokens the gateway
     //! never delivered.
     //!
-    //! The gate uses `chunks_delivered`, incremented post-yield in
-    //! the stream body. `async_stream::stream!` resumes post-yield
-    //! code only when the consumer pulls the next item, so a
-    //! non-zero `chunks_delivered` value is a reliable
-    //! "delivered-to-client" signal.
+    //! Delivery counting is driven by the `DeliveryCounter` stream
+    //! wrapper: every `poll_next -> Ready(Some(_))` increments the
+    //! shared `Arc<AtomicU32>`. `CompleteOnDrop::drop` reads that
+    //! atomic and gates the completion-side counters on zero.
     //!
     //! These tests exercise the Drop logic directly — no real
-    //! upstream stream, no axum, no httptest. Just construct a
-    //! StreamCompletion with the field values that would arise
-    //! from the post-yield path, drop, observe the callback args.
-    use super::{CompleteOnDrop, StreamCompletion};
+    //! upstream stream, no axum, no httptest. Construct a
+    //! StreamCompletion, set the shared atomic to simulate "N
+    //! chunks delivered to the consumer", drop, observe the
+    //! callback args.
+    use super::{AtomicU32, CompleteOnDrop, Ordering, StreamCompletion};
     use std::sync::{Arc, Mutex};
 
-    fn drop_and_capture(comp: StreamCompletion) -> StreamCompletion {
+    /// Build the guard with `delivered_count` pre-set on the
+    /// shared atomic, drop it, return whatever on_complete received.
+    fn drop_and_capture(comp: StreamCompletion, delivered_count: u32) -> StreamCompletion {
         let captured: Arc<Mutex<Option<StreamCompletion>>> = Arc::new(Mutex::new(None));
         let cap = captured.clone();
+        let delivered = Arc::new(AtomicU32::new(delivered_count));
         {
             let guard = CompleteOnDrop {
                 slot: Some((
@@ -2553,6 +2620,7 @@ mod complete_on_drop_tests {
                     },
                     comp,
                 )),
+                delivered,
             };
             drop(guard);
         }
@@ -2564,9 +2632,9 @@ mod complete_on_drop_tests {
     fn no_chunks_delivered_zeroes_completion_tokens() {
         // Simulated state: upstream emitted a usage block populating
         // completion_tokens=5, but the consumer aborted before any
-        // chunk was pulled (chunks_delivered stayed 0). Drop must
-        // zero completion-side counters so the customer isn't billed
-        // for tokens that never crossed the wire.
+        // chunk crossed the wire (DeliveryCounter atomic stayed 0).
+        // Drop must zero completion-side counters so the customer
+        // isn't billed for tokens that never reached them.
         let mut comp = StreamCompletion::default();
         comp.prompt_tokens = 10;
         comp.completion_tokens = 5;
@@ -2574,13 +2642,12 @@ mod complete_on_drop_tests {
         comp.reasoning_tokens = 2;
         comp.cache_creation_tokens = 1;
         comp.cache_read_tokens = 1;
-        comp.chunks_delivered = 0; // ← client never received anything
 
-        let out = drop_and_capture(comp);
+        let out = drop_and_capture(comp, 0);
 
         assert_eq!(
             out.completion_tokens, 0,
-            "completion_tokens must zero when chunks_delivered==0 (#419)"
+            "completion_tokens must zero when delivered==0 (#419)"
         );
         assert_eq!(out.reasoning_tokens, 0, "reasoning_tokens must zero");
         assert_eq!(out.cache_creation_tokens, 0, "cache_creation must zero");
@@ -2593,11 +2660,12 @@ mod complete_on_drop_tests {
             out.total_tokens, 10,
             "total_tokens recomputed = prompt_tokens only when completion-side zeroed"
         );
+        assert_eq!(out.chunks_delivered, 0, "Drop must persist delivered count");
     }
 
     #[test]
     fn one_chunk_delivered_preserves_completion_tokens() {
-        // At least one chunk was pulled by the consumer (could be a
+        // At least one chunk reached the consumer (could be a
         // role-only chunk + abort, or full stream + clean exit).
         // Either way, the upstream usage block is the source of
         // truth — pass through unchanged.
@@ -2606,31 +2674,32 @@ mod complete_on_drop_tests {
         comp.completion_tokens = 5;
         comp.total_tokens = 15;
         comp.reasoning_tokens = 2;
-        comp.chunks_delivered = 1; // ← at least one chunk reached the client
 
-        let out = drop_and_capture(comp);
+        let out = drop_and_capture(comp, 1);
 
         assert_eq!(
             out.completion_tokens, 5,
-            "completion_tokens preserved when at least one chunk delivered"
+            "completion_tokens preserved when delivered>=1"
         );
         assert_eq!(out.reasoning_tokens, 2);
         assert_eq!(out.total_tokens, 15);
         assert_eq!(out.prompt_tokens, 10);
+        assert_eq!(out.chunks_delivered, 1);
     }
 
     #[test]
     fn no_chunks_no_prompt_zero_total() {
         // Edge: connection dropped so early the upstream didn't even
-        // confirm prompt_tokens. Drop should still produce a clean
-        // zeroed completion-side and prompt_tokens=0.
-        let comp = StreamCompletion::default(); // all zeros, chunks_delivered=0
+        // confirm prompt_tokens. Drop produces a clean zeroed
+        // completion-side AND prompt_tokens=0.
+        let comp = StreamCompletion::default(); // all zeros
 
-        let out = drop_and_capture(comp);
+        let out = drop_and_capture(comp, 0);
 
         assert_eq!(out.completion_tokens, 0);
         assert_eq!(out.prompt_tokens, 0);
         assert_eq!(out.total_tokens, 0);
+        assert_eq!(out.chunks_delivered, 0);
     }
 
     #[test]
@@ -2644,9 +2713,8 @@ mod complete_on_drop_tests {
         comp.total_tokens = 350;
         comp.cached_prompt_tokens = 30;
         comp.reasoning_tokens = 50;
-        comp.chunks_delivered = 42;
 
-        let out = drop_and_capture(comp);
+        let out = drop_and_capture(comp, 42);
 
         assert_eq!(out.prompt_tokens, 100);
         assert_eq!(out.completion_tokens, 250);
@@ -2654,5 +2722,127 @@ mod complete_on_drop_tests {
         assert_eq!(out.cached_prompt_tokens, 30);
         assert_eq!(out.reasoning_tokens, 50);
         assert_eq!(out.chunks_delivered, 42);
+    }
+}
+
+#[cfg(test)]
+mod delivery_counter_tests {
+    //! Integration-style test for the `DeliveryCounter` wrapper +
+    //! `CompleteOnDrop` collaboration (audit follow-up to the
+    //! original #419 fix). The audit's HIGH-1 finding showed that
+    //! the original post-yield approach under-counted by 1 on
+    //! every abort path. This test would have caught that.
+    //!
+    //! Builds a real `Stream` via async_stream::stream!, pulls N
+    //! items via `.next().await`, drops the stream, asserts the
+    //! `chunks_delivered` value the on_complete callback received
+    //! matches N exactly.
+    use super::{AtomicU32, CompleteOnDrop, DeliveryCounter, Ordering, StreamCompletion};
+    use futures::Stream;
+    use futures::StreamExt;
+    use std::sync::{Arc, Mutex};
+
+    /// Build a minimal stream that mirrors `build_sse_stream`'s
+    /// shape: an async_stream yielding N units, wrapped in
+    /// CompleteOnDrop + DeliveryCounter. The on_complete callback
+    /// stores the received StreamCompletion in `captured`.
+    fn build_test_stream(
+        items: u32,
+        captured: Arc<Mutex<Option<StreamCompletion>>>,
+    ) -> impl Stream<Item = u32> {
+        let delivered = Arc::new(AtomicU32::new(0));
+        let delivered_for_drop = Arc::clone(&delivered);
+        let inner = async_stream::stream! {
+            let mut guard = CompleteOnDrop {
+                slot: Some((
+                    move |c: StreamCompletion| {
+                        *captured.lock().unwrap() = Some(c);
+                    },
+                    StreamCompletion {
+                        prompt_tokens: 10,
+                        completion_tokens: 5,
+                        total_tokens: 15,
+                        ..Default::default()
+                    },
+                )),
+                delivered: delivered_for_drop,
+            };
+            // Silence unused-field warning on the test side; guard
+            // is held by the body for its full lifetime.
+            let _ = &mut guard;
+            for i in 0..items {
+                yield i;
+            }
+        };
+        DeliveryCounter {
+            inner: Box::pin(inner),
+            delivered,
+        }
+    }
+
+    // NOTE: there is no "zero polls" test case here — `async_stream`
+    // only runs its body on the first poll, so creating a stream
+    // without ever polling means the inner guard is never even
+    // constructed, and on_complete cannot fire. That's not the
+    // production failure mode (#419) anyway: axum's Sse driver always
+    // polls at least once. The zero-delivered case is covered
+    // synthetically in `complete_on_drop_tests` where the Drop logic
+    // is exercised directly.
+
+    #[tokio::test]
+    async fn pulling_one_chunk_then_drop_yields_one_delivered() {
+        // This is the canary case the audit flagged: under the old
+        // post-yield approach, this would have come back as 0
+        // (off-by-one). With DeliveryCounter at poll_next, the count
+        // is 1 — gate skipped, completion_tokens preserved.
+        let captured = Arc::new(Mutex::new(None));
+        {
+            let stream = build_test_stream(5, captured.clone());
+            futures::pin_mut!(stream);
+            let v = stream.next().await;
+            assert_eq!(v, Some(0));
+            // Consumer aborts here. Drop fires.
+        }
+        let out = captured.lock().unwrap().take().expect("on_complete fired");
+        assert_eq!(
+            out.chunks_delivered, 1,
+            "delivery counter must reflect the 1 pull"
+        );
+        assert_eq!(
+            out.completion_tokens, 5,
+            "completion_tokens preserved when delivered>=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn pulling_three_then_drop_yields_three_delivered() {
+        let captured = Arc::new(Mutex::new(None));
+        {
+            let stream = build_test_stream(5, captured.clone());
+            futures::pin_mut!(stream);
+            assert_eq!(stream.next().await, Some(0));
+            assert_eq!(stream.next().await, Some(1));
+            assert_eq!(stream.next().await, Some(2));
+            // 3 pulls; abort.
+        }
+        let out = captured.lock().unwrap().take().expect("on_complete fired");
+        assert_eq!(out.chunks_delivered, 3);
+    }
+
+    #[tokio::test]
+    async fn pulling_full_stream_yields_count_equal_to_items() {
+        let captured = Arc::new(Mutex::new(None));
+        {
+            let stream = build_test_stream(4, captured.clone());
+            futures::pin_mut!(stream);
+            let collected: Vec<u32> = stream.by_ref().collect().await;
+            assert_eq!(collected, vec![0, 1, 2, 3]);
+            // Stream is exhausted; consumer drops naturally.
+        }
+        let out = captured.lock().unwrap().take().expect("on_complete fired");
+        assert_eq!(
+            out.chunks_delivered, 4,
+            "exact match — DeliveryCounter fires on every Ready(Some)"
+        );
     }
 }
