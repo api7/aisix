@@ -1881,10 +1881,20 @@ struct StreamCompletion {
     /// Time to first token in milliseconds. Set once when the first
     /// Ok(chunk) arrives in `build_sse_stream`.
     ttft_ms: u32,
+    /// Count of SSE events the **consumer actually pulled** from the
+    /// stream — incremented on the post-yield resume in
+    /// `build_sse_stream`. `async_stream::stream!` semantics: code
+    /// AFTER a `yield` runs only when the consumer asks for the
+    /// next item, so this counter is a reliable "delivered-to-the-
+    /// client" signal even when the consumer disconnects mid-stream.
+    ///
+    /// `CompleteOnDrop::drop` uses this to gate `completion_tokens`:
+    /// if the consumer disconnected before any chunk reached them
+    /// (`chunks_delivered == 0`), the upstream's `usage` block is
+    /// irrelevant — the customer must not be billed for tokens that
+    /// never crossed the wire. Issue #419.
+    chunks_delivered: u32,
 }
-
-/// Parameters needed to run output-guardrail evaluation at
-/// end-of-stream. Per #204 the streaming path used to skip output
 /// guardrails entirely — a `kind: "keyword"` deny-list could be
 /// trivially bypassed by setting `stream: true`. Buffer-then-check
 /// is the right cadence for blocking guardrails (per-chunk evaluation
@@ -1930,7 +1940,23 @@ impl<F: FnOnce(StreamCompletion)> CompleteOnDrop<F> {
 
 impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
     fn drop(&mut self) {
-        if let Some((f, c)) = self.slot.take() {
+        if let Some((f, mut c)) = self.slot.take() {
+            // Issue #419 — cost-leak gate. If the consumer disconnected
+            // before any chunk was delivered (e.g. AbortController.abort()
+            // mid-`upstream.next().await`, or axum dropped the response
+            // future before the first chunk was pulled), the upstream's
+            // `usage` block is meaningless for billing — no completion
+            // tokens crossed the wire to the client. Zero out the
+            // completion-side counters but keep `prompt_tokens` (the
+            // prompt was processed by upstream regardless, and the
+            // industry contract is "prompts always billed").
+            if c.chunks_delivered == 0 {
+                c.completion_tokens = 0;
+                c.reasoning_tokens = 0;
+                c.cache_creation_tokens = 0;
+                c.cache_read_tokens = 0;
+                c.total_tokens = c.prompt_tokens as u64;
+            }
             f(c);
         }
     }
@@ -2064,6 +2090,12 @@ where
                 }
             };
             yield Ok::<_, Infallible>(ev);
+            // Issue #419 — post-yield. async_stream::stream! suspends
+            // at `yield`; this line runs only when the consumer pulls
+            // the next item, which means the previously yielded
+            // event was actually retrieved. Saturating-add caps at
+            // u32::MAX so an unbounded-length stream doesn't wrap.
+            guard.comp().chunks_delivered = guard.comp().chunks_delivered.saturating_add(1);
         }
         // Per #204: run the output guardrail on the accumulated
         // assistant content BEFORE emitting `[DONE]`. Buffer-then-
@@ -2481,5 +2513,146 @@ mod sanitize_tag_tests {
         // non-ASCII (operator might label a team in their language).
         let normal = "team-α / prod-east-1".to_string();
         assert_eq!(sanitize_tag(normal.clone()), normal);
+    }
+}
+
+#[cfg(test)]
+mod complete_on_drop_tests {
+    //! Issue #419: streaming-abort cost-leak gate.
+    //!
+    //! The DP's streaming SSE generator (`build_sse_stream`) wraps an
+    //! `on_complete` callback in a `CompleteOnDrop` guard so the
+    //! callback fires reliably on BOTH normal stream completion AND
+    //! mid-stream cancellation. Before the gate, the upstream's
+    //! `usage` block populated `completion_tokens` regardless of
+    //! whether any chunk actually reached the client — a customer
+    //! who aborted mid-await was still billed for tokens the gateway
+    //! never delivered.
+    //!
+    //! The gate uses `chunks_delivered`, incremented post-yield in
+    //! the stream body. `async_stream::stream!` resumes post-yield
+    //! code only when the consumer pulls the next item, so a
+    //! non-zero `chunks_delivered` value is a reliable
+    //! "delivered-to-client" signal.
+    //!
+    //! These tests exercise the Drop logic directly — no real
+    //! upstream stream, no axum, no httptest. Just construct a
+    //! StreamCompletion with the field values that would arise
+    //! from the post-yield path, drop, observe the callback args.
+    use super::{CompleteOnDrop, StreamCompletion};
+    use std::sync::{Arc, Mutex};
+
+    fn drop_and_capture(comp: StreamCompletion) -> StreamCompletion {
+        let captured: Arc<Mutex<Option<StreamCompletion>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+        {
+            let guard = CompleteOnDrop {
+                slot: Some((
+                    move |c: StreamCompletion| {
+                        *cap.lock().unwrap() = Some(c);
+                    },
+                    comp,
+                )),
+            };
+            drop(guard);
+        }
+        let out = captured.lock().unwrap().take().expect("on_complete fired");
+        out
+    }
+
+    #[test]
+    fn no_chunks_delivered_zeroes_completion_tokens() {
+        // Simulated state: upstream emitted a usage block populating
+        // completion_tokens=5, but the consumer aborted before any
+        // chunk was pulled (chunks_delivered stayed 0). Drop must
+        // zero completion-side counters so the customer isn't billed
+        // for tokens that never crossed the wire.
+        let mut comp = StreamCompletion::default();
+        comp.prompt_tokens = 10;
+        comp.completion_tokens = 5;
+        comp.total_tokens = 15;
+        comp.reasoning_tokens = 2;
+        comp.cache_creation_tokens = 1;
+        comp.cache_read_tokens = 1;
+        comp.chunks_delivered = 0; // ← client never received anything
+
+        let out = drop_and_capture(comp);
+
+        assert_eq!(
+            out.completion_tokens, 0,
+            "completion_tokens must zero when chunks_delivered==0 (#419)"
+        );
+        assert_eq!(out.reasoning_tokens, 0, "reasoning_tokens must zero");
+        assert_eq!(out.cache_creation_tokens, 0, "cache_creation must zero");
+        assert_eq!(out.cache_read_tokens, 0, "cache_read must zero");
+        assert_eq!(
+            out.prompt_tokens, 10,
+            "prompt_tokens preserved — prompt was processed regardless of delivery"
+        );
+        assert_eq!(
+            out.total_tokens, 10,
+            "total_tokens recomputed = prompt_tokens only when completion-side zeroed"
+        );
+    }
+
+    #[test]
+    fn one_chunk_delivered_preserves_completion_tokens() {
+        // At least one chunk was pulled by the consumer (could be a
+        // role-only chunk + abort, or full stream + clean exit).
+        // Either way, the upstream usage block is the source of
+        // truth — pass through unchanged.
+        let mut comp = StreamCompletion::default();
+        comp.prompt_tokens = 10;
+        comp.completion_tokens = 5;
+        comp.total_tokens = 15;
+        comp.reasoning_tokens = 2;
+        comp.chunks_delivered = 1; // ← at least one chunk reached the client
+
+        let out = drop_and_capture(comp);
+
+        assert_eq!(
+            out.completion_tokens, 5,
+            "completion_tokens preserved when at least one chunk delivered"
+        );
+        assert_eq!(out.reasoning_tokens, 2);
+        assert_eq!(out.total_tokens, 15);
+        assert_eq!(out.prompt_tokens, 10);
+    }
+
+    #[test]
+    fn no_chunks_no_prompt_zero_total() {
+        // Edge: connection dropped so early the upstream didn't even
+        // confirm prompt_tokens. Drop should still produce a clean
+        // zeroed completion-side and prompt_tokens=0.
+        let comp = StreamCompletion::default(); // all zeros, chunks_delivered=0
+
+        let out = drop_and_capture(comp);
+
+        assert_eq!(out.completion_tokens, 0);
+        assert_eq!(out.prompt_tokens, 0);
+        assert_eq!(out.total_tokens, 0);
+    }
+
+    #[test]
+    fn many_chunks_delivered_preserves_full_state() {
+        // Normal stream completion: dozens of chunks pulled, full
+        // upstream usage block received, Drop fires on natural exit
+        // of the async_stream body. All fields pass through.
+        let mut comp = StreamCompletion::default();
+        comp.prompt_tokens = 100;
+        comp.completion_tokens = 250;
+        comp.total_tokens = 350;
+        comp.cached_prompt_tokens = 30;
+        comp.reasoning_tokens = 50;
+        comp.chunks_delivered = 42;
+
+        let out = drop_and_capture(comp);
+
+        assert_eq!(out.prompt_tokens, 100);
+        assert_eq!(out.completion_tokens, 250);
+        assert_eq!(out.total_tokens, 350);
+        assert_eq!(out.cached_prompt_tokens, 30);
+        assert_eq!(out.reasoning_tokens, 50);
+        assert_eq!(out.chunks_delivered, 42);
     }
 }
