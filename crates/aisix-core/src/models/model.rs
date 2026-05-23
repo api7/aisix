@@ -217,8 +217,24 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
 
-    /// Upstream model id sent to the provider (e.g. "gpt-4o",
-    /// "claude-sonnet-4-5"). None for routing models.
+    /// Upstream model id sent to the provider — the literal string
+    /// the upstream LLM API expects in its `model` field
+    /// (e.g. `"gpt-4o"`, `"claude-sonnet-4-5"`,
+    /// `"gpt-4o-mini-2024-08-06"`). `None` for routing models.
+    ///
+    /// **NOTE — this field name is a known footgun.** Some other proxy
+    /// gateways define a `model_name` field that holds the
+    /// *customer-facing alias* (the name a client SDK sends), with a
+    /// separate `model` sub-field holding the upstream id. In this
+    /// codebase the convention is reversed: `display_name` (above)
+    /// is the customer-facing alias, and **`model_name` is the
+    /// upstream id**. When reading or writing this struct, do not
+    /// assume the field name alone disambiguates the role — read
+    /// the docs.
+    ///
+    /// Renaming this field to `upstream_id` to remove the ambiguity
+    /// is tracked at api7/AISIX-Cloud#470 but deferred behind a
+    /// coordinated wire-format change across cp-api + dashboard.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_name: Option<String>,
 
