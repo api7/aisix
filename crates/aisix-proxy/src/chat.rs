@@ -2603,7 +2603,7 @@ mod complete_on_drop_tests {
     //! StreamCompletion, set the shared atomic to simulate "N
     //! chunks delivered to the consumer", drop, observe the
     //! callback args.
-    use super::{AtomicU32, CompleteOnDrop, Ordering, StreamCompletion};
+    use super::{AtomicU32, CompleteOnDrop, StreamCompletion};
     use std::sync::{Arc, Mutex};
 
     /// Build the guard with `delivered_count` pre-set on the
@@ -2635,13 +2635,15 @@ mod complete_on_drop_tests {
         // chunk crossed the wire (DeliveryCounter atomic stayed 0).
         // Drop must zero completion-side counters so the customer
         // isn't billed for tokens that never reached them.
-        let mut comp = StreamCompletion::default();
-        comp.prompt_tokens = 10;
-        comp.completion_tokens = 5;
-        comp.total_tokens = 15;
-        comp.reasoning_tokens = 2;
-        comp.cache_creation_tokens = 1;
-        comp.cache_read_tokens = 1;
+        let comp = StreamCompletion {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            reasoning_tokens: 2,
+            cache_creation_tokens: 1,
+            cache_read_tokens: 1,
+            ..Default::default()
+        };
 
         let out = drop_and_capture(comp, 0);
 
@@ -2669,11 +2671,13 @@ mod complete_on_drop_tests {
         // role-only chunk + abort, or full stream + clean exit).
         // Either way, the upstream usage block is the source of
         // truth — pass through unchanged.
-        let mut comp = StreamCompletion::default();
-        comp.prompt_tokens = 10;
-        comp.completion_tokens = 5;
-        comp.total_tokens = 15;
-        comp.reasoning_tokens = 2;
+        let comp = StreamCompletion {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            reasoning_tokens: 2,
+            ..Default::default()
+        };
 
         let out = drop_and_capture(comp, 1);
 
@@ -2707,12 +2711,14 @@ mod complete_on_drop_tests {
         // Normal stream completion: dozens of chunks pulled, full
         // upstream usage block received, Drop fires on natural exit
         // of the async_stream body. All fields pass through.
-        let mut comp = StreamCompletion::default();
-        comp.prompt_tokens = 100;
-        comp.completion_tokens = 250;
-        comp.total_tokens = 350;
-        comp.cached_prompt_tokens = 30;
-        comp.reasoning_tokens = 50;
+        let comp = StreamCompletion {
+            prompt_tokens: 100,
+            completion_tokens: 250,
+            total_tokens: 350,
+            cached_prompt_tokens: 30,
+            reasoning_tokens: 50,
+            ..Default::default()
+        };
 
         let out = drop_and_capture(comp, 42);
 
@@ -2737,7 +2743,7 @@ mod delivery_counter_tests {
     //! items via `.next().await`, drops the stream, asserts the
     //! `chunks_delivered` value the on_complete callback received
     //! matches N exactly.
-    use super::{AtomicU32, CompleteOnDrop, DeliveryCounter, Ordering, StreamCompletion};
+    use super::{AtomicU32, CompleteOnDrop, DeliveryCounter, StreamCompletion};
     use futures::Stream;
     use futures::StreamExt;
     use std::sync::{Arc, Mutex};
