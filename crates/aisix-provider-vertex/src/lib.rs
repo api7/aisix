@@ -4,18 +4,20 @@
 //!
 //! ## Status (issue #302 Phase E)
 //!
+//! - [x] D5.1 — In-process GCP OAuth2 token mint. The bridge now
+//!   accepts EITHER a pre-minted `access_token` (operator manages
+//!   refresh, backward-compatible) OR a full `service_account_json`
+//!   in `ProviderKey.secret`. When the SA path is taken, the bridge
+//!   signs a JWT with the SA's RSA private key, posts to the SA's
+//!   `token_uri` to mint an OAuth2 access token, and caches it
+//!   in-process keyed by SA `client_email` with TTL refresh ~60s
+//!   before the upstream-reported expiry.
 //! - [x] D5.2.a — Gemini publisher chat dispatch
 //!   (`publishers/google/models/<model>:generateContent`)
 //! - [x] D5.2.b — Gemini streaming via
 //!   `:streamGenerateContent?alt=sse` (SSE chunks, no `[DONE]`
 //!   sentinel — Gemini closes the connection cleanly)
 //! - [x] D5.5 — `BridgeContext.deadline` plumbing on `chat()`
-//! - [ ] D5.1 — In-process GCP OAuth2 token mint (`yup-oauth2` /
-//!   `gcp_auth` service-account JSON → access token with
-//!   auto-refresh). **Today the bridge expects a pre-minted
-//!   access token** in `ProviderKey.secret.access_token`;
-//!   operators are responsible for refresh (GCP tokens TTL
-//!   ~1 hour). Follow-up will lift that burden into the bridge.
 //! - [ ] D5.3 — Anthropic-on-Vertex dispatch
 //!   (`publishers/anthropic/models/<model>:rawPredict`,
 //!   `anthropic_version: "vertex-2023-10-16"`)
@@ -51,6 +53,7 @@
 #![deny(rust_2018_idioms)]
 
 mod bridge;
+mod token_mint;
 mod wire;
 
 pub use bridge::{VertexBridge, VertexPublisher};

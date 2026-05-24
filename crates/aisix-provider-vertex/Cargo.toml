@@ -15,6 +15,7 @@ async-trait.workspace = true
 async-stream = "0.3"
 bytes.workspace = true
 futures.workspace = true
+jsonwebtoken = "9"
 thiserror.workspace = true
 tracing.workspace = true
 reqwest.workspace = true

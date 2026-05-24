@@ -29,8 +29,10 @@ use http::{
 };
 use reqwest::{header, Client, StatusCode};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::token_mint::{ServiceAccountKey, TokenMinter};
 use crate::wire;
 
 /// Family Bridge for Google Vertex AI.
@@ -40,6 +42,11 @@ pub struct VertexBridge {
     /// metrics dashboards keep their existing `provider="vertex"`
     /// filters working.
     name: &'static str,
+    /// In-process GCP OAuth2 token minter + cache. Used only on the
+    /// `service_account_json` secret path; the pre-minted-token path
+    /// bypasses this entirely. Wrapped in `Arc` so the bridge stays
+    /// `Clone`-friendly for callers that share it across Hub registrations.
+    token_minter: Arc<TokenMinter>,
     /// Test-only Vertex API base override (e.g. wiremock URI). When
     /// set, replaces the canonical `<region>-aiplatform.googleapis.com`
     /// host so wiremock can stand in.
@@ -57,6 +64,7 @@ impl VertexBridge {
     /// when downstream callers want to share a connection pool.
     pub fn with_client(client: Client) -> Self {
         Self {
+            token_minter: Arc::new(TokenMinter::new(client.clone())),
             client,
             name: "vertex",
             #[cfg(test)]
@@ -71,6 +79,16 @@ impl VertexBridge {
     #[cfg(test)]
     pub(crate) fn with_api_base_override(mut self, url: impl Into<String>) -> Self {
         self.api_base_override = Some(url.into());
+        self
+    }
+
+    /// Test-only seam: replace the SA `token_uri` host on the
+    /// internal token minter. Used by the SA-flow tests to redirect
+    /// JWT-bearer assertions to a wiremock endpoint.
+    #[cfg(test)]
+    pub(crate) fn with_token_endpoint_override(mut self, url: impl Into<String>) -> Self {
+        let new_minter = TokenMinter::new(self.client.clone()).with_token_endpoint_override(url);
+        self.token_minter = Arc::new(new_minter);
         self
     }
 
@@ -165,15 +183,34 @@ impl VertexPublisher {
 /// `ProviderKey.secret` schema for a Vertex provider key.
 ///
 /// Convention: GCP credentials are JSON-encoded into the `secret`
-/// field. `access_token` is a pre-minted OAuth2 bearer (operator
-/// manages refresh; ~1-hour GCP TTL). D5.1 follow-up adds in-process
-/// JWT signing via `service_account_json`.
+/// field. The operator chooses ONE of two credential modes:
+///
+/// 1. **Pre-minted token** — set `access_token`; operator manages
+///    refresh (GCP token TTL ~1h). Backward-compatible with the
+///    original D5.2.a schema; useful for short-lived testing
+///    rigs and for operators who already have a token-mint pipeline.
+///
+/// 2. **In-process SA mint** (D5.1) — set `service_account_json`
+///    to the full GCP service-account JSON key. The bridge signs a
+///    JWT with the SA's RSA private key, exchanges it for an OAuth2
+///    access token via the SA's `token_uri`, and caches it
+///    in-process with TTL refresh.
+///
+/// Exactly one of the two must be set. Setting both — or neither —
+/// fails at parse time so the operator gets an actionable error
+/// before the first chat.
 #[derive(Debug, Deserialize)]
 struct VertexSecret {
     /// Pre-minted GCP OAuth2 access token (operator manages refresh).
-    /// D5.1 follow-up will accept a `service_account_json` field in
-    /// addition and mint tokens in-process.
-    access_token: String,
+    /// Mutually exclusive with `service_account_json`.
+    #[serde(default)]
+    access_token: Option<String>,
+    /// GCP service-account JSON key (the on-disk shape `gcloud iam
+    /// service-accounts keys create` emits). When present, the bridge
+    /// mints + caches tokens in-process. Mutually exclusive with
+    /// `access_token`.
+    #[serde(default)]
+    service_account_json: Option<ServiceAccountKey>,
     /// GCP project id (numeric or named, e.g. `my-org-prod`).
     project: String,
     /// GCP region the Vertex AI deployment targets
@@ -182,7 +219,8 @@ struct VertexSecret {
 }
 
 impl VertexSecret {
-    /// Parse the JSON-encoded credential blob.
+    /// Parse the JSON-encoded credential blob and validate the
+    /// mutually-exclusive credential modes.
     ///
     /// **Audit-aware:** error messages MUST NOT echo raw secret
     /// bytes (serde error messages can leak partial content via
@@ -191,17 +229,69 @@ impl VertexSecret {
         if secret.trim().is_empty() {
             return Err(BridgeError::Config(
                 "vertex provider_key.secret is empty — \
-                 expected JSON {access_token, project, region}"
+                 expected JSON with project, region, and either access_token \
+                 or service_account_json"
                     .into(),
             ));
         }
-        serde_json::from_str::<VertexSecret>(secret).map_err(|_e| {
+        let parsed: VertexSecret = serde_json::from_str(secret).map_err(|_e| {
             BridgeError::Config(
                 "vertex provider_key.secret must be valid JSON: \
-                 {access_token, project, region}"
+                 {project, region, and either access_token or service_account_json}"
                     .into(),
             )
-        })
+        })?;
+        // Enforce mutual exclusion. Both-set is suspect (which one
+        // wins?); neither-set is unusable. Empty-string token is a
+        // distinct error so the operator gets a clearer message than
+        // generic "neither set".
+        if parsed.access_token.as_deref().is_some_and(str::is_empty) {
+            return Err(BridgeError::Config(
+                "vertex provider_key.secret.access_token is empty".into(),
+            ));
+        }
+        let has_token = parsed
+            .access_token
+            .as_deref()
+            .is_some_and(|t| !t.is_empty());
+        let has_sa = parsed.service_account_json.is_some();
+        if has_token && has_sa {
+            return Err(BridgeError::Config(
+                "vertex provider_key.secret must set exactly one of access_token \
+                 or service_account_json (both were provided)"
+                    .into(),
+            ));
+        }
+        if !has_token && !has_sa {
+            return Err(BridgeError::Config(
+                "vertex provider_key.secret must set either access_token or \
+                 service_account_json (neither was provided)"
+                    .into(),
+            ));
+        }
+        // Validate the SA shape eagerly if present so the operator
+        // hits the actionable error at parse, not at first chat.
+        if let Some(sa) = &parsed.service_account_json {
+            sa.validate()?;
+        }
+        Ok(parsed)
+    }
+
+    /// Resolve the bearer token to use on this request. Returns the
+    /// pre-minted token verbatim if set; otherwise mints (or pulls
+    /// from cache) via the bridge's [`TokenMinter`].
+    async fn resolve_access_token(&self, minter: &TokenMinter) -> Result<String, BridgeError> {
+        if let Some(token) = &self.access_token {
+            return Ok(token.clone());
+        }
+        if let Some(sa) = &self.service_account_json {
+            return minter.get_token(sa).await;
+        }
+        // parse() rejects neither-set, so this is unreachable in
+        // practice — keep the explicit error for defense in depth.
+        Err(BridgeError::Config(
+            "internal: VertexSecret has neither token nor SA after parse".into(),
+        ))
     }
 }
 
@@ -417,7 +507,11 @@ impl VertexBridge {
                     .into(),
             ));
         }
-        let headers = build_request_headers(&creds.access_token, &ctx.request_id)?;
+        // Resolve bearer: pre-minted token verbatim, or mint+cache
+        // via the in-process token minter from SA JSON. Failure
+        // surfaces as a Config error (operator-actionable).
+        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let headers = build_request_headers(&access_token, &ctx.request_id)?;
         let client = self.client.clone();
         let started = Instant::now();
 
@@ -488,7 +582,11 @@ impl VertexBridge {
                     .into(),
             ));
         }
-        let headers = build_request_headers(&creds.access_token, &ctx.request_id)?;
+        // Resolve bearer (pre-minted OR minted-from-SA) BEFORE
+        // entering the stream future so token-mint errors surface
+        // as a direct Err return rather than being yielded mid-stream.
+        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let headers = build_request_headers(&access_token, &ctx.request_id)?;
         let client = self.client.clone();
         let started = Instant::now();
 
@@ -1006,7 +1104,8 @@ mod tests {
     fn vertex_secret_parses_full_form() {
         let json = r#"{"access_token":"ya29.test","project":"my-proj","region":"us-central1"}"#;
         let s = VertexSecret::parse(json).unwrap();
-        assert_eq!(s.access_token, "ya29.test");
+        assert_eq!(s.access_token.as_deref(), Some("ya29.test"));
+        assert!(s.service_account_json.is_none());
         assert_eq!(s.project, "my-proj");
         assert_eq!(s.region, "us-central1");
     }
@@ -1045,6 +1144,83 @@ mod tests {
                     !msg.contains("DISTINCTIVE") && !msg.contains("LEAK-MARKER"),
                     "must NOT leak raw secret bytes; got {msg}"
                 );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vertex_secret_accepts_service_account_json_path() {
+        let json = serde_json::json!({
+            "service_account_json": {
+                "type": "service_account",
+                "private_key": "-----BEGIN PRIVATE KEY-----\nFAKE_PEM_BUT_VALID_HEADER\n-----END PRIVATE KEY-----",
+                "client_email": "tester@my-proj.iam.gserviceaccount.com",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            },
+            "project": "my-proj",
+            "region": "us-central1"
+        });
+        let s = VertexSecret::parse(&json.to_string()).unwrap();
+        assert!(s.access_token.is_none());
+        let sa = s.service_account_json.as_ref().unwrap();
+        assert_eq!(sa.client_email, "tester@my-proj.iam.gserviceaccount.com");
+        assert_eq!(sa.token_uri, "https://oauth2.googleapis.com/token");
+    }
+
+    #[test]
+    fn vertex_secret_rejects_both_credential_modes_set() {
+        let json = serde_json::json!({
+            "access_token": "ya29.foo",
+            "service_account_json": {
+                "type": "service_account",
+                "private_key": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----",
+                "client_email": "x@y.z",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            },
+            "project": "my-proj",
+            "region": "us-central1"
+        });
+        let err = VertexSecret::parse(&json.to_string()).unwrap_err();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(
+                    msg.contains("exactly one of access_token or service_account_json"),
+                    "got: {msg}"
+                );
+                assert!(msg.contains("both were provided"));
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vertex_secret_rejects_neither_credential_mode_set() {
+        let json = r#"{"project":"my-proj","region":"us-central1"}"#;
+        let err = VertexSecret::parse(json).unwrap_err();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(
+                    msg.contains("either access_token or service_account_json"),
+                    "got: {msg}"
+                );
+                assert!(msg.contains("neither was provided"));
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vertex_secret_rejects_empty_access_token_string() {
+        // Edge case: operator pastes an empty string into access_token
+        // rather than omitting the field entirely. The pre-mint path
+        // would build an Authorization header of "Bearer " which would
+        // 401 upstream — better to fail at parse time.
+        let json = r#"{"access_token":"","project":"my-proj","region":"us-central1"}"#;
+        let err = VertexSecret::parse(json).unwrap_err();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(msg.contains("access_token is empty"), "got: {msg}");
             }
             other => panic!("expected Config error, got {other:?}"),
         }
@@ -2259,5 +2435,104 @@ mod tests {
             url.contains("alt=sse"),
             "expected ?alt=sse query, got {url}"
         );
+    }
+
+    // ─── Service-account credential path (D5.1) ─────────────────────
+
+    /// Embedded test SA private key (PEM). Generated via:
+    ///   `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048`
+    /// Deterministic so the JWT byte sequence is reproducible. NOT a
+    /// real GCP key — safe to commit.
+    const TEST_SA_PRIVATE_PEM: &str = include_str!("../test-fixtures/test_sa_private.pem");
+
+    fn sa_credential_secret(token_uri: &str) -> String {
+        // Operator's secret JSON, SA-mode (no access_token field).
+        // Serialize via serde_json so the multi-line PEM lands as a
+        // proper JSON-escaped string ("\n" escapes).
+        serde_json::json!({
+            "service_account_json": {
+                "type": "service_account",
+                "private_key": TEST_SA_PRIVATE_PEM,
+                "client_email": "tester@my-proj.iam.gserviceaccount.com",
+                "token_uri": token_uri,
+            },
+            "project": "my-proj",
+            "region": "us-central1"
+        })
+        .to_string()
+    }
+
+    /// End-to-end: SA JSON in secret → bridge resolves token via
+    /// in-process minter → minted token used as Authorization Bearer
+    /// on the upstream Gemini chat call.
+    ///
+    /// Pins the full D5.1 pipeline: VertexSecret SA parse +
+    /// TokenMinter JWT sign + mint endpoint POST + cache insert +
+    /// chat_gemini header forwarding. A regression that broke any
+    /// link in this chain surfaces here.
+    #[tokio::test]
+    async fn chat_gemini_sa_path_mints_token_and_forwards_as_bearer() {
+        // Two wiremock servers: one for GCP OAuth token endpoint,
+        // one for Vertex AI Gemini chat.
+        let oauth_server = MockServer::start().await;
+        let vertex_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "ya29.minted-by-mock-oauth",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .expect(1) // exactly one mint despite two chats below
+            .mount(&oauth_server)
+            .await;
+
+        // Capture the Authorization header on the Vertex chat call so
+        // we can assert the bridge actually forwarded the minted
+        // token (not a hardcoded placeholder).
+        let captured_auth: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured_auth.clone();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-1.5-pro:generateContent",
+            ))
+            .respond_with(move |req: &MockRequest| {
+                let auth = req
+                    .headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                *captured_for_responder.lock().unwrap() = auth;
+                default_gemini_response_template()
+            })
+            .mount(&vertex_server)
+            .await;
+
+        let bridge = VertexBridge::new()
+            .with_api_base_override(vertex_server.uri())
+            .with_token_endpoint_override(oauth_server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret(&sa_credential_secret(&oauth_server.uri())),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+
+        // Two chats — second one MUST hit the cache (no second mint).
+        let _r1 = bridge.chat(&req, &ctx).await.unwrap();
+        let _r2 = bridge.chat(&req, &ctx).await.unwrap();
+
+        let auth = captured_auth
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("authorization captured");
+        assert_eq!(
+            auth, "Bearer ya29.minted-by-mock-oauth",
+            "bridge must forward the minted token verbatim"
+        );
+        // wiremock's .expect(1) on the OAuth mock fires here at drop —
+        // proves the cache prevented a second mint on the second chat.
     }
 }
