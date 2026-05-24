@@ -12,6 +12,9 @@ description = "aisix: Google Vertex AI provider bridge (skeleton — multi-publi
 aisix-core = { path = "../aisix-core" }
 aisix-gateway = { path = "../aisix-gateway" }
 async-trait.workspace = true
+async-stream = "0.3"
+bytes.workspace = true
+futures.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
