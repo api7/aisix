@@ -2021,4 +2021,71 @@ mod tests {
             other => panic!("expected Config error, got {other:?}"),
         }
     }
+
+    /// Audit LOW (audit-aigw-388-azure-aad): chat_stream must also
+    /// resolve auth via the AAD path. The streaming code calls the
+    /// same `resolve_auth` helper as chat(), so this regression-
+    /// guards a future refactor that accidentally skipped it.
+    /// Mirrors the same gap noted (and addressed in follow-up) by
+    /// audit-aigw-387 on the Vertex SA OAuth side.
+    #[tokio::test]
+    async fn chat_stream_with_aad_secret_sets_authorization_bearer_header() {
+        let aad_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/v2.0/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "aad.stream-bearer",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .expect(1)
+            .mount(&aad_server)
+            .await;
+
+        let azure_server = MockServer::start().await;
+        let captured_headers: std::sync::Arc<std::sync::Mutex<Option<http::HeaderMap>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured_headers.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |req: &wiremock::Request| {
+                *captured_for_responder.lock().unwrap() = Some(req.headers.clone());
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: [DONE]\n\n")
+            })
+            .mount(&azure_server)
+            .await;
+
+        let bridge = AzureOpenAiBridge::new()
+            .with_url_override(mock_chat_url(&azure_server.uri(), "gpt4o-prod"))
+            .with_aad_token_endpoint_override(format!("{}/oauth2/v2.0/token", aad_server.uri()));
+        let ctx = BridgeContext::new(
+            "req-azure-1",
+            sample_model(),
+            sample_pk_with_aad_secret("https://acme-west.openai.azure.com"),
+        );
+        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let headers = captured_headers
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("headers captured");
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer aad.stream-bearer",
+            "chat_stream AAD path must send Authorization: Bearer <minted-token>"
+        );
+        assert!(
+            !headers.contains_key("api-key"),
+            "chat_stream AAD path must NOT send api-key: header"
+        );
+        assert_eq!(
+            headers.get("accept").unwrap(),
+            "text/event-stream",
+            "chat_stream must request SSE via Accept header"
+        );
+    }
 }
