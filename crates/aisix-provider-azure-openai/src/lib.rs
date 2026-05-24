@@ -4,7 +4,8 @@
 //!
 //! ## Status (issue #302 Phase F)
 //!
-//! - [x] D6.1 — `api-key` header auth (NOT `Authorization: Bearer`)
+//! - [x] D6.1 — `api-key` header auth (resource-key scheme;
+//!   `provider_key.secret` is a verbatim string)
 //! - [x] D6.2 — Azure URL pattern:
 //!   `https://<resource>.openai.azure.com/openai/deployments/<deployment>/chat/completions?api-version=<version>`
 //! - [x] D6.3 — Deployment-keyed dispatch from `Model.model_name`
@@ -16,13 +17,19 @@
 //!   `OpenAiStreamChunk` parsers ignore unknown fields by default
 //!   (no `deny_unknown_fields`), so the extension passes through
 //!   without breaking decoding.
+//! - [x] D6.6 — AAD (Entra ID) Bearer auth as a second auth scheme.
+//!   `provider_key.secret` autodetects between the resource-key path
+//!   (verbatim string) and the AAD client_credentials path (JSON
+//!   `{tenant_id, client_id, client_secret}`) by checking the leading
+//!   character. The AAD path mints + caches tokens in-process via the
+//!   client_credentials grant (no JWT signing) and sends
+//!   `Authorization: Bearer <token>` instead of the `api-key:` header.
+//!   Backward-compatible — existing api-key deployments keep working
+//!   unchanged.
 //! - [ ] D6.4 — Per-PK `api_version` override. Today the bridge pins
 //!   `AzureUpstreamRef::DEFAULT_API_VERSION` (GA). Follow-up will
 //!   accept an explicit version from `provider_key.api_base` query
 //!   string or a dedicated PK field.
-//! - [ ] D6.6 — AAD Bearer auth as a second auth scheme. Today the
-//!   bridge supports api-key only (the common case). AAD support will
-//!   land alongside the cp-api `auth_scheme` field becoming routable.
 //!
 //! # Why Azure-OpenAI is a separate `Adapter::AzureOpenai` family bridge
 //!
@@ -61,6 +68,7 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+mod aad_token_mint;
 mod bridge;
 mod wire;
 

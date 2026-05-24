@@ -39,7 +39,10 @@ use aisix_provider_openai::wire::{
     OpenAiResponse, OpenAiStreamChunk,
 };
 
+use crate::aad_token_mint::TokenMinter;
 use crate::wire;
+
+use std::sync::Arc;
 
 /// Family Bridge for Azure OpenAI Service.
 pub struct AzureOpenAiBridge {
@@ -48,6 +51,12 @@ pub struct AzureOpenAiBridge {
     /// so dashboards can split Azure traffic from canonical OpenAI
     /// traffic in metrics.
     name: &'static str,
+    /// In-process AAD token cache + minter. Used only when the
+    /// inbound `ProviderKey.secret` parses to the AAD branch; the
+    /// api-key branch bypasses this entirely. `Arc` so the bridge
+    /// remains cheaply clonable for callers that share it across
+    /// Hub registrations.
+    token_minter: Arc<TokenMinter>,
     /// Test-only POST URL override. When set, [`Bridge::chat`] /
     /// [`Bridge::chat_stream`] still run resolve / validation /
     /// header / body building against the real `AzureUpstreamRef`,
@@ -72,11 +81,23 @@ impl AzureOpenAiBridge {
     /// timeouts. Public surface — not test-only.
     pub fn with_client(client: Client) -> Self {
         Self {
+            token_minter: Arc::new(TokenMinter::new(client.clone())),
             client,
             name: "azure-openai",
             #[cfg(test)]
             url_override: None,
         }
+    }
+
+    /// Test-only seam: replace the AAD token endpoint host on the
+    /// internal minter (without touching the chat-completions URL
+    /// override on `url_override`). Used by AAD-flow tests so
+    /// `client_credentials` POSTs land on a wiremock instance.
+    #[cfg(test)]
+    pub(crate) fn with_aad_token_endpoint_override(mut self, url: impl Into<String>) -> Self {
+        self.token_minter =
+            Arc::new(TokenMinter::new(self.client.clone()).with_token_endpoint_override(url));
+        self
     }
 
     /// Resolve the URL the bridge will POST to. Returns
@@ -98,6 +119,28 @@ impl AzureOpenAiBridge {
     pub(crate) fn with_url_override(mut self, url: impl Into<String>) -> Self {
         self.url_override = Some(url.into());
         self
+    }
+
+    /// Resolve the per-request auth pair from the provider key's
+    /// secret. Returns either an `api_key` (verbatim resource-key)
+    /// or a `bearer_token` (freshly minted-or-cached AAD access
+    /// token). Token-mint failures (e.g. AAD 401 invalid_client)
+    /// surface as `Err` here so `chat()` / `chat_stream()` short-
+    /// circuit BEFORE attempting the upstream Azure OpenAI call.
+    async fn resolve_auth(&self, ctx: &BridgeContext) -> Result<AzureAuth, BridgeError> {
+        match AzureSecret::parse(&ctx.provider_key.secret)? {
+            AzureSecret::ApiKey(key) => Ok(AzureAuth {
+                api_key: Some(key),
+                bearer_token: None,
+            }),
+            AzureSecret::Aad(creds) => {
+                let token = self.token_minter.get_token(&creds).await?;
+                Ok(AzureAuth {
+                    api_key: None,
+                    bearer_token: Some(token),
+                })
+            }
+        }
     }
 }
 
@@ -243,14 +286,59 @@ fn validate_url_token(name: &str, value: &str) -> Result<(), BridgeError> {
     Ok(())
 }
 
-/// Pull the api-key from the BridgeContext's ProviderKey.
-fn api_key(ctx: &BridgeContext) -> Result<&str, BridgeError> {
-    let k = &ctx.provider_key.secret;
-    if k.is_empty() {
-        Err(BridgeError::Config("provider_key.secret is empty".into()))
-    } else {
-        Ok(k.as_str())
+/// Discriminated auth scheme. Today's resource-key deployments keep
+/// the verbatim-string secret shape (backward-compat); the AAD path
+/// is opted into by encoding the secret as JSON
+/// `{tenant_id, client_id, client_secret}`.
+///
+/// Detection is by the leading character of the trimmed secret —
+/// `{` triggers JSON parse, anything else is treated as a literal
+/// api-key. Real Azure api-keys are URL-safe base64 strings, never
+/// starting with `{`, so the heuristic is unambiguous in practice.
+#[derive(Debug)]
+pub(crate) enum AzureSecret {
+    ApiKey(String),
+    Aad(crate::aad_token_mint::AadCredentials),
+}
+
+impl AzureSecret {
+    /// Parse the inbound `ProviderKey.secret` into either the api-key
+    /// or AAD branch.
+    ///
+    /// **Audit-aware:** error messages MUST NOT echo raw secret
+    /// bytes. The branch heuristic is `starts_with('{')` after
+    /// trimming — that test does not panic, returns Bool, no leaks.
+    /// The JSON parse error message is fixed (not interpolated from
+    /// serde) so partial secret contents can't surface in the error.
+    pub(crate) fn parse(secret: &str) -> Result<Self, BridgeError> {
+        let trimmed = secret.trim();
+        if trimmed.is_empty() {
+            return Err(BridgeError::Config("provider_key.secret is empty".into()));
+        }
+        if trimmed.starts_with('{') {
+            let creds: crate::aad_token_mint::AadCredentials = serde_json::from_str(trimmed)
+                .map_err(|_e| {
+                    BridgeError::Config(
+                        "azure provider_key.secret looks JSON-shaped but failed to parse \
+                         as AAD client_credentials \
+                         {tenant_id, client_id, client_secret}"
+                            .into(),
+                    )
+                })?;
+            creds.validate()?;
+            Ok(AzureSecret::Aad(creds))
+        } else {
+            Ok(AzureSecret::ApiKey(trimmed.to_string()))
+        }
     }
+}
+
+/// Resolved per-request auth header pair the bridge writes onto the
+/// outbound request. Exactly ONE of `api_key` / `bearer_token` is
+/// `Some`; the other is `None`.
+pub(crate) struct AzureAuth {
+    pub api_key: Option<String>,
+    pub bearer_token: Option<String>,
 }
 
 /// Pull the upstream deployment name off the BridgeContext. Azure
@@ -401,32 +489,61 @@ fn prepare_outbound_body<T: serde::Serialize>(
     Ok(body)
 }
 
-/// Build the base outbound `HeaderMap` for Azure:
-///   - `api-key: <secret>` (Azure's standard auth header — NOT
-///     `Authorization: Bearer`)
-///   - `Content-Type: application/json`
-///   - `x-aisix-request-id: <ctx.request_id>`
-///   - `Accept: text/event-stream` when streaming
+/// Build the base outbound `HeaderMap` for Azure. The auth header
+/// depends on the resolved auth scheme:
 ///
-/// Bridge-owned headers are inserted before `apply_default_headers` so
-/// the reserved-headers list in `aisix-provider-openai::overrides`
-/// (which already covers `api-key`, `authorization`, `x-api-key`, plus
-/// hop-by-hop / proxy-auth headers) cannot overwrite them. Defense in
-/// depth: the reserved-list blocks even before the
-/// `headers.contains_key` guard inside `apply_default_headers`.
+///   - api-key scheme → `api-key: <secret>` (Azure docs:
+///     <https://learn.microsoft.com/en-us/azure/ai-services/openai/reference>;
+///     the literal lowercase-hyphenated `api-key`, NOT
+///     `Authorization: Bearer`).
+///   - AAD scheme → `Authorization: Bearer <access_token>` (the
+///     industry-standard Bearer header; matches how Azure's own
+///     Python SDK sets the header on Entra ID auth).
+///
+/// In both branches the bridge also sets `Content-Type: application/json`,
+/// `x-aisix-request-id: <ctx.request_id>`, and (for streaming)
+/// `Accept: text/event-stream`. Bridge-owned headers are inserted
+/// before `apply_default_headers` so the reserved-headers list in
+/// `aisix-provider-openai::overrides` (which already covers
+/// `api-key`, `authorization`, `x-api-key`, plus hop-by-hop /
+/// proxy-auth headers) cannot overwrite them. Defense in depth: the
+/// reserved-list blocks even before the `headers.contains_key` guard
+/// inside `apply_default_headers`.
 fn build_request_headers(
-    api_key_str: &str,
+    auth: &AzureAuth,
     request_id: &str,
     sse: bool,
     request: Option<&RequestOverrides>,
 ) -> Result<HeaderMap, BridgeError> {
     let mut headers = HeaderMap::new();
-    let api_key_value = HeaderValue::from_str(api_key_str)
-        .map_err(|e| BridgeError::Config(format!("api key contains invalid header chars: {e}")))?;
-    // Per Azure docs (https://learn.microsoft.com/en-us/azure/ai-services/openai/reference)
-    // the canonical auth header for the api-key scheme is the literal
-    // `api-key` (lowercase, hyphenated).
-    headers.insert(HeaderName::from_static("api-key"), api_key_value);
+    match (&auth.api_key, &auth.bearer_token) {
+        (Some(key), None) => {
+            let value = HeaderValue::from_str(key).map_err(|e| {
+                BridgeError::Config(format!("api key contains invalid header chars: {e}"))
+            })?;
+            headers.insert(HeaderName::from_static("api-key"), value);
+        }
+        (None, Some(token)) => {
+            // Bearer token from AAD. Same byte-validation pattern as
+            // api-key. Note: the validation error MUST NOT echo the
+            // token bytes — `http::InvalidHeaderValue`'s Display is
+            // opaque, but a future change could include byte
+            // position; rebind to a fixed message to be safe.
+            let value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+                BridgeError::Config(
+                    "azure aad access_token contains invalid header characters".into(),
+                )
+            })?;
+            headers.insert(header::AUTHORIZATION, value);
+        }
+        // parse() / resolve_auth() ensure exactly one is Some — keep
+        // explicit guard for defense in depth.
+        _ => {
+            return Err(BridgeError::Config(
+                "internal: AzureAuth must set exactly one of api_key / bearer_token".into(),
+            ))
+        }
+    }
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
@@ -466,7 +583,10 @@ impl Bridge for AzureOpenAiBridge {
         let _ = wire::reserved_query_params();
         let _ = wire::reserved_auth_headers();
 
-        let key = api_key(ctx)?;
+        // Resolve auth BEFORE entering the request future so AAD
+        // mint failures surface as a direct Err return rather than
+        // a transport timeout. api-key path is a no-op string copy.
+        let auth = self.resolve_auth(ctx).await?;
         // Azure expects the deployment name in the URL path; the JSON
         // body's `model` field is ignored by Azure (or echoed back).
         // We still set it to the deployment name for log-trace clarity
@@ -479,7 +599,7 @@ impl Bridge for AzureOpenAiBridge {
             ctx.provider_key.response.as_ref(),
         )?;
         let headers = build_request_headers(
-            key,
+            &auth,
             &ctx.request_id,
             false,
             ctx.provider_key.request.as_ref(),
@@ -526,7 +646,8 @@ impl Bridge for AzureOpenAiBridge {
         let _ = wire::reserved_query_params();
         let _ = wire::reserved_auth_headers();
 
-        let key = api_key(ctx)?;
+        // See chat() — resolve auth before the request future.
+        let auth = self.resolve_auth(ctx).await?;
         let messages = messages_from(req);
         let typed = build_request(req, deployment, &messages, true);
         let body = prepare_outbound_body(
@@ -535,7 +656,7 @@ impl Bridge for AzureOpenAiBridge {
             ctx.provider_key.response.as_ref(),
         )?;
         let headers = build_request_headers(
-            key,
+            &auth,
             &ctx.request_id,
             true,
             ctx.provider_key.request.as_ref(),
@@ -883,6 +1004,20 @@ mod tests {
         )
     }
 
+    /// Build a `ProviderKey` whose `secret` is the JSON-encoded AAD
+    /// credentials shape. Used by the D6.6 (Entra ID) tests; sidesteps
+    /// the string-escaping awkwardness of embedding JSON inside JSON.
+    fn sample_pk_with_aad_secret(api_base: &str) -> Arc<ProviderKey> {
+        let aad_json = r#"{"tenant_id":"tenant-uuid-aaa","client_id":"client-uuid-bbb","client_secret":"aad-secret-rotation-managed"}"#;
+        let pk = serde_json::from_value::<ProviderKey>(serde_json::json!({
+            "display_name": "azure-aad-prod",
+            "secret": aad_json,
+            "api_base": api_base,
+        }))
+        .unwrap();
+        Arc::new(pk)
+    }
+
     fn sample_pk_with_overrides(api_base: &str, overrides_json: &str) -> Arc<ProviderKey> {
         Arc::new(
             serde_json::from_str(&format!(
@@ -912,6 +1047,16 @@ mod tests {
     /// what `AzureUpstreamRef::chat_completions_url()` would produce
     /// but rooted at the mock's URI. Pass to
     /// [`AzureOpenAiBridge::with_url_override`].
+    /// Test helper: build an [`AzureAuth`] for the api-key branch.
+    /// Mirrors the inbound shape the production parser produces for
+    /// a verbatim-string secret.
+    fn api_key_auth(key: &str) -> AzureAuth {
+        AzureAuth {
+            api_key: Some(key.to_string()),
+            bearer_token: None,
+        }
+    }
+
     fn mock_chat_url(mock_uri: &str, deployment: &str) -> String {
         format!(
             "{}/openai/deployments/{}/chat/completions?api-version=2024-10-21",
@@ -923,7 +1068,8 @@ mod tests {
     fn build_request_headers_uses_api_key_not_bearer() {
         // Critical Azure-vs-OpenAI distinction: the auth header is
         // literally `api-key`, NOT `Authorization: Bearer`.
-        let headers = build_request_headers("az-secret-key", "req-1", false, None).unwrap();
+        let headers =
+            build_request_headers(&api_key_auth("az-secret-key"), "req-1", false, None).unwrap();
         assert_eq!(headers.get("api-key").unwrap(), "az-secret-key");
         assert!(
             !headers.contains_key("authorization"),
@@ -939,7 +1085,7 @@ mod tests {
 
     #[test]
     fn build_request_headers_sets_sse_accept_when_streaming() {
-        let headers = build_request_headers("az-key", "req-1", true, None).unwrap();
+        let headers = build_request_headers(&api_key_auth("az-key"), "req-1", true, None).unwrap();
         assert_eq!(headers.get("accept").unwrap(), "text/event-stream");
     }
 
@@ -960,8 +1106,13 @@ mod tests {
             default_body_fields: Default::default(),
             default_headers,
         };
-        let headers =
-            build_request_headers("legit-key", "req-1", false, Some(&request_overrides)).unwrap();
+        let headers = build_request_headers(
+            &api_key_auth("legit-key"),
+            "req-1",
+            false,
+            Some(&request_overrides),
+        )
+        .unwrap();
         assert_eq!(
             headers.get("api-key").unwrap(),
             "legit-key",
@@ -984,7 +1135,9 @@ mod tests {
             default_body_fields: Default::default(),
             default_headers,
         };
-        let headers = build_request_headers("k", "req-1", false, Some(&request_overrides)).unwrap();
+        let headers =
+            build_request_headers(&api_key_auth("k"), "req-1", false, Some(&request_overrides))
+                .unwrap();
         assert_eq!(headers.get("x-custom-trace").unwrap(), "trace-123");
     }
 
@@ -992,13 +1145,15 @@ mod tests {
     fn build_request_headers_rejects_invalid_api_key_chars() {
         // A secret with a newline would let an operator inject extra
         // headers via the api-key value.
-        let err = build_request_headers("legit\nx-evil: 1", "req-1", false, None).unwrap_err();
+        let err = build_request_headers(&api_key_auth("legit\nx-evil: 1"), "req-1", false, None)
+            .unwrap_err();
         assert!(matches!(err, BridgeError::Config(_)));
     }
 
     #[test]
     fn build_request_headers_rejects_invalid_request_id_chars() {
-        let err = build_request_headers("legit", "req\nbad", false, None).unwrap_err();
+        let err =
+            build_request_headers(&api_key_auth("legit"), "req\nbad", false, None).unwrap_err();
         assert!(matches!(err, BridgeError::Config(_)));
     }
 
@@ -1661,6 +1816,209 @@ mod tests {
                 // Acceptable: initial POST already timed out.
             }
             Err(other) => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    // ─── AAD (Entra ID) auth scheme (D6.6) ─────────────────────────
+
+    /// JSON-shaped Azure secret triggering the AAD branch.
+    fn aad_secret_json() -> String {
+        r#"{
+            "tenant_id": "tenant-uuid-aaa",
+            "client_id": "client-uuid-bbb",
+            "client_secret": "aad-secret-rotation-managed"
+        }"#
+        .to_string()
+    }
+
+    #[test]
+    fn azure_secret_parses_verbatim_string_as_api_key() {
+        // Backward compat: existing pre-D6.6 deployments encode the
+        // resource api-key as a bare string.
+        let parsed = AzureSecret::parse("legacy-api-key-string").unwrap();
+        match parsed {
+            AzureSecret::ApiKey(k) => assert_eq!(k, "legacy-api-key-string"),
+            AzureSecret::Aad(_) => panic!("verbatim string must parse as api-key, not AAD"),
+        }
+    }
+
+    #[test]
+    fn azure_secret_parses_json_object_as_aad_credentials() {
+        let parsed = AzureSecret::parse(&aad_secret_json()).unwrap();
+        match parsed {
+            AzureSecret::Aad(creds) => {
+                assert_eq!(creds.tenant_id, "tenant-uuid-aaa");
+                assert_eq!(creds.client_id, "client-uuid-bbb");
+                assert_eq!(creds.client_secret, "aad-secret-rotation-managed");
+            }
+            AzureSecret::ApiKey(_) => panic!("JSON-shaped secret must parse as AAD, not api-key"),
+        }
+    }
+
+    #[test]
+    fn azure_secret_rejects_empty_secret() {
+        let err = AzureSecret::parse("   ").unwrap_err();
+        assert!(matches!(err, BridgeError::Config(_)));
+    }
+
+    #[test]
+    fn azure_secret_rejects_json_missing_required_aad_fields() {
+        let err = AzureSecret::parse(r#"{"tenant_id":"t"}"#).unwrap_err();
+        match err {
+            BridgeError::Config(msg) => {
+                // Message must NOT echo raw secret bytes (audit-aware).
+                assert!(msg.contains("looks JSON-shaped"));
+                assert!(!msg.contains("tenant-uuid-aaa"));
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_with_aad_secret_mints_token_and_sets_authorization_bearer_header() {
+        // End-to-end pin: AAD JSON secret → token mint via wiremock
+        // AAD endpoint → chat POST to Azure OpenAI endpoint carrying
+        // Authorization: Bearer <minted-token> (NOT api-key:).
+        let aad_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/v2.0/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "aad.bearer.test-token",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .expect(1)
+            .mount(&aad_server)
+            .await;
+
+        let azure_server = MockServer::start().await;
+        let captured_headers: std::sync::Arc<std::sync::Mutex<Option<http::HeaderMap>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured_headers.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |req: &wiremock::Request| {
+                *captured_for_responder.lock().unwrap() = Some(req.headers.clone());
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-aad-test",
+                    "object": "chat.completion",
+                    "created": 1700000000_i64,
+                    "model": "gpt-4o",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hello via aad"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 4, "completion_tokens": 6, "total_tokens": 10}
+                }))
+            })
+            .mount(&azure_server)
+            .await;
+
+        let bridge = AzureOpenAiBridge::new()
+            .with_url_override(mock_chat_url(&azure_server.uri(), "gpt4o-prod"))
+            .with_aad_token_endpoint_override(format!("{}/oauth2/v2.0/token", aad_server.uri()));
+        let ctx = BridgeContext::new(
+            "req-azure-1",
+            sample_model(),
+            sample_pk_with_aad_secret("https://acme-west.openai.azure.com"),
+        );
+        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+        let resp = bridge.chat(&req, &ctx).await.unwrap();
+        assert_eq!(resp.message.content, "hello via aad");
+
+        let headers = captured_headers
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("headers captured");
+        assert_eq!(
+            headers.get("authorization").unwrap(),
+            "Bearer aad.bearer.test-token",
+            "AAD path must send Authorization: Bearer <minted-token>"
+        );
+        assert!(
+            !headers.contains_key("api-key"),
+            "AAD path must NOT send api-key: header (mutually exclusive auth schemes)"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_with_aad_secret_caches_minted_token_across_calls() {
+        // Three back-to-back chats with the same AAD secret must
+        // share the cache slot — only one token-mint trip.
+        let aad_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/v2.0/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "aad.cached-token",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .expect(1) // critical: must be called EXACTLY ONCE across 3 chats
+            .mount(&aad_server)
+            .await;
+
+        let azure_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "x", "object": "chat.completion", "created": 1700000000_i64,
+                "model": "gpt-4o",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&azure_server)
+            .await;
+
+        let bridge = AzureOpenAiBridge::new()
+            .with_url_override(mock_chat_url(&azure_server.uri(), "gpt4o-prod"))
+            .with_aad_token_endpoint_override(format!("{}/oauth2/v2.0/token", aad_server.uri()));
+        let ctx = BridgeContext::new(
+            "req-azure-1",
+            sample_model(),
+            sample_pk_with_aad_secret("https://acme-west.openai.azure.com"),
+        );
+        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+        for _ in 0..3 {
+            bridge.chat(&req, &ctx).await.unwrap();
+        }
+        // wiremock's `expect(1)` on the AAD mock asserts on server
+        // drop that only one mint trip happened across three chats.
+    }
+
+    #[tokio::test]
+    async fn chat_with_aad_secret_aad_4xx_surfaces_before_azure_call() {
+        // AAD 401 bubbles out as Config (operator-actionable) without
+        // ever calling the Azure OpenAI endpoint.
+        let aad_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(
+                r#"{"error":"invalid_client","error_description":"AADSTS7000215"}"#,
+            ))
+            .mount(&aad_server)
+            .await;
+
+        let azure_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0) // must NOT be called
+            .mount(&azure_server)
+            .await;
+
+        let bridge = AzureOpenAiBridge::new()
+            .with_url_override(mock_chat_url(&azure_server.uri(), "gpt4o-prod"))
+            .with_aad_token_endpoint_override(format!("{}/oauth2/v2.0/token", aad_server.uri()));
+        let ctx = BridgeContext::new(
+            "req-azure-1",
+            sample_model(),
+            sample_pk_with_aad_secret("https://acme-west.openai.azure.com"),
+        );
+        let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(msg.contains("invalid_client"));
+            }
+            other => panic!("expected Config error, got {other:?}"),
         }
     }
 }
