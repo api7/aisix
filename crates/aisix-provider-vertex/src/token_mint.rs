@@ -231,15 +231,28 @@ impl TokenMinter {
 
         let status = resp.status();
         if !status.is_success() {
+            // Read Retry-After BEFORE consuming the body via .text() so a
+            // 429/503 from GCP flows the upstream backoff hint into the
+            // cooldown layer.
+            let retry_after = aisix_gateway::parse_retry_after(resp.headers());
             // Cap body to 500 chars to keep error messages bounded.
             // GCP returns OAuth-shape errors `{error, error_description}`
             // — text is operator-actionable (invalid_grant etc.) and
             // does not echo the SA's private key.
             let body = resp.text().await.unwrap_or_default();
             let truncated: String = body.chars().take(500).collect();
-            return Err(BridgeError::Config(format!(
-                "vertex token mint upstream returned HTTP {status}: {truncated}"
-            )));
+            let msg = format!("vertex token mint upstream returned HTTP {status}: {truncated}");
+            // Audit MEDIUM (PR #387): classify 5xx as a transient
+            // upstream failure (502 with cooldown semantics) rather
+            // than `Config` (500, operator must fix). A flapping GCP
+            // token endpoint should not look operator-actionable to
+            // the customer. 4xx (invalid_grant / bad SA / clock skew)
+            // IS operator-actionable, so it stays Config.
+            return Err(if status.is_server_error() {
+                BridgeError::upstream_status_with_retry_after(status.as_u16(), msg, retry_after)
+            } else {
+                BridgeError::Config(msg)
+            });
         }
         let parsed: TokenResponse = resp
             .json()
@@ -361,12 +374,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn token_endpoint_5xx_surfaces_as_config_error_with_body_truncated() {
+    async fn token_endpoint_5xx_surfaces_as_upstream_status_with_retry_hint() {
+        // Audit MEDIUM (PR #387): 5xx is transient upstream — must
+        // be UpstreamStatus (502 with cooldown semantics), not
+        // Config (500 operator-must-fix).
         let (private_pem, _) = test_key_pair();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(
                 ResponseTemplate::new(503)
+                    .insert_header("Retry-After", "30")
                     .set_body_string("upstream OAuth backend transient failure"),
             )
             .mount(&server)
@@ -375,9 +392,40 @@ mod tests {
         let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(server.uri());
         let err = minter.get_token(&sa).await.err().unwrap();
         match err {
+            BridgeError::UpstreamStatus {
+                status,
+                message,
+                retry_after,
+                ..
+            } => {
+                assert_eq!(status, 503);
+                assert!(message.contains("HTTP 503"));
+                assert!(message.contains("upstream OAuth backend transient failure"));
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(30)));
+            }
+            other => panic!("expected UpstreamStatus error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_4xx_surfaces_as_config_error() {
+        // Audit MEDIUM (PR #387): 4xx remains Config — invalid_grant
+        // / bad SA / clock skew are operator-actionable.
+        let (private_pem, _) = test_key_pair();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"error":"invalid_grant","error_description":"JWT iat/exp out of range"}"#,
+            ))
+            .mount(&server)
+            .await;
+        let sa = sample_sa(&private_pem, &server.uri());
+        let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(server.uri());
+        let err = minter.get_token(&sa).await.err().unwrap();
+        match err {
             BridgeError::Config(msg) => {
-                assert!(msg.contains("HTTP 503"));
-                assert!(msg.contains("upstream OAuth backend transient failure"));
+                assert!(msg.contains("HTTP 400"));
+                assert!(msg.contains("invalid_grant"));
             }
             other => panic!("expected Config error, got {other:?}"),
         }
