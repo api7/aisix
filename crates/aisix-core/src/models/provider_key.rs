@@ -116,7 +116,16 @@ pub struct ProviderKey {
     /// header name. Non-configurable headers (`host`, `content-length`,
     /// RFC 7230 §6.1 hop-by-hop) are stripped separately by the
     /// passthrough handler and cannot be removed via this list.
-    #[serde(default = "default_strip_headers")]
+    ///
+    /// Entries are normalised on deserialize via
+    /// `normalize_strip_headers`: trimmed, lowercased, dedup'd,
+    /// empties dropped. This prevents the "operator typed `' cookie '`,
+    /// the strip set has `' cookie '` but the inbound header is
+    /// `'cookie'` → no match → silent credential leak" footgun.
+    #[serde(
+        default = "default_strip_headers",
+        deserialize_with = "deserialize_normalized_strip_headers"
+    )]
     pub strip_headers: Vec<String>,
 
     /// Filled in by the snapshot loader from the etcd key path.
@@ -138,6 +147,41 @@ pub fn default_strip_headers() -> Vec<String> {
         "set-cookie".to_string(),
         "x-api-key".to_string(),
     ]
+}
+
+/// Normalize a single strip-list entry: trim whitespace, lowercase
+/// ASCII. Returns `None` for entries that, post-trim, are empty or
+/// reference-invalid HTTP header names. Non-ASCII chars survive
+/// `to_ascii_lowercase` (no-op for them) but are unusual in practice;
+/// the passthrough handler's `to_ascii_lowercase` comparison will
+/// still match correctly.
+fn normalize_strip_entry(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
+}
+
+/// Deserialize + normalize: drop empties, lowercase, dedup. Preserves
+/// first-occurrence order so a hand-curated list reads sanely in the
+/// dashboard. Per issue #411 audit MEDIUM-1.
+fn deserialize_normalized_strip_headers<'de, D>(de: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let raw: Vec<String> = Vec::deserialize(de)?;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(raw.len());
+    for entry in raw {
+        if let Some(normalized) = normalize_strip_entry(&entry) {
+            if seen.insert(normalized.clone()) {
+                out.push(normalized);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Telemetry attribution tags emitted alongside requests routed
@@ -643,5 +687,61 @@ mod tests {
     fn param_constraints_rejects_unknown_field() {
         let r: Result<ParamConstraints, _> = serde_json::from_str(r#"{"top_p_max": 0.9}"#);
         assert!(r.is_err());
+    }
+
+    // ---- Issue #411 strip_headers deserialize/normalize ----
+
+    fn pk_with_strip(strip_json: &str) -> ProviderKey {
+        let json = format!(r#"{{"display_name":"x","secret":"sk","strip_headers":{strip_json}}}"#);
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn strip_headers_default_applies_when_field_absent() {
+        let pk: ProviderKey =
+            serde_json::from_str(r#"{"display_name":"x","secret":"sk"}"#).unwrap();
+        assert_eq!(pk.strip_headers, default_strip_headers());
+    }
+
+    #[test]
+    fn strip_headers_explicit_empty_array_is_preserved() {
+        // The "customer cleared all defaults" override case must
+        // produce an empty Vec, NOT fall through to the default.
+        let pk = pk_with_strip("[]");
+        assert!(pk.strip_headers.is_empty());
+    }
+
+    #[test]
+    fn strip_headers_trims_whitespace() {
+        // Without the normalize hook, "  cookie  " would never match
+        // an inbound `cookie` header → silent credential leak.
+        let pk = pk_with_strip(r#"["  cookie  ", "\tauthorization\n"]"#);
+        assert_eq!(pk.strip_headers, vec!["cookie", "authorization"]);
+    }
+
+    #[test]
+    fn strip_headers_lowercases_input() {
+        let pk = pk_with_strip(r#"["Authorization", "COOKIE", "X-Custom-Header"]"#);
+        assert_eq!(
+            pk.strip_headers,
+            vec!["authorization", "cookie", "x-custom-header"]
+        );
+    }
+
+    #[test]
+    fn strip_headers_drops_empty_entries() {
+        // Operators pasting from a comma-split tool may end up with
+        // stray empty strings. Silently ignored, not fatal.
+        let pk = pk_with_strip(r#"["", "  ", "cookie", ""]"#);
+        assert_eq!(pk.strip_headers, vec!["cookie"]);
+    }
+
+    #[test]
+    fn strip_headers_dedupes_case_insensitively() {
+        // Customer accidentally added "Cookie" and "cookie" both.
+        // Dedup post-lowercase. First-occurrence order is preserved
+        // so the dashboard reads sanely.
+        let pk = pk_with_strip(r#"["Cookie", "x-trace", "cookie", "X-Trace"]"#);
+        assert_eq!(pk.strip_headers, vec!["cookie", "x-trace"]);
     }
 }

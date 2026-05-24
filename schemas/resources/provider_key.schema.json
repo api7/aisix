@@ -60,6 +60,19 @@
       "description": "Upstream provider's API key, stored in plaintext on the standalone path (the etcd channel is mTLS-only — same trust boundary as Guardrail credentials and ObservabilityExporter headers). On the AISIX-Cloud path cp-api decrypts the envelope-encrypted secret at projection time and writes the plaintext here.",
       "type": "string"
     },
+    "strip_headers": {
+      "description": "Inbound request headers to strip before forwarding to the upstream provider on the passthrough endpoint (#411).\n\nDefaults (when the field is absent on the wire) to the 4 canonical credential headers: `authorization`, `cookie`, `set-cookie`, `x-api-key`. Customers can: - Remove a default entry → that header reaches upstream (the dashboard warns when removing a default). - Add custom entries → extra headers stripped.\n\nCase-insensitive. Compared lowercased against the inbound header name. Non-configurable headers (`host`, `content-length`, RFC 7230 §6.1 hop-by-hop) are stripped separately by the passthrough handler and cannot be removed via this list.",
+      "default": [
+        "authorization",
+        "cookie",
+        "set-cookie",
+        "x-api-key"
+      ],
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "telemetry_tags": {
       "description": "Telemetry tags carried alongside the key for metric/log emission. Introduced as a skeleton for issue #302 Phase A. No metric path consumes these tags yet; the field exists so future Phase A sub-PRs can attribute traffic without an on-disk schema break. Old payloads that omit `telemetry_tags` fall back to the `Default` impl via `#[serde(default)]`.",
       "default": {
