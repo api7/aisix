@@ -6,6 +6,9 @@
 //!
 //! - [x] D5.2.a — Gemini publisher chat dispatch
 //!   (`publishers/google/models/<model>:generateContent`)
+//! - [x] D5.2.b — Gemini streaming via
+//!   `:streamGenerateContent?alt=sse` (SSE chunks, no `[DONE]`
+//!   sentinel — Gemini closes the connection cleanly)
 //! - [x] D5.5 — `BridgeContext.deadline` plumbing on `chat()`
 //! - [ ] D5.1 — In-process GCP OAuth2 token mint (`yup-oauth2` /
 //!   `gcp_auth` service-account JSON → access token with
@@ -13,8 +16,6 @@
 //!   access token** in `ProviderKey.secret.access_token`;
 //!   operators are responsible for refresh (GCP tokens TTL
 //!   ~1 hour). Follow-up will lift that burden into the bridge.
-//! - [ ] D5.2.b — Gemini streaming via
-//!   `:streamGenerateContent?alt=sse`
 //! - [ ] D5.3 — Anthropic-on-Vertex dispatch
 //!   (`publishers/anthropic/models/<model>:rawPredict`,
 //!   `anthropic_version: "vertex-2023-10-16"`)

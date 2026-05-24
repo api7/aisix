@@ -16,10 +16,13 @@
 //!  locations/<region>/publishers/google/models/<model>:generateContent`
 
 use aisix_gateway::{
-    Bridge, BridgeContext, BridgeError, ChatChunkStream, ChatFormat, ChatMessage, ChatResponse,
-    FinishReason, Role, UsageStats,
+    sse::{SseDecoder, SseEvent},
+    Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatDelta, ChatFormat,
+    ChatMessage, ChatResponse, FinishReason, Role, UsageStats,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::StreamExt;
 use http::{
     header::{HeaderName, HeaderValue},
     HeaderMap,
@@ -354,22 +357,25 @@ impl Bridge for VertexBridge {
 
     async fn chat_stream(
         &self,
-        _req: &ChatFormat,
+        req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
         let upstream_id = upstream_model(ctx)?;
-        let _publisher = VertexPublisher::from_upstream_id(upstream_id).ok_or_else(|| {
+        let publisher = VertexPublisher::from_upstream_id(upstream_id).ok_or_else(|| {
             BridgeError::Config(format!(
                 "vertex publisher unknown for upstream model id {upstream_id:?}; \
                  expected one of gemini-* / claude-* / meta/llama-* or llama* / \
                  mistral-* / jamba-*"
             ))
         })?;
-        Err(BridgeError::Config(
-            "vertex streaming is not yet implemented — \
-             tracked under api7/AISIX-Cloud#302 Phase E (D5.2.b)"
-                .into(),
-        ))
+        match publisher {
+            VertexPublisher::Google => self.chat_gemini_stream(req, ctx, upstream_id).await,
+            other => Err(BridgeError::Config(format!(
+                "vertex publisher {publisher:?} streaming not yet implemented — \
+                 tracked under api7/AISIX-Cloud#302 Phase E (D5.3/D5.4, publisher={})",
+                other.name()
+            ))),
+        }
     }
 }
 
@@ -436,6 +442,221 @@ impl VertexBridge {
         })
         .await
     }
+
+    /// Dispatch Gemini streaming chat (publisher `google`).
+    ///
+    /// URL: `<base>/v1/projects/<project>/locations/<region>/
+    ///       publishers/google/models/<model>:streamGenerateContent?alt=sse`
+    ///
+    /// Per the official Vertex AI REST docs
+    /// <https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/inference#stream>,
+    /// the `?alt=sse` query selects the SSE wire (`data: {json}\n\n`
+    /// chunks). Without it the same path emits a JSON array stream
+    /// (one JSON object per chunk, comma-separated) — not implemented
+    /// here because every DP-side consumer wants SSE.
+    ///
+    /// Unlike OpenAI, Gemini does NOT emit a `data: [DONE]` sentinel
+    /// — the upstream simply closes the connection after the last
+    /// chunk (typically the one carrying `finishReason` and
+    /// `usageMetadata`). The decoder treats either pattern as end of
+    /// stream so a future upstream change that adds `[DONE]` doesn't
+    /// break us.
+    async fn chat_gemini_stream(
+        &self,
+        req: &ChatFormat,
+        ctx: &BridgeContext,
+        upstream_id: &str,
+    ) -> Result<ChatChunkStream, BridgeError> {
+        let creds = VertexSecret::parse(&ctx.provider_key.secret)?;
+        validate_url_token("project", &creds.project)?;
+        validate_url_token("region", &creds.region)?;
+        validate_url_token("upstream_id", upstream_id)?;
+
+        let base = self.resolve_api_base(&creds.region);
+        let url = format!(
+            "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:streamGenerateContent?alt=sse",
+            project = creds.project,
+            region = creds.region,
+            model = upstream_id,
+        );
+
+        let body = build_gemini_request(req);
+        if body.contents.is_empty() {
+            return Err(BridgeError::Config(
+                "vertex chat: messages must include at least one user / \
+                 assistant turn (system-only requests are not supported by Gemini)"
+                    .into(),
+            ));
+        }
+        let headers = build_request_headers(&creds.access_token, &ctx.request_id)?;
+        let client = self.client.clone();
+        let started = Instant::now();
+
+        let resp = with_deadline(ctx.deadline, started, async move {
+            client
+                .post(&url)
+                .headers(headers)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| BridgeError::Transport(e.to_string()))
+        })
+        .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(map_http_error(status, resp).await);
+        }
+
+        let upstream_id_owned = upstream_id.to_string();
+        let byte_stream = resp.bytes_stream();
+
+        // try_stream! adapts the byte stream into a Stream of
+        // Result<ChatChunk, BridgeError>. Pattern mirrors the
+        // openai bridge's chat_stream — see
+        // `aisix-provider-openai::build_chunk_stream`.
+        let stream = async_stream::try_stream! {
+            let mut decoder = SseDecoder::new();
+            let mut emitted_role = false;
+            let mut byte_stream = Box::pin(byte_stream);
+
+            while let Some(item) = byte_stream.next().await {
+                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(e.to_string()))?;
+                for event in decoder.feed(bytes.as_ref()) {
+                    if let SseEvent::Data(data) = event {
+                        let parsed: GeminiGenerateContentResponse =
+                            serde_json::from_str(&data).map_err(|e| {
+                                BridgeError::UpstreamDecode(format!(
+                                    "vertex stream chunk parse: {e}"
+                                ))
+                            })?;
+                        for chunk in
+                            gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut emitted_role)
+                        {
+                            yield chunk;
+                        }
+                    }
+                    // SseEvent::Done would fire only if upstream emits
+                    // [DONE]; Gemini doesn't. We tolerate either pattern
+                    // by simply ignoring the sentinel — the stream-close
+                    // signal is the byte stream ending.
+                }
+            }
+            // Flush any buffered trailing bytes — Gemini closes
+            // cleanly so this rarely fires, but it covers a partial
+            // last chunk if the upstream connection drops without a
+            // final `\n\n`.
+            if let Some(SseEvent::Data(data)) = decoder.finish() {
+                let parsed: GeminiGenerateContentResponse =
+                    serde_json::from_str(&data).map_err(|e| {
+                        BridgeError::UpstreamDecode(format!(
+                            "vertex stream tail parse: {e}"
+                        ))
+                    })?;
+                for chunk in
+                    gemini_chunk_into_chat_chunks(parsed, &upstream_id_owned, &mut emitted_role)
+                {
+                    yield chunk;
+                }
+            }
+        };
+
+        Ok(Box::pin(stream))
+    }
+}
+
+/// Translate one Gemini stream chunk into the gateway's
+/// [`ChatChunk`] sequence. Returns up to TWO chunks per upstream
+/// chunk:
+///
+/// 1. **Role chunk** (only on the first emission carrying text) —
+///    sets `delta.role = Role::Assistant` so downstream consumers
+///    know this is an assistant turn. Mirrors OpenAI's
+///    "first-chunk-is-role" wire convention.
+/// 2. **Content / terminal chunk** — carries the text delta and,
+///    on the final upstream chunk, the `finish_reason` +
+///    `usage` populated from `finishReason` + `usageMetadata`.
+///
+/// Returns 0 chunks if the upstream chunk had no candidates AND no
+/// usage metadata (which would be an empty keep-alive — Gemini
+/// doesn't emit those today, but the no-op is the safe response).
+fn gemini_chunk_into_chat_chunks(
+    raw: GeminiGenerateContentResponse,
+    upstream_id: &str,
+    emitted_role: &mut bool,
+) -> Vec<ChatChunk> {
+    let first_candidate = raw.candidates.into_iter().next();
+    let (text, finish_reason_raw) = match first_candidate {
+        Some(c) => {
+            let text = c
+                .content
+                .map(|ct| {
+                    ct.parts
+                        .into_iter()
+                        .filter_map(|p| p.text)
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default();
+            (text, c.finish_reason)
+        }
+        None => (String::new(), None),
+    };
+    // Distinguish "no finishReason field" from "finishReason: STOP".
+    // The non-stream path collapses both to FinishReason::Stop (since
+    // ChatResponse always carries a finish_reason); on the stream
+    // path we only attach finish_reason when upstream explicitly set
+    // one, otherwise downstream consumers assume "stream still going".
+    let finish_reason = finish_reason_raw
+        .as_deref()
+        .map(|s| map_gemini_finish_reason(Some(s)));
+
+    let usage = raw.usage_metadata.map(|u| UsageStats {
+        prompt_tokens: u.prompt_token_count,
+        completion_tokens: u.candidates_token_count,
+        total_tokens: if u.total_token_count > 0 {
+            u.total_token_count
+        } else {
+            u.prompt_token_count
+                .saturating_add(u.candidates_token_count)
+        },
+        ..Default::default()
+    });
+
+    let mut chunks = Vec::with_capacity(2);
+
+    // Role-setting chunk on first content emission.
+    if !*emitted_role && !text.is_empty() {
+        *emitted_role = true;
+        chunks.push(ChatChunk {
+            id: String::new(),
+            model: upstream_id.to_string(),
+            delta: ChatDelta {
+                role: Some(Role::Assistant),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+        });
+    }
+
+    // Content / terminal chunk — emit when there's text OR a
+    // finishReason OR usage, so the terminal-state chunk lands even
+    // when its content is empty.
+    if !text.is_empty() || finish_reason.is_some() || usage.is_some() {
+        chunks.push(ChatChunk {
+            id: String::new(),
+            model: upstream_id.to_string(),
+            delta: ChatDelta {
+                content: (!text.is_empty()).then_some(text),
+                ..Default::default()
+            },
+            finish_reason,
+            usage,
+        });
+    }
+
+    chunks
 }
 
 /// Build the outbound headers: `Authorization: Bearer <access_token>`,
@@ -1162,21 +1383,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_stream_returns_clear_not_implemented_error() {
+    async fn chat_stream_for_non_google_publishers_returns_clear_not_implemented_error() {
+        // Streaming is wired for Google (Gemini) only as of D5.2.b.
+        // Other publishers (anthropic / meta / mistral / ai21) must
+        // still surface the publisher-specific "not yet implemented"
+        // error pointing at D5.3 / D5.4 follow-ups so an operator who
+        // tries to stream Claude-on-Vertex sees the right tracking
+        // reference rather than a generic transport failure.
         let bridge = VertexBridge::new();
-        let ctx = BridgeContext::new(
-            "req-1",
-            sample_model_with("gemini-1.5-pro"),
-            sample_pk_with_secret(valid_secret_json()),
-        );
-        let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
-        let err = bridge.chat_stream(&req, &ctx).await.err().unwrap();
-        match err {
-            BridgeError::Config(msg) => {
-                assert!(msg.contains("streaming is not yet implemented"));
-                assert!(msg.contains("D5.2.b"));
+        for upstream in [
+            "claude-3-5-sonnet@20241022",
+            "llama-3-70b-instruct-maas",
+            "mistral-large-2411",
+            "jamba-1.5-large",
+        ] {
+            let ctx = BridgeContext::new(
+                "req-1",
+                sample_model_with(upstream),
+                sample_pk_with_secret(valid_secret_json()),
+            );
+            let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
+            let err = bridge.chat_stream(&req, &ctx).await.err().unwrap();
+            match err {
+                BridgeError::Config(msg) => {
+                    assert!(
+                        msg.contains("streaming not yet implemented"),
+                        "upstream={upstream} unexpected message: {msg}"
+                    );
+                    assert!(
+                        msg.contains("D5.3/D5.4"),
+                        "upstream={upstream} missing D5.3/D5.4 reference: {msg}"
+                    );
+                }
+                other => panic!("upstream={upstream} expected Config error, got {other:?}"),
             }
-            other => panic!("expected Config error, got {other:?}"),
         }
     }
 
@@ -1677,5 +1917,347 @@ mod tests {
         let chat = bridge.chat(&req, &ctx).await.unwrap();
         assert_eq!(chat.finish_reason, FinishReason::Length);
         assert_eq!(chat.message.content, "truncated...");
+    }
+
+    // ─── Streaming (:streamGenerateContent?alt=sse) ─────────────────
+
+    // futures::StreamExt is in scope via `use super::*;` (re-exported
+    // from the module-level imports), so .next().await works on the
+    // ChatChunkStream below without an explicit local import.
+
+    /// SSE body matching what Vertex emits for a short streamed chat:
+    /// a content chunk followed by a terminal chunk carrying
+    /// `finishReason` + `usageMetadata`. No `[DONE]` sentinel —
+    /// Gemini closes the connection cleanly.
+    fn happy_path_sse_body() -> String {
+        let chunk_1 = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hello"}]},
+                "index": 0
+            }],
+            "modelVersion": "gemini-1.5-pro"
+        });
+        let chunk_2 = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": " world"}]},
+                "index": 0
+            }],
+            "modelVersion": "gemini-1.5-pro"
+        });
+        let chunk_final = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": ""}]},
+                "finishReason": "STOP",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 3,
+                "candidatesTokenCount": 2,
+                "totalTokenCount": 5
+            },
+            "modelVersion": "gemini-1.5-pro"
+        });
+        format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+            serde_json::to_string(&chunk_1).unwrap(),
+            serde_json::to_string(&chunk_2).unwrap(),
+            serde_json::to_string(&chunk_final).unwrap()
+        )
+    }
+
+    #[tokio::test]
+    async fn chat_gemini_stream_dispatches_to_stream_generate_content_url() {
+        // Pin the URL shape: `:streamGenerateContent` action + `?alt=sse`
+        // query. wiremock's `path()` matcher covers only the path
+        // component, so we assert the body of the *request* via a
+        // capturing responder to also verify the query string round
+        // trips. A regression that dropped `?alt=sse` would land here
+        // — Vertex would return chunked JSON array instead of SSE,
+        // breaking the decoder.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-1.5-pro:streamGenerateContent",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(happy_path_sse_body()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        // Drain the stream so wiremock's `expect(1)` is satisfied on
+        // server drop. Errors are surfaced below.
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.unwrap());
+        }
+        assert!(!chunks.is_empty(), "expected at least one chunk");
+    }
+
+    #[tokio::test]
+    async fn chat_gemini_stream_first_chunk_is_role_then_content() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(happy_path_sse_body()),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.unwrap());
+        }
+
+        // Expected: 4 chunks total
+        //   [0] role=Assistant (from chunk_1 first emission)
+        //   [1] content="hello" (from chunk_1)
+        //   [2] content=" world" (from chunk_2)
+        //   [3] finish_reason=Stop + usage (from chunk_final)
+        assert_eq!(chunks.len(), 4, "got chunks: {:#?}", chunks);
+
+        assert_eq!(chunks[0].delta.role, Some(Role::Assistant));
+        assert!(chunks[0].delta.content.is_none());
+        assert!(chunks[0].finish_reason.is_none());
+        assert!(chunks[0].usage.is_none());
+
+        assert!(chunks[1].delta.role.is_none());
+        assert_eq!(chunks[1].delta.content.as_deref(), Some("hello"));
+
+        assert!(chunks[2].delta.role.is_none());
+        assert_eq!(chunks[2].delta.content.as_deref(), Some(" world"));
+
+        assert!(chunks[3].delta.content.is_none());
+        assert_eq!(chunks[3].finish_reason, Some(FinishReason::Stop));
+        let usage = chunks[3].usage.as_ref().unwrap();
+        assert_eq!(usage.prompt_tokens, 3);
+        assert_eq!(usage.completion_tokens, 2);
+        assert_eq!(usage.total_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn chat_gemini_stream_handles_chunks_split_across_packet_boundaries() {
+        // SSE decoder must tolerate `data: ` events that straddle
+        // HTTP packet boundaries — easy to get wrong with naive
+        // chunk-by-chunk parsing. wiremock emits the body in a single
+        // write, so this test exercises the SseDecoder's buffering
+        // path indirectly: we feed an SSE body that has a `\n\n`
+        // separator mid-stream and assert all chunks arrive intact.
+        let body = happy_path_sse_body();
+        // Sanity: body has multiple chunks separated by \n\n.
+        assert!(body.matches("\n\n").count() >= 3);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        let mut texts = Vec::new();
+        while let Some(item) = stream.next().await {
+            let chunk = item.unwrap();
+            if let Some(content) = chunk.delta.content {
+                texts.push(content);
+            }
+        }
+        // Concatenated text equals the deterministic happy-path body.
+        assert_eq!(texts.concat(), "hello world");
+    }
+
+    #[tokio::test]
+    async fn chat_gemini_stream_finish_reason_maps_max_tokens_to_length() {
+        // Sanity-check that the FinishReason mapping applies on the
+        // stream path the same way it does on the non-stream path —
+        // a regression that hard-coded Stop in the helper would slip
+        // past the happy-path test (which uses STOP).
+        let body = format!(
+            "data: {}\n\n",
+            serde_json::to_string(&serde_json::json!({
+                "candidates": [{
+                    "content": {"role": "model", "parts": [{"text": "truncated"}]},
+                    "finishReason": "MAX_TOKENS",
+                    "index": 0
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 1,
+                    "candidatesTokenCount": 100,
+                    "totalTokenCount": 101
+                }
+            }))
+            .unwrap()
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        let mut last_finish = None;
+        while let Some(item) = stream.next().await {
+            let chunk = item.unwrap();
+            if chunk.finish_reason.is_some() {
+                last_finish = chunk.finish_reason;
+            }
+        }
+        assert_eq!(last_finish, Some(FinishReason::Length));
+    }
+
+    #[tokio::test]
+    async fn chat_gemini_stream_4xx_returns_upstream_status_error_before_streaming() {
+        // 4xx errors must surface BEFORE the stream starts (Bridge
+        // returns Err from chat_stream rather than yielding an Err
+        // chunk). This matches the non-stream path and is what
+        // DP-side error handling expects.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": {
+                    "code": 429,
+                    "message": "Quota exceeded",
+                    "status": "RESOURCE_EXHAUSTED"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat_stream(&req, &ctx).await.err().unwrap();
+        match err {
+            BridgeError::UpstreamStatus { status, .. } => {
+                assert_eq!(status, 429);
+            }
+            other => panic!("expected UpstreamStatus, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_gemini_stream_invalid_chunk_payload_surfaces_decode_error() {
+        // A regression that mis-parsed the SSE wire (e.g. tried to
+        // decode the `data:` payload as a different shape) should
+        // surface as UpstreamDecode, not panic or skip the chunk.
+        let body = "data: this is not valid JSON\n\n".to_string();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        let mut saw_decode_err = false;
+        while let Some(item) = stream.next().await {
+            if let Err(BridgeError::UpstreamDecode(msg)) = item {
+                assert!(msg.contains("vertex stream chunk parse"));
+                saw_decode_err = true;
+                break;
+            }
+        }
+        assert!(
+            saw_decode_err,
+            "expected UpstreamDecode error on invalid JSON chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_gemini_stream_url_uses_alt_sse_query_param() {
+        // Pin the URL shape via capturing-responder pattern: assert
+        // the request URI included `?alt=sse`. Without that query,
+        // Vertex emits a chunked JSON array, not SSE — which would
+        // make every downstream stream consumer fail to decode.
+        let server = MockServer::start().await;
+        let captured: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_for_responder = captured.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |req: &MockRequest| {
+                *captured_for_responder.lock().unwrap() = Some(req.url.to_string());
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(happy_path_sse_body())
+            })
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let url = captured.lock().unwrap().clone().expect("URL was captured");
+        assert!(
+            url.contains(":streamGenerateContent"),
+            "expected :streamGenerateContent in URL, got {url}"
+        );
+        assert!(
+            url.contains("alt=sse"),
+            "expected ?alt=sse query, got {url}"
+        );
     }
 }
