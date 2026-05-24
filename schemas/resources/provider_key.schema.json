@@ -61,7 +61,7 @@
       "type": "string"
     },
     "strip_headers": {
-      "description": "Inbound request headers to strip before forwarding to the upstream provider on the passthrough endpoint (#411).\n\nDefaults (when the field is absent on the wire) to the 4 canonical credential headers: `authorization`, `cookie`, `set-cookie`, `x-api-key`. Customers can: - Remove a default entry → that header reaches upstream (the dashboard warns when removing a default). - Add custom entries → extra headers stripped.\n\nCase-insensitive. Compared lowercased against the inbound header name. Non-configurable headers (`host`, `content-length`, RFC 7230 §6.1 hop-by-hop) are stripped separately by the passthrough handler and cannot be removed via this list.",
+      "description": "Inbound request headers to strip before forwarding to the upstream provider on the passthrough endpoint (#411).\n\nDefaults (when the field is absent on the wire) to the 4 canonical credential headers: `authorization`, `cookie`, `set-cookie`, `x-api-key`. Customers can: - Remove a default entry → that header reaches upstream (the dashboard warns when removing a default). - Add custom entries → extra headers stripped.\n\nCase-insensitive. Compared lowercased against the inbound header name. Non-configurable headers (`host`, `content-length`, RFC 7230 §6.1 hop-by-hop) are stripped separately by the passthrough handler and cannot be removed via this list.\n\nEntries are normalised on deserialize via `normalize_strip_headers`: trimmed, lowercased, dedup'd, empties dropped. This prevents the \"operator typed `' cookie '`, the strip set has `' cookie '` but the inbound header is `'cookie'` → no match → silent credential leak\" footgun.",
       "default": [
         "authorization",
         "cookie",

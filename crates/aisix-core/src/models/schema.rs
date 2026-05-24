@@ -361,6 +361,17 @@ fn provider_key_schema() -> Value {
                     "error_envelope":         { "type": "string" },
                     "reasoning_field":        { "type": "string" }
                 }
+            },
+            // Issue #411 — per-PK passthrough header strip list.
+            // Optional (defaults applied DP-side via
+            // `#[serde(default = "default_strip_headers")]`); when
+            // present, must be an array of strings. Entries are
+            // normalised (trim/lowercase/dedup/drop-empties) on
+            // deserialize so this validator doesn't enforce
+            // formatting beyond the type shape.
+            "strip_headers": {
+                "type": "array",
+                "items": { "type": "string" }
             }
         }
     })
