@@ -102,9 +102,42 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<ResponseOverrides>,
 
+    /// Inbound request headers to strip before forwarding to the
+    /// upstream provider on the passthrough endpoint (#411).
+    ///
+    /// Defaults (when the field is absent on the wire) to the 4
+    /// canonical credential headers: `authorization`, `cookie`,
+    /// `set-cookie`, `x-api-key`. Customers can:
+    ///   - Remove a default entry → that header reaches upstream
+    ///     (the dashboard warns when removing a default).
+    ///   - Add custom entries → extra headers stripped.
+    ///
+    /// Case-insensitive. Compared lowercased against the inbound
+    /// header name. Non-configurable headers (`host`, `content-length`,
+    /// RFC 7230 §6.1 hop-by-hop) are stripped separately by the
+    /// passthrough handler and cannot be removed via this list.
+    #[serde(default = "default_strip_headers")]
+    pub strip_headers: Vec<String>,
+
     /// Filled in by the snapshot loader from the etcd key path.
     #[serde(skip)]
     pub(crate) runtime_id: String,
+}
+
+/// Default header-strip list for a freshly-created ProviderKey
+/// on the passthrough endpoint, per issue #411. These four headers
+/// are credentials that the upstream LLM provider has no legitimate
+/// use for; stripping by default protects against accidental
+/// session-token disclosure. Customers can remove entries via the
+/// dashboard (with a warning) if they have a specific audit /
+/// forwarding need.
+pub fn default_strip_headers() -> Vec<String> {
+    vec![
+        "authorization".to_string(),
+        "cookie".to_string(),
+        "set-cookie".to_string(),
+        "x-api-key".to_string(),
+    ]
 }
 
 /// Telemetry attribution tags emitted alongside requests routed
@@ -437,6 +470,7 @@ mod tests {
             telemetry_tags: TelemetryTags::default(),
             request: None,
             response: None,
+            strip_headers: default_strip_headers(),
             runtime_id: String::new(),
         };
         let s = serde_json::to_string(&original).unwrap();

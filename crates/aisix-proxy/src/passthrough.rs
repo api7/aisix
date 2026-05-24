@@ -35,6 +35,33 @@ use crate::error::ProxyError;
 use crate::request_id::new_request_id;
 use crate::state::ProxyState;
 
+/// Headers that the passthrough endpoint ALWAYS strips before
+/// forwarding to upstream, regardless of customer configuration.
+///
+/// Two categories:
+///   1. HTTP protocol metadata (`host`, `content-length`) — the
+///      outbound HTTP client recomputes these based on the upstream
+///      URL + body bytes.
+///   2. RFC 7230 §6.1 hop-by-hop headers — by definition single-
+///      hop, never legitimately forwarded.
+///
+/// Customer-configurable credential strips (`authorization`,
+/// `cookie`, `set-cookie`, `x-api-key`) live on the ProviderKey's
+/// `strip_headers` field — defaults set in
+/// `aisix_core::default_strip_headers`. Per issue #411.
+const ALWAYS_STRIP: &[&str] = &[
+    "host",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
 /// Provider defaults indexed by provider-prefix string.
 ///
 /// NOTE: `"cohere"` and `"jina"` are intentionally absent. #213
@@ -262,6 +289,49 @@ async fn dispatch(
     // - openai / gemini / deepseek (and any unknown provider that
     //   reuses the OpenAI-compat shape): `Authorization: Bearer …`
     // - anthropic: `x-api-key` + `anthropic-version` only
+    //
+    // Order matters: strip inbound headers FIRST (per ALWAYS_STRIP +
+    // pk.strip_headers), THEN set the gateway's own auth. If we did
+    // the reverse, `reqwest::RequestBuilder::header()` would `append`
+    // a second value to `Authorization` when the strip list doesn't
+    // include `authorization` (the customer-elected override case);
+    // the upstream would receive `Authorization: Bearer <gw>, Bearer
+    // <client>` on the wire, leaking the client's credential
+    // regardless of intent. Strip-then-set keeps the wire single-
+    // valued in the default case; in the override case the client's
+    // value reaches upstream, which is the documented opt-in cost.
+    //
+    // Strip rules:
+    //   1. ALWAYS_STRIP — HTTP protocol metadata + RFC 7230 §6.1
+    //      hop-by-hop headers. Non-configurable; stripping these
+    //      is required for protocol correctness.
+    //   2. provider_key.strip_headers — customer-configurable
+    //      strip list (per ProviderKey, default: authorization,
+    //      cookie, set-cookie, x-api-key). See issue #411.
+    //
+    // Case-insensitive comparison; build a lowercased HashSet once
+    // per request to avoid O(N*M) scans on large header lists.
+    let strip_set: std::collections::HashSet<String> = pk_entry
+        .value
+        .strip_headers
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .chain(ALWAYS_STRIP.iter().map(|s| (*s).to_string()))
+        .collect();
+
+    for (name, value) in &incoming_headers {
+        let n = name.as_str().to_ascii_lowercase();
+        if strip_set.contains(&n) {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+
+    // Gateway's own auth — set AFTER the strip loop. This guarantees
+    // the upstream sees exactly one `Authorization` (or `x-api-key`
+    // + `anthropic-version`) line in the default case, even when
+    // the client sent one of those headers — the client's value
+    // was filtered out in the loop above.
     if api_key.is_empty() {
         // Provider key has no secret configured. Nothing to inject —
         // explicit blank-Authorization rather than fall-through-to-
@@ -271,18 +341,6 @@ async fn dispatch(
         builder = builder.header("anthropic-version", "2023-06-01");
     } else {
         builder = builder.header(header::AUTHORIZATION, format!("Bearer {api_key}"));
-    }
-
-    // Forward safe incoming headers (drop hop-by-hop and auth).
-    for (name, value) in &incoming_headers {
-        let n = name.as_str().to_lowercase();
-        if matches!(
-            n.as_str(),
-            "authorization" | "x-api-key" | "host" | "content-length"
-        ) {
-            continue;
-        }
-        builder = builder.header(name, value);
     }
 
     builder = builder.header("x-aisix-request-id", request_id);
@@ -704,5 +762,351 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         // 422 from upstream is relayed as-is (not remapped to 502).
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // ---- Issue #411: header-strip policy --------------------------
+    //
+    // Inbound headers must be filtered through:
+    //   1. ALWAYS_STRIP — RFC 7230 §6.1 hop-by-hop + protocol
+    //      metadata. Non-configurable.
+    //   2. provider_key.strip_headers — per-PK configurable list.
+    //      Defaults to the 4 canonical credentials.
+    //
+    // These tests pin the wire contract upstream observes.
+
+    /// Builds a PK with a caller-supplied `strip_headers` value
+    /// (overriding the serde default of 4 credentials).
+    fn provider_key_entry_with_strip(
+        api_base: &str,
+        strip_headers: &[&str],
+    ) -> ResourceEntry<aisix_core::ProviderKey> {
+        let strip_json = serde_json::to_string(strip_headers).unwrap();
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}","provider":"openai","adapter":"openai","strip_headers":{strip_json}}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
+    /// Helper: returns all values associated with `header_name` in the
+    /// upstream's received request. The mock server uses an
+    /// http::HeaderMap; `get` only returns the first value when a
+    /// header has multiple. To verify "client credential didn't
+    /// leak", we must scan all values (including the gateway's own
+    /// injection) — anything matching the client's input is a leak.
+    fn upstream_header_values<'a>(
+        received: &'a wiremock::Request,
+        header_name: &str,
+    ) -> Vec<&'a str> {
+        received
+            .headers
+            .get_all(header_name)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn default_strip_blocks_client_credentials_leak() {
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&upstream)
+            .await;
+
+        // new_snap() uses provider_key_entry() which doesn't set
+        // strip_headers → serde default fills in the 4 credentials.
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/passthrough/openai/v1/models")
+            // Authorization is BOTH the gateway-auth credential AND
+            // a credential that must not leak to upstream. We have
+            // to send the valid gateway key here (so AuthenticatedKey
+            // succeeds), then assert upstream sees the PK secret
+            // (`sk-test`) instead of the client value (`sk-caller`).
+            .header("authorization", "Bearer sk-caller")
+            // Cookie: client-side leak canary. Unique value lets us
+            // verify nothing of this string reached upstream.
+            .header("cookie", "session=CLIENT-COOKIE-LEAK-CANARY")
+            // X-API-Key: ditto.
+            .header("x-api-key", "X-API-KEY-LEAK-CANARY")
+            // Set-Cookie is a response header; clients don't usually
+            // send it, but the default strip list includes it anyway
+            // (defense-in-depth against pathological clients).
+            .header("set-cookie", "leak-set-cookie=1")
+            // The customer's own trace-correlation header — NOT in
+            // the strip list, MUST reach upstream.
+            .header("x-trace-id", "trace-abc")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = upstream.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let r = &received[0];
+
+        // Authorization: gateway sets its own (`Bearer sk-test` from
+        // the PK secret); client's `Bearer sk-caller` MUST be
+        // stripped before reaching the wire.
+        let auths = upstream_header_values(r, "authorization");
+        assert_eq!(
+            auths,
+            vec!["Bearer sk-test"],
+            "default strip must replace client Authorization with PK secret only (#411); got: {:?}",
+            auths
+        );
+
+        // Cookie / x-api-key / set-cookie: the gateway never sets
+        // these on the outbound side (for OpenAI), so absence is
+        // the right signal.
+        assert!(
+            upstream_header_values(r, "cookie").is_empty(),
+            "cookie must not leak by default (#411)"
+        );
+        assert!(
+            upstream_header_values(r, "x-api-key").is_empty(),
+            "x-api-key must not leak by default (#411)"
+        );
+        assert!(
+            upstream_header_values(r, "set-cookie").is_empty(),
+            "set-cookie must not leak by default (#411)"
+        );
+
+        // Non-stripped header DID reach upstream.
+        assert_eq!(
+            upstream_header_values(r, "x-trace-id"),
+            vec!["trace-abc"],
+            "non-stripped header must pass through"
+        );
+    }
+
+    #[tokio::test]
+    async fn always_strip_removes_hop_by_hop_regardless_of_config() {
+        // PK with empty strip_headers (customer disabled all default
+        // strips). ALWAYS_STRIP still applies — hop-by-hop / protocol
+        // headers are non-configurable.
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry_with_strip(&upstream.uri(), &[]));
+        snap.models.insert(openai_model("gpt-4o"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/passthrough/openai/v1/models")
+            .header("authorization", "Bearer sk-caller")
+            .header("connection", "keep-alive, x-custom-fake")
+            .header("upgrade", "websocket")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = upstream.received_requests().await.unwrap();
+        let h = &received[0].headers;
+        assert!(
+            !h.contains_key("connection"),
+            "connection must always be stripped (RFC 7230 §6.1)"
+        );
+        assert!(
+            !h.contains_key("upgrade"),
+            "upgrade must always be stripped (RFC 7230 §6.1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_strip_list_lets_credentials_through() {
+        // The dangerous-but-legal "I unchecked all defaults in the
+        // dashboard" override case. Customer takes the risk; the
+        // gateway respects the explicit configuration. Documented
+        // in the dashboard's confirmation flow.
+        //
+        // In this case the upstream's Authorization HeaderMap entry
+        // has BOTH values (client's + gateway's): `Bearer sk-caller,
+        // Bearer sk-test` on the wire. We assert the client's value
+        // appears among them — that proves the strip didn't run, the
+        // override worked. We DON'T assert the wire order; reqwest
+        // append semantics put gateway's value first since it's added
+        // after the loop, but the test should be robust to either
+        // ordering decision.
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry_with_strip(&upstream.uri(), &[]));
+        snap.models.insert(openai_model("gpt-4o"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/passthrough/openai/v1/models")
+            .header("authorization", "Bearer sk-caller")
+            .header("cookie", "session=letitthrough")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = upstream.received_requests().await.unwrap();
+        let r = &received[0];
+
+        // Authorization: should have BOTH client's and gateway's
+        // values present.
+        let auths = upstream_header_values(r, "authorization");
+        assert!(
+            auths.contains(&"Bearer sk-caller"),
+            "empty strip_headers must let client Authorization through; got: {:?}",
+            auths
+        );
+        // Cookie: only client's value; gateway doesn't set cookie.
+        assert_eq!(
+            upstream_header_values(r, "cookie"),
+            vec!["session=letitthrough"],
+            "empty strip_headers must let cookie through"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_strip_list_strips_only_named_headers() {
+        // Customer overrides defaults — drops `cookie` from the
+        // strip list (cookie passes through) but adds custom
+        // `x-internal-trace-id` (gets stripped).
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(provider_key_entry_with_strip(
+            &upstream.uri(),
+            // No "cookie" — cookie passes through. New "x-internal-trace-id"
+            // gets stripped. authorization still stripped.
+            &["authorization", "x-internal-trace-id"],
+        ));
+        snap.models.insert(openai_model("gpt-4o"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/passthrough/openai/v1/models")
+            .header("authorization", "Bearer sk-caller")
+            .header("cookie", "tracker=stays")
+            .header("x-internal-trace-id", "internal-12345")
+            .header("x-public-trace-id", "public-67890")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = upstream.received_requests().await.unwrap();
+        let r = &received[0];
+
+        // Authorization is in the custom strip list → client's
+        // value must not appear; gateway's own auth (PK secret)
+        // IS present.
+        let auths = upstream_header_values(r, "authorization");
+        assert!(
+            !auths.iter().any(|v| v.contains("sk-caller")),
+            "authorization in custom strip list → client value must not leak; got: {:?}",
+            auths
+        );
+        assert!(
+            auths.contains(&"Bearer sk-test"),
+            "gateway's own auth still present"
+        );
+
+        // Cookie is NOT in custom strip list → client's value
+        // reaches upstream.
+        assert_eq!(
+            upstream_header_values(r, "cookie"),
+            vec!["tracker=stays"],
+            "cookie removed from strip list → passes through"
+        );
+
+        // x-internal-trace-id is in custom strip list → gone.
+        assert!(
+            upstream_header_values(r, "x-internal-trace-id").is_empty(),
+            "custom-added strip → removed"
+        );
+
+        // x-public-trace-id is NOT stripped → reaches upstream.
+        assert_eq!(
+            upstream_header_values(r, "x-public-trace-id"),
+            vec!["public-67890"],
+            "header not in strip list → passes through"
+        );
+    }
+
+    #[tokio::test]
+    async fn strip_header_match_is_case_insensitive() {
+        // Inbound header keys can be ANY case. The strip list is
+        // lowercased; the comparison must be case-insensitive too.
+        let upstream = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/passthrough/openai/v1/models")
+            // axum will lower-case the keys via http::HeaderName but
+            // the original-case roundtrip is preserved on some paths;
+            // covering it explicitly anchors the contract.
+            .header("Authorization", "Bearer sk-caller")
+            .header("Cookie", "session=case")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = upstream.received_requests().await.unwrap();
+        let r = &received[0];
+        // Even with mixed-case input headers, the lowercased strip
+        // set matches → client's leaks must not appear.
+        let auths = upstream_header_values(r, "authorization");
+        assert!(
+            !auths.iter().any(|v| v.contains("sk-caller")),
+            "case-insensitive strip: client Authorization must not leak"
+        );
+        assert!(
+            upstream_header_values(r, "cookie").is_empty(),
+            "case-insensitive strip: cookie must be removed"
+        );
     }
 }
