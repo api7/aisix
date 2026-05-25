@@ -36,6 +36,7 @@ use aws_sdk_bedrockruntime::types::{
 };
 use aws_sdk_bedrockruntime::Client as BedrockClient;
 use aws_smithy_runtime_api::client::result::ServiceError;
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use serde::Deserialize;
 use std::time::{Duration, Instant};
 
@@ -650,11 +651,15 @@ impl BedrockBridge {
         for mb in message_blocks {
             call = call.messages(mb);
         }
-        // Bedrock's InferenceConfiguration is optional — we leave it
-        // unset by default so the upstream model's own defaults apply.
-        // A follow-up override-pipeline PR can wire temperature /
-        // max_tokens from RequestOverrides.
-        let _ = InferenceConfiguration::builder();
+        // Audit MEDIUM-2 (PR #389): wire ChatFormat's
+        // temperature/max_tokens/top_p through to Converse's
+        // InferenceConfiguration. The legacy chat_anthropic path
+        // forwards these via build_request → AnthropicRequest;
+        // dropping them on the Converse path is a silent
+        // behavioural regression for every non-Anthropic customer.
+        if let Some(cfg) = build_inference_config(req) {
+            call = call.inference_config(cfg);
+        }
 
         let resp = call
             .send()
@@ -712,6 +717,10 @@ impl BedrockBridge {
         }
         for mb in message_blocks {
             call = call.messages(mb);
+        }
+        // Mirror chat_converse on the stream path — same audit fix.
+        if let Some(cfg) = build_inference_config(req) {
+            call = call.inference_config(cfg);
         }
 
         let mut resp = call
@@ -934,14 +943,14 @@ fn emit_converse_chunk(
 }
 
 /// Map the SDK's `ConverseError` SdkError variant to BridgeError.
-/// Same classification rules as `map_sdk_error` (UpstreamStatus for
-/// retryable upstream failures, Timeout on dispatch timeout).
+/// Delegates to the generic helper so both Converse and ConverseStream
+/// share the wire-shape + Retry-After preservation logic.
 fn map_converse_sdk_error(
     e: SdkError<ConverseError, aws_smithy_runtime_api::http::Response>,
     started: Instant,
     deadline: Option<Duration>,
 ) -> BridgeError {
-    map_aws_sdk_error_generic(e.to_string(), &e, started, deadline)
+    map_aws_sdk_error_generic(e, started, deadline)
 }
 
 fn map_converse_stream_sdk_error(
@@ -949,22 +958,37 @@ fn map_converse_stream_sdk_error(
     started: Instant,
     deadline: Option<Duration>,
 ) -> BridgeError {
-    map_aws_sdk_error_generic(e.to_string(), &e, started, deadline)
+    map_aws_sdk_error_generic(e, started, deadline)
 }
 
-/// Common AWS SDK error classifier. Tries to recover a Bedrock HTTP
-/// status (4xx vs 5xx) and routes through the same UpstreamStatus /
-/// Transport / Timeout taxonomy as the legacy invoke path. The
-/// `service_error()` accessor is generic across operation types so
-/// we delegate to a trait object via the boxed-error path.
+/// Common AWS SDK error classifier. Routes through the same
+/// UpstreamStatus / Transport / Timeout taxonomy the legacy
+/// `map_service_error` uses for `/invoke`, preserving:
+///
+/// - `wire: UpstreamWire::Bedrock` — so `error_translate` renders
+///   Bedrock-shape errors back to OpenAI/Anthropic-shape clients
+/// - `retry_after: Some(...)` — parsed from the upstream's
+///   `Retry-After` header so the cooldown layer honours the AWS
+///   throttle hint instead of falling back to its default
+/// - `parsed.kind: Some(<AWS error code>)` — so a 429 from
+///   `ThrottlingException` is distinguishable from a 429 from a
+///   different throttle source
+///
+/// The `E: ProvideErrorMetadata` bound lets the helper extract
+/// `.meta().code()` regardless of which operation the error came
+/// from (Converse vs. ConverseStream variants of the same shape).
+///
+/// Audit MEDIUM / HIGH on PR #389 — the prior implementation
+/// collapsed to `BridgeError::upstream_status(status, msg)` which
+/// sets `wire: Unknown` and `retry_after: None`, silently regressing
+/// the legacy /invoke path's hardening (PR #323 MEDIUM-2).
 fn map_aws_sdk_error_generic<E>(
-    msg: String,
-    err: &SdkError<E, aws_smithy_runtime_api::http::Response>,
+    err: SdkError<E, aws_smithy_runtime_api::http::Response>,
     started: Instant,
     deadline: Option<Duration>,
 ) -> BridgeError
 where
-    E: std::fmt::Debug,
+    E: std::fmt::Debug + ProvideErrorMetadata,
 {
     // Deadline-elapsed wins over upstream classification — surfacing
     // an UpstreamStatus on a timed-out request would hide the
@@ -977,15 +1001,92 @@ where
         }
     }
     match err {
-        SdkError::ServiceError(svc) => {
-            let status = svc.raw().status().as_u16();
-            BridgeError::upstream_status(status, msg)
-        }
+        SdkError::ServiceError(svc) => bedrock_service_error_to_upstream_status(svc),
         SdkError::TimeoutError(_) => BridgeError::Timeout {
             elapsed_ms: started.elapsed().as_millis() as u64,
         },
-        _ => BridgeError::Transport(msg),
+        other => BridgeError::Transport(format!("{other}")),
     }
+}
+
+/// Translate an AWS SDK `ServiceError` into a fully-shaped
+/// `BridgeError::UpstreamStatus` — same fields as the legacy
+/// `map_service_error` would emit for `/invoke`. Generic over the
+/// operation error type so the same logic covers Converse +
+/// ConverseStream + any future Bedrock op.
+fn bedrock_service_error_to_upstream_status<E>(
+    svc: ServiceError<E, aws_smithy_runtime_api::http::Response>,
+) -> BridgeError
+where
+    E: ProvideErrorMetadata,
+{
+    let kind = svc.err().meta().code().map(str::to_string);
+    let raw = svc.raw();
+    let status = raw.status().as_u16();
+    // Convert smithy HeaderMap → http::HeaderMap so we can reuse the
+    // gateway-level `parse_retry_after` helper. Headers with invalid
+    // bytes are dropped (defensive — SDK should not produce them).
+    let mut hdrs = http::HeaderMap::new();
+    for (k, v) in raw.headers() {
+        if let (Ok(name), Ok(val)) = (
+            http::HeaderName::from_bytes(k.as_bytes()),
+            http::HeaderValue::from_str(v),
+        ) {
+            hdrs.insert(name, val);
+        }
+    }
+    let retry_after = aisix_gateway::parse_retry_after(&hdrs);
+    let message = match status {
+        401 | 403 => "upstream authentication failed".to_string(),
+        404 => "upstream model not found".to_string(),
+        408 => "upstream request timeout".to_string(),
+        429 => "upstream rate limited".to_string(),
+        _ => format!("upstream returned {status}"),
+    };
+    // SECURITY: the AWS error message embeds operator-internal
+    // taxonomy (ARNs, region, account id, IAM role names). We surface
+    // only the AWS error CODE (e.g. "ThrottlingException") for the
+    // error_translate layer; the customer-visible `message` is the
+    // canned status-keyed phrase above.
+    let parsed = kind.as_ref().map(|k| {
+        Box::new(aisix_gateway::UpstreamErrorView {
+            kind: Some(k.clone()),
+            message: None,
+            code: None,
+            param: None,
+        })
+    });
+    BridgeError::UpstreamStatus {
+        status,
+        message,
+        parsed,
+        wire: aisix_gateway::UpstreamWire::Bedrock,
+        retry_after,
+    }
+}
+
+/// Build an `InferenceConfiguration` from the gateway's
+/// [`ChatFormat`] knobs, or `None` if no knobs are set. Caller
+/// only attaches when `Some` so we don't ship an empty
+/// `inferenceConfig: {}` to Bedrock (some publishers tolerate it,
+/// others 400).
+fn build_inference_config(req: &ChatFormat) -> Option<InferenceConfiguration> {
+    if req.temperature.is_none() && req.max_tokens.is_none() && req.top_p.is_none() {
+        return None;
+    }
+    let mut b = InferenceConfiguration::builder();
+    if let Some(t) = req.temperature {
+        b = b.temperature(t);
+    }
+    if let Some(m) = req.max_tokens {
+        // Bedrock's API uses i32; ChatFormat's u32 is always non-negative.
+        let clamped = i32::try_from(m).unwrap_or(i32::MAX);
+        b = b.max_tokens(clamped);
+    }
+    if let Some(p) = req.top_p {
+        b = b.top_p(p);
+    }
+    Some(b.build())
 }
 
 #[cfg(test)]
@@ -2067,6 +2168,206 @@ mod tests {
         );
         let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
         let _ = bridge.chat_stream(&req, &ctx).await;
+    }
+
+    /// Audit HIGH-1+HIGH-2 (PR #389): Converse 4xx must preserve
+    /// `wire: Bedrock`, parse `Retry-After` into `retry_after`, and
+    /// extract the AWS error code into `parsed.kind` — matching the
+    /// legacy /invoke path's `map_service_error`. Without this fix,
+    /// non-Anthropic publishers and all streaming silently regress
+    /// `wire` to `Unknown` (breaks error_translate) and drop the
+    /// Retry-After hint (breaks cooldown auto-tuning).
+    #[tokio::test]
+    async fn chat_converse_maps_upstream_429_with_retry_after_and_bedrock_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/meta\..+/converse$"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "42")
+                    .insert_header("x-amzn-ErrorType", "ThrottlingException")
+                    .set_body_json(serde_json::json!({
+                        "__type": "ThrottlingException",
+                        "message": "Rate exceeded"
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        match err {
+            BridgeError::UpstreamStatus {
+                status,
+                message,
+                wire,
+                retry_after,
+                parsed,
+            } => {
+                assert_eq!(status, 429);
+                assert_eq!(message, "upstream rate limited");
+                assert_eq!(
+                    wire,
+                    aisix_gateway::UpstreamWire::Bedrock,
+                    "must preserve Bedrock wire for error_translate"
+                );
+                assert_eq!(
+                    retry_after,
+                    Some(std::time::Duration::from_secs(42)),
+                    "must propagate upstream Retry-After to cooldown layer"
+                );
+                let parsed = parsed.expect("must expose AWS error kind to error_translate");
+                assert_eq!(
+                    parsed.kind.as_deref(),
+                    Some("ThrottlingException"),
+                    "must extract AWS error code into parsed.kind"
+                );
+            }
+            other => panic!("expected UpstreamStatus, got {other:?}"),
+        }
+    }
+
+    /// Audit HIGH-1 (PR #389): Converse 4xx that isn't 429 must
+    /// still get the canned status-keyed message + Bedrock wire,
+    /// matching the legacy /invoke path.
+    #[tokio::test]
+    async fn chat_converse_maps_upstream_4xx_to_canned_message_with_bedrock_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/meta\..+/converse$"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .insert_header("x-amzn-ErrorType", "AccessDeniedException")
+                    .set_body_json(serde_json::json!({
+                        "__type": "AccessDeniedException",
+                        "message": "User: arn:aws:iam::123:user/x is not authorized"
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        match err {
+            BridgeError::UpstreamStatus {
+                status,
+                message,
+                wire,
+                parsed,
+                ..
+            } => {
+                assert_eq!(status, 403);
+                assert_eq!(
+                    message, "upstream authentication failed",
+                    "must use canned phrase (NOT echo upstream ARN)"
+                );
+                assert_eq!(wire, aisix_gateway::UpstreamWire::Bedrock);
+                assert!(
+                    !message.contains("arn:aws:iam"),
+                    "canned phrase must not leak the operator-internal ARN; got {message}"
+                );
+                let parsed = parsed.expect("must expose AWS error kind");
+                assert_eq!(parsed.kind.as_deref(), Some("AccessDeniedException"));
+            }
+            other => panic!("expected UpstreamStatus, got {other:?}"),
+        }
+    }
+
+    /// Audit MEDIUM-2 (PR #389): ChatFormat.temperature /
+    /// .max_tokens / .top_p must flow through to Converse's
+    /// InferenceConfiguration. Dropping them silently is a
+    /// behavioural regression for every non-Anthropic Bedrock
+    /// customer who was setting these knobs via the gateway.
+    #[tokio::test]
+    async fn chat_converse_wires_temperature_max_tokens_top_p_into_inference_config() {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse$"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let mut req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        // Pick values that survive the f32 → JSON → f64 round-trip
+        // cleanly (powers of 1/2 / 1/4 / 1/8 ...). Avoids brittle
+        // `0.7 ≠ 0.6999999881` precision-comparison failures.
+        req.temperature = Some(0.5);
+        req.max_tokens = Some(128);
+        req.top_p = Some(0.75);
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let _ = bridge.chat(&req, &ctx).await;
+
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        let cfg = body
+            .get("inferenceConfig")
+            .and_then(|v| v.as_object())
+            .expect("inferenceConfig must be set when ChatFormat carries knobs");
+        // Bedrock uses camelCase per AWS spec.
+        assert_eq!(
+            cfg.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.5),
+            "temperature must propagate; body={body}"
+        );
+        assert_eq!(
+            cfg.get("maxTokens").and_then(|v| v.as_i64()),
+            Some(128),
+            "maxTokens (camelCase) must propagate; body={body}"
+        );
+        assert_eq!(
+            cfg.get("topP").and_then(|v| v.as_f64()),
+            Some(0.75),
+            "topP (camelCase) must propagate; body={body}"
+        );
+    }
+
+    /// Companion to the wires-temperature test: when no knobs are
+    /// set, inferenceConfig must be OMITTED from the body — sending
+    /// an empty `{}` causes some Bedrock publishers to 400.
+    #[tokio::test]
+    async fn chat_converse_omits_inference_config_when_no_knobs_set() {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse$"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        // ChatFormat::new leaves temperature/max_tokens/top_p None.
+        let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let _ = bridge.chat(&req, &ctx).await;
+
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        assert!(
+            body.get("inferenceConfig").is_none(),
+            "inferenceConfig must be absent when ChatFormat has no knobs; body={body}"
+        );
     }
 
     #[tokio::test]
