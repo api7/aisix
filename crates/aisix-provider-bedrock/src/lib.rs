@@ -10,18 +10,22 @@
 //!   "bedrock-2023-05-31"` in body not header)
 //! - [x] D7.6 — Cross-region inference profiles (`us.`/`eu.`/`apac.`/
 //!   `global.`/`us-gov.` prefixes stripped by [`bridge::BedrockPublisher::from_model_id`])
-//! - [ ] D7.2.b — Anthropic-on-Bedrock streaming via
-//!   `invoke_model_with_response_stream` (AWS event-stream framed,
-//!   NOT canonical SSE; reuses the Anthropic typed-event stream state
-//!   machine from `aisix-provider-anthropic`)
-//! - [ ] D7.3 — Meta-on-Bedrock dispatch (Llama 3 / 3.1 / 3.2 / 3.3)
-//! - [ ] D7.4 — Mistral / Amazon Titan / Amazon Nova / Cohere / AI21
-//!   per-publisher request bodies
+//! - [x] D7.2.b — All-publisher streaming via the unified Converse API
+//!   (`/model/<id>/converse-stream`). The SDK owns the
+//!   `vnd.amazon.eventstream` binary frame decoding; the bridge layer
+//!   maps typed events to ChatChunk via `emit_converse_chunk`.
+//! - [x] D7.3 — Meta-on-Bedrock dispatch via Converse
+//!   (`/model/meta.*/converse`). SDK shapes the Converse JSON body
+//!   from typed builders.
+//! - [x] D7.4 — Mistral / Amazon Titan / Amazon Nova / Cohere / AI21
+//!   dispatch via Converse (same unified path; AWS handles
+//!   publisher-specific body shaping inside Bedrock).
 //!
-//! Until D7.2.b lands, `chat_stream()` returns a clear
-//! `BridgeError::Config(...)` referencing the streaming follow-up.
-//! Publishers other than Anthropic return a publisher-specific
-//! "not yet implemented" error from `chat()` / `chat_stream()`.
+//! Anthropic non-streaming keeps the legacy `/invoke` path
+//! (`chat_anthropic`) for backward compat with existing operator
+//! deployments + e2e test fixtures. Anthropic streaming, and all
+//! non-Anthropic dispatch (stream or non-stream), flow through
+//! Converse.
 //!
 //! # Multi-publisher single-entry model
 //!

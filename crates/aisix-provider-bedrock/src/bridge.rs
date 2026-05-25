@@ -17,15 +17,23 @@
 //! point at a private deployment / VPC endpoint.
 
 use aisix_gateway::{
-    Bridge, BridgeContext, BridgeError, ChatChunkStream, ChatFormat, ChatResponse,
+    Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatDelta, ChatFormat,
+    ChatMessage, ChatResponse, FinishReason, Role, UsageStats,
 };
 use async_trait::async_trait;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_credential_types::Credentials;
 use aws_sdk_bedrockruntime::config::{BehaviorVersion, Region};
 use aws_sdk_bedrockruntime::error::SdkError;
+use aws_sdk_bedrockruntime::operation::converse::ConverseError;
+use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
 use aws_sdk_bedrockruntime::operation::invoke_model::InvokeModelError;
 use aws_sdk_bedrockruntime::primitives::Blob;
+use aws_sdk_bedrockruntime::types::{
+    ContentBlock, ContentBlockDelta, ConversationRole, ConverseStreamOutput,
+    InferenceConfiguration, Message as BedrockMessage, StopReason as SdkStopReason,
+    SystemContentBlock,
+};
 use aws_sdk_bedrockruntime::Client as BedrockClient;
 use aws_smithy_runtime_api::client::result::ServiceError;
 use serde::Deserialize;
@@ -39,9 +47,9 @@ use crate::wire;
 
 /// Anthropic-on-Bedrock body-shape version pin per
 /// <https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-messages.html>.
-/// Goes in the request body as the `anthropic_version` field; the
-/// `model` field is stripped because Bedrock keys dispatch off the
-/// URL path, not the body.
+/// Used by the legacy /invoke Anthropic non-stream path
+/// ([`BedrockBridge::chat_anthropic`]); the Converse path doesn't
+/// need it (the SDK shapes the body).
 const BEDROCK_ANTHROPIC_VERSION: &str = "bedrock-2023-05-31";
 
 /// Family Bridge for AWS Bedrock Runtime.
@@ -200,7 +208,11 @@ impl BedrockPublisher {
         })
     }
 
-    /// Human-readable name used in publisher-not-implemented errors.
+    /// Human-readable name. Was used by the old "publisher-not-
+    /// implemented" error path; kept after Phase G Step 3's Converse
+    /// dispatch wiring made the legacy path obsolete because the same
+    /// label is still useful for telemetry tagging follow-ups.
+    #[allow(dead_code)]
     fn name(&self) -> &'static str {
         match self {
             Self::Anthropic => "anthropic",
@@ -478,25 +490,28 @@ impl Bridge for BedrockBridge {
         // for any operator default_headers override.
         let _ = wire::reserved_sigv4_headers();
 
+        // Phase G productionization (#302 Step 3): unified Converse
+        // wire for non-Anthropic publishers (Meta / Mistral / Cohere /
+        // Amazon Titan / Amazon Nova / AI21). Anthropic stays on the
+        // legacy /invoke path (chat_anthropic, wired via #320) for
+        // backward compat with existing operator deployments — the
+        // Anthropic Messages JSON envelope is what cp-api / dashboard
+        // tests already pin. Moving Anthropic to Converse is a clean
+        // follow-up since the SDK-decoded Converse response shape is
+        // equivalent for the customer-visible ChatResponse.
+        //
+        // chat_stream (below) dispatches ALL publishers through
+        // Converse because the legacy /invoke path never had a
+        // streaming variant (D7.2.b was the gap).
         match publisher {
             BedrockPublisher::Anthropic => self.chat_anthropic(req, ctx, upstream_id).await,
-            // Audit H2: surface the operator's actual model id rather
-            // than the enum's Debug taxonomy (`Other` / `<unspecified>`
-            // are internal labels that don't help the customer or the
-            // operator diagnose). The `publisher.name()` is the
-            // catalog-level identifier the operator pinned.
-            other => Err(BridgeError::Config(format!(
-                "bedrock dispatch for model id {upstream_id:?} (publisher={}) \
-                 not yet implemented — tracked under api7/AISIX-Cloud#302 \
-                 Phase G (D7.3+)",
-                other.name()
-            ))),
+            _ => self.chat_converse(req, ctx, upstream_id).await,
         }
     }
 
     async fn chat_stream(
         &self,
-        _req: &ChatFormat,
+        req: &ChatFormat,
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
         let upstream_id = upstream_model(ctx)?;
@@ -509,62 +524,34 @@ impl Bridge for BedrockBridge {
                  (optionally prefixed with a cross-region inference profile like us. / eu. / apac.)"
             ))
         })?;
-        // Audit M4: distinguish "anthropic streaming not yet wired"
-        // (D7.2.b — same publisher as chat, just streaming) from
-        // "publisher X not yet wired at all" (D7.3+). Mixing them
-        // would mis-route the operator to the wrong follow-up
-        // tracking task.
-        match publisher {
-            BedrockPublisher::Anthropic => Err(BridgeError::Config(
-                "bedrock anthropic streaming is not yet implemented — \
-                 tracked under api7/AISIX-Cloud#302 Phase G (D7.2.b)"
-                    .into(),
-            )),
-            other => Err(BridgeError::Config(format!(
-                "bedrock dispatch (chat_stream) for model id {upstream_id:?} \
-                 (publisher={}) not yet implemented — tracked under \
-                 api7/AISIX-Cloud#302 Phase G (D7.3+)",
-                other.name()
-            ))),
-        }
+        // Phase G productionization (#302 Step 3): unified Converse
+        // stream path for all publishers — same SDK call (.converse_stream)
+        // owns the AWS event-stream binary frame decoding internally,
+        // so the bridge layer doesn't ship its own decoder.
+        let _ = publisher;
+        self.chat_converse_stream(req, ctx, upstream_id).await
     }
 }
 
 impl BedrockBridge {
-    /// Dispatch Anthropic-on-Bedrock chat. Body shape per
+    /// Dispatch Anthropic-on-Bedrock chat via the legacy /invoke
+    /// path. Body shape per
     /// <https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-messages.html>:
     /// the Anthropic Messages JSON minus the `model` field (Bedrock
     /// keys dispatch off the URL) plus `anthropic_version:
-    /// "bedrock-2023-05-31"`.
+    /// "bedrock-2023-05-31"`. Kept alongside `chat_converse` because
+    /// the existing customer deployments + e2e tests pin the
+    /// Anthropic-shape outbound body; future PR can fold this into
+    /// the Converse path once cp-api / dashboard tests have been
+    /// updated to assert the Converse envelope instead.
     async fn chat_anthropic(
         &self,
         req: &ChatFormat,
         ctx: &BridgeContext,
         upstream_id: &str,
     ) -> Result<ChatResponse, BridgeError> {
-        // Parse credentials. Per-request to keep the bridge stateless
-        // — credential rotation lands as soon as the PK snapshot
-        // refreshes, no client cache invalidation needed.
-        let creds = BedrockSecret::parse(&ctx.provider_key.secret)?;
-        let endpoint_url = {
-            #[cfg(test)]
-            {
-                self.endpoint_url_override
-                    .as_deref()
-                    .or(ctx.provider_key.api_base.as_deref())
-            }
-            #[cfg(not(test))]
-            {
-                ctx.provider_key.api_base.as_deref()
-            }
-        };
-        let client = build_client(&creds, endpoint_url)?;
+        let client = self.build_client_from_ctx(ctx)?;
 
-        // Build the Anthropic Messages body via the shared
-        // serializers, then shape it for Bedrock:
-        //   1. Strip `model` (Bedrock takes it via URL path)
-        //   2. Strip `stream` (Bedrock decides via Invoke vs InvokeWithResponseStream)
-        //   3. Add `anthropic_version` (Bedrock-specific pin)
         let (system, messages) =
             split_system(req).map_err(|e| BridgeError::Config(format!("{e}")))?;
         let anthropic_req = build_request(req, upstream_id, system, messages, false);
@@ -582,9 +569,6 @@ impl BedrockBridge {
             BridgeError::Config(format!("serialize Anthropic request body bytes: {e}"))
         })?;
 
-        // Dispatch via the SDK. SigV4 + retries + content-type
-        // headers are handled by the SDK; we pass model id +
-        // accept/content-type + body bytes.
         let started = Instant::now();
         let deadline = ctx.deadline;
         let resp = client
@@ -600,6 +584,407 @@ impl BedrockBridge {
         let parsed: AnthropicResponse = serde_json::from_slice(resp.body().as_ref())
             .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
         Ok(response_into_chat_response(parsed))
+    }
+
+    /// Resolve credentials + build an SDK client. Pulled out of
+    /// `chat_converse` / `chat_converse_stream` because both methods
+    /// need it and the body is identical.
+    fn build_client_from_ctx(&self, ctx: &BridgeContext) -> Result<BedrockClient, BridgeError> {
+        // Parse credentials per-request to keep the bridge stateless —
+        // credential rotation lands as soon as the PK snapshot
+        // refreshes, no client cache invalidation needed.
+        let creds = BedrockSecret::parse(&ctx.provider_key.secret)?;
+        let endpoint_url = {
+            #[cfg(test)]
+            {
+                self.endpoint_url_override
+                    .as_deref()
+                    .or(ctx.provider_key.api_base.as_deref())
+            }
+            #[cfg(not(test))]
+            {
+                ctx.provider_key.api_base.as_deref()
+            }
+        };
+        build_client(&creds, endpoint_url)
+    }
+
+    /// Dispatch Bedrock chat via the unified Converse API.
+    ///
+    /// Request: `POST /model/<modelId>/converse`. The SDK builds the
+    /// Converse JSON envelope (`messages[]`, `system[]`,
+    /// `inferenceConfig`) from typed builders, signs SigV4, and POSTs
+    /// to the resolved endpoint. Response: typed `ConverseOutput` with
+    /// `output.message.content[]` text blocks, `stop_reason`, `usage`
+    /// (input/output/total tokens), and `metrics.latency_ms`.
+    ///
+    /// Unlike the per-publisher `/invoke` legacy path, Converse uses
+    /// ONE wire shape for every Bedrock publisher (Anthropic, Meta,
+    /// Mistral, Cohere, Amazon Titan/Nova, AI21). Adding a new
+    /// publisher to AWS's supported list requires zero gateway-side
+    /// code change — the SDK upgrade picks it up.
+    ///
+    /// Reference: <https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html>
+    async fn chat_converse(
+        &self,
+        req: &ChatFormat,
+        ctx: &BridgeContext,
+        upstream_id: &str,
+    ) -> Result<ChatResponse, BridgeError> {
+        let client = self.build_client_from_ctx(ctx)?;
+        let (system_blocks, message_blocks) = build_converse_inputs(req)?;
+        if message_blocks.is_empty() {
+            return Err(BridgeError::Config(
+                "bedrock converse: messages must include at least one user / \
+                 assistant turn (system-only requests are not supported by Converse)"
+                    .into(),
+            ));
+        }
+
+        let started = Instant::now();
+        let deadline = ctx.deadline;
+        let mut call = client.converse().model_id(upstream_id);
+        for sb in system_blocks {
+            call = call.system(sb);
+        }
+        for mb in message_blocks {
+            call = call.messages(mb);
+        }
+        // Bedrock's InferenceConfiguration is optional — we leave it
+        // unset by default so the upstream model's own defaults apply.
+        // A follow-up override-pipeline PR can wire temperature /
+        // max_tokens from RequestOverrides.
+        let _ = InferenceConfiguration::builder();
+
+        let resp = call
+            .send()
+            .await
+            .map_err(|e| map_converse_sdk_error(e, started, deadline))?;
+        Ok(converse_output_into_chat_response(resp, upstream_id))
+    }
+
+    /// Dispatch Bedrock chat via the unified Converse stream API.
+    ///
+    /// Request: `POST /model/<modelId>/converse-stream`. The SDK
+    /// reads the binary `vnd.amazon.eventstream` body internally and
+    /// yields typed [`ConverseStreamOutput`] events through the
+    /// returned stream — no per-byte frame decoder lives in the
+    /// bridge layer.
+    ///
+    /// Event sequence per AWS docs:
+    ///
+    /// ```text
+    /// MessageStart      → {role: "assistant"}
+    /// ContentBlockStart → {start: {text: ""}, contentBlockIndex: 0}
+    /// ContentBlockDelta → {delta: {text: "..."}, contentBlockIndex: 0}
+    /// ContentBlockStop  → {contentBlockIndex: 0}
+    /// MessageStop       → {stopReason: "end_turn"}
+    /// Metadata          → {usage: {...}, metrics: {latencyMs: ...}}
+    /// ```
+    ///
+    /// Each event maps to zero, one, or two [`ChatChunk`]s — see
+    /// [`emit_converse_chunk`]. Stream closes cleanly when AWS sends
+    /// the final Metadata event and the underlying eventstream
+    /// connection terminates.
+    ///
+    /// Reference: <https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html>
+    async fn chat_converse_stream(
+        &self,
+        req: &ChatFormat,
+        ctx: &BridgeContext,
+        upstream_id: &str,
+    ) -> Result<ChatChunkStream, BridgeError> {
+        let client = self.build_client_from_ctx(ctx)?;
+        let (system_blocks, message_blocks) = build_converse_inputs(req)?;
+        if message_blocks.is_empty() {
+            return Err(BridgeError::Config(
+                "bedrock converse: messages must include at least one user / \
+                 assistant turn (system-only requests are not supported by Converse)"
+                    .into(),
+            ));
+        }
+
+        let started = Instant::now();
+        let deadline = ctx.deadline;
+        let mut call = client.converse_stream().model_id(upstream_id);
+        for sb in system_blocks {
+            call = call.system(sb);
+        }
+        for mb in message_blocks {
+            call = call.messages(mb);
+        }
+
+        let mut resp = call
+            .send()
+            .await
+            .map_err(|e| map_converse_stream_sdk_error(e, started, deadline))?;
+
+        let upstream_id_owned = upstream_id.to_string();
+        let stream = async_stream::try_stream! {
+            let mut emitted_role = false;
+            loop {
+                match resp.stream.recv().await {
+                    Ok(Some(event)) => {
+                        for chunk in emit_converse_chunk(event, &upstream_id_owned, &mut emitted_role) {
+                            yield chunk;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        // SDK already maps eventstream-decode and
+                        // transport failures into its error type.
+                        // Surface as Transport to flow through the
+                        // existing customer-visible error envelope.
+                        Err(BridgeError::Transport(format!(
+                            "bedrock converse-stream: {e}"
+                        )))?;
+                    }
+                }
+            }
+        };
+        Ok(Box::pin(stream))
+    }
+}
+
+/// Translate the gateway [`ChatFormat`] into the SDK's typed
+/// `(Vec<SystemContentBlock>, Vec<Message>)` Converse inputs.
+///
+/// System messages → top-level `system[]` blocks (Converse splits
+/// them out of `messages[]` per AWS spec).
+/// User / assistant messages → `messages[]` with role + text content
+/// block. Bedrock Converse rejects empty `messages[]` so the caller
+/// must check the returned `Vec` length.
+fn build_converse_inputs(
+    req: &ChatFormat,
+) -> Result<(Vec<SystemContentBlock>, Vec<BedrockMessage>), BridgeError> {
+    let mut systems: Vec<SystemContentBlock> = Vec::new();
+    let mut messages: Vec<BedrockMessage> = Vec::new();
+    for msg in &req.messages {
+        match msg.role {
+            Role::System => {
+                if !msg.content.is_empty() {
+                    systems.push(SystemContentBlock::Text(msg.content.clone()));
+                }
+            }
+            Role::User | Role::Assistant => {
+                let role = if matches!(msg.role, Role::User) {
+                    ConversationRole::User
+                } else {
+                    ConversationRole::Assistant
+                };
+                let m = BedrockMessage::builder()
+                    .role(role)
+                    .content(ContentBlock::Text(msg.content.clone()))
+                    .build()
+                    .map_err(|e| {
+                        BridgeError::Config(format!("bedrock converse: build message: {e}"))
+                    })?;
+                messages.push(m);
+            }
+            Role::Tool => {
+                // Tool-result messages are part of Anthropic's tool-use
+                // protocol; Bedrock Converse supports them via
+                // `ContentBlock::ToolResult` but the gateway's ChatMessage
+                // surface doesn't carry the structured tool_use_id +
+                // content shape needed to round-trip cleanly. Skip
+                // silently for now; a tool-use-aware follow-up PR can
+                // wire this when the upstream ChatFormat extends to
+                // carry the structured payload.
+            }
+        }
+    }
+    Ok((systems, messages))
+}
+
+/// Translate a Converse response into the gateway [`ChatResponse`].
+/// Text content blocks are concatenated; tool-use / image / document
+/// blocks (rare in chat scenarios) are skipped.
+fn converse_output_into_chat_response(
+    resp: aws_sdk_bedrockruntime::operation::converse::ConverseOutput,
+    upstream_id: &str,
+) -> ChatResponse {
+    let (text, finish) = match resp.output() {
+        Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) => {
+            let text: String = msg
+                .content()
+                .iter()
+                .filter_map(|cb| match cb {
+                    ContentBlock::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            (text, map_stop_reason(resp.stop_reason()))
+        }
+        _ => (String::new(), FinishReason::Stop),
+    };
+    let usage = resp
+        .usage()
+        .map(|u| UsageStats {
+            prompt_tokens: u.input_tokens().max(0) as u32,
+            completion_tokens: u.output_tokens().max(0) as u32,
+            total_tokens: u.total_tokens().max(0) as u32,
+            ..Default::default()
+        })
+        .unwrap_or_default();
+    ChatResponse {
+        id: String::new(),
+        model: upstream_id.to_string(),
+        message: ChatMessage::assistant(text),
+        finish_reason: finish,
+        usage,
+    }
+}
+
+/// Map AWS Converse `StopReason` to the gateway's [`FinishReason`]
+/// taxonomy. Reference:
+/// <https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html#API_runtime_Converse_ResponseSyntax>
+fn map_stop_reason(stop: &SdkStopReason) -> FinishReason {
+    match stop {
+        SdkStopReason::EndTurn => FinishReason::Stop,
+        SdkStopReason::MaxTokens => FinishReason::Length,
+        SdkStopReason::ContentFiltered | SdkStopReason::GuardrailIntervened => {
+            FinishReason::ContentFilter
+        }
+        SdkStopReason::ToolUse => FinishReason::ToolCalls,
+        SdkStopReason::StopSequence => FinishReason::Stop,
+        _ => FinishReason::Stop,
+    }
+}
+
+/// Translate one Converse stream event into zero, one, or two
+/// [`ChatChunk`]s.
+///
+/// - `MessageStart` → role chunk (role=assistant)
+/// - `ContentBlockDelta` (text) → content chunk
+/// - `MessageStop` → finish-reason chunk
+/// - `Metadata` → usage chunk
+/// - Other variants (`ContentBlockStart`, `ContentBlockStop`,
+///   tool-use deltas) → no chunk emitted (covered by the AWS spec
+///   but not surfaced through the OpenAI-style ChatChunk shape).
+fn emit_converse_chunk(
+    event: ConverseStreamOutput,
+    upstream_id: &str,
+    emitted_role: &mut bool,
+) -> Vec<ChatChunk> {
+    let mut out = Vec::new();
+    match event {
+        ConverseStreamOutput::MessageStart(_m) => {
+            if !*emitted_role {
+                *emitted_role = true;
+                out.push(ChatChunk {
+                    id: String::new(),
+                    model: upstream_id.to_string(),
+                    delta: ChatDelta {
+                        role: Some(Role::Assistant),
+                        ..Default::default()
+                    },
+                    finish_reason: None,
+                    usage: None,
+                });
+            }
+        }
+        ConverseStreamOutput::ContentBlockDelta(d) => {
+            if let Some(ContentBlockDelta::Text(text)) = d.delta {
+                out.push(ChatChunk {
+                    id: String::new(),
+                    model: upstream_id.to_string(),
+                    delta: ChatDelta {
+                        content: Some(text),
+                        ..Default::default()
+                    },
+                    finish_reason: None,
+                    usage: None,
+                });
+            }
+        }
+        ConverseStreamOutput::MessageStop(m) => {
+            out.push(ChatChunk {
+                id: String::new(),
+                model: upstream_id.to_string(),
+                delta: ChatDelta::default(),
+                finish_reason: Some(map_stop_reason(&m.stop_reason)),
+                usage: None,
+            });
+        }
+        ConverseStreamOutput::Metadata(m) => {
+            if let Some(u) = m.usage {
+                out.push(ChatChunk {
+                    id: String::new(),
+                    model: upstream_id.to_string(),
+                    delta: ChatDelta::default(),
+                    finish_reason: None,
+                    usage: Some(UsageStats {
+                        prompt_tokens: u.input_tokens.max(0) as u32,
+                        completion_tokens: u.output_tokens.max(0) as u32,
+                        total_tokens: u.total_tokens.max(0) as u32,
+                        ..Default::default()
+                    }),
+                });
+            }
+        }
+        // ContentBlockStart / ContentBlockStop carry no customer-visible
+        // payload in chat scenarios; tool-use / image deltas are
+        // deferred. The catch-all is non-exhaustive because the SDK
+        // enum is non_exhaustive — future AWS event types fall here
+        // safely.
+        _ => {}
+    }
+    out
+}
+
+/// Map the SDK's `ConverseError` SdkError variant to BridgeError.
+/// Same classification rules as `map_sdk_error` (UpstreamStatus for
+/// retryable upstream failures, Timeout on dispatch timeout).
+fn map_converse_sdk_error(
+    e: SdkError<ConverseError, aws_smithy_runtime_api::http::Response>,
+    started: Instant,
+    deadline: Option<Duration>,
+) -> BridgeError {
+    map_aws_sdk_error_generic(e.to_string(), &e, started, deadline)
+}
+
+fn map_converse_stream_sdk_error(
+    e: SdkError<ConverseStreamError, aws_smithy_runtime_api::http::Response>,
+    started: Instant,
+    deadline: Option<Duration>,
+) -> BridgeError {
+    map_aws_sdk_error_generic(e.to_string(), &e, started, deadline)
+}
+
+/// Common AWS SDK error classifier. Tries to recover a Bedrock HTTP
+/// status (4xx vs 5xx) and routes through the same UpstreamStatus /
+/// Transport / Timeout taxonomy as the legacy invoke path. The
+/// `service_error()` accessor is generic across operation types so
+/// we delegate to a trait object via the boxed-error path.
+fn map_aws_sdk_error_generic<E>(
+    msg: String,
+    err: &SdkError<E, aws_smithy_runtime_api::http::Response>,
+    started: Instant,
+    deadline: Option<Duration>,
+) -> BridgeError
+where
+    E: std::fmt::Debug,
+{
+    // Deadline-elapsed wins over upstream classification — surfacing
+    // an UpstreamStatus on a timed-out request would hide the
+    // operator's configured deadline.
+    if let Some(d) = deadline {
+        if started.elapsed() >= d {
+            return BridgeError::Timeout {
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            };
+        }
+    }
+    match err {
+        SdkError::ServiceError(svc) => {
+            let status = svc.raw().status().as_u16();
+            BridgeError::upstream_status(status, msg)
+        }
+        SdkError::TimeoutError(_) => BridgeError::Timeout {
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        },
+        _ => BridgeError::Transport(msg),
     }
 }
 
@@ -886,31 +1271,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn chat_rejects_non_anthropic_publishers_with_publisher_named() {
-        // Other Bedrock publishers are recognized but not yet wired
-        // for dispatch — the error must call out which publisher
-        // got rejected so the operator can pin the follow-up task.
-        let bridge = BedrockBridge::new();
-        let ctx = BridgeContext::new(
-            "req-1",
-            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
-            sample_pk_with_secret(valid_secret_json()),
-        );
-        let req = ChatFormat::new("customer-facing-name", vec![ChatMessage::user("hi")]);
-        let err = bridge.chat(&req, &ctx).await.unwrap_err();
-        match err {
-            BridgeError::Config(msg) => {
-                assert!(msg.contains("not yet implemented"));
-                assert!(
-                    msg.contains("meta") || msg.contains("Meta"),
-                    "publisher name must appear in error; got {msg}"
-                );
-                assert!(msg.contains("D7.3+") || msg.contains("Phase G"));
-            }
-            other => panic!("expected Config error, got {other:?}"),
-        }
-    }
+    // Removed `chat_rejects_non_anthropic_publishers_with_publisher_named`:
+    // Phase G Step 3 wires non-Anthropic publishers via Converse, so the
+    // "not yet implemented" error path it pinned no longer exists.
+    // Coverage replaced by the new Converse-path tests in this module.
 
     #[tokio::test]
     async fn chat_with_invalid_secret_errors_before_dispatch() {
@@ -975,50 +1339,47 @@ mod tests {
 
     #[tokio::test]
     async fn chat_ignores_req_model_and_uses_ctx_model_name() {
-        // D6 audit HIGH-1 regression: dispatch must read upstream
-        // id from ctx.model.model_name, NOT from req.model. We use
-        // a non-anthropic publisher on the upstream id so the chat
-        // call hits the publisher-not-implemented branch (proving
-        // dispatch read model_name), not the publisher-unknown branch.
+        // D6 audit HIGH-1 regression: dispatch must read upstream id
+        // from ctx.model.model_name, NOT from req.model. Phase G
+        // Step 3 wires Converse for all known publishers, so the old
+        // "publisher-not-implemented" proof path is gone — we now use
+        // an UNKNOWN publisher prefix on ctx.model.model_name so the
+        // chat call hits the publisher-resolution error AND the error
+        // message echoes the unknown id (proving model_name was the
+        // source). req.model is set to a known Anthropic id; if
+        // dispatch had used req.model the call would have routed
+        // successfully or hit a different error class.
         let bridge = BedrockBridge::new();
         let ctx = BridgeContext::new(
             "req-1",
-            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_model_with("unknown-publisher.foo-bar-v1:0"),
             sample_pk_with_secret(valid_secret_json()),
         );
-        // req.model deliberately set to something the publisher
-        // resolver would also reject if used as source of truth.
-        let req = ChatFormat::new("totally-bogus-model-id", vec![ChatMessage::user("hi")]);
+        let req = ChatFormat::new(
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            vec![ChatMessage::user("hi")],
+        );
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
             BridgeError::Config(msg) => {
                 assert!(
-                    msg.contains("not yet implemented"),
-                    "must hit publisher-not-implemented (proving model_name was used); got {msg}"
+                    msg.contains("publisher unknown"),
+                    "must hit publisher-resolution error (proving model_name was used); got {msg}"
+                );
+                assert!(
+                    msg.contains("unknown-publisher.foo-bar-v1:0"),
+                    "must echo the ctx.model.model_name value (NOT req.model); got {msg}"
                 );
             }
             other => panic!("expected Config error, got {other:?}"),
         }
     }
 
-    #[tokio::test]
-    async fn chat_stream_returns_clear_not_implemented_error() {
-        let bridge = BedrockBridge::new();
-        let ctx = BridgeContext::new(
-            "req-1",
-            sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
-            sample_pk_with_secret(valid_secret_json()),
-        );
-        let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
-        let err = bridge.chat_stream(&req, &ctx).await.err().unwrap();
-        match err {
-            BridgeError::Config(msg) => {
-                assert!(msg.contains("streaming is not yet implemented"));
-                assert!(msg.contains("D7.2.b"));
-            }
-            other => panic!("expected Config error, got {other:?}"),
-        }
-    }
+    // Removed `chat_stream_returns_clear_not_implemented_error`:
+    // Phase G Step 3 wires Converse streaming for all publishers; the
+    // "streaming not yet implemented" error path it pinned no longer
+    // exists. The new chat_converse_stream-side tests in this module
+    // exercise the actual streaming path.
 
     // ─── Dispatch end-to-end against wiremock via endpoint_url override ──
 
@@ -1472,40 +1833,12 @@ mod tests {
         assert_eq!(chat.message.content, "global ok");
     }
 
-    /// Audit H2 regression: rejection error for a not-yet-wired
-    /// publisher must include the operator's model id (so they can
-    /// open the right follow-up tracking issue) and the publisher
-    /// name (so dashboards can group). The earlier message echoed
-    /// `BedrockPublisher::Other` Debug output (`Other` /
-    /// `<unspecified>`) which is internal taxonomy that doesn't help.
-    #[tokio::test]
-    async fn chat_publisher_not_implemented_error_includes_model_id_and_publisher_name() {
-        let bridge = BedrockBridge::new();
-        let ctx = BridgeContext::new(
-            "req-1",
-            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
-            sample_pk_with_secret(valid_secret_json()),
-        );
-        let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
-        let err = bridge.chat(&req, &ctx).await.unwrap_err();
-        match err {
-            BridgeError::Config(msg) => {
-                assert!(
-                    msg.contains("meta.llama3-3-70b-instruct-v1:0"),
-                    "must include operator's model id; got {msg}"
-                );
-                assert!(
-                    msg.contains("publisher=meta"),
-                    "must name the publisher catalog identifier; got {msg}"
-                );
-                assert!(
-                    !msg.contains("Other") && !msg.contains("<unspecified>"),
-                    "must not leak internal enum taxonomy; got {msg}"
-                );
-            }
-            other => panic!("expected Config error, got {other:?}"),
-        }
-    }
+    // Removed `chat_publisher_not_implemented_error_includes_model_id_and_publisher_name`
+    // (and its preceding doc comment about the H2 regression):
+    // Phase G Step 3 wires Converse for all non-Anthropic publishers,
+    // so the "not yet implemented" error path the test pinned no
+    // longer exists. New Converse-path tests below cover the
+    // non-Anthropic dispatch contract.
 
     /// Audit M2 regression: defense-in-depth model-id char check.
     /// Even though the AWS SDK URL-encodes reserved chars, the gateway
@@ -1536,57 +1869,12 @@ mod tests {
         }
     }
 
-    /// Audit M4 regression: `chat_stream` must distinguish "anthropic
-    /// streaming not wired yet" (D7.2.b — same publisher as chat
-    /// just streaming) from "publisher X not wired at all" (D7.3+).
-    /// Mixing them mis-routes operators to the wrong tracking task.
-    #[tokio::test]
-    async fn chat_stream_anthropic_returns_d7_2_b_specific_error() {
-        let bridge = BedrockBridge::new();
-        let ctx = BridgeContext::new(
-            "req-1",
-            sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
-            sample_pk_with_secret(valid_secret_json()),
-        );
-        let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
-        let err = bridge.chat_stream(&req, &ctx).await.err().unwrap();
-        match err {
-            BridgeError::Config(msg) => {
-                assert!(
-                    msg.contains("anthropic streaming"),
-                    "must call out anthropic streaming specifically; got {msg}"
-                );
-                assert!(msg.contains("D7.2.b"), "must point at D7.2.b; got {msg}");
-            }
-            other => panic!("expected Config error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn chat_stream_non_anthropic_publisher_returns_d7_3_specific_error() {
-        let bridge = BedrockBridge::new();
-        let ctx = BridgeContext::new(
-            "req-1",
-            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
-            sample_pk_with_secret(valid_secret_json()),
-        );
-        let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
-        let err = bridge.chat_stream(&req, &ctx).await.err().unwrap();
-        match err {
-            BridgeError::Config(msg) => {
-                assert!(
-                    msg.contains("publisher=meta"),
-                    "must call out the publisher; got {msg}"
-                );
-                assert!(msg.contains("D7.3+"), "must point at D7.3+; got {msg}");
-                assert!(
-                    !msg.contains("D7.2.b"),
-                    "must NOT point at the anthropic-streaming task; got {msg}"
-                );
-            }
-            other => panic!("expected Config error, got {other:?}"),
-        }
-    }
+    // Removed `chat_stream_anthropic_returns_d7_2_b_specific_error`
+    // and `chat_stream_non_anthropic_publisher_returns_d7_3_specific_error`:
+    // Phase G Step 3 wires Converse streaming for all publishers, so
+    // the "not yet implemented" error paths these tests pinned no
+    // longer exist. New chat_converse_stream-path tests below cover
+    // the actual streaming dispatch.
 
     #[tokio::test]
     async fn chat_anthropic_translates_system_messages_to_system_field() {
@@ -1634,6 +1922,215 @@ mod tests {
         assert_eq!(
             messages[0].get("role").and_then(|v| v.as_str()),
             Some("user")
+        );
+    }
+
+    // ─── Phase G Step 3 — Converse path tests ──────────────────────
+
+    /// Canned Converse non-stream response body. Shape per AWS docs:
+    /// <https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html#API_runtime_Converse_ResponseSyntax>.
+    fn default_converse_response_template() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"text": "hello from converse"}]
+                }
+            },
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 7,
+                "outputTokens": 3,
+                "totalTokens": 10
+            },
+            "metrics": {"latencyMs": 1}
+        }))
+    }
+
+    #[tokio::test]
+    async fn chat_meta_publisher_dispatches_via_converse_url() {
+        // Non-Anthropic publisher: Phase G Step 3 wires Meta (and the
+        // other 4 publishers) through the unified Converse API.
+        // Asserts URL path is `/model/<id>/converse` (NOT /invoke) and
+        // the SDK's typed response decodes into the gateway's
+        // ChatResponse correctly.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"^/model/meta\.llama3-3-70b-instruct-v1(:0|%3A0)/converse$",
+            ))
+            .respond_with(default_converse_response_template())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+        assert_eq!(chat.message.content, "hello from converse");
+        assert_eq!(chat.usage.prompt_tokens, 7);
+        assert_eq!(chat.usage.completion_tokens, 3);
+        assert_eq!(chat.usage.total_tokens, 10);
+        assert_eq!(chat.finish_reason, FinishReason::Stop);
+    }
+
+    #[tokio::test]
+    async fn chat_amazon_nova_publisher_dispatches_via_converse_url() {
+        // Second non-Anthropic publisher — Amazon Nova. Same Converse
+        // dispatch as Meta, different model id prefix; pins that the
+        // dispatch is genuinely uniform across publishers (regression
+        // guard against a future change that hard-codes per-publisher
+        // routing inside chat_converse itself).
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"^/model/amazon\.nova-pro-v1(:0|%3A0)/converse$",
+            ))
+            .respond_with(default_converse_response_template())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("amazon.nova-pro-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-nova", vec![ChatMessage::user("hi")]);
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+        assert_eq!(chat.message.content, "hello from converse");
+    }
+
+    #[tokio::test]
+    async fn chat_stream_for_anthropic_dispatches_via_converse_stream_url() {
+        // Stream dispatch goes through Converse for ALL publishers
+        // including Anthropic (the legacy /invoke path never had a
+        // stream variant). Wiremock here only needs to acknowledge
+        // the request — full event-stream binary frame decode is
+        // exercised at the SDK level, beyond the scope of unit
+        // tests; this guard just verifies the URL routing.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"^/model/anthropic\.claude-3-5-sonnet-20241022-v2(:0|%3A0)/converse-stream$",
+            ))
+            // Returning a 200 with an empty body causes the SDK to
+            // emit a transport / decode error which we catch below.
+            // The test's job is to pin the URL pattern, not to
+            // exercise the eventstream decoder.
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        // Either the chat_stream() call returns Ok (and the stream
+        // errors on first .next() because the empty body isn't a
+        // valid eventstream) OR returns Err directly from the SDK.
+        // Both prove the dispatch reached wiremock — wiremock's
+        // `.expect(1)` enforces this on drop.
+        let _ = bridge.chat_stream(&req, &ctx).await;
+    }
+
+    #[tokio::test]
+    async fn chat_stream_for_meta_dispatches_via_converse_stream_url() {
+        // Same as the Anthropic-stream test but for a non-Anthropic
+        // publisher — pins that chat_stream wiring is uniform across
+        // publishers.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(
+                r"^/model/meta\.llama3-3-70b-instruct-v1(:0|%3A0)/converse-stream$",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        let _ = bridge.chat_stream(&req, &ctx).await;
+    }
+
+    #[tokio::test]
+    async fn chat_converse_request_body_uses_text_content_block_shape() {
+        // Pin the outbound request body shape: Converse expects
+        // `messages: [{role, content: [{text: "..."}]}]`. A
+        // regression that emitted Anthropic-shape `messages: [{role,
+        // content: "..."}]` (string instead of typed block array)
+        // would 400 upstream. We use Meta here so the test routes
+        // through chat_converse (the Anthropic publisher would route
+        // through legacy /invoke and skip the Converse body shape).
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse$"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new(
+            "my-llama",
+            vec![
+                ChatMessage::system("you are concise"),
+                ChatMessage::user("hi"),
+            ],
+        );
+        let _ = bridge.chat(&req, &ctx).await;
+
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        // System message must be lifted to top-level `system` array
+        // (Converse splits systems out of `messages` per AWS spec).
+        let system = body.get("system").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(system.len(), 1, "system block must be present; body={body}");
+        assert_eq!(
+            system[0].get("text").and_then(|v| v.as_str()),
+            Some("you are concise")
+        );
+        // messages[] must use typed content-block shape, NOT Anthropic-
+        // style flat string.
+        let messages = body.get("messages").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(messages.len(), 1);
+        let content = messages[0]
+            .get("content")
+            .and_then(|v| v.as_array())
+            .expect("content must be an array of typed blocks");
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            content[0].get("text").and_then(|v| v.as_str()),
+            Some("hi"),
+            "content block must carry `text` field; body={body}"
+        );
+        // Per Bedrock Converse spec, the `model` field is NOT part of
+        // the body — model id flows via URL path. The SDK should not
+        // emit it.
+        assert!(
+            body.get("model").is_none(),
+            "Converse body must NOT carry top-level `model` field; body={body}"
         );
     }
 }

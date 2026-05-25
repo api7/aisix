@@ -12,11 +12,14 @@ description = "aisix: AWS Bedrock runtime provider bridge (skeleton — multi-pu
 aisix-core = { path = "../aisix-core" }
 aisix-gateway = { path = "../aisix-gateway" }
 # Reuse Anthropic Messages request/response wire types for the
-# `anthropic.*` Bedrock publisher (Claude on Bedrock). The body shape
-# is the Anthropic Messages API minus the API-key header plus
-# `anthropic_version: "bedrock-2023-05-31"` — built on top of the
-# anthropic crate's typed serializers/deserializers.
+# `anthropic.*` Bedrock publisher (Claude on Bedrock) non-stream
+# /invoke path. The body shape is the Anthropic Messages API minus
+# the API-key header plus `anthropic_version: "bedrock-2023-05-31"`.
+# Other publishers (Meta / Mistral / Cohere / Amazon Titan/Nova /
+# AI21) and all streaming go through the unified Converse API
+# instead — see `chat_converse` / `chat_converse_stream`.
 aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
+async-stream = "0.3"
 async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
