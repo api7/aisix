@@ -141,9 +141,14 @@ impl VertexBridge {
                 )));
             }
             if b.contains('@') {
+                // Redact userinfo before echoing the rejected value into
+                // the error string — the whole point of rejecting `@` is
+                // that operator-pasted credentials shouldn't appear in
+                // logs. Audit #392 re-audit LOW-1.
+                let redacted = redact_userinfo(b);
                 return Err(BridgeError::Config(format!(
                     "vertex provider_key api_base must not embed userinfo (@); use the request's \
-                     Authorization header instead, got {b:?}",
+                     Authorization header instead, got {redacted:?}",
                 )));
             }
             if b.contains('?') {
@@ -389,6 +394,35 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
         .model_name
         .as_deref()
         .ok_or_else(|| BridgeError::Config("model.model_name missing".into()))
+}
+
+/// Redact embedded userinfo from a URL string before echoing it
+/// into an error message. Specifically: `scheme://user:pass@host`
+/// becomes `scheme://<redacted>@host`. Only touches the substring
+/// between `://` and the first `@`; leaves the rest of the URL
+/// intact (including any other `@` in a path component). PR #392
+/// re-audit LOW-1.
+fn redact_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let rest_start = scheme_end + "://".len();
+    let rest = &url[rest_start..];
+    let Some(at_offset) = rest.find('@') else {
+        return url.to_string();
+    };
+    // Don't redact if the `@` is past the first path slash — that's
+    // RFC 3986 path syntax, not userinfo.
+    if let Some(slash_offset) = rest.find('/') {
+        if slash_offset < at_offset {
+            return url.to_string();
+        }
+    }
+    format!(
+        "{}://<redacted>@{}",
+        &url[..scheme_end],
+        &rest[at_offset + 1..],
+    )
 }
 
 /// Wrap a future in the optional deadline. `None` → no timeout.
@@ -1235,9 +1269,53 @@ mod tests {
         match err {
             BridgeError::Config(msg) => {
                 assert!(msg.contains("userinfo") || msg.contains("@"));
+                // Defense-in-depth: the error message MUST NOT echo
+                // the original userinfo back into log output (re-audit
+                // LOW-1). The redactor replaces `user:secret` with
+                // `<redacted>` so an operator-supplied credential
+                // doesn't propagate into operational telemetry.
+                assert!(
+                    !msg.contains("user:secret"),
+                    "error message leaked operator-supplied userinfo: {msg}"
+                );
+                assert!(
+                    msg.contains("<redacted>"),
+                    "error message should redact userinfo: {msg}"
+                );
             }
             other => panic!("expected Config error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn redact_userinfo_strips_user_and_password() {
+        assert_eq!(
+            redact_userinfo("https://user:secret@proxy.internal"),
+            "https://<redacted>@proxy.internal",
+        );
+        assert_eq!(
+            redact_userinfo("http://just-user@host:8001/path"),
+            "http://<redacted>@host:8001/path",
+        );
+    }
+
+    #[test]
+    fn redact_userinfo_leaves_non_userinfo_at_alone() {
+        // `@` past the first path slash is NOT userinfo per RFC 3986.
+        assert_eq!(
+            redact_userinfo("https://proxy.internal/v1@my-namespace"),
+            "https://proxy.internal/v1@my-namespace",
+        );
+        // No scheme → unchanged.
+        assert_eq!(
+            redact_userinfo("proxy.internal@path"),
+            "proxy.internal@path"
+        );
+        // No `@` at all → unchanged.
+        assert_eq!(
+            redact_userinfo("https://proxy.internal/x"),
+            "https://proxy.internal/x"
+        );
     }
 
     #[test]
