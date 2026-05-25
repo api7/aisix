@@ -179,6 +179,17 @@ pub struct AzureUpstreamRef {
     pub resource: String,
     pub deployment: String,
     pub api_version: String,
+    /// Operator-supplied verbatim upstream base URL, used when
+    /// `ProviderKey.api_base` does NOT match the canonical
+    /// `<resource>.openai.azure.com` host shape. Set for corporate
+    /// proxies, private-VPC endpoints, mock services. When `Some(_)`,
+    /// `resource` is empty and `chat_completions_url()` builds the
+    /// URL off this override instead of `<resource>.openai.azure.com`.
+    ///
+    /// Fixes api7/ai-gateway#391 — pre-fix builds rejected any
+    /// `api_base` whose host didn't end in `.openai.azure.com`
+    /// with a `Config` error, blocking BYO override deployments.
+    pub upstream_override: Option<String>,
 }
 
 impl AzureUpstreamRef {
@@ -206,59 +217,94 @@ impl AzureUpstreamRef {
         validate_url_token("deployment name", deployment)?;
 
         let base = api_base.unwrap_or_default().trim();
-        let resource = if base.is_empty() {
+        if base.is_empty() {
             return Err(BridgeError::Config(
                 "azure provider_key has no api_base — \
-                 expected https://<resource>.openai.azure.com or a bare resource name"
+                 expected https://<resource>.openai.azure.com, a bare resource name, \
+                 or a verbatim override URL (https://<host>[:<port>])"
                     .into(),
             ));
-        } else if let Some(rest) = base
+        }
+
+        if let Some(rest) = base
             .strip_prefix("https://")
             .or_else(|| base.strip_prefix("http://"))
         {
             // Canonical form: split off the leading host segment
-            // before the first `.`. The remainder of the host MUST
-            // be `openai.azure.com` — anything else is a misconfig
-            // we surface up rather than silently dropping the path.
-            let (host_resource, host_tail) = rest.split_once('.').ok_or_else(|| {
-                BridgeError::Config(format!(
-                    "azure api_base {base:?} missing the .openai.azure.com suffix"
-                ))
-            })?;
-            // Strip a trailing `/...` path so an operator who pasted
-            // the full chat-completions URL still parses correctly,
-            // but reject anything that injected query params.
-            let host_tail_trimmed = host_tail.trim_end_matches('/');
-            let host_tail_core = host_tail_trimmed
-                .split_once('/')
-                .map(|(host, _path)| host)
-                .unwrap_or(host_tail_trimmed);
-            if host_tail_core != "openai.azure.com" {
+            // before the first `.`. If the remainder of the host is
+            // `openai.azure.com`, extract the resource as today.
+            // Otherwise fall through to the verbatim-override path.
+            if let Some((host_resource, host_tail)) = rest.split_once('.') {
+                let host_tail_trimmed = host_tail.trim_end_matches('/');
+                let host_tail_core = host_tail_trimmed
+                    .split_once('/')
+                    .map(|(host, _path)| host)
+                    .unwrap_or(host_tail_trimmed);
+                if host_tail_core == "openai.azure.com" {
+                    validate_url_token("resource name", host_resource)?;
+                    return Ok(Self {
+                        resource: host_resource.to_string(),
+                        deployment: deployment.to_string(),
+                        api_version: Self::DEFAULT_API_VERSION.to_string(),
+                        upstream_override: None,
+                    });
+                }
+            }
+
+            // Verbatim-override branch — corporate proxy / private
+            // endpoint / mock service. Reject `?` and `#` so an
+            // operator-supplied default cannot inject a malicious
+            // api-version or URL fragment that the bridge's
+            // canonical query-string append would silently merge with.
+            if base.contains('?') {
                 return Err(BridgeError::Config(format!(
-                    "azure api_base {base:?} host must end in .openai.azure.com \
-                     (got host suffix {host_tail_core:?})"
+                    "azure api_base {base:?} must not contain a query string \
+                     (the bridge appends `?api-version=…`; an operator-supplied \
+                     query would either merge or override the pinned api-version)"
                 )));
             }
-            host_resource.to_string()
-        } else {
-            // Bare-resource shorthand.
-            base.to_string()
-        };
+            if base.contains('#') {
+                return Err(BridgeError::Config(format!(
+                    "azure api_base {base:?} must not contain a fragment"
+                )));
+            }
+            let override_base = base.trim_end_matches('/').to_string();
+            return Ok(Self {
+                resource: String::new(),
+                deployment: deployment.to_string(),
+                api_version: Self::DEFAULT_API_VERSION.to_string(),
+                upstream_override: Some(override_base),
+            });
+        }
 
-        validate_url_token("resource name", &resource)?;
-
+        // Bare-resource shorthand (`acme-east` → canonical Azure URL).
+        validate_url_token("resource name", base)?;
         Ok(Self {
-            resource,
+            resource: base.to_string(),
             deployment: deployment.to_string(),
             api_version: Self::DEFAULT_API_VERSION.to_string(),
+            upstream_override: None,
         })
     }
 
     /// Build the chat-completions URL for this Azure upstream.
+    ///
+    /// Two shapes:
+    ///   - Canonical (no override): `https://<resource>.openai.azure.com/openai/deployments/<deployment>/chat/completions?api-version=<v>`
+    ///   - Verbatim override: `<override>/openai/deployments/<deployment>/chat/completions?api-version=<v>`
+    ///
+    /// The deployment path + api-version are always appended by the
+    /// bridge — operators set just the host root in `api_base`,
+    /// never a full chat-completions URL (the `?` / `#` rejection
+    /// in `resolve()` enforces this).
     pub fn chat_completions_url(&self) -> String {
+        let base = self
+            .upstream_override
+            .clone()
+            .unwrap_or_else(|| format!("https://{}.openai.azure.com", self.resource));
         format!(
-            "https://{}.openai.azure.com/openai/deployments/{}/chat/completions?api-version={}",
-            self.resource, self.deployment, self.api_version,
+            "{}/openai/deployments/{}/chat/completions?api-version={}",
+            base, self.deployment, self.api_version,
         )
     }
 }
@@ -879,6 +925,7 @@ mod tests {
             resource: "acme-west".into(),
             deployment: "gpt4o-prod".into(),
             api_version: "2024-10-21".into(),
+            upstream_override: None,
         };
         assert_eq!(
             r.chat_completions_url(),
@@ -916,17 +963,79 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_canonical_https_with_wrong_suffix() {
-        let err = AzureUpstreamRef::resolve("dep", Some("https://acme.evil.com")).unwrap_err();
+    fn resolve_accepts_verbatim_override_for_non_canonical_host() {
+        // Fixes api7/ai-gateway#391: a BYO operator pasting a
+        // corporate-proxy / private-VPC / mock URL whose host does
+        // NOT end in `.openai.azure.com` is now treated as a verbatim
+        // override (resource is empty, `upstream_override` holds the
+        // base). Pre-fix builds rejected this as a Config error,
+        // blocking any non-canonical Azure deployment.
+        //
+        // Compatible with Bedrock's `endpoint_url` precedence — both
+        // bridges now honor `ProviderKey.api_base` as a production
+        // override path.
+        let r = AzureUpstreamRef::resolve("gpt4o-prod", Some("https://acme.evil.com")).unwrap();
+        assert_eq!(r.resource, "");
+        assert_eq!(r.deployment, "gpt4o-prod");
+        assert_eq!(
+            r.upstream_override.as_deref(),
+            Some("https://acme.evil.com")
+        );
+        assert_eq!(
+            r.chat_completions_url(),
+            "https://acme.evil.com/openai/deployments/gpt4o-prod/chat/completions?api-version=2024-10-21",
+        );
+    }
+
+    #[test]
+    fn resolve_accepts_http_override_for_mock_endpoint() {
+        // The canonical e2e use case: mock-llm at http://mock-llm:8000
+        // in the compose bridge network. Same shape as the corporate-
+        // proxy override, just over plain HTTP.
+        let r = AzureUpstreamRef::resolve("gpt4o", Some("http://mock-llm:8000")).unwrap();
+        assert_eq!(r.upstream_override.as_deref(), Some("http://mock-llm:8000"));
+        assert_eq!(
+            r.chat_completions_url(),
+            "http://mock-llm:8000/openai/deployments/gpt4o/chat/completions?api-version=2024-10-21",
+        );
+    }
+
+    #[test]
+    fn resolve_strips_trailing_slash_on_verbatim_override() {
+        let r = AzureUpstreamRef::resolve("dep", Some("https://proxy.acme.internal/")).unwrap();
+        assert_eq!(
+            r.upstream_override.as_deref(),
+            Some("https://proxy.acme.internal")
+        );
+        // Single-slash separator before /openai/... — no `//`.
+        assert!(!r.chat_completions_url().contains("internal//openai"));
+    }
+
+    #[test]
+    fn resolve_rejects_override_with_query_injection() {
+        // Defence-in-depth: an operator-supplied query string would
+        // either merge with or override the bridge's pinned
+        // `api-version=…` append. Reject up-front rather than risk
+        // a downstream api-version downgrade attack.
+        let err =
+            AzureUpstreamRef::resolve("dep", Some("https://proxy.acme.internal?api-version=evil"))
+                .unwrap_err();
         match err {
             BridgeError::Config(msg) => {
                 assert!(
-                    msg.contains("openai.azure.com"),
-                    "must call out the required host suffix; got {msg}"
+                    msg.contains("query string"),
+                    "must call out the query rejection; got {msg}"
                 );
             }
             other => panic!("expected Config error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_rejects_override_with_fragment() {
+        let err = AzureUpstreamRef::resolve("dep", Some("https://proxy.acme.internal#fragment"))
+            .unwrap_err();
+        assert!(matches!(err, BridgeError::Config(_)));
     }
 
     #[test]
