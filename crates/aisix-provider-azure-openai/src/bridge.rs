@@ -174,7 +174,14 @@ fn default_client() -> Client {
 /// The resolver is intentionally cautious — any missing piece produces
 /// a clear `BridgeError::Config` so an operator can fix the
 /// registration before traffic ever hits Azure.
+/// **Construction**: marked `#[non_exhaustive]` so future field
+/// additions don't break downstream crates. External callers should
+/// always go through [`Self::resolve`]; in-crate tests can use
+/// `..Default::default()`-style struct-literal completion (no
+/// `Default` impl is offered yet, but the `Debug` derive lets test
+/// failures dump the full shape).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AzureUpstreamRef {
     pub resource: String,
     pub deployment: String,
@@ -189,6 +196,23 @@ pub struct AzureUpstreamRef {
     /// Fixes api7/ai-gateway#391 — pre-fix builds rejected any
     /// `api_base` whose host didn't end in `.openai.azure.com`
     /// with a `Config` error, blocking BYO override deployments.
+    ///
+    /// **Typo caveat**: this override mode accepts any HTTP/HTTPS
+    /// URL. A typo like `https://acme.openai.azur.com` (missing
+    /// `e`) no longer errors at resolve time — it silently activates
+    /// override mode and routes traffic to wherever that domain
+    /// resolves. Operators are responsible for double-checking the
+    /// URL. Same risk model as the OpenAI / Anthropic / Bedrock
+    /// bridges, which already accept arbitrary operator-supplied
+    /// `api_base`. The trade-off is intentional: enabling corporate-
+    /// proxy / private-VPC / mock deployments requires accepting
+    /// arbitrary hosts.
+    ///
+    /// **Path preservation**: an `api_base` with an internal path
+    /// segment (e.g. `https://corp-proxy/azure-passthrough`) is
+    /// preserved verbatim. The bridge appends `/openai/deployments/<d>/...`
+    /// to whatever the operator supplied, including any internal
+    /// prefix.
     pub upstream_override: Option<String>,
 }
 
@@ -252,10 +276,21 @@ impl AzureUpstreamRef {
             }
 
             // Verbatim-override branch — corporate proxy / private
-            // endpoint / mock service. Reject `?` and `#` so an
-            // operator-supplied default cannot inject a malicious
-            // api-version or URL fragment that the bridge's
-            // canonical query-string append would silently merge with.
+            // endpoint / mock service. Defence-in-depth checks mirror
+            // the Vertex sibling fix (#390): reject userinfo, query,
+            // and fragment because each opens an injection / credential-
+            // leak / api-version-downgrade vector. Scheme is already
+            // constrained to `http://` or `https://` by the outer
+            // `strip_prefix` chain.
+            if rest.contains('@') {
+                // `rest` is post-scheme; an `@` here means userinfo
+                // (`user:pass@host`). Operators must use the
+                // api-key / AAD path for auth, never URL-embedded.
+                return Err(BridgeError::Config(format!(
+                    "azure api_base {base:?} must not embed userinfo (@); use the \
+                     api-key / AAD credentials in `provider_key.secret` instead"
+                )));
+            }
             if base.contains('?') {
                 return Err(BridgeError::Config(format!(
                     "azure api_base {base:?} must not contain a query string \
@@ -1036,6 +1071,43 @@ mod tests {
         let err = AzureUpstreamRef::resolve("dep", Some("https://proxy.acme.internal#fragment"))
             .unwrap_err();
         assert!(matches!(err, BridgeError::Config(_)));
+    }
+
+    #[test]
+    fn resolve_rejects_override_with_userinfo() {
+        // PR #392 audit MEDIUM-defence: an operator embedding
+        // user:pass@host in the override URL would leak via logs and
+        // bypass the api-key / AAD auth path that the bridge owns.
+        let err = AzureUpstreamRef::resolve("dep", Some("https://user:pass@proxy.acme.internal"))
+            .unwrap_err();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(
+                    msg.contains("userinfo"),
+                    "must call out the userinfo rejection; got {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_preserves_path_prefix_on_verbatim_override() {
+        // PR #392 audit MEDIUM-1: an operator pasting a proxy URL
+        // with an internal path prefix (e.g. corporate gateway that
+        // routes `/azure-passthrough/*` to upstream Azure) gets the
+        // prefix preserved verbatim, with the bridge's deployment
+        // path appended after.
+        let r =
+            AzureUpstreamRef::resolve("dep", Some("http://corp-proxy/azure-passthrough/")).unwrap();
+        assert_eq!(
+            r.upstream_override.as_deref(),
+            Some("http://corp-proxy/azure-passthrough"),
+        );
+        assert_eq!(
+            r.chat_completions_url(),
+            "http://corp-proxy/azure-passthrough/openai/deployments/dep/chat/completions?api-version=2024-10-21",
+        );
     }
 
     #[test]
