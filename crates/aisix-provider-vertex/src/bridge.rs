@@ -92,13 +92,29 @@ impl VertexBridge {
         self
     }
 
-    /// Resolve the base host the bridge POSTs to. Production:
-    /// `https://<region>-aiplatform.googleapis.com`. Tests can pin
-    /// the host via [`Self::with_api_base_override`].
-    fn resolve_api_base(&self, region: &str) -> String {
+    /// Resolve the base host the bridge POSTs to.
+    ///
+    /// Precedence (highest first):
+    ///   1. `#[cfg(test)]` `Self::with_api_base_override` — test seam.
+    ///   2. `ProviderKey.api_base` — production override for
+    ///      corporate-proxy / private-VPC / mock deployments. The
+    ///      operator-supplied value is trimmed and any trailing `/`
+    ///      is stripped so `chat_gemini`'s URL stitching produces
+    ///      a single-slash separator.
+    ///   3. Canonical `https://<region>-aiplatform.googleapis.com`.
+    ///
+    /// Mirrors the Bedrock bridge's `endpoint_url` precedence
+    /// (`crates/aisix-provider-bedrock/src/bridge.rs::build_client_from_ctx`).
+    /// Fixes api7/ai-gateway#390 — pre-fix production builds
+    /// silently dropped `ProviderKey.api_base` for Vertex, so a BYO
+    /// operator's corporate-proxy URL was ignored.
+    fn resolve_api_base(&self, region: &str, ctx_api_base: Option<&str>) -> String {
         #[cfg(test)]
         if let Some(b) = &self.api_base_override {
             return b.clone();
+        }
+        if let Some(b) = ctx_api_base.map(str::trim).filter(|s| !s.is_empty()) {
+            return b.trim_end_matches('/').to_string();
         }
         format!("https://{region}-aiplatform.googleapis.com")
     }
@@ -486,7 +502,7 @@ impl VertexBridge {
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
 
-        let base = self.resolve_api_base(&creds.region);
+        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref());
         let url = format!(
             "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:generateContent",
             project = creds.project,
@@ -566,7 +582,7 @@ impl VertexBridge {
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
 
-        let base = self.resolve_api_base(&creds.region);
+        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref());
         let url = format!(
             "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:streamGenerateContent?alt=sse",
             project = creds.project,
@@ -1061,6 +1077,63 @@ mod tests {
         );
     }
 
+    // ─── resolve_api_base precedence ─────────────────────────────────
+    //
+    // Fixes api7/ai-gateway#391-companion (ai-gateway#390): pre-fix
+    // production builds hardcoded `https://<region>-aiplatform.googleapis.com`
+    // and silently ignored `ProviderKey.api_base`. The fix adds a
+    // `ctx_api_base: Option<&str>` arg with precedence:
+    //   #[cfg(test)] override > ctx_api_base > canonical region URL.
+
+    #[test]
+    fn resolve_api_base_honors_ctx_api_base_in_production_path() {
+        // Constructed without `with_api_base_override` so the test
+        // seam is None — exercises the production code path that
+        // pre-fix would have hit the canonical URL.
+        let bridge = VertexBridge::new();
+        let resolved = bridge.resolve_api_base("us-central1", Some("http://mock-vertex:8001"));
+        assert_eq!(resolved, "http://mock-vertex:8001");
+    }
+
+    #[test]
+    fn resolve_api_base_trims_trailing_slash_on_ctx_override() {
+        let bridge = VertexBridge::new();
+        let resolved = bridge.resolve_api_base("us-central1", Some("http://x.example.internal/"));
+        assert_eq!(
+            resolved, "http://x.example.internal",
+            "trailing slash must be stripped so URL stitching produces a single separator",
+        );
+    }
+
+    #[test]
+    fn resolve_api_base_falls_back_to_canonical_on_empty_ctx_value() {
+        let bridge = VertexBridge::new();
+        // Empty string and whitespace-only values are treated as "no
+        // override" — fall through to the canonical region URL.
+        assert_eq!(
+            bridge.resolve_api_base("us-central1", Some("")),
+            "https://us-central1-aiplatform.googleapis.com",
+        );
+        assert_eq!(
+            bridge.resolve_api_base("us-central1", Some("   ")),
+            "https://us-central1-aiplatform.googleapis.com",
+        );
+        assert_eq!(
+            bridge.resolve_api_base("us-central1", None),
+            "https://us-central1-aiplatform.googleapis.com",
+        );
+    }
+
+    #[test]
+    fn resolve_api_base_cfg_test_override_takes_precedence_over_ctx() {
+        // The test-only `with_api_base_override` seam shadows
+        // `ctx_api_base` so existing tests that pin against a
+        // wiremock URI keep working unchanged.
+        let bridge = VertexBridge::new().with_api_base_override("http://wiremock:9999");
+        let resolved = bridge.resolve_api_base("us-central1", Some("http://ignored-ctx:8001"));
+        assert_eq!(resolved, "http://wiremock:9999");
+    }
+
     #[test]
     fn publisher_case_insensitive_on_model_name() {
         assert_eq!(
@@ -1445,6 +1518,20 @@ mod tests {
         )
     }
 
+    /// Variant that sets `api_base` on the ProviderKey — exercises
+    /// the production-path override introduced by #390 without
+    /// touching the test-only `with_api_base_override` seam.
+    fn sample_pk_with_secret_and_api_base(secret_json: &str, api_base: &str) -> Arc<ProviderKey> {
+        Arc::new(
+            serde_json::from_str(&format!(
+                r#"{{"display_name": "vertex-prod", "secret": {}, "api_base": {}}}"#,
+                serde_json::to_string(secret_json).unwrap(),
+                serde_json::to_string(api_base).unwrap(),
+            ))
+            .unwrap(),
+        )
+    }
+
     fn valid_secret_json() -> &'static str {
         r#"{"access_token":"ya29.test","project":"my-proj","region":"us-central1"}"#
     }
@@ -1655,6 +1742,71 @@ mod tests {
         let chat = bridge.chat(&req, &ctx).await.unwrap();
         assert_eq!(chat.message.content, "hello from gemini");
         assert_eq!(chat.usage.total_tokens, 6);
+    }
+
+    /// End-to-end production-path coverage for api7/ai-gateway#390:
+    /// drive the bridge with `ProviderKey.api_base` set (and NO
+    /// `with_api_base_override`), assert the bridge actually POSTs
+    /// to the operator-supplied host. Pre-fix this would have hit
+    /// the canonical `<region>-aiplatform.googleapis.com` URL, the
+    /// wiremock would observe zero requests, and `.expect(1)` would
+    /// surface the bug.
+    #[tokio::test]
+    async fn chat_gemini_honors_provider_key_api_base_in_production_path() {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-1.5-pro:generateContent",
+            ))
+            .and(header("authorization", "Bearer ya29.test"))
+            .respond_with(responder.clone())
+            .expect(1) // pre-fix: 0 (traffic went to canonical Google URL); post-fix: 1
+            .mount(&server)
+            .await;
+
+        // Production path: NO `with_api_base_override`; the URL must
+        // be driven entirely by `ProviderKey.api_base`.
+        let bridge = VertexBridge::new();
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret_and_api_base(valid_secret_json(), &server.uri()),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+        assert_eq!(chat.message.content, "hello from gemini");
+    }
+
+    /// Same as above but exercises the trailing-slash trim — a
+    /// realistic operator paste (`http://corp-proxy/vertex/`) must
+    /// still produce a single-slash URL after concatenation.
+    #[tokio::test]
+    async fn chat_gemini_trims_trailing_slash_on_provider_key_api_base() {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-1.5-pro:generateContent",
+            ))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new();
+        // Note: server.uri() typically has no trailing slash; append one.
+        let api_base_with_slash = format!("{}/", server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret_and_api_base(valid_secret_json(), &api_base_with_slash),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+        // Body shape unaffected — the assertion is the wiremock's
+        // `expect(1)` on the exact path (no `//` doubling).
+        assert_eq!(chat.message.content, "hello from gemini");
     }
 
     #[tokio::test]
