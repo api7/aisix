@@ -108,15 +108,59 @@ impl VertexBridge {
     /// Fixes api7/ai-gateway#390 — pre-fix production builds
     /// silently dropped `ProviderKey.api_base` for Vertex, so a BYO
     /// operator's corporate-proxy URL was ignored.
-    fn resolve_api_base(&self, region: &str, ctx_api_base: Option<&str>) -> String {
+    ///
+    /// **Validation of `ProviderKey.api_base`** (PR #392 audit MEDIUM-1):
+    /// the operator-supplied override is interpolated directly into
+    /// the URL template, so we reject classes of input that the
+    /// bridge cannot safely concatenate or that would shadow auth:
+    ///   - non-`http(s)` schemes (no `file://`, `gs://`, etc.)
+    ///   - userinfo `@` (an operator embedding `user:pass@host` would
+    ///     leak credentials via logs / SSRF-style escalation)
+    ///   - `?` query string (would silently merge with the streaming
+    ///     `?alt=sse` the bridge appends)
+    ///   - `#` fragment (no meaningful semantic for an upstream POST)
+    ///
+    /// Mirrors the Azure-OpenAI sibling fix (#391) which rejects the
+    /// same classes. Errors surface as `BridgeError::Config` so the
+    /// operator sees an actionable message instead of a silent
+    /// fall-through-to-canonical (which is what the original #390 bug
+    /// was — exactly what we don't want to bring back).
+    fn resolve_api_base(
+        &self,
+        region: &str,
+        ctx_api_base: Option<&str>,
+    ) -> Result<String, BridgeError> {
         #[cfg(test)]
         if let Some(b) = &self.api_base_override {
-            return b.clone();
+            return Ok(b.clone());
         }
         if let Some(b) = ctx_api_base.map(str::trim).filter(|s| !s.is_empty()) {
-            return b.trim_end_matches('/').to_string();
+            if !(b.starts_with("https://") || b.starts_with("http://")) {
+                return Err(BridgeError::Config(format!(
+                    "vertex provider_key api_base must use http:// or https:// scheme, got {b:?}",
+                )));
+            }
+            if b.contains('@') {
+                return Err(BridgeError::Config(format!(
+                    "vertex provider_key api_base must not embed userinfo (@); use the request's \
+                     Authorization header instead, got {b:?}",
+                )));
+            }
+            if b.contains('?') {
+                return Err(BridgeError::Config(format!(
+                    "vertex provider_key api_base must not contain a query string (the bridge \
+                     appends `?alt=sse` on streaming; an operator query would silently merge), \
+                     got {b:?}",
+                )));
+            }
+            if b.contains('#') {
+                return Err(BridgeError::Config(format!(
+                    "vertex provider_key api_base must not contain a fragment, got {b:?}",
+                )));
+            }
+            return Ok(b.trim_end_matches('/').to_string());
         }
-        format!("https://{region}-aiplatform.googleapis.com")
+        Ok(format!("https://{region}-aiplatform.googleapis.com"))
     }
 }
 
@@ -502,7 +546,7 @@ impl VertexBridge {
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
 
-        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref());
+        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
         let url = format!(
             "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:generateContent",
             project = creds.project,
@@ -582,7 +626,7 @@ impl VertexBridge {
         validate_url_token("region", &creds.region)?;
         validate_url_token("upstream_id", upstream_id)?;
 
-        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref());
+        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
         let url = format!(
             "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:streamGenerateContent?alt=sse",
             project = creds.project,
@@ -1091,14 +1135,18 @@ mod tests {
         // seam is None — exercises the production code path that
         // pre-fix would have hit the canonical URL.
         let bridge = VertexBridge::new();
-        let resolved = bridge.resolve_api_base("us-central1", Some("http://mock-vertex:8001"));
+        let resolved = bridge
+            .resolve_api_base("us-central1", Some("http://mock-vertex:8001"))
+            .unwrap();
         assert_eq!(resolved, "http://mock-vertex:8001");
     }
 
     #[test]
     fn resolve_api_base_trims_trailing_slash_on_ctx_override() {
         let bridge = VertexBridge::new();
-        let resolved = bridge.resolve_api_base("us-central1", Some("http://x.example.internal/"));
+        let resolved = bridge
+            .resolve_api_base("us-central1", Some("http://x.example.internal/"))
+            .unwrap();
         assert_eq!(
             resolved, "http://x.example.internal",
             "trailing slash must be stripped so URL stitching produces a single separator",
@@ -1111,15 +1159,15 @@ mod tests {
         // Empty string and whitespace-only values are treated as "no
         // override" — fall through to the canonical region URL.
         assert_eq!(
-            bridge.resolve_api_base("us-central1", Some("")),
+            bridge.resolve_api_base("us-central1", Some("")).unwrap(),
             "https://us-central1-aiplatform.googleapis.com",
         );
         assert_eq!(
-            bridge.resolve_api_base("us-central1", Some("   ")),
+            bridge.resolve_api_base("us-central1", Some("   ")).unwrap(),
             "https://us-central1-aiplatform.googleapis.com",
         );
         assert_eq!(
-            bridge.resolve_api_base("us-central1", None),
+            bridge.resolve_api_base("us-central1", None).unwrap(),
             "https://us-central1-aiplatform.googleapis.com",
         );
     }
@@ -1130,8 +1178,101 @@ mod tests {
         // `ctx_api_base` so existing tests that pin against a
         // wiremock URI keep working unchanged.
         let bridge = VertexBridge::new().with_api_base_override("http://wiremock:9999");
-        let resolved = bridge.resolve_api_base("us-central1", Some("http://ignored-ctx:8001"));
+        let resolved = bridge
+            .resolve_api_base("us-central1", Some("http://ignored-ctx:8001"))
+            .unwrap();
         assert_eq!(resolved, "http://wiremock:9999");
+    }
+
+    // ─── SSRF / credential-embed validation of api_base (PR #392 audit M1) ──
+    //
+    // The operator-supplied api_base is interpolated directly into
+    // `format!("{base}/v1/projects/...")`. The bridge rejects classes
+    // of input that would either escalate (userinfo `@`) or silently
+    // corrupt the URL stitching (`?` / `#`). Mirrors the Azure-OpenAI
+    // sibling fix (#391) which rejects the same shapes.
+
+    #[test]
+    fn resolve_api_base_rejects_non_http_scheme() {
+        let bridge = VertexBridge::new();
+        for bad in [
+            "file:///etc/passwd",
+            "gs://my-bucket/path",
+            "ftp://internal.example",
+            // bare host without scheme — operator might paste this
+            // expecting the bridge to add https://, but it won't.
+            "mock-vertex:8001",
+            "//mock-vertex:8001",
+        ] {
+            let err = bridge
+                .resolve_api_base("us-central1", Some(bad))
+                .err()
+                .unwrap_or_else(|| panic!("expected error for api_base={bad:?}"));
+            match err {
+                BridgeError::Config(msg) => {
+                    assert!(
+                        msg.contains("http"),
+                        "error message should name the http(s) requirement; got: {msg}"
+                    );
+                }
+                other => panic!("expected Config error for api_base={bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_api_base_rejects_embedded_userinfo() {
+        let bridge = VertexBridge::new();
+        // userinfo (`user:pass@host`) is rejected because:
+        //   1. it would leak credentials via access-log URLs;
+        //   2. the bridge writes its own Authorization header from
+        //      the SA-minted Bearer; userinfo would either shadow it
+        //      or get sent to a non-Google host.
+        let err = bridge
+            .resolve_api_base("us-central1", Some("https://user:secret@proxy.internal"))
+            .err()
+            .unwrap();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(msg.contains("userinfo") || msg.contains("@"));
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_api_base_rejects_query_string() {
+        let bridge = VertexBridge::new();
+        // Streaming path appends `?alt=sse`; an operator query would
+        // silently merge with that and produce a broken URL.
+        let err = bridge
+            .resolve_api_base(
+                "us-central1",
+                Some("https://proxy.internal?api-version=oops"),
+            )
+            .err()
+            .unwrap();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(msg.contains("query") || msg.contains('?'));
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_api_base_rejects_fragment() {
+        let bridge = VertexBridge::new();
+        let err = bridge
+            .resolve_api_base("us-central1", Some("https://proxy.internal#fragment"))
+            .err()
+            .unwrap();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(msg.contains("fragment") || msg.contains('#'));
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2331,6 +2472,48 @@ mod tests {
             chunks.push(item.unwrap());
         }
         assert!(!chunks.is_empty(), "expected at least one chunk");
+    }
+
+    /// Streaming-path counterpart to
+    /// `chat_gemini_honors_provider_key_api_base_in_production_path`
+    /// (PR #392 audit HIGH-1). Pre-fix, `chat_gemini_stream` also
+    /// hardcoded the canonical Google URL; this test pins that the
+    /// production path of the streaming bridge follows `ProviderKey.api_base`
+    /// without the test-only `with_api_base_override` seam.
+    #[tokio::test]
+    async fn chat_gemini_stream_honors_provider_key_api_base_in_production_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-1.5-pro:streamGenerateContent",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(happy_path_sse_body()),
+            )
+            .expect(1) // pre-fix: 0 (canonical Google host); post-fix: 1.
+            .mount(&server)
+            .await;
+
+        // Production path: NO `with_api_base_override`; the URL must
+        // be driven entirely by `ProviderKey.api_base`.
+        let bridge = VertexBridge::new();
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_secret_and_api_base(valid_secret_json(), &server.uri()),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.unwrap());
+        }
+        assert!(
+            !chunks.is_empty(),
+            "expected at least one chunk via ctx-driven URL"
+        );
     }
 
     #[tokio::test]
