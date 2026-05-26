@@ -1,0 +1,95 @@
+# Scheduled real-chain coverage.
+#
+# Drives the gateway's Anthropic-native /v1/messages endpoint through
+# the REAL Claude Code CLI (`claude -p`) against a real non-Anthropic
+# upstream (DeepSeek by default — the credential available in CI).
+# Catches regressions in cross-provider translation of the wire shape
+# that Anthropic-ecosystem clients actually emit but the in-repo
+# vitest mock-upstream tests do not generate.
+#
+# Gated separately from PR CI for the same reason as AISIX-Cloud's
+# real-chain.yml: spends real upstream quota.
+
+name: real chain
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    # 08:00 Asia/Shanghai every day.
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: real-chain-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  real-chain:
+    name: claude-code-cli real-chain
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 30
+    # Same fork-guard + label-gate shape as AISIX-Cloud's real-chain
+    # workflow: secrets only flow on PRs from the same repo, and only
+    # when an opt-in label is set.
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'real chain test')) }}
+    services:
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.15
+        env:
+          ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+          ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
+        ports: ["2379:2379"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate required secrets
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          test -n "$DEEPSEEK_API_KEY" || {
+            echo "::error::DEEPSEEK_API_KEY is required (the test gates on at least one upstream credential)"
+            exit 1
+          }
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3.0.0
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build aisix binary
+        run: cargo build -p aisix-server --bin aisix
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install Claude Code CLI
+        # https://code.claude.com/docs/en/setup — npm path is the
+        # reproducible CI install (avoids the native installer's
+        # auto-update side-effect mid-job).
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+
+      - name: e2e install
+        working-directory: tests/e2e
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Run Claude Code CLI real-chain
+        working-directory: tests/e2e
+        env:
+          AISIX_BIN: ${{ github.workspace }}/target/debug/aisix
+          AISIX_E2E_ETCD: http://127.0.0.1:2379
+          RUN_CLAUDE_CODE_REAL_CHAIN: "1"
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: pnpm exec vitest run src/cases/claude-code-cli-compat-e2e.test.ts
