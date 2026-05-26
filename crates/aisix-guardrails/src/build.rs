@@ -334,9 +334,10 @@ pub fn build_index_from_snapshot(
         }
         match build_one(row, bedrock_endpoint_url) {
             Ok(Some(g)) => {
-                tracing::debug!(
+                tracing::info!(
                     guardrail_id = %guardrail_arc.id,
-                    "guardrail has no attachment; applying as implicit env-scope (backward compat)",
+                    guardrail_name = %row.name,
+                    "guardrail has no attachment rows; applying as implicit env-scope at priority 0 (backward-compat rolling-upgrade window)",
                 );
                 entries.push(GuardrailIndex::push_entry(
                     guardrail_arc.id.clone(),
@@ -735,6 +736,61 @@ mod tests {
 
         let index = build_index_from_snapshot(&guardrails, &attachments, None);
         assert_eq!(index.len(), 0);
+        // Verify the guardrail does not fire (not just that the index is empty).
+        let ctx = RequestContext {
+            model_id: "m",
+            api_key_id: "k",
+            team_id: None,
+        };
+        assert!(
+            !index
+                .resolve(&ctx)
+                .check_input(&req("here AKIA"))
+                .await
+                .is_block(),
+            "disabled-only-attachment guardrail must not block any request",
+        );
+    }
+
+    #[tokio::test]
+    async fn no_attachment_guardrail_fires_globally_backward_compat() {
+        // Core backward-compat contract: a guardrail with ZERO attachment rows
+        // must fire on every request (env-scope at priority 0), preserving
+        // the pre-P0c "apply globally" behavior during rolling upgrade.
+        let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        guardrails.insert(entry(
+            "g",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "g",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+
+        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        assert_eq!(
+            index.len(),
+            1,
+            "no-attachment guardrail must appear as env-scope entry",
+        );
+
+        let ctx = RequestContext {
+            model_id: "any-model",
+            api_key_id: "any-key",
+            team_id: None,
+        };
+        assert!(
+            index
+                .resolve(&ctx)
+                .check_input(&req("here AKIA"))
+                .await
+                .is_block(),
+            "no-attachment guardrail must block matching requests",
+        );
     }
 
     #[tokio::test]

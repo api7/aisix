@@ -179,15 +179,22 @@ pub struct Guardrail {
     // cp-api's marshalGuardrailKV will start emitting these once the P0c
     // CP PR lands. Until then, old kine rows omit them and the defaults apply.
     /// How the DP behaves when this guardrail fires.
-    /// `"monitor"` — let the request through and record the event.
     /// `"block"` (default) — reject the request.
+    /// `"monitor"` — let the request through and record the event
+    ///   (**not yet implemented**; the DP currently always blocks regardless
+    ///   of this field — do not set `"monitor"` expecting pass-through
+    ///   behavior until a future release wires it into the chain).
     #[serde(default = "default_enforcement_mode")]
     pub enforcement_mode: String,
 
     /// When `true`, a runtime error in this guardrail's evaluation
-    /// (e.g. a Bedrock timeout when `fail_open=false`) is treated as
-    /// fatal: the request is blocked regardless of `fail_open`.
+    /// (e.g. a Bedrock timeout) is treated as fatal: the request is
+    /// blocked regardless of `fail_open`.
     /// When `false` (default), `fail_open` governs the error path.
+    ///
+    /// **Not yet implemented** — the field is stored and forwarded to
+    /// the CP dashboard but the DP does not yet consult it; `fail_open`
+    /// alone governs error behavior in the current release.
     #[serde(default)]
     pub mandatory: bool,
 
