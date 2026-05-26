@@ -294,7 +294,13 @@ impl Resource for GuardrailAttachment {
     }
 
     /// Keyed by `guardrail_id` in the `ResourceTable` name-index so
-    /// callers can look up all attachments for a given guardrail.
+    /// callers can look up attachments by guardrail.
+    ///
+    /// WARNING: the name-index is a flat map and silently overwrites
+    /// earlier entries when a guardrail has multiple attachments (e.g.
+    /// one Env-scope and one Model-scope attachment share the same key).
+    /// Use `ResourceTable::entries()` (not `get_by_name`) to enumerate
+    /// all attachments. `build_index_from_snapshot` already does this.
     fn name(&self) -> &str {
         &self.guardrail_id
     }
