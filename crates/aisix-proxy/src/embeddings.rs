@@ -15,7 +15,7 @@
 //! `"type": "not_implemented"`.
 
 use aisix_gateway::{BridgeContext, BridgeError, EmbeddingRequest};
-use aisix_obs::{AccessLog, RequestOutcome};
+use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -72,25 +72,47 @@ pub async fn embeddings(
     let model_name = body.model.clone();
 
     match dispatch(&state, &auth, body, &request_id).await {
-        Ok((resp, provider)) => {
+        Ok(success) => {
             let elapsed = started.elapsed();
             let status = 200u16;
             emit_access_log(
                 &model_name,
-                &provider,
+                &success.provider,
                 &api_key_id,
                 status,
                 elapsed,
                 &request_id,
             );
             state.metrics.record_request(
-                &provider,
+                &success.provider,
                 &model_name,
                 status,
                 RequestOutcome::Success,
                 elapsed,
             );
-            resp
+            // Issue #226: emit UsageEvent so cp-api's budget ledger
+            // and customer-facing /logs analytics see embeddings
+            // spend. Pre-#226 the embedding handler dropped the
+            // event entirely, so any /v1/embeddings traffic was
+            // invisible to budget enforcement and billing
+            // reconciliation. Skip when prompt_tokens == 0 — the
+            // dispatch's 501-NotImplemented path returns zero
+            // tokens because no upstream call happened, and
+            // attributing zero-token spend to the api_key would
+            // bloat /logs with noise. Same emit-on-success-only
+            // convention as chat.rs.
+            if success.prompt_tokens > 0 {
+                emit_usage_event(
+                    &state,
+                    &request_id,
+                    &success.model_id,
+                    &api_key_id,
+                    status,
+                    elapsed,
+                    success.prompt_tokens,
+                );
+            }
+            success.response
         }
         Err(err) => {
             let status = err.status().as_u16();
@@ -115,12 +137,25 @@ pub async fn embeddings(
     }
 }
 
+/// Per-request payload from a successful dispatch — carries
+/// everything the handler needs to emit access-log + UsageEvent +
+/// the actual HTTP response. Pre-#226 the dispatch only returned
+/// the response + provider label; expanding to a struct surfaces
+/// the model_id + prompt_tokens the UsageEvent emission needs
+/// without threading two more positional args through the handler.
+struct EmbedDispatchSuccess {
+    response: Response,
+    provider: String,
+    model_id: String,
+    prompt_tokens: u32,
+}
+
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
     body: EmbeddingRequestBody,
     request_id: &str,
-) -> Result<(Response, String), ProxyError> {
+) -> Result<EmbedDispatchSuccess, ProxyError> {
     let snapshot = state.snapshot.load();
 
     let model_entry = snapshot
@@ -174,18 +209,34 @@ async fn dispatch(
             // here even though other handlers commit 0.
             reservation.commit_tokens(embed_resp.usage.total_tokens as u64);
             let provider_label = provider.to_ascii_lowercase();
-            Ok((Json(embed_resp).into_response(), provider_label))
+            // Capture the prompt_tokens count BEFORE moving the
+            // embed_resp into the JSON response — the handler needs
+            // this for UsageEvent emission downstream (#226).
+            let prompt_tokens = embed_resp.usage.prompt_tokens;
+            Ok(EmbedDispatchSuccess {
+                response: Json(embed_resp).into_response(),
+                provider: provider_label,
+                model_id: model_entry.id.to_string(),
+                prompt_tokens,
+            })
         }
         Err(BridgeError::Config(msg)) if msg.contains("does not support embeddings") => {
             // Provider doesn't implement embed → 501 Not Implemented.
             // Drop the reservation without committing — the request
-            // didn't hit the upstream.
+            // didn't hit the upstream. No UsageEvent emission either
+            // (prompt_tokens = 0 → handler skips emit per the
+            // chat.rs convention that we only attribute usage on a
+            // real upstream completion).
             reservation.commit_tokens(0);
             let env = ErrorEnvelope::new(msg, "not_implemented");
-            Ok((
-                (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
-                provider.to_ascii_lowercase(),
-            ))
+            Ok(EmbedDispatchSuccess {
+                response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
+                provider: provider.to_ascii_lowercase(),
+                model_id: model_entry.id.to_string(),
+                // Zero prompt_tokens signals "no upstream call" — the
+                // handler reads this and skips UsageEvent emission.
+                prompt_tokens: 0,
+            })
         }
         Err(e) => {
             reservation.commit_tokens(0);
@@ -225,6 +276,79 @@ fn emit_access_log(
         routing_attempts: None,
     }
     .emit();
+}
+
+/// Push one `UsageEvent` onto cp-api's telemetry sink **and** fan it
+/// out to every per-env OTLP/HTTP exporter in the live snapshot.
+/// Non-blocking on both legs: the CP sink drops on full queue, the
+/// OTLP fan-out detaches a tokio task per exporter. Mirrors the
+/// shape of chat.rs::emit_usage_event for the fields that matter
+/// to /v1/embeddings:
+///
+///   - `completion_tokens = 0` — embeddings have no completion side.
+///   - `inbound_protocol = "openai"` — match chat.rs convention.
+///   - No cache / streaming / reasoning / finish_reason metadata —
+///     none of these concepts apply to the embeddings endpoint;
+///     cp-api reads these UsageEvent fields with `omitempty`-equivalent
+///     defaults so leaving them zero is the same as omitting.
+///   - `cost_usd = 0.0` — cp-api computes cost server-side from
+///     pricing catalog + token counts on ingestion (same convention
+///     as every chat.rs emit site).
+///
+/// Issue #226. /v1/embeddings is the first non-chat handler to gain
+/// emission; follow-ups for completions / responses / rerank /
+/// audio / images each get their own PR with the same shape.
+fn emit_usage_event(
+    state: &ProxyState,
+    request_id: &str,
+    model_id: &str,
+    api_key_id: &str,
+    status_code: u16,
+    elapsed: Duration,
+    prompt_tokens: u32,
+) {
+    // Only populate fields meaningful to /v1/embeddings; rely on
+    // UsageEvent's `#[derive(Default)]` for everything else. Wire-level
+    // empty / zero / false maps to NULL on cp-api via skip_serializing_if,
+    // identical to the legacy "field absent" semantics older DP images
+    // emitted. Specifically left at Default:
+    //   - completion_tokens / cached_prompt_tokens / reasoning_tokens /
+    //     cache_creation_tokens / cache_read_tokens — embeddings have
+    //     no completion side and no cache token concepts
+    //   - provider_request_id / provider_model_version / finish_reason
+    //     — not exposed by the OpenAI embeddings response shape
+    //   - cost_usd — cp-api computes server-side from pricing catalog
+    //   - guardrail_blocked / guardrail_bypassed_reason — embeddings
+    //     bypass guardrails today
+    //   - cache_status / cache_hit_saved_* — no caching on embeddings
+    //   - ttft_ms — embeddings are not streamed
+    //   - served_by_model / routing_* — embeddings don't run routing
+    //   - provider_kind / provider_featured / branded_provider /
+    //     pk_label / byo_label — per-PK telemetry attribution is wired
+    //     for chat completions only; tracked as a follow-up for the
+    //     non-chat handlers (see #226 follow-up issues).
+    let event = UsageEvent {
+        request_id: request_id.to_string(),
+        // RFC 3339 UTC. cp-api parses with time.Parse(time.RFC3339, ...);
+        // chrono's `to_rfc3339_opts(Secs, true)` emits the trailing Z.
+        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        model_id: model_id.to_string(),
+        api_key_id: api_key_id.to_string(),
+        prompt_tokens,
+        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        status_code,
+        inbound_protocol: "openai".to_string(),
+        ..Default::default()
+    };
+    state.usage_sink.try_emit(event.clone());
+    // Per-env OTLP/HTTP fan-out — same shape as chat.rs:1334. The
+    // snapshot's exporter table is empty for envs that haven't
+    // configured any, so this is a cheap no-op on the common path.
+    let snap = state.snapshot.load();
+    let exporters = snap.observability_exporters.entries();
+    state
+        .otlp_fan_out
+        .fan_out(&event, exporters.iter().map(|e| &e.value));
 }
 
 #[cfg(test)]
@@ -619,5 +743,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// Issue #226: a successful /v1/embeddings call must emit a
+    /// `UsageEvent` onto the `usage_sink`. Pre-#226 the embeddings
+    /// handler dropped the event entirely, so any /v1/embeddings
+    /// traffic was invisible to cp-api's budget ledger and the
+    /// customer-facing /logs analytics. This test pins the contract:
+    /// after a 200 response, exactly one event arrives with the
+    /// caller's prompt_tokens, model_id, status, and `inbound_protocol
+    /// = "openai"` (mirroring chat.rs's emission convention).
+    #[tokio::test]
+    async fn emits_usage_event_on_200_with_prompt_tokens_issue_226() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // Pin a specific upstream token count so a regression that
+        // hardcoded 0 (or swapped prompt/completion semantics) would
+        // surface here.
+        let upstream_body = serde_json::json!({
+            "object": "list",
+            "data": [{
+                "object": "embedding",
+                "index": 0,
+                "embedding": [0.1_f32, 0.2_f32]
+            }],
+            "model": "text-embedding-3-small",
+            "usage": {"prompt_tokens": 42, "total_tokens": 42}
+        });
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({"model": "my-embed", "input": "hello world"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Event must arrive within a generous window — the emit is
+        // try_send (non-blocking) so a 500ms ceiling is well clear of
+        // schedule jitter.
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent was never emitted for /v1/embeddings 200")
+            .expect("usage_sink sender dropped before emission");
+
+        assert_eq!(
+            event.prompt_tokens, 42,
+            "UsageEvent.prompt_tokens must mirror upstream usage.prompt_tokens"
+        );
+        assert_eq!(
+            event.completion_tokens, 0,
+            "embeddings have no completion side; completion_tokens must be zero"
+        );
+        assert_eq!(
+            event.status_code, 200,
+            "status_code must reflect the response"
+        );
+        assert_eq!(
+            event.api_key_id, "k-1",
+            "api_key_id must reflect the authenticated caller"
+        );
+        assert_eq!(
+            event.model_id, "m-1",
+            "model_id must reflect the resolved model row"
+        );
+        assert_eq!(
+            event.inbound_protocol, "openai",
+            "inbound_protocol must be \"openai\" for /v1/embeddings (matches chat.rs convention)"
+        );
+        assert!(
+            !event.request_id.is_empty(),
+            "request_id must be set for join with x-aisix-call-id"
+        );
+        assert!(
+            !event.occurred_at.is_empty(),
+            "occurred_at must be set (RFC 3339 UTC)"
+        );
     }
 }
