@@ -639,6 +639,94 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// Issue #324: missing required field on the chat-completion
+    /// request body must surface as **400 Bad Request** per OpenAI's
+    /// wire contract, not 422 Unprocessable Entity. SDKs branching
+    /// on the status code see different semantics depending on
+    /// which proxy they sit behind; a customer migrating between
+    /// OpenAI direct and a gateway-fronted deployment needs the
+    /// 400-vs-422 distinction to be wire-stable.
+    ///
+    /// Pre-fix: axum's `Json<ChatFormat>` extractor returned
+    /// `JsonRejection::JsonDataError` → 422.
+    /// Post-fix: the handler intercepts the JsonRejection and maps
+    /// to `ProxyError::InvalidRequest` → 400.
+    #[tokio::test]
+    async fn missing_model_field_returns_400_not_422() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        // Valid JSON, valid `messages` field, but `model` omitted —
+        // the OpenAI ChatCompletion contract requires it.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "missing model field must surface as 400 per OpenAI wire contract — #324",
+        );
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    /// Companion case: missing `messages` field must also surface
+    /// as 400. Same OpenAI wire contract — `messages` is required.
+    #[tokio::test]
+    async fn missing_messages_field_returns_400_not_422() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"my-gpt4"}"#))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "missing messages field must surface as 400 per OpenAI wire contract — #324",
+        );
+    }
+
+    /// Companion case: malformed JSON (syntax error) also must
+    /// surface as 400, not 422. Same handler path as #324 — the
+    /// JsonRejection variants for syntax vs data error both map
+    /// to InvalidRequest.
+    #[tokio::test]
+    async fn malformed_json_returns_400() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{not even valid json"#))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "malformed JSON must surface as 400, not 422",
+        );
+    }
+
     /// Issue #159: a request body whose declared `Content-Length`
     /// exceeds the configured cap must surface as `413 Content Too
     /// Large` per RFC 9110 §15.5.14, NOT as `ECONNRESET` from a

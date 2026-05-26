@@ -125,11 +125,47 @@ use crate::cooldown::decide_cooldown;
 pub async fn chat_completions(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
-    Json(req): Json<ChatFormat>,
+    // Issue #324: catch the JSON-extractor rejection here so we can
+    // map it to OpenAI's documented 400 invalid_request_error wire
+    // shape. Axum's `Json<T>` extractor returns 422 on JsonDataError
+    // (valid-JSON-but-missing-required-field, e.g. no `model`),
+    // which diverges from OpenAI — every SDK that branches on 400
+    // vs 422 sees different semantics here than it does talking to
+    // api.openai.com. Same discriminate-then-map pattern as
+    // messages.rs (#336) which already handles this for /v1/messages.
+    body: Result<Json<ChatFormat>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let started = Instant::now();
     let method = "POST";
     let path = "/v1/chat/completions";
+    let req = match body {
+        Ok(Json(r)) => r,
+        Err(rej) => {
+            use axum::extract::rejection::JsonRejection;
+            use axum::http::StatusCode;
+            // BytesRejection → distinguish 413 (PAYLOAD_TOO_LARGE,
+            // real per-extractor cap exceeded) from 400 (transport-
+            // side read failure). `JsonRejection` is `#[non_exhaustive]`
+            // so the fallback `_` arm catches today's JsonDataError
+            // (the #324 case) / JsonSyntaxError / MissingJsonContentType
+            // AND any future variant axum adds, defaulting to 400
+            // until each new variant gets an explicit policy decision.
+            return match rej {
+                JsonRejection::BytesRejection(inner)
+                    if inner.status() == StatusCode::PAYLOAD_TOO_LARGE =>
+                {
+                    ProxyError::RequestTooLarge {
+                        limit_bytes: state.request_body_limit_bytes,
+                    }
+                }
+                JsonRejection::BytesRejection(_) => {
+                    ProxyError::InvalidRequest("failed to read request body".into())
+                }
+                _ => ProxyError::InvalidRequest("invalid JSON request body".into()),
+            }
+            .into_response();
+        }
+    };
     let request_id = new_request_id();
     let api_key_id = auth.entry.id.clone();
     let model_name = req.model.clone();
