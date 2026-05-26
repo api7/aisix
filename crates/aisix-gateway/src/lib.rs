@@ -32,7 +32,7 @@ pub use bridge::{
 };
 pub use chat::{
     ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest,
-    EmbeddingResponse, EmbeddingUsage, FinishReason, Role, UsageStats,
+    EmbeddingResponse, EmbeddingUsage, EmbeddingVector, FinishReason, Role, UsageStats,
 };
 pub use hub::Hub;
 pub use sse::{SseDecoder, SseEvent};

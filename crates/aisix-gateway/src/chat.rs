@@ -368,12 +368,38 @@ pub struct ChatDelta {
 
 // ─── Embeddings ──────────────────────────────────────────────────────────────
 
+/// The vector returned on one embedding object. Untagged enum so JSON
+/// round-trips OpenAI's documented `string | array` shape on the
+/// `embedding` field (issue #393):
+///
+///   - `Float(vec![0.1, 0.2, ...])` → JSON array of numbers; what
+///     OpenAI returns when the request carries
+///     `encoding_format: "float"`.
+///   - `Base64("BASE64STRING")` → JSON string; what OpenAI returns
+///     when the request carries `encoding_format: "base64"` (the
+///     SDK default). Stored verbatim — the gateway is a pure
+///     pass-through for this field so callers who chose `base64`
+///     for payload-size reasons see the same bytes the upstream
+///     returned.
+///
+/// The gateway does NOT translate between the two formats. If a
+/// future caller needs cross-format translation, that belongs at
+/// the dispatcher, not the wire layer.
+///
+/// Reference: <https://platform.openai.com/docs/api-reference/embeddings/object>.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingVector {
+    Float(Vec<f32>),
+    Base64(String),
+}
+
 /// Single embedding object as returned by a provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingObject {
     pub index: u32,
     pub object: String,
-    pub embedding: Vec<f32>,
+    pub embedding: EmbeddingVector,
 }
 
 /// Normalised embedding request.

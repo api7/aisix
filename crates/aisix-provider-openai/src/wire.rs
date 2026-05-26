@@ -29,7 +29,7 @@
 
 use aisix_gateway::{
     ChatChunk, ChatDelta, ChatFormat, ChatMessage, ChatResponse, EmbeddingObject, EmbeddingRequest,
-    EmbeddingResponse, EmbeddingUsage, FinishReason, Role, UsageStats,
+    EmbeddingResponse, EmbeddingUsage, EmbeddingVector, FinishReason, Role, UsageStats,
 };
 use serde::{Deserialize, Serialize};
 
@@ -364,11 +364,21 @@ pub(crate) struct OpenAiEmbedRequest<'a> {
 }
 
 /// One embedding object from OpenAI's response.
+///
+/// Issue #393: `embedding` is an `EmbeddingVector` (untagged enum
+/// over `Vec<f32>` / `String`) so the deserializer accepts both
+/// shapes OpenAI emits — `Vec<f32>` when the request carried
+/// `encoding_format: "float"`, and base64 `String` when it carried
+/// `encoding_format: "base64"` (the OpenAI SDK default). Pre-#393
+/// this field was strict-typed `Vec<f32>` and every default-SDK
+/// `embeddings.create({model, input})` call failed with
+/// `502 upstream_decode_error` because the deserializer rejected
+/// the string shape.
 #[derive(Debug, Deserialize)]
 pub(crate) struct OpenAiEmbeddingObject {
     pub index: u32,
     pub object: String,
-    pub embedding: Vec<f32>,
+    pub embedding: EmbeddingVector,
 }
 
 /// Usage block from OpenAI's embeddings response.
@@ -712,5 +722,96 @@ mod tests {
         let tool_msg = &json["messages"][2];
         assert_eq!(tool_msg["tool_call_id"], "c1");
         assert_eq!(tool_msg["role"], "tool");
+    }
+
+    /// Issue #393: OpenAI's embeddings response carries `embedding` as
+    /// either a JSON array (when the request set
+    /// `encoding_format: "float"`) OR a base64 string (when the
+    /// request set `encoding_format: "base64"`, which is the OpenAI
+    /// SDK default). Pre-fix the deserializer rejected the string
+    /// shape with `error decoding response body` → 502.
+    #[test]
+    fn embeddings_response_accepts_float_array() {
+        let body = r#"{
+            "object": "list",
+            "model": "text-embedding-3-small",
+            "data": [{
+                "index": 0,
+                "object": "embedding",
+                "embedding": [0.1, -0.2, 0.3]
+            }],
+            "usage": { "prompt_tokens": 1, "total_tokens": 1 }
+        }"#;
+        let raw: OpenAiEmbedResponse =
+            serde_json::from_str(body).expect("float-array embedding must deserialize");
+        let resp = embed_response_into(raw);
+        assert_eq!(resp.data.len(), 1);
+        match &resp.data[0].embedding {
+            EmbeddingVector::Float(v) => {
+                assert_eq!(v.len(), 3);
+                assert!((v[0] - 0.1).abs() < 1e-6);
+            }
+            EmbeddingVector::Base64(_) => {
+                panic!("float request must deserialize as EmbeddingVector::Float")
+            }
+        }
+    }
+
+    #[test]
+    fn embeddings_response_accepts_base64_string() {
+        // OpenAI returns base64 as a quoted JSON string. Pre-#393
+        // this was the bug — `Vec<f32>` deserializer rejected the
+        // string shape with `error decoding response body`.
+        let body = r#"{
+            "object": "list",
+            "model": "text-embedding-3-small",
+            "data": [{
+                "index": 0,
+                "object": "embedding",
+                "embedding": "ZAAAANSAAAA="
+            }],
+            "usage": { "prompt_tokens": 1, "total_tokens": 1 }
+        }"#;
+        let raw: OpenAiEmbedResponse =
+            serde_json::from_str(body).expect("base64-string embedding must deserialize");
+        let resp = embed_response_into(raw);
+        assert_eq!(resp.data.len(), 1);
+        match &resp.data[0].embedding {
+            EmbeddingVector::Base64(s) => assert_eq!(s, "ZAAAANSAAAA="),
+            EmbeddingVector::Float(_) => {
+                panic!("base64 string must deserialize as EmbeddingVector::Base64")
+            }
+        }
+    }
+
+    #[test]
+    fn embeddings_response_serializes_back_to_same_shape() {
+        // The pass-through contract: the JSON serialization of the
+        // gateway-internal EmbeddingObject MUST emit the same shape
+        // the upstream returned. Float → array, base64 → string. An
+        // SDK that asked for base64 sees a base64 string in the
+        // gateway's response; an SDK that asked for float sees an
+        // array. No format translation.
+        let float_obj = EmbeddingObject {
+            index: 0,
+            object: "embedding".to_string(),
+            embedding: EmbeddingVector::Float(vec![0.1, -0.2, 0.3]),
+        };
+        let s = serde_json::to_string(&float_obj).unwrap();
+        assert!(
+            s.contains(r#""embedding":[0.1,-0.2,0.3]"#),
+            "float must serialize as JSON array; got {s}"
+        );
+
+        let b64_obj = EmbeddingObject {
+            index: 0,
+            object: "embedding".to_string(),
+            embedding: EmbeddingVector::Base64("ZAAAANSAAAA=".to_string()),
+        };
+        let s = serde_json::to_string(&b64_obj).unwrap();
+        assert!(
+            s.contains(r#""embedding":"ZAAAANSAAAA=""#),
+            "base64 must serialize as JSON string; got {s}"
+        );
     }
 }
