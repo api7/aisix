@@ -75,6 +75,15 @@ fn build_one(
     row: &DomainGuardrail,
     bedrock_endpoint_url: Option<&str>,
 ) -> Result<Option<Arc<dyn Guardrail>>, BuildError> {
+    // enforcement_mode is not yet implemented: warn so operators don't silently
+    // assume "monitor" means pass-through. See doc comment on the field.
+    if row.enforcement_mode != "block" {
+        tracing::warn!(
+            guardrail_name = %row.name,
+            enforcement_mode = %row.enforcement_mode,
+            "enforcement_mode is not yet implemented; DP will block regardless of this setting",
+        );
+    }
     match &row.config {
         GuardrailKind::Keyword(cfg) => {
             if cfg.patterns.is_empty() {
@@ -324,6 +333,12 @@ pub fn build_index_from_snapshot(
     // behavior where all guardrails in the snapshot were applied globally).
     // This covers the rolling-upgrade window where the DP has been updated to
     // P0c but the CP hasn't yet written attachment rows for existing guardrails.
+    //
+    // TODO(P0c-cleanup): Remove this block once the CP is fully rolled out and
+    // guaranteed to write at least one attachment row for every guardrail
+    // (tracked in https://github.com/api7/ai-gateway/issues/417).
+    // After removal, a guardrail with zero attachment rows is a silent no-op —
+    // operators must explicitly attach it to a scope.
     for guardrail_arc in guardrails.entries() {
         if attached_ids.contains(guardrail_arc.id.as_str()) {
             continue; // explicit attachment governs this guardrail
@@ -452,8 +467,10 @@ impl LiveGuardrailIndex {
         self.current().resolve(ctx)
     }
 
-    /// `true` when the current snapshot has no attachment entries. Callers
-    /// can use this to skip chain allocation on the hot path.
+    /// `true` when the resolved index has no guardrail entries — neither
+    /// from explicit attachment rows nor from the backward-compat implicit
+    /// env-scope fallback for no-attachment guardrails. Callers can use
+    /// this to skip chain allocation on the hot path.
     pub fn is_empty(&self) -> bool {
         self.current().is_empty()
     }
@@ -749,6 +766,54 @@ mod tests {
                 .await
                 .is_block(),
             "disabled-only-attachment guardrail must not block any request",
+        );
+    }
+
+    #[tokio::test]
+    async fn one_enabled_one_disabled_attachment_fires_exactly_once() {
+        // Verifies the HashSet boundary: a guardrail with one enabled + one disabled
+        // attachment must fire exactly once (via the enabled attachment) and must NOT
+        // trigger the backward-compat env-scope fallback.
+        let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        guardrails.insert(entry(
+            "g",
+            "g-1",
+            parse(
+                r#"{"name":"g","kind":"keyword","patterns":[{"kind":"literal","value":"AKIA"}]}"#,
+            ),
+        ));
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        attachments.insert(attachment_entry(
+            "a-enabled",
+            parse_attachment(r#"{"guardrail_id":"g-1","scope_type":"env","priority":50}"#),
+        ));
+        attachments.insert(attachment_entry(
+            "a-disabled",
+            parse_attachment(
+                r#"{"guardrail_id":"g-1","scope_type":"model","scope_id":"m1","priority":10,"enabled":false}"#,
+            ),
+        ));
+
+        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        // Exactly one entry — from the enabled attachment only.
+        // The disabled attachment must NOT produce a second entry or trigger the fallback.
+        assert_eq!(
+            index.len(),
+            1,
+            "enabled+disabled attachments: exactly 1 entry expected",
+        );
+        let ctx = RequestContext {
+            model_id: "any",
+            api_key_id: "any",
+            team_id: None,
+        };
+        assert!(
+            index
+                .resolve(&ctx)
+                .check_input(&req("here AKIA"))
+                .await
+                .is_block(),
+            "env-scope enabled attachment must still fire",
         );
     }
 
