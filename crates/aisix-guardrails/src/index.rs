@@ -117,9 +117,9 @@ fn scope_specificity(k: &ScopeKind) -> u8 {
 impl GuardrailIndex {
     pub(crate) fn new(mut entries: Vec<IndexEntry>) -> Self {
         entries.sort_by(|a, b| {
-            b.priority
-                .cmp(&a.priority)
-                .then_with(|| scope_specificity(&b.scope_kind).cmp(&scope_specificity(&a.scope_kind)))
+            b.priority.cmp(&a.priority).then_with(|| {
+                scope_specificity(&b.scope_kind).cmp(&scope_specificity(&a.scope_kind))
+            })
         });
         Self { entries }
     }
@@ -232,7 +232,10 @@ mod tests {
         let idx = GuardrailIndex::from_entries(vec![]);
         let chain = idx.resolve(&ctx("m1", "k1", None));
         assert!(chain.is_empty());
-        assert_eq!(chain.check_input(&req("AKIA")).await, GuardrailVerdict::Allow);
+        assert_eq!(
+            chain.check_input(&req("AKIA")).await,
+            GuardrailVerdict::Allow
+        );
     }
 
     // 2. Env-scope attachment applies to all requests.
@@ -285,7 +288,10 @@ mod tests {
         )]);
 
         let chain_alpha = idx.resolve(&ctx("m1", "key-ALPHA", None));
-        assert!(chain_alpha.check_input(&req("restricted term")).await.is_block());
+        assert!(chain_alpha
+            .check_input(&req("restricted term"))
+            .await
+            .is_block());
 
         let chain_other = idx.resolve(&ctx("m1", "key-BETA", None));
         assert_eq!(
@@ -298,13 +304,8 @@ mod tests {
     #[tokio::test]
     async fn team_scope_only_matching_team() {
         let g = kw("g1", "classified");
-        let idx = GuardrailIndex::from_entries(vec![entry(
-            "g1",
-            ScopeKind::Team,
-            Some("team-X"),
-            50,
-            g,
-        )]);
+        let idx =
+            GuardrailIndex::from_entries(vec![entry("g1", ScopeKind::Team, Some("team-X"), 50, g)]);
 
         // Key belongs to team-X → blocks.
         let chain_x = idx.resolve(&ctx("m1", "k1", Some("team-X")));
@@ -480,7 +481,11 @@ mod tests {
         // For key-A: ApiKey(priority=50, specificity=3) wins over Env(priority=50, specificity=0).
         // Dedup fires on Env → chain has exactly 1 entry.
         let chain = idx.resolve(&ctx("m1", "key-A", None));
-        assert_eq!(chain.len(), 1, "equal-priority: ApiKey-scope must deduplicate Env-scope");
+        assert_eq!(
+            chain.len(),
+            1,
+            "equal-priority: ApiKey-scope must deduplicate Env-scope"
+        );
     }
 
     // -----------------------------------------------------------------------

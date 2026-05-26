@@ -255,9 +255,18 @@ pub fn build_index_from_snapshot(
     bedrock_endpoint_url: Option<&str>,
 ) -> GuardrailIndex {
     let mut entries = Vec::new();
+    // Track guardrail IDs that have ANY attachment record (enabled or not).
+    // The backward-compat fallback below only fires for guardrails that have
+    // zero attachment rows — operators who explicitly disabled an attachment
+    // are expressing intent; we must not override it with the env-scope fallback.
+    let mut attached_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for attachment_arc in attachments.entries() {
         let attachment = &attachment_arc.value;
+        // Track ALL attachment references (enabled or not) so the backward-compat
+        // fallback below treats "has an explicit attachment" as opt-in to P0c
+        // attachment semantics — even if all attachments are currently disabled.
+        attached_ids.insert(attachment.guardrail_id.clone());
 
         if !attachment.enabled {
             continue;
@@ -310,6 +319,44 @@ pub fn build_index_from_snapshot(
         ));
     }
 
+    // Backward compat: a guardrail definition that has no enabled attachment
+    // fires on every request in the env at priority 0 (same as the pre-P0c
+    // behavior where all guardrails in the snapshot were applied globally).
+    // This covers the rolling-upgrade window where the DP has been updated to
+    // P0c but the CP hasn't yet written attachment rows for existing guardrails.
+    for guardrail_arc in guardrails.entries() {
+        if attached_ids.contains(guardrail_arc.id.as_str()) {
+            continue; // explicit attachment governs this guardrail
+        }
+        let row = &guardrail_arc.value;
+        if !row.enabled {
+            continue;
+        }
+        match build_one(row, bedrock_endpoint_url) {
+            Ok(Some(g)) => {
+                tracing::debug!(
+                    guardrail_id = %guardrail_arc.id,
+                    "guardrail has no attachment; applying as implicit env-scope (backward compat)",
+                );
+                entries.push(GuardrailIndex::push_entry(
+                    guardrail_arc.id.clone(),
+                    ScopeKind::Env,
+                    None,
+                    0,
+                    g,
+                ));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    guardrail_id = %guardrail_arc.id,
+                    error = %err,
+                    "skipping guardrail with invalid config (no-attachment backward-compat path)",
+                );
+            }
+        }
+    }
+
     GuardrailIndex::from_entries(entries)
 }
 
@@ -352,7 +399,10 @@ impl LiveGuardrailIndex {
         Arc::new(Self {
             snapshot,
             bedrock_endpoint_url,
-            cache: Mutex::new(IndexCache { last_version, index }),
+            cache: Mutex::new(IndexCache {
+                last_version,
+                index,
+            }),
         })
     }
 
@@ -612,10 +662,7 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
-    fn attachment_entry(
-        id: &str,
-        row: GuardrailAttachment,
-    ) -> ResourceEntry<GuardrailAttachment> {
+    fn attachment_entry(id: &str, row: GuardrailAttachment) -> ResourceEntry<GuardrailAttachment> {
         ResourceEntry::new(id, row, 1)
     }
 
@@ -756,7 +803,11 @@ mod tests {
         };
 
         // Empty snapshot → no rules → input passes.
-        assert!(!live.resolve(&ctx).check_input(&req("AKIA-EXAMPLE")).await.is_block());
+        assert!(!live
+            .resolve(&ctx)
+            .check_input(&req("AKIA-EXAMPLE"))
+            .await
+            .is_block());
         assert!(live.is_empty());
 
         // Swap in a snapshot that attaches a blocking keyword guardrail env-wide.
@@ -784,7 +835,11 @@ mod tests {
         ));
         handle.store(next);
 
-        assert!(live.resolve(&ctx).check_input(&req("AKIA-EXAMPLE")).await.is_block());
+        assert!(live
+            .resolve(&ctx)
+            .check_input(&req("AKIA-EXAMPLE"))
+            .await
+            .is_block());
         assert!(!live.is_empty());
     }
 

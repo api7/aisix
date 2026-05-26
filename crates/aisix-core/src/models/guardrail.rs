@@ -178,7 +178,6 @@ pub struct Guardrail {
     //
     // cp-api's marshalGuardrailKV will start emitting these once the P0c
     // CP PR lands. Until then, old kine rows omit them and the defaults apply.
-
     /// How the DP behaves when this guardrail fires.
     /// `"monitor"` — let the request through and record the event.
     /// `"block"` (default) — reject the request.

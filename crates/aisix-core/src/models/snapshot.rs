@@ -15,7 +15,7 @@ use crate::snapshot::ResourceTable;
 
 /// Composite of every typed [`ResourceTable`] the gateway reads on the hot
 /// path. Cheap to construct empty; populated by the loader.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct AisixSnapshot {
     pub models: ResourceTable<Model>,
     pub apikeys: ResourceTable<ApiKey>,
