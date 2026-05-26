@@ -24,8 +24,11 @@ permissions:
   contents: read
 
 concurrency:
+  # Cancel superseded runs — every `labeled` event re-triggers the
+  # workflow and each run burns real upstream quota; without
+  # cancellation a labeling spree stacks costs fast.
   group: real-chain-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   real-chain:
@@ -34,8 +37,11 @@ jobs:
     timeout-minutes: 30
     # Same fork-guard + label-gate shape as AISIX-Cloud's real-chain
     # workflow: secrets only flow on PRs from the same repo, and only
-    # when an opt-in label is set.
-    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'real chain test')) }}
+    # when an opt-in label is set. The `action != 'labeled'` clause
+    # narrows the label trigger to the relevant label name — otherwise
+    # *any* label change on a PR that already carries the gating label
+    # re-runs the workflow.
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && contains(github.event.pull_request.labels.*.name, 'real chain test') && (github.event.action != 'labeled' || github.event.label.name == 'real chain test')) }}
     services:
       etcd:
         image: quay.io/coreos/etcd:v3.5.15
@@ -91,5 +97,11 @@ jobs:
           AISIX_BIN: ${{ github.workspace }}/target/debug/aisix
           AISIX_E2E_ETCD: http://127.0.0.1:2379
           RUN_CLAUDE_CODE_REAL_CHAIN: "1"
+          # Pin upstream deterministically — without REAL_CHAIN_UPSTREAM
+          # the test's pickUpstream() iterates UPSTREAMS in array order
+          # (OpenAI first), and if a future runner had both keys set
+          # the upstream would silently change across runs, making
+          # regression triage harder.
+          REAL_CHAIN_UPSTREAM: deepseek
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: pnpm exec vitest run src/cases/claude-code-cli-compat-e2e.test.ts
