@@ -95,13 +95,16 @@ pub async fn embeddings(
             // spend. Pre-#226 the embedding handler dropped the
             // event entirely, so any /v1/embeddings traffic was
             // invisible to budget enforcement and billing
-            // reconciliation. Skip when prompt_tokens == 0 — the
-            // dispatch's 501-NotImplemented path returns zero
-            // tokens because no upstream call happened, and
-            // attributing zero-token spend to the api_key would
-            // bloat /logs with noise. Same emit-on-success-only
+            // reconciliation. Skip when `upstream_called == false`
+            // — the dispatch's 501-NotImplemented path returns the
+            // false flag because no upstream call happened, and
+            // attributing a zero-everything event to the api_key
+            // would bloat /logs with noise. Distinguished from
+            // `prompt_tokens == 0` so a 200 with legitimately zero
+            // tokens (empty input, provider-specific billing
+            // convention) still emits. Same emit-on-success-only
             // convention as chat.rs.
-            if success.prompt_tokens > 0 {
+            if success.upstream_called {
                 emit_usage_event(
                     &state,
                     &request_id,
@@ -148,6 +151,16 @@ struct EmbedDispatchSuccess {
     provider: String,
     model_id: String,
     prompt_tokens: u32,
+    /// `true` when the dispatch produced a real 200 from the upstream
+    /// (we have authoritative usage data to attribute). `false` for the
+    /// 501-NotImplemented branch where no upstream call was made.
+    ///
+    /// Explicitly distinguished from `prompt_tokens == 0` so a future
+    /// provider that legitimately reports zero tokens on a 200 (empty
+    /// input, special billing convention) still gets emitted — the
+    /// "no upstream call" channel must not piggyback on a numeric
+    /// sentinel that real responses could also produce.
+    upstream_called: bool,
 }
 
 async fn dispatch(
@@ -218,13 +231,14 @@ async fn dispatch(
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
                 prompt_tokens,
+                upstream_called: true,
             })
         }
         Err(BridgeError::Config(msg)) if msg.contains("does not support embeddings") => {
             // Provider doesn't implement embed → 501 Not Implemented.
             // Drop the reservation without committing — the request
             // didn't hit the upstream. No UsageEvent emission either
-            // (prompt_tokens = 0 → handler skips emit per the
+            // (`upstream_called: false` → handler skips emit per the
             // chat.rs convention that we only attribute usage on a
             // real upstream completion).
             reservation.commit_tokens(0);
@@ -233,9 +247,12 @@ async fn dispatch(
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
                 provider: provider.to_ascii_lowercase(),
                 model_id: model_entry.id.to_string(),
-                // Zero prompt_tokens signals "no upstream call" — the
-                // handler reads this and skips UsageEvent emission.
                 prompt_tokens: 0,
+                // No upstream call happened — the handler reads this
+                // and skips UsageEvent emission. Distinguished from
+                // `prompt_tokens == 0` so a 200 that legitimately
+                // reports zero tokens still emits.
+                upstream_called: false,
             })
         }
         Err(e) => {
@@ -836,5 +853,73 @@ mod tests {
             !event.occurred_at.is_empty(),
             "occurred_at must be set (RFC 3339 UTC)"
         );
+    }
+
+    /// Issue #226 audit M1: a 200 response with upstream-reported
+    /// `prompt_tokens = 0` MUST still emit a UsageEvent. Pre-fix the
+    /// handler gated emission on `prompt_tokens > 0`, conflating
+    /// "no upstream call" (501 NotImplemented) with "upstream returned
+    /// zero tokens" (legitimate 200, rare-but-possible for empty input
+    /// or provider-specific billing conventions). The fix introduces an
+    /// explicit `upstream_called: bool` flag on EmbedDispatchSuccess
+    /// so the channel is unambiguous; this test pins the post-fix
+    /// contract by driving a 200 with zero tokens and asserting the
+    /// event still arrives.
+    #[tokio::test]
+    async fn emits_usage_event_on_200_with_zero_prompt_tokens_audit_m1() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // 200 with usage.prompt_tokens=0. The contract: emit anyway —
+        // attribution belongs to the api_key for compliance / audit
+        // even when the billable count is zero.
+        let upstream_body = serde_json::json!({
+            "object": "list",
+            "data": [{
+                "object": "embedding",
+                "index": 0,
+                "embedding": [0.1_f32, 0.2_f32]
+            }],
+            "model": "text-embedding-3-small",
+            "usage": {"prompt_tokens": 0, "total_tokens": 0}
+        });
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({"model": "my-embed", "input": ""});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect(
+                "UsageEvent must be emitted even when upstream reports prompt_tokens=0 \
+                 (audit M1 — emission keyed on upstream_called, not on token count)",
+            )
+            .expect("usage_sink sender dropped before emission");
+
+        assert_eq!(event.prompt_tokens, 0);
+        assert_eq!(event.status_code, 200);
+        assert_eq!(event.api_key_id, "k-1");
+        assert_eq!(event.model_id, "m-1");
+        assert_eq!(event.inbound_protocol, "openai");
     }
 }
