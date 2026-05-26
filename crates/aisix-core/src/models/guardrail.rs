@@ -171,9 +171,6 @@ pub struct Guardrail {
     /// The provider discriminator + its config. Use serde's flattening
     /// so the wire shape is `{ kind: "keyword", patterns: [...] }`
     /// rather than `{ kind: "keyword", keyword: { patterns: [...] }}`.
-    /// The provider discriminator + its config. Use serde's flattening
-    /// so the wire shape is `{ kind: "keyword", patterns: [...] }`
-    /// rather than `{ kind: "keyword", keyword: { patterns: [...] }}`.
     #[serde(flatten)]
     pub config: GuardrailKind,
 
@@ -197,9 +194,11 @@ pub struct Guardrail {
 
     /// Which traffic directions this guardrail applies to when resolved
     /// through an attachment. Values: `"input"`, `"output"`, `"both"` (default).
-    /// This is a routing hint used by `GuardrailIndex::resolve` — it
-    /// narrows down which guardrails run at each hook point even when
-    /// the attachment's scope matches the request.
+    ///
+    /// Stored and forwarded to the CP dashboard. Direction-based filtering
+    /// in `GuardrailIndex::resolve` is not yet implemented; the `hook_point`
+    /// field on the guardrail definition provides equivalent per-hook-point
+    /// control for keyword rules.
     #[serde(default = "default_direction")]
     pub direction: String,
 

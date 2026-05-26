@@ -103,9 +103,24 @@ pub struct GuardrailIndex {
     entries: Vec<IndexEntry>,
 }
 
+/// Scope specificity rank: higher = more specific → wins dedup on equal priority.
+/// ApiKey > Team > Model > Env, matching the P0c spec in #379.
+fn scope_specificity(k: &ScopeKind) -> u8 {
+    match k {
+        ScopeKind::ApiKey => 3,
+        ScopeKind::Team => 2,
+        ScopeKind::Model => 1,
+        ScopeKind::Env => 0,
+    }
+}
+
 impl GuardrailIndex {
     pub(crate) fn new(mut entries: Vec<IndexEntry>) -> Self {
-        entries.sort_by(|a, b| b.priority.cmp(&a.priority));
+        entries.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| scope_specificity(&b.scope_kind).cmp(&scope_specificity(&a.scope_kind)))
+        });
         Self { entries }
     }
 
@@ -445,6 +460,27 @@ mod tests {
         // Only env + model match (different key and no team).
         let chain2 = idx.resolve(&ctx("m1", "k-other", None));
         assert_eq!(chain2.len(), 2);
+    }
+
+    // 14. Equal-priority dedup uses scope-specificity: ApiKey > Env.
+    //     Same guardrail_id, env(priority=50) + apikey(priority=50).
+    //     For a request from the matching api-key, the ApiKey entry must win
+    //     (appears first after the sort tiebreaker) and deduplicate the Env entry.
+    #[test]
+    fn equal_priority_apikey_beats_env_in_dedup() {
+        let g_env = kw("g1", "keyword");
+        let g_key = kw("g1", "keyword");
+        let entries = vec![
+            // Insert in "wrong" order (env first) to confirm sort fixes it.
+            entry("g1", ScopeKind::Env, None, 50, g_env),
+            entry("g1", ScopeKind::ApiKey, Some("key-A"), 50, g_key),
+        ];
+        let idx = GuardrailIndex::from_entries(entries);
+
+        // For key-A: ApiKey(priority=50, specificity=3) wins over Env(priority=50, specificity=0).
+        // Dedup fires on Env → chain has exactly 1 entry.
+        let chain = idx.resolve(&ctx("m1", "key-A", None));
+        assert_eq!(chain.len(), 1, "equal-priority: ApiKey-scope must deduplicate Env-scope");
     }
 
     // -----------------------------------------------------------------------

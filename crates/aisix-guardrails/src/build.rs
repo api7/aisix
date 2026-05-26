@@ -358,17 +358,35 @@ impl LiveGuardrailIndex {
 
     fn current(&self) -> Arc<GuardrailIndex> {
         let cur_version = self.snapshot.version();
+
+        // Fast path: return cached index without building.
+        {
+            let cache = self
+                .cache
+                .lock()
+                .expect("LiveGuardrailIndex mutex poisoned");
+            if cache.last_version == cur_version {
+                return Arc::clone(&cache.index);
+            }
+        }
+
+        // Build the new index OUTSIDE the lock so a panic (e.g. from a
+        // badly-behaved regex engine) does not poison the mutex.
+        let snap = self.snapshot.load();
+        let new_index = Arc::new(build_index_from_snapshot(
+            &snap.guardrails,
+            &snap.guardrail_attachments,
+            self.bedrock_endpoint_url.as_deref(),
+        ));
+
+        // Re-acquire and store. A concurrent rebuild (rare) is harmless —
+        // both produce equivalent indexes from the same snapshot version.
         let mut cache = self
             .cache
             .lock()
             .expect("LiveGuardrailIndex mutex poisoned");
         if cache.last_version != cur_version {
-            let snap = self.snapshot.load();
-            cache.index = Arc::new(build_index_from_snapshot(
-                &snap.guardrails,
-                &snap.guardrail_attachments,
-                self.bedrock_endpoint_url.as_deref(),
-            ));
+            cache.index = new_index;
             cache.last_version = cur_version;
         }
         Arc::clone(&cache.index)
