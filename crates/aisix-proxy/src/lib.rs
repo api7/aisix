@@ -31,6 +31,7 @@ pub mod budget;
 mod chat;
 mod completions;
 pub(crate) mod cooldown;
+mod count_tokens;
 mod dispatch;
 mod embeddings;
 mod error;
@@ -82,6 +83,10 @@ pub fn build_router(state: ProxyState) -> Router {
         .route("/v1/embeddings", post(embeddings::embeddings))
         .route("/v1/images/generations", post(images::image_generations))
         .route("/v1/messages", post(messages::messages))
+        .route(
+            "/v1/messages/count_tokens",
+            post(count_tokens::count_tokens),
+        )
         .route("/v1/rerank", post(rerank::rerank))
         .route("/v1/responses", post(responses::responses))
         .route("/v1/audio/transcriptions", post(audio::transcriptions))
@@ -135,7 +140,7 @@ async fn record_in_flight_request(
 }
 
 fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
-    if endpoint == "/v1/messages" {
+    if endpoint == "/v1/messages" || endpoint == "/v1/messages/count_tokens" {
         "anthropic"
     } else {
         "openai"
@@ -207,7 +212,8 @@ async fn enforce_request_body_limit(
     // near-zero, but non-SDK callers (curl, custom clients) could
     // hit it. Accept both forms.
     let path = request.uri().path();
-    let is_anthropic_path = path == "/v1/messages" || path == "/v1/messages/";
+    let is_anthropic_path =
+        path == "/v1/messages" || path == "/v1/messages/" || path == "/v1/messages/count_tokens";
     let render = |e: ProxyError| -> Response {
         if is_anthropic_path {
             e.into_anthropic_response()

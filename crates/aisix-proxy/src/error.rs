@@ -382,6 +382,47 @@ impl ProxyError {
     }
 }
 
+/// Map an axum `JsonRejection` (the body-extractor failure on a POST
+/// handler) onto the internal [`ProxyError`] taxonomy. The caller
+/// decides the wire envelope (`into_response` for OpenAI shape /
+/// `into_anthropic_response` for the Anthropic shape) — this helper
+/// only classifies the failure.
+///
+/// Shared by `/v1/messages` and `/v1/messages/count_tokens` so the two
+/// Anthropic-protocol handlers can't drift on the discrimination rules
+/// below:
+///
+/// - `BytesRejection` is a composite rejection whose inner
+///   `FailedToBufferBody` has two variants: `LengthLimitError`
+///   (`413 PAYLOAD_TOO_LARGE` — the configured body cap was exceeded
+///   during read; the chunked / no-Content-Length case the
+///   `enforce_request_body_limit` middleware can't catch up front) and
+///   `UnknownBodyError` (`400 BAD_REQUEST` — a transport-side body-read
+///   failure, e.g. peer reset mid-body). They MUST map to
+///   `RequestTooLarge` vs `InvalidRequest` respectively, because the
+///   Anthropic SDK's non-retriable-cap branch assumes a true cap hit —
+///   mislabelling a transport failure as `request_too_large` breaks it.
+///   Discriminate via the rejection's own `.status()`.
+/// - `JsonRejection` is `#[non_exhaustive]`, so the fallback arm catches
+///   today's `JsonDataError` / `JsonSyntaxError` / `MissingJsonContentType`
+///   AND any future variant axum adds, defaulting to a 400
+///   `invalid_request_error` until each gets an explicit policy.
+pub(crate) fn proxy_error_from_json_rejection(
+    rej: axum::extract::rejection::JsonRejection,
+    limit_bytes: usize,
+) -> ProxyError {
+    use axum::extract::rejection::JsonRejection;
+    match rej {
+        JsonRejection::BytesRejection(inner) if inner.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            ProxyError::RequestTooLarge { limit_bytes }
+        }
+        JsonRejection::BytesRejection(_) => {
+            ProxyError::InvalidRequest("failed to read request body".into())
+        }
+        _ => ProxyError::InvalidRequest("invalid JSON request body".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
