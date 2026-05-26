@@ -83,9 +83,20 @@ impl Guardrail for GuardrailChain {
         }
 
         match current {
-            Cow::Owned(rewritten) => GuardrailVerdict::Rewrite {
-                payload: Box::new(rewritten),
-            },
+            Cow::Owned(rewritten) => {
+                // If a Bypass also fired earlier in the chain, surface it in
+                // the audit trail. The Rewrite takes precedence for routing
+                // but the bypass reason must not disappear from logs.
+                if let Some(ref reason) = bypass {
+                    tracing::info!(
+                        bypass_reason = %reason,
+                        "guardrail bypass shadowed by Rewrite verdict; bypass recorded"
+                    );
+                }
+                GuardrailVerdict::Rewrite {
+                    payload: Box::new(rewritten),
+                }
+            }
             Cow::Borrowed(_) => match bypass {
                 Some(reason) => GuardrailVerdict::Bypass { reason },
                 None => GuardrailVerdict::Allow,

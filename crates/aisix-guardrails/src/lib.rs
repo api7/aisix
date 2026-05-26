@@ -76,7 +76,9 @@ impl PartialEq for GuardrailVerdict {
                 a == b
             }
             // `ChatFormat` contains `f32` fields which don't implement `Eq`.
-            // Tests use `is_rewrite()` rather than `==` for this variant.
+            // WARNING: Rewrite == Rewrite is ALWAYS false regardless of content.
+            // Never use `assert_eq!` or `==` to compare Rewrite verdicts —
+            // use `is_rewrite()` instead, otherwise the assertion will always fail.
             (GuardrailVerdict::Rewrite { .. }, GuardrailVerdict::Rewrite { .. }) => false,
             _ => false,
         }
