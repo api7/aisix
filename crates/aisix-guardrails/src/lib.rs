@@ -14,6 +14,8 @@
 //!   or output content.
 //! - [`GuardrailChain`] — composes multiple guardrails; first
 //!   [`GuardrailVerdict::Block`] short-circuits.
+//! - [`GuardrailIndex`] — P0c: resolves the per-request chain from a
+//!   snapshot of guardrail definitions + attachment rows.
 
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
@@ -22,6 +24,7 @@
 mod bedrock;
 mod build;
 mod chain;
+mod index;
 mod keyword;
 mod length;
 
@@ -30,8 +33,11 @@ use async_trait::async_trait;
 
 #[cfg(feature = "bedrock")]
 pub use bedrock::BedrockGuardrail;
-pub use build::{build_chain_from_snapshot, LiveGuardrailChain};
+pub use build::{
+    build_chain_from_snapshot, build_index_from_snapshot, LiveGuardrailChain, LiveGuardrailIndex,
+};
 pub use chain::GuardrailChain;
+pub use index::{GuardrailIndex, RequestContext};
 pub use keyword::{KeywordBlocklist, KeywordRule};
 pub use length::MaxContentLength;
 
@@ -44,11 +50,37 @@ pub use length::MaxContentLength;
 /// `Bypass` is **not** a block — the chain doesn't short-circuit on
 /// it, and other guardrails downstream still get to inspect the
 /// request. See PRD-09c §6.4.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Rewrite` signals that the guardrail modified the request payload
+/// (e.g. a PII-scrubbing guardrail that replaces tokens before the
+/// prompt reaches the upstream). The modified payload is propagated to
+/// all subsequent guardrails in the chain via [`GuardrailChain`] and
+/// eventually substituted for the original request before bridge
+/// dispatch. See `chain.rs` + PRD-09c §6.5.
+#[derive(Debug, Clone)]
 pub enum GuardrailVerdict {
     Allow,
     Block { reason: String },
     Bypass { reason: String },
+    Rewrite { payload: Box<ChatFormat> },
+}
+
+impl PartialEq for GuardrailVerdict {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (GuardrailVerdict::Allow, GuardrailVerdict::Allow) => true,
+            (GuardrailVerdict::Block { reason: a }, GuardrailVerdict::Block { reason: b }) => {
+                a == b
+            }
+            (GuardrailVerdict::Bypass { reason: a }, GuardrailVerdict::Bypass { reason: b }) => {
+                a == b
+            }
+            // `ChatFormat` contains `f32` fields which don't implement `Eq`.
+            // Tests use `is_rewrite()` rather than `==` for this variant.
+            (GuardrailVerdict::Rewrite { .. }, GuardrailVerdict::Rewrite { .. }) => false,
+            _ => false,
+        }
+    }
 }
 
 impl GuardrailVerdict {
@@ -58,6 +90,10 @@ impl GuardrailVerdict {
 
     pub fn is_bypass(&self) -> bool {
         matches!(self, GuardrailVerdict::Bypass { .. })
+    }
+
+    pub fn is_rewrite(&self) -> bool {
+        matches!(self, GuardrailVerdict::Rewrite { .. })
     }
 
     /// Extract the bypass reason if this is a `Bypass` verdict, else
@@ -114,5 +150,13 @@ mod tests {
             Some("y"),
         );
         assert_eq!(GuardrailVerdict::Allow.bypass_reason(), None);
+        assert!(GuardrailVerdict::Rewrite {
+            payload: Box::new(ChatFormat::new("m", vec![]))
+        }
+        .is_rewrite());
+        assert!(!GuardrailVerdict::Rewrite {
+            payload: Box::new(ChatFormat::new("m", vec![]))
+        }
+        .is_block());
     }
 }

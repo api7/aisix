@@ -14,13 +14,15 @@
 use std::sync::{Arc, Mutex};
 
 use aisix_core::models::{
-    AisixSnapshot, Guardrail as DomainGuardrail, GuardrailHookPoint, GuardrailKind, KeywordPattern,
+    AisixSnapshot, Guardrail as DomainGuardrail, GuardrailAttachment, GuardrailHookPoint,
+    GuardrailKind, GuardrailScopeType, KeywordPattern,
 };
 use aisix_core::snapshot::ResourceTable;
 use aisix_core::SnapshotHandle;
 use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 
+use crate::index::{GuardrailIndex, RequestContext, ScopeKind};
 use crate::keyword::{KeywordBlocklist, KeywordRule};
 use crate::{Guardrail, GuardrailChain, GuardrailVerdict};
 
@@ -230,6 +232,164 @@ impl Guardrail for LiveGuardrailChain {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GuardrailIndex builder
+// ---------------------------------------------------------------------------
+
+/// Build a [`GuardrailIndex`] from a snapshot's `guardrails` and
+/// `guardrail_attachments` tables.
+///
+/// For each enabled attachment, the function:
+/// 1. Looks up the guardrail definition by `attachment.guardrail_id`.
+/// 2. Skips the attachment if the guardrail is disabled or unknown.
+/// 3. Builds the runtime guardrail via [`build_one`] (same path as
+///    `build_chain_from_snapshot`).
+/// 4. Adds an entry to the index carrying the attachment's scope +
+///    priority.
+///
+/// The resulting index is pre-sorted by priority (descending) so
+/// `GuardrailIndex::resolve` can walk it linearly.
+pub fn build_index_from_snapshot(
+    guardrails: &ResourceTable<DomainGuardrail>,
+    attachments: &ResourceTable<GuardrailAttachment>,
+    bedrock_endpoint_url: Option<&str>,
+) -> GuardrailIndex {
+    let mut entries = Vec::new();
+
+    for attachment_arc in attachments.entries() {
+        let attachment = &attachment_arc.value;
+
+        if !attachment.enabled {
+            continue;
+        }
+
+        let gid = &attachment.guardrail_id;
+        let guardrail_arc = match guardrails.get_by_id(gid) {
+            Some(e) => e,
+            None => {
+                tracing::warn!(
+                    attachment_id = %attachment_arc.id,
+                    guardrail_id = %gid,
+                    "attachment references unknown guardrail; skipping",
+                );
+                continue;
+            }
+        };
+
+        let row = &guardrail_arc.value;
+        if !row.enabled {
+            continue;
+        }
+
+        let runtime_guardrail = match build_one(row, bedrock_endpoint_url) {
+            Ok(Some(g)) => g,
+            Ok(None) => continue, // inert (e.g. empty keyword list)
+            Err(err) => {
+                tracing::warn!(
+                    guardrail_id = %gid,
+                    error = %err,
+                    "skipping guardrail with invalid config in index build",
+                );
+                continue;
+            }
+        };
+
+        let scope_kind = match attachment.scope_type {
+            GuardrailScopeType::Env => ScopeKind::Env,
+            GuardrailScopeType::Model => ScopeKind::Model,
+            GuardrailScopeType::ApiKey => ScopeKind::ApiKey,
+            GuardrailScopeType::Team => ScopeKind::Team,
+        };
+
+        entries.push(GuardrailIndex::push_entry(
+            gid.clone(),
+            scope_kind,
+            attachment.scope_id.clone(),
+            attachment.priority,
+            runtime_guardrail,
+        ));
+    }
+
+    GuardrailIndex::from_entries(entries)
+}
+
+// ---------------------------------------------------------------------------
+// LiveGuardrailIndex — lazy-rebuild adapter over a snapshot handle
+// ---------------------------------------------------------------------------
+
+/// Wraps a snapshot handle and rebuilds the runtime index whenever the
+/// snapshot pointer changes. The proxy chat handler calls `resolve(ctx)`
+/// on each request to get the applicable `GuardrailChain`.
+///
+/// Rebuild semantics are identical to `LiveGuardrailChain`: one atomic
+/// load + one version compare on the hot path; a full index build (linear
+/// in the number of attachment rows) only on the first call after each
+/// snapshot swap.
+pub struct LiveGuardrailIndex {
+    snapshot: SnapshotHandle<AisixSnapshot>,
+    bedrock_endpoint_url: Option<String>,
+    cache: Mutex<IndexCache>,
+}
+
+struct IndexCache {
+    last_version: u64,
+    index: Arc<GuardrailIndex>,
+}
+
+impl LiveGuardrailIndex {
+    pub fn new(
+        snapshot: SnapshotHandle<AisixSnapshot>,
+        bedrock_endpoint_url: Option<String>,
+    ) -> Arc<Self> {
+        // Read version before load — same ordering discipline as LiveGuardrailChain.
+        let last_version = snapshot.version();
+        let snap = snapshot.load();
+        let index = Arc::new(build_index_from_snapshot(
+            &snap.guardrails,
+            &snap.guardrail_attachments,
+            bedrock_endpoint_url.as_deref(),
+        ));
+        Arc::new(Self {
+            snapshot,
+            bedrock_endpoint_url,
+            cache: Mutex::new(IndexCache { last_version, index }),
+        })
+    }
+
+    fn current(&self) -> Arc<GuardrailIndex> {
+        let cur_version = self.snapshot.version();
+        let mut cache = self
+            .cache
+            .lock()
+            .expect("LiveGuardrailIndex mutex poisoned");
+        if cache.last_version != cur_version {
+            let snap = self.snapshot.load();
+            cache.index = Arc::new(build_index_from_snapshot(
+                &snap.guardrails,
+                &snap.guardrail_attachments,
+                self.bedrock_endpoint_url.as_deref(),
+            ));
+            cache.last_version = cur_version;
+        }
+        Arc::clone(&cache.index)
+    }
+
+    /// Resolve the guardrail chain applicable to `ctx`.
+    ///
+    /// Cheap on the cache-hit path (one lock acquire + version compare +
+    /// arc clone + `O(n)` linear walk over attachment rows). Rebuilds only
+    /// on snapshot version change.
+    pub fn resolve(&self, ctx: &RequestContext<'_>) -> GuardrailChain {
+        self.current().resolve(ctx)
+    }
+
+    /// `true` when the current snapshot has no attachment entries. Callers
+    /// can use this to skip chain allocation on the hot path.
+    pub fn is_empty(&self) -> bool {
+        self.current().is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +584,190 @@ mod tests {
         handle.store(next);
 
         assert!(live.check_input(&req("AKIA-EXAMPLE")).await.is_block());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_index_from_snapshot tests
+    // -----------------------------------------------------------------------
+
+    fn parse_attachment(json: &str) -> GuardrailAttachment {
+        serde_json::from_str(json).unwrap()
+    }
+
+    fn attachment_entry(
+        id: &str,
+        row: GuardrailAttachment,
+    ) -> ResourceEntry<GuardrailAttachment> {
+        ResourceEntry::new(id, row, 1)
+    }
+
+    #[tokio::test]
+    async fn enabled_attachment_builds_index_entry() {
+        let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        guardrails.insert(entry(
+            "secrets",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "block-secrets",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(
+                r#"{
+                    "guardrail_id": "g-1",
+                    "scope_type": "env",
+                    "priority": 50
+                }"#,
+            ),
+        ));
+
+        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        assert_eq!(index.len(), 1);
+
+        let ctx = RequestContext {
+            model_id: "m1",
+            api_key_id: "k1",
+            team_id: None,
+        };
+        let chain = index.resolve(&ctx);
+        assert!(chain.check_input(&req("here AKIA")).await.is_block());
+    }
+
+    #[tokio::test]
+    async fn disabled_attachment_is_skipped_in_index() {
+        let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        guardrails.insert(entry(
+            "g",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "g",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(
+                r#"{
+                    "guardrail_id": "g-1",
+                    "scope_type": "env",
+                    "priority": 50,
+                    "enabled": false
+                }"#,
+            ),
+        ));
+
+        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        assert_eq!(index.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn attachment_referencing_unknown_guardrail_is_skipped() {
+        let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        // "g-99" is not inserted — attachment points to a missing definition.
+
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(
+                r#"{
+                    "guardrail_id": "g-99",
+                    "scope_type": "env",
+                    "priority": 50
+                }"#,
+            ),
+        ));
+
+        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        assert_eq!(index.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn disabled_guardrail_with_enabled_attachment_is_skipped() {
+        let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        guardrails.insert(entry(
+            "g",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "g",
+                    "enabled": false,
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(
+                r#"{
+                    "guardrail_id": "g-1",
+                    "scope_type": "env",
+                    "priority": 50
+                }"#,
+            ),
+        ));
+
+        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        assert_eq!(index.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn live_index_rebuilds_on_snapshot_swap() {
+        let initial = AisixSnapshot::new();
+        let handle = SnapshotHandle::new(initial);
+        let live = LiveGuardrailIndex::new(handle.clone(), None);
+
+        let ctx = RequestContext {
+            model_id: "m1",
+            api_key_id: "k1",
+            team_id: None,
+        };
+
+        // Empty snapshot → no rules → input passes.
+        assert!(!live.resolve(&ctx).check_input(&req("AKIA-EXAMPLE")).await.is_block());
+        assert!(live.is_empty());
+
+        // Swap in a snapshot that attaches a blocking keyword guardrail env-wide.
+        let next = AisixSnapshot::new();
+        next.guardrails.insert(entry(
+            "block-secrets",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "block-secrets",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        next.guardrail_attachments.insert(attachment_entry(
+            "a-1",
+            parse_attachment(
+                r#"{
+                    "guardrail_id": "g-1",
+                    "scope_type": "env",
+                    "priority": 50
+                }"#,
+            ),
+        ));
+        handle.store(next);
+
+        assert!(live.resolve(&ctx).check_input(&req("AKIA-EXAMPLE")).await.is_block());
+        assert!(!live.is_empty());
     }
 
     #[tokio::test]

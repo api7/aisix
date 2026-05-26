@@ -6,7 +6,7 @@
 
 use super::apikey::ApiKey;
 use super::cache_policy::CachePolicy;
-use super::guardrail::Guardrail;
+use super::guardrail::{Guardrail, GuardrailAttachment};
 use super::model::Model;
 use super::observability_exporter::ObservabilityExporter;
 use super::provider_key::ProviderKey;
@@ -21,6 +21,11 @@ pub struct AisixSnapshot {
     pub apikeys: ResourceTable<ApiKey>,
     pub provider_keys: ResourceTable<ProviderKey>,
     pub guardrails: ResourceTable<Guardrail>,
+    /// Attachment rows: `/aisix/<env>/guardrail_attachments/<uuid>`.
+    /// Each row binds a guardrail definition to a scope (env / model /
+    /// api_key / team). `GuardrailIndex::build_from_snapshot` consumes
+    /// both this table and `guardrails` to build the per-request resolver.
+    pub guardrail_attachments: ResourceTable<GuardrailAttachment>,
     /// Per-env cache policies. Stage 2 honors only the existence of an
     /// enabled row to gate the cache; Stage 3 will parse `applies_to`
     /// + per-policy `ttl_seconds`. See `aisix-core::CachePolicy`.
@@ -43,6 +48,7 @@ impl AisixSnapshot {
             + self.apikeys.len()
             + self.provider_keys.len()
             + self.guardrails.len()
+            + self.guardrail_attachments.len()
             + self.cache_policies.len()
             + self.observability_exporters.len()
             + self.rate_limit_policies.len()
