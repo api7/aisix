@@ -700,6 +700,13 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "missing messages field must surface as 400 per OpenAI wire contract — #324",
         );
+        // Pin the envelope shape too — a future regression that
+        // returned 400 with a non-OpenAI envelope (or empty body)
+        // would otherwise pass on status alone. Per audit MEDIUM on
+        // PR #400.
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
     }
 
     /// Companion case: malformed JSON (syntax error) also must
@@ -725,6 +732,12 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "malformed JSON must surface as 400, not 422",
         );
+        // Envelope-shape pin matching the sibling missing-field
+        // tests — same JsonRejection → InvalidRequest path; the
+        // envelope must stay OpenAI-shape on every variant.
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
     }
 
     /// Issue #159: a request body whose declared `Content-Length`
