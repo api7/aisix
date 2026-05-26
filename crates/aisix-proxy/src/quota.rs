@@ -60,7 +60,18 @@ fn policy_to_rate_limit(policy: &RateLimitPolicy) -> RateLimit {
             // and silently grants freebies on every cross-boundary
             // request. Tracked separately in api7/ai-gateway#396.
             rl.rps = policy.max_requests;
-            let _ = policy.max_tokens;
+            // Audit M1 (#399): warn loudly when an operator set
+            // `max_tokens` on a sub-minute window. Without the warn,
+            // the policy looks accepted at cp-api but the token cap
+            // is silently inert until ai-gateway#396 lands.
+            if policy.max_tokens.is_some() {
+                tracing::warn!(
+                    policy_name = %policy.name,
+                    window = %policy.window,
+                    "max_tokens ignored: per-second token-rate counter not yet implemented; \
+                     see api7/ai-gateway#396"
+                );
+            }
         }
         "minute" => {
             rl.rpm = policy.max_requests;
@@ -76,7 +87,14 @@ fn policy_to_rate_limit(policy: &RateLimitPolicy) -> RateLimit {
             //
             // Tokens (`tph`) intentionally NOT wired — see ai-gateway#396.
             rl.rph = policy.max_requests;
-            let _ = policy.max_tokens;
+            if policy.max_tokens.is_some() {
+                tracing::warn!(
+                    policy_name = %policy.name,
+                    window = %policy.window,
+                    "max_tokens ignored: per-hour token-rate counter not yet implemented; \
+                     see api7/ai-gateway#396"
+                );
+            }
         }
         _ => {}
     }

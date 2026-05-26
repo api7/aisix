@@ -991,6 +991,31 @@ mod tests {
     }
 
     #[test]
+    fn rph_rejection_rolls_back_rps_and_rpm_increments() {
+        // Audit #399 M2: the rpd-rejection test covers the tail of
+        // the chain (rolls back rps + rpm + rph), and the
+        // rpm-rejection tests cover the head (rolls back rps). The
+        // MIDDLE layer — rph rejecting after rps+rpm passed — wasn't
+        // directly covered. Pin it here.
+        let clock = TestClock::new(100);
+        let limiter = Limiter::with_clock(clock.clone());
+        // High rps + rpm so they never trip; low rph; rpd unset.
+        let l = limits_full(Some(1000), Some(1000), Some(2), None);
+
+        limiter.pre_commit("k1", &l).unwrap();
+        limiter.pre_commit("k1", &l).unwrap();
+        // 3rd hits rph. rpm must roll back so subsequent reads see
+        // rpm_used = 2 (the two accepted requests), not 3.
+        let err = limiter.pre_commit("k1", &l).unwrap_err();
+        assert!(matches!(err, RateLimitError::Requests { .. }));
+        let status = limiter.peek("k1", &l).unwrap();
+        assert_eq!(
+            status.rpm_used, 2,
+            "rph rejection must roll back rpm by exactly 1, leaving the two earlier accepts"
+        );
+    }
+
+    #[test]
     fn rps_layer_disabled_when_field_unset() {
         // Regression guard: without `rps: Some(_)`, the limiter must
         // skip the rps branch entirely — pre-#426 callers (api_key
