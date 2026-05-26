@@ -380,6 +380,30 @@ mod tests {
     }
 
     #[test]
+    fn p0c_fields_dont_trip_keyword_config_deny_unknown_fields() {
+        // `KeywordConfig` has `deny_unknown_fields`. The P0c fields
+        // (`enforcement_mode`, `mandatory`, `direction`) are declared on
+        // the outer `Guardrail` struct with `#[serde(default)]`, so serde
+        // absorbs them at the outer level before the flattened inner sees
+        // the remaining fields. This test pins that routing: if any of
+        // these fields accidentally reached `KeywordConfig`, the parse
+        // would return an unknown-field error.
+        let v = json!({
+            "name": "g",
+            "kind": "keyword",
+            "patterns": [],
+            "enforcement_mode": "monitor",
+            "mandatory": true,
+            "direction": "input"
+        });
+        let g: Guardrail = serde_json::from_value(v)
+            .expect("P0c fields must not trip KeywordConfig deny_unknown_fields");
+        assert_eq!(g.enforcement_mode, "monitor");
+        assert!(g.mandatory);
+        assert_eq!(g.direction, "input");
+    }
+
+    #[test]
     fn bedrock_kind_parses_with_serial_latency() {
         let v = json!({
             "name": "block-pii",
