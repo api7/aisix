@@ -49,16 +49,34 @@ fn policy_to_rate_limit(policy: &RateLimitPolicy) -> RateLimit {
     let mut rl = RateLimit::default();
     match policy.window.as_str() {
         "second" => {
-            rl.rpm = policy.max_requests.map(|r| r.saturating_mul(60));
-            rl.tpm = policy.max_tokens.map(|t| t.saturating_mul(60));
+            // Pre-fix (api7/AISIX-Cloud#426): `rl.rpm = max * 60` — a
+            // 5/second policy was upscaled to 300/minute, allowing
+            // 60× bursts past the operator-declared cap inside any
+            // single 1-second window.
+            // Post-fix: native rps via `FixedWindowCounter::new(1)`.
+            //
+            // Tokens (`tps`) intentionally NOT wired — at a 1s window
+            // the post-deduct add pattern races the window roll-over
+            // and silently grants freebies on every cross-boundary
+            // request. Tracked separately in api7/ai-gateway#396.
+            rl.rps = policy.max_requests;
+            let _ = policy.max_tokens;
         }
         "minute" => {
             rl.rpm = policy.max_requests;
             rl.tpm = policy.max_tokens;
         }
         "hour" => {
-            rl.rpd = policy.max_requests.map(|r| r.saturating_mul(24));
-            rl.tpd = policy.max_tokens.map(|t| t.saturating_mul(24));
+            // Pre-fix (api7/AISIX-Cloud#426): `rl.rpd = max * 24` —
+            // a 1000/hour policy was upscaled to 24000/day, allowing
+            // the entire hourly cap to be burned in any single hour
+            // with no enforcement (24× exploit shape, slower-window
+            // counterpart of the "second" bug).
+            // Post-fix: native rph via `FixedWindowCounter::new(3600)`.
+            //
+            // Tokens (`tph`) intentionally NOT wired — see ai-gateway#396.
+            rl.rph = policy.max_requests;
+            let _ = policy.max_tokens;
         }
         _ => {}
     }
@@ -196,19 +214,61 @@ mod tests {
         assert!(rl.tpd.is_none());
     }
 
+    // Regression guard for api7/AISIX-Cloud#426. Pre-fix these tests
+    // asserted the BUG: `second` → `rpm = max * 60` and `hour` →
+    // `rpd = max * 24`. The upscaling allowed 60× and 24× bursts past
+    // the operator-declared cap. Post-fix asserts the new contract:
+    // `second` produces a native rps and `hour` produces a native rph.
     #[test]
-    fn second_scales_to_per_minute() {
+    fn second_maps_to_rps_not_rpm_times_sixty() {
         let rl = policy_to_rate_limit(&make_policy("second", Some(10), Some(1000)));
-        assert_eq!(rl.rpm, Some(600));
-        assert_eq!(rl.tpm, Some(60000));
+        assert_eq!(
+            rl.rps,
+            Some(10),
+            "second window must populate rps natively, not rpm*60"
+        );
+        // No upscale into rpm/tpm — that was the #426 bug.
+        assert!(
+            rl.rpm.is_none(),
+            "second window MUST NOT populate rpm (would 60× the cap)"
+        );
+        assert!(
+            rl.tpm.is_none(),
+            "second window MUST NOT populate tpm (would 60× the cap)"
+        );
+        // tps intentionally deferred — see ai-gateway#396.
     }
 
     #[test]
-    fn hour_scales_to_per_day() {
+    fn hour_maps_to_rph_not_rpd_times_twentyfour() {
         let rl = policy_to_rate_limit(&make_policy("hour", Some(1000), Some(500000)));
-        assert_eq!(rl.rpd, Some(24000));
-        assert_eq!(rl.tpd, Some(12000000));
-        assert!(rl.rpm.is_none());
+        assert_eq!(
+            rl.rph,
+            Some(1000),
+            "hour window must populate rph natively, not rpd*24"
+        );
+        // No upscale into rpd/tpd — that was the parallel #426 bug.
+        assert!(
+            rl.rpd.is_none(),
+            "hour window MUST NOT populate rpd (would 24× the cap)"
+        );
+        assert!(
+            rl.tpd.is_none(),
+            "hour window MUST NOT populate tpd (would 24× the cap)"
+        );
+        // tph intentionally deferred — see ai-gateway#396.
+    }
+
+    #[test]
+    fn minute_window_unchanged_by_426() {
+        // Regression guard: the minute branch was always correct
+        // (rpm/tpm map 1:1). #426 must not have touched it.
+        let rl = policy_to_rate_limit(&make_policy("minute", Some(60), Some(30000)));
+        assert_eq!(rl.rpm, Some(60));
+        assert_eq!(rl.tpm, Some(30000));
+        assert!(rl.rps.is_none());
+        assert!(rl.rph.is_none());
+        assert!(rl.rpd.is_none());
     }
 
     #[test]

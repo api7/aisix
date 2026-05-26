@@ -21,8 +21,26 @@
       "format": "uint64",
       "minimum": 0.0
     },
+    "rph": {
+      "description": "Requests per hour (3600s window). Added in #426 — see module docstring. Per-hour tokens (`tph`) intentionally NOT shipped; see ai-gateway#396.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
     "rpm": {
       "description": "Requests per minute (60s window).",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "rps": {
+      "description": "Requests per second (1s window). Added in #426 — see module docstring. Per-second tokens (`tps`) intentionally NOT shipped; see api7/ai-gateway#396 for the design tracking issue.",
       "type": [
         "integer",
         "null"
