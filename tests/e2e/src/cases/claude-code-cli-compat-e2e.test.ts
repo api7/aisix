@@ -115,11 +115,27 @@ const UPSTREAMS: ReadonlyArray<UpstreamProfile> = [
 
 // Honor an explicit override so CI matrices can pin a single upstream
 // deterministically even when more than one credential is in scope.
+//
+// Hard-fail on a pin whose key is missing — the contract of
+// `REAL_CHAIN_UPSTREAM=<x>` is "use <x>, not anything else". A silent
+// fallback to a different upstream would defeat the determinism the
+// env var exists for and let cross-provider regressions hide behind
+// non-deterministic CI runs.
 function pickUpstream(): UpstreamProfile | undefined {
   const pin = process.env.REAL_CHAIN_UPSTREAM?.toLowerCase();
   if (pin) {
     const explicit = UPSTREAMS.find((u) => u.provider === pin);
-    if (explicit && process.env[explicit.envVar]) return explicit;
+    if (!explicit) {
+      throw new Error(
+        `REAL_CHAIN_UPSTREAM=${pin} is not a known provider; known: ${UPSTREAMS.map((u) => u.provider).join(", ")}`,
+      );
+    }
+    if (!process.env[explicit.envVar]) {
+      throw new Error(
+        `REAL_CHAIN_UPSTREAM=${pin} requires ${explicit.envVar}; refusing to silently fall back to a different upstream`,
+      );
+    }
+    return explicit;
   }
   return UPSTREAMS.find((u) => !!process.env[u.envVar]);
 }
@@ -255,7 +271,6 @@ describe("claude code CLI compat: drive gateway through `claude -p`", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
   let proxy: RecordingProxy | undefined;
-  let etcdReachable = false;
   let upstream: UpstreamProfile | undefined;
   let claudeProbe: ClaudeProbe = { available: false, missingFlags: [] };
 
@@ -283,8 +298,7 @@ describe("claude code CLI compat: drive gateway through `claude -p`", () => {
       );
     }
 
-    etcdReachable = await new EtcdClient().ping();
-    if (!etcdReachable) {
+    if (!(await new EtcdClient().ping())) {
       throw new Error(
         "RUN_CLAUDE_CODE_REAL_CHAIN=1 requires etcd reachable at AISIX_E2E_ETCD",
       );
@@ -373,11 +387,12 @@ describe("claude code CLI compat: drive gateway through `claude -p`", () => {
       DISABLE_AUTOUPDATER: "1",
       CLAUDE_CODE_SIMPLE: "1",
     };
+    const PROMPT = "Reply with exactly the single word: ready";
     const result = spawnSync(
       "claude",
       [
         "-p",
-        "Reply with exactly the single word: ready",
+        PROMPT,
         "--bare",
         "--model",
         MODEL_ALIAS,
@@ -456,12 +471,29 @@ describe("claude code CLI compat: drive gateway through `claude -p`", () => {
     // Upstream sees the provider-side model id (gpt-4o-mini /
     // deepseek-chat), not the gateway's display alias.
     expect(sentBody.model).toBe(upstream.upstreamModel);
-    // The user prompt must round-trip through the gateway's
-    // Anthropic-→-OpenAI body translation.
+    // The user prompt must round-trip verbatim through the gateway's
+    // Anthropic-→-OpenAI body translation, AND it must arrive in
+    // role=user. Asserting `role === "user"` separately catches a
+    // regression that moved the prompt into `system` (some bridges
+    // do this to honor cache_control); asserting `contains(PROMPT)`
+    // (the literal sent string, not a partial token) catches a
+    // regression where Claude Code's own system catalogue happens
+    // to contain a fragment of our test prompt and falsely satisfies
+    // a loose includes() check.
     const userMsgs = (sentBody.messages ?? []).filter((m) => m.role === "user");
-    expect(userMsgs.length).toBeGreaterThan(0);
-    const promptText = JSON.stringify(userMsgs).toLowerCase();
-    expect(promptText).toContain("ready");
+    expect(
+      userMsgs.length,
+      "gateway must keep the user prompt in role=user after Anthropic→OpenAI translation",
+    ).toBeGreaterThan(0);
+    const userContentText = userMsgs
+      .map((m) =>
+        typeof m.content === "string" ? m.content : JSON.stringify(m.content),
+      )
+      .join("\n");
+    expect(
+      userContentText,
+      "user prompt must round-trip verbatim through translation",
+    ).toContain(PROMPT);
     // The CLI sends ~30 Anthropic-shape tools. The gateway must
     // translate them to the OpenAI `{type: "function", function: {…}}`
     // shape; a regression that dropped or mistranslated tool blocks
