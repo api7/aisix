@@ -39,7 +39,7 @@ async-trait = "0.1"
 axum = { version = "0.7", features = ["macros", "ws", "tracing", "multipart"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors", "limit", "compression-gzip"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "limit", "compression-gzip", "set-header"] }
 hyper = "1.5"
 hyper-util = "0.1"
 http = "1.2"

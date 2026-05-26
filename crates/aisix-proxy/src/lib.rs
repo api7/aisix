@@ -57,11 +57,18 @@ pub use health::{
 pub use state::ProxyState;
 
 use axum::extract::State;
-use axum::http::Request;
+use axum::http::{header, HeaderValue, Request};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::Router;
+use tower_http::set_header::SetResponseHeaderLayer;
+
+/// Product token emitted in the `Server` response header. Format follows
+/// RFC 9110 §10.2.4 (`product/version`) and matches the convention used
+/// by adjacent gateways (APISIX, nginx, kong). Version is the workspace
+/// crate version, baked in at compile time.
+const SERVER_HEADER_VALUE: &str = concat!("AISIX/", env!("CARGO_PKG_VERSION"));
 
 /// Build the proxy router. Mounts `/livez` plus the
 /// OpenAI-compatible proxy surface.
@@ -101,6 +108,17 @@ pub fn build_router(state: ProxyState) -> Router {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             record_in_flight_request,
+        ))
+        // Identify the data plane on every response, including error
+        // envelopes and short-circuited responses from the layers
+        // above. `overriding` (vs `if_not_present`) ensures the
+        // gateway's identity is authoritative — any Server header set
+        // by inner handlers or accidentally proxied from upstream is
+        // replaced, so client-visible Server never leaks provider
+        // identity.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::SERVER,
+            HeaderValue::from_static(SERVER_HEADER_VALUE),
         ))
         .with_state(state)
 }
@@ -504,6 +522,55 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
         assert_eq!(std::str::from_utf8(&bytes).unwrap(), "ok");
+    }
+
+    /// Every response — including success bodies, error envelopes, and
+    /// short-circuited middleware rejections — must carry the gateway's
+    /// `Server` product token (`AISIX/<semver>`) so clients can identify
+    /// the data plane without round-tripping to a status endpoint.
+    #[tokio::test]
+    async fn server_header_identifies_the_data_plane() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        // Success path — plain handler response.
+        let ok_req = Request::builder()
+            .method("GET")
+            .uri("/livez")
+            .body(Body::empty())
+            .unwrap();
+        let ok_resp = run(app.clone(), ok_req).await;
+        let ok_server = ok_resp
+            .headers()
+            .get(axum::http::header::SERVER)
+            .expect("success response must carry Server header")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            ok_server.starts_with("AISIX/") && ok_server.len() > "AISIX/".len(),
+            "expected `AISIX/<version>`, got {ok_server:?}"
+        );
+
+        // Error path — auth failure envelope. Same Server header must
+        // appear so error responses don't accidentally hide the gateway's
+        // identity (and don't leak any upstream Server token).
+        let unauth_req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"my-gpt4","messages":[]}"#))
+            .unwrap();
+        let unauth_resp = run(app, unauth_req).await;
+        assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
+        let err_server = unauth_resp
+            .headers()
+            .get(axum::http::header::SERVER)
+            .expect("error response must carry Server header")
+            .to_str()
+            .unwrap();
+        assert_eq!(err_server, ok_server);
     }
 
     #[tokio::test]
