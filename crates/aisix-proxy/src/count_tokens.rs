@@ -305,10 +305,13 @@ async fn dispatch(
                 .insert(axum::http::header::CONTENT_TYPE, hv);
         }
     }
-    resp.headers_mut().insert(
-        HeaderName::from_static("x-aisix-request-id"),
-        HeaderValue::from_str(request_id).unwrap_or_else(|_| HeaderValue::from_static("")),
-    );
+    // Only emit the request-id header when it parses — matching the
+    // /v1/messages handler. An empty fallback value would hurt log
+    // correlation more than an absent header.
+    if let Ok(hv) = HeaderValue::from_str(request_id) {
+        resp.headers_mut()
+            .insert(HeaderName::from_static("x-aisix-request-id"), hv);
+    }
 
     Ok((resp, "anthropic".to_string()))
 }
