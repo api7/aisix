@@ -573,6 +573,115 @@ mod tests {
         assert_eq!(err_server, ok_server);
     }
 
+    /// The 413 short-circuit runs INSIDE `SetResponseHeaderLayer` —
+    /// `enforce_request_body_limit` rejects the request before any
+    /// handler executes. This pins layer ordering: a regression that
+    /// moves `SetResponseHeaderLayer` inside the body-limit middleware
+    /// (or anywhere "below" it in the stack) would silently strip the
+    /// Server header from 413 responses while every existing test
+    /// still passed.
+    #[tokio::test]
+    async fn server_header_present_on_413_short_circuit() {
+        let hub = Arc::new(Hub::new());
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
+        let app = build_router(build_state(snap, hub));
+
+        let oversized = 2 * 1024 * 1024; // 2 MiB > 1 MiB cap from cfg()
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .header("content-length", oversized.to_string())
+            .body(Body::from(
+                r#"{"model":"my-gpt4","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let server = resp
+            .headers()
+            .get(axum::http::header::SERVER)
+            .expect("413 short-circuit must carry Server header")
+            .to_str()
+            .unwrap();
+        assert!(
+            server.starts_with("AISIX/"),
+            "expected `AISIX/<version>`, got {server:?}"
+        );
+    }
+
+    /// Security contract: the gateway must NEVER leak an upstream
+    /// provider's `Server` token to the client. The passthrough handler
+    /// copies upstream response headers wholesale (minus hop-by-hop),
+    /// so an upstream like Cloudflare/nginx/gunicorn would surface its
+    /// own Server unless `overriding` actually replaces it. A regression
+    /// that swapped `overriding` → `if_not_present` would be a silent
+    /// information-disclosure bug (provider fingerprinting via error
+    /// envelopes) — this test locks the no-leak property.
+    #[tokio::test]
+    async fn server_header_overrides_upstream_provider_token_no_leak() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    // Upstream's identity — MUST NOT survive the round-trip.
+                    .insert_header("server", "cloudflare-nginx/3.7-leakthis")
+                    .set_body_json(serde_json::json!({
+                        "id": "cmpl-upstream",
+                        "model": "gpt-4o",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "x"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    })),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let app = build_router(build_state(snap, hub));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"my-gpt4","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Exactly one Server value — `overriding` replaces, doesn't append.
+        let all: Vec<_> = resp
+            .headers()
+            .get_all(axum::http::header::SERVER)
+            .iter()
+            .collect();
+        assert_eq!(
+            all.len(),
+            1,
+            "exactly one Server value expected; got {all:?}"
+        );
+
+        let server = all[0].to_str().unwrap();
+        assert!(
+            server.starts_with("AISIX/"),
+            "Server must be the gateway identity; got {server:?}"
+        );
+        assert!(
+            !server.contains("cloudflare") && !server.contains("nginx"),
+            "Upstream Server token leaked through; got {server:?}"
+        );
+    }
+
     #[tokio::test]
     async fn livez_rejects_non_get_requests() {
         let hub = Arc::new(Hub::new());
