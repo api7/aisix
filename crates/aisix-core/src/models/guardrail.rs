@@ -126,8 +126,12 @@ pub struct AzureContentSafetyConfig {
     /// logged.
     pub api_key: String,
     /// HTTP call timeout in milliseconds. When elapsed the `fail_open`
-    /// flag governs the verdict. Defaults to 5000 ms. 0 = no timeout
-    /// (blocks until response).
+    /// flag governs the verdict. Defaults to 5 000 ms.
+    ///
+    /// **`0` does not mean "no timeout".** `Duration::ZERO` causes
+    /// `tokio::time::timeout` to fire on the first poll, so every call
+    /// immediately maps to a timeout failure. Use `u32::MAX` (≈ 49 days)
+    /// for an effectively unlimited timeout.
     #[serde(default = "default_acs_timeout_ms")]
     pub timeout_ms: u32,
 }

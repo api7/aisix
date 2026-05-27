@@ -35,6 +35,8 @@
 //! | 429 Throttling                  | false       | Block { "azure content safety …" }    |
 //! | 5xx / IO error                  | true        | Bypass { "azure_cs_5xx" }             |
 //! | 5xx / IO error                  | false       | Block { "azure content safety …" }    |
+//! | 4xx (non-429, e.g. 401/400/404) | true        | Bypass { "azure_cs_config_error" }    |
+//! | 4xx (non-429, e.g. 401/400/404) | false       | Block { "azure content safety …" }    |
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,8 +90,9 @@ impl PromptShieldGuardrail {
         fail_open: bool,
     ) -> Self {
         let client = reqwest::Client::builder()
-            // Disable the default connection pool timeout; we enforce
-            // per-call timeout via tokio::time::timeout instead.
+            // Per-call timeout is enforced via tokio::time::timeout in
+            // call_api(); the connection pool uses reqwest's default idle
+            // timeout (90 s). No pool customisation is needed here.
             .build()
             .expect("reqwest::Client::builder() failed; this should never happen");
         Self {
@@ -146,13 +149,7 @@ impl PromptShieldGuardrail {
 
         let resp = match tokio::time::timeout(self.timeout, future).await {
             Err(_elapsed) => return Err(AcsFailure::Timeout),
-            Ok(Err(e)) => {
-                return Err(if e.is_connect() || e.is_request() {
-                    AcsFailure::IoError
-                } else {
-                    AcsFailure::Other
-                });
-            }
+            Ok(Err(e)) => return Err(AcsFailure::IoError),
             Ok(Ok(r)) => r,
         };
 
@@ -161,19 +158,23 @@ impl PromptShieldGuardrail {
             return Err(AcsFailure::Throttled);
         }
         if status.is_server_error() {
-            return Err(AcsFailure::Other);
+            return Err(AcsFailure::ServerError);
         }
         if !status.is_success() {
-            // 4xx other than 429 — treat as a configuration/input error.
-            tracing::warn!(
+            // 4xx other than 429 — almost always a misconfiguration.
+            // Log at error level (not warn): with fail_open=true this
+            // silently bypasses the guardrail on every request until
+            // the operator notices. A persistent error-level log is
+            // the only signal they get.
+            tracing::error!(
                 row = %self.row_name,
                 http_status = status.as_u16(),
-                "azure content safety returned unexpected non-success status",
+                "azure content safety returned 4xx — check endpoint and api_key configuration",
             );
-            return Err(AcsFailure::Other);
+            return Err(AcsFailure::ConfigError);
         }
 
-        let parsed: ShieldResponse = resp.json().await.map_err(|_| AcsFailure::Other)?;
+        let parsed: ShieldResponse = resp.json().await.map_err(|_| AcsFailure::ServerError)?;
         let attacked = parsed.user_prompt_analysis.attack_detected
             || parsed.documents_analysis.iter().any(|d| d.attack_detected);
         Ok(attacked)
@@ -205,7 +206,13 @@ enum AcsFailure {
     Timeout,
     Throttled,
     IoError,
-    Other,
+    /// HTTP 5xx or unparseable response body — Azure CS infrastructure error.
+    ServerError,
+    /// HTTP 4xx (other than 429) — almost always a misconfiguration
+    /// (wrong `api_key`, wrong `endpoint`, etc.). Tagged separately from
+    /// `ServerError` so operators can distinguish transient infrastructure
+    /// problems from persistent config bugs without reading raw access logs.
+    ConfigError,
 }
 
 impl AcsFailure {
@@ -213,9 +220,8 @@ impl AcsFailure {
         match self {
             Self::Timeout => "azure_cs_timeout",
             Self::Throttled => "azure_cs_throttled",
-            // IoError and generic Other both collapse to "5xx" so the
-            // operator's dashboard filter surface is bounded and stable.
-            Self::IoError | Self::Other => "azure_cs_5xx",
+            Self::IoError | Self::ServerError => "azure_cs_5xx",
+            Self::ConfigError => "azure_cs_config_error",
         }
     }
 }
@@ -301,6 +307,9 @@ fn collect_input_text(req: &ChatFormat) -> String {
 /// hard-truncated to that limit (avoids infinite loops on pathological
 /// inputs; such strings are rejected by the Azure CS API anyway).
 fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![];
+    }
     if text.chars().count() <= max_chars {
         return vec![text.to_owned()];
     }
@@ -341,7 +350,7 @@ mod tests {
     use aisix_core::models::AzureContentSafetyConfig;
     use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse, FinishReason, UsageStats};
     use serde_json::json;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -391,8 +400,12 @@ mod tests {
     fn bypass_tags_match_wire_contract() {
         assert_eq!(AcsFailure::Timeout.bypass_tag(), "azure_cs_timeout");
         assert_eq!(AcsFailure::Throttled.bypass_tag(), "azure_cs_throttled");
-        assert_eq!(AcsFailure::Other.bypass_tag(), "azure_cs_5xx");
         assert_eq!(AcsFailure::IoError.bypass_tag(), "azure_cs_5xx");
+        assert_eq!(AcsFailure::ServerError.bypass_tag(), "azure_cs_5xx");
+        assert_eq!(
+            AcsFailure::ConfigError.bypass_tag(),
+            "azure_cs_config_error"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -449,8 +462,8 @@ mod tests {
         // collect_input_text filters empty strings before calling shield(),
         // so chunk_text("", …) is unlikely in production, but must be safe.
         let chunks = chunk_text("", MAX_PROMPT_CHARS);
-        // Either [] or [""] is acceptable; just must not panic.
-        assert!(chunks.len() <= 1);
+        // Empty input must produce an empty chunk list — not [""].
+        assert!(chunks.is_empty(), "expected [], got {chunks:?}");
     }
 
     // -----------------------------------------------------------------------
@@ -522,15 +535,22 @@ mod tests {
     // Wiremock integration tests
     // -----------------------------------------------------------------------
 
-    /// Happy path: API returns clean → Allow. Also pins that the
-    /// `Ocp-Apim-Subscription-Key` header is forwarded; wiremock's
-    /// header matcher rejects the request if the header is missing.
+    /// Happy path: API returns clean → Allow. Pins the full wire shape:
+    /// - `Ocp-Apim-Subscription-Key` auth header forwarded
+    /// - `Content-Type: application/json` set by reqwest `.json()`
+    /// - request body uses `userPrompt` / `documents` field names
+    ///   (a rename in `ShieldRequest` would compile but break the Azure CS API)
     #[tokio::test]
     async fn clean_input_returns_allow_and_sends_auth_header() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
             .and(header("Ocp-Apim-Subscription-Key", "test-key-abc"))
+            .and(header("content-type", "application/json"))
+            .and(body_json(json!({
+                "userPrompt": "hello, how are you?",
+                "documents": []
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "userPromptAnalysis": { "attackDetected": false },
                 "documentsAnalysis": []
@@ -613,6 +633,42 @@ mod tests {
             GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "azure_cs_throttled"),
             other => panic!("expected Bypass(azure_cs_throttled), got {other:?}"),
         }
+    }
+
+    /// HTTP 401 (wrong api_key) + fail_open=true → Bypass tagged
+    /// `azure_cs_config_error` (NOT `azure_cs_5xx`).
+    #[tokio::test]
+    async fn http_401_fail_open_true_returns_bypass_config_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/contentsafety/text:shieldPrompt"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let g = build(&server.uri(), true);
+        let v = g.check_input(&req("test")).await;
+        match v {
+            GuardrailVerdict::Bypass { reason } => {
+                assert_eq!(reason, "azure_cs_config_error")
+            }
+            other => panic!("expected Bypass(azure_cs_config_error), got {other:?}"),
+        }
+    }
+
+    /// HTTP 401 + fail_open=false → Block (same as other failures).
+    #[tokio::test]
+    async fn http_401_fail_open_false_returns_block() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/contentsafety/text:shieldPrompt"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let g = build(&server.uri(), false);
+        let v = g.check_input(&req("test")).await;
+        assert!(v.is_block(), "expected Block, got {v:?}");
     }
 
     /// `timeout=100ms` + wiremock delayed 800ms → Bypass tagged `azure_cs_timeout`.

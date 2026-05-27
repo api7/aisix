@@ -99,7 +99,7 @@
           ]
         },
         "timeout_ms": {
-          "description": "HTTP call timeout in milliseconds. When elapsed the `fail_open` flag governs the verdict. Defaults to 5000 ms. 0 = no timeout (blocks until response).",
+          "description": "HTTP call timeout in milliseconds. When elapsed the `fail_open` flag governs the verdict. Defaults to 5 000 ms.\n\n**`0` does not mean \"no timeout\".** `Duration::ZERO` causes `tokio::time::timeout` to fire on the first poll, so every call immediately maps to a timeout failure. Use `u32::MAX` (≈ 49 days) for an effectively unlimited timeout.",
           "default": 5000,
           "type": "integer",
           "format": "uint32",
