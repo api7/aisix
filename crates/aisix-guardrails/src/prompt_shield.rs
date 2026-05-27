@@ -149,7 +149,7 @@ impl PromptShieldGuardrail {
 
         let resp = match tokio::time::timeout(self.timeout, future).await {
             Err(_elapsed) => return Err(AcsFailure::Timeout),
-            Ok(Err(e)) => return Err(AcsFailure::IoError),
+            Ok(Err(_e)) => return Err(AcsFailure::IoError),
             Ok(Ok(r)) => r,
         };
 
