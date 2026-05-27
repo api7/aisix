@@ -269,7 +269,7 @@ fn apikey_schema() -> Value {
             },
             "rate_limit": { "$ref": "#/$defs/rate_limit" },
             "team_id": { "type": "string", "minLength": 1 },
-            "owner_id": { "type": "string", "minLength": 1 }
+            "user_id": { "type": "string", "minLength": 1 }
         },
         "$defs": {
             "rate_limit": {
@@ -790,12 +790,12 @@ mod tests {
     }
 
     #[test]
-    fn apikey_with_team_and_owner_fields_passes() {
+    fn apikey_with_team_and_user_fields_passes() {
         let v = json!({
             "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
             "allowed_models":["gpt-4o"],
             "team_id": "team-uuid-1",
-            "owner_id": "member-uuid-1"
+            "user_id": "member-uuid-1"
         });
         validate_apikey(&v).unwrap();
     }

@@ -5,7 +5,7 @@
 //! - `api_key` — matches by API key entry ID
 //! - `model`   — matches by model entry ID
 //! - `team`    — matches by team ID on the API key
-//! - `member`  — matches by owner ID on the API key
+//! - `member`  — matches by user ID on the API key
 //!
 //! The proxy iterates all policies on each request, converts the
 //! `window`+`max_requests`/`max_tokens` into a `RateLimit`, and

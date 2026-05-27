@@ -182,7 +182,7 @@ pub async fn chat_completions(
                 &model_name,
                 &api_key_id,
                 auth.key().team_id.as_deref(),
-                auth.key().owner_id.as_deref(),
+                auth.key().user_id.as_deref(),
                 status,
                 &success,
                 elapsed,
@@ -846,7 +846,7 @@ async fn dispatch(
         let model_id_for_telem = model_id.clone();
         let api_key_id_for_telem = auth.entry.id.clone();
         let team_id_for_metrics = auth.key().team_id.clone();
-        let owner_id_for_metrics = auth.key().owner_id.clone();
+        let user_id_for_metrics = auth.key().user_id.clone();
         let provider_for_metrics = provider.to_ascii_lowercase();
         let model_for_metrics = req.model.clone();
         let provider_key_id_for_metrics = pk_entry.id.clone();
@@ -962,7 +962,7 @@ async fn dispatch(
                         provider_key_id: &provider_key_id_for_metrics,
                         api_key_id: &api_key_id_for_telem,
                         team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
-                        owner_id: owner_id_for_metrics.as_deref().unwrap_or("unknown"),
+                        user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
                     },
                     LlmUsage {
                         input_tokens: comp.prompt_tokens,
@@ -981,7 +981,7 @@ async fn dispatch(
                         provider_key_id: &provider_key_id_for_metrics,
                         api_key_id: &api_key_id_for_telem,
                         team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
-                        owner_id: owner_id_for_metrics.as_deref().unwrap_or("unknown"),
+                        user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
                     },
                     Duration::from_millis(u64::from(comp.ttft_ms)),
                 );
@@ -1585,7 +1585,7 @@ fn record_success(
     model: &str,
     api_key_id: &str,
     team_id: Option<&str>,
-    owner_id: Option<&str>,
+    user_id: Option<&str>,
     status: u16,
     s: &Success,
     elapsed: Duration,
@@ -1601,7 +1601,7 @@ fn record_success(
         provider_key_id: &s.provider_key_id,
         api_key_id,
         team_id: team_id.unwrap_or("unknown"),
-        owner_id: owner_id.unwrap_or("unknown"),
+        user_id: user_id.unwrap_or("unknown"),
         status,
         outcome,
     };
@@ -1620,7 +1620,7 @@ fn record_success(
             provider_key_id: &s.provider_key_id,
             api_key_id,
             team_id: team_id.unwrap_or("unknown"),
-            owner_id: owner_id.unwrap_or("unknown"),
+            user_id: user_id.unwrap_or("unknown"),
         },
         LlmUsage {
             input_tokens: s.prompt_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
@@ -1639,7 +1639,7 @@ fn record_budget_gauges(
     let labels = aisix_obs::BudgetLabels {
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-        owner_id: auth.key().owner_id.as_deref().unwrap_or("unknown"),
+        user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
     };
     if let Some(budget) = budget {
         metrics.set_budget_gauges(
