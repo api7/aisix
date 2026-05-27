@@ -64,11 +64,46 @@ impl InputField {
 pub async fn embeddings(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
-    Json(body): Json<EmbeddingRequestBody>,
+    // Issue #401 (follow-up to #324): catch the JSON-extractor
+    // rejection here so we can map it to OpenAI's documented 400
+    // invalid_request_error wire shape. Axum's `Json<T>` extractor
+    // returns 422 on JsonDataError (valid-JSON-but-missing-required-
+    // field, e.g. no `model` / no `input`), which diverges from
+    // OpenAI — every SDK that branches on 400 vs 422 sees different
+    // semantics here than it does talking to api.openai.com. Same
+    // discriminate-then-map pattern chat.rs uses for #324.
+    body: Result<Json<EmbeddingRequestBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let started = Instant::now();
     let request_id = new_request_id();
     let api_key_id = auth.entry.id.clone();
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(rej) => {
+            use axum::extract::rejection::JsonRejection;
+            // BytesRejection → distinguish 413 (PAYLOAD_TOO_LARGE,
+            // real per-extractor cap exceeded) from 400 (transport-
+            // side read failure). `JsonRejection` is `#[non_exhaustive]`
+            // so the fallback `_` arm catches today's JsonDataError
+            // (the #401 case) / JsonSyntaxError / MissingJsonContentType
+            // AND any future variant axum adds, defaulting to 400
+            // until each new variant gets an explicit policy decision.
+            return match rej {
+                JsonRejection::BytesRejection(inner)
+                    if inner.status() == StatusCode::PAYLOAD_TOO_LARGE =>
+                {
+                    ProxyError::RequestTooLarge {
+                        limit_bytes: state.request_body_limit_bytes,
+                    }
+                }
+                JsonRejection::BytesRejection(_) => {
+                    ProxyError::InvalidRequest("failed to read request body".into())
+                }
+                _ => ProxyError::InvalidRequest("invalid JSON request body".into()),
+            }
+            .into_response();
+        }
+    };
     let model_name = body.model.clone();
 
     match dispatch(&state, &auth, body, &request_id).await {
@@ -921,5 +956,98 @@ mod tests {
         assert_eq!(event.api_key_id, "k-1");
         assert_eq!(event.model_id, "m-1");
         assert_eq!(event.inbound_protocol, "openai");
+    }
+
+    /// Issue #401 (follow-up to #324): omitting the required `model`
+    /// field on /v1/embeddings must surface as `400 Bad Request` with
+    /// the OpenAI-shape `invalid_request_error` envelope — NOT 422.
+    /// Pre-fix axum's `Json<EmbeddingRequestBody>` extractor returned
+    /// `JsonRejection::JsonDataError` → 422 on missing fields, which
+    /// every SDK that branches on 400 vs 422 (most of them) sees as a
+    /// silent semantic divergence from api.openai.com. Same wire
+    /// contract chat.rs pins for #324; this test pins it for
+    /// embeddings.
+    #[tokio::test]
+    async fn missing_model_field_on_embeddings_returns_400_not_422() {
+        let snap = new_snap("http://unused");
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        // Valid JSON, valid `input` field, but `model` omitted.
+        let body = serde_json::json!({"input": "hello"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "missing model field must surface as 400 per OpenAI wire contract — #401",
+        );
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["error"]["type"], "invalid_request_error",
+            "envelope must be OpenAI-shape invalid_request_error — #401",
+        );
+    }
+
+    /// Companion case: missing `input` field also surfaces as 400.
+    /// Same JsonRejection path as the missing-model case — pinning
+    /// it independently so a regression that only special-cased one
+    /// required field would surface here.
+    #[tokio::test]
+    async fn missing_input_field_on_embeddings_returns_400_not_422() {
+        let snap = new_snap("http://unused");
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let body = serde_json::json!({"model": "my-embed"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "missing input field must surface as 400 per OpenAI wire contract — #401",
+        );
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["error"]["type"], "invalid_request_error",
+            "envelope must be OpenAI-shape invalid_request_error — #401",
+        );
+    }
+
+    /// Malformed JSON (syntax error) on /v1/embeddings must also
+    /// surface as 400, not 422. Same JsonRejection → InvalidRequest
+    /// path as the missing-field cases.
+    #[tokio::test]
+    async fn malformed_json_on_embeddings_returns_400() {
+        let snap = new_snap("http://unused");
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{not even valid json"#))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "malformed JSON must surface as 400, not 422 — #401",
+        );
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["error"]["type"], "invalid_request_error",
+            "envelope must be OpenAI-shape invalid_request_error — #401",
+        );
     }
 }
