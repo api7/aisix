@@ -62,7 +62,7 @@ Example on an API key:
   - `api_key` → matches when the authenticated `ApiKey` entry id equals `scope_ref`.
   - `model` → matches when the resolved `Model` entry id equals `scope_ref`.
   - `team` → matches when the authenticated `ApiKey.team_id` equals `scope_ref`.
-  - `member` → matches when the authenticated `ApiKey.owner_id` equals `scope_ref`.
+  - `member` → matches when the authenticated `ApiKey.user_id` equals `scope_ref`.
 - `window`: `second`, `minute`, or `hour` (required).
 - `max_requests`: maximum requests allowed in the window (optional).
 - `max_tokens`: maximum tokens allowed in the window (optional).
@@ -107,7 +107,7 @@ A per-member burst limit:
 }
 ```
 
-For `scope = team` or `scope = member` to match, the authenticated `ApiKey` must carry the corresponding `team_id` or `owner_id` field. Set those on the API key resource at create time.
+For `scope = team` or `scope = member` to match, the authenticated `ApiKey` must carry the corresponding `team_id` or `user_id` field. Set those on the API key resource at create time.
 
 ### Provisioning
 
@@ -136,13 +136,13 @@ Walk the layers in order:
 
 1. inspect the `ApiKey.rate_limit` on the authenticated key
 2. inspect the resolved `Model.rate_limit`
-3. list the `rate_limit_policies` rows that match the key's `team_id` / `owner_id` and the resolved model entry id
+3. list the `rate_limit_policies` rows that match the key's `team_id` / `user_id` and the resolved model entry id
 
 Any one of those can be the gating layer.
 
 ### A team-scope or member-scope policy is not taking effect
 
-Check the API key. `team` and `member` policies match against `ApiKey.team_id` and `ApiKey.owner_id` respectively. If those fields are missing on the key, the policy will never match.
+Check the API key. `team` and `member` policies match against `ApiKey.team_id` and `ApiKey.user_id` respectively. If those fields are missing on the key, the policy will never match.
 
 ### Limits work for chat but appear silent on other endpoints
 

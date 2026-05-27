@@ -16,16 +16,29 @@ This resource controls who can call the proxy and which model aliases they can u
 - `allowed_models`
 - optional `rate_limit`
 - optional `team_id`
-- optional `owner_id`
+- optional `user_id`
 
 Think of those fields as four distinct control layers:
 
 - identity: `key_hash`
 - authorization: `allowed_models`
 - inline policy: `rate_limit`
-- bucket identity: `team_id` and `owner_id`
+- bucket identity: `team_id` and `user_id`
 
-`team_id` and `owner_id` are not access controls in themselves. They are the bucket keys that `team`-scoped and `member`-scoped [`RateLimitPolicy`](rate-limits.md#rate-limit-policy-entities) rows match against. Set them when you want a policy to span all keys belonging to the same team or to the same member.
+`team_id` and `user_id` are not access controls in themselves. They are the bucket keys that scoped policies on the control plane match against. Set them when you want a policy to span all keys belonging to the same team or to the same member.
+
+Two policy families match against these buckets today:
+
+- `team`-scoped and `member`-scoped [`RateLimitPolicy`](rate-limits.md#rate-limit-policy-entities) rows.
+- `team`-scoped and `member`-scoped [budget](budgets.md#budget-scopes) rows.
+
+Setting `team_id` opts the key into both the team rate-limit pool and the team budget (if either exists). Setting `user_id` does the same on the member side. Leaving them null means the key is unbound — the team and member rows of either policy family simply don't apply to it.
+
+:::note Wire compatibility
+
+The control plane projects this field on kine as `user_id` (renamed from `owner_id` in AISIX-Cloud PR #527, 2026-05-27). The data plane's Rust model is being migrated to match — see [ai-gateway#430](https://github.com/api7/ai-gateway/issues/430). Until that issue lands, member-scope `RateLimitPolicy` rows may not match on a freshly-projected api_key. Budget enforcement is unaffected because the control plane resolves bindings server-side; the DP only asks "is this api_key still allowed?".
+
+:::
 
 ## Create A Caller Key
 
@@ -99,11 +112,19 @@ The inline rate-limit object on `ApiKey` supports:
 
 `ApiKey.rate_limit` is one of three layers the proxy enforces. The other two are `Model.rate_limit` (inline on the resolved model) and standalone `RateLimitPolicy` rows. All applicable layers are AND-combined per request.
 
-See [Rate Limits](rate-limits.md) for the full enforcement model and for `team`/`member`-scope policies that match against `team_id` / `owner_id`.
+See [Rate Limits](rate-limits.md) for the full enforcement model and for `team`/`member`-scope policies that match against `team_id` / `user_id`.
 
 ## Budget Boundary
 
 Managed budget enforcement exists on the managed `/dp/budget_check` path.
+
+Up to six budget rows can apply to a single request — see [Budget Scopes](budgets.md#budget-scopes) for the full list and applicability rules. The `team_id` and `user_id` fields on this api_key control which of the `team` and `member` scope rows apply:
+
+- `team_id = null` and `user_id = null` → only `org`, `environment`, `api_key`, `provider_key` scope rows apply
+- `team_id = T` → `team` scope rows whose `scope_ref = T` also apply
+- `user_id = M` → `member` scope rows whose `scope_ref = M` also apply
+
+Membership in a team via the control plane's `team_members` relation does **not** propagate into budget applicability — only the explicit `team_id` on the api_key itself counts. If you want a key to contribute to a team's budget, set `team_id` at creation time.
 
 Current standalone boundary:
 
