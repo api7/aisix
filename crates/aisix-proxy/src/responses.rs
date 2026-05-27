@@ -302,17 +302,21 @@ async fn dispatch(
 }
 
 /// Pull the usage counters out of a Responses-API non-streaming
-/// response body. Returns `None` if the response is missing the
-/// `usage` block entirely (some error-response shapes don't carry
-/// it); returns `Some(...)` with zeros for fields the upstream
-/// didn't report. Spec:
+/// response body. Returns `None` when:
+///   - The `usage` block is missing entirely, OR
+///   - `usage.input_tokens` is missing / non-numeric
+///
+/// Both cases skip UsageEvent emission rather than attributing a
+/// zero-everything noise row to the api_key. Per the OpenAI
+/// Responses API spec, `input_tokens` is required on every
+/// successful non-streaming 200 — its absence (e.g. `usage: {}`)
+/// is upstream-malformed, not a legitimate zero-spend reply.
+/// Audit MEDIUM-1 on this PR. Spec:
 /// <https://platform.openai.com/docs/api-reference/responses/object>
 fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
     let usage = body.get("usage")?;
-    let prompt_tokens = usage
-        .get("input_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
+    // Required field — gate emit on its presence (audit MEDIUM-1).
+    let prompt_tokens = usage.get("input_tokens").and_then(|v| v.as_u64())? as u32;
     let completion_tokens = usage
         .get("output_tokens")
         .and_then(|v| v.as_u64())
@@ -343,11 +347,16 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
 /// `"openai"` — Responses API is OpenAI-only.
 ///
 /// Other fields left at `UsageEvent::default()`:
-///   - completion_tokens / cached / reasoning — populated above
+///   - cache_creation_tokens / cache_read_tokens — Anthropic-only
 ///   - provider_request_id / provider_model_version / finish_reason
 ///     — not yet plumbed for non-chat handlers (follow-up)
 ///   - cost_usd — cp-api computes server-side from pricing catalog
-///   - cache_status / cache_hit_* — no caching on Responses API
+///   - cache_status / cache_hit_* / ttft_ms — no caching/streaming
+///     surface on Responses API non-streaming
+///   - served_by_model / routing_* — Responses doesn't run routing
+///   - provider_kind / provider_featured / branded_provider /
+///     pk_label / byo_label — per-PK telemetry attribution wired
+///     for chat only today (same deferred gap as #402)
 fn emit_usage_event(
     state: &ProxyState,
     request_id: &str,
@@ -810,8 +819,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        // Drain the body so the request fully completes.
-        let _ = to_bytes(resp.into_body(), 65536).await.unwrap();
+        // Drain the body and pin its shape — audit LOW-2 on this
+        // PR. A regression that dropped headers in the refactored
+        // `ResponseDispatchSuccess` path could surface as a 200
+        // with an empty body; the SSE prefix check guards against
+        // the byte-stream being silently rewritten.
+        let body_bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert!(
+            !body_bytes.is_empty(),
+            "streaming body must pass through verbatim",
+        );
+        assert!(
+            body_bytes.starts_with(b"data: "),
+            "SSE shape must survive the refactor",
+        );
 
         // Streaming path MVP: no UsageEvent emitted today. Follow-up
         // tracked to wire SSE byte-stream interception. `Ok(None)`
@@ -822,6 +843,106 @@ mod tests {
             panic!(
                 "streaming /v1/responses must not emit UsageEvent yet \
                  (follow-up tracked), but got prompt_tokens={}",
+                ev.prompt_tokens,
+            );
+        }
+    }
+
+    /// Issue #404 negative pinning: 5xx responses must NOT emit
+    /// a UsageEvent. Audit MEDIUM-2 on this PR — without negative
+    /// pinning, a future regression that moved `emit_usage_event`
+    /// into the error branch would silently ship.
+    #[tokio::test]
+    async fn upstream_5xx_does_not_emit_usage_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hello"
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        if let Ok(Some(ev)) = recv {
+            panic!(
+                "5xx must not emit UsageEvent, got status_code={}",
+                ev.status_code,
+            );
+        }
+    }
+
+    /// Issue #404 audit MEDIUM-1: a 200 with `usage: {}` (malformed
+    /// — `input_tokens` is required by the Responses-API spec) must
+    /// NOT emit a zero-everything noise row. Same edge as the
+    /// `skips_usage_event_when_upstream_omits_usage_block` test but
+    /// the gate is one layer deeper — `usage` exists but is empty.
+    #[tokio::test]
+    async fn skips_usage_event_when_usage_block_is_empty_audit_m1() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let upstream_body = serde_json::json!({
+            "id": "resp-abc",
+            "object": "response",
+            "output": [],
+            "usage": {}  // malformed — input_tokens required by spec
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hi"
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        if let Ok(Some(ev)) = recv {
+            panic!(
+                "no UsageEvent should be emitted for malformed `usage: {{}}`, \
+                 got prompt_tokens={}",
                 ev.prompt_tokens,
             );
         }
