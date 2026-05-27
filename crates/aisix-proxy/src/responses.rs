@@ -12,7 +12,7 @@
 //! Only OpenAI models support this endpoint. Non-OpenAI models receive a
 //! 400 with an explanatory message.
 
-use aisix_obs::{AccessLog, RequestOutcome};
+use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -24,6 +24,41 @@ use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
 use crate::request_id::new_request_id;
 use crate::state::ProxyState;
+
+/// Per-request payload from a successful dispatch — carries the
+/// response + provider label + the bits of usage data needed for
+/// UsageEvent emission (#404). The streaming path returns
+/// `usage = None` because the byte stream is passed through verbatim
+/// and the gateway doesn't parse SSE chunks here today; emission
+/// for the streaming path is tracked as a follow-up.
+struct ResponseDispatchSuccess {
+    response: Response,
+    provider: String,
+    /// Set on non-streaming 2xx; `None` on streaming (where the
+    /// gateway doesn't parse the SSE chunks to extract usage).
+    usage: Option<ResponseUsage>,
+    /// UUID of the resolved Model row — needed for UsageEvent
+    /// `model_id` field. Always present on success.
+    model_id: String,
+}
+
+/// Subset of the OpenAI Responses-API `usage` block the gateway
+/// surfaces for telemetry. Other fields (`total_tokens`,
+/// `output_tokens_details.audio_tokens`, etc.) are intentionally
+/// dropped here — cp-api's `dpmgr_usage_events` table records only
+/// the ones below.
+struct ResponseUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    /// o1/o3/GPT-5 class models surface reasoning tokens as a
+    /// subset of `completion_tokens` via
+    /// `usage.output_tokens_details.reasoning_tokens`. Zero for
+    /// models that don't expose this.
+    reasoning_tokens: u32,
+    /// OpenAI prompt-cache hit count, subset of `prompt_tokens`,
+    /// surfaced via `usage.input_tokens_details.cached_tokens`.
+    cached_prompt_tokens: u32,
+}
 
 pub async fn responses(
     State(state): State<ProxyState>,
@@ -41,25 +76,44 @@ pub async fn responses(
         .to_string();
 
     match dispatch(&state, &auth, &mut body, &request_id).await {
-        Ok((resp, provider)) => {
+        Ok(success) => {
             let elapsed = started.elapsed();
-            let status = resp.status().as_u16();
+            let status = success.response.status().as_u16();
             emit_access_log(
                 &model_name,
-                &provider,
+                &success.provider,
                 &api_key_id,
                 status,
                 elapsed,
                 &request_id,
             );
             state.metrics.record_request(
-                &provider,
+                &success.provider,
                 &model_name,
                 status,
                 RequestOutcome::from_status(status),
                 elapsed,
             );
-            resp
+            // Issue #404: emit UsageEvent so cp-api's budget ledger
+            // and customer-facing /logs analytics see /v1/responses
+            // spend. Pre-#404 the responses handler dropped the event
+            // entirely — every o1/o3/GPT-5 traffic via Responses API
+            // was invisible to budget enforcement and billing
+            // reconciliation. Non-streaming-only MVP; streaming
+            // emission requires SSE byte-stream interception and is
+            // tracked as a follow-up.
+            if let Some(usage) = success.usage {
+                emit_usage_event(
+                    &state,
+                    &request_id,
+                    &success.model_id,
+                    &api_key_id,
+                    status,
+                    elapsed,
+                    &usage,
+                );
+            }
+            success.response
         }
         Err(err) => {
             let status = err.status().as_u16();
@@ -89,7 +143,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     body: &mut Value,
     request_id: &str,
-) -> Result<(Response, String), ProxyError> {
+) -> Result<ResponseDispatchSuccess, ProxyError> {
     let snapshot = state.snapshot.load();
 
     let model_name = body
@@ -207,7 +261,17 @@ async fn dispatch(
                 .insert(HeaderName::from_static("x-aisix-request-id"), hv);
         }
 
-        Ok((response, provider_label))
+        // Streaming path passes the upstream byte stream verbatim;
+        // the gateway doesn't parse SSE chunks here today, so we
+        // can't extract the usage block from `response.completed`
+        // without a stream wrapper. Emission for the streaming
+        // path is tracked as a #404 follow-up (see PR body).
+        Ok(ResponseDispatchSuccess {
+            response,
+            provider: provider_label,
+            usage: None,
+            model_id: model_entry.id.to_string(),
+        })
     } else {
         let json_body: Value = upstream_resp
             .json()
@@ -222,8 +286,97 @@ async fn dispatch(
             })
             .map_err(ProxyError::Bridge)?;
 
-        Ok((Json(json_body).into_response(), provider_label))
+        // Extract the upstream-reported usage block for telemetry
+        // emission. Pulled here (before the response is moved into
+        // `Json::into_response`) so the success struct can carry
+        // typed counters rather than re-parsing JSON downstream.
+        let usage = extract_response_usage(&json_body);
+
+        Ok(ResponseDispatchSuccess {
+            response: Json(json_body).into_response(),
+            provider: provider_label,
+            usage,
+            model_id: model_entry.id.to_string(),
+        })
     }
+}
+
+/// Pull the usage counters out of a Responses-API non-streaming
+/// response body. Returns `None` if the response is missing the
+/// `usage` block entirely (some error-response shapes don't carry
+/// it); returns `Some(...)` with zeros for fields the upstream
+/// didn't report. Spec:
+/// <https://platform.openai.com/docs/api-reference/responses/object>
+fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
+    let usage = body.get("usage")?;
+    let prompt_tokens = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let completion_tokens = usage
+        .get("output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let reasoning_tokens = usage
+        .get("output_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let cached_prompt_tokens = usage
+        .get("input_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    Some(ResponseUsage {
+        prompt_tokens,
+        completion_tokens,
+        reasoning_tokens,
+        cached_prompt_tokens,
+    })
+}
+
+/// Issue #404: push one `UsageEvent` onto cp-api's telemetry sink
+/// and fan it out to per-env OTLP exporters. Mirrors the shape of
+/// `embeddings::emit_usage_event` (#402) for the fields that matter
+/// to /v1/responses, with one extension: `reasoning_tokens` is
+/// surfaced for o1/o3/GPT-5 class models. `inbound_protocol` is
+/// `"openai"` — Responses API is OpenAI-only.
+///
+/// Other fields left at `UsageEvent::default()`:
+///   - completion_tokens / cached / reasoning — populated above
+///   - provider_request_id / provider_model_version / finish_reason
+///     — not yet plumbed for non-chat handlers (follow-up)
+///   - cost_usd — cp-api computes server-side from pricing catalog
+///   - cache_status / cache_hit_* — no caching on Responses API
+fn emit_usage_event(
+    state: &ProxyState,
+    request_id: &str,
+    model_id: &str,
+    api_key_id: &str,
+    status_code: u16,
+    elapsed: Duration,
+    usage: &ResponseUsage,
+) {
+    let event = UsageEvent {
+        request_id: request_id.to_string(),
+        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        model_id: model_id.to_string(),
+        api_key_id: api_key_id.to_string(),
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        cached_prompt_tokens: usage.cached_prompt_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        status_code,
+        inbound_protocol: "openai".to_string(),
+        ..Default::default()
+    };
+    state.usage_sink.try_emit("responses", event.clone());
+    let snap = state.snapshot.load();
+    let exporters = snap.observability_exporters.entries();
+    state
+        .otlp_fan_out
+        .fan_out(&event, exporters.iter().map(|e| &e.value));
 }
 
 fn emit_access_log(
@@ -453,5 +606,224 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// Issue #404: a successful non-streaming /v1/responses call must
+    /// emit a `UsageEvent` onto the `usage_sink`. Pre-#404 the
+    /// responses handler dropped the event entirely, so every
+    /// o1/o3/GPT-5 traffic through Responses API was invisible to
+    /// cp-api's budget ledger and customer-facing /logs analytics.
+    /// This test pins the contract: after a 200 with a real
+    /// upstream usage block, exactly one event arrives with the
+    /// input_tokens / output_tokens / reasoning_tokens / cached
+    /// counters and `inbound_protocol = "openai"`.
+    #[tokio::test]
+    async fn emits_usage_event_on_200_non_streaming_issue_404() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // Responses-API wire shape. Pin specific token counts so a
+        // regression that swapped semantics (input vs output) or
+        // dropped reasoning_tokens would fail here. Mirrors the
+        // canonical OpenAI Responses API response object.
+        let upstream_body = serde_json::json!({
+            "id": "resp-abc",
+            "object": "response",
+            "model": "gpt-4o-2024-08-06",
+            "output": [{
+                "type": "message",
+                "id": "msg-1",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }],
+            "usage": {
+                "input_tokens": 17,
+                "input_tokens_details": {"cached_tokens": 5},
+                "output_tokens": 23,
+                "output_tokens_details": {"reasoning_tokens": 8},
+                "total_tokens": 40
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hello world"
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for /v1/responses 200")
+            .expect("usage_sink sender dropped");
+
+        assert_eq!(
+            event.prompt_tokens, 17,
+            "prompt_tokens must mirror upstream usage.input_tokens",
+        );
+        assert_eq!(
+            event.completion_tokens, 23,
+            "completion_tokens must mirror upstream usage.output_tokens",
+        );
+        assert_eq!(
+            event.reasoning_tokens, 8,
+            "reasoning_tokens must mirror usage.output_tokens_details.reasoning_tokens \
+             (o1/o3/GPT-5 class models)",
+        );
+        assert_eq!(
+            event.cached_prompt_tokens, 5,
+            "cached_prompt_tokens must mirror usage.input_tokens_details.cached_tokens",
+        );
+        assert_eq!(event.status_code, 200);
+        assert_eq!(event.api_key_id, "k-1");
+        assert_eq!(event.model_id, "m-1");
+        assert_eq!(event.inbound_protocol, "openai");
+        assert!(!event.request_id.is_empty());
+        assert!(!event.occurred_at.is_empty());
+    }
+
+    /// Companion: an upstream response missing the `usage` block
+    /// entirely (some edge / error response shapes) must NOT emit
+    /// — there's nothing meaningful to attribute. Pre-#404 the
+    /// handler emitted nothing; we keep that behaviour for this
+    /// edge so the api_key isn't credited with zero-everything
+    /// noise rows.
+    #[tokio::test]
+    async fn skips_usage_event_when_upstream_omits_usage_block() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // 200 OK but no `usage` field — should NOT emit.
+        let upstream_body = serde_json::json!({
+            "id": "resp-abc",
+            "object": "response",
+            "model": "gpt-4o-2024-08-06",
+            "output": []
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hello"
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Wait briefly — no event should arrive. `Ok(None)` means
+        // the channel closed (state dropped) without sending; `Err`
+        // means timeout. Both are acceptable "no event" outcomes;
+        // only `Ok(Some(_))` would be a real failure.
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        if let Ok(Some(ev)) = recv {
+            panic!(
+                "expected NO event when usage block absent, but got: \
+                 prompt_tokens={}, completion_tokens={}, status_code={}",
+                ev.prompt_tokens, ev.completion_tokens, ev.status_code,
+            );
+        }
+    }
+
+    /// Issue #404 streaming follow-up coverage: the streaming path
+    /// MUST NOT regress on the non-streaming emission. A streaming
+    /// request should pass the byte stream through verbatim and
+    /// (today's MVP) skip emission — without crashing or hanging.
+    /// Streaming emission requires SSE byte-stream interception
+    /// and is tracked as a separate follow-up; this test pins the
+    /// "no regression, no emission today" contract.
+    #[tokio::test]
+    async fn streaming_path_does_not_emit_today_but_passes_through() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // Minimal SSE-style body. Real Responses-API streaming uses
+        // `response.completed` events with a usage block in the
+        // final chunk; the gateway doesn't parse these today.
+        let sse_body = "data: {\"type\":\"response.created\",\"response\":{}}\n\ndata: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hi",
+                "stream": true
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Drain the body so the request fully completes.
+        let _ = to_bytes(resp.into_body(), 65536).await.unwrap();
+
+        // Streaming path MVP: no UsageEvent emitted today. Follow-up
+        // tracked to wire SSE byte-stream interception. `Ok(None)`
+        // = channel closed (state dropped); `Err` = timeout. Both
+        // are "no event"; only `Ok(Some(_))` is a real failure.
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        if let Ok(Some(ev)) = recv {
+            panic!(
+                "streaming /v1/responses must not emit UsageEvent yet \
+                 (follow-up tracked), but got prompt_tokens={}",
+                ev.prompt_tokens,
+            );
+        }
     }
 }
