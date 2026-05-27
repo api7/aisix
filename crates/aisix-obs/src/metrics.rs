@@ -402,24 +402,31 @@ impl Metrics {
         });
     }
 
-    /// Issue #408: bump on a successful `UsageSink::try_emit` (the
-    /// event handed off to the telemetry worker). `handler` is the
-    /// OpenAI-shape endpoint name (`chat`, `embeddings`, etc.);
-    /// `status_code` is a raw u16 — bucketed here so prometheus
-    /// cardinality stays bounded. `inbound_protocol` mirrors the
-    /// wire-level field on `UsageEvent` (`openai` / `anthropic`).
+    /// Issue #408: bump on every `UsageSink::try_emit` call (the
+    /// handler's emission intent — paired with the drops counter so
+    /// the invariant `emitted == delivered + dropped` holds strictly).
+    ///
+    /// All three labels are `&'static str` so prometheus cardinality
+    /// is type-system-bounded:
+    /// - `handler`: OpenAI-shape endpoint name (`chat`, `embeddings`,
+    ///   `messages`, etc.)
+    /// - `status_code`: bucketed by `status_bucket()` (one of `2xx` /
+    ///   `3xx` / `4xx` / `5xx` / `other`) — never a raw u16
+    /// - `inbound_protocol`: normalised by the caller to one of
+    ///   `"openai"` / `"anthropic"` / `"other"` (audit MEDIUM-3 —
+    ///   `&'static str` here prevents user-controlled cardinality)
     pub fn record_usage_event_emit(
         &self,
         handler: &'static str,
         status_code: u16,
-        inbound_protocol: &str,
+        inbound_protocol: &'static str,
     ) {
         metrics::with_local_recorder(&self.inner.recorder, || {
             metrics::counter!(
                 M_USAGE_EVENT_EMITS_TOTAL,
                 "handler" => handler,
                 "status_code" => status_bucket(status_code),
-                "inbound_protocol" => inbound_protocol.to_string(),
+                "inbound_protocol" => inbound_protocol,
             )
             .increment(1);
         });
@@ -872,5 +879,31 @@ mod tests {
             rendered.contains(" 0"),
             "expected gauge to return to zero:\n{rendered}"
         );
+    }
+
+    /// Issue #408 audit MEDIUM-2: pin every boundary of
+    /// `status_bucket` so an off-by-one (e.g. `200..299` excluding
+    /// 299) would surface as a CI failure rather than slipping
+    /// past as silent re-labelling. Covers all 5 buckets including
+    /// the dead-code `3xx` / `other` arms which have no live caller
+    /// today.
+    #[test]
+    fn status_bucket_boundaries_are_inclusive() {
+        // 2xx
+        assert_eq!(status_bucket(200), "2xx");
+        assert_eq!(status_bucket(299), "2xx");
+        // 3xx
+        assert_eq!(status_bucket(300), "3xx");
+        assert_eq!(status_bucket(399), "3xx");
+        // 4xx
+        assert_eq!(status_bucket(400), "4xx");
+        assert_eq!(status_bucket(499), "4xx");
+        // 5xx
+        assert_eq!(status_bucket(500), "5xx");
+        assert_eq!(status_bucket(599), "5xx");
+        // out-of-range → other
+        assert_eq!(status_bucket(199), "other");
+        assert_eq!(status_bucket(600), "other");
+        assert_eq!(status_bucket(0), "other");
     }
 }

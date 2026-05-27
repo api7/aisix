@@ -293,7 +293,12 @@ fn is_false(b: &bool) -> bool {
 /// can externally assert emission without a cp-api receiver in the
 /// loop. Counter is bumped on emission *intent* (i.e. every call to
 /// `try_emit`); drops counter is the subset that failed to enqueue.
-/// Invariant: `emitted - drops ≈ delivered`.
+/// Invariant (audit HIGH-1): `emitted == delivered + dropped`. Every
+/// emit increments exactly one of these:
+/// - delivered: channel accepted the event
+/// - dropped (reason=sink_full): worker overloaded
+/// - dropped (reason=sink_closed): worker shut down
+/// - dropped (reason=sink_disabled): no sink wired (legacy / dev mode)
 #[derive(Debug, Clone)]
 pub struct UsageSink {
     tx: Option<tokio::sync::mpsc::Sender<UsageEvent>>,
@@ -344,16 +349,35 @@ impl UsageSink {
     /// `"embeddings"`, `"messages"`, `"responses"`, etc. Keep it
     /// `&'static str` so cardinality stays bounded.
     pub fn try_emit(&self, handler: &'static str, event: UsageEvent) {
+        // Normalise inbound_protocol to a fixed `&'static str` set at
+        // the boundary (audit MEDIUM-3). This both kills the heap
+        // alloc per call AND pins prometheus cardinality at the type
+        // level: a future caller that sets `event.inbound_protocol`
+        // to user-controlled data still produces a bounded label.
+        let bounded_protocol: &'static str = match event.inbound_protocol.as_str() {
+            "openai" => "openai",
+            "anthropic" => "anthropic",
+            _ => "other",
+        };
+
         // Bump the emit counter on *intent* — handler tried to emit.
-        // Subtract `drops_total` for delivered-event rate. Disabled
-        // sinks still bump because operators want to see "handler
-        // wanted to emit but no sink was wired" via a metric, not
-        // silent zeros.
+        // Audit HIGH-1: paired with a drops counter bump on every
+        // failure path (including `sink_disabled`) so the invariant
+        // `emitted == delivered + dropped` holds strictly.
         if let Some(m) = &self.metrics {
-            m.record_usage_event_emit(handler, event.status_code, &event.inbound_protocol);
+            m.record_usage_event_emit(handler, event.status_code, bounded_protocol);
         }
 
-        let Some(tx) = &self.tx else { return };
+        let Some(tx) = &self.tx else {
+            // No sink wired (legacy / dev mode). Counted as a drop
+            // with reason=sink_disabled so operators can see "DP
+            // intended to emit but no sink was wired" — silent
+            // zeros would otherwise hide the misconfiguration.
+            if let Some(m) = &self.metrics {
+                m.record_usage_event_drop("sink_disabled");
+            }
+            return;
+        };
 
         if let Err(err) = tx.try_send(event) {
             // `Full` = worker is overloaded; `Closed` = worker shut
@@ -456,10 +480,14 @@ mod tests {
         );
     }
 
-    /// Issue #408: when `try_send` fails (channel full / closed),
-    /// the drops counter bumps with the right reason and the emit
-    /// counter still records the intent. Invariant:
-    /// `emitted == delivered + dropped`.
+    /// Issue #408 audit HIGH-2: when `try_send` fails the emit
+    /// counter still bumps for *intent* and the drops counter
+    /// bumps for *outcome*. Strict numeric invariant pinned:
+    /// `emit_total == delivered + drops_total`. After two calls
+    /// (one delivered, one dropped on a capacity-1 channel) the
+    /// scrape must show `emit_total == 2` and `drops_total == 1`.
+    /// A regression that double-bumped emit on drop, or skipped
+    /// emit when the channel rejected, would fail here.
     #[tokio::test]
     async fn dropped_event_records_reason_and_keeps_emit_count() {
         let metrics = crate::metrics::Metrics::new(false);
@@ -476,18 +504,166 @@ mod tests {
         sink.try_emit("chat", event()); // dropped (channel full)
 
         let rendered = metrics.render();
+        // Numeric assertions (audit HIGH-2): name-only checks let a
+        // double-bump regression through. Pin exact values.
+        let emit_value = parse_counter_value(
+            &rendered,
+            "aisix_usage_events_emitted_total",
+            &[("handler", "chat"), ("status_code", "2xx")],
+        );
+        assert_eq!(emit_value, 2, "emit must be exactly 2:\n{rendered}");
+
+        let drop_value = parse_counter_value(
+            &rendered,
+            "aisix_usage_event_drops_total",
+            &[("reason", "sink_full")],
+        );
+        assert_eq!(
+            drop_value, 1,
+            "drops_total{{reason=sink_full}} must be exactly 1:\n{rendered}",
+        );
+    }
+
+    /// Issue #408 audit MEDIUM-1: the `sink_closed` reason path must
+    /// be covered independently of `sink_full`. A future refactor that
+    /// swapped the labels would only be caught by exercising both
+    /// arms of the match.
+    #[tokio::test]
+    async fn dropped_event_with_closed_receiver_records_sink_closed_reason() {
+        let metrics = crate::metrics::Metrics::new(false);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        drop(rx); // close the receiver before any send
+        let sink = UsageSink::new(tx).with_metrics(metrics.clone());
+
+        sink.try_emit(
+            "chat",
+            UsageEvent {
+                status_code: 200,
+                inbound_protocol: "openai".into(),
+                ..Default::default()
+            },
+        );
+
+        let rendered = metrics.render();
+        let drop_value = parse_counter_value(
+            &rendered,
+            "aisix_usage_event_drops_total",
+            &[("reason", "sink_closed")],
+        );
+        assert_eq!(
+            drop_value, 1,
+            "drops_total{{reason=sink_closed}} must be 1 when receiver was dropped:\n{rendered}",
+        );
+    }
+
+    /// Issue #408 audit HIGH-1: a `disabled()` sink with metrics
+    /// attached must still preserve `emitted == delivered + dropped`.
+    /// The drop is recorded with `reason=sink_disabled` so operators
+    /// can see "DP intended to emit but no sink was wired" rather
+    /// than silent zeros.
+    #[tokio::test]
+    async fn disabled_sink_with_metrics_records_sink_disabled_drop() {
+        let metrics = crate::metrics::Metrics::new(false);
+        let sink = UsageSink::disabled().with_metrics(metrics.clone());
+
+        sink.try_emit(
+            "chat",
+            UsageEvent {
+                status_code: 200,
+                inbound_protocol: "openai".into(),
+                ..Default::default()
+            },
+        );
+        sink.try_emit(
+            "chat",
+            UsageEvent {
+                status_code: 200,
+                inbound_protocol: "openai".into(),
+                ..Default::default()
+            },
+        );
+
+        let rendered = metrics.render();
+        // Both calls bump emit; both calls bump drop with sink_disabled.
+        // Invariant: emit (2) == delivered (0) + drops (2).
+        let emit_value = parse_counter_value(
+            &rendered,
+            "aisix_usage_events_emitted_total",
+            &[("handler", "chat"), ("status_code", "2xx")],
+        );
+        assert_eq!(
+            emit_value, 2,
+            "emit must be 2 even on disabled sink:\n{rendered}"
+        );
+
+        let drop_value = parse_counter_value(
+            &rendered,
+            "aisix_usage_event_drops_total",
+            &[("reason", "sink_disabled")],
+        );
+        assert_eq!(
+            drop_value, 2,
+            "drops_total{{reason=sink_disabled}} must be 2:\n{rendered}",
+        );
+    }
+
+    /// Issue #408 audit MEDIUM-3: a wire-level `inbound_protocol`
+    /// outside the documented set must be normalised to `"other"`
+    /// rather than landing on the metric as a user-controlled
+    /// cardinality vector. This pins the boundary defence.
+    #[tokio::test]
+    async fn unknown_inbound_protocol_buckets_into_other() {
+        let metrics = crate::metrics::Metrics::new(false);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let sink = UsageSink::new(tx).with_metrics(metrics.clone());
+
+        sink.try_emit(
+            "chat",
+            UsageEvent {
+                status_code: 200,
+                // A future / out-of-spec value that some future
+                // caller might set. Must NOT land on the wire as a
+                // label value.
+                inbound_protocol: "evil-cardinality-bomb".into(),
+                ..Default::default()
+            },
+        );
+
+        let rendered = metrics.render();
         assert!(
-            rendered.contains("aisix_usage_events_emitted_total"),
-            "emit counter must be present:\n{rendered}",
+            !rendered.contains("evil-cardinality-bomb"),
+            "user-controlled inbound_protocol must not leak into the label:\n{rendered}",
         );
         assert!(
-            rendered.contains("aisix_usage_event_drops_total"),
-            "drops counter must be present after a drop:\n{rendered}",
+            rendered.contains("inbound_protocol=\"other\""),
+            "unknown inbound_protocol must bucket to \"other\":\n{rendered}",
         );
-        assert!(
-            rendered.contains("reason=\"sink_full\""),
-            "drop reason must be sink_full when channel was at capacity:\n{rendered}",
-        );
+    }
+
+    /// Helper: pull the integer counter value from a prometheus
+    /// scrape, matching by metric name and all required label pairs.
+    /// Returns 0 if no matching line. Robust to label ordering in
+    /// the scrape output.
+    #[cfg(test)]
+    fn parse_counter_value(scrape: &str, name: &str, labels: &[(&str, &str)]) -> u64 {
+        for line in scrape.lines() {
+            if !line.starts_with(&format!("{name}{{")) {
+                continue;
+            }
+            let all_match = labels
+                .iter()
+                .all(|(k, v)| line.contains(&format!("{k}=\"{v}\"")));
+            if !all_match {
+                continue;
+            }
+            // Format: `metric{labels} <value>`
+            if let Some(value_str) = line.rsplit_once(' ').map(|(_, v)| v.trim()) {
+                if let Ok(v) = value_str.parse::<u64>() {
+                    return v;
+                }
+            }
+        }
+        0
     }
 
     #[test]
