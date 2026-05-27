@@ -36,9 +36,10 @@ struct CompletionDispatchSuccess {
     response: Response,
     provider: String,
     /// UUID of the resolved Model row — required for UsageEvent
-    /// `model_id`. Empty only on the 501 NotImplemented branch
-    /// where no upstream call happened (paired with
-    /// `upstream_called=false`).
+    /// `model_id`. Always populated on every success arm (including
+    /// the 501 NotImplemented branch where no upstream call
+    /// happened); the emit gate is `usage.is_some()`, not this
+    /// field. Audit MEDIUM-1 on PR #426 clarified.
     model_id: String,
     /// Upstream-reported token counts. `None` on the 501
     /// NotImplemented path (provider doesn't support completions)
@@ -74,19 +75,27 @@ pub async fn completions(
     match dispatch(&state, &auth, body, &request_id).await {
         Ok(success) => {
             let elapsed = started.elapsed();
+            // Audit MEDIUM-2 on PR #426: use the actual response
+            // status, not a hardcoded 200. The 501 NotImplemented
+            // branch returns `Ok(success)` with a 501 response —
+            // logging status=200 there made it impossible for
+            // operators to distinguish real successes from "provider
+            // does not support completions". Matches the convention
+            // PR #404 (responses) and PR #405 (rerank) adopted.
+            let status = success.response.status().as_u16();
             emit_access_log(
                 &model_name,
                 &success.provider,
                 &api_key_id,
-                200,
+                status,
                 elapsed,
                 &request_id,
             );
             state.metrics.record_request(
                 &success.provider,
                 &model_name,
-                200,
-                RequestOutcome::Success,
+                status,
+                RequestOutcome::from_status(status),
                 elapsed,
             );
             // Issue #403: emit UsageEvent so cp-api's budget ledger
@@ -101,7 +110,7 @@ pub async fn completions(
                     &request_id,
                     &success.model_id,
                     &api_key_id,
-                    200,
+                    status,
                     elapsed,
                     &usage,
                 );
@@ -636,6 +645,120 @@ mod tests {
             panic!(
                 "5xx must not emit UsageEvent, got status_code={}",
                 ev.status_code,
+            );
+        }
+    }
+
+    /// Issue #403 audit MEDIUM-3: the 501 NotImplemented path
+    /// (provider doesn't support text completions) must not emit
+    /// a UsageEvent — no upstream call happened, so no usage to
+    /// attribute. Without this test, a future regression that
+    /// flipped `usage: None` → `Some(zero)` on the 501 branch
+    /// would silently emit a bogus zero event. Triggers the path
+    /// by routing /v1/completions at an Anthropic-backed model;
+    /// `AnthropicBridge` doesn't override `Bridge::complete()`
+    /// so the trait default returns `BridgeError::Config(...)`
+    /// which maps to 501.
+    #[tokio::test]
+    async fn provider_lacking_complete_returns_501_without_emit() {
+        use aisix_obs::UsageSink;
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        const ANTHROPIC_PK_ID: &str = "22222222-2222-2222-2222-222222222222";
+
+        let anthropic_pk_json = r#"{"display_name":"anthropic-up","secret":"sk-ant-test","provider":"anthropic","adapter":"anthropic"}"#;
+        let anthropic_pk: aisix_core::ProviderKey =
+            serde_json::from_str(anthropic_pk_json).unwrap();
+        let anthropic_pk_entry = ResourceEntry::new(ANTHROPIC_PK_ID, anthropic_pk, 1);
+
+        let anthropic_model_json = format!(
+            r#"{{"display_name":"claude-instruct","provider":"anthropic","model_name":"claude-3-haiku-20240307","provider_key_id":"{ANTHROPIC_PK_ID}"}}"#
+        );
+        let anthropic_model: Model = serde_json::from_str(&anthropic_model_json).unwrap();
+        let anthropic_model_entry = ResourceEntry::new("m-anthropic", anthropic_model, 1);
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(anthropic_pk_entry);
+        snap.models.insert(anthropic_model_entry);
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({"model": "claude-instruct", "prompt": "hi"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "Anthropic-backed /v1/completions must surface as 501 \
+             (default Bridge::complete returns BridgeError::Config)",
+        );
+
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        if let Ok(Some(ev)) = recv {
+            panic!(
+                "501 NotImplemented must not emit UsageEvent, \
+                 got prompt_tokens={}, status_code={}",
+                ev.prompt_tokens, ev.status_code,
+            );
+        }
+    }
+
+    /// Issue #403 audit LOW-1: a 200 response with NO `usage` block
+    /// at all (vs `usage: {}` which is empty-but-present) must not
+    /// emit. Pins the outer `body.get("usage")?` short-circuit in
+    /// `extract_completion_usage` distinctly from the inner empty
+    /// case.
+    #[tokio::test]
+    async fn skips_usage_event_when_upstream_omits_usage_block_entirely() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // No `usage` key at all — distinct from `usage: {}`.
+        let upstream_body = serde_json::json!({
+            "id": "cmpl-no-usage",
+            "object": "text_completion",
+            "choices": []
+        });
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({"model": "instruct", "prompt": "x"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        if let Ok(Some(ev)) = recv {
+            panic!(
+                "no UsageEvent when `usage` key is entirely absent, \
+                 got prompt_tokens={}",
+                ev.prompt_tokens,
             );
         }
     }
