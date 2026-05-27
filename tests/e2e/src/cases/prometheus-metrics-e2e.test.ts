@@ -78,7 +78,8 @@ describe("prometheus metrics e2e", () => {
       /aisix_llm_requests_total\{[^}]*endpoint="\/v1\/chat\/completions"[^}]*model="prometheus-gpt"[^}]*status="200"/,
     );
     expect(text).toContain('team_id="unknown"');
-    expect(text).toContain('owner_id="unknown"');
+    expect(text).toContain('user_id="unknown"');
+    expect(text).not.toContain("owner_id=");
   });
 
   test("custom prometheus path is used for scrapes", async (ctx) => {

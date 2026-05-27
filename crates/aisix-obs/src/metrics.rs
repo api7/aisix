@@ -224,7 +224,7 @@ impl Metrics {
                 "provider_key_id" => labels.provider_key_id.to_string(),
                 "api_key_id" => labels.api_key_id.to_string(),
                 "team_id" => labels.team_id.to_string(),
-                "owner_id" => labels.owner_id.to_string(),
+                "user_id" => labels.user_id.to_string(),
                 "status" => labels.status.to_string(),
                 "outcome" => labels.outcome.as_str().to_string(),
             )
@@ -248,7 +248,7 @@ impl Metrics {
                 "provider_key_id" => labels.provider_key_id.to_string(),
                 "api_key_id" => labels.api_key_id.to_string(),
                 "team_id" => labels.team_id.to_string(),
-                "owner_id" => labels.owner_id.to_string(),
+                "user_id" => labels.user_id.to_string(),
                 "status" => labels.status.to_string(),
                 "outcome" => labels.outcome.as_str().to_string(),
             )
@@ -291,7 +291,7 @@ impl Metrics {
                 "provider_key_id" => labels.provider_key_id.to_string(),
                 "api_key_id" => labels.api_key_id.to_string(),
                 "team_id" => labels.team_id.to_string(),
-                "owner_id" => labels.owner_id.to_string(),
+                "user_id" => labels.user_id.to_string(),
             )
             .record(ttft.as_secs_f64());
         });
@@ -476,7 +476,7 @@ pub struct RequestLabels<'a> {
     pub provider_key_id: &'a str,
     pub api_key_id: &'a str,
     pub team_id: &'a str,
-    pub owner_id: &'a str,
+    pub user_id: &'a str,
     pub status: u16,
     pub outcome: RequestOutcome,
 }
@@ -492,7 +492,7 @@ impl Default for RequestLabels<'_> {
             provider_key_id: "unknown",
             api_key_id: "unknown",
             team_id: "unknown",
-            owner_id: "unknown",
+            user_id: "unknown",
             status: 0,
             outcome: RequestOutcome::UpstreamError,
         }
@@ -511,7 +511,7 @@ impl RequestLabels<'_> {
             "provider_key_id" => self.provider_key_id.to_string(),
             "api_key_id" => self.api_key_id.to_string(),
             "team_id" => self.team_id.to_string(),
-            "owner_id" => self.owner_id.to_string(),
+            "user_id" => self.user_id.to_string(),
             "status" => self.status.to_string(),
             "outcome" => self.outcome.as_str().to_string(),
         )
@@ -529,7 +529,7 @@ pub struct UsageLabels<'a> {
     pub provider_key_id: &'a str,
     pub api_key_id: &'a str,
     pub team_id: &'a str,
-    pub owner_id: &'a str,
+    pub user_id: &'a str,
 }
 
 impl Default for UsageLabels<'_> {
@@ -543,7 +543,7 @@ impl Default for UsageLabels<'_> {
             provider_key_id: "unknown",
             api_key_id: "unknown",
             team_id: "unknown",
-            owner_id: "unknown",
+            user_id: "unknown",
         }
     }
 }
@@ -560,7 +560,7 @@ impl UsageLabels<'_> {
             "provider_key_id" => self.provider_key_id.to_string(),
             "api_key_id" => self.api_key_id.to_string(),
             "team_id" => self.team_id.to_string(),
-            "owner_id" => self.owner_id.to_string(),
+            "user_id" => self.user_id.to_string(),
         )
         .increment(value);
     }
@@ -583,7 +583,7 @@ impl UsageLabels<'_> {
             "provider_key_id" => self.provider_key_id.to_string(),
             "api_key_id" => self.api_key_id.to_string(),
             "team_id" => self.team_id.to_string(),
-            "owner_id" => self.owner_id.to_string(),
+            "user_id" => self.user_id.to_string(),
         )
         .increment(micro_usd as u64);
     }
@@ -659,7 +659,7 @@ impl DeploymentState {
 pub struct BudgetLabels<'a> {
     pub api_key_id: &'a str,
     pub team_id: &'a str,
-    pub owner_id: &'a str,
+    pub user_id: &'a str,
 }
 
 impl Default for BudgetLabels<'_> {
@@ -667,7 +667,7 @@ impl Default for BudgetLabels<'_> {
         Self {
             api_key_id: "unknown",
             team_id: "unknown",
-            owner_id: "unknown",
+            user_id: "unknown",
         }
     }
 }
@@ -678,7 +678,7 @@ impl BudgetLabels<'_> {
             metric,
             "api_key_id" => self.api_key_id.to_string(),
             "team_id" => self.team_id.to_string(),
-            "owner_id" => self.owner_id.to_string(),
+            "user_id" => self.user_id.to_string(),
         )
         .set(value);
     }
@@ -806,7 +806,7 @@ mod tests {
             provider_key_id: "pk-1",
             api_key_id: "ak-1",
             team_id: "team-1",
-            owner_id: "owner-1",
+            user_id: "user-1",
             status: 200,
             outcome: RequestOutcome::Success,
         };
@@ -822,7 +822,7 @@ mod tests {
                 provider_key_id: "pk-1",
                 api_key_id: "ak-1",
                 team_id: "team-1",
-                owner_id: "owner-1",
+                user_id: "user-1",
             },
             LlmUsage {
                 input_tokens: 5,
@@ -841,7 +841,7 @@ mod tests {
                 provider_key_id: "pk-1",
                 api_key_id: "ak-1",
                 team_id: "team-1",
-                owner_id: "owner-1",
+                user_id: "user-1",
             },
             Duration::from_millis(42),
         );
@@ -857,6 +857,7 @@ mod tests {
         assert!(rendered.contains(M_LLM_TTFT));
         assert!(rendered.contains("endpoint=\"/v1/chat/completions\""));
         assert!(rendered.contains("team_id=\"team-1\""));
+        assert!(rendered.contains("user_id=\"user-1\""));
     }
 
     #[test]

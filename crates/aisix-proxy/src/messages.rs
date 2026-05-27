@@ -136,7 +136,7 @@ pub async fn messages(
                 provider_key_id: &provider_key_id,
                 api_key_id: &api_key_id,
                 team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-                owner_id: auth.key().owner_id.as_deref().unwrap_or("unknown"),
+                user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
                 status,
                 outcome,
             };
@@ -153,7 +153,7 @@ pub async fn messages(
                     &provider_key_id,
                     &upstream_model,
                     auth.key().team_id.as_deref(),
-                    auth.key().owner_id.as_deref(),
+                    auth.key().user_id.as_deref(),
                     status,
                     elapsed,
                     metrics,
@@ -193,7 +193,7 @@ pub async fn messages(
                 "unknown",
                 "unknown",
                 auth.key().team_id.as_deref(),
-                auth.key().owner_id.as_deref(),
+                auth.key().user_id.as_deref(),
                 status,
                 elapsed,
                 AnthropicUsageMetrics::default(),
@@ -259,7 +259,7 @@ async fn dispatch(
             started,
             &auth.entry.id,
             auth.key().team_id.clone(),
-            auth.key().owner_id.clone(),
+            auth.key().user_id.clone(),
         )
         .await;
     }
@@ -545,7 +545,7 @@ async fn cross_provider_dispatch(
     started: Instant,
     api_key_id: &str,
     team_id: Option<String>,
-    owner_id: Option<String>,
+    user_id: Option<String>,
 ) -> Result<DispatchOutcome, ProxyError> {
     use aisix_gateway::{Bridge, BridgeContext};
     use aisix_provider_anthropic::{
@@ -621,7 +621,7 @@ async fn cross_provider_dispatch(
         let provider_key_id_for_telem = provider_key_id.to_string();
         let upstream_model_for_telem = upstream_model.clone();
         let team_id_for_telem = team_id;
-        let owner_id_for_telem = owner_id;
+        let user_id_for_telem = user_id;
         let started_for_telem = started;
         let sse_body = build_anthropic_sse_stream(upstream, encoder, started, move |comp| {
             let metrics = AnthropicUsageMetrics {
@@ -644,7 +644,7 @@ async fn cross_provider_dispatch(
                 &provider_key_id_for_telem,
                 &upstream_model_for_telem,
                 team_id_for_telem.as_deref(),
-                owner_id_for_telem.as_deref(),
+                user_id_for_telem.as_deref(),
                 200,
                 started_for_telem.elapsed(),
                 metrics,
@@ -873,7 +873,7 @@ fn emit_anthropic_usage_event(
     provider_key_id: &str,
     upstream_model: &str,
     team_id: Option<&str>,
-    owner_id: Option<&str>,
+    user_id: Option<&str>,
     status_code: u16,
     elapsed: Duration,
     metrics: AnthropicUsageMetrics,
@@ -932,7 +932,7 @@ fn emit_anthropic_usage_event(
             provider_key_id,
             api_key_id,
             team_id: team_id.unwrap_or("unknown"),
-            owner_id: owner_id.unwrap_or("unknown"),
+            user_id: user_id.unwrap_or("unknown"),
         },
         LlmUsage {
             input_tokens: metrics.prompt_tokens,
@@ -954,7 +954,7 @@ fn emit_anthropic_usage_event(
                 provider_key_id,
                 api_key_id,
                 team_id: team_id.unwrap_or("unknown"),
-                owner_id: owner_id.unwrap_or("unknown"),
+                user_id: user_id.unwrap_or("unknown"),
             },
             Duration::from_millis(u64::from(metrics.ttft_ms)),
         );

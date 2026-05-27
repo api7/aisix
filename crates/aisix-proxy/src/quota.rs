@@ -139,7 +139,7 @@ fn reserve_layers<'a>(
             "api_key" => policy.scope_ref == auth.entry.id,
             "model" => model_rl.is_some_and(|m| policy.scope_ref == m.entry_id),
             "team" => auth.key().team_id.as_deref() == Some(policy.scope_ref.as_str()),
-            "member" => auth.key().owner_id.as_deref() == Some(policy.scope_ref.as_str()),
+            "member" => auth.key().user_id.as_deref() == Some(policy.scope_ref.as_str()),
             _ => false,
         };
         if !applies {
@@ -173,7 +173,7 @@ pub(crate) async fn enforce<'a>(
     let budget_labels = aisix_obs::BudgetLabels {
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
-        owner_id: auth.key().owner_id.as_deref().unwrap_or("unknown"),
+        user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
     };
     if let Some(budget) = decision.budget.as_ref() {
         state.metrics.set_budget_gauges(

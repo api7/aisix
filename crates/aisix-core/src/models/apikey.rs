@@ -38,7 +38,7 @@ pub struct ApiKey {
     /// Org member who owns this key. Used for matching member-scope
     /// rate limit policies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_id: Option<String>,
+    pub user_id: Option<String>,
 
     /// etcd-key uuid; filled by the loader, never in the JSON payload.
     #[serde(skip)]
@@ -155,7 +155,7 @@ mod tests {
             allowed_models: vec![],
             rate_limit: None,
             team_id: None,
-            owner_id: None,
+            user_id: None,
             runtime_id: String::new(),
         };
         assert!(!k.can_access("my-gpt4"));
@@ -221,24 +221,24 @@ mod tests {
     }
 
     #[test]
-    fn deserialises_with_team_and_owner_fields() {
+    fn deserialises_with_team_and_user_fields() {
         let k: ApiKey = serde_json::from_str(&format!(
             r#"{{
               "key_hash": "{SAMPLE_HASH}",
               "allowed_models": ["gpt-4o"],
               "team_id": "team-uuid-1",
-              "owner_id": "member-uuid-1"
+              "user_id": "member-uuid-1"
             }}"#
         ))
         .unwrap();
         assert_eq!(k.team_id.as_deref(), Some("team-uuid-1"));
-        assert_eq!(k.owner_id.as_deref(), Some("member-uuid-1"));
+        assert_eq!(k.user_id.as_deref(), Some("member-uuid-1"));
     }
 
     #[test]
-    fn absent_team_owner_fields_default_to_none() {
+    fn absent_team_user_fields_default_to_none() {
         let k = sample();
         assert!(k.team_id.is_none());
-        assert!(k.owner_id.is_none());
+        assert!(k.user_id.is_none());
     }
 }

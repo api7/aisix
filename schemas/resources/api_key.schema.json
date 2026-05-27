@@ -18,13 +18,6 @@
       "description": "SHA-256 hex of the plaintext bearer. Secondary-indexed for O(1) auth — the proxy hashes incoming bearers before lookup.",
       "type": "string"
     },
-    "owner_id": {
-      "description": "Org member who owns this key. Used for matching member-scope rate limit policies.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
     "rate_limit": {
       "anyOf": [
         {
@@ -37,6 +30,13 @@
     },
     "team_id": {
       "description": "Team this API key belongs to. Used for matching team-scope rate limit policies.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "user_id": {
+      "description": "Org member who owns this key. Used for matching member-scope rate limit policies.",
       "type": [
         "string",
         "null"
