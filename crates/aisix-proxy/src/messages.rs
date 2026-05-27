@@ -49,7 +49,9 @@ use crate::request_id::new_request_id;
 use crate::state::ProxyState;
 
 /// Anthropic API version header value injected on every forwarded request.
-const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// Shared with the `/v1/messages/count_tokens` handler so both Anthropic
+/// passthrough paths pin the same version.
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 pub async fn messages(
     State(state): State<ProxyState>,
@@ -68,58 +70,15 @@ pub async fn messages(
     let Json(mut body) = match body {
         Ok(j) => j,
         Err(rej) => {
-            use axum::extract::rejection::JsonRejection;
-            use axum::http::StatusCode;
-            // Audit MEDIUM-1: replace `JsonRejection::body_text()`
-            // with stable customer-friendly phrases — axum's internal
-            // wording could drift between releases and silently leak
-            // into the customer-facing envelope.
-            //
-            // Audit MEDIUM-A (3rd audit): discriminate
-            // `BytesRejection` (DefaultBodyLimit fired during read)
-            // from JSON parse errors. Chunked oversize-body callers
-            // (no Content-Length, so `enforce_request_body_limit`
-            // can't decide on the declared size) reach this rejection
-            // when the per-extractor cap fires — they MUST surface as
-            // 413 request_too_large per Anthropic SDK ErrorType
-            // taxonomy, not 400 invalid_request_error.
-            //
-            // Audit MEDIUM-B (4th audit): `BytesRejection` is a
-            // composite rejection — its inner `FailedToBufferBody`
-            // has TWO variants: `LengthLimitError` (status
-            // PAYLOAD_TOO_LARGE — real cap exceeded) and
-            // `UnknownBodyError` (status BAD_REQUEST — transport-
-            // side body-read failure, e.g. peer reset mid-body, hyper
-            // decoder error). The earlier `BytesRejection(_)` blanket
-            // arm mis-labelled transport failures as
-            // `request_too_large`, breaking the Claude SDK's
-            // non-retriable-cap branch (which assumes a true cap
-            // hit). Discriminate via the rejection's own `.status()`
-            // method (exposed by axum's composite_rejection macro,
-            // recursively delegated to the inner variant's
-            // `define_rejection! #[status = ...]`).
-            //
-            // `JsonRejection` is `#[non_exhaustive]` (axum-core
-            // 0.5.6 macros.rs:157), so the fallback `_` arm catches
-            // both today's `JsonDataError` / `JsonSyntaxError` /
-            // `MissingJsonContentType` AND any future variant axum
-            // adds — defaulting to 400 `invalid_request_error` until
-            // each new variant gets an explicit policy decision.
-            return match rej {
-                JsonRejection::BytesRejection(inner)
-                    if inner.status() == StatusCode::PAYLOAD_TOO_LARGE =>
-                {
-                    ProxyError::RequestTooLarge {
-                        limit_bytes: state.request_body_limit_bytes,
-                    }
-                }
-                JsonRejection::BytesRejection(_) => {
-                    // UnknownBodyError or any future composite arm —
-                    // transport-side failure, NOT a size cap.
-                    ProxyError::InvalidRequest("failed to read request body".into())
-                }
-                _ => ProxyError::InvalidRequest("invalid JSON request body".into()),
-            }
+            // Classify the body-extractor failure (malformed JSON vs
+            // 413 cap vs transport read error) via the shared helper so
+            // /v1/messages and /v1/messages/count_tokens stay in lockstep
+            // on the discrimination rules, then render the Anthropic-
+            // shape envelope the Claude SDK can parse (#336).
+            return crate::error::proxy_error_from_json_rejection(
+                rej,
+                state.request_body_limit_bytes,
+            )
             .into_anthropic_response();
         }
     };
