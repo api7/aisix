@@ -136,6 +136,26 @@ fn build_one(
             // pruned-build DP sees the misconfig in logs.
             Err(BuildError::FeatureDisabled("bedrock"))
         }
+        #[cfg(feature = "azure-content-safety")]
+        GuardrailKind::AzureContentSafety(cfg) => {
+            // P1: HTTP-based Prompt Shield dispatcher. cp-api already
+            // decrypted the api_key at projection time; the config carries
+            // plaintext. No deployment-wide endpoint override needed —
+            // the endpoint is per-row (each customer has their own Azure CS
+            // resource).
+            let g = crate::prompt_shield::PromptShieldGuardrail::new(
+                row.name.clone(),
+                cfg,
+                row.hook_point,
+                row.fail_open,
+            );
+            Ok(Some(Arc::new(g)))
+        }
+        #[cfg(not(feature = "azure-content-safety"))]
+        GuardrailKind::AzureContentSafety(_) => {
+            // Built without --features azure-content-safety. Skip + warn.
+            Err(BuildError::FeatureDisabled("azure-content-safety"))
+        }
     }
 }
 
@@ -146,13 +166,16 @@ enum BuildError {
         pattern: String,
         source: regex::Error,
     },
-    /// Reserved for guardrail kinds whose runtime dispatch is
-    /// compiled out (e.g. a slim build that excluded the
-    /// `--features bedrock` AWS SDK dependency). The chain treats
-    /// these rows as disabled and the supervisor's warn log
-    /// surfaces the kind name so a misconfigured environment is
-    /// visible.
-    #[cfg(not(feature = "bedrock"))]
+    /// A guardrail kind whose runtime dispatch was compiled out via
+    /// feature flags (e.g. a pruned build that excluded `--features bedrock`
+    /// or `--features azure-content-safety`). The chain treats the row as
+    /// disabled and the warn log surfaces the kind name so the misconfig is visible.
+    ///
+    /// Always declared in the enum (not behind `#[cfg]`) so `build_one` can
+    /// reference it from any `not(feature = "…")` arm. When all features are
+    /// enabled (the default), the variant exists but is never constructed —
+    /// the dead_code lint is suppressed below.
+    #[allow(dead_code)]
     #[error("guardrail kind {0:?} not compiled into this build; treating row as disabled")]
     FeatureDisabled(&'static str),
 }
