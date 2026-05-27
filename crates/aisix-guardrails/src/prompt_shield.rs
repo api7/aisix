@@ -182,12 +182,17 @@ impl PromptShieldGuardrail {
 
     fn handle_failure(&self, failure: AcsFailure) -> GuardrailVerdict {
         let tag = failure.bypass_tag();
-        tracing::warn!(
-            row = %self.row_name,
-            failure = ?failure,
-            fail_open = self.fail_open,
-            "azure content safety call failed",
-        );
+        // ConfigError is already logged at error level in call_api(); skip
+        // the generic warn here so operators see exactly one log line per
+        // event and alert rules don't fire twice for the same failure.
+        if !matches!(failure, AcsFailure::ConfigError) {
+            tracing::warn!(
+                row = %self.row_name,
+                failure = ?failure,
+                fail_open = self.fail_open,
+                "azure content safety call failed",
+            );
+        }
         if self.fail_open {
             GuardrailVerdict::Bypass { reason: tag.into() }
         } else {
@@ -350,7 +355,7 @@ mod tests {
     use aisix_core::models::AzureContentSafetyConfig;
     use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse, FinishReason, UsageStats};
     use serde_json::json;
-    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
@@ -540,11 +545,14 @@ mod tests {
     /// - `Content-Type: application/json` set by reqwest `.json()`
     /// - request body uses `userPrompt` / `documents` field names
     ///   (a rename in `ShieldRequest` would compile but break the Azure CS API)
+    /// - `api-version=2024-09-01` query parameter present
+    ///   (a version bump in SHIELD_PATH would otherwise silently pass all tests)
     #[tokio::test]
     async fn clean_input_returns_allow_and_sends_auth_header() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
+            .and(query_param("api-version", "2024-09-01"))
             .and(header("Ocp-Apim-Subscription-Key", "test-key-abc"))
             .and(header("content-type", "application/json"))
             .and(body_json(json!({
