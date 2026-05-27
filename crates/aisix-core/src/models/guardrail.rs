@@ -29,6 +29,9 @@
 //!     parses + accepts the kind but the chain builder logs
 //!     "bedrock not yet implemented" and skips the row; Phase 2
 //!     wires the actual dispatch (PRD-09c §6.7).
+//!   * `azure_content_safety` — calls Azure AI Content Safety Prompt
+//!     Shield (`/contentsafety/text:shieldPrompt`). Detects jailbreak
+//!     and indirect injection attacks. P1 (PRD-09c §6 P1).
 //!
 //! See `aisix-guardrails/src/keyword.rs` for the runtime semantics
 //! the snapshot is parsed into.
@@ -104,6 +107,35 @@ pub enum BedrockLatencyMode {
     Timed { timeout_ms: u32 },
 }
 
+/// Config block for `kind: "azure_content_safety"`. Calls Azure AI
+/// Content Safety Prompt Shield API to detect jailbreak and indirect
+/// injection attacks. PRD-09c §6 P1.
+///
+/// The CP (cp-api) decrypts the envelope-encrypted `api_key` at kine-
+/// projection time so the DP always holds plaintext in memory; the
+/// key is never logged.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AzureContentSafetyConfig {
+    /// Azure Cognitive Services resource endpoint, e.g.
+    /// `https://my-resource.cognitiveservices.azure.com`.
+    /// The DP appends `/contentsafety/text:shieldPrompt?api-version=2024-09-01`.
+    pub endpoint: String,
+    /// Subscription key (`Ocp-Apim-Subscription-Key`). Decrypted by
+    /// cp-api before kine projection; plaintext in memory only, never
+    /// logged.
+    pub api_key: String,
+    /// HTTP call timeout in milliseconds. When elapsed the `fail_open`
+    /// flag governs the verdict. Defaults to 5000 ms. 0 = no timeout
+    /// (blocks until response).
+    #[serde(default = "default_acs_timeout_ms")]
+    pub timeout_ms: u32,
+}
+
+fn default_acs_timeout_ms() -> u32 {
+    5_000
+}
+
 /// Config block for `kind: "bedrock"`. Phase 1 stores the shape +
 /// passes it through `aisix-guardrails::build` which logs
 /// `bedrock not yet implemented` and skips the row.
@@ -125,7 +157,7 @@ pub struct BedrockConfig {
 /// Provider discriminator. The kind drives which `*_config` block is
 /// expected; serde's `tag = "kind"` keeps us honest at parse time.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GuardrailKind {
     /// In-process literal/regex blocklist. Always available.
     Keyword(KeywordConfig),
@@ -133,6 +165,10 @@ pub enum GuardrailKind {
     /// the chain builder skips it with a warn log. Phase 2 wires
     /// real `ApplyGuardrail` dispatch.
     Bedrock(BedrockConfig),
+    /// Azure AI Content Safety Prompt Shield. Detects jailbreak and
+    /// indirect injection attacks via the `/contentsafety/text:shieldPrompt`
+    /// API. P1 (PRD-09c §6 P1).
+    AzureContentSafety(AzureContentSafetyConfig),
 }
 
 /// Top-level `Guardrail` resource shape. Mirrors what cp-api writes
@@ -346,7 +382,7 @@ mod tests {
                     KeywordPattern::Regex(r"\bssn:\s*\d{3}-\d{2}-\d{4}".into())
                 );
             }
-            GuardrailKind::Bedrock(_) => panic!("expected Keyword variant"),
+            _ => panic!("expected Keyword variant"),
         }
     }
 
@@ -472,6 +508,45 @@ mod tests {
                 _ => panic!("expected Timed"),
             },
             _ => panic!("expected Bedrock variant"),
+        }
+    }
+
+    #[test]
+    fn azure_content_safety_kind_parses() {
+        let v = json!({
+            "name": "shield",
+            "kind": "azure_content_safety",
+            "endpoint": "https://my-resource.cognitiveservices.azure.com",
+            "api_key": "plaintext-key",
+            "timeout_ms": 3000
+        });
+        let g: Guardrail = serde_json::from_value(v).unwrap();
+        assert_eq!(g.name, "shield");
+        match g.config {
+            GuardrailKind::AzureContentSafety(ref c) => {
+                assert_eq!(
+                    c.endpoint,
+                    "https://my-resource.cognitiveservices.azure.com"
+                );
+                assert_eq!(c.api_key, "plaintext-key");
+                assert_eq!(c.timeout_ms, 3000);
+            }
+            _ => panic!("expected AzureContentSafety variant"),
+        }
+    }
+
+    #[test]
+    fn azure_content_safety_timeout_defaults_to_5000() {
+        let v = json!({
+            "name": "shield",
+            "kind": "azure_content_safety",
+            "endpoint": "https://my-resource.cognitiveservices.azure.com",
+            "api_key": "k"
+        });
+        let g: Guardrail = serde_json::from_value(v).unwrap();
+        match g.config {
+            GuardrailKind::AzureContentSafety(ref c) => assert_eq!(c.timeout_ms, 5_000),
+            _ => panic!("expected AzureContentSafety variant"),
         }
     }
 

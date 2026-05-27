@@ -30,8 +30,13 @@ aws-smithy-async = { workspace = true, optional = true }
 aws-smithy-runtime-api = { workspace = true, optional = true }
 aws-smithy-types = { workspace = true, optional = true }
 
+# kind=azure_content_safety guardrail (PRD-09c §6 P1). reqwest is the
+# HTTP client for the Prompt Shield API call; behind a default feature
+# so a slim build can opt out.
+reqwest = { workspace = true, optional = true }
+
 [features]
-default = ["bedrock"]
+default = ["bedrock", "azure-content-safety"]
 bedrock = [
     "dep:aws-config",
     "dep:aws-sdk-bedrockruntime",
@@ -40,6 +45,7 @@ bedrock = [
     "dep:aws-smithy-runtime-api",
     "dep:aws-smithy-types",
 ]
+azure-content-safety = ["dep:reqwest"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

@@ -159,6 +159,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

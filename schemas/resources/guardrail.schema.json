@@ -74,6 +74,38 @@
           "type": "string"
         }
       }
+    },
+    {
+      "description": "Azure AI Content Safety Prompt Shield. Detects jailbreak and indirect injection attacks via the `/contentsafety/text:shieldPrompt` API. P1 (PRD-09c §6 P1).",
+      "type": "object",
+      "required": [
+        "api_key",
+        "endpoint",
+        "kind"
+      ],
+      "properties": {
+        "api_key": {
+          "description": "Subscription key (`Ocp-Apim-Subscription-Key`). Decrypted by cp-api before kine projection; plaintext in memory only, never logged.",
+          "type": "string"
+        },
+        "endpoint": {
+          "description": "Azure Cognitive Services resource endpoint, e.g. `https://my-resource.cognitiveservices.azure.com`. The DP appends `/contentsafety/text:shieldPrompt?api-version=2024-09-01`.",
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "azure_content_safety"
+          ]
+        },
+        "timeout_ms": {
+          "description": "HTTP call timeout in milliseconds. When elapsed the `fail_open` flag governs the verdict. Defaults to 5000 ms. 0 = no timeout (blocks until response).",
+          "default": 5000,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
     }
   ],
   "required": [
