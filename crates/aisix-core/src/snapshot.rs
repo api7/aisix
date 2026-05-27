@@ -25,7 +25,7 @@ use std::sync::Arc;
 ///
 /// Both indices point at the same `Arc<ResourceEntry<T>>` so there is no
 /// duplicate storage — the name map just holds ids.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResourceTable<T: Resource> {
     by_id: DashMap<String, Arc<ResourceEntry<T>>>,
     by_name: DashMap<String, String>,

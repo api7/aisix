@@ -1,11 +1,16 @@
 //! Compose multiple guardrails into one. First [`GuardrailVerdict::Block`]
 //! short-circuits the chain; subsequent guardrails are not consulted.
+//! A [`GuardrailVerdict::Rewrite`] propagates the modified payload to all
+//! subsequent guardrails via `Cow<ChatFormat>` — the heap allocation is
+//! deferred until an actual rewrite occurs.
 //! Useful for building a single `Arc<dyn Guardrail>` to hand to the
 //! proxy from a config-driven list.
 
+use std::borrow::Cow;
+use std::sync::Arc;
+
 use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
-use std::sync::Arc;
 
 use crate::{Guardrail, GuardrailVerdict};
 
@@ -52,9 +57,13 @@ impl Guardrail for GuardrailChain {
     }
 
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
+        // `current` starts as a borrow; flips to Owned only if a Rewrite fires.
+        // This keeps the common (no-rewrite) path allocation-free.
+        let mut current: Cow<'_, ChatFormat> = Cow::Borrowed(req);
         let mut bypass: Option<String> = None;
+
         for g in &self.guardrails {
-            let verdict = g.check_input(req).await;
+            let verdict = g.check_input(current.as_ref()).await;
             match verdict {
                 GuardrailVerdict::Allow => continue,
                 GuardrailVerdict::Block { .. } => return verdict,
@@ -65,11 +74,33 @@ impl Guardrail for GuardrailChain {
                         bypass = Some(reason);
                     }
                 }
+                GuardrailVerdict::Rewrite { payload } => {
+                    // Substitute the rewritten payload for all remaining
+                    // guardrails. A Block from a later guardrail still wins.
+                    current = Cow::Owned(*payload);
+                }
             }
         }
-        match bypass {
-            Some(reason) => GuardrailVerdict::Bypass { reason },
-            None => GuardrailVerdict::Allow,
+
+        match current {
+            Cow::Owned(rewritten) => {
+                // If a Bypass also fired earlier in the chain, surface it in
+                // the audit trail. The Rewrite takes precedence for routing
+                // but the bypass reason must not disappear from logs.
+                if let Some(ref reason) = bypass {
+                    tracing::info!(
+                        bypass_reason = %reason,
+                        "guardrail bypass shadowed by Rewrite verdict; bypass recorded"
+                    );
+                }
+                GuardrailVerdict::Rewrite {
+                    payload: Box::new(rewritten),
+                }
+            }
+            Cow::Borrowed(_) => match bypass {
+                Some(reason) => GuardrailVerdict::Bypass { reason },
+                None => GuardrailVerdict::Allow,
+            },
         }
     }
 
@@ -85,6 +116,10 @@ impl Guardrail for GuardrailChain {
                         bypass = Some(reason);
                     }
                 }
+                // Rewrite on the output path is valid but rare; the chain
+                // ignores it (output rewrites would need a mutable `resp`
+                // which the trait doesn't provide). Treat as Allow.
+                GuardrailVerdict::Rewrite { .. } => {}
             }
         }
         match bypass {

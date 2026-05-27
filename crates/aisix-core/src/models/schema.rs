@@ -26,6 +26,7 @@ pub struct Schemas {
     pub apikey: Validator,
     pub provider_key: Validator,
     pub guardrail: Validator,
+    pub guardrail_attachment: Validator,
     pub cache_policy: Validator,
     pub observability_exporter: Validator,
     pub rate_limit_policy: Validator,
@@ -48,6 +49,9 @@ impl Schemas {
             guardrail: jsonschema::options()
                 .build(&guardrail_schema())
                 .expect("guardrail schema is well-formed"),
+            guardrail_attachment: jsonschema::options()
+                .build(&guardrail_attachment_schema())
+                .expect("guardrail_attachment schema is well-formed"),
             cache_policy: jsonschema::options()
                 .build(&cache_policy_schema())
                 .expect("cache_policy schema is well-formed"),
@@ -107,6 +111,10 @@ pub fn validate_observability_exporter(value: &Value) -> Result<(), SchemaError>
 
 pub fn validate_rate_limit_policy(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.rate_limit_policy, value)
+}
+
+pub fn validate_guardrail_attachment(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.guardrail_attachment, value)
 }
 
 fn model_schema() -> Value {
@@ -552,6 +560,28 @@ fn rate_limit_policy_schema() -> Value {
             { "required": ["max_requests"] },
             { "required": ["max_tokens"] }
         ]
+    })
+}
+
+fn guardrail_attachment_schema() -> Value {
+    // `additionalProperties` is NOT set to false: cp-api includes `env_id`
+    // in the kine payload (for its own idempotency logic) which the DP
+    // doesn't need. Allowing extra keys here keeps the schema forward-
+    // compatible if cp-api adds more metadata fields later.
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["guardrail_id", "scope_type", "priority"],
+        "properties": {
+            "guardrail_id": { "type": "string", "minLength": 1 },
+            "scope_type":   {
+                "type": "string",
+                "enum": ["env", "model", "api_key", "team"]
+            },
+            "scope_id":     { "type": ["string", "null"] },
+            "priority":     { "type": "integer" },
+            "enabled":      { "type": "boolean" }
+        }
     })
 }
 

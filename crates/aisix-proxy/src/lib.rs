@@ -395,6 +395,49 @@ mod tests {
         snap
     }
 
+    /// Seed an env-scope keyword guardrail into a live snapshot handle.
+    ///
+    /// Uses `handle.rcu()` to atomically replace the snapshot and bump the
+    /// version counter. `LiveGuardrailIndex` compares versions on every
+    /// `resolve()` call; without the bump it would return a stale (empty)
+    /// index regardless of when this helper is called relative to
+    /// `build_state`. With the bump the index rebuilds on the next request,
+    /// making the call-order invariant.
+    ///
+    /// `guardrail_json` must be a valid inline `Guardrail` JSON payload
+    /// (same wire shape as `/aisix/<env>/guardrails/<uuid>`).
+    /// A single env-scope attachment is inserted alongside it so the
+    /// guardrail fires on every request.
+    fn seed_guardrail(
+        handle: &SnapshotHandle<AisixSnapshot>,
+        guardrail_id: &str,
+        guardrail_json: &str,
+    ) {
+        use aisix_core::models::{Guardrail as DomainGuardrail, GuardrailAttachment};
+        let gid = guardrail_id.to_string();
+        let row: DomainGuardrail = serde_json::from_str(guardrail_json).unwrap();
+        let att: GuardrailAttachment = serde_json::from_str(&format!(
+            r#"{{"guardrail_id": "{gid}", "scope_type": "env", "priority": 50}}"#
+        ))
+        .unwrap();
+        // rcu: load current snapshot → clone it → insert guardrail entries →
+        // store the new snapshot and bump the version. The closure is
+        // idempotent: re-inserting the same id merely overwrites with
+        // identical data, so retries under contention are safe.
+        handle.rcu(|snap| {
+            let new_snap = snap.clone();
+            new_snap
+                .guardrails
+                .insert(ResourceEntry::new(gid.clone(), row.clone(), 1));
+            new_snap.guardrail_attachments.insert(ResourceEntry::new(
+                format!("att-{gid}"),
+                att.clone(),
+                1,
+            ));
+            new_snap
+        });
+    }
+
     /// Insert a default-enabled cache policy on the snapshot so the
     /// proxy's cache gate (chat::dispatch) opens the lookup path.
     /// Stage 2 honors existence + `enabled`; Stage 3 honors
@@ -1774,8 +1817,6 @@ data: <not valid json>\n\n";
     /// block" — what we assert here.
     #[tokio::test]
     async fn streaming_output_guardrail_blocks_with_sse_error_event_and_no_done() {
-        use aisix_guardrails::{GuardrailChain, KeywordBlocklist, KeywordRule};
-
         let upstream = MockServer::start().await;
         // Upstream emits 3 SSE chunks: role, then content containing
         // the forbidden literal, then the terminal stop. The full
@@ -1799,10 +1840,12 @@ data: [DONE]\n\n";
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
-        let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(
-            KeywordBlocklist::output_only(vec![KeywordRule::literal("secret-string")]),
-        )]));
-        let state = build_state(snap, hub).with_guardrails(guardrails);
+        let state = build_state(snap, hub);
+        seed_guardrail(
+            &state.snapshot,
+            "g-stream-output",
+            r#"{"name":"stream-output-guard","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"secret-string"}]}"#,
+        );
         let app = build_router(state);
 
         let body = serde_json::json!({
@@ -3422,8 +3465,6 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn input_guardrail_block_returns_422_and_skips_upstream() {
-        use aisix_guardrails::{GuardrailChain, KeywordBlocklist, KeywordRule};
-
         // wiremock that fails the test if it's hit at all.
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
@@ -3436,11 +3477,12 @@ data: [DONE]\n\n";
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
-
-        let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(KeywordBlocklist::new(
-            vec![KeywordRule::literal("forbidden-token")],
-        ))]));
-        let state = build_state(snap, hub).with_guardrails(guardrails);
+        let state = build_state(snap, hub);
+        seed_guardrail(
+            &state.snapshot,
+            "g-input-block",
+            r#"{"name":"input-guard","kind":"keyword","patterns":[{"kind":"literal","value":"forbidden-token"}]}"#,
+        );
         let app = build_router(state);
 
         let body = serde_json::json!({
@@ -3480,7 +3522,6 @@ data: [DONE]\n\n";
     /// "Guardrail blocks" tab showing an empty model column.
     #[tokio::test]
     async fn input_guardrail_block_records_resolved_model_id_in_telemetry() {
-        use aisix_guardrails::{GuardrailChain, KeywordBlocklist, KeywordRule};
         use aisix_obs::UsageSink;
 
         // Capturing usage sink — we read the emitted event off the
@@ -3498,12 +3539,13 @@ data: [DONE]\n\n";
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
-        let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(KeywordBlocklist::new(
-            vec![KeywordRule::literal("forbidden-token")],
-        ))]));
-        let state = build_state(snap, hub)
-            .with_guardrails(guardrails)
-            .with_usage_sink(UsageSink::new(tx));
+        let state = build_state(snap, hub);
+        seed_guardrail(
+            &state.snapshot,
+            "g-input-block",
+            r#"{"name":"input-guard","kind":"keyword","patterns":[{"kind":"literal","value":"forbidden-token"}]}"#,
+        );
+        let state = state.with_usage_sink(UsageSink::new(tx));
         let app = build_router(state);
 
         let body = serde_json::json!({
@@ -3535,8 +3577,6 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn output_guardrail_block_returns_422_after_upstream_runs() {
-        use aisix_guardrails::{GuardrailChain, KeywordBlocklist, KeywordRule};
-
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
@@ -3557,11 +3597,12 @@ data: [DONE]\n\n";
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(openai_test_bridge()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
-
-        let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(
-            KeywordBlocklist::output_only(vec![KeywordRule::literal("secret-string")]),
-        )]));
-        let state = build_state(snap, hub).with_guardrails(guardrails);
+        let state = build_state(snap, hub);
+        seed_guardrail(
+            &state.snapshot,
+            "g-output-block",
+            r#"{"name":"output-guard","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"secret-string"}]}"#,
+        );
         let app = build_router(state);
 
         let body = serde_json::json!({
@@ -3615,7 +3656,6 @@ data: [DONE]\n\n";
     /// the upstream HAS run and the provider has already charged.
     #[tokio::test]
     async fn output_guardrail_block_records_upstream_usage_in_telemetry() {
-        use aisix_guardrails::{GuardrailChain, KeywordBlocklist, KeywordRule};
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -3639,12 +3679,13 @@ data: [DONE]\n\n";
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
-        let guardrails = Arc::new(GuardrailChain::new(vec![Arc::new(
-            KeywordBlocklist::output_only(vec![KeywordRule::literal("secret-string")]),
-        )]));
-        let state = build_state(snap, hub)
-            .with_guardrails(guardrails)
-            .with_usage_sink(UsageSink::new(tx));
+        let state = build_state(snap, hub);
+        seed_guardrail(
+            &state.snapshot,
+            "g-output-block",
+            r#"{"name":"output-guard","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"secret-string"}]}"#,
+        );
+        let state = state.with_usage_sink(UsageSink::new(tx));
         let app = build_router(state);
 
         let body = serde_json::json!({

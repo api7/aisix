@@ -80,10 +80,20 @@
     "name"
   ],
   "properties": {
+    "direction": {
+      "description": "Which traffic directions this guardrail applies to when resolved through an attachment. Values: `\"input\"`, `\"output\"`, `\"both\"` (default).\n\nStored and forwarded to the CP dashboard. Direction-based filtering in `GuardrailIndex::resolve` is not yet implemented; the `hook_point` field on the guardrail definition provides equivalent per-hook-point control for keyword rules.",
+      "default": "both",
+      "type": "string"
+    },
     "enabled": {
       "description": "When false the chain skips this rule entirely. Lets operators stage a rule (write it, sanity-check it via dry runs, then flip it on) without deleting + recreating.",
       "default": true,
       "type": "boolean"
+    },
+    "enforcement_mode": {
+      "description": "How the DP behaves when this guardrail fires. `\"block\"` (default) — reject the request. `\"monitor\"` — let the request through and record the event (**not yet implemented**; the DP currently always blocks regardless of this field — do not set `\"monitor\"` expecting pass-through behavior until a future release wires it into the chain).",
+      "default": "block",
+      "type": "string"
     },
     "fail_open": {
       "description": "Behavior when a remote-API guardrail (today `kind=bedrock`) can't reach its upstream. `true` lets the request through (recorded in usage_events.guardrail_bypassed_reason); `false` blocks with 422. No-op for `kind=keyword`. Defaults `true` (matches the PG schema default + PRD-09c §6.4).",
@@ -98,6 +108,11 @@
           "$ref": "#/definitions/GuardrailHookPoint"
         }
       ]
+    },
+    "mandatory": {
+      "description": "When `true`, a runtime error in this guardrail's evaluation (e.g. a Bedrock timeout) is treated as fatal: the request is blocked regardless of `fail_open`. When `false` (default), `fail_open` governs the error path.\n\n**Not yet implemented** — the field is stored and forwarded to the CP dashboard but the DP does not yet consult it; `fail_open` alone governs error behavior in the current release.",
+      "default": false,
+      "type": "boolean"
     },
     "name": {
       "description": "Operator-facing name; surfaces in metric labels + error reasons.",

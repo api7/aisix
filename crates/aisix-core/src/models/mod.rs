@@ -30,8 +30,8 @@ pub mod snapshot;
 pub use apikey::ApiKey;
 pub use cache_policy::{AppliesTo, CacheBackend, CachePolicy};
 pub use guardrail::{
-    BedrockAWSCredentials, BedrockConfig, BedrockLatencyMode, Guardrail, GuardrailHookPoint,
-    GuardrailKind, KeywordConfig, KeywordPattern,
+    BedrockAWSCredentials, BedrockConfig, BedrockLatencyMode, Guardrail, GuardrailAttachment,
+    GuardrailHookPoint, GuardrailKind, GuardrailScopeType, KeywordConfig, KeywordPattern,
 };
 pub use model::{
     Adapter, BackgroundModelCheck, CooldownConfig, Model, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
@@ -45,8 +45,8 @@ pub use rate_limit::RateLimit;
 pub use rate_limit_policy::RateLimitPolicy;
 pub use routing::{OnAllFilteredPolicy, Routing, RoutingStrategy, RoutingTarget};
 pub use schema::{
-    validate_apikey, validate_cache_policy, validate_guardrail, validate_model,
-    validate_observability_exporter, validate_provider_key, validate_rate_limit_policy,
-    SchemaError,
+    validate_apikey, validate_cache_policy, validate_guardrail, validate_guardrail_attachment,
+    validate_model, validate_observability_exporter, validate_provider_key,
+    validate_rate_limit_policy, SchemaError,
 };
 pub use snapshot::AisixSnapshot;

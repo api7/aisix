@@ -390,20 +390,20 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     if let Some(client) = budget_client {
         proxy_state = proxy_state.with_budget_client(client);
     }
-    // Live guardrail chain: rebuilds itself whenever the etcd watch
-    // supervisor stores a fresh snapshot, so dashboard mutations
-    // (`/guardrails` create / enable / delete) take effect within
-    // one watch tick. Empty `guardrails` table → chain is a noop;
-    // adding the wrapper costs one mutex + ptr-compare per chat,
-    // never a regex compile on the hot path. See
-    // `aisix_guardrails::LiveGuardrailChain`.
+    // Live guardrail index: resolves per-request chains from
+    // attachment scope + priority, rebuilding lazily whenever the
+    // etcd watch supervisor stores a fresh snapshot. Dashboard
+    // mutations (`/guardrails` and `/guardrail_attachments` CRUD)
+    // take effect within one watch tick. Empty attachment table →
+    // every resolved chain is empty (no-op). See
+    // `aisix_guardrails::LiveGuardrailIndex`.
     //
     // `bedrock_endpoint_url` is the deployment-wide override for
     // kind=bedrock guardrails; empty string is normalized to
     // `None` so a `docker run -e AISIX_BEDROCK_ENDPOINT_URL=`
     // doesn't accidentally redirect Bedrock calls into thin air.
     let bedrock_endpoint_url = cfg.bedrock_endpoint_url.clone().filter(|s| !s.is_empty());
-    proxy_state = proxy_state.with_guardrails(aisix_guardrails::LiveGuardrailChain::new(
+    proxy_state = proxy_state.with_guardrail_index(aisix_guardrails::LiveGuardrailIndex::new(
         snapshot_handle.clone(),
         bedrock_endpoint_url,
     ));

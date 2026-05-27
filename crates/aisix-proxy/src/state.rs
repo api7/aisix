@@ -18,7 +18,7 @@ use aisix_cache::{Cache, MemoryCache};
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ProxyConfig};
 use aisix_gateway::Hub;
-use aisix_guardrails::{Guardrail, GuardrailChain};
+use aisix_guardrails::LiveGuardrailIndex;
 use aisix_obs::{Metrics, OtlpHttpFanOut, UsageSink};
 use aisix_ratelimit::Limiter;
 use std::sync::Arc;
@@ -35,9 +35,11 @@ pub struct ProxyState {
     pub metrics: Arc<Metrics>,
     pub cache: Option<Arc<dyn Cache>>,
     pub routing: Arc<RoutingRegistry>,
-    /// Content-policy hooks. Default is an empty chain (no-op); the
-    /// server bootstrap loads a real chain from config.
-    pub guardrails: Arc<dyn Guardrail>,
+    /// Per-request guardrail index. Resolves the applicable chain from
+    /// attachment scope + priority on each request. Rebuilds lazily
+    /// when the snapshot version changes. Default is an empty index
+    /// (no-op); the server bootstrap wires a live handle at startup.
+    pub guardrail_index: Arc<LiveGuardrailIndex>,
     /// Per-request budget gate. Asks cp-api whether the api_key may
     /// proceed; cached for 5s with sticky fallback on cp-api outage.
     pub budgets: Arc<BudgetClient>,
@@ -66,6 +68,7 @@ pub struct ProxyState {
 
 impl ProxyState {
     pub fn new(snapshot: SnapshotHandle<AisixSnapshot>, hub: Arc<Hub>, cfg: &ProxyConfig) -> Self {
+        let guardrail_index = LiveGuardrailIndex::new(snapshot.clone(), None);
         Self {
             snapshot,
             hub,
@@ -73,7 +76,7 @@ impl ProxyState {
             metrics: Arc::new(Metrics::new(false)),
             cache: Some(Arc::new(MemoryCache::with_defaults())),
             routing: Arc::new(RoutingRegistry::new()),
-            guardrails: Arc::new(GuardrailChain::empty()),
+            guardrail_index,
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
@@ -92,6 +95,7 @@ impl ProxyState {
         limiter: Arc<Limiter>,
         cfg: &ProxyConfig,
     ) -> Self {
+        let guardrail_index = LiveGuardrailIndex::new(snapshot.clone(), None);
         Self {
             snapshot,
             hub,
@@ -99,7 +103,7 @@ impl ProxyState {
             metrics: Arc::new(Metrics::new(false)),
             cache: Some(Arc::new(MemoryCache::with_defaults())),
             routing: Arc::new(RoutingRegistry::new()),
-            guardrails: Arc::new(GuardrailChain::empty()),
+            guardrail_index,
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
@@ -121,6 +125,7 @@ impl ProxyState {
         cache: Option<Arc<dyn Cache>>,
         cfg: &ProxyConfig,
     ) -> Self {
+        let guardrail_index = LiveGuardrailIndex::new(snapshot.clone(), None);
         Self {
             snapshot,
             hub,
@@ -128,7 +133,7 @@ impl ProxyState {
             metrics,
             cache,
             routing: Arc::new(RoutingRegistry::new()),
-            guardrails: Arc::new(GuardrailChain::empty()),
+            guardrail_index,
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
@@ -146,10 +151,11 @@ impl ProxyState {
         self
     }
 
-    /// Replace the guardrail chain. Used by both the server bootstrap
-    /// and tests that want a deterministic policy.
-    pub fn with_guardrails(mut self, guardrails: Arc<dyn Guardrail>) -> Self {
-        self.guardrails = guardrails;
+    /// Replace the guardrail index. Used by the server bootstrap to
+    /// wire a live snapshot-backed index; tests can substitute a
+    /// deterministic one via `LiveGuardrailIndex::new(stub_handle, None)`.
+    pub fn with_guardrail_index(mut self, index: Arc<LiveGuardrailIndex>) -> Self {
+        self.guardrail_index = index;
         self
     }
 

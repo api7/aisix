@@ -647,13 +647,26 @@ async fn dispatch(
         return Err(with_model(ProxyError::ModelForbidden(req.model.clone())));
     }
 
+    // Resolve the per-request guardrail chain from the index.
+    // Done once here; `resolved_chain` is reused for both the input
+    // check below, the output check later, and the streaming output
+    // guardrail context.
+    let guardrail_ctx = aisix_guardrails::RequestContext {
+        model_id: &model_id,
+        api_key_id: &auth.entry.id,
+        team_id: auth.key().team_id.as_deref(),
+    };
+    let resolved_chain: std::sync::Arc<dyn aisix_guardrails::Guardrail> =
+        std::sync::Arc::new(state.guardrail_index.resolve(&guardrail_ctx));
+
     // Input guardrails. Run before reservation so a blocked prompt
     // doesn't burn an RPM slot — content-policy refusals shouldn't
     // count against quota. Bypass (remote-API guardrail unavailable
     // + fail_open=true) doesn't short-circuit; the reason is stashed
     // and attached to the telemetry event when the request finishes.
     let mut bypass_reason: Option<String> = None;
-    match state.guardrails.check_input(req).await {
+    let mut rewritten_req: Option<Box<aisix_gateway::ChatFormat>> = None;
+    match resolved_chain.check_input(req).await {
         GuardrailVerdict::Allow => {}
         GuardrailVerdict::Block { reason } => {
             // The verdict's `reason` carries matched-pattern detail
@@ -675,7 +688,18 @@ async fn dispatch(
         GuardrailVerdict::Bypass { reason } => {
             bypass_reason = Some(reason);
         }
+        GuardrailVerdict::Rewrite { payload } => {
+            // A guardrail rewrote the prompt (e.g. PII scrubbing).
+            // Substitute the returned payload for the original before
+            // dispatching to the upstream. Downstream guardrails in the
+            // chain already saw the rewritten form (propagated by
+            // GuardrailChain::check_input via Cow<ChatFormat>).
+            rewritten_req = Some(payload);
+        }
     }
+    // Shadow `req` with the possibly-rewritten payload. All downstream
+    // code (budget check, routing, bridge dispatch) uses this reference.
+    let req = rewritten_req.as_deref().unwrap_or(req);
 
     // Budget pre-check via cp-api. The DP no longer owns budget state;
     // cp-api returns a cached/live decision per api_key.
@@ -852,23 +876,20 @@ async fn dispatch(
             RoutingTelemetry::default()
         };
         let stream_routing_for_telem = stream_routing.clone();
-        // Per #204: pass the gateway's guardrail chain so the
-        // streaming path can run output guardrails at end-of-stream
+        // Per #204: pass the resolved guardrail chain so the streaming
+        // path can run output guardrails at end-of-stream
         // (buffer-then-check). Mirrors the non-streaming
-        // `state.guardrails.check_output(...)` call site.
+        // `resolved_chain.check_output(...)` call site below.
         //
-        // Fast-path: skip the context entirely when no policies are
-        // configured. The Guardrail trait's `is_empty()` (audit
-        // PR #222 M2) lets `Arc<dyn Guardrail>` answer the question
-        // without a downcast. When `None`, `build_sse_stream` skips
-        // the per-chunk content accumulation and the post-loop
-        // synthesized-ChatResponse construction — both noise on
+        // Fast-path: skip the context entirely when the resolved chain
+        // for this request is empty (no attachment matched). When `None`,
+        // `build_sse_stream` skips per-chunk accumulation — both noise on
         // the hot path for the dominant guardrail-free deployment.
-        let stream_guardrail = if state.guardrails.is_empty() {
+        let stream_guardrail = if resolved_chain.is_empty() {
             None
         } else {
             Some(StreamGuardrailContext {
-                chain: Arc::clone(&state.guardrails),
+                chain: Arc::clone(&resolved_chain),
                 model_name: req.model.clone(),
             })
         };
@@ -1329,8 +1350,13 @@ async fn dispatch(
     // ingesting telemetry; the DP just records 0.0 on the wire.
     let cost_usd = 0.0;
 
-    match state.guardrails.check_output(&upstream).await {
+    match resolved_chain.check_output(&upstream).await {
         GuardrailVerdict::Allow => {}
+        GuardrailVerdict::Rewrite { .. } => {
+            // Output rewrites are not supported on the non-streaming path
+            // in P0c (check_output on GuardrailChain already coerces Rewrite
+            // to Allow internally; this arm is for future direct-check paths).
+        }
         GuardrailVerdict::Block { reason } => {
             // Output filter fires AFTER the upstream call, so the
             // provider has already billed for these tokens. Surface
@@ -2232,6 +2258,12 @@ where
                         }
                     }
                     aisix_guardrails::GuardrailVerdict::Allow => {}
+                    aisix_guardrails::GuardrailVerdict::Rewrite { .. } => {
+                        // Output rewrites on the streaming path are not
+                        // supported in P0c — GuardrailChain::check_output
+                        // already coerces Rewrite to Allow internally;
+                        // this arm handles future direct-check paths.
+                    }
                 }
             }
         }

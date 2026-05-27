@@ -1,8 +1,14 @@
 //! `Guardrail` entity — content-policy hooks the DP runs on every
 //! chat request. The control plane (cp-api) writes these to etcd at
 //! `/aisix/<env>/guardrails/<uuid>`; the DP loads them on watch and
-//! the `aisix-proxy::ProxyState::guardrails` chain composes the
-//! enabled ones.
+//! the `aisix-proxy::ProxyState::guardrail_index` resolves the
+//! applicable chain per request.
+//!
+//! P0b added `enforcement_mode`, `mandatory`, and `direction` columns
+//! to the CP `guardrails` table. P0c wires them to the kine payload
+//! and adds the `GuardrailAttachment` row type (`/aisix/<env>/guardrail_attachments/<uuid>`).
+//! The outer `Guardrail` struct accepts but defaults the three new fields
+//! so old kine rows (written before P0c CP lands) still parse.
 //!
 //! Two run sites per request (matches `aisix-guardrails::Guardrail`):
 //!   * `input`  — runs before bridge dispatch; a block here means the
@@ -168,6 +174,40 @@ pub struct Guardrail {
     #[serde(flatten)]
     pub config: GuardrailKind,
 
+    // --- P0c additive fields (outer-struct level; no deny_unknown_fields) ---
+    //
+    // cp-api's marshalGuardrailKV will start emitting these once the P0c
+    // CP PR lands. Until then, old kine rows omit them and the defaults apply.
+    /// How the DP behaves when this guardrail fires.
+    /// `"block"` (default) — reject the request.
+    /// `"monitor"` — let the request through and record the event
+    ///   (**not yet implemented**; the DP currently always blocks regardless
+    ///   of this field — do not set `"monitor"` expecting pass-through
+    ///   behavior until a future release wires it into the chain).
+    #[serde(default = "default_enforcement_mode")]
+    pub enforcement_mode: String,
+
+    /// When `true`, a runtime error in this guardrail's evaluation
+    /// (e.g. a Bedrock timeout) is treated as fatal: the request is
+    /// blocked regardless of `fail_open`.
+    /// When `false` (default), `fail_open` governs the error path.
+    ///
+    /// **Not yet implemented** — the field is stored and forwarded to
+    /// the CP dashboard but the DP does not yet consult it; `fail_open`
+    /// alone governs error behavior in the current release.
+    #[serde(default)]
+    pub mandatory: bool,
+
+    /// Which traffic directions this guardrail applies to when resolved
+    /// through an attachment. Values: `"input"`, `"output"`, `"both"` (default).
+    ///
+    /// Stored and forwarded to the CP dashboard. Direction-based filtering
+    /// in `GuardrailIndex::resolve` is not yet implemented; the `hook_point`
+    /// field on the guardrail definition provides equivalent per-hook-point
+    /// control for keyword rules.
+    #[serde(default = "default_direction")]
+    pub direction: String,
+
     #[serde(skip)]
     pub(crate) runtime_id: String,
 }
@@ -178,6 +218,14 @@ fn default_enabled() -> bool {
 
 fn default_fail_open() -> bool {
     true
+}
+
+fn default_enforcement_mode() -> String {
+    "block".to_owned()
+}
+
+fn default_direction() -> String {
+    "both".to_owned()
 }
 
 impl Resource for Guardrail {
@@ -191,6 +239,80 @@ impl Resource for Guardrail {
 
     fn kind() -> &'static str {
         "guardrails"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GuardrailAttachment — P0c
+// ---------------------------------------------------------------------------
+
+/// Which dimension of the request a guardrail attachment is scoped to.
+///
+/// `Env` applies to every request in the environment (the pre-P0c behaviour).
+/// The narrower scopes let operators attach a guardrail to just the models,
+/// API keys, or teams that need it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardrailScopeType {
+    Env,
+    Model,
+    ApiKey,
+    Team,
+}
+
+/// One attachment row — written by cp-api to `/aisix/<env>/guardrail_attachments/<uuid>`.
+///
+/// The DP loads these alongside the guardrail definitions and builds a
+/// `GuardrailIndex` that resolves the applicable chain per request via
+/// `scope_type` + `scope_id` matching.
+///
+/// `deny_unknown_fields` is intentionally NOT set: cp-api includes `env_id`
+/// in the payload (for its own idempotency checks) which the DP doesn't need.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+pub struct GuardrailAttachment {
+    /// UUID of the guardrail definition this attachment points to.
+    pub guardrail_id: String,
+
+    /// What dimension of the request this attachment is scoped to.
+    pub scope_type: GuardrailScopeType,
+
+    /// The UUID of the specific resource (model / api_key / team).
+    /// `None` when `scope_type` is `Env` (applies to all requests).
+    pub scope_id: Option<String>,
+
+    /// Higher number = higher precedence. When the same guardrail appears
+    /// via multiple matching scopes, the highest-priority attachment wins
+    /// and duplicates are dropped.
+    pub priority: i32,
+
+    /// When `false`, `GuardrailIndex::resolve` skips this attachment
+    /// entirely (same as the row not existing).
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+
+    #[serde(skip)]
+    pub(crate) runtime_id: String,
+}
+
+impl Resource for GuardrailAttachment {
+    fn id(&self) -> &str {
+        &self.runtime_id
+    }
+
+    /// Keyed by `guardrail_id` in the `ResourceTable` name-index so
+    /// callers can look up attachments by guardrail.
+    ///
+    /// WARNING: the name-index is a flat map and silently overwrites
+    /// earlier entries when a guardrail has multiple attachments (e.g.
+    /// one Env-scope and one Model-scope attachment share the same key).
+    /// Use `ResourceTable::entries()` (not `get_by_name`) to enumerate
+    /// all attachments. `build_index_from_snapshot` already does this.
+    fn name(&self) -> &str {
+        &self.guardrail_id
+    }
+
+    fn kind() -> &'static str {
+        "guardrail_attachments"
     }
 }
 
@@ -267,6 +389,30 @@ mod tests {
         });
         let r: Result<Guardrail, _> = serde_json::from_value(v);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn p0c_fields_dont_trip_keyword_config_deny_unknown_fields() {
+        // `KeywordConfig` has `deny_unknown_fields`. The P0c fields
+        // (`enforcement_mode`, `mandatory`, `direction`) are declared on
+        // the outer `Guardrail` struct with `#[serde(default)]`, so serde
+        // absorbs them at the outer level before the flattened inner sees
+        // the remaining fields. This test pins that routing: if any of
+        // these fields accidentally reached `KeywordConfig`, the parse
+        // would return an unknown-field error.
+        let v = json!({
+            "name": "g",
+            "kind": "keyword",
+            "patterns": [],
+            "enforcement_mode": "monitor",
+            "mandatory": true,
+            "direction": "input"
+        });
+        let g: Guardrail = serde_json::from_value(v)
+            .expect("P0c fields must not trip KeywordConfig deny_unknown_fields");
+        assert_eq!(g.enforcement_mode, "monitor");
+        assert!(g.mandatory);
+        assert_eq!(g.direction, "input");
     }
 
     #[test]
