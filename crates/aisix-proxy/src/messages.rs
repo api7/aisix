@@ -915,7 +915,9 @@ fn emit_anthropic_usage_event(
         byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
         ..Default::default()
     };
-    state.usage_sink.try_emit(event.clone());
+    // Handler label "messages" — Anthropic /v1/messages inbound
+    // path. Bucketed prometheus counter (#408).
+    state.usage_sink.try_emit("messages", event.clone());
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out

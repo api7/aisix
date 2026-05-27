@@ -1737,7 +1737,10 @@ fn emit_usage_event(
         pk_label: sanitize_tag(tags.pk_label.unwrap_or_default()),
         byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
     };
-    state.usage_sink.try_emit(event.clone());
+    // Handler label "chat" matches the documented enumeration for
+    // `aisix_usage_events_emitted_total` (#408). Keep `&'static str`
+    // so prometheus cardinality stays bounded.
+    state.usage_sink.try_emit("chat", event.clone());
     // Per-env OTLP/HTTP fan-out. The snapshot's exporter table is
     // empty for envs that haven't configured any, so this is a cheap
     // no-op on the common path. Spawned tasks own the POST work and

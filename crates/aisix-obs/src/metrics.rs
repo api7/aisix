@@ -59,6 +59,20 @@ pub const M_BUDGET_RESET_SECONDS: &str = "aisix_budget_reset_seconds";
 pub const M_BUDGET_DETAILS_PRESENT: &str = "aisix_budget_details_present";
 pub const M_REDIS_FAILURES_TOTAL: &str = "aisix_redis_failures_total";
 pub const M_USAGE_EVENT_DROPS_TOTAL: &str = "aisix_usage_event_drops_total";
+/// Issue #408: counter for UsageEvents successfully enqueued onto the
+/// `UsageSink` (i.e. handed off to the telemetry worker for delivery
+/// to cp-api + per-env OTLP exporters). Operators slice this by:
+/// - `handler`: which OpenAI-shape handler emitted (chat /
+///   embeddings / responses / completions / rerank / audio /
+///   images / messages). Fixed enumeration, low cardinality.
+/// - `status_code`: bucketed as `2xx` / `4xx` / `5xx` (avoid the
+///   1000-value cardinality blowup of raw u16 codes).
+/// - `inbound_protocol`: `openai` / `anthropic`. Matches the
+///   wire-level field on UsageEvent.
+///
+/// Paired with `aisix_usage_event_drops_total{reason}` for the
+/// `try_send` failure paths (sink full / closed).
+pub const M_USAGE_EVENT_EMITS_TOTAL: &str = "aisix_usage_events_emitted_total";
 pub const M_OTLP_FANOUT_DROPS_TOTAL: &str = "aisix_otlp_fanout_drops_total";
 pub const M_OTLP_FANOUT_FAILURES_TOTAL: &str = "aisix_otlp_fanout_failures_total";
 
@@ -388,6 +402,29 @@ impl Metrics {
         });
     }
 
+    /// Issue #408: bump on a successful `UsageSink::try_emit` (the
+    /// event handed off to the telemetry worker). `handler` is the
+    /// OpenAI-shape endpoint name (`chat`, `embeddings`, etc.);
+    /// `status_code` is a raw u16 — bucketed here so prometheus
+    /// cardinality stays bounded. `inbound_protocol` mirrors the
+    /// wire-level field on `UsageEvent` (`openai` / `anthropic`).
+    pub fn record_usage_event_emit(
+        &self,
+        handler: &'static str,
+        status_code: u16,
+        inbound_protocol: &str,
+    ) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            metrics::counter!(
+                M_USAGE_EVENT_EMITS_TOTAL,
+                "handler" => handler,
+                "status_code" => status_bucket(status_code),
+                "inbound_protocol" => inbound_protocol.to_string(),
+            )
+            .increment(1);
+        });
+    }
+
     pub fn record_otlp_fanout_drop(&self, exporter: &str, reason: &str) {
         metrics::with_local_recorder(&self.inner.recorder, || {
             metrics::counter!(
@@ -404,6 +441,21 @@ impl Metrics {
             metrics::counter!(M_OTLP_FANOUT_FAILURES_TOTAL, "exporter" => exporter.to_string())
                 .increment(1);
         });
+    }
+}
+
+/// Bucket an HTTP status code into one of `2xx` / `3xx` / `4xx` /
+/// `5xx` / `other` (the last covers 1xx and out-of-range). Used by
+/// the UsageEvent emission counter (#408) to keep prometheus label
+/// cardinality bounded — raw `u16` would explode to ~1000 series per
+/// handler×protocol combination.
+fn status_bucket(status: u16) -> &'static str {
+    match status {
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "other",
     }
 }
 

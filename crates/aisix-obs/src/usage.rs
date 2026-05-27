@@ -281,27 +281,54 @@ fn is_false(b: &bool) -> bool {
 /// by an mpsc::Sender; `try_emit` is non-blocking and silently drops
 /// the event if the worker's queue is full (avoids back-pressuring
 /// the request hot path on a wedged CP). Drops are counted via
-/// tracing::warn! so observers can see a wedge.
+/// tracing::warn! and (when a `Metrics` handle is attached) the
+/// `aisix_usage_event_drops_total{reason}` prometheus counter so
+/// observers can see a wedge.
 ///
 /// In a deployment without CP-side telemetry (legacy / dev), the
 /// handle's `tx` is `None` and `try_emit` is a no-op.
+///
+/// Issue #408: the sink also bumps `aisix_usage_events_emitted_total
+/// {handler, status_code, inbound_protocol}` on every call so e2e
+/// can externally assert emission without a cp-api receiver in the
+/// loop. Counter is bumped on emission *intent* (i.e. every call to
+/// `try_emit`); drops counter is the subset that failed to enqueue.
+/// Invariant: `emitted - drops ≈ delivered`.
 #[derive(Debug, Clone)]
 pub struct UsageSink {
     tx: Option<tokio::sync::mpsc::Sender<UsageEvent>>,
+    metrics: Option<crate::metrics::Metrics>,
 }
 
 impl UsageSink {
     /// Build a real sink backed by an mpsc::Sender. The receiving end
-    /// is owned by the worker spawned in aisix-server.
+    /// is owned by the worker spawned in aisix-server. No prometheus
+    /// counter wiring until `with_metrics` is also called.
     pub fn new(tx: tokio::sync::mpsc::Sender<UsageEvent>) -> Self {
-        Self { tx: Some(tx) }
+        Self {
+            tx: Some(tx),
+            metrics: None,
+        }
     }
 
     /// Build a no-op sink. `try_emit` drops events silently — used
     /// when the DP runs without a configured CP (dev / standalone
     /// modes) so handlers don't have to special-case Optional fields.
     pub fn disabled() -> Self {
-        Self { tx: None }
+        Self {
+            tx: None,
+            metrics: None,
+        }
+    }
+
+    /// Attach a Metrics handle so `try_emit` bumps the #408 emission
+    /// and drops counters. Optional — without it, the sink behaves
+    /// exactly as the pre-#408 sink (channel send only, no counters).
+    /// The server bootstrap calls this in managed mode after building
+    /// the shared `Metrics` instance.
+    pub fn with_metrics(mut self, metrics: crate::metrics::Metrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Non-blocking emit. Returns immediately:
@@ -311,13 +338,35 @@ impl UsageSink {
     ///   error to the caller — request handlers must NOT fail because
     ///   telemetry can't keep up.
     /// - `Ok(())` no-op on a `disabled()` sink.
-    pub fn try_emit(&self, event: UsageEvent) {
+    ///
+    /// `handler` is a fixed-set label for the prometheus
+    /// `aisix_usage_events_emitted_total` counter (#408): `"chat"`,
+    /// `"embeddings"`, `"messages"`, `"responses"`, etc. Keep it
+    /// `&'static str` so cardinality stays bounded.
+    pub fn try_emit(&self, handler: &'static str, event: UsageEvent) {
+        // Bump the emit counter on *intent* — handler tried to emit.
+        // Subtract `drops_total` for delivered-event rate. Disabled
+        // sinks still bump because operators want to see "handler
+        // wanted to emit but no sink was wired" via a metric, not
+        // silent zeros.
+        if let Some(m) = &self.metrics {
+            m.record_usage_event_emit(handler, event.status_code, &event.inbound_protocol);
+        }
+
         let Some(tx) = &self.tx else { return };
+
         if let Err(err) = tx.try_send(event) {
-            // Both `Full` and `Closed` end up here. Full = worker is
-            // overloaded; Closed = worker shut down cleanly. Either
-            // way the event is gone — log once per drop and move on.
-            tracing::warn!(error = %err, "usage event dropped (sink full or closed)");
+            // `Full` = worker is overloaded; `Closed` = worker shut
+            // down cleanly. Either way the event is gone — record the
+            // distinction so the operator knows *why* the wedge.
+            let reason = match err {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => "sink_full",
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => "sink_closed",
+            };
+            if let Some(m) = &self.metrics {
+                m.record_usage_event_drop(reason);
+            }
+            tracing::warn!(reason = reason, "usage event dropped");
         }
     }
 }
@@ -331,16 +380,16 @@ mod tests {
         let sink = UsageSink::disabled();
         // Doesn't panic; doesn't allocate a worker. Two emits in a
         // row also fine.
-        sink.try_emit(sample_event("req-1"));
-        sink.try_emit(sample_event("req-2"));
+        sink.try_emit("test", sample_event("req-1"));
+        sink.try_emit("test", sample_event("req-2"));
     }
 
     #[tokio::test]
     async fn emit_into_real_channel_arrives_in_order() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let sink = UsageSink::new(tx);
-        sink.try_emit(sample_event("req-a"));
-        sink.try_emit(sample_event("req-b"));
+        sink.try_emit("test", sample_event("req-a"));
+        sink.try_emit("test", sample_event("req-b"));
         let a = rx.recv().await.unwrap();
         let b = rx.recv().await.unwrap();
         assert_eq!(a.request_id, "req-a");
@@ -354,8 +403,91 @@ mod tests {
         // hot path.
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let sink = UsageSink::new(tx);
-        sink.try_emit(sample_event("req-1"));
-        sink.try_emit(sample_event("req-2")); // dropped, logged
+        sink.try_emit("test", sample_event("req-1"));
+        sink.try_emit("test", sample_event("req-2")); // dropped, logged
+    }
+
+    /// Issue #408: a `try_emit` call with a Metrics handle attached
+    /// must bump `aisix_usage_events_emitted_total` exactly once per
+    /// call. The status_code label is bucketed (2xx / 4xx / 5xx)
+    /// rather than raw to keep prometheus cardinality bounded.
+    #[tokio::test]
+    async fn emits_counter_increments_per_call() {
+        let metrics = crate::metrics::Metrics::new(false);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let sink = UsageSink::new(tx).with_metrics(metrics.clone());
+
+        sink.try_emit(
+            "chat",
+            UsageEvent {
+                status_code: 200,
+                inbound_protocol: "openai".into(),
+                ..Default::default()
+            },
+        );
+        sink.try_emit(
+            "embeddings",
+            UsageEvent {
+                status_code: 200,
+                inbound_protocol: "openai".into(),
+                ..Default::default()
+            },
+        );
+
+        let rendered = metrics.render();
+        // The exact text format is metrics-rs's choice; assert both
+        // the metric name and label combinations are present, and
+        // value reaches 1 per (handler, status_code, inbound_protocol).
+        assert!(
+            rendered.contains("aisix_usage_events_emitted_total"),
+            "counter must appear in scrape:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("handler=\"chat\"") && rendered.contains("handler=\"embeddings\""),
+            "per-handler labels must be present:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("status_code=\"2xx\""),
+            "status_code must be bucketed (2xx), not raw 200:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("inbound_protocol=\"openai\""),
+            "inbound_protocol label must be present:\n{rendered}",
+        );
+    }
+
+    /// Issue #408: when `try_send` fails (channel full / closed),
+    /// the drops counter bumps with the right reason and the emit
+    /// counter still records the intent. Invariant:
+    /// `emitted == delivered + dropped`.
+    #[tokio::test]
+    async fn dropped_event_records_reason_and_keeps_emit_count() {
+        let metrics = crate::metrics::Metrics::new(false);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1); // capacity 1
+        let sink = UsageSink::new(tx).with_metrics(metrics.clone());
+
+        let event = || UsageEvent {
+            status_code: 200,
+            inbound_protocol: "openai".into(),
+            ..Default::default()
+        };
+
+        sink.try_emit("chat", event()); // delivered
+        sink.try_emit("chat", event()); // dropped (channel full)
+
+        let rendered = metrics.render();
+        assert!(
+            rendered.contains("aisix_usage_events_emitted_total"),
+            "emit counter must be present:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("aisix_usage_event_drops_total"),
+            "drops counter must be present after a drop:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("reason=\"sink_full\""),
+            "drop reason must be sink_full when channel was at capacity:\n{rendered}",
+        );
     }
 
     #[test]

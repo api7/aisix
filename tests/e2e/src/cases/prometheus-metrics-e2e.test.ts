@@ -119,6 +119,66 @@ describe("prometheus metrics e2e", () => {
     }
   });
 
+  // Issue #408: a successful /v1/chat/completions request must bump
+  // `aisix_usage_events_emitted_total{handler="chat", status_code="2xx",
+  // inbound_protocol="openai"}` on the DP's /metrics endpoint. Pre-#408
+  // the gateway emitted UsageEvents to the sink + OTLP fan-out but
+  // had no DP-side prometheus counter, so a regression that dropped
+  // emission was invisible to e2e (the harness has no cp-api / OTLP
+  // receiver in the loop).
+  test("usage_events_emitted counter increments on successful chat (#408)", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    // Reuse the same model the first test configured. The counter
+    // accumulates across tests within the same describe block, so we
+    // snapshot the pre-call value and assert a delta rather than an
+    // absolute count.
+    await waitConfigPropagation(async () => {
+      const probe = await proxy.chat({
+        model: "prometheus-gpt",
+        messages: [{ role: "user", content: "ready" }],
+      });
+      return probe.status === 200;
+    });
+
+    const before = await fetch(`${app.adminUrl}/metrics`).then((r) => r.text());
+    const beforeCount = parseUsageEmittedCount(before, "chat", "2xx", "openai");
+
+    const { status } = await proxy.chat({
+      model: "prometheus-gpt",
+      messages: [{ role: "user", content: "for-#408-counter" }],
+    });
+    expect(status).toBe(200);
+
+    const after = await fetch(`${app.adminUrl}/metrics`).then((r) => r.text());
+    expect(after).toContain("aisix_usage_events_emitted_total");
+    // The counter line must carry all three #408 labels — handler,
+    // bucketed status_code, inbound_protocol. A regression that
+    // dropped any label (cardinality compromise, mis-spelled key)
+    // would surface here.
+    expect(after).toMatch(
+      /aisix_usage_events_emitted_total\{[^}]*handler="chat"[^}]*\}/,
+    );
+    expect(after).toMatch(
+      /aisix_usage_events_emitted_total\{[^}]*status_code="2xx"[^}]*\}/,
+    );
+    expect(after).toMatch(
+      /aisix_usage_events_emitted_total\{[^}]*inbound_protocol="openai"[^}]*\}/,
+    );
+    // Status codes MUST be bucketed (2xx / 4xx / 5xx) — raw "200"
+    // would explode cardinality at ~1000 series per handler×protocol.
+    expect(after).not.toMatch(
+      /aisix_usage_events_emitted_total\{[^}]*status_code="200"/,
+    );
+
+    const afterCount = parseUsageEmittedCount(after, "chat", "2xx", "openai");
+    expect(afterCount - beforeCount).toBeGreaterThanOrEqual(1);
+  });
+
   test("disabled prometheus endpoint is not mounted", async (ctx) => {
     if (!etcdReachable) {
       ctx.skip();
@@ -151,6 +211,31 @@ function responseBody() {
     ],
     usage: { prompt_tokens: 11, completion_tokens: 13, total_tokens: 24 },
   };
+}
+
+/**
+ * Extract the integer value of one `aisix_usage_events_emitted_total`
+ * label combination from a prometheus scrape. Returns 0 if the line
+ * is absent (the metric only appears once an emission has happened).
+ * Labels may appear in any order in the scrape output; we match each
+ * by name independently.
+ */
+function parseUsageEmittedCount(
+  scrape: string,
+  handler: string,
+  statusCode: string,
+  inboundProtocol: string,
+): number {
+  for (const line of scrape.split("\n")) {
+    if (!line.startsWith("aisix_usage_events_emitted_total{")) continue;
+    if (!line.includes(`handler="${handler}"`)) continue;
+    if (!line.includes(`status_code="${statusCode}"`)) continue;
+    if (!line.includes(`inbound_protocol="${inboundProtocol}"`)) continue;
+    const valueStr = line.split("}").at(-1)?.trim() ?? "";
+    const v = parseInt(valueStr, 10);
+    if (!Number.isNaN(v)) return v;
+  }
+  return 0;
 }
 
 async function configureOpenAi(

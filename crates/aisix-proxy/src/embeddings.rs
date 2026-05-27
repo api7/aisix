@@ -357,7 +357,8 @@ fn emit_usage_event(
         inbound_protocol: "openai".to_string(),
         ..Default::default()
     };
-    state.usage_sink.try_emit(event.clone());
+    // Handler label "embeddings" — bucketed prometheus counter (#408).
+    state.usage_sink.try_emit("embeddings", event.clone());
     // Per-env OTLP/HTTP fan-out — same shape as chat.rs:1334. The
     // snapshot's exporter table is empty for envs that haven't
     // configured any, so this is a cheap no-op on the common path.

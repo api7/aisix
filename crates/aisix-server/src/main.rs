@@ -386,7 +386,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         cache.clone(),
         &cfg.proxy,
     );
-    proxy_state = proxy_state.with_usage_sink(usage_sink);
+    // Wire the prometheus emit/drop counters into the sink (#408)
+    // so a real DP scrape surfaces UsageEvent throughput without
+    // needing cp-api or an OTLP receiver in the loop.
+    proxy_state = proxy_state.with_usage_sink(usage_sink.with_metrics((*metrics).clone()));
     if let Some(client) = budget_client {
         proxy_state = proxy_state.with_budget_client(client);
     }
