@@ -15,7 +15,7 @@
 //! 8. Providers that don't support completions return 501.
 
 use aisix_gateway::{BridgeContext, BridgeError};
-use aisix_obs::{AccessLog, RequestOutcome};
+use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -28,6 +28,34 @@ use crate::auth::AuthenticatedKey;
 use crate::error::{ErrorEnvelope, ProxyError};
 use crate::request_id::new_request_id;
 use crate::state::ProxyState;
+
+/// Per-request payload from a successful dispatch — carries the
+/// response + provider + the bits the handler needs to emit a
+/// UsageEvent on the success path (#403).
+struct CompletionDispatchSuccess {
+    response: Response,
+    provider: String,
+    /// UUID of the resolved Model row — required for UsageEvent
+    /// `model_id`. Empty only on the 501 NotImplemented branch
+    /// where no upstream call happened (paired with
+    /// `upstream_called=false`).
+    model_id: String,
+    /// Upstream-reported token counts. `None` on the 501
+    /// NotImplemented path (provider doesn't support completions)
+    /// or on a 200 with no `usage` block (rare edge). Handler
+    /// gates UsageEvent emission on this being `Some`.
+    usage: Option<CompletionUsage>,
+}
+
+/// Subset of the OpenAI legacy /v1/completions response `usage`
+/// block surfaced for telemetry. Field naming mirrors the wire:
+/// `prompt_tokens` + `completion_tokens` are both present (unlike
+/// embeddings which has only prompt_tokens). Source:
+/// <https://platform.openai.com/docs/api-reference/completions/object>
+struct CompletionUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+}
 
 pub async fn completions(
     State(state): State<ProxyState>,
@@ -44,24 +72,41 @@ pub async fn completions(
         .to_string();
 
     match dispatch(&state, &auth, body, &request_id).await {
-        Ok((resp, provider)) => {
+        Ok(success) => {
             let elapsed = started.elapsed();
             emit_access_log(
                 &model_name,
-                &provider,
+                &success.provider,
                 &api_key_id,
                 200,
                 elapsed,
                 &request_id,
             );
             state.metrics.record_request(
-                &provider,
+                &success.provider,
                 &model_name,
                 200,
                 RequestOutcome::Success,
                 elapsed,
             );
-            resp
+            // Issue #403: emit UsageEvent so cp-api's budget ledger
+            // and customer-facing /logs see /v1/completions spend.
+            // Pre-#403 the legacy completions handler dropped the
+            // event entirely. Skip emit on the 501 NotImplemented
+            // path (no upstream call) and on 200 without a usage
+            // block (rare edge) — both surface as `usage: None`.
+            if let Some(usage) = success.usage {
+                emit_usage_event(
+                    &state,
+                    &request_id,
+                    &success.model_id,
+                    &api_key_id,
+                    200,
+                    elapsed,
+                    &usage,
+                );
+            }
+            success.response
         }
         Err(err) => {
             let status = err.status().as_u16();
@@ -91,7 +136,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     body: Value,
     request_id: &str,
-) -> Result<(Response, String), ProxyError> {
+) -> Result<CompletionDispatchSuccess, ProxyError> {
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -127,16 +172,98 @@ async fn dispatch(
     let provider_label = provider.to_ascii_lowercase();
 
     match bridge.complete(&body, &ctx).await {
-        Ok(resp_json) => Ok((Json(resp_json).into_response(), provider_label)),
+        Ok(resp_json) => {
+            // Extract usage BEFORE moving resp_json into the Response
+            // so the success struct carries typed counters rather
+            // than re-parsing JSON downstream.
+            let usage = extract_completion_usage(&resp_json);
+            Ok(CompletionDispatchSuccess {
+                response: Json(resp_json).into_response(),
+                provider: provider_label,
+                model_id: model_entry.id.to_string(),
+                usage,
+            })
+        }
         Err(BridgeError::Config(msg)) if msg.contains("does not support text completions") => {
             let env = ErrorEnvelope::new(msg, "not_implemented");
-            Ok((
-                (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
-                provider_label,
-            ))
+            Ok(CompletionDispatchSuccess {
+                response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
+                provider: provider_label,
+                model_id: model_entry.id.to_string(),
+                // No upstream call → no usage to attribute. Handler
+                // gates emission on `usage.is_some()` so 501 stays
+                // out of /logs noise (same convention as #402).
+                usage: None,
+            })
         }
         Err(e) => Err(ProxyError::Bridge(e)),
     }
+}
+
+/// Pull the usage counters out of a legacy /v1/completions response
+/// body. Returns `None` when:
+///   - The `usage` block is missing entirely (non-conformant edge), or
+///   - `usage.prompt_tokens` is missing / non-numeric (malformed)
+///
+/// Both cases skip UsageEvent emission rather than attributing a
+/// zero-everything noise row to the api_key. Per the OpenAI spec,
+/// `prompt_tokens` is required on every successful completion
+/// response — its absence is upstream-malformed, not a legitimate
+/// zero-spend reply. Wire shape:
+/// <https://platform.openai.com/docs/api-reference/completions/object>
+fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
+    let usage = body.get("usage")?;
+    // Required field — gate emit on its presence so a malformed
+    // `usage: {}` upstream response doesn't generate a noise row.
+    let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64())? as u32;
+    let completion_tokens = usage
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    Some(CompletionUsage {
+        prompt_tokens,
+        completion_tokens,
+    })
+}
+
+/// Issue #403: push one `UsageEvent` onto cp-api's telemetry sink
+/// and fan it out to per-env OTLP exporters. Mirrors the shape of
+/// `embeddings::emit_usage_event` (#402) and `responses::emit_usage_event`
+/// (#404); the legacy /v1/completions endpoint has both prompt and
+/// completion sides but no streaming / reasoning tokens.
+///
+/// `inbound_protocol = "openai"` per chat.rs convention. Per-PK
+/// telemetry attribution (`provider_kind` / `branded_provider` /
+/// `pk_label` / `byo_label`) intentionally deferred — wired for
+/// chat only today; non-chat handlers gain it via the same
+/// follow-up that covers #403-#407.
+fn emit_usage_event(
+    state: &ProxyState,
+    request_id: &str,
+    model_id: &str,
+    api_key_id: &str,
+    status_code: u16,
+    elapsed: Duration,
+    usage: &CompletionUsage,
+) {
+    let event = UsageEvent {
+        request_id: request_id.to_string(),
+        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        model_id: model_id.to_string(),
+        api_key_id: api_key_id.to_string(),
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        status_code,
+        inbound_protocol: "openai".to_string(),
+        ..Default::default()
+    };
+    state.usage_sink.try_emit("completions", event.clone());
+    let snap = state.snapshot.load();
+    let exporters = snap.observability_exporters.entries();
+    state
+        .otlp_fan_out
+        .fan_out(&event, exporters.iter().map(|e| &e.value));
 }
 
 fn emit_access_log(
@@ -351,5 +478,165 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// Issue #403: a successful /v1/completions call must emit a
+    /// `UsageEvent` with the upstream-reported prompt + completion
+    /// tokens, status_code, model_id, api_key_id, and
+    /// `inbound_protocol = "openai"`. Pre-#403 the legacy
+    /// completions handler dropped the event entirely.
+    #[tokio::test]
+    async fn emits_usage_event_on_200_with_tokens_issue_403() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // Legacy OpenAI completions wire shape. Pin specific token
+        // counts so a regression that swapped prompt/completion
+        // semantics would fail here.
+        let upstream_body = serde_json::json!({
+            "id": "cmpl-up-1",
+            "object": "text_completion",
+            "model": "gpt-3.5-turbo-instruct",
+            "choices": [{
+                "text": "hi",
+                "index": 0,
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+        });
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({"model": "instruct", "prompt": "hello"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for /v1/completions 200")
+            .expect("usage_sink sender dropped");
+
+        assert_eq!(event.prompt_tokens, 11);
+        assert_eq!(event.completion_tokens, 7);
+        assert_eq!(event.status_code, 200);
+        assert_eq!(event.api_key_id, "k-1");
+        assert_eq!(event.model_id, "m-1");
+        assert_eq!(event.inbound_protocol, "openai");
+        assert!(!event.request_id.is_empty());
+        assert!(!event.occurred_at.is_empty());
+    }
+
+    /// Companion: an upstream 200 with `usage: {}` (malformed —
+    /// `prompt_tokens` is a required field on every legitimate
+    /// completion response) must NOT emit a zero-everything noise
+    /// row. Per audit MEDIUM-1 on PR #425 — applied preemptively
+    /// here so /v1/completions and /v1/responses share the same
+    /// edge-case gate.
+    #[tokio::test]
+    async fn skips_usage_event_when_upstream_usage_block_is_empty() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let upstream_body = serde_json::json!({
+            "id": "cmpl-up-1",
+            "object": "text_completion",
+            "choices": [],
+            "usage": {}  // malformed — prompt_tokens required by spec
+        });
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({"model": "instruct", "prompt": "x"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        if let Ok(Some(ev)) = recv {
+            panic!(
+                "no UsageEvent should be emitted when upstream usage block is malformed, \
+                 but got prompt_tokens={}",
+                ev.prompt_tokens,
+            );
+        }
+    }
+
+    /// Issue #403 negative pinning: 4xx / 5xx responses must NOT
+    /// emit a UsageEvent. Audit MEDIUM-2 on PR #425 — a future
+    /// regression that moved `emit_usage_event` into the error
+    /// branch would silently ship without this kind of negative
+    /// assertion.
+    #[tokio::test]
+    async fn upstream_5xx_does_not_emit_usage_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({"model": "instruct", "prompt": "x"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        if let Ok(Some(ev)) = recv {
+            panic!(
+                "5xx must not emit UsageEvent, got status_code={}",
+                ev.status_code,
+            );
+        }
     }
 }
