@@ -857,6 +857,7 @@ mod tests {
         assert!(rendered.contains(M_LLM_TTFT));
         assert!(rendered.contains("endpoint=\"/v1/chat/completions\""));
         assert!(rendered.contains("team_id=\"team-1\""));
+        assert!(rendered.contains("user_id=\"user-1\""));
     }
 
     #[test]

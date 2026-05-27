@@ -79,6 +79,7 @@ describe("prometheus metrics e2e", () => {
     );
     expect(text).toContain('team_id="unknown"');
     expect(text).toContain('user_id="unknown"');
+    expect(text).not.toContain("owner_id=");
   });
 
   test("custom prometheus path is used for scrapes", async (ctx) => {

@@ -268,8 +268,18 @@ fn apikey_schema() -> Value {
                 "items": { "type": "string" }
             },
             "rate_limit": { "$ref": "#/$defs/rate_limit" },
-            "team_id": { "type": "string", "minLength": 1 },
-            "user_id": { "type": "string", "minLength": 1 }
+            "team_id": {
+                "anyOf": [
+                    { "type": "string", "minLength": 1 },
+                    { "type": "null" }
+                ]
+            },
+            "user_id": {
+                "anyOf": [
+                    { "type": "string", "minLength": 1 },
+                    { "type": "null" }
+                ]
+            }
         },
         "$defs": {
             "rate_limit": {
@@ -796,6 +806,17 @@ mod tests {
             "allowed_models":["gpt-4o"],
             "team_id": "team-uuid-1",
             "user_id": "member-uuid-1"
+        });
+        validate_apikey(&v).unwrap();
+    }
+
+    #[test]
+    fn apikey_with_null_team_and_user_fields_passes() {
+        let v = json!({
+            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models":["gpt-4o"],
+            "team_id": null,
+            "user_id": null
         });
         validate_apikey(&v).unwrap();
     }
