@@ -288,10 +288,23 @@ async fn dispatch(
     // fields (Cohere `meta.api_version`, Jina-specific fields, etc.)
     // that the JSON round-trip would otherwise re-format. A parse
     // failure here is non-fatal: we just skip emission rather than
-    // failing the request.
-    let usage = serde_json::from_slice::<Value>(&body_bytes)
-        .ok()
-        .and_then(|v| extract_rerank_usage(&v));
+    // failing the request. Audit HIGH: log the parse failure so a
+    // silent billing gap is visible in operator dashboards (the
+    // upstream returned 200 + claimed JSON but the body was
+    // unparseable — this is upstream-malformed, not gateway-bug,
+    // but operators need to see it).
+    let usage = match serde_json::from_slice::<Value>(&body_bytes) {
+        Ok(v) => extract_rerank_usage(&v),
+        Err(e) => {
+            tracing::warn!(
+                request_id = %request_id,
+                model = %model_name,
+                error = %e,
+                "rerank: upstream body parse failed; skipping UsageEvent emission"
+            );
+            None
+        }
+    };
 
     let mut resp = axum::response::Response::new(axum::body::Body::from(body_bytes));
 
@@ -894,6 +907,68 @@ mod tests {
         assert_eq!(event.inbound_protocol, "openai");
         assert!(!event.request_id.is_empty());
         assert!(!event.occurred_at.is_empty());
+    }
+
+    /// Issue #405 audit MEDIUM: Jina's wire shape only puts
+    /// `total_tokens` in the usage block (no `prompt_tokens` or
+    /// `input_tokens` field). The extractor's precedence chain
+    /// must fall through correctly — without this test, a refactor
+    /// that broke the `total_tokens` arm would silently zero out
+    /// every Jina-backed billing row.
+    #[tokio::test]
+    async fn emits_usage_event_on_jina_total_tokens_only_shape_audit_m1() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // Jina wire shape: `usage.total_tokens` only (no prompt /
+        // input variant). Real Jina rerank responses look exactly
+        // like this.
+        let upstream_body = serde_json::json!({
+            "model": "jina-reranker-v1-base-en",
+            "results": [{"index": 0, "relevance_score": 0.87}],
+            "usage": {"total_tokens": 19}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(jina_model("rerank-jina"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({
+            "model": "rerank-jina",
+            "query": "x",
+            "documents": ["a", "b"]
+        });
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for Jina-shape rerank 200")
+            .expect("usage_sink sender dropped");
+
+        assert_eq!(
+            event.prompt_tokens, 19,
+            "Jina usage.total_tokens must be surfaced as prompt_tokens \
+             (rerank has no completion side; precedence chain must fall through)",
+        );
+        assert_eq!(event.completion_tokens, 0);
+        assert_eq!(event.inbound_protocol, "openai");
     }
 
     /// Issue #405: Cohere's wire shape puts the token counter at
