@@ -9,7 +9,7 @@
 //! be configured with a `base_url` pointing to their rerank endpoint root.
 //! The gateway appends `/v1/rerank`.
 
-use aisix_obs::{AccessLog, RequestOutcome};
+use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::HeaderValue;
 use axum::response::{IntoResponse, Response};
@@ -21,6 +21,36 @@ use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
 use crate::request_id::new_request_id;
 use crate::state::ProxyState;
+
+/// Per-request payload from a successful dispatch — carries the
+/// response + provider + the bits the handler needs to emit a
+/// UsageEvent on the success path (#405).
+struct RerankDispatchSuccess {
+    response: Response,
+    provider: String,
+    /// UUID of the resolved Model row — required for UsageEvent
+    /// `model_id`. Always present on success.
+    model_id: String,
+    /// Upstream-reported token count. `None` on a 200 with no
+    /// recognisable usage field (provider returned malformed body,
+    /// or a wire shape this gateway doesn't yet support). Handler
+    /// gates UsageEvent emission on this being `Some`.
+    usage: Option<RerankUsage>,
+}
+
+/// Rerank has no completion side — only the input (query + docs)
+/// gets tokenised. Wire shapes by provider:
+/// - Cohere: `meta.billed_units.input_tokens`
+/// - Jina: `usage.total_tokens`
+/// - OpenAI-compat: `usage.prompt_tokens` / `usage.input_tokens`
+///
+/// All three end up here as a single `prompt_tokens` counter
+/// because cp-api's `dpmgr_usage_events` table has no rerank-
+/// specific columns; the value is what gets multiplied by the
+/// model's per-token price for billing.
+struct RerankUsage {
+    prompt_tokens: u32,
+}
 
 pub async fn rerank(
     State(state): State<ProxyState>,
@@ -38,25 +68,42 @@ pub async fn rerank(
         .to_string();
 
     match dispatch(&state, &auth, &mut body, &request_id).await {
-        Ok((resp, provider)) => {
+        Ok(success) => {
             let elapsed = started.elapsed();
-            let status = resp.status().as_u16();
+            let status = success.response.status().as_u16();
             emit_access_log(
                 &model_name,
-                &provider,
+                &success.provider,
                 &api_key_id,
                 status,
                 elapsed,
                 &request_id,
             );
             state.metrics.record_request(
-                &provider,
+                &success.provider,
                 &model_name,
                 status,
                 RequestOutcome::from_status(status),
                 elapsed,
             );
-            resp
+            // Issue #405: emit UsageEvent so cp-api's budget ledger
+            // and customer-facing /logs see /v1/rerank spend.
+            // Pre-#405 the rerank handler dropped the event entirely.
+            // Skip on 200 without a recognisable usage field — avoids
+            // attributing zero-everything noise rows when an
+            // upstream returns a malformed / unsupported shape.
+            if let Some(usage) = success.usage {
+                emit_usage_event(
+                    &state,
+                    &request_id,
+                    &success.model_id,
+                    &api_key_id,
+                    status,
+                    elapsed,
+                    &usage,
+                );
+            }
+            success.response
         }
         Err(err) => {
             let status = err.status().as_u16();
@@ -86,7 +133,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     body: &mut Value,
     request_id: &str,
-) -> Result<(Response, String), ProxyError> {
+) -> Result<RerankDispatchSuccess, ProxyError> {
     let snapshot = state.snapshot.load();
 
     let model_name = body
@@ -235,6 +282,17 @@ async fn dispatch(
         })
         .map_err(ProxyError::Bridge)?;
 
+    // Extract usage from the upstream body BEFORE handing the bytes
+    // off to the response builder. We parse for telemetry but still
+    // forward raw bytes downstream — preserves any provider-specific
+    // fields (Cohere `meta.api_version`, Jina-specific fields, etc.)
+    // that the JSON round-trip would otherwise re-format. A parse
+    // failure here is non-fatal: we just skip emission rather than
+    // failing the request.
+    let usage = serde_json::from_slice::<Value>(&body_bytes)
+        .ok()
+        .and_then(|v| extract_rerank_usage(&v));
+
     let mut resp = axum::response::Response::new(axum::body::Body::from(body_bytes));
 
     // Forward content-type from upstream.
@@ -249,7 +307,84 @@ async fn dispatch(
         HeaderValue::from_str(request_id).unwrap_or_else(|_| HeaderValue::from_static("")),
     );
 
-    Ok((resp, provider_label))
+    Ok(RerankDispatchSuccess {
+        response: resp,
+        provider: provider_label,
+        model_id: model_entry.id.to_string(),
+        usage,
+    })
+}
+
+/// Pull the input token counter out of a rerank response body.
+/// Returns `None` when no recognisable usage field is present.
+///
+/// Three known wire shapes (per #213):
+/// - **OpenAI-compat** — `usage.prompt_tokens` (or `usage.input_tokens`)
+/// - **Cohere** — `meta.billed_units.input_tokens`
+///   (<https://docs.cohere.com/reference/rerank>)
+/// - **Jina** — `usage.total_tokens`
+///   (<https://api.jina.ai/v1/rerank>)
+///
+/// Rerank has no completion side — all three providers tokenise
+/// only the input (query + documents). The single counter is what
+/// cp-api multiplies by the model's per-token price for billing.
+fn extract_rerank_usage(body: &Value) -> Option<RerankUsage> {
+    // OpenAI-compat / Jina shape: `usage` object at the top level.
+    if let Some(usage) = body.get("usage") {
+        let tokens = usage
+            .get("prompt_tokens")
+            .or_else(|| usage.get("input_tokens"))
+            .or_else(|| usage.get("total_tokens"))
+            .and_then(|v| v.as_u64());
+        if let Some(t) = tokens {
+            return Some(RerankUsage {
+                prompt_tokens: t as u32,
+            });
+        }
+    }
+    // Cohere shape: `meta.billed_units.input_tokens`.
+    if let Some(units) = body.get("meta").and_then(|m| m.get("billed_units")) {
+        if let Some(t) = units.get("input_tokens").and_then(|v| v.as_u64()) {
+            return Some(RerankUsage {
+                prompt_tokens: t as u32,
+            });
+        }
+    }
+    None
+}
+
+/// Issue #405: push one `UsageEvent` onto cp-api's telemetry sink
+/// and fan it out to per-env OTLP exporters. Mirrors the shape of
+/// `embeddings::emit_usage_event` (#402) — rerank, like embeddings,
+/// has no completion side, no streaming, no reasoning tokens.
+/// `inbound_protocol = "openai"` per chat.rs convention; rerank
+/// uses the OpenAI-compatible request shape regardless of upstream.
+fn emit_usage_event(
+    state: &ProxyState,
+    request_id: &str,
+    model_id: &str,
+    api_key_id: &str,
+    status_code: u16,
+    elapsed: Duration,
+    usage: &RerankUsage,
+) {
+    let event = UsageEvent {
+        request_id: request_id.to_string(),
+        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        model_id: model_id.to_string(),
+        api_key_id: api_key_id.to_string(),
+        prompt_tokens: usage.prompt_tokens,
+        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        status_code,
+        inbound_protocol: "openai".to_string(),
+        ..Default::default()
+    };
+    state.usage_sink.try_emit("rerank", event.clone());
+    let snap = state.snapshot.load();
+    let exporters = snap.observability_exporters.entries();
+    state
+        .otlp_fan_out
+        .fan_out(&event, exporters.iter().map(|e| &e.value));
 }
 
 /// Default upstream host for the rerank-supporting providers,
@@ -314,6 +449,7 @@ mod tests {
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ApiKey, Model, ProxyConfig};
     use aisix_gateway::Hub;
+    use aisix_provider_openai::OpenAiBridge;
     use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -695,5 +831,225 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         upstream.verify().await;
+    }
+
+    /// Issue #405: a successful /v1/rerank call must emit a
+    /// `UsageEvent` with the upstream-reported `prompt_tokens`,
+    /// `inbound_protocol = "openai"`, `model_id`, `api_key_id`.
+    /// Pre-#405 the rerank handler dropped the event entirely.
+    #[tokio::test]
+    async fn emits_usage_event_on_200_openai_compat_issue_405() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // OpenAI-compat rerank: `usage.prompt_tokens`.
+        let upstream_body = serde_json::json!({
+            "id": "rerank-1",
+            "results": [{"index": 0, "relevance_score": 0.9}],
+            "model": "rerank-multilingual-v3.0",
+            "usage": {"prompt_tokens": 31, "total_tokens": 31}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(openai_model("rerank-openai"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({
+            "model": "rerank-openai",
+            "query": "what is the capital of France?",
+            "documents": ["Paris", "London", "Berlin"]
+        });
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for /v1/rerank 200")
+            .expect("usage_sink sender dropped");
+
+        assert_eq!(event.prompt_tokens, 31);
+        assert_eq!(
+            event.completion_tokens, 0,
+            "rerank has no completion side — completion_tokens must be 0",
+        );
+        assert_eq!(event.status_code, 200);
+        assert_eq!(event.api_key_id, "k-1");
+        assert_eq!(event.model_id, "m-1");
+        assert_eq!(event.inbound_protocol, "openai");
+        assert!(!event.request_id.is_empty());
+        assert!(!event.occurred_at.is_empty());
+    }
+
+    /// Issue #405: Cohere's wire shape puts the token counter at
+    /// `meta.billed_units.input_tokens` instead of `usage.prompt_tokens`.
+    /// The extractor must handle this — without coverage, customers
+    /// running Cohere-backed rerank would see zero spend in cp-api
+    /// even though billing is happening.
+    #[tokio::test]
+    async fn emits_usage_event_on_cohere_wire_shape_issue_405() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // Cohere wire shape: `meta.billed_units.input_tokens`.
+        let upstream_body = serde_json::json!({
+            "id": "rerank-cohere",
+            "results": [{"index": 0, "relevance_score": 0.95}],
+            "meta": {
+                "api_version": {"version": "1"},
+                "billed_units": {"input_tokens": 47, "search_units": 1}
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(cohere_model("rerank-cohere"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({
+            "model": "rerank-cohere",
+            "query": "x",
+            "documents": ["a", "b"]
+        });
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for Cohere-shape rerank 200")
+            .expect("usage_sink sender dropped");
+
+        assert_eq!(
+            event.prompt_tokens, 47,
+            "Cohere meta.billed_units.input_tokens must be surfaced as prompt_tokens",
+        );
+        assert_eq!(event.inbound_protocol, "openai");
+    }
+
+    /// Issue #405: an upstream 200 with no recognisable usage field
+    /// (neither `usage` nor `meta.billed_units`) must NOT emit a
+    /// zero-everything noise row. Same edge-case discipline as
+    /// PR #425 audit MEDIUM-1.
+    #[tokio::test]
+    async fn skips_usage_event_when_upstream_lacks_usage_fields() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let upstream_body = serde_json::json!({
+            "id": "rerank-bare",
+            "results": []
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(openai_model("rerank-openai"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({
+            "model": "rerank-openai",
+            "query": "x",
+            "documents": ["a"]
+        });
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        if let Ok(Some(ev)) = recv {
+            panic!(
+                "no UsageEvent should be emitted when upstream lacks usage fields, \
+                 got prompt_tokens={}",
+                ev.prompt_tokens,
+            );
+        }
+    }
+
+    /// Issue #405 negative pinning: upstream 5xx must NOT emit
+    /// a UsageEvent (same discipline as #425 audit MEDIUM-2).
+    #[tokio::test]
+    async fn upstream_5xx_does_not_emit_usage_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(openai_model("rerank-openai"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({
+            "model": "rerank-openai",
+            "query": "x",
+            "documents": ["a"]
+        });
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        if let Ok(Some(ev)) = recv {
+            panic!(
+                "5xx must not emit UsageEvent, got status_code={}",
+                ev.status_code,
+            );
+        }
     }
 }
