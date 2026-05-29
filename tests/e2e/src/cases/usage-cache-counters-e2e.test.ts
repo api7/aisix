@@ -270,4 +270,126 @@ describe("usage cache-counter passthrough on /v1/chat/completions (#542)", () =>
       await plainUpstream.close();
     }
   });
+
+  test("streaming DeepSeek → terminal chunk carries native + normalized cache counters (#542 audit MEDIUM-7)", async (ctx) => {
+    if (!etcdReachable) {
+      ctx.skip();
+      return;
+    }
+    // DeepSeek streaming puts the usage block (incl. native cache
+    // counters) on the terminal chunk. The harness wraps each
+    // streamEvent as `data: <event>\n\n`; the DP parses via the
+    // OpenAI-compat stream path → render_chunk applies the same
+    // usage policy as the non-streaming path.
+    const streamUpstream = await startOpenAiUpstream({
+      streamEvents: [
+        JSON.stringify({
+          id: "cmpl-ds-stream",
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: "deepseek-chat",
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        }),
+        JSON.stringify({
+          id: "cmpl-ds-stream",
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: "deepseek-chat",
+          choices: [{ index: 0, delta: { content: "hi" }, finish_reason: null }],
+        }),
+        // Terminal chunk: finish_reason set + usage with DeepSeek
+        // native cache counters.
+        JSON.stringify({
+          id: "cmpl-ds-stream",
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: "deepseek-chat",
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          usage: {
+            prompt_tokens: 1000,
+            completion_tokens: 50,
+            total_tokens: 1050,
+            prompt_cache_hit_tokens: 640,
+            prompt_cache_miss_tokens: 360,
+          },
+        }),
+        "[DONE]",
+      ],
+    });
+    const streamApp = await spawnApp();
+    try {
+      const streamAdmin = new AdminClient(streamApp.adminUrl, streamApp.adminKey);
+      const pk = await streamAdmin.createProviderKey({
+        display_name: "cache-ds-stream-pk",
+        secret: "sk-mock",
+        api_base: `${streamUpstream.baseUrl}/v1`,
+        provider: "deepseek",
+        adapter: "openai",
+      });
+      await streamAdmin.createModel({
+        display_name: "cache-ds-stream",
+        provider: "deepseek",
+        model_name: "deepseek-chat",
+        provider_key_id: pk.id,
+      });
+      await streamAdmin.createApiKey({
+        key_hash: CALLER_KEY_HASH,
+        allowed_models: ["cache-ds-stream"],
+      });
+
+      await waitConfigPropagation(async () => {
+        try {
+          const r = await fetch(`${streamApp.proxyUrl}/v1/chat/completions`, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              authorization: `Bearer ${CALLER_PLAINTEXT}`,
+            },
+            body: JSON.stringify({
+              model: "cache-ds-stream",
+              stream: true,
+              messages: [{ role: "user", content: "probe" }],
+            }),
+          });
+          return r.ok;
+        } catch {
+          return false;
+        }
+      });
+
+      const res = await fetch(`${streamApp.proxyUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        },
+        body: JSON.stringify({
+          model: "cache-ds-stream",
+          stream: true,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      });
+      expect(res.status).toBe(200);
+
+      // Find the SSE chunk that carries the usage block and inspect it.
+      const sse = await res.text();
+      const usageChunk = sse
+        .split("\n")
+        .filter((l) => l.startsWith("data: ") && l.includes("\"usage\""))
+        .map((l) => JSON.parse(l.slice("data: ".length)))
+        .find((c) => c.usage);
+      expect(usageChunk, `no usage chunk in stream:\n${sse}`).toBeDefined();
+      const usage = usageChunk.usage as Record<string, unknown>;
+      // Native passthrough on the streaming path
+      expect(usage.prompt_cache_hit_tokens).toBe(640);
+      expect(usage.prompt_cache_miss_tokens).toBe(360);
+      // Normalized OpenAI-canonical shape on the streaming path
+      expect(
+        (usage.prompt_tokens_details as Record<string, unknown>).cached_tokens,
+      ).toBe(640);
+    } finally {
+      await streamApp.exit();
+      await streamUpstream.close();
+    }
+  });
 });

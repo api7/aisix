@@ -265,6 +265,13 @@ fn into_usage(u: OpenAiUsage) -> UsageStats {
             .prompt_tokens_details
             .as_ref()
             .map(|d| d.cached_tokens)
+            // A *zeroed* nested detail must not mask a real native
+            // count (PR #442 audit MEDIUM-1): a hybrid OpenAI-compat
+            // proxy could send `prompt_tokens_details:{cached_tokens:0}`
+            // alongside a non-zero top-level `prompt_cache_hit_tokens`.
+            // Treat nested-zero as "no signal" so the native count
+            // wins; a genuine nested non-zero still takes precedence.
+            .filter(|&n| n > 0)
             .or(u.prompt_cache_hit_tokens)
             .unwrap_or(0),
         reasoning_tokens: u
@@ -612,6 +619,39 @@ mod tests {
         // (b) native fields preserved verbatim for passthrough
         assert_eq!(out.usage.prompt_cache_hit_tokens, Some(768));
         assert_eq!(out.usage.prompt_cache_miss_tokens, Some(232));
+    }
+
+    /// PR #442 audit MEDIUM-1: a hybrid OpenAI-compat upstream that
+    /// sends BOTH a nested `prompt_tokens_details.cached_tokens: 0`
+    /// AND a non-zero top-level `prompt_cache_hit_tokens` must not let
+    /// the zeroed nested detail mask the real native count. The
+    /// normalized `cached_prompt_tokens` should take the native 700.
+    #[test]
+    fn zeroed_nested_cache_detail_does_not_mask_native_count() {
+        let body = r#"{
+            "id": "cmpl-hybrid",
+            "object": "chat.completion",
+            "model": "some-compat-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 10,
+                "total_tokens": 1010,
+                "prompt_tokens_details": {"cached_tokens": 0},
+                "prompt_cache_hit_tokens": 700
+            }
+        }"#;
+        let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        assert_eq!(
+            out.usage.cached_prompt_tokens, 700,
+            "zeroed nested cached_tokens must not mask the non-zero native count",
+        );
+        assert_eq!(out.usage.prompt_cache_hit_tokens, Some(700));
     }
 
     #[test]
