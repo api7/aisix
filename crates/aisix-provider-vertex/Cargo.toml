@@ -11,6 +11,11 @@ description = "aisix: Google Vertex AI provider bridge (skeleton — multi-publi
 [dependencies]
 aisix-core = { path = "../aisix-core" }
 aisix-gateway = { path = "../aisix-gateway" }
+# Claude on Vertex reuses the Anthropic Messages request serializer +
+# response decoder (same crate the Bedrock /invoke path reuses) — the
+# Vertex `:rawPredict` body is Anthropic Messages JSON with a
+# Vertex-specific `anthropic_version`.
+aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
 async-trait.workspace = true
 async-stream = "0.3"
 bytes.workspace = true

@@ -2,9 +2,12 @@
 //!
 //! Multi-publisher dispatch for Google Vertex AI. The publisher is
 //! resolved from the upstream model id and routed to a per-publisher
-//! wire path. **Currently wired:** `google` (Gemini) chat. Other
-//! publishers + streaming surface clear `not yet implemented` errors
-//! referencing D5.x follow-ups — see crate-level docs.
+//! wire path. **Currently wired:** `google` (Gemini) chat + streaming
+//! (`:generateContent` / `:streamGenerateContent`); `anthropic`
+//! (Claude) non-stream chat via `:rawPredict` (Anthropic Messages
+//! wire). Claude streaming (`:streamRawPredict`, D5.3) and the
+//! remaining publishers (`meta` / `mistral` / `ai21`, D5.4) surface
+//! clear `not yet implemented` errors — see crate-level docs.
 //!
 //! Credentials: `ProviderKey.secret` is a JSON-encoded
 //! `{access_token, project, region}` struct. The `access_token` is
@@ -34,6 +37,21 @@ use std::time::{Duration, Instant};
 
 use crate::token_mint::{ServiceAccountKey, TokenMinter};
 use crate::wire;
+
+// Claude on Vertex reuses the shared Anthropic Messages serializer +
+// response decoder (the same `wire` items the Bedrock `/invoke` path
+// reuses). The Vertex `:rawPredict` body is Anthropic Messages JSON
+// minus `model`/`stream` plus a Vertex-specific `anthropic_version`.
+use aisix_provider_anthropic::wire::{
+    build_request as build_anthropic_request, response_into_chat_response, split_system,
+    AnthropicResponse,
+};
+
+/// `anthropic_version` value Vertex's Claude `:rawPredict` endpoint
+/// requires in the request body. Distinct from the Bedrock value
+/// (`bedrock-2023-05-31`). Per Google's Vertex AI Claude reference
+/// <https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/use-claude>.
+const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
 
 /// Family Bridge for Google Vertex AI.
 pub struct VertexBridge {
@@ -531,9 +549,10 @@ impl Bridge for VertexBridge {
 
         match publisher {
             VertexPublisher::Google => self.chat_gemini(req, ctx, upstream_id).await,
+            VertexPublisher::Anthropic => self.chat_anthropic(req, ctx, upstream_id).await,
             other => Err(BridgeError::Config(format!(
                 "vertex publisher {publisher:?} not yet implemented — \
-                 tracked under api7/AISIX-Cloud#302 Phase E (D5.3/D5.4, publisher={})",
+                 tracked under api7/AISIX-Cloud#302 Phase E (D5.4, publisher={})",
                 other.name()
             ))),
         }
@@ -554,6 +573,17 @@ impl Bridge for VertexBridge {
         })?;
         match publisher {
             VertexPublisher::Google => self.chat_gemini_stream(req, ctx, upstream_id).await,
+            // Claude on Vertex non-stream chat is wired (`:rawPredict`);
+            // streaming (`:streamRawPredict`) is the immediate follow-up
+            // — the `stream`-field-in-body vs URL-only contract needs a
+            // primary-source confirmation before shipping, so it is held
+            // back from this PR rather than guessed.
+            VertexPublisher::Anthropic => Err(BridgeError::Config(
+                "vertex anthropic (Claude) streaming is not yet implemented — \
+                 non-stream chat via :rawPredict is wired; streaming \
+                 (:streamRawPredict) tracked under api7/AISIX-Cloud#302 Phase E (D5.3)"
+                    .into(),
+            )),
             other => Err(BridgeError::Config(format!(
                 "vertex publisher {publisher:?} streaming not yet implemented — \
                  tracked under api7/AISIX-Cloud#302 Phase E (D5.3/D5.4, publisher={})",
@@ -627,6 +657,93 @@ impl VertexBridge {
                 .await
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
             Ok(gemini_response_into_chat_response(parsed, upstream_id))
+        })
+        .await
+    }
+
+    /// Dispatch Claude chat (publisher `anthropic`) on Vertex.
+    ///
+    /// URL: `<base>/v1/projects/<project>/locations/<region>/
+    ///       publishers/anthropic/models/<model>:rawPredict`
+    ///
+    /// Unlike Gemini, Claude on Vertex speaks the **Anthropic Messages**
+    /// wire — so the request body is the shared Anthropic Messages JSON
+    /// (the same serializer the Bedrock `/invoke` path uses) with two
+    /// Vertex-specific shaping steps per Google's Vertex AI Claude
+    /// reference
+    /// <https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/use-claude>
+    /// and the Anthropic Vertex SDK
+    /// <https://docs.anthropic.com/en/api/claude-on-vertex-ai>:
+    ///
+    ///   1. Strip `model` — Vertex keys the model off the URL path.
+    ///   2. Strip `stream` — `:rawPredict` is the non-stream route.
+    ///   3. Add `anthropic_version: "vertex-2023-10-16"` (required).
+    ///
+    /// Auth is the same GCP OAuth2 Bearer the Gemini path uses (minted
+    /// from the SA JSON or supplied pre-minted). The response is the
+    /// native Anthropic Messages envelope, decoded by the shared
+    /// `response_into_chat_response`; the customer-facing alias restore
+    /// happens at the proxy render layer, not here.
+    async fn chat_anthropic(
+        &self,
+        req: &ChatFormat,
+        ctx: &BridgeContext,
+        upstream_id: &str,
+    ) -> Result<ChatResponse, BridgeError> {
+        let creds = VertexSecret::parse(&ctx.provider_key.secret)?;
+        validate_url_token("project", &creds.project)?;
+        validate_url_token("region", &creds.region)?;
+        validate_url_token("upstream_id", upstream_id)?;
+
+        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
+        let url = format!(
+            "{base}/v1/projects/{project}/locations/{region}/publishers/anthropic/models/{model}:rawPredict",
+            project = creds.project,
+            region = creds.region,
+            model = upstream_id,
+        );
+
+        // Build the Anthropic Messages body via the shared serializer,
+        // then shape it for Vertex (strip model + stream, add the
+        // Vertex `anthropic_version`). Mirrors the Bedrock `/invoke`
+        // body shaping, differing only in the version string.
+        let (system, messages) =
+            split_system(req).map_err(|e| BridgeError::Config(format!("{e}")))?;
+        let anthropic_req = build_anthropic_request(req, upstream_id, system, messages, false);
+        let mut body_value = serde_json::to_value(&anthropic_req)
+            .map_err(|e| BridgeError::Config(format!("serialize Anthropic request body: {e}")))?;
+        if let Some(obj) = body_value.as_object_mut() {
+            obj.remove("model");
+            obj.remove("stream");
+            obj.insert(
+                "anthropic_version".to_string(),
+                serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.to_string()),
+            );
+        }
+
+        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let headers = build_request_headers(&access_token, &ctx.request_id)?;
+        let client = self.client.clone();
+        let started = Instant::now();
+
+        with_deadline(ctx.deadline, started, async move {
+            let resp = client
+                .post(&url)
+                .headers(headers)
+                .json(&body_value)
+                .send()
+                .await
+                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(map_http_error(status, resp).await);
+            }
+            let parsed: AnthropicResponse = resp
+                .json()
+                .await
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            Ok(response_into_chat_response(parsed))
         })
         .await
     }
@@ -1776,10 +1893,13 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_non_google_publisher_errors_with_publisher_named() {
+        // Claude (anthropic) is now wired for non-stream chat, so use a
+        // still-deferred publisher (Mistral) to exercise the
+        // publisher-not-implemented path.
         let bridge = VertexBridge::new();
         let ctx = BridgeContext::new(
             "req-1",
-            sample_model_with("claude-3-5-sonnet@20241022"),
+            sample_model_with("mistral-large-2411"),
             sample_pk_with_secret(valid_secret_json()),
         );
         let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
@@ -1787,7 +1907,7 @@ mod tests {
         match err {
             BridgeError::Config(msg) => {
                 assert!(msg.contains("not yet implemented"));
-                assert!(msg.contains("anthropic"));
+                assert!(msg.contains("mistral"));
                 assert!(msg.contains("D5"));
             }
             other => panic!("expected Config error, got {other:?}"),
@@ -1843,9 +1963,12 @@ mod tests {
     #[tokio::test]
     async fn chat_ignores_req_model_and_uses_ctx_model_name() {
         let bridge = VertexBridge::new();
+        // Use a still-deferred publisher (Mistral) so the proof of
+        // "model_name is the source of truth" stays on the
+        // publisher-not-implemented path (Claude is now wired).
         let ctx = BridgeContext::new(
             "req-1",
-            sample_model_with("claude-3-5-sonnet@20241022"),
+            sample_model_with("mistral-large-2411"),
             sample_pk_with_secret(valid_secret_json()),
         );
         // req.model set to a value the resolver would reject if it
@@ -1872,9 +1995,12 @@ mod tests {
         // error pointing at D5.3 / D5.4 follow-ups so an operator who
         // tries to stream Claude-on-Vertex sees the right tracking
         // reference rather than a generic transport failure.
+        // Claude streaming is covered by a dedicated test below (it
+        // carries a publisher-specific message now that non-stream
+        // Claude is wired). The remaining publishers still surface the
+        // generic D5.3/D5.4 streaming-not-implemented error.
         let bridge = VertexBridge::new();
         for upstream in [
-            "claude-3-5-sonnet@20241022",
             "llama-3-70b-instruct-maas",
             "mistral-large-2411",
             "jamba-1.5-large",
@@ -1899,6 +2025,37 @@ mod tests {
                 }
                 other => panic!("upstream={upstream} expected Config error, got {other:?}"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_stream_anthropic_returns_streaming_not_yet_implemented() {
+        // Claude non-stream chat is wired (`:rawPredict`); streaming
+        // (`:streamRawPredict`) is the deferred follow-up. The error
+        // must be publisher-specific + actionable (point at D5.3 and
+        // note that non-stream IS available) rather than a generic
+        // transport failure.
+        let bridge = VertexBridge::new();
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-3-5-sonnet@20241022"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat_stream(&req, &ctx).await.err().unwrap();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(
+                    msg.contains("streaming is not yet implemented"),
+                    "got: {msg}"
+                );
+                assert!(
+                    msg.contains("rawPredict"),
+                    "should note non-stream is wired: {msg}"
+                );
+                assert!(msg.contains("D5.3"), "got: {msg}");
+            }
+            other => panic!("expected Config error, got {other:?}"),
         }
     }
 
@@ -1961,6 +2118,95 @@ mod tests {
         let chat = bridge.chat(&req, &ctx).await.unwrap();
         assert_eq!(chat.message.content, "hello from gemini");
         assert_eq!(chat.usage.total_tokens, 6);
+    }
+
+    /// Capturing responder that replies with an Anthropic Messages
+    /// envelope (Claude on Vertex `:rawPredict` returns the native
+    /// Anthropic shape, not the Gemini shape).
+    #[derive(Clone, Default)]
+    struct CapturingAnthropicResponder {
+        captured_body: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    }
+
+    impl Respond for CapturingAnthropicResponder {
+        fn respond(&self, req: &MockRequest) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            *self.captured_body.lock().unwrap() = Some(body);
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_vertex_test",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4-5",
+                "content": [{"type": "text", "text": "hello from claude on vertex"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 3, "output_tokens": 5}
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_anthropic_dispatches_to_raw_predict_url_with_messages_body() {
+        let server = MockServer::start().await;
+        let responder = CapturingAnthropicResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/anthropic/models/claude-sonnet-4-5:rawPredict",
+            ))
+            .and(header("authorization", "Bearer ya29.test"))
+            .and(header("content-type", "application/json"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-sonnet-4-5"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+
+        // Customer-visible response decoded from the Anthropic envelope.
+        assert_eq!(chat.message.content, "hello from claude on vertex");
+        assert_eq!(chat.usage.total_tokens, 8);
+
+        // Wire-shape: Anthropic Messages body with the Vertex
+        // anthropic_version, NO `model` (URL carries it), NO `stream`
+        // (rawPredict is the non-stream route), user turn present, and
+        // `max_tokens` (required by the Anthropic wire, supplied by the
+        // shared serializer).
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        let obj = body.as_object().expect("object body");
+        assert_eq!(
+            obj.get("anthropic_version").and_then(|v| v.as_str()),
+            Some("vertex-2023-10-16"),
+            "Vertex Claude requires anthropic_version=vertex-2023-10-16; got {body}",
+        );
+        assert!(
+            !obj.contains_key("model"),
+            "model must be stripped (Vertex keys it off the URL): {body}"
+        );
+        assert!(
+            !obj.contains_key("stream"),
+            "stream must be stripped on the :rawPredict (non-stream) route: {body}"
+        );
+        assert!(
+            obj.get("messages")
+                .and_then(|v| v.as_array())
+                .is_some_and(|m| !m.is_empty()),
+            "messages array must carry the user turn: {body}"
+        );
+        assert!(
+            obj.contains_key("max_tokens"),
+            "max_tokens is required by the Anthropic Messages wire: {body}"
+        );
     }
 
     /// End-to-end production-path coverage for api7/ai-gateway#390:
