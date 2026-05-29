@@ -128,9 +128,11 @@ impl Usage {
             prompt_tokens_details: (u.cached_prompt_tokens > 0).then_some(PromptTokensDetails {
                 cached_tokens: u.cached_prompt_tokens,
             }),
-            completion_tokens_details: (u.reasoning_tokens > 0).then_some(CompletionTokensDetails {
-                reasoning_tokens: u.reasoning_tokens,
-            }),
+            completion_tokens_details: (u.reasoning_tokens > 0).then_some(
+                CompletionTokensDetails {
+                    reasoning_tokens: u.reasoning_tokens,
+                },
+            ),
             prompt_cache_hit_tokens: u.prompt_cache_hit_tokens,
             prompt_cache_miss_tokens: u.prompt_cache_miss_tokens,
         }
