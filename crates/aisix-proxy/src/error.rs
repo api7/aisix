@@ -73,6 +73,35 @@ pub struct ErrorBody {
     pub param: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    /// Budget-denial detail (prd-09b §5.8), flattened into the `error`
+    /// block on a `budget_exceeded` 429 only. `None` (and thus absent
+    /// from the wire) for every other error — upstream-translated
+    /// errors, rate limits, validation, etc. — so the bare OpenAI
+    /// {message,type,param,code} shape is preserved everywhere else.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<BudgetErrorFields>,
+}
+
+/// The structured budget fields that `budget_exceeded` 429s lift from
+/// cp-api's reason. Flattened into `ErrorBody`. Each field is omitted
+/// when absent so a fallback-mode denial (cp-api unreachable, no
+/// structured detail) still serializes cleanly with just a message.
+#[derive(Debug, Serialize, Clone)]
+pub struct BudgetErrorFields {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_usd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spent_usd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub period_resets_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u64>,
 }
 
 impl ErrorEnvelope {
@@ -83,12 +112,28 @@ impl ErrorEnvelope {
                 kind: kind.into(),
                 param: None,
                 code: None,
+                budget: None,
             },
         }
     }
 
     pub fn with_code(mut self, code: impl Into<String>) -> Self {
         self.error.code = Some(code.into());
+        self
+    }
+
+    /// Attach the structured budget detail to the error block. Only
+    /// the budget_exceeded path calls this.
+    pub fn with_budget(mut self, r: &crate::budget::BudgetReason) -> Self {
+        self.error.budget = Some(BudgetErrorFields {
+            scope: r.scope.clone(),
+            scope_ref: r.scope_ref.clone(),
+            limit_usd: r.limit_usd.clone(),
+            spent_usd: r.spent_usd.clone(),
+            period: r.period.clone(),
+            period_resets_at: r.period_resets_at.clone(),
+            retry_after_seconds: r.retry_after_seconds,
+        });
         self
     }
 }
@@ -127,8 +172,17 @@ pub enum ProxyError {
     /// to `tracing` for operators.
     #[error("{0}")]
     ContentFiltered(String),
-    #[error("budget exceeded for ApiKey {0:?}")]
-    BudgetExceeded(String),
+    // Carries cp-api's structured reason. Display forwards the cp-api
+    // message verbatim (it's already a complete customer sentence —
+    // "<scope> budget '<name>' exceeded ($X/period). Resets …"); the
+    // structured fields ride along in the 429 error block via
+    // `with_budget` (prd-09b §5.8).
+    // Boxed: BudgetReason is ~184 bytes; inlining it would make this the
+    // largest ProxyError variant and trip clippy::result_large_err across
+    // every `Result<_, ProxyError>` in the hot path. The box keeps the
+    // enum small (budget denial is rare, so the extra alloc is fine).
+    #[error("{}", .0.message)]
+    BudgetExceeded(Box<crate::budget::BudgetReason>),
     /// Per RFC 9110 §15.5.14, a request body that exceeds a server-
     /// imposed limit gets a `413 Content Too Large`. The caller-visible
     /// `message` is intentionally bare of the actual incoming size
@@ -214,7 +268,7 @@ impl ProxyError {
         }
         let env = ErrorEnvelope::new(self.to_string(), self.kind());
         match self {
-            ProxyError::BudgetExceeded(_) => env.with_code("budget_exceeded"),
+            ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
             _ => env,
         }
     }
@@ -591,9 +645,49 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_envelope_429_budget_exceeded_maps_to_rate_limit_error() {
-        let err = ProxyError::BudgetExceeded("ak-1".into());
+        let err =
+            ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason::message_only("ak-1")));
         let resp = err.into_anthropic_response();
         assert_anthropic_envelope(resp, StatusCode::TOO_MANY_REQUESTS, "rate_limit_error").await;
+    }
+
+    #[test]
+    fn openai_envelope_budget_exceeded_carries_structured_fields() {
+        // prd-09b §5.8: the budget_exceeded 429 lifts cp-api's structured
+        // reason into the error block. Pin scope / scope_ref / limit_usd /
+        // spent_usd / period so a regression that drops them (the old
+        // String-only variant) fails here.
+        let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
+            message: "team budget 'frontend' exceeded ($1.00/month). Resets soon.".into(),
+            scope: Some("team".into()),
+            scope_ref: Some("team-uuid-1".into()),
+            limit_usd: Some("1.00".into()),
+            spent_usd: Some("2.00".into()),
+            period: Some("month".into()),
+            period_resets_at: Some("2026-06-01T00:00:00Z".into()),
+            retry_after_seconds: Some(259_200),
+        }));
+        let v = serde_json::to_value(err.envelope()).unwrap();
+        let e = &v["error"];
+        assert_eq!(e["type"], "billing_error");
+        assert_eq!(e["code"], "budget_exceeded");
+        assert_eq!(e["scope"], "team");
+        assert_eq!(e["scope_ref"], "team-uuid-1");
+        assert_eq!(e["limit_usd"], "1.00");
+        assert_eq!(e["spent_usd"], "2.00");
+        assert_eq!(e["period"], "month");
+        assert_eq!(e["period_resets_at"], "2026-06-01T00:00:00Z");
+        assert_eq!(e["retry_after_seconds"], 259_200);
+        assert!(e["message"]
+            .as_str()
+            .unwrap()
+            .contains("team budget 'frontend'"));
+
+        // A non-budget error must NOT carry these fields — the flatten
+        // omits them so every other error keeps the bare OpenAI shape.
+        let other = serde_json::to_value(ProxyError::ModelNotFound("m".into()).envelope()).unwrap();
+        assert!(other["error"].get("scope").is_none());
+        assert!(other["error"].get("limit_usd").is_none());
     }
 
     #[tokio::test]

@@ -43,7 +43,7 @@ impl FailMode {
 pub struct Decision {
     pub allowed: bool,
     pub fail_mode: FailMode,
-    pub reason: Option<String>,
+    pub reason: Option<BudgetReason>,
     pub budget: Option<BudgetDetails>,
 }
 
@@ -53,6 +53,37 @@ pub struct BudgetDetails {
     pub spent_usd: Option<f64>,
     pub remaining_usd: Option<f64>,
     pub reset_seconds: Option<u64>,
+}
+
+/// Customer-facing detail for a budget denial, forwarded from cp-api's
+/// `BudgetCheckReason` (prd-09b §5.8). The DP lifts these into the 429
+/// `error` block so a programmatic client can see *which* budget tripped
+/// (`scope` / `scope_ref`) and by how much (`limit_usd` / `spent_usd`),
+/// not just the human `message`. Every field beyond `message` is
+/// optional: the cp-api-unreachable fallback decisions carry only a
+/// message, with no structured detail.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BudgetReason {
+    pub message: String,
+    pub scope: Option<String>,
+    pub scope_ref: Option<String>,
+    pub limit_usd: Option<String>,
+    pub spent_usd: Option<String>,
+    pub period: Option<String>,
+    pub period_resets_at: Option<String>,
+    pub retry_after_seconds: Option<u64>,
+}
+
+impl BudgetReason {
+    /// A reason carrying only a human message — used by the
+    /// cp-api-unreachable fallback paths (and the api_key fallback in
+    /// chat dispatch), which have no structured scope detail.
+    pub(crate) fn message_only(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            ..Default::default()
+        }
+    }
 }
 
 impl Decision {
@@ -180,7 +211,9 @@ impl BudgetClient {
         Decision {
             allowed: false,
             fail_mode: FailMode::Sticky,
-            reason: Some("cp-api unreachable and no cached decision".to_string()),
+            reason: Some(BudgetReason::message_only(
+                "cp-api unreachable and no cached decision",
+            )),
             budget: None,
         }
     }
@@ -221,13 +254,17 @@ fn apply_fail_mode(prev: &Decision) -> Decision {
         FailMode::Closed => Decision {
             allowed: false,
             fail_mode: FailMode::Closed,
-            reason: Some("cp-api unreachable; fail_mode=closed".to_string()),
+            reason: Some(BudgetReason::message_only(
+                "cp-api unreachable; fail_mode=closed",
+            )),
             budget: prev.budget.clone(),
         },
         FailMode::Sticky => Decision {
             allowed: false,
             fail_mode: FailMode::Sticky,
-            reason: Some("cp-api unreachable; cached decision stale".to_string()),
+            reason: Some(BudgetReason::message_only(
+                "cp-api unreachable; cached decision stale",
+            )),
             budget: prev.budget.clone(),
         },
     }
@@ -268,12 +305,24 @@ struct WireReason {
     #[serde(default)]
     message: String,
     #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    scope_ref: Option<String>,
+    #[serde(default)]
     limit_usd: Option<Value>,
     #[serde(default)]
     spent_usd: Option<Value>,
     #[serde(default)]
     remaining_usd: Option<Value>,
-    #[serde(default, alias = "period_resets_at")]
+    #[serde(default)]
+    period: Option<String>,
+    #[serde(default)]
+    period_resets_at: Option<String>,
+    // cp-api's reason carries `retry_after_seconds` (int). Aliased to
+    // `reset_seconds` so the existing BudgetDetails (gauge) path keeps
+    // reading the same field, and the BudgetReason path reuses it for
+    // retry_after_seconds.
+    #[serde(default, alias = "retry_after_seconds")]
     reset_seconds: Option<Value>,
 }
 
@@ -314,12 +363,19 @@ async fn fetch_decision(
         remaining_usd: value_as_f64(b.remaining_usd.as_ref()),
         reset_seconds: value_as_u64(b.reset_seconds.as_ref()),
     });
-    let reason = wire.reason.and_then(|r| {
-        if r.message.is_empty() {
-            None
-        } else {
-            Some(r.message)
-        }
+    // Lift cp-api's structured reason into the customer-facing detail
+    // (prd-09b §5.8). limit_usd / spent_usd are formatted to the 2dp
+    // dollar-string cp-api itself uses. A reason with neither a message
+    // nor any structured field is treated as absent.
+    let reason = wire.reason.map(|r| BudgetReason {
+        message: r.message,
+        scope: r.scope,
+        scope_ref: r.scope_ref,
+        limit_usd: value_as_f64(r.limit_usd.as_ref()).map(|v| format!("{v:.2}")),
+        spent_usd: value_as_f64(r.spent_usd.as_ref()).map(|v| format!("{v:.2}")),
+        period: r.period,
+        period_resets_at: r.period_resets_at,
+        retry_after_seconds: value_as_u64(r.reset_seconds.as_ref()),
     });
     Ok(Decision {
         allowed: wire.allow,
@@ -434,11 +490,17 @@ mod tests {
         let d = c.check("k-1").await;
         assert!(!d.allowed);
         assert_eq!(d.fail_mode, FailMode::Closed);
-        assert!(d
-            .reason
-            .as_deref()
-            .unwrap()
-            .contains("org budget 'monthly' exceeded"));
+        let r = d.reason.expect("reason present");
+        assert!(r.message.contains("org budget 'monthly' exceeded"));
+        // Structured fields must be lifted from cp-api's reason (#433),
+        // not dropped at deserialization.
+        assert_eq!(r.scope.as_deref(), Some("org"));
+        assert_eq!(r.scope_ref.as_deref(), Some("org-uuid-1"));
+        assert_eq!(r.limit_usd.as_deref(), Some("10.00"));
+        assert_eq!(r.spent_usd.as_deref(), Some("10.50"));
+        assert_eq!(r.period.as_deref(), Some("month"));
+        assert_eq!(r.period_resets_at.as_deref(), Some("2026-05-01T00:00:00Z"));
+        assert_eq!(r.retry_after_seconds, Some(86_400));
     }
 
     #[tokio::test]

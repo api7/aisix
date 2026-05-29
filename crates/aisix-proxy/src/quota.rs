@@ -189,9 +189,11 @@ pub(crate) async fn enforce<'a>(
         state.metrics.clear_budget_gauges(budget_labels);
     }
     if !decision.allowed {
-        return Err(ProxyError::BudgetExceeded(
-            decision.reason.unwrap_or_else(|| auth.entry.id.clone()),
-        ));
+        return Err(ProxyError::BudgetExceeded(Box::new(
+            decision.reason.unwrap_or_else(|| {
+                crate::budget::BudgetReason::message_only(auth.entry.id.clone())
+            }),
+        )));
     }
 
     reserve_layers(state, auth, model_rl)

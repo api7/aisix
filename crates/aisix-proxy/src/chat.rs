@@ -710,9 +710,11 @@ async fn dispatch(
         record_budget_gauges(&state.metrics, auth, None);
     }
     if !decision.allowed {
-        return Err(with_model(ProxyError::BudgetExceeded(
-            decision.reason.unwrap_or_else(|| auth.entry.id.clone()),
-        )));
+        return Err(with_model(ProxyError::BudgetExceeded(Box::new(
+            decision.reason.unwrap_or_else(|| {
+                crate::budget::BudgetReason::message_only(auth.entry.id.clone())
+            }),
+        ))));
     }
 
     // Resolve the attempt-list of underlying Model entries. For a

@@ -85,6 +85,7 @@ pub(crate) fn render_openai_envelope(
             UpstreamWire::AzureOpenAI => derived_code.or_else(|| view.code.clone()),
             _ => derived_code,
         },
+        budget: None,
     }
 }
 
@@ -98,6 +99,7 @@ fn generic(message: &str) -> ErrorBody {
         kind: UPSTREAM_ERROR_TYPE.to_string(),
         param: None,
         code: None,
+        budget: None,
     }
 }
 
