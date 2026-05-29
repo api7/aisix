@@ -409,7 +409,7 @@ fn guardrail_schema() -> Value {
             "enabled":    { "type": "boolean" },
             "hook_point": { "enum": ["input", "output", "both"] },
             "fail_open":  { "type": "boolean" },
-            "kind":       { "enum": ["keyword", "bedrock"] }
+            "kind":       { "enum": ["keyword", "bedrock", "azure_content_safety"] }
         },
         "oneOf": [
             {
@@ -436,6 +436,20 @@ fn guardrail_schema() -> Value {
                     "region":             { "type": "string", "minLength": 1 },
                     "aws_credentials":    { "$ref": "#/$defs/bedrock_aws_credentials" },
                     "latency_mode":       { "$ref": "#/$defs/bedrock_latency_mode" }
+                }
+            },
+            {
+                // kind=azure_content_safety — Azure AI Content Safety
+                // Prompt Shield. Mirrors AzureContentSafetyConfig in
+                // guardrail.rs: endpoint + api_key required, timeout_ms
+                // optional (u32, defaults to 5000 on the struct).
+                "type": "object",
+                "required": ["kind", "endpoint", "api_key"],
+                "properties": {
+                    "kind":       { "const": "azure_content_safety" },
+                    "endpoint":   { "type": "string", "minLength": 1 },
+                    "api_key":    { "type": "string", "minLength": 1 },
+                    "timeout_ms": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295u64 }
                 }
             }
         ],
@@ -1096,6 +1110,43 @@ mod tests {
             "latency_mode": { "kind": "serial" }
         });
         // Phase 4 will add role_arn; today it's rejected.
+        assert!(validate_guardrail(&v).is_err());
+    }
+
+    #[test]
+    fn guardrail_azure_content_safety_passes() {
+        // Regression for #437: the loader JSON schema must accept the
+        // azure_content_safety kind, not just the Rust struct. timeout_ms
+        // omitted here — it's optional (defaults to 5000 on the struct).
+        let v = json!({
+            "name": "prompt-shield",
+            "kind": "azure_content_safety",
+            "hook_point": "input",
+            "endpoint": "https://my-resource.cognitiveservices.azure.com",
+            "api_key": "plaintext-key"
+        });
+        validate_guardrail(&v).unwrap();
+    }
+
+    #[test]
+    fn guardrail_azure_content_safety_with_timeout_passes() {
+        let v = json!({
+            "name": "prompt-shield",
+            "kind": "azure_content_safety",
+            "endpoint": "https://r.cognitiveservices.azure.com",
+            "api_key": "k",
+            "timeout_ms": 3000
+        });
+        validate_guardrail(&v).unwrap();
+    }
+
+    #[test]
+    fn guardrail_azure_content_safety_missing_api_key_rejected() {
+        let v = json!({
+            "name": "g",
+            "kind": "azure_content_safety",
+            "endpoint": "https://r.cognitiveservices.azure.com"
+        });
         assert!(validate_guardrail(&v).is_err());
     }
 
