@@ -1031,6 +1031,12 @@ fn emit_anthropic_usage_event(
 // end-of-stream OR on client-disconnect (mirroring chat.rs's
 // `CompleteOnDrop`), so a streamed request always ships a UsageEvent.
 
+/// Upper bound on the in-flight SSE frame buffer (PR #436 audit
+/// MEDIUM-2). Real Anthropic SSE frames are a few KB at most; this
+/// ceiling only trips on a non-conformant upstream that never emits a
+/// frame terminator, guarding against per-request memory exhaustion.
+const MAX_SSE_FRAME_BUF_BYTES: usize = 1 << 20; // 1 MiB
+
 /// Accumulated usage observed across an Anthropic SSE stream.
 /// Sourced from `message_start` (input + cache tokens, id, model) and
 /// `message_delta` (running output_tokens, stop_reason). All fields
@@ -1099,12 +1105,21 @@ fn update_anthropic_usage(
             }
         }
         Some("message_delta") => {
-            if let Some(t) = json
-                .get("usage")
-                .and_then(|u| u.get("output_tokens"))
-                .and_then(Value::as_u64)
-            {
-                acc.completion_tokens = acc.completion_tokens.max(t as u32);
+            if let Some(v) = json.get("usage").and_then(|u| u.get("output_tokens")) {
+                if let Some(t) = v.as_u64() {
+                    acc.completion_tokens = acc.completion_tokens.max(t as u32);
+                } else {
+                    // PR #436 audit LOW-1: a `usage` object present but
+                    // with a non-numeric `output_tokens` leaves
+                    // completion_tokens at the message_start floor
+                    // (often 1) — a silent under-count. Surface it so a
+                    // wire-shape drift is visible to operators.
+                    tracing::debug!(
+                        output_tokens = %v,
+                        "anthropic stream: message_delta usage.output_tokens \
+                         is non-numeric; completion_tokens left at floor"
+                    );
+                }
             }
             if let Some(sr) = json
                 .get("delta")
@@ -1274,6 +1289,28 @@ where
                     started,
                     &mut first_token_seen,
                 );
+                // Bound the frame buffer (PR #436 audit MEDIUM-2). The
+                // happy path drains complete frames above, so `buf`
+                // only retains a partial trailing frame — normally a
+                // few hundred bytes. A malformed / hostile upstream
+                // that streams bytes WITHOUT a blank-line terminator
+                // would otherwise grow `buf` unboundedly (per-request
+                // memory exhaustion). Real Anthropic SSE frames are
+                // well under a few KB, so a 1 MiB ceiling can only be
+                // hit by a non-conformant stream; drop the buffer
+                // (losing usage parsing for that pathological case)
+                // rather than OOM. The bytes themselves still forward
+                // to the client verbatim — only telemetry parsing is
+                // affected.
+                if buf.len() > MAX_SSE_FRAME_BUF_BYTES {
+                    tracing::warn!(
+                        buffered = buf.len(),
+                        "anthropic stream: SSE frame buffer exceeded cap without a \
+                         terminator; dropping buffer (usage parsing skipped for the \
+                         oversized frame)"
+                    );
+                    buf.clear();
+                }
             }
             // Forward the original item verbatim (Ok bytes OR Err — an
             // upstream error mid-stream is passed through; the
@@ -2490,6 +2527,37 @@ event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_toke
             "output_tokens parsed once the split frame is reassembled",
         );
         assert!(buf.is_empty(), "buffer fully drained after both frames");
+    }
+
+    /// Issue #245 (audit angle 8c): a stream that carries NO usage
+    /// blocks at all — e.g. an Anthropic error stream — must drain
+    /// cleanly leaving the accumulator at zeros, without panicking.
+    /// Guards the best-effort parser against a frame shape it doesn't
+    /// recognise.
+    #[test]
+    fn sse_frame_parser_tolerates_streams_without_usage() {
+        use super::{drain_anthropic_sse_frames, AnthropicStreamUsage};
+
+        let mut acc = AnthropicStreamUsage::default();
+        let mut first_token_seen = false;
+        let started = std::time::Instant::now();
+
+        let mut buf: Vec<u8> = Vec::new();
+        // An error-style stream: a `ping` frame, an `error` frame, no
+        // message_start / message_delta and so no usage anywhere.
+        buf.extend_from_slice(
+            b"event: ping\ndata: {\"type\":\"ping\"}\n\n\
+event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}\n\n",
+        );
+        drain_anthropic_sse_frames(&mut buf, &mut acc, started, &mut first_token_seen);
+
+        assert_eq!(acc.prompt_tokens, 0, "no usage → prompt_tokens stays zero");
+        assert_eq!(acc.completion_tokens, 0, "no usage → completion stays zero");
+        assert!(
+            acc.provider_request_id.is_empty(),
+            "no message_start → no provider_request_id",
+        );
+        assert!(buf.is_empty(), "both frames drained even without usage");
     }
 
     /// Issue #245 / #419 parity: the stream Drop guard must zero the
