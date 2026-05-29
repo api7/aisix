@@ -36,7 +36,7 @@ Each adapter family is a distinct `Bridge` implementation. The gateway does not 
 - The **OpenAI** and **Azure OpenAI** bridges speak the OpenAI chat-completions wire. Azure differs on the URL pattern (deployment-keyed), the auth header (`api-key` instead of `Authorization`), and tolerance for Azure's `prompt_filter_results` / `content_filter_results` response extensions.
 - The **Anthropic** bridge speaks the Anthropic Messages wire and translates Anthropic-shaped requests bidirectionally for non-Anthropic upstreams (see [Anthropic Messages](../integration/anthropic-messages.md)).
 - The **Bedrock** bridge dispatches through the AWS SDK with SigV4 signing. Anthropic-on-Bedrock models use the legacy `/invoke` route with an Anthropic Messages body; all other publishers use the unified Converse API.
-- The **Vertex** bridge builds Gemini's `:generateContent` request body and mints a GCP OAuth2 token from the service-account credential before each call.
+- The **Vertex** bridge builds Gemini's `:generateContent` request body and authenticates with a GCP OAuth2 Bearer token — either minted in-process from a service-account credential and cached, or supplied pre-minted (see [Google Vertex AI upstream § Token minting](../integration/upstream-vertex.md#token-minting)).
 
 Whatever the upstream protocol, the customer-facing contract stays OpenAI-shaped: the response is rendered back as an OpenAI chat-completions envelope, and `response.model` echoes your model alias rather than the upstream id. That alias restore is gateway-wide and applies identically across all five families.
 
