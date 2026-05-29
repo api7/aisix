@@ -50,7 +50,7 @@ A key `K` runs in environment `prod` and was created with `team_id = frontend` a
 | `team` `frontend` | $200 / month | $185 | $15 |
 | `member` `alice` | $30 / month | $30 | **$0** |
 
-A request on `K` is checked against **all five** — they all apply. `alice`'s member cap is exactly spent, so the request is **denied with `429`** even though the org, env, api_key, and team budgets still have room. `reason.scope` is `member`. A caller always feels the cap with the least remaining room.
+A request on `K` is checked against **all five** configured budgets — they all apply (this scenario has no `provider_key` budget; that's the sixth scope). `alice`'s member cap is exactly spent, so the request is **denied with `429`** even though the org, env, api_key, and team budgets still have room. `reason.scope` is `member`. A caller always feels the cap with the least remaining room.
 
 **2. `team` and `member` totals span every environment; `environment` and `api_key` do not.**
 `team` / `member` budgets are org-scoped — they sum spend across *every* environment their bound keys run in. Team `frontend` owns `K1` in `prod` and `K2` in `staging`:
