@@ -4,13 +4,12 @@
 //! resolved from the upstream model id and routed to a per-publisher
 //! wire path. **Currently wired:** `google` (Gemini) chat + streaming
 //! (`:generateContent` / `:streamGenerateContent`); `anthropic`
-//! (Claude) non-stream chat via `:rawPredict` (Anthropic Messages
-//! wire); and the **OpenAI-compatible MaaS family** (Llama, DeepSeek,
-//! Qwen, gpt-oss, MiniMax, Moonshot, Z.ai) chat + streaming via the
-//! OpenAI shim (`endpoints/openapi/chat/completions`). Claude
-//! streaming (`:streamRawPredict`, D5.3) and the `:rawPredict`
-//! publishers `mistral` / `ai21` (D5.4) still surface clear `not yet
-//! implemented` errors — see crate-level docs.
+//! (Claude) chat + streaming via `:rawPredict` / `:streamRawPredict`
+//! (Anthropic Messages wire); and the **OpenAI-compatible MaaS family**
+//! (Llama, DeepSeek, Qwen, gpt-oss, MiniMax, Moonshot, Z.ai) chat +
+//! streaming via the OpenAI shim (`endpoints/openapi/chat/completions`).
+//! The `:rawPredict` publishers `mistral` / `ai21` (D5.4) still surface
+//! clear `not yet implemented` errors — see crate-level docs.
 //!
 //! Credentials: `ProviderKey.secret` is a JSON-encoded
 //! `{access_token, project, region}` struct. The `access_token` is
@@ -44,10 +43,13 @@ use crate::wire;
 // Claude on Vertex reuses the shared Anthropic Messages serializer +
 // response decoder (the same `wire` items the Bedrock `/invoke` path
 // reuses). The Vertex `:rawPredict` body is Anthropic Messages JSON
-// minus `model`/`stream` plus a Vertex-specific `anthropic_version`.
+// minus `model`/`stream` plus a Vertex-specific `anthropic_version`;
+// `:streamRawPredict` keeps `stream: true` in the body and emits native
+// Anthropic SSE, decoded by the shared `AnthropicStreamEvent` +
+// `StreamState` (the same decoder the direct Anthropic bridge uses).
 use aisix_provider_anthropic::wire::{
     build_request as build_anthropic_request, response_into_chat_response, split_system,
-    AnthropicResponse,
+    AnthropicResponse, AnthropicStreamEvent, StreamState,
 };
 
 // Llama + the OpenAI-compatible MaaS family on Vertex use the OpenAI
@@ -612,17 +614,7 @@ impl Bridge for VertexBridge {
             VertexPublisher::OpenAiCompat => {
                 self.chat_openai_shim_stream(req, ctx, upstream_id).await
             }
-            // Claude on Vertex non-stream chat is wired (`:rawPredict`);
-            // streaming (`:streamRawPredict`) is the immediate follow-up
-            // — the `stream`-field-in-body vs URL-only contract needs a
-            // primary-source confirmation before shipping, so it is held
-            // back from this PR rather than guessed.
-            VertexPublisher::Anthropic => Err(BridgeError::Config(
-                "vertex anthropic (Claude) streaming is not yet implemented — \
-                 non-stream chat via :rawPredict is wired; streaming \
-                 (:streamRawPredict) tracked under api7/AISIX-Cloud#302 Phase E (D5.3)"
-                    .into(),
-            )),
+            VertexPublisher::Anthropic => self.chat_anthropic_stream(req, ctx, upstream_id).await,
             other => Err(BridgeError::Config(format!(
                 "vertex publisher {publisher:?} streaming not yet implemented — \
                  tracked under api7/AISIX-Cloud#302 Phase E (D5.3/D5.4, publisher={})",
@@ -785,6 +777,116 @@ impl VertexBridge {
             Ok(response_into_chat_response(parsed))
         })
         .await
+    }
+
+    /// Streaming counterpart of [`Self::chat_anthropic`]. Claude on
+    /// Vertex streams via the `:streamRawPredict` action with the SAME
+    /// Anthropic Messages body shaping as the non-stream path EXCEPT
+    /// `stream: true` is KEPT in the body. The URL action alone does not
+    /// signal streaming: the Anthropic Vertex SDK pops `model` into the
+    /// URL but *reads* (not removes) `stream`, so `"stream": true` still
+    /// rides in the body
+    /// <https://github.com/anthropics/anthropic-sdk-python/blob/main/src/anthropic/lib/vertex/_client.py>.
+    ///
+    /// The response is native Anthropic SSE (`message_start` /
+    /// `content_block_delta` / `message_delta` / `message_stop`), decoded
+    /// by the shared [`AnthropicStreamEvent`] + [`StreamState`] — the
+    /// exact decoder the direct Anthropic bridge drives, so streaming
+    /// behaviour matches direct Anthropic. Auth + the customer-facing
+    /// alias restore are identical to the non-stream path.
+    async fn chat_anthropic_stream(
+        &self,
+        req: &ChatFormat,
+        ctx: &BridgeContext,
+        upstream_id: &str,
+    ) -> Result<ChatChunkStream, BridgeError> {
+        let creds = VertexSecret::parse(&ctx.provider_key.secret)?;
+        validate_url_token("project", &creds.project)?;
+        validate_url_token("region", &creds.region)?;
+        validate_url_token("upstream_id", upstream_id)?;
+
+        let base = self.resolve_api_base(&creds.region, ctx.provider_key.api_base.as_deref())?;
+        let url = format!(
+            "{base}/v1/projects/{project}/locations/{region}/publishers/anthropic/models/{model}:streamRawPredict",
+            project = creds.project,
+            region = creds.region,
+            model = upstream_id,
+        );
+
+        // Same Anthropic Messages body as the non-stream path, but built
+        // with stream=true and — unlike `:rawPredict` — `stream` is KEPT
+        // in the body (only `model` is stripped into the URL). Add the
+        // Vertex `anthropic_version`.
+        let (system, messages) =
+            split_system(req).map_err(|e| BridgeError::Config(format!("{e}")))?;
+        let anthropic_req = build_anthropic_request(req, upstream_id, system, messages, true);
+        let mut body_value = serde_json::to_value(&anthropic_req)
+            .map_err(|e| BridgeError::Config(format!("serialize Anthropic request body: {e}")))?;
+        if let Some(obj) = body_value.as_object_mut() {
+            obj.remove("model");
+            obj.insert(
+                "anthropic_version".to_string(),
+                serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.to_string()),
+            );
+        }
+
+        // Resolve bearer BEFORE entering the stream future so a
+        // token-mint error surfaces as a direct Err, not mid-stream.
+        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let headers = build_request_headers(&access_token, &ctx.request_id)?;
+        let client = self.client.clone();
+        let started = Instant::now();
+
+        let resp = with_deadline(ctx.deadline, started, async move {
+            client
+                .post(&url)
+                .headers(headers)
+                .json(&body_value)
+                .send()
+                .await
+                .map_err(|e| BridgeError::Transport(e.to_string()))
+        })
+        .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(map_http_error(status, resp).await);
+        }
+
+        // Native Anthropic SSE → ChatChunk, driven by the shared
+        // StreamState. Mirrors aisix-provider-anthropic's
+        // `build_chunk_stream`: parse each `data:` payload into an
+        // AnthropicStreamEvent, update rolling state (id/model carried
+        // from `message_start`), emit any chunk, and stop on the
+        // terminal `message_stop`. Anthropic emits no `[DONE]` sentinel.
+        let byte_stream = resp.bytes_stream();
+        let stream = async_stream::try_stream! {
+            let mut decoder = SseDecoder::new();
+            let mut state = StreamState::default();
+            let mut byte_stream = Box::pin(byte_stream);
+
+            while let Some(item) = byte_stream.next().await {
+                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(e.to_string()))?;
+                for event in decoder.feed(bytes.as_ref()) {
+                    let SseEvent::Data(data) = event else { continue };
+                    let parsed: AnthropicStreamEvent =
+                        serde_json::from_str(&data).map_err(|e| {
+                            BridgeError::UpstreamDecode(format!(
+                                "vertex anthropic stream chunk parse: {e}"
+                            ))
+                        })?;
+                    state.update(&parsed);
+                    if let Some(chunk) = state.to_chunk(&parsed) {
+                        yield chunk;
+                    }
+                    if StreamState::is_terminal(&parsed) {
+                        return;
+                    }
+                }
+            }
+        };
+
+        Ok(Box::pin(stream))
     }
 
     /// Build the OpenAI-shim chat-completions URL for the MaaS family.
@@ -2245,37 +2347,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn chat_stream_anthropic_returns_streaming_not_yet_implemented() {
-        // Claude non-stream chat is wired (`:rawPredict`); streaming
-        // (`:streamRawPredict`) is the deferred follow-up. The error
-        // must be publisher-specific + actionable (point at D5.3 and
-        // note that non-stream IS available) rather than a generic
-        // transport failure.
-        let bridge = VertexBridge::new();
-        let ctx = BridgeContext::new(
-            "req-1",
-            sample_model_with("claude-3-5-sonnet@20241022"),
-            sample_pk_with_secret(valid_secret_json()),
-        );
-        let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
-        let err = bridge.chat_stream(&req, &ctx).await.err().unwrap();
-        match err {
-            BridgeError::Config(msg) => {
-                assert!(
-                    msg.contains("streaming is not yet implemented"),
-                    "got: {msg}"
-                );
-                assert!(
-                    msg.contains("rawPredict"),
-                    "should note non-stream is wired: {msg}"
-                );
-                assert!(msg.contains("D5.3"), "got: {msg}");
-            }
-            other => panic!("expected Config error, got {other:?}"),
-        }
-    }
-
     // ─── Dispatch end-to-end against wiremock via api_base override ──
 
     use wiremock::matchers::{header, method, path};
@@ -2423,6 +2494,144 @@ mod tests {
         assert!(
             obj.contains_key("max_tokens"),
             "max_tokens is required by the Anthropic Messages wire: {body}"
+        );
+    }
+
+    /// Capturing responder that returns a native Anthropic SSE stream
+    /// (the `:streamRawPredict` wire) while recording the inbound request
+    /// body — the streaming analogue of [`CapturingAnthropicResponder`].
+    #[derive(Clone, Default)]
+    struct CapturingAnthropicStreamResponder {
+        captured_body: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    }
+
+    impl Respond for CapturingAnthropicStreamResponder {
+        fn respond(&self, req: &MockRequest) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            *self.captured_body.lock().unwrap() = Some(body);
+            // Native Anthropic Messages SSE: `message_start` carries the
+            // id + model, two `text_delta` content deltas, then
+            // `message_delta` (stop_reason + output usage) and the
+            // terminal `message_stop`. `event:` lines are included to
+            // mirror the real wire — the shared SseDecoder keys off the
+            // `data:` payloads and skips the `event:` lines.
+            let model = "claude-sonnet-4-5";
+            let start = serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_vertex_stream", "model": model, "role": "assistant",
+                    "content": [], "usage": {"input_tokens": 3, "output_tokens": 0}
+                }
+            });
+            let d1 = serde_json::json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "hello"}
+            });
+            let d2 = serde_json::json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": " world"}
+            });
+            let mdelta = serde_json::json!({
+                "type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 2}
+            });
+            let sse = format!(
+                "event: message_start\ndata: {}\n\n\
+                 event: content_block_delta\ndata: {}\n\n\
+                 event: content_block_delta\ndata: {}\n\n\
+                 event: message_delta\ndata: {}\n\n\
+                 event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n",
+                serde_json::to_string(&start).unwrap(),
+                serde_json::to_string(&d1).unwrap(),
+                serde_json::to_string(&d2).unwrap(),
+                serde_json::to_string(&mdelta).unwrap(),
+            );
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse)
+        }
+    }
+
+    /// D5.3 — Claude on Vertex streams via the `:streamRawPredict`
+    /// action. Sibling of the non-stream `:rawPredict` test above. Pin
+    /// the streaming URL action + Bearer auth (mock matchers), the body
+    /// shaping that DIFFERS from the non-stream path (`stream:true` is
+    /// KEPT, not stripped), the `model` strip + `anthropic_version` add +
+    /// `split_system` lift, and that native Anthropic SSE decodes into
+    /// ChatChunks whose aggregated content matches the upstream stream
+    /// and surface a terminal finish_reason.
+    #[tokio::test]
+    async fn chat_anthropic_stream_dispatches_to_stream_raw_predict_keeping_stream_in_body() {
+        let server = MockServer::start().await;
+        let responder = CapturingAnthropicStreamResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/anthropic/models/claude-sonnet-4-5:streamRawPredict",
+            ))
+            .and(header("authorization", "Bearer ya29.test"))
+            .and(header("content-type", "application/json"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-sonnet-4-5"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new(
+            "my-claude",
+            vec![ChatMessage::system("be brief"), ChatMessage::user("hi")],
+        );
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+
+        let mut content = String::new();
+        let mut saw_finish = false;
+        while let Some(item) = stream.next().await {
+            let chunk = item.unwrap();
+            if let Some(delta) = chunk.delta.content.as_deref() {
+                content.push_str(delta);
+            }
+            if chunk.finish_reason.is_some() {
+                saw_finish = true;
+            }
+        }
+        assert_eq!(
+            content, "hello world",
+            "aggregated stream content decodes from the native Anthropic SSE frames"
+        );
+        assert!(saw_finish, "stream surfaces a terminal finish_reason");
+
+        // Wire-shape: the `:streamRawPredict` body KEEPS `stream:true`
+        // (unlike `:rawPredict`, which strips it — see sibling test),
+        // strips `model` into the URL, adds the Vertex `anthropic_version`,
+        // and lifts the system turn to the top-level `system` field.
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        let obj = body.as_object().expect("object body");
+        assert_eq!(
+            obj.get("stream").and_then(|v| v.as_bool()),
+            Some(true),
+            "stream:true must be KEPT in the body for :streamRawPredict: {body}"
+        );
+        assert!(
+            !obj.contains_key("model"),
+            "model must be stripped (Vertex keys it off the URL): {body}"
+        );
+        assert_eq!(
+            obj.get("anthropic_version").and_then(|v| v.as_str()),
+            Some("vertex-2023-10-16"),
+            "bridge must add the Vertex anthropic_version: {body}"
+        );
+        assert!(
+            obj.get("system").is_some(),
+            "system prompt must be lifted to the top-level `system` field: {body}"
         );
     }
 
