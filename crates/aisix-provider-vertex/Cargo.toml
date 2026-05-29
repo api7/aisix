@@ -16,6 +16,12 @@ aisix-gateway = { path = "../aisix-gateway" }
 # Vertex `:rawPredict` body is Anthropic Messages JSON with a
 # Vertex-specific `anthropic_version`.
 aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
+# Llama + the OpenAI-compatible MaaS family (DeepSeek / Qwen / gpt-oss /
+# MiniMax / Moonshot / Z.ai) on Vertex use the OpenAI chat-completions
+# shim at `endpoints/openapi/chat/completions`; reuse the OpenAI request
+# serializer + response/stream-chunk decoders so the wire matches direct
+# OpenAI exactly.
+aisix-provider-openai = { path = "../aisix-provider-openai" }
 async-trait.workspace = true
 async-stream = "0.3"
 bytes.workspace = true

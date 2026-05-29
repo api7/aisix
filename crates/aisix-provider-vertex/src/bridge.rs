@@ -5,9 +5,12 @@
 //! wire path. **Currently wired:** `google` (Gemini) chat + streaming
 //! (`:generateContent` / `:streamGenerateContent`); `anthropic`
 //! (Claude) non-stream chat via `:rawPredict` (Anthropic Messages
-//! wire). Claude streaming (`:streamRawPredict`, D5.3) and the
-//! remaining publishers (`meta` / `mistral` / `ai21`, D5.4) surface
-//! clear `not yet implemented` errors — see crate-level docs.
+//! wire); and the **OpenAI-compatible MaaS family** (Llama, DeepSeek,
+//! Qwen, gpt-oss, MiniMax, Moonshot, Z.ai) chat + streaming via the
+//! OpenAI shim (`endpoints/openapi/chat/completions`). Claude
+//! streaming (`:streamRawPredict`, D5.3) and the `:rawPredict`
+//! publishers `mistral` / `ai21` (D5.4) still surface clear `not yet
+//! implemented` errors — see crate-level docs.
 //!
 //! Credentials: `ProviderKey.secret` is a JSON-encoded
 //! `{access_token, project, region}` struct. The `access_token` is
@@ -45,6 +48,16 @@ use crate::wire;
 use aisix_provider_anthropic::wire::{
     build_request as build_anthropic_request, response_into_chat_response, split_system,
     AnthropicResponse,
+};
+
+// Llama + the OpenAI-compatible MaaS family on Vertex use the OpenAI
+// chat-completions shim, so reuse the OpenAI request serializer +
+// response/stream decoders verbatim — the wire matches direct OpenAI.
+use aisix_provider_openai::wire::{
+    build_request as build_openai_request, messages_from as openai_messages_from,
+    response_into_chat_response as openai_response_into_chat_response,
+    stream_chunk_into_chat_chunk as openai_stream_chunk_into_chat_chunk, OpenAiResponse,
+    OpenAiStreamChunk,
 };
 
 /// `anthropic_version` value Vertex's Claude `:rawPredict` endpoint
@@ -209,11 +222,20 @@ pub enum VertexPublisher {
     /// on Vertex. Wire shape is `rawPredict`, not canonical Anthropic
     /// Messages.
     Anthropic,
-    /// `publishers/meta/models/llama-*` — Meta's Llama family.
-    Meta,
-    /// `publishers/mistralai/models/mistral-*` — Mistral on Vertex.
+    /// The OpenAI-compatible MaaS family on Vertex — Meta Llama,
+    /// DeepSeek, Qwen, gpt-oss, MiniMax, Moonshot, Z.ai. These do NOT
+    /// use a `publishers/<vendor>/...:rawPredict` URL; Vertex exposes
+    /// them through a single OpenAI chat-completions shim at
+    /// `endpoints/openapi/chat/completions` (the model id goes in the
+    /// request body, not the URL). One wire shape serves the whole
+    /// family, so adding a new MaaS vendor is a resolver-prefix add.
+    /// <https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/llama#openai>
+    OpenAiCompat,
+    /// `publishers/mistralai/models/mistral-*` — Mistral on Vertex
+    /// (`rawPredict`; not yet wired).
     Mistral,
-    /// `publishers/ai21/models/jamba-*` — AI21 Jamba family.
+    /// `publishers/ai21/models/jamba-*` — AI21 Jamba family
+    /// (`rawPredict`; not yet wired).
     Ai21,
 }
 
@@ -225,8 +247,21 @@ impl VertexPublisher {
             Some(Self::Google)
         } else if lower.starts_with("claude-") {
             Some(Self::Anthropic)
-        } else if lower.starts_with("meta/") || lower.starts_with("llama") {
-            Some(Self::Meta)
+        } else if lower.starts_with("meta/")
+            || lower.starts_with("llama")
+            || lower.starts_with("deepseek")
+            || lower.starts_with("qwen")
+            || lower.starts_with("openai/gpt-oss")
+            || lower.starts_with("minimaxai/")
+            || lower.starts_with("moonshotai/")
+            || lower.starts_with("zai-org/")
+        {
+            // The OpenAI-shim MaaS family. Prefix set mirrors the
+            // documented Vertex Model Garden MaaS models served via the
+            // OpenAI chat-completions endpoint; Mistral / AI21 are
+            // deliberately excluded (they use `rawPredict`, handled by
+            // their own arms below).
+            Some(Self::OpenAiCompat)
         } else if lower.starts_with("mistral-") || lower.starts_with("codestral-") {
             Some(Self::Mistral)
         } else if lower.starts_with("jamba-") {
@@ -238,16 +273,16 @@ impl VertexPublisher {
 
     /// The `publishers/<tag>` URL segment Vertex expects.
     ///
-    /// **Returns `None` for [`Self::Meta`]** — Llama on Vertex uses
-    /// the OpenAPI shim at `endpoints/openapi/chat/completions`, not
-    /// a `publishers/meta/...` URL.
+    /// **Returns `None` for [`Self::OpenAiCompat`]** — the MaaS family
+    /// uses the OpenAI shim at `endpoints/openapi/chat/completions`,
+    /// which carries no `publishers/<vendor>/...` segment.
     pub fn url_segment(self) -> Option<&'static str> {
         Some(match self {
             Self::Google => "publishers/google",
             Self::Anthropic => "publishers/anthropic",
             Self::Mistral => "publishers/mistralai",
             Self::Ai21 => "publishers/ai21",
-            Self::Meta => return None,
+            Self::OpenAiCompat => return None,
         })
     }
 
@@ -256,7 +291,7 @@ impl VertexPublisher {
         match self {
             Self::Google => "google",
             Self::Anthropic => "anthropic",
-            Self::Meta => "meta",
+            Self::OpenAiCompat => "openai-compat",
             Self::Mistral => "mistralai",
             Self::Ai21 => "ai21",
         }
@@ -550,6 +585,7 @@ impl Bridge for VertexBridge {
         match publisher {
             VertexPublisher::Google => self.chat_gemini(req, ctx, upstream_id).await,
             VertexPublisher::Anthropic => self.chat_anthropic(req, ctx, upstream_id).await,
+            VertexPublisher::OpenAiCompat => self.chat_openai_shim(req, ctx, upstream_id).await,
             other => Err(BridgeError::Config(format!(
                 "vertex publisher {publisher:?} not yet implemented — \
                  tracked under api7/AISIX-Cloud#302 Phase E (D5.4, publisher={})",
@@ -573,6 +609,9 @@ impl Bridge for VertexBridge {
         })?;
         match publisher {
             VertexPublisher::Google => self.chat_gemini_stream(req, ctx, upstream_id).await,
+            VertexPublisher::OpenAiCompat => {
+                self.chat_openai_shim_stream(req, ctx, upstream_id).await
+            }
             // Claude on Vertex non-stream chat is wired (`:rawPredict`);
             // streaming (`:streamRawPredict`) is the immediate follow-up
             // — the `stream`-field-in-body vs URL-only contract needs a
@@ -746,6 +785,163 @@ impl VertexBridge {
             Ok(response_into_chat_response(parsed))
         })
         .await
+    }
+
+    /// Build the OpenAI-shim chat-completions URL for the MaaS family.
+    /// Unlike the Gemini / Anthropic `publishers/<vendor>/...` paths,
+    /// the shim has NO publisher segment and NO model in the path — the
+    /// model rides in the request body. Only `project` + `region` are
+    /// URL-path tokens (validated by the caller).
+    fn openai_shim_url(
+        &self,
+        creds: &VertexSecret,
+        api_base: Option<&str>,
+    ) -> Result<String, BridgeError> {
+        let base = self.resolve_api_base(&creds.region, api_base)?;
+        Ok(format!(
+            "{base}/v1/projects/{project}/locations/{region}/endpoints/openapi/chat/completions",
+            project = creds.project,
+            region = creds.region,
+        ))
+    }
+
+    /// Dispatch Llama + the OpenAI-compatible MaaS family (DeepSeek /
+    /// Qwen / gpt-oss / MiniMax / Moonshot / Z.ai) non-stream chat via
+    /// Vertex's OpenAI chat-completions shim. Body + response are the
+    /// OpenAI wire, reused verbatim from the OpenAI bridge's serializer
+    /// / decoder, so behaviour matches direct OpenAI. The model id is
+    /// kept in the body's `model` field (the shim keys off it, not the
+    /// URL). Reference impl confirms the shim endpoint + OpenAI body:
+    /// <https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/llama#openai>.
+    async fn chat_openai_shim(
+        &self,
+        req: &ChatFormat,
+        ctx: &BridgeContext,
+        upstream_id: &str,
+    ) -> Result<ChatResponse, BridgeError> {
+        let creds = VertexSecret::parse(&ctx.provider_key.secret)?;
+        // Only project + region are URL-path tokens; the model id rides
+        // in the body and may legitimately contain `/` (e.g.
+        // `meta/llama-3.3-70b-instruct-maas`), so it is NOT validated as
+        // a URL token here.
+        validate_url_token("project", &creds.project)?;
+        validate_url_token("region", &creds.region)?;
+
+        let url = self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref())?;
+
+        let messages = openai_messages_from(req);
+        let typed = build_openai_request(req, upstream_id, &messages, false);
+        let body = serde_json::to_value(&typed)
+            .map_err(|e| BridgeError::Config(format!("serialize OpenAI shim request body: {e}")))?;
+
+        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let headers = build_request_headers(&access_token, &ctx.request_id)?;
+        let client = self.client.clone();
+        let started = Instant::now();
+
+        with_deadline(ctx.deadline, started, async move {
+            let resp = client
+                .post(&url)
+                .headers(headers)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(map_http_error(status, resp).await);
+            }
+            let parsed: OpenAiResponse = resp
+                .json()
+                .await
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            Ok(openai_response_into_chat_response(parsed))
+        })
+        .await
+    }
+
+    /// Streaming counterpart of [`Self::chat_openai_shim`]. The shim
+    /// emits OpenAI-style SSE (`data: {chunk}` lines terminated by
+    /// `data: [DONE]`), so reuse the shared [`SseDecoder`] + the OpenAI
+    /// stream-chunk decoder. `stream: true` goes in the body (the shim
+    /// has no `?alt=sse`-style query).
+    async fn chat_openai_shim_stream(
+        &self,
+        req: &ChatFormat,
+        ctx: &BridgeContext,
+        upstream_id: &str,
+    ) -> Result<ChatChunkStream, BridgeError> {
+        let creds = VertexSecret::parse(&ctx.provider_key.secret)?;
+        validate_url_token("project", &creds.project)?;
+        validate_url_token("region", &creds.region)?;
+
+        let url = self.openai_shim_url(&creds, ctx.provider_key.api_base.as_deref())?;
+
+        let messages = openai_messages_from(req);
+        let typed = build_openai_request(req, upstream_id, &messages, true);
+        let body = serde_json::to_value(&typed)
+            .map_err(|e| BridgeError::Config(format!("serialize OpenAI shim request body: {e}")))?;
+
+        // Resolve bearer BEFORE entering the stream future so a
+        // token-mint error surfaces as a direct Err, not mid-stream.
+        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let headers = build_request_headers(&access_token, &ctx.request_id)?;
+        let client = self.client.clone();
+        let started = Instant::now();
+
+        let resp = with_deadline(ctx.deadline, started, async move {
+            client
+                .post(&url)
+                .headers(headers)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| BridgeError::Transport(e.to_string()))
+        })
+        .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(map_http_error(status, resp).await);
+        }
+
+        let byte_stream = resp.bytes_stream();
+        let stream = async_stream::try_stream! {
+            let mut decoder = SseDecoder::new();
+            let mut byte_stream = Box::pin(byte_stream);
+
+            while let Some(item) = byte_stream.next().await {
+                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(e.to_string()))?;
+                for event in decoder.feed(bytes.as_ref()) {
+                    match event {
+                        SseEvent::Data(data) => {
+                            let parsed: OpenAiStreamChunk =
+                                serde_json::from_str(&data).map_err(|e| {
+                                    BridgeError::UpstreamDecode(format!(
+                                        "vertex openai-shim stream chunk parse: {e}"
+                                    ))
+                                })?;
+                            yield openai_stream_chunk_into_chat_chunk(parsed);
+                        }
+                        // OpenAI shim terminates with `data: [DONE]`;
+                        // stop emitting on the sentinel.
+                        SseEvent::Done => {}
+                    }
+                }
+            }
+            // Flush a partial trailing chunk if the connection drops
+            // without a final blank line.
+            if let Some(SseEvent::Data(data)) = decoder.finish() {
+                let parsed: OpenAiStreamChunk = serde_json::from_str(&data).map_err(|e| {
+                    BridgeError::UpstreamDecode(format!(
+                        "vertex openai-shim stream tail parse: {e}"
+                    ))
+                })?;
+                yield openai_stream_chunk_into_chat_chunk(parsed);
+            }
+        };
+
+        Ok(Box::pin(stream))
     }
 
     /// Dispatch Gemini streaming chat (publisher `google`).
@@ -1249,15 +1445,29 @@ mod tests {
     }
 
     #[test]
-    fn publisher_resolves_meta_mistral_ai21_prefixes() {
-        assert_eq!(
-            VertexPublisher::from_upstream_id("meta/llama-3.3-70b-instruct-maas"),
-            Some(VertexPublisher::Meta),
-        );
-        assert_eq!(
-            VertexPublisher::from_upstream_id("llama3-405b-instruct-maas"),
-            Some(VertexPublisher::Meta),
-        );
+    fn publisher_resolves_openai_shim_family_and_rawpredict_publishers() {
+        // The OpenAI-shim MaaS family — Llama + DeepSeek / Qwen /
+        // gpt-oss / MiniMax / Moonshot / Z.ai — all resolve to the one
+        // OpenAiCompat variant (one shim wire). Adding a vendor is a
+        // resolver-prefix add, nothing else.
+        for id in [
+            "meta/llama-3.3-70b-instruct-maas",
+            "llama3-405b-instruct-maas",
+            "deepseek-ai/deepseek-r1-0528-maas",
+            "qwen/qwen3-235b-a22b-instruct-maas",
+            "openai/gpt-oss-120b-maas",
+            "minimaxai/minimax-m2-maas",
+            "moonshotai/kimi-k2-instruct-maas",
+            "zai-org/glm-4.6-maas",
+        ] {
+            assert_eq!(
+                VertexPublisher::from_upstream_id(id),
+                Some(VertexPublisher::OpenAiCompat),
+                "{id} should resolve to the OpenAI-shim family",
+            );
+        }
+        // Mistral + AI21 are NOT part of the shim family — they use
+        // `:rawPredict` and resolve to their own (still-deferred) arms.
         assert_eq!(
             VertexPublisher::from_upstream_id("mistral-large-2411"),
             Some(VertexPublisher::Mistral),
@@ -1499,7 +1709,8 @@ mod tests {
             Some("publishers/mistralai"),
         );
         assert_eq!(VertexPublisher::Ai21.url_segment(), Some("publishers/ai21"));
-        assert_eq!(VertexPublisher::Meta.url_segment(), None);
+        // The OpenAI-shim family has no `publishers/<vendor>` segment.
+        assert_eq!(VertexPublisher::OpenAiCompat.url_segment(), None);
     }
 
     #[test]
@@ -2005,12 +2216,12 @@ mod tests {
         // carries a publisher-specific message now that non-stream
         // Claude is wired). The remaining publishers still surface the
         // generic D5.3/D5.4 streaming-not-implemented error.
+        // Llama (and the rest of the OpenAI-shim MaaS family) streaming
+        // is now wired via the openapi shim, so only the `:rawPredict`
+        // publishers (Mistral, AI21) still surface the generic
+        // streaming-not-implemented error.
         let bridge = VertexBridge::new();
-        for upstream in [
-            "llama-3-70b-instruct-maas",
-            "mistral-large-2411",
-            "jamba-1.5-large",
-        ] {
+        for upstream in ["mistral-large-2411", "jamba-1.5-large"] {
             let ctx = BridgeContext::new(
                 "req-1",
                 sample_model_with(upstream),
@@ -2212,6 +2423,87 @@ mod tests {
         assert!(
             obj.contains_key("max_tokens"),
             "max_tokens is required by the Anthropic Messages wire: {body}"
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturingOpenAiResponder {
+        captured_body: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    }
+
+    impl Respond for CapturingOpenAiResponder {
+        fn respond(&self, req: &MockRequest) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            *self.captured_body.lock().unwrap() = Some(body);
+            // Standard OpenAI chat.completion envelope (the openapi shim
+            // returns the OpenAI wire verbatim).
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-vertex-shim",
+                "object": "chat.completion",
+                "model": "meta/llama-3.3-70b-instruct-maas",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hello from llama on vertex"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 6, "total_tokens": 9}
+            }))
+        }
+    }
+
+    /// Llama-on-Vertex (and the rest of the OpenAI-shim MaaS family)
+    /// dispatch through the OpenAI chat-completions shim, NOT a
+    /// `publishers/<vendor>/...:rawPredict` URL. Pin the URL shape, the
+    /// Bearer auth, and that the model id rides in the body (kept, not
+    /// stripped — opposite of the Gemini/Anthropic publisher paths).
+    #[tokio::test]
+    async fn chat_openai_shim_dispatches_to_openapi_endpoint_with_model_in_body() {
+        let server = MockServer::start().await;
+        let responder = CapturingOpenAiResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/endpoints/openapi/chat/completions",
+            ))
+            .and(header("authorization", "Bearer ya29.test"))
+            .and(header("content-type", "application/json"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta/llama-3.3-70b-instruct-maas"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+
+        // Customer-visible response decoded from the OpenAI envelope.
+        assert_eq!(chat.message.content, "hello from llama on vertex");
+        assert_eq!(chat.usage.total_tokens, 9);
+
+        // Wire-shape: OpenAI chat body with the model id IN the body
+        // (the shim keys off it; there is no model segment in the URL),
+        // and the user turn present.
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        let obj = body.as_object().expect("object body");
+        assert_eq!(
+            obj.get("model").and_then(|v| v.as_str()),
+            Some("meta/llama-3.3-70b-instruct-maas"),
+            "openapi shim keys off the body `model` field (kept, not stripped): {body}"
+        );
+        assert!(
+            obj.get("messages")
+                .and_then(|v| v.as_array())
+                .is_some_and(|m| !m.is_empty()),
+            "messages array must carry the user turn: {body}"
         );
     }
 
