@@ -34,12 +34,6 @@ Two policy families match against these buckets today:
 
 Setting `team_id` opts the key into both the team rate-limit pool and the team budget (if either exists). Setting `user_id` does the same on the member side. Leaving them null means the key is unbound — the team and member rows of either policy family simply don't apply to it.
 
-:::note Wire compatibility
-
-The control plane projects this field on kine as `user_id` (renamed from `owner_id` in AISIX-Cloud PR #527, 2026-05-27). The data plane's Rust model is being migrated to match — see [ai-gateway#430](https://github.com/api7/ai-gateway/issues/430). Until that issue lands, member-scope `RateLimitPolicy` rows may not match on a freshly-projected api_key. Budget enforcement is unaffected because the control plane resolves bindings server-side; the DP only asks "is this api_key still allowed?".
-
-:::
-
 ## Create A Caller Key
 
 Hash the plaintext key first:

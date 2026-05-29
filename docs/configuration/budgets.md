@@ -35,8 +35,6 @@ The control plane evaluates **up to six budget rows simultaneously** for a singl
 
 All six rows are peers — no row "wraps" or "overrides" another. Any applicable row with `hard_stop=true` and `spent_cents >= limit_cents` rejects the request with `429`. Warn-only rows never block but surface alerts on the dashboard.
 
-For the full applicability matrix, re-binding semantics, orphan handling, and worked scenarios, see [PRD-09b §4 in the AISIX-Cloud repo](https://github.com/api7/AISIX-Cloud/blob/main/docs/prd/prd-09b-budget.md#4-scope-model--applicability).
-
 ## Managed Versus Standalone
 
 Current boundary:
