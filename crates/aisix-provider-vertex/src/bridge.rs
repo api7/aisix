@@ -2507,6 +2507,125 @@ mod tests {
         );
     }
 
+    /// Capturing responder that returns an OpenAI-shim SSE stream while
+    /// recording the inbound request body — the streaming-path analogue
+    /// of [`CapturingOpenAiResponder`].
+    #[derive(Clone, Default)]
+    struct CapturingOpenAiStreamResponder {
+        captured_body: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    }
+
+    impl Respond for CapturingOpenAiStreamResponder {
+        fn respond(&self, req: &MockRequest) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            *self.captured_body.lock().unwrap() = Some(body);
+            // OpenAI chat.completion.chunk frames terminated by the
+            // `data: [DONE]` sentinel — the exact wire the Vertex openapi
+            // shim emits (OpenAI-compatible verbatim): a leading role
+            // delta, two content deltas, then a terminal chunk carrying
+            // `finish_reason` + `usage`.
+            let model = "meta/llama-3.3-70b-instruct-maas";
+            let role = serde_json::json!({
+                "id": "chatcmpl-vertex-shim", "object": "chat.completion.chunk", "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+            });
+            let c1 = serde_json::json!({
+                "id": "chatcmpl-vertex-shim", "object": "chat.completion.chunk", "model": model,
+                "choices": [{"index": 0, "delta": {"content": "hello"}, "finish_reason": null}]
+            });
+            let c2 = serde_json::json!({
+                "id": "chatcmpl-vertex-shim", "object": "chat.completion.chunk", "model": model,
+                "choices": [{"index": 0, "delta": {"content": " world"}, "finish_reason": null}]
+            });
+            let final_chunk = serde_json::json!({
+                "id": "chatcmpl-vertex-shim", "object": "chat.completion.chunk", "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+            });
+            let sse = format!(
+                "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                serde_json::to_string(&role).unwrap(),
+                serde_json::to_string(&c1).unwrap(),
+                serde_json::to_string(&c2).unwrap(),
+                serde_json::to_string(&final_chunk).unwrap(),
+            );
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse)
+        }
+    }
+
+    /// Streaming counterpart to
+    /// `chat_openai_shim_dispatches_to_openapi_endpoint_with_model_in_body`.
+    /// The OpenAI-shim MaaS family streams through the SAME openapi
+    /// endpoint with `stream: true` in the body (the model id still rides
+    /// in the body, never the URL). Pin the URL + Bearer auth (via the
+    /// mock matchers), the `stream:true` body flag, the model-in-body, and
+    /// that the SSE frames decode into ChatChunks whose aggregated content
+    /// matches the upstream stream and surface a terminal finish_reason.
+    #[tokio::test]
+    async fn chat_openai_shim_stream_dispatches_to_openapi_endpoint_with_stream_in_body() {
+        let server = MockServer::start().await;
+        let responder = CapturingOpenAiStreamResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/endpoints/openapi/chat/completions",
+            ))
+            .and(header("authorization", "Bearer ya29.test"))
+            .and(header("content-type", "application/json"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta/llama-3.3-70b-instruct-maas"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+
+        let mut content = String::new();
+        let mut saw_finish = false;
+        while let Some(item) = stream.next().await {
+            let chunk = item.unwrap();
+            if let Some(delta) = chunk.delta.content.as_deref() {
+                content.push_str(delta);
+            }
+            if chunk.finish_reason.is_some() {
+                saw_finish = true;
+            }
+        }
+        assert_eq!(
+            content, "hello world",
+            "aggregated stream content decodes from the OpenAI SSE frames"
+        );
+        assert!(saw_finish, "stream surfaces a terminal finish_reason");
+
+        // Wire-shape: `stream:true` and the model id BOTH ride in the
+        // body (the shim has no model URL segment); the openapi URL +
+        // Bearer are pinned by the mock matchers above.
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        let obj = body.as_object().expect("object body");
+        assert_eq!(
+            obj.get("stream").and_then(|v| v.as_bool()),
+            Some(true),
+            "stream:true must ride in the body for the openapi shim: {body}"
+        );
+        assert_eq!(
+            obj.get("model").and_then(|v| v.as_str()),
+            Some("meta/llama-3.3-70b-instruct-maas"),
+            "model id stays in the body (never the URL) on the stream path: {body}"
+        );
+    }
+
     /// End-to-end production-path coverage for api7/ai-gateway#390:
     /// drive the bridge with `ProviderKey.api_base` set (and NO
     /// `with_api_base_override`), assert the bridge actually POSTs
