@@ -234,18 +234,18 @@ pub async fn capture_upstream_error_http(
     parse: impl FnOnce(&[u8]) -> Option<UpstreamErrorView>,
 ) -> BridgeError {
     let retry_after = parse_retry_after(resp.headers());
-    let content_type = resp
-        .headers()
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase);
     let body = read_body_capped(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
-    let parsed = content_type
-        .as_deref()
-        .map(content_type_is_json)
-        .unwrap_or(false)
-        .then(|| parse(&body))
-        .flatten()
+    // Parse the error envelope opportunistically, regardless of the
+    // upstream's Content-Type (#543). OpenAI's 401 `invalid_api_key`
+    // path (and edge / proxy layers fronting some upstreams) return the
+    // JSON error body labelled with a non-`application/json`
+    // Content-Type; gating the parse on Content-Type silently dropped
+    // `code` / `param` and dumped the raw body into `message`. The
+    // per-bridge `parse` fn is the real validator — it requires the
+    // provider's `{"error": {...}}` shape and returns `None` on any
+    // non-matching body (HTML error pages, plain text, 5xx bodies), so
+    // attempting it unconditionally is safe and strictly more robust.
+    let parsed = parse(&body)
         // Truncate every parsed string at the same cap as the outer
         // `message`. Otherwise a hostile or buggy upstream emitting a
         // 60 KB `error.message` / `error.code` / `error.type` /
