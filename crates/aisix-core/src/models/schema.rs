@@ -1150,6 +1150,38 @@ mod tests {
         assert!(validate_guardrail(&v).is_err());
     }
 
+    #[test]
+    fn guardrail_azure_content_safety_max_timeout_passes() {
+        // Guards the exact regression class of #437: the loader schema
+        // must accept everything AzureContentSafetyConfig's timeout_ms
+        // (u32) accepts, INCLUDING u32::MAX. A future edit that tightens
+        // the schema below u32::MAX would make the loader stricter than
+        // the struct and silently drop valid rows — this test fails loud.
+        let v = json!({
+            "name": "g",
+            "kind": "azure_content_safety",
+            "endpoint": "https://r.cognitiveservices.azure.com",
+            "api_key": "k",
+            "timeout_ms": 4_294_967_295u64
+        });
+        validate_guardrail(&v).unwrap();
+    }
+
+    #[test]
+    fn guardrail_azure_content_safety_timeout_overflow_rejected() {
+        // u32::MAX + 1 — beyond what the struct can deserialize. The
+        // schema must reject it at the gate so the loader skips the row
+        // cleanly instead of surfacing an opaque serde error downstream.
+        let v = json!({
+            "name": "g",
+            "kind": "azure_content_safety",
+            "endpoint": "https://r.cognitiveservices.azure.com",
+            "api_key": "k",
+            "timeout_ms": 4_294_967_296u64
+        });
+        assert!(validate_guardrail(&v).is_err());
+    }
+
     // ---- rate_limit_policy schema tests ----
 
     #[test]
