@@ -682,6 +682,44 @@ mod tests {
         assert_eq!(reasoning, "Let me think step by step... 6 times 7 is 42.");
     }
 
+    /// Issue #466 (audit LOW): a reasoning model that also calls a
+    /// tool returns BOTH `tool_calls` and `reasoning_content` on the
+    /// same message. Both must land in `extra` under their own keys
+    /// (independent inserts, no collision).
+    #[test]
+    fn non_streaming_tool_calls_and_reasoning_content_coexist() {
+        let body = r#"{
+            "id": "cmpl-r1-tool",
+            "object": "chat.completion",
+            "model": "deepseek-reasoner",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "I should call the time tool.",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_time", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 8, "total_tokens": 13}
+        }"#;
+        let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        assert!(
+            out.message.extra.contains_key("tool_calls"),
+            "tool_calls must be preserved alongside reasoning_content",
+        );
+        assert_eq!(
+            out.message.extra["reasoning_content"],
+            "I should call the time tool.",
+        );
+    }
+
     /// Issue #466 companion: a response WITHOUT reasoning_content (the
     /// common non-reasoning model case) must not add a spurious empty
     /// field to extra.
