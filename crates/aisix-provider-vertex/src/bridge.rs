@@ -1644,6 +1644,12 @@ mod tests {
         validate_url_token("region", "europe-west4").unwrap();
         validate_url_token("upstream_id", "gemini-1.5-pro").unwrap();
         validate_url_token("upstream_id", "gemini-2.0-flash-exp").unwrap();
+        // Vertex Claude model ids carry an `@<version>` suffix
+        // (e.g. `claude-3-5-sonnet@20241022`). The `@` is a legitimate
+        // path char and MUST pass validation — a future tightening of
+        // the reject set that banned `@` would break real Claude-on-
+        // Vertex dispatch, so pin it here.
+        validate_url_token("upstream_id", "claude-3-5-sonnet@20241022").unwrap();
     }
 
     #[test]
