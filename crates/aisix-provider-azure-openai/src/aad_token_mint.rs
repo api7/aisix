@@ -73,6 +73,22 @@ pub(crate) struct AadCredentials {
     pub client_id: String,
     /// Client secret value (NOT the secret id). Confidential.
     pub client_secret: String,
+    /// Optional AAD authority host override. Absent for the common
+    /// public-cloud case, which defaults to
+    /// `https://login.microsoftonline.com`. Set when the tenant lives
+    /// in an Azure national / sovereign cloud whose AAD authority
+    /// differs from public Azure:
+    ///   - US Government: `https://login.microsoftonline.us`
+    ///   - China (21Vianet): `https://login.chinacloudapi.cn`
+    ///
+    /// per Microsoft's national-cloud authentication endpoints table
+    /// <https://learn.microsoft.com/en-us/entra/identity-platform/authentication-national-cloud>
+    /// (the same value the Azure SDK reads from the
+    /// `AZURE_AUTHORITY_HOST` environment variable). Must be a bare
+    /// http(s) origin — the bridge interpolates the tenant and the
+    /// `/oauth2/v2.0/token` path itself.
+    #[serde(default)]
+    pub authority_host: Option<String>,
 }
 
 impl AadCredentials {
@@ -106,6 +122,32 @@ impl AadCredentials {
                 return Err(BridgeError::Config(format!(
                     "azure aad credentials.{name} {value:?} contains URL-control \
                      characters — reject `/`, `?`, `#`, whitespace, `..`"
+                )));
+            }
+        }
+        // Optional authority_host: when present it becomes the origin
+        // of the token-endpoint URL, so it must be a bare http(s)
+        // origin. Mirrors the Vertex `resolve_api_base` validation
+        // (PR #392) — reject userinfo / query / fragment first (fixed
+        // message, no echo, so pasted `user:pass@host` credentials
+        // never surface in logs), then enforce the scheme.
+        if let Some(host) = self
+            .authority_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if host.contains('@') || host.contains('?') || host.contains('#') {
+                return Err(BridgeError::Config(
+                    "azure aad credentials.authority_host must be a bare origin — \
+                     reject userinfo (@), query (?), fragment (#)"
+                        .into(),
+                ));
+            }
+            if !(host.starts_with("https://") || host.starts_with("http://")) {
+                return Err(BridgeError::Config(format!(
+                    "azure aad credentials.authority_host must use http:// or https:// \
+                     scheme, got {host:?}"
                 )));
             }
         }
@@ -231,6 +273,18 @@ impl TokenMinter {
         Ok((parsed.access_token, parsed.expires_in))
     }
 
+    /// Resolve the AAD token endpoint URL. Precedence:
+    ///   1. `#[cfg(test)]` `token_endpoint_override` — unit-test seam,
+    ///      a full fixed URL (tenant not interpolated).
+    ///   2. `creds.authority_host` — production override for Azure
+    ///      national / sovereign clouds (and the live-e2e mock). The
+    ///      tenant + `/oauth2/v2.0/token` path is interpolated onto it.
+    ///   3. Default public-cloud authority `login.microsoftonline.com`.
+    ///
+    /// `authority_host` is validated by [`AadCredentials::validate`]
+    /// (bare http(s) origin, no userinfo / query / fragment) before
+    /// this runs, so the only normalisation needed here is trimming a
+    /// trailing slash to avoid a `//{tenant}` double slash.
     fn resolve_token_endpoint(&self, creds: &AadCredentials) -> String {
         #[cfg(test)]
         if let Some(base) = &self.token_endpoint_override {
@@ -238,10 +292,14 @@ impl TokenMinter {
             // upstream of this call.
             return base.clone();
         }
-        format!(
-            "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
-            creds.tenant_id
-        )
+        let authority = creds
+            .authority_host
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("https://login.microsoftonline.com")
+            .trim_end_matches('/');
+        format!("{authority}/{}/oauth2/v2.0/token", creds.tenant_id)
     }
 }
 
@@ -256,6 +314,7 @@ mod tests {
             tenant_id: "11111111-1111-1111-1111-111111111111".into(),
             client_id: "22222222-2222-2222-2222-222222222222".into(),
             client_secret: "fake-secret-not-a-real-one".into(),
+            authority_host: None,
         }
     }
 
@@ -345,11 +404,13 @@ mod tests {
             tenant_id: "shared-tenant".into(),
             client_id: "aaaa-aaaa".into(),
             client_secret: "secret-a".into(),
+            authority_host: None,
         };
         let app_b = AadCredentials {
             tenant_id: "shared-tenant".into(),
             client_id: "bbbb-bbbb".into(),
             client_secret: "secret-b".into(),
+            authority_host: None,
         };
         assert_eq!(minter.get_token(&app_a).await.unwrap(), "token-for-app-A");
         assert_eq!(minter.get_token(&app_b).await.unwrap(), "token-for-app-B");
@@ -417,6 +478,7 @@ mod tests {
             tenant_id: "".into(),
             client_id: "abc".into(),
             client_secret: "xyz".into(),
+            authority_host: None,
         };
         let err = minter.get_token(&creds).await.err().unwrap();
         match err {
@@ -443,11 +505,136 @@ mod tests {
             tenant_id: "../malicious".into(),
             client_id: "abc".into(),
             client_secret: "xyz".into(),
+            authority_host: None,
         };
         let err = minter.get_token(&creds).await.err().unwrap();
         match err {
             BridgeError::Config(msg) => {
                 assert!(msg.contains("URL-control"));
+            }
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    // ─── authority_host production seam (ai-gateway#413 / #302 D6.6) ───
+
+    /// The default public-cloud authority is used when `authority_host`
+    /// is absent — backward compat for every existing operator who
+    /// pasted only `{tenant_id, client_id, client_secret}`.
+    #[test]
+    fn resolve_token_endpoint_defaults_to_public_cloud_when_authority_absent() {
+        let minter = TokenMinter::new(Client::new());
+        let creds = sample_creds();
+        assert_eq!(
+            minter.resolve_token_endpoint(&creds),
+            "https://login.microsoftonline.com/11111111-1111-1111-1111-111111111111/oauth2/v2.0/token",
+        );
+    }
+
+    /// A production `authority_host` (national cloud / sovereign /
+    /// live-e2e mock) becomes the origin; the tenant + standard path
+    /// are interpolated. This is the production code path — NO
+    /// `#[cfg(test)]` override is set, so a regression that ignored
+    /// `authority_host` would fail here.
+    #[test]
+    fn resolve_token_endpoint_honors_authority_host_in_production() {
+        let minter = TokenMinter::new(Client::new());
+        let creds = AadCredentials {
+            tenant_id: "tenant-gov".into(),
+            client_id: "app".into(),
+            client_secret: "s".into(),
+            // US Government cloud authority per Microsoft national-cloud docs.
+            authority_host: Some("https://login.microsoftonline.us".into()),
+        };
+        assert_eq!(
+            minter.resolve_token_endpoint(&creds),
+            "https://login.microsoftonline.us/tenant-gov/oauth2/v2.0/token",
+        );
+    }
+
+    /// A trailing slash on `authority_host` must not produce a `//`
+    /// double-slash before the tenant segment.
+    #[test]
+    fn resolve_token_endpoint_trims_authority_host_trailing_slash() {
+        let minter = TokenMinter::new(Client::new());
+        let creds = AadCredentials {
+            tenant_id: "t".into(),
+            client_id: "app".into(),
+            client_secret: "s".into(),
+            authority_host: Some("https://login.microsoftonline.us/".into()),
+        };
+        assert_eq!(
+            minter.resolve_token_endpoint(&creds),
+            "https://login.microsoftonline.us/t/oauth2/v2.0/token",
+        );
+    }
+
+    /// End-to-end through the production path: build the minter WITHOUT
+    /// the `#[cfg(test)]` override, point `authority_host` at a wiremock
+    /// server, and assert the client-credentials POST lands on the
+    /// interpolated `/{tenant}/oauth2/v2.0/token` path. A regression
+    /// that POSTed to the wrong path (or to public-cloud regardless of
+    /// authority_host) would not match and the mock would 404.
+    #[tokio::test]
+    async fn mint_via_production_authority_host_posts_to_interpolated_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path("/tenant-xyz/oauth2/v2.0/token"))
+            .and(body_string_contains("grant_type=client_credentials"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "aad.gov-cloud-token",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .mount(&server)
+            .await;
+
+        // NOTE: no with_token_endpoint_override — exercises the real
+        // production resolve_token_endpoint via authority_host.
+        let minter = TokenMinter::new(Client::new());
+        let creds = AadCredentials {
+            tenant_id: "tenant-xyz".into(),
+            client_id: "app".into(),
+            client_secret: "s".into(),
+            authority_host: Some(server.uri()),
+        };
+        let token = minter.get_token(&creds).await.unwrap();
+        assert_eq!(token, "aad.gov-cloud-token");
+    }
+
+    #[test]
+    fn validate_rejects_authority_host_without_scheme() {
+        let creds = AadCredentials {
+            tenant_id: "t".into(),
+            client_id: "app".into(),
+            client_secret: "s".into(),
+            authority_host: Some("login.microsoftonline.us".into()),
+        };
+        let err = creds.validate().err().unwrap();
+        match err {
+            BridgeError::Config(msg) => assert!(msg.contains("http:// or https://")),
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_authority_host_with_userinfo_without_echoing_it() {
+        let creds = AadCredentials {
+            tenant_id: "t".into(),
+            client_id: "app".into(),
+            client_secret: "s".into(),
+            authority_host: Some("https://user:pass@evil.example.com".into()),
+        };
+        let err = creds.validate().err().unwrap();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(msg.contains("bare origin"));
+                // The pasted userinfo must NOT surface in the error.
+                assert!(!msg.contains("pass"), "error leaked userinfo: {msg}");
+                assert!(
+                    !msg.contains("evil.example.com"),
+                    "error leaked host: {msg}"
+                );
             }
             other => panic!("expected Config, got {other:?}"),
         }
