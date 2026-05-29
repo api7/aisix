@@ -14,6 +14,13 @@ export interface OpenAiUpstreamOptions {
   status?: number;
   /** Body to return when `status` >= 400. */
   errorBody?: unknown;
+  /**
+   * Content-Type for the error body (default `application/json`). Lets
+   * tests reproduce upstreams / edge layers that return a JSON error
+   * body labelled with a non-JSON Content-Type (e.g. OpenAI's 401
+   * `invalid_api_key` path — see #543).
+   */
+  errorContentType?: string;
   /** Drop the connection after writing this many SSE events. */
   disconnectAfterEvents?: number;
   /** Per-request response script; used in order before static opts. */
@@ -33,6 +40,8 @@ export interface OpenAiUpstreamStep {
   eventDelayMs?: number;
   status?: number;
   errorBody?: unknown;
+  /** Content-Type for the error body (default `application/json`). See #543. */
+  errorContentType?: string;
   disconnectAfterEvents?: number;
   /** Extra response headers, same semantics as on the top-level options. */
   responseHeaders?: Record<string, string>;
@@ -88,7 +97,10 @@ export async function startOpenAiUpstream(
       const status = step.status ?? 200;
       if (status >= 400) {
         res.statusCode = status;
-        res.setHeader("content-type", "application/json");
+        res.setHeader(
+          "content-type",
+          step.errorContentType ?? opts.errorContentType ?? "application/json",
+        );
         res.end(JSON.stringify(step.errorBody ?? { error: { message: "mock error" } }));
         return;
       }

@@ -455,6 +455,42 @@ mod tests {
         }
     }
 
+    /// Issue #543 (audit MEDIUM): the shared `capture_upstream_error_http`
+    /// no longer gates parsing on Content-Type, so the Anthropic bridge
+    /// must ALSO surface the parsed envelope when the upstream labels a
+    /// JSON error body with a non-`application/json` Content-Type. Guards
+    /// the shared-fn change on the Anthropic side.
+    #[tokio::test]
+    async fn non_streaming_400_non_json_content_type_still_surfaces_message() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_raw(
+                r#"{"error":{"type":"invalid_request","message":"bad"}}"#.as_bytes(),
+                "text/plain",
+            ))
+            .mount(&server)
+            .await;
+
+        let bridge = AnthropicBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        let err = bridge.chat(&req(), &ctx).await.unwrap_err();
+        match err {
+            BridgeError::UpstreamStatus {
+                status,
+                message,
+                parsed,
+                ..
+            } => {
+                assert_eq!(status, 400);
+                assert_eq!(message, "bad");
+                let parsed = parsed.expect("envelope must parse regardless of Content-Type");
+                assert_eq!(parsed.kind.as_deref(), Some("invalid_request"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn non_streaming_decode_error_on_malformed_body() {
         let server = MockServer::start().await;

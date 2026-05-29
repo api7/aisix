@@ -934,6 +934,100 @@ mod tests {
         }
     }
 
+    // Canonical OpenAI 401 invalid_api_key error body (#543).
+    const OPENAI_401_BODY: &str = r#"{"error":{"message":"Incorrect API key provided: sk-inval***c66a. You can find your API key at https://platform.openai.com/account/api-keys.","type":"invalid_request_error","code":"invalid_api_key","param":null}}"#;
+
+    /// Baseline: a 401 whose JSON error body is labelled
+    /// `application/json` parses correctly — `code` reaches the
+    /// envelope. (Already worked pre-#543.)
+    #[tokio::test]
+    async fn non_streaming_401_json_content_type_surfaces_code() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_raw(
+                OPENAI_401_BODY.as_bytes(),
+                "application/json; charset=utf-8",
+            ))
+            .mount(&server)
+            .await;
+        let bridge = OpenAiBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        let err = bridge.chat(&req(), &ctx).await.unwrap_err();
+        match err {
+            BridgeError::UpstreamStatus { parsed, .. } => {
+                assert_eq!(
+                    parsed.and_then(|p| p.code),
+                    Some("invalid_api_key".to_string())
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// Issue #543: the SAME JSON error body labelled with a
+    /// non-`application/json` Content-Type (as OpenAI's 401 path / an
+    /// edge layer returns it) must STILL surface `code` / `param`.
+    /// Pre-fix the Content-Type gate skipped the parse, dumping the raw
+    /// body into `message` and emitting an empty `code`.
+    #[tokio::test]
+    async fn non_streaming_401_non_json_content_type_still_surfaces_code() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_raw(OPENAI_401_BODY.as_bytes(), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+        let bridge = OpenAiBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        let err = bridge.chat(&req(), &ctx).await.unwrap_err();
+        match err {
+            BridgeError::UpstreamStatus {
+                parsed, message, ..
+            } => {
+                let parsed = parsed.expect("error envelope must parse regardless of Content-Type");
+                assert_eq!(parsed.code.as_deref(), Some("invalid_api_key"));
+                assert_eq!(parsed.kind.as_deref(), Some("invalid_request_error"));
+                // `message` must be the clean upstream message, NOT the
+                // raw JSON-stringified body.
+                assert!(
+                    message.starts_with("Incorrect API key provided"),
+                    "message must be the parsed upstream message, got: {message}",
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// A genuinely non-JSON error body (HTML / plain text, no
+    /// `{"error":...}`) must still fall back cleanly — parse returns
+    /// None, no panic. Guards the opportunistic-parse change against
+    /// over-parsing.
+    #[tokio::test]
+    async fn non_streaming_non_json_error_body_falls_back() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(502)
+                    .set_body_raw(b"<html>502 Bad Gateway</html>", "text/html"),
+            )
+            .mount(&server)
+            .await;
+        let bridge = OpenAiBridge::new();
+        let ctx = sample_ctx(&server.uri());
+        let err = bridge.chat(&req(), &ctx).await.unwrap_err();
+        match err {
+            BridgeError::UpstreamStatus { parsed, status, .. } => {
+                assert_eq!(status, 502);
+                assert!(parsed.is_none(), "non-JSON body must not parse into a view");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn non_streaming_decode_error_on_malformed_body() {
         let server = MockServer::start().await;
