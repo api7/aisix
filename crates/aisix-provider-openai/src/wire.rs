@@ -182,6 +182,16 @@ pub struct OpenAiUsage {
     /// `completion_tokens`.
     #[serde(default)]
     pub completion_tokens_details: Option<OpenAiCompletionDetails>,
+    /// DeepSeek-native context-cache HIT count (#542). DeepSeek's
+    /// OpenAI-compatible response puts the cache counters at the top
+    /// level of `usage` (not nested under `prompt_tokens_details` like
+    /// OpenAI). Optional so OpenAI / other compat upstreams parse
+    /// without it.
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: Option<u32>,
+    /// DeepSeek-native context-cache MISS count (#542).
+    #[serde(default)]
+    pub prompt_cache_miss_tokens: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -244,10 +254,18 @@ fn into_usage(u: OpenAiUsage) -> UsageStats {
         prompt_tokens: u.prompt_tokens,
         completion_tokens: u.completion_tokens,
         total_tokens: u.total_tokens,
+        // Normalize the cache-hit count into the canonical field for
+        // ALL providers (#542): OpenAI nests it under
+        // `prompt_tokens_details.cached_tokens`; DeepSeek puts it at the
+        // top level as `prompt_cache_hit_tokens`. Prefer the OpenAI
+        // nested form when present, else fall back to DeepSeek's native
+        // field. This is what surfaces as `prompt_tokens_details.cached_tokens`
+        // on the client response regardless of upstream.
         cached_prompt_tokens: u
             .prompt_tokens_details
             .as_ref()
             .map(|d| d.cached_tokens)
+            .or(u.prompt_cache_hit_tokens)
             .unwrap_or(0),
         reasoning_tokens: u
             .completion_tokens_details
@@ -259,6 +277,12 @@ fn into_usage(u: OpenAiUsage) -> UsageStats {
         // prompt rate for unset cache counters).
         cache_creation_tokens: 0,
         cache_read_tokens: 0,
+        // Preserve DeepSeek's native counters verbatim for passthrough
+        // (#542) so a client reading the native field names still works,
+        // alongside the normalized `cached_prompt_tokens` above. `None`
+        // for non-DeepSeek upstreams → the renderer omits the fields.
+        prompt_cache_hit_tokens: u.prompt_cache_hit_tokens,
+        prompt_cache_miss_tokens: u.prompt_cache_miss_tokens,
     }
 }
 
@@ -542,6 +566,52 @@ mod tests {
         assert_eq!(out.usage.cached_prompt_tokens, 800);
         assert_eq!(out.usage.completion_tokens, 500);
         assert_eq!(out.usage.reasoning_tokens, 200);
+        // OpenAI upstreams don't emit DeepSeek's native top-level cache
+        // counters — they stay None so the renderer omits them (#542).
+        assert_eq!(out.usage.prompt_cache_hit_tokens, None);
+        assert_eq!(out.usage.prompt_cache_miss_tokens, None);
+    }
+
+    /// Issue #542: DeepSeek's OpenAI-compatible response carries the
+    /// context-cache counters at the TOP LEVEL of `usage`
+    /// (`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`), not
+    /// nested under `prompt_tokens_details` like OpenAI. The bridge
+    /// must (a) NORMALIZE the hit count into the canonical
+    /// `cached_prompt_tokens` so it surfaces as OpenAI-shape
+    /// `prompt_tokens_details.cached_tokens`, AND (b) PRESERVE the
+    /// native fields verbatim for passthrough. Mirrors the ecosystem's
+    /// hybrid (DeepSeek-native + OpenAI-canonical both present).
+    #[test]
+    fn deepseek_native_cache_counters_normalize_and_passthrough() {
+        // Verified shape from https://api-docs.deepseek.com — DeepSeek's
+        // usage object adds prompt_cache_hit_tokens / prompt_cache_miss_tokens.
+        let body = r#"{
+            "id": "cmpl-ds",
+            "object": "chat.completion",
+            "model": "deepseek-chat",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 100,
+                "total_tokens": 1100,
+                "prompt_cache_hit_tokens": 768,
+                "prompt_cache_miss_tokens": 232
+            }
+        }"#;
+        let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        // (a) normalized into the canonical cache-hit field
+        assert_eq!(
+            out.usage.cached_prompt_tokens, 768,
+            "DeepSeek prompt_cache_hit_tokens must normalize into cached_prompt_tokens",
+        );
+        // (b) native fields preserved verbatim for passthrough
+        assert_eq!(out.usage.prompt_cache_hit_tokens, Some(768));
+        assert_eq!(out.usage.prompt_cache_miss_tokens, Some(232));
     }
 
     #[test]

@@ -68,6 +68,73 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// OpenAI-canonical prompt-token breakdown. Emitted whenever the
+    /// gateway has a non-zero cache-hit count (#542) — for OpenAI it
+    /// comes from the upstream's `prompt_tokens_details.cached_tokens`,
+    /// for DeepSeek from the normalized native `prompt_cache_hit_tokens`.
+    /// Skipped (not `{}`) when there's nothing to report, so callers
+    /// that branch on the field's presence behave like they do against
+    /// api.openai.com.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// OpenAI-canonical completion-token breakdown. Emitted when the
+    /// upstream reported reasoning tokens (o1/o3/DeepSeek-R1) (#542/#466).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+    /// DeepSeek-native cache-hit counter, passed through verbatim
+    /// (#542/#465) alongside the normalized `prompt_tokens_details`
+    /// above so DeepSeek-aware clients reading the native field name
+    /// still work. Omitted for upstreams that don't emit it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_hit_tokens: Option<u32>,
+    /// DeepSeek-native cache-miss counter, passed through verbatim
+    /// (#542/#465).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_miss_tokens: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct PromptTokensDetails {
+    /// Prompt tokens served from the provider's prompt cache.
+    pub cached_tokens: u32,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct CompletionTokensDetails {
+    /// o1 / o3 / DeepSeek-R1 reasoning tokens (subset of completion).
+    pub reasoning_tokens: u32,
+}
+
+impl Usage {
+    /// Build the client-facing usage envelope from the gateway's
+    /// canonical [`UsageStats`]. Centralises the normalize + native-
+    /// passthrough policy (#542) so the non-streaming and streaming
+    /// renderers stay in lock-step:
+    ///
+    /// - canonical triplet copied through
+    /// - `cached_prompt_tokens > 0` → emit OpenAI-shape
+    ///   `prompt_tokens_details.cached_tokens` (works for OpenAI's
+    ///   nested field AND DeepSeek's normalized native one)
+    /// - `reasoning_tokens > 0` → emit
+    ///   `completion_tokens_details.reasoning_tokens`
+    /// - DeepSeek-native `prompt_cache_hit_tokens` /
+    ///   `prompt_cache_miss_tokens` passed through verbatim when the
+    ///   upstream sent them (Some), omitted otherwise
+    fn from_stats(u: &aisix_gateway::UsageStats) -> Self {
+        Usage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+            prompt_tokens_details: (u.cached_prompt_tokens > 0).then_some(PromptTokensDetails {
+                cached_tokens: u.cached_prompt_tokens,
+            }),
+            completion_tokens_details: (u.reasoning_tokens > 0).then_some(CompletionTokensDetails {
+                reasoning_tokens: u.reasoning_tokens,
+            }),
+            prompt_cache_hit_tokens: u.prompt_cache_hit_tokens,
+            prompt_cache_miss_tokens: u.prompt_cache_miss_tokens,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -129,11 +196,7 @@ pub fn render_response(
             },
             finish_reason: finish_to_str(&resp.finish_reason).to_string(),
         }],
-        usage: Usage {
-            prompt_tokens: resp.usage.prompt_tokens,
-            completion_tokens: resp.usage.completion_tokens,
-            total_tokens: resp.usage.total_tokens,
-        },
+        usage: Usage::from_stats(&resp.usage),
     }
 }
 
@@ -164,11 +227,7 @@ pub fn render_chunk(
                 .as_ref()
                 .map(|f| finish_to_str(f).to_string()),
         }],
-        usage: chunk.usage.map(|u| Usage {
-            prompt_tokens: u.prompt_tokens,
-            completion_tokens: u.completion_tokens,
-            total_tokens: u.total_tokens,
-        }),
+        usage: chunk.usage.as_ref().map(Usage::from_stats),
     }
 }
 
@@ -268,6 +327,114 @@ mod tests {
         assert_eq!(json["choices"][0]["message"]["role"], "assistant");
         assert_eq!(json["choices"][0]["message"]["content"], "hello");
         assert_eq!(json["usage"]["total_tokens"], 5);
+        // No cache / reasoning / native fields when the upstream
+        // reported none — the nested objects must be ABSENT, not
+        // emitted as empty `{}` (#542). OpenAI SDK clients branch on
+        // presence.
+        assert!(
+            json["usage"].get("prompt_tokens_details").is_none(),
+            "prompt_tokens_details must be omitted when no cache hit"
+        );
+        assert!(json["usage"].get("completion_tokens_details").is_none());
+        assert!(json["usage"].get("prompt_cache_hit_tokens").is_none());
+    }
+
+    /// Issue #542 (OpenAI half): when the gateway has a non-zero
+    /// cache-hit / reasoning count, the client response must carry the
+    /// OpenAI-canonical nested breakdown objects (pre-fix these were
+    /// silently dropped by the renderer).
+    #[test]
+    fn render_response_emits_openai_canonical_usage_details() {
+        let usage = UsageStats {
+            prompt_tokens: 1000,
+            completion_tokens: 500,
+            total_tokens: 1500,
+            cached_prompt_tokens: 800,
+            reasoning_tokens: 200,
+            ..UsageStats::default()
+        };
+        let r = ChatResponse {
+            id: "cmpl-1".into(),
+            model: "m".into(),
+            message: ChatMessage::assistant("hi"),
+            finish_reason: FinishReason::Stop,
+            usage,
+        };
+        let json = serde_json::to_value(render_response(0, r, "m")).unwrap();
+        assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 800);
+        assert_eq!(
+            json["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            200
+        );
+        // OpenAI upstream → no DeepSeek-native fields.
+        assert!(json["usage"].get("prompt_cache_hit_tokens").is_none());
+    }
+
+    /// Issue #542 (DeepSeek half, hybrid): the response must carry BOTH
+    /// the normalized OpenAI-shape `prompt_tokens_details.cached_tokens`
+    /// AND the DeepSeek-native `prompt_cache_hit_tokens` /
+    /// `prompt_cache_miss_tokens` passed through verbatim. Matches the
+    /// ecosystem's hybrid so clients reading either field name work.
+    #[test]
+    fn render_response_emits_deepseek_native_and_normalized_cache() {
+        let usage = UsageStats {
+            prompt_tokens: 1000,
+            completion_tokens: 100,
+            total_tokens: 1100,
+            // Normalized from DeepSeek's prompt_cache_hit_tokens by the
+            // bridge.
+            cached_prompt_tokens: 768,
+            prompt_cache_hit_tokens: Some(768),
+            prompt_cache_miss_tokens: Some(232),
+            ..UsageStats::default()
+        };
+        let r = ChatResponse {
+            id: "cmpl-ds".into(),
+            model: "deepseek-chat".into(),
+            message: ChatMessage::assistant("hi"),
+            finish_reason: FinishReason::Stop,
+            usage,
+        };
+        let json = serde_json::to_value(render_response(0, r, "ds-alias")).unwrap();
+        // Normalized OpenAI-canonical shape
+        assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 768);
+        // Native passthrough
+        assert_eq!(json["usage"]["prompt_cache_hit_tokens"], 768);
+        assert_eq!(json["usage"]["prompt_cache_miss_tokens"], 232);
+    }
+
+    /// Issue #542: the streaming renderer (`render_chunk`) must apply
+    /// the same usage policy as `render_response` — the terminal chunk's
+    /// usage carries the nested details + native passthrough. A
+    /// regression that only fixed the non-streaming path would let
+    /// streaming DeepSeek/OpenAI clients lose cache visibility.
+    #[test]
+    fn render_chunk_emits_usage_details_on_terminal_chunk() {
+        let usage = UsageStats {
+            prompt_tokens: 50,
+            completion_tokens: 10,
+            total_tokens: 60,
+            cached_prompt_tokens: 32,
+            prompt_cache_hit_tokens: Some(32),
+            prompt_cache_miss_tokens: Some(18),
+            ..UsageStats::default()
+        };
+        let chunk = ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: aisix_gateway::ChatDelta {
+                role: None,
+                content: None,
+                tool_calls: None,
+                reasoning_content: None,
+            },
+            finish_reason: Some(FinishReason::Stop),
+            usage: Some(usage),
+        };
+        let json = serde_json::to_value(render_chunk(0, chunk, "m")).unwrap();
+        assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 32);
+        assert_eq!(json["usage"]["prompt_cache_hit_tokens"], 32);
+        assert_eq!(json["usage"]["prompt_cache_miss_tokens"], 18);
     }
 
     /// Pins the AISIX-Cloud#410 contract: when the upstream returns one

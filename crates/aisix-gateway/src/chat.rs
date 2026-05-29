@@ -308,6 +308,20 @@ pub struct UsageStats {
     /// counter on top of input_tokens.
     #[serde(default)]
     pub cache_read_tokens: u32,
+    /// DeepSeek-native `prompt_cache_hit_tokens`, preserved verbatim
+    /// for client passthrough (#542). The canonical `cached_prompt_tokens`
+    /// above carries the *normalized* (OpenAI-shape) cache-hit count for
+    /// all providers; this Option carries the raw provider-native field
+    /// so a DeepSeek-aware client reading the native name still works.
+    /// `None` for providers that don't emit it — distinct from a real
+    /// `Some(0)` so the renderer only emits the field when the upstream
+    /// actually sent it. Bounded allowlist, not arbitrary passthrough.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_hit_tokens: Option<u32>,
+    /// DeepSeek-native `prompt_cache_miss_tokens`, preserved verbatim
+    /// (#542). See `prompt_cache_hit_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_miss_tokens: Option<u32>,
 }
 
 impl UsageStats {

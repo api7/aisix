@@ -483,6 +483,10 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
             // reasoning-tokens taxonomy; leave at 0.
             cached_prompt_tokens: 0,
             reasoning_tokens: 0,
+            // DeepSeek-native passthrough fields (#542) don't apply to
+            // Anthropic upstreams.
+            prompt_cache_hit_tokens: None,
+            prompt_cache_miss_tokens: None,
         })
         .unwrap_or_default();
 
