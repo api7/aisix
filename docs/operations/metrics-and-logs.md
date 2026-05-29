@@ -32,7 +32,7 @@ The Prometheus integration also emits LiteLLM-category equivalents under AISIX-n
 - deployment and routing: `aisix_deployment_*` and `aisix_routing_*` metric families when the request path has those events
 - exporter/cache health: Redis, usage-event drop, and OTLP fan-out drop/failure counters
 
-Labels are limited to values the data plane has reliably: `endpoint`, `inbound_protocol`, `provider`, `model`, `upstream_model`, `provider_key_id`, `api_key_id`, `team_id`, `owner_id`, `status`, and `outcome`. User email, team alias, and end-user labels are not fabricated by the data plane.
+Labels are limited to values the data plane has reliably: `endpoint`, `inbound_protocol`, `provider`, `model`, `upstream_model`, `provider_key_id`, `api_key_id`, `team_id`, `user_id`, `status`, and `outcome`. User email, team alias, and end-user labels are not fabricated by the data plane.
 
 ## Access Logs And Usage Signals
 

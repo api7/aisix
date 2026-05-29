@@ -118,7 +118,7 @@ Up to six budget rows can apply to a single request — see [Budget Scopes](budg
 - `team_id = T` → `team` scope rows whose `scope_ref = T` also apply
 - `user_id = M` → `member` scope rows whose `scope_ref = M` also apply
 
-Membership in a team via the control plane's `team_members` relation does **not** propagate into budget applicability — only the explicit `team_id` on the api_key itself counts. If you want a key to contribute to a team's budget, set `team_id` at creation time.
+Adding a user to a team does **not** by itself make that user's keys count against the team budget — only the explicit `team_id` on the api_key does. If you want a key to contribute to a team's budget, set `team_id` at creation time.
 
 Current standalone boundary:
 
