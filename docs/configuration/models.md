@@ -156,8 +156,9 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
 
 ## Field Notes
 
-- `display_name` is the alias clients send in proxy requests.
-- `provider` currently supports `openai`, `anthropic`, `google`, `deepseek`, `cohere`, and `jina`.
+- `display_name` is the alias clients send in proxy requests, and the value `response.model` echoes back. It is **not** the upstream model id.
+- `model_name` is the upstream model id — the literal string the upstream provider expects in its own `model` field (for example `gpt-4o`, `claude-sonnet-4-5`, an Azure deployment name, or a Bedrock model id). Despite the name, this field holds the upstream id, not a caller alias; the caller alias is `display_name`.
+- `provider` is a free-form vendor label, not a closed enum. The value must match the pattern `^[a-z0-9][a-z0-9._-]*$` (lowercase alphanumerics plus `.`, `-`, `_`, and no leading separator) and be at most 64 characters. In AISIX Cloud it is the catalog provider id (for example `openai`, `anthropic`, `deepseek`, `amazon-bedrock`); in the self-hosted gateway it can be any label you choose for a vendor or endpoint (for example `vllm`, `openrouter`, `xai`). Dispatch reads the referenced provider key's `adapter` and `provider`; this field also serves as a metrics and access-log label and gates a few vendor-specific endpoints. See [Adapter protocol families](../reference/adapters.md#how-a-model-resolves-to-a-bridge).
 - `provider_key_id` must reference an existing `ProviderKey` resource.
 - `timeout` is in milliseconds. `0` or omission means no timeout.
 - `cost` stores pricing metadata that AISIX Cloud's cp-api consumes when emitting usage events. The standalone OSS proxy does not consult this field at request time and always emits `cost_usd=0.0`; pricing-aware budget enforcement requires the AISIX Cloud control plane.
@@ -221,6 +222,7 @@ That is expected with the current discovery boundary.
 ## Related Pages
 
 - [Provider Keys](provider-keys.md)
+- [Adapter protocol families](../reference/adapters.md) — how `provider` and the provider key's `adapter` select an upstream bridge.
 - [API Keys](api-keys.md)
 - [Routing And Failover](routing-and-failover.md)
 - [Configuration Propagation](configuration-propagation.md)

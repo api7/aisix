@@ -37,6 +37,14 @@ This documentation set is organized for two primary audiences:
 - Use [Errors And Retries](integration/errors-and-retries.md) for shared failure handling.
 - Use the quickstarts to configure a working model and caller key first.
 
+### I want to connect an upstream provider
+
+- Read [Adapter protocol families](reference/adapters.md) to see which of the five wire shapes your provider uses.
+- Onboard a public OpenAI-compatible vendor (DeepSeek, Groq, Mistral) with [OpenAI-compatible vendor upstream](integration/upstream-openai-compat.md).
+- Point the gateway at a private or self-hosted endpoint with [Bring your own endpoint](configuration/byo-endpoint.md).
+- Connect a specialized provider with [AWS Bedrock](integration/upstream-bedrock.md), [Google Vertex AI](integration/upstream-vertex.md), or [Azure OpenAI](integration/upstream-azure-openai.md).
+- Look up the credential resource fields in the [Provider key schema](reference/runtime-config-schema.md).
+
 ### I want to operate the gateway in production
 
 - Start with the [Self-Hosted Quickstart](quickstart/self-hosted.md).
@@ -59,6 +67,8 @@ This documentation set is organized for two primary audiences:
 - [AISIX Cloud](cloud/overview.md)
 - [Operations](operations/production-deployment.md)
 - [Reference](reference/proxy-api-reference.md)
+- [Adapter protocol families](reference/adapters.md)
+- [Provider key schema](reference/runtime-config-schema.md)
 - [Tutorials](tutorials/build-a-virtual-model-with-failover.md)
 - [Roadmap](roadmap.md)
 
