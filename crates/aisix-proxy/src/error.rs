@@ -239,6 +239,10 @@ impl ProxyError {
         match self {
             ProxyError::RateLimit(e) => e.retry_after_secs(),
             ProxyError::AllCandidatesUnavailable { retry_after_secs } => *retry_after_secs,
+            // Source the Retry-After header from the same value the 429
+            // body carries (prd-09b §5.8 retry_after_seconds), so the
+            // header and body agree — SDKs back off on the header.
+            ProxyError::BudgetExceeded(r) => r.retry_after_seconds,
             _ => None,
         }
     }
@@ -667,6 +671,10 @@ mod tests {
             period_resets_at: Some("2026-06-01T00:00:00Z".into()),
             retry_after_seconds: Some(259_200),
         }));
+        // The Retry-After *header* must source the same value the body
+        // carries — otherwise SDKs (which back off on the header) and
+        // the body disagree.
+        assert_eq!(err.retry_after_secs(), Some(259_200));
         let v = serde_json::to_value(err.envelope()).unwrap();
         let e = &v["error"];
         assert_eq!(e["type"], "billing_error");
@@ -688,6 +696,32 @@ mod tests {
         let other = serde_json::to_value(ProxyError::ModelNotFound("m".into()).envelope()).unwrap();
         assert!(other["error"].get("scope").is_none());
         assert!(other["error"].get("limit_usd").is_none());
+    }
+
+    #[tokio::test]
+    async fn anthropic_envelope_budget_exceeded_omits_structured_fields() {
+        // The structured budget fields are an OpenAI-envelope extension
+        // only. The Anthropic /v1/messages error block is the strict
+        // {type, message} shape — a fully-populated reason must NOT leak
+        // scope / limit_usd etc. into it.
+        let err = ProxyError::BudgetExceeded(Box::new(crate::budget::BudgetReason {
+            message: "team budget 'frontend' exceeded ($1.00/month). Resets soon.".into(),
+            scope: Some("team".into()),
+            scope_ref: Some("team-uuid-1".into()),
+            limit_usd: Some("1.00".into()),
+            spent_usd: Some("2.00".into()),
+            period: Some("month".into()),
+            period_resets_at: Some("2026-06-01T00:00:00Z".into()),
+            retry_after_seconds: Some(259_200),
+        }));
+        let resp = err.into_anthropic_response();
+        let json =
+            assert_anthropic_envelope(resp, StatusCode::TOO_MANY_REQUESTS, "rate_limit_error")
+                .await;
+        assert!(json["error"].get("scope").is_none());
+        assert!(json["error"].get("scope_ref").is_none());
+        assert!(json["error"].get("limit_usd").is_none());
+        assert!(json["error"].get("spent_usd").is_none());
     }
 
     #[tokio::test]
