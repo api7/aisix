@@ -166,6 +166,16 @@ pub struct OpenAiResponseMessage {
     pub content: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Vec<serde_json::Value>>,
+    /// DeepSeek-reasoner (and other reasoning models) return the
+    /// chain-of-thought text at `message.reasoning_content` on the
+    /// non-streaming path (#466). Without this field it was silently
+    /// dropped at deserialization — the streaming path already
+    /// surfaces it via `extract_reasoning_field`, but non-streaming
+    /// had no capture. Forwarded to the client verbatim via
+    /// `ChatMessage.extra` so OpenAI-SDK clients see
+    /// `choices[0].message.reasoning_content`.
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -220,6 +230,21 @@ pub fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
                     extra.insert(
                         "tool_calls".to_string(),
                         serde_json::Value::Array(tool_calls),
+                    );
+                }
+            }
+            // #466: surface DeepSeek-reasoner's reasoning_content on the
+            // non-streaming path. Stashed in `extra` so render.rs's
+            // RenderedMessage (which flattens `extra`) emits it as
+            // `message.reasoning_content` on the wire — matching the
+            // streaming path's `delta.reasoning_content`. Skip empty
+            // strings so a model that returns `""` doesn't add a noise
+            // field.
+            if let Some(reasoning) = c.message.reasoning_content {
+                if !reasoning.is_empty() {
+                    extra.insert(
+                        "reasoning_content".to_string(),
+                        serde_json::Value::String(reasoning),
                     );
                 }
             }
@@ -619,6 +644,66 @@ mod tests {
         // (b) native fields preserved verbatim for passthrough
         assert_eq!(out.usage.prompt_cache_hit_tokens, Some(768));
         assert_eq!(out.usage.prompt_cache_miss_tokens, Some(232));
+    }
+
+    /// Issue #466: DeepSeek-reasoner returns `reasoning_content` on the
+    /// non-streaming `choices[0].message`. The bridge must capture it
+    /// (it was silently dropped pre-fix — the response message struct
+    /// had no field for it) and surface it via `ChatMessage.extra` so
+    /// render.rs flattens it back onto `message.reasoning_content` for
+    /// the SDK client.
+    #[test]
+    fn non_streaming_reasoning_content_surfaces_via_extra() {
+        let body = r#"{
+            "id": "cmpl-r1",
+            "object": "chat.completion",
+            "model": "deepseek-reasoner",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "The answer is 42.",
+                    "reasoning_content": "Let me think step by step... 6 times 7 is 42."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+        }"#;
+        let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        assert_eq!(out.message.content, "The answer is 42.");
+        let reasoning = out
+            .message
+            .extra
+            .get("reasoning_content")
+            .expect("reasoning_content must be captured into message.extra (#466)")
+            .as_str()
+            .unwrap();
+        assert_eq!(reasoning, "Let me think step by step... 6 times 7 is 42.");
+    }
+
+    /// Issue #466 companion: a response WITHOUT reasoning_content (the
+    /// common non-reasoning model case) must not add a spurious empty
+    /// field to extra.
+    #[test]
+    fn non_streaming_without_reasoning_content_adds_no_extra_field() {
+        let body = r#"{
+            "id": "cmpl-plain",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }"#;
+        let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        assert!(
+            !out.message.extra.contains_key("reasoning_content"),
+            "no reasoning_content field when upstream didn't send one",
+        );
     }
 
     /// PR #442 audit MEDIUM-1: a hybrid OpenAI-compat upstream that
