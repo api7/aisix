@@ -38,7 +38,13 @@ use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
 use serde_json::Value;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -401,8 +407,62 @@ async fn dispatch(
         let headers = upstream_resp.headers().clone();
         let body_stream = upstream_resp.bytes_stream();
 
+        // Issue #245: parity with the OpenAI streaming fix (#225 /
+        // #196). Pre-fix this path forwarded raw bytes and emitted a
+        // UsageEvent with `prompt_tokens=0 completion_tokens=0` —
+        // every streaming /v1/messages request billed as zero. Wrap
+        // the byte stream in an Anthropic-shape SSE parser that
+        // side-channels the upstream `usage` block (input_tokens from
+        // `message_start`, running output_tokens from `message_delta`)
+        // while forwarding bytes verbatim, then fires
+        // `emit_anthropic_usage_event` from a Drop guard so the event
+        // ships even on client-disconnect mid-stream (same
+        // CompleteOnDrop pattern as chat.rs::build_sse_stream).
+        let state_c = state.clone();
+        let request_id_c = request_id.to_string();
+        let model_id_c = model_entry.id.clone();
+        let api_key_id_c = auth.entry.id.clone();
+        let provider_c = provider_label.clone();
+        let model_name_c = model_name.clone();
+        let provider_key_id_c = pk_entry.id.clone();
+        let upstream_model_c = upstream_model.clone();
+        let team_id_c = auth.key().team_id.clone();
+        let user_id_c = auth.key().user_id.clone();
+
+        let parsed_stream =
+            build_anthropic_passthrough_stream(body_stream, started, move |usage| {
+                // Streaming responses that got this far are 200 — the
+                // !status.is_success() guard above returned early on
+                // upstream errors.
+                let metrics = AnthropicUsageMetrics {
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    cache_creation_tokens: usage.cache_creation_tokens,
+                    cache_read_tokens: usage.cache_read_tokens,
+                    provider_request_id: usage.provider_request_id,
+                    provider_model_version: usage.provider_model_version,
+                    finish_reason: usage.finish_reason,
+                    ttft_ms: usage.ttft_ms,
+                };
+                emit_anthropic_usage_event(
+                    &state_c,
+                    &request_id_c,
+                    &model_id_c,
+                    &api_key_id_c,
+                    &provider_c,
+                    &model_name_c,
+                    &provider_key_id_c,
+                    &upstream_model_c,
+                    team_id_c.as_deref(),
+                    user_id_c.as_deref(),
+                    200,
+                    started.elapsed(),
+                    metrics,
+                );
+            });
+
         let mut response =
-            axum::response::Response::new(axum::body::Body::from_stream(body_stream));
+            axum::response::Response::new(axum::body::Body::from_stream(parsed_stream));
 
         // Copy content-type from upstream (should be text/event-stream).
         if let Some(ct) = headers.get("content-type") {
@@ -424,20 +484,18 @@ async fn dispatch(
                 .insert(HeaderName::from_static("x-aisix-request-id"), hv);
         }
 
-        // Streaming passthrough: the upstream byte stream isn't
-        // parsed in-flight, so token counts aren't available here.
-        // Emit a UsageEvent without token detail; the
-        // `inbound_protocol="anthropic"` label still lets dashboard
-        // Logs surface the request alongside non-streaming siblings.
-        // Real token counts on this path land with the parsing
-        // wrapper in a follow-up.
+        // `usage_handled_by_stream: true` — the Drop guard inside
+        // `build_anthropic_passthrough_stream` owns the UsageEvent
+        // emission, so the top-level handler must NOT double-emit.
+        // `metrics` here is unused on this path (the stream computes
+        // the real counts at end-of-stream).
         Ok(DispatchOutcome {
             response,
             provider_label,
             provider_key_id: pk_entry.id.clone(),
             upstream_model: upstream_model.clone(),
             metrics: AnthropicUsageMetrics::default(),
-            usage_handled_by_stream: false,
+            usage_handled_by_stream: true,
         })
     } else {
         // Non-streaming: deserialise and re-serialise as JSON. Decode
@@ -958,6 +1016,275 @@ fn emit_anthropic_usage_event(
             },
             Duration::from_millis(u64::from(metrics.ttft_ms)),
         );
+    }
+}
+
+// ─── Anthropic streaming usage parser (#245) ───────────────────────
+//
+// The Anthropic `/v1/messages` passthrough forwards the upstream SSE
+// byte stream verbatim. To recover token counts for telemetry without
+// altering the bytes the client sees, `build_anthropic_passthrough_stream`
+// wraps the byte stream: it appends each chunk to a frame buffer,
+// extracts complete SSE events (delimited by a blank line), and parses
+// their `data:` JSON to accumulate usage — then yields the *original*
+// bytes unchanged. A Drop guard fires `on_complete` exactly once at
+// end-of-stream OR on client-disconnect (mirroring chat.rs's
+// `CompleteOnDrop`), so a streamed request always ships a UsageEvent.
+
+/// Accumulated usage observed across an Anthropic SSE stream.
+/// Sourced from `message_start` (input + cache tokens, id, model) and
+/// `message_delta` (running output_tokens, stop_reason). All fields
+/// default to zero / empty when the upstream never emits the
+/// corresponding frame.
+#[derive(Default)]
+struct AnthropicStreamUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cache_creation_tokens: u32,
+    cache_read_tokens: u32,
+    provider_request_id: String,
+    provider_model_version: String,
+    finish_reason: String,
+    ttft_ms: u32,
+    /// Count of upstream byte-chunks actually delivered to the client
+    /// (read by the Drop guard for the #419 cost-leak gate).
+    chunks_delivered: u32,
+}
+
+/// Update the accumulator from one parsed SSE `data:` JSON object.
+/// Best-effort: unrecognised `type` values are ignored. `started` +
+/// `first_token_seen` drive the TTFT measurement (first content frame).
+fn update_anthropic_usage(
+    acc: &mut AnthropicStreamUsage,
+    json: &Value,
+    started: Instant,
+    first_token_seen: &mut bool,
+) {
+    match json.get("type").and_then(Value::as_str) {
+        Some("message_start") => {
+            let msg = json.get("message");
+            if let Some(usage) = msg.and_then(|m| m.get("usage")) {
+                if let Some(t) = usage.get("input_tokens").and_then(Value::as_u64) {
+                    acc.prompt_tokens = t as u32;
+                }
+                if let Some(t) = usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    acc.cache_creation_tokens = t as u32;
+                }
+                if let Some(t) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
+                    acc.cache_read_tokens = t as u32;
+                }
+                // message_start carries an initial output_tokens (often
+                // 1); take it as a floor — message_delta supersedes with
+                // the real total. max-wins guards against a provider that
+                // double-emits or re-orders.
+                if let Some(t) = usage.get("output_tokens").and_then(Value::as_u64) {
+                    acc.completion_tokens = acc.completion_tokens.max(t as u32);
+                }
+            }
+            if let Some(id) = msg.and_then(|m| m.get("id")).and_then(Value::as_str) {
+                acc.provider_request_id = id.to_string();
+            }
+            if let Some(m) = msg.and_then(|m| m.get("model")).and_then(Value::as_str) {
+                acc.provider_model_version = m.to_string();
+            }
+        }
+        Some("content_block_start") | Some("content_block_delta") => {
+            // First content frame → record time-to-first-token.
+            if !*first_token_seen {
+                *first_token_seen = true;
+                acc.ttft_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            }
+        }
+        Some("message_delta") => {
+            if let Some(t) = json
+                .get("usage")
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(Value::as_u64)
+            {
+                acc.completion_tokens = acc.completion_tokens.max(t as u32);
+            }
+            if let Some(sr) = json
+                .get("delta")
+                .and_then(|d| d.get("stop_reason"))
+                .and_then(Value::as_str)
+            {
+                acc.finish_reason = sr.to_string();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Drain every complete SSE frame from `buf`, updating `acc`. A frame
+/// ends at the first blank line (`\n\n`). Incomplete trailing bytes are
+/// left in `buf` for the next chunk. The `data:` payload is parsed as
+/// JSON; non-JSON or non-`data` frames are skipped.
+fn drain_anthropic_sse_frames(
+    buf: &mut Vec<u8>,
+    acc: &mut AnthropicStreamUsage,
+    started: Instant,
+    first_token_seen: &mut bool,
+) {
+    // SSE event delimiter is a blank line. Anthropic emits `\n\n`;
+    // tolerate `\r\n\r\n` defensively by normalising the search.
+    while let Some(end) = find_frame_end(buf) {
+        let frame: Vec<u8> = buf.drain(..end).collect();
+        if let Some(data) = extract_sse_data_line(&frame) {
+            if let Ok(json) = serde_json::from_slice::<Value>(data) {
+                update_anthropic_usage(acc, &json, started, first_token_seen);
+            }
+        }
+    }
+}
+
+/// Find the byte index just past the first SSE frame terminator
+/// (`\n\n` or `\r\n\r\n`). Returns the number of bytes to drain
+/// (frame + terminator), or `None` if no complete frame is buffered.
+fn find_frame_end(buf: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
+            return Some(i + 2);
+        }
+        if i + 3 < buf.len()
+            && buf[i] == b'\r'
+            && buf[i + 1] == b'\n'
+            && buf[i + 2] == b'\r'
+            && buf[i + 3] == b'\n'
+        {
+            return Some(i + 4);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Extract the `data:` payload bytes from one SSE frame. Returns the
+/// JSON slice (after `data:` and an optional leading space), or `None`
+/// if the frame has no data line. Only the first data line is read —
+/// Anthropic emits single-line data for the frames we care about.
+fn extract_sse_data_line(frame: &[u8]) -> Option<&[u8]> {
+    for line in frame.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if let Some(rest) = line.strip_prefix(b"data:") {
+            let rest = rest.strip_prefix(b" ").unwrap_or(rest);
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// Drop guard that fires `on_complete` exactly once with the
+/// accumulated usage — on normal end-of-stream AND on client
+/// disconnect (the async-stream generator drops at its suspension
+/// point). Applies the #419 cost-leak gate: if no byte-chunk reached
+/// the client, the completion-side counters are zeroed (the prompt was
+/// processed upstream regardless, so `prompt_tokens` is kept).
+struct AnthropicStreamGuard<F: FnOnce(AnthropicStreamUsage)> {
+    slot: Option<(F, AnthropicStreamUsage)>,
+    delivered: Arc<AtomicU32>,
+}
+
+impl<F: FnOnce(AnthropicStreamUsage)> AnthropicStreamGuard<F> {
+    fn usage(&mut self) -> &mut AnthropicStreamUsage {
+        &mut self
+            .slot
+            .as_mut()
+            .expect("AnthropicStreamGuard accessed after take")
+            .1
+    }
+}
+
+impl<F: FnOnce(AnthropicStreamUsage)> Drop for AnthropicStreamGuard<F> {
+    fn drop(&mut self) {
+        if let Some((f, mut usage)) = self.slot.take() {
+            let delivered = self.delivered.load(Ordering::Relaxed);
+            usage.chunks_delivered = delivered;
+            if delivered == 0 {
+                // No bytes crossed the wire (client aborted before the
+                // first chunk). Don't bill the completion side; keep
+                // prompt_tokens per the "prompts always billed"
+                // industry contract (#419 parity).
+                usage.completion_tokens = 0;
+                usage.cache_creation_tokens = 0;
+                usage.cache_read_tokens = 0;
+            }
+            f(usage);
+        }
+    }
+}
+
+/// Stream wrapper that counts delivered items (`poll_next ->
+/// Ready(Some)`) into a shared atomic, read by the Drop guard for the
+/// #419 cost-leak gate. Mirrors chat.rs's `DeliveryCounter`.
+struct AnthropicDeliveryCounter<T> {
+    inner: Pin<Box<dyn Stream<Item = T> + Send>>,
+    delivered: Arc<AtomicU32>,
+}
+
+impl<T> Stream for AnthropicDeliveryCounter<T> {
+    type Item = T;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(item)) => {
+                self.delivered.fetch_add(1, Ordering::Relaxed);
+                Poll::Ready(Some(item))
+            }
+            other => other,
+        }
+    }
+}
+
+/// Wrap an Anthropic upstream byte stream so token usage is parsed
+/// in-flight and `on_complete` fires once at end-of-stream (or
+/// client-disconnect) with the accumulated counts. Bytes are forwarded
+/// verbatim — the client sees the exact upstream SSE wire shape.
+fn build_anthropic_passthrough_stream<S, F>(
+    upstream: S,
+    started: Instant,
+    on_complete: F,
+) -> AnthropicDeliveryCounter<reqwest::Result<Bytes>>
+where
+    S: Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+    F: FnOnce(AnthropicStreamUsage) + Send + 'static,
+{
+    let delivered = Arc::new(AtomicU32::new(0));
+    let delivered_for_drop = Arc::clone(&delivered);
+    let inner = async_stream::stream! {
+        let mut guard = AnthropicStreamGuard {
+            slot: Some((on_complete, AnthropicStreamUsage::default())),
+            delivered: delivered_for_drop,
+        };
+        futures::pin_mut!(upstream);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut first_token_seen = false;
+        while let Some(item) = upstream.next().await {
+            if let Ok(bytes) = &item {
+                // Side-channel parse: copy into the frame buffer (the
+                // original `bytes` is yielded unchanged below) and drain
+                // any complete SSE frames into the accumulator.
+                buf.extend_from_slice(bytes);
+                drain_anthropic_sse_frames(
+                    &mut buf,
+                    guard.usage(),
+                    started,
+                    &mut first_token_seen,
+                );
+            }
+            // Forward the original item verbatim (Ok bytes OR Err — an
+            // upstream error mid-stream is passed through; the
+            // accumulator keeps whatever was captured before it).
+            yield item;
+        }
+        // guard drops here → on_complete fires (delivery-gated).
+    };
+    AnthropicDeliveryCounter {
+        inner: Box::pin(inner),
+        delivered,
     }
 }
 
@@ -2021,6 +2348,213 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert!(body.contains("event: content_block_delta"));
         assert!(body.contains("\"text\":\"hi\""));
         assert!(body.contains("event: message_stop"));
+    }
+
+    /// Issue #245 (dp-blocker): the Anthropic passthrough STREAMING
+    /// path must record the upstream-billed token counts on the
+    /// UsageEvent — parity with the OpenAI streaming fix (#225/#196).
+    /// Pre-fix this path forwarded raw bytes and emitted
+    /// `prompt_tokens=0 completion_tokens=0`, so every streaming
+    /// /v1/messages request billed as zero. This test drives a
+    /// realistic Anthropic SSE response (input_tokens in
+    /// `message_start`, running output_tokens in `message_delta`) and
+    /// asserts the emitted UsageEvent carries the real counts, plus
+    /// the response bytes still pass through verbatim.
+    #[tokio::test]
+    async fn anthropic_passthrough_streaming_records_usage_from_sse_frames() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // Canonical Anthropic streaming wire shape:
+        // - message_start carries usage.input_tokens (+ cache fields)
+        //   and the message id / model
+        // - message_delta carries the running usage.output_tokens and
+        //   the terminal stop_reason
+        let sse = "\
+event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream_245\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",\"stop_reason\":null,\"usage\":{\"input_tokens\":37,\"cache_creation_input_tokens\":4,\"cache_read_input_tokens\":9,\"output_tokens\":1}}}\n\n\
+event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello there\"}}\n\n\
+event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":52}}\n\n\
+event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    // Small delay so TTFT measurement is non-zero.
+                    .set_delay(std::time::Duration::from_millis(20))
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let snap = new_snap_anthropic(&upstream.uri());
+        snap.models.insert(anthropic_model("my-claude"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 100,
+            "stream": true,
+        });
+        let resp = app.oneshot(make_req(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Bytes pass through verbatim — the client still sees the exact
+        // Anthropic SSE wire shape.
+        let streamed =
+            String::from_utf8(to_bytes(resp.into_body(), 65536).await.unwrap().to_vec()).unwrap();
+        assert!(streamed.contains("event: message_start"));
+        assert!(streamed.contains("\"text\":\"hello there\""));
+        assert!(streamed.contains("event: message_stop"));
+
+        // The UsageEvent must carry the real upstream counts (#245).
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("streaming /v1/messages must emit a UsageEvent (#245)")
+            .expect("usage event sender dropped");
+        assert_eq!(event.inbound_protocol, "anthropic");
+        assert_eq!(
+            event.prompt_tokens, 37,
+            "prompt_tokens must mirror message_start usage.input_tokens",
+        );
+        assert_eq!(
+            event.completion_tokens, 52,
+            "completion_tokens must mirror message_delta usage.output_tokens (running total)",
+        );
+        assert_eq!(
+            event.cache_creation_tokens, 4,
+            "cache_creation_tokens from message_start",
+        );
+        assert_eq!(
+            event.cache_read_tokens, 9,
+            "cache_read_tokens from message_start",
+        );
+        assert_eq!(event.provider_request_id, "msg_stream_245");
+        assert_eq!(event.provider_model_version, "claude-3-5-haiku-20241022");
+        assert_eq!(event.finish_reason, "end_turn");
+        assert_eq!(event.status_code, 200);
+        assert!(
+            event.ttft_ms > 0,
+            "streaming /v1/messages telemetry must record TTFT",
+        );
+        assert!(rx.try_recv().is_err(), "usage event should be emitted once");
+    }
+
+    /// Issue #245: the SSE frame parser must reassemble events that
+    /// arrive split across byte-chunk boundaries (reqwest's
+    /// `bytes_stream()` makes no frame-alignment guarantees). Drives
+    /// `drain_anthropic_sse_frames` directly with a buffer that holds
+    /// one complete frame plus a partial second frame, then completes
+    /// the second frame on the next call.
+    #[test]
+    fn sse_frame_parser_reassembles_split_chunks() {
+        use super::{drain_anthropic_sse_frames, AnthropicStreamUsage};
+
+        let mut acc = AnthropicStreamUsage::default();
+        let mut first_token_seen = false;
+        let started = std::time::Instant::now();
+
+        // First "chunk": a complete message_start frame + the start of
+        // a message_delta frame (no terminating blank line yet).
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude-x\",\"usage\":{\"input_tokens\":11}}}\n\n\
+event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2",
+        );
+        drain_anthropic_sse_frames(&mut buf, &mut acc, started, &mut first_token_seen);
+        // Only the complete first frame is consumed.
+        assert_eq!(acc.prompt_tokens, 11, "input_tokens parsed from frame 1");
+        assert_eq!(acc.provider_request_id, "m1");
+        assert_eq!(
+            acc.completion_tokens, 0,
+            "partial frame 2 must NOT be parsed until its terminator arrives",
+        );
+
+        // Second "chunk": the remainder of the message_delta frame.
+        buf.extend_from_slice(b"3}}\n\n");
+        drain_anthropic_sse_frames(&mut buf, &mut acc, started, &mut first_token_seen);
+        assert_eq!(
+            acc.completion_tokens, 23,
+            "output_tokens parsed once the split frame is reassembled",
+        );
+        assert!(buf.is_empty(), "buffer fully drained after both frames");
+    }
+
+    /// Issue #245 / #419 parity: the stream Drop guard must zero the
+    /// completion-side counters when no byte-chunk reached the client
+    /// (mid-stream disconnect), while preserving prompt_tokens. Drives
+    /// `AnthropicStreamGuard::drop` directly with the delivered atomic
+    /// pre-set, mirroring chat.rs's CompleteOnDrop test discipline.
+    #[test]
+    fn stream_guard_zeroes_completion_when_nothing_delivered() {
+        use super::{AnthropicStreamGuard, AnthropicStreamUsage, AtomicU32};
+        use std::sync::{Arc, Mutex};
+
+        fn drop_and_capture(
+            usage: AnthropicStreamUsage,
+            delivered_count: u32,
+        ) -> AnthropicStreamUsage {
+            let captured: Arc<Mutex<Option<AnthropicStreamUsage>>> = Arc::new(Mutex::new(None));
+            let cap = captured.clone();
+            let delivered = Arc::new(AtomicU32::new(delivered_count));
+            {
+                let guard = AnthropicStreamGuard {
+                    slot: Some((
+                        move |u: AnthropicStreamUsage| {
+                            *cap.lock().unwrap() = Some(u);
+                        },
+                        usage,
+                    )),
+                    delivered,
+                };
+                drop(guard);
+            }
+            let out = captured.lock().unwrap().take().expect("on_complete fired");
+            out
+        }
+
+        // delivered==0: completion side zeroed, prompt kept.
+        let usage = AnthropicStreamUsage {
+            prompt_tokens: 30,
+            completion_tokens: 17,
+            cache_creation_tokens: 3,
+            cache_read_tokens: 2,
+            ..Default::default()
+        };
+        let out = drop_and_capture(usage, 0);
+        assert_eq!(out.prompt_tokens, 30, "prompt_tokens preserved (#419)");
+        assert_eq!(
+            out.completion_tokens, 0,
+            "completion zeroed when delivered==0"
+        );
+        assert_eq!(out.cache_creation_tokens, 0);
+        assert_eq!(out.cache_read_tokens, 0);
+        assert_eq!(out.chunks_delivered, 0);
+
+        // delivered>0: counts preserved.
+        let usage = AnthropicStreamUsage {
+            prompt_tokens: 30,
+            completion_tokens: 17,
+            ..Default::default()
+        };
+        let out = drop_and_capture(usage, 5);
+        assert_eq!(
+            out.completion_tokens, 17,
+            "completion kept when delivered>0"
+        );
+        assert_eq!(out.chunks_delivered, 5);
     }
 
     /// Helper for the streaming variants of (Anthropic inbound) ×
