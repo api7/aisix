@@ -34,7 +34,7 @@ Support depth varies by adapter family. The matrix below summarizes the current 
 
 Notes on the matrix:
 
-- The image, audio, `/v1/responses`, and embeddings endpoints are gated to OpenAI-shaped upstreams. A request that resolves to a non-OpenAI model on those endpoints is rejected rather than mis-dispatched.
+- The image, audio, `/v1/responses`, and embeddings endpoints are gated to OpenAI-shaped upstreams. A request that resolves to a non-OpenAI model on those endpoints is rejected rather than mis-dispatched. The gate keys on the literal `provider: "openai"` (plus the OpenAI embeddings/native surfaces), **not** the whole `openai` adapter family — an OpenAI-compatible vendor (for example a DeepSeek model on the `openai` adapter) works on `/v1/chat/completions` but is rejected on `/v1/responses`, images, and audio.
 - `/v1/rerank` is served by the Cohere and Jina native rerank surfaces, which bypass the chat bridge; it is keyed on the model's `provider`.
 - `/v1/messages` accepts non-Anthropic models through a cross-provider translation path; see [Anthropic Messages](../integration/anthropic-messages.md).
 

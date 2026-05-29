@@ -113,8 +113,10 @@ Per-key overrides applied to the outbound request body and headers. The object i
 }
 ```
 
-:::note Overrides are an on-disk shape today
-The `request` and `response` blocks are accepted, validated, and persisted, but no dispatch path consumes them in the current standalone gateway. They exist so the AISIX Cloud control plane can populate per-key runtime config without an on-disk schema break. Treat them as forward-looking configuration that the gateway stores but does not yet apply at request time.
+:::note Where overrides are applied
+The `request` and `response` blocks are applied at dispatch by the **`openai` and `azure-openai`** bridges (the OpenAI-wire families): request `param_renames` / `param_constraints` / `default_headers` / `default_body_fields` are folded into the outbound call, and response `stream_done_marker` / `content_list_to_string` / `reasoning_field` shape how the upstream reply is interpreted. The `bedrock` and `vertex` bridges build their providers' native request shapes and do **not** apply these blocks today.
+
+What is not yet shipped is the AISIX Cloud control-plane wiring that auto-populates these blocks from the dashboard, so in AISIX Cloud they are currently empty. A self-hosted operator who sets `request` / `response` directly through the admin API gets them applied on the `openai` / `azure-openai` paths.
 :::
 
 ## response overrides
