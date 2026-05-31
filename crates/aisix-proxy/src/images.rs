@@ -11,7 +11,7 @@
 //! 8. Providers that don't support image generation return 501.
 
 use aisix_gateway::{BridgeContext, BridgeError};
-use aisix_obs::{AccessLog, RequestOutcome};
+use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -24,6 +24,26 @@ use crate::auth::AuthenticatedKey;
 use crate::error::{ErrorEnvelope, ProxyError};
 use crate::request_id::new_request_id;
 use crate::state::ProxyState;
+
+/// Per-request payload from a successful dispatch — carries the
+/// response + the bits the handler needs to emit a UsageEvent (#407).
+struct ImageDispatchSuccess {
+    response: Response,
+    provider: String,
+    /// UUID of the resolved Model row — required for UsageEvent
+    /// `model_id`. Always present on success.
+    model_id: String,
+    /// `(prompt_tokens, completion_tokens)` from the upstream `usage`
+    /// block when the model returns one (gpt-image-1). `None` for
+    /// models that don't (dall-e-3) — those still emit a zero-token
+    /// event so the request is visible + attributed.
+    usage: Option<(u32, u32)>,
+    /// `false` on the 501 NotImplemented branch (provider lacks image
+    /// generation → no upstream call). Gates emission so the
+    /// not-implemented path stays out of /logs (same convention as
+    /// embeddings #402).
+    upstream_called: bool,
+}
 
 pub async fn image_generations(
     State(state): State<ProxyState>,
@@ -40,24 +60,46 @@ pub async fn image_generations(
         .to_string();
 
     match dispatch(&state, &auth, body, &request_id).await {
-        Ok((resp, provider)) => {
+        Ok(success) => {
             let elapsed = started.elapsed();
             emit_access_log(
                 &model_name,
-                &provider,
+                &success.provider,
                 &api_key_id,
                 200,
                 elapsed,
                 &request_id,
             );
             state.metrics.record_request(
-                &provider,
+                &success.provider,
                 &model_name,
                 200,
                 RequestOutcome::Success,
                 elapsed,
             );
-            resp
+            // Issue #407: emit UsageEvent so cp-api's budget ledger +
+            // /logs see image-generation traffic. Pre-#407 the handler
+            // dropped the event entirely. Emit on a real upstream call
+            // (even zero tokens — request visible/attributed); skip the
+            // 501 NotImplemented path. Tokens come from the upstream
+            // `usage` block when present (gpt-image-1); dall-e-3 has no
+            // usage block → zero tokens (precise per-image cost is a
+            // documented cross-repo follow-up — needs image-count /
+            // size / quality on the wire + cp-api pricing).
+            if success.upstream_called {
+                let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
+                emit_usage_event(
+                    &state,
+                    &request_id,
+                    &success.model_id,
+                    &api_key_id,
+                    200,
+                    elapsed,
+                    prompt_tokens,
+                    completion_tokens,
+                );
+            }
+            success.response
         }
         Err(err) => {
             let status = err.status().as_u16();
@@ -87,7 +129,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     body: Value,
     request_id: &str,
-) -> Result<(Response, String), ProxyError> {
+) -> Result<ImageDispatchSuccess, ProxyError> {
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -142,16 +184,86 @@ async fn dispatch(
     let provider_label = provider.to_ascii_lowercase();
 
     match bridge.generate_image(&body, &ctx).await {
-        Ok(resp_json) => Ok((Json(resp_json).into_response(), provider_label)),
+        Ok(resp_json) => {
+            // Extract usage tokens (gpt-image-1 returns a `usage` block;
+            // dall-e-3 doesn't) BEFORE moving resp_json into the
+            // Response, so the success struct carries typed counters.
+            let usage = extract_token_usage(&resp_json);
+            Ok(ImageDispatchSuccess {
+                response: Json(resp_json).into_response(),
+                provider: provider_label,
+                model_id: model_entry.id.to_string(),
+                usage,
+                upstream_called: true,
+            })
+        }
         Err(BridgeError::Config(msg)) if msg.contains("does not support image generation") => {
             let env = ErrorEnvelope::new(msg, "not_implemented");
-            Ok((
-                (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
-                provider_label,
-            ))
+            Ok(ImageDispatchSuccess {
+                response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
+                provider: provider_label,
+                model_id: model_entry.id.to_string(),
+                usage: None,
+                // No upstream call happened → handler skips emit.
+                upstream_called: false,
+            })
         }
         Err(e) => Err(ProxyError::Bridge(e)),
     }
+}
+
+/// Pull `(prompt_tokens, completion_tokens)` from an OpenAI image
+/// response `usage` block. gpt-image-1 returns
+/// `usage: {input_tokens, output_tokens, total_tokens, ...}`; dall-e-2/3
+/// return no `usage` block → `None`. Wire shape:
+/// <https://platform.openai.com/docs/api-reference/images/object>
+fn extract_token_usage(body: &Value) -> Option<(u32, u32)> {
+    let usage = body.get("usage")?;
+    let input = usage.get("input_tokens").and_then(Value::as_u64)? as u32;
+    let output = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
+    Some((input, output))
+}
+
+/// Issue #407: push one `UsageEvent` onto cp-api's telemetry sink and
+/// fan it out to per-env OTLP exporters. Mirrors
+/// `embeddings::emit_usage_event` (#402). `inbound_protocol = "openai"`
+/// (images are an OpenAI-shape endpoint). Tokens are populated when the
+/// upstream returned a `usage` block (gpt-image-1); zero otherwise —
+/// the per-image cost basis (n × size × quality) is a cross-repo
+/// follow-up needing a UsageEvent wire extension + cp-api pricing.
+#[allow(clippy::too_many_arguments)]
+fn emit_usage_event(
+    state: &ProxyState,
+    request_id: &str,
+    model_id: &str,
+    api_key_id: &str,
+    status_code: u16,
+    elapsed: Duration,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+) {
+    let event = UsageEvent {
+        request_id: request_id.to_string(),
+        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        model_id: model_id.to_string(),
+        api_key_id: api_key_id.to_string(),
+        prompt_tokens,
+        completion_tokens,
+        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        status_code,
+        inbound_protocol: "openai".to_string(),
+        ..Default::default()
+    };
+    // Handler label "images" — bucketed prometheus counter (#408).
+    state.usage_sink.try_emit("images", event.clone());
+    let snap = state.snapshot.load();
+    let exporters = snap.observability_exporters.entries();
+    state
+        .otlp_fan_out
+        .fan_out(&event, exporters.iter().map(|e| &e.value));
 }
 
 fn emit_access_log(
@@ -189,6 +301,7 @@ mod tests {
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ApiKey, Model, ProxyConfig};
     use aisix_gateway::Hub;
+    use aisix_obs::UsageEvent;
     use aisix_provider_openai::OpenAiBridge;
     use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
@@ -405,5 +518,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    fn build_app_with_sink(
+        snap: AisixSnapshot,
+        tx: tokio::sync::mpsc::Sender<UsageEvent>,
+    ) -> axum::Router {
+        use aisix_obs::UsageSink;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        crate::build_router(state)
+    }
+
+    /// Issue #407: gpt-image-1 returns a `usage` token block — a
+    /// successful generation must emit a UsageEvent carrying those
+    /// tokens, attributed to the api_key + model, inbound_protocol
+    /// "openai".
+    #[tokio::test]
+    async fn emits_usage_event_with_tokens_when_upstream_returns_usage() {
+        let upstream = MockServer::start().await;
+        let body = serde_json::json!({
+            "created": 1_700_000_000i64,
+            "data": [{"b64_json": "aGVsbG8="}],
+            "usage": {
+                "input_tokens": 50,
+                "output_tokens": 1568,
+                "total_tokens": 1618,
+                "input_tokens_details": {"text_tokens": 10, "image_tokens": 40}
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/images/generations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("gpt-image"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let req = serde_json::json!({"model": "gpt-image", "prompt": "a cat", "n": 1});
+        let resp = tower::ServiceExt::oneshot(app, make_req(req))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for /v1/images/generations 200")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.prompt_tokens, 50);
+        assert_eq!(event.completion_tokens, 1568);
+        assert_eq!(event.status_code, 200);
+        assert_eq!(event.api_key_id, "k-1");
+        assert_eq!(event.model_id, "m-1");
+        assert_eq!(event.inbound_protocol, "openai");
+    }
+
+    /// Issue #407: dall-e-3 returns NO `usage` block — the request still
+    /// emits a zero-token UsageEvent so it's visible in /logs and
+    /// attributed (precise per-image cost is a cross-repo follow-up).
+    #[tokio::test]
+    async fn emits_zero_token_event_when_upstream_omits_usage() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images/generations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("dall-e"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let req = serde_json::json!({"model": "dall-e", "prompt": "a dog", "n": 1});
+        let resp = tower::ServiceExt::oneshot(app, make_req(req))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("zero-token UsageEvent must still be emitted (visibility)")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.prompt_tokens, 0);
+        assert_eq!(event.completion_tokens, 0);
+        assert_eq!(event.status_code, 200);
+        assert_eq!(event.model_id, "m-1");
+        assert_eq!(event.inbound_protocol, "openai");
     }
 }
