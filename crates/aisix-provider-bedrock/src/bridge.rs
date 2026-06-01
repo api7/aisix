@@ -787,12 +787,7 @@ impl BedrockBridge {
         // only the /invoke body path runs apply_param_constraints otherwise,
         // so without this a Bedrock-wide temperature ceiling silently no-ops
         // for every Converse (non-Anthropic) publisher.
-        let constraints = ctx
-            .provider_key
-            .request
-            .as_ref()
-            .and_then(|r| r.param_constraints.as_ref());
-        if let Some(cfg) = build_inference_config(req, constraints) {
+        if let Some(cfg) = build_inference_config(req, pk_param_constraints(ctx)) {
             call = call.inference_config(cfg);
         }
 
@@ -855,12 +850,7 @@ impl BedrockBridge {
         }
         // Mirror chat_converse on the stream path — same audit fix +
         // the #463 param_constraints temperature clamp.
-        let constraints = ctx
-            .provider_key
-            .request
-            .as_ref()
-            .and_then(|r| r.param_constraints.as_ref());
-        if let Some(cfg) = build_inference_config(req, constraints) {
+        if let Some(cfg) = build_inference_config(req, pk_param_constraints(ctx)) {
             call = call.inference_config(cfg);
         }
 
@@ -1204,6 +1194,16 @@ where
         wire: aisix_gateway::UpstreamWire::Bedrock,
         retry_after,
     }
+}
+
+/// Pull the PK's `request.param_constraints` off the context — the single
+/// source both Converse dispatch paths read, so they cannot drift in how the
+/// clamp input is resolved (#463).
+fn pk_param_constraints(ctx: &BridgeContext) -> Option<&ParamConstraints> {
+    ctx.provider_key
+        .request
+        .as_ref()
+        .and_then(|r| r.param_constraints.as_ref())
 }
 
 /// Build an `InferenceConfiguration` from the gateway's
@@ -3072,6 +3072,47 @@ mod tests {
             cfg.get("temperature").and_then(|v| v.as_f64()),
             Some(1.0),
             "max-then-min order: min wins on a misconfigured min>max; body={body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_converse_stream_clamps_temperature_via_param_constraints() {
+        // #468 audit MEDIUM-1: the stream path (`chat_converse_stream`) wires
+        // the same clamp as `chat_converse` but lacked a regression guard.
+        // Capture the outbound `/converse-stream` body and assert the clamp
+        // reached the wire. (The SDK sends + wiremock captures before the
+        // eventstream decode fails on the non-eventstream response, so the
+        // ignored `chat_stream` result is fine — same pattern as the
+        // non-stream clamp tests.)
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse-stream$"))
+            .respond_with(responder.clone())
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let mut req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        req.temperature = Some(1.9); // over the ceiling
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "param_constraints": { "temperature_max": 1.0 }
+            })),
+        );
+        let _ = bridge.chat_stream(&req, &ctx).await;
+
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        let cfg = body
+            .get("inferenceConfig")
+            .and_then(|v| v.as_object())
+            .expect("inferenceConfig must be set when temperature is carried");
+        assert_eq!(
+            cfg.get("temperature").and_then(|v| v.as_f64()),
+            Some(1.0),
+            "stream-path Converse temperature must be clamped to temperature_max; body={body}",
         );
     }
 }
