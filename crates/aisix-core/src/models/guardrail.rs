@@ -140,6 +140,122 @@ fn default_acs_timeout_ms() -> u32 {
     5_000
 }
 
+/// Config block for `kind: "azure_content_safety_text_moderation"`. Calls
+/// Azure AI Content Safety `text:analyze` for category-severity + blocklist
+/// moderation on input and/or output (including streaming output). P2
+/// (PRD-09c §6 P2, #379).
+///
+/// Reuses the P1 connection block (endpoint + api_key + timeout_ms). cp-api
+/// projects only operator-set fields (omitempty), so every optional field
+/// carries a serde default matching the cp-api validator's documented
+/// default. Only `api_key` is a secret (decrypted by cp-api before kine
+/// projection); every other field travels in the clear.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AzureContentSafetyTextModerationConfig {
+    /// Azure Cognitive Services resource endpoint. The DP appends
+    /// `/contentsafety/text:analyze?api-version=2024-09-01`.
+    pub endpoint: String,
+    /// Subscription key (`Ocp-Apim-Subscription-Key`). Plaintext in memory
+    /// only, never logged.
+    pub api_key: String,
+    /// HTTP call timeout (ms); `fail_open` / `output_fail_open` govern the
+    /// verdict when it elapses. See the `AzureContentSafetyConfig` note on
+    /// why `0` means "fire immediately", not "no timeout".
+    #[serde(default = "default_acs_timeout_ms")]
+    pub timeout_ms: u32,
+
+    // --- moderation parameters ---
+    /// `FourSeverityLevels` (0,2,4,6; default) or `EightSeverityLevels` (0..7).
+    #[serde(default = "default_acs_output_type")]
+    pub output_type: String,
+    /// Categories to analyze. Defaults to all four.
+    #[serde(default = "default_acs_categories")]
+    pub categories: Vec<String>,
+    /// General severity threshold; a category at or above it blocks.
+    #[serde(default = "default_acs_severity_threshold")]
+    pub severity_threshold: u8,
+    /// Per-category threshold overrides (take precedence over the general one).
+    #[serde(default)]
+    pub severity_threshold_by_category: std::collections::BTreeMap<String, u8>,
+    /// Azure CS blocklist names to match against.
+    #[serde(default)]
+    pub blocklist_names: Vec<String>,
+    /// Forwarded to Azure's `haltOnBlocklistHit`.
+    #[serde(default)]
+    pub halt_on_blocklist_hit: bool,
+    /// Input-hook text selection: `concatenate_user_content` (default) or
+    /// `concatenate_all_content`. Ignored on the output hook.
+    #[serde(default = "default_acs_text_source")]
+    pub text_source: String,
+
+    // --- streaming-output controls (consumed by aisix-proxy build_sse_stream) ---
+    /// `window` (sliding-window incremental release; default) or
+    /// `buffer_full` (whole-response hold-back).
+    #[serde(default = "default_acs_stream_processing_mode")]
+    pub stream_processing_mode: String,
+    /// Sliding-window size in chars (window mode); cp-api caps it at the
+    /// 10 000-char Azure limit. Default 10 000.
+    #[serde(default = "default_acs_window_size")]
+    pub window_size: u32,
+    /// Chars carried between windows so a span split across a boundary is
+    /// still caught. Default 256.
+    #[serde(default = "default_acs_window_overlap_size")]
+    pub window_overlap_size: u32,
+    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded`
+    /// applies. Default 262 144.
+    #[serde(default = "default_acs_max_buffer_bytes")]
+    pub max_buffer_bytes: u64,
+    /// `fail_closed` (default) or `fail_open` when the buffer cap is hit.
+    #[serde(default = "default_acs_on_buffer_exceeded")]
+    pub on_buffer_exceeded: String,
+    /// Fail-open policy for the OUTPUT hook. Defaults `false` (fail-closed)
+    /// so an Azure outage can't release unscanned model output.
+    #[serde(default)]
+    pub output_fail_open: bool,
+}
+
+fn default_acs_output_type() -> String {
+    "FourSeverityLevels".to_owned()
+}
+
+fn default_acs_categories() -> Vec<String> {
+    vec![
+        "Hate".to_owned(),
+        "Sexual".to_owned(),
+        "SelfHarm".to_owned(),
+        "Violence".to_owned(),
+    ]
+}
+
+fn default_acs_severity_threshold() -> u8 {
+    2
+}
+
+fn default_acs_text_source() -> String {
+    "concatenate_user_content".to_owned()
+}
+
+fn default_acs_stream_processing_mode() -> String {
+    "window".to_owned()
+}
+
+fn default_acs_window_size() -> u32 {
+    10_000
+}
+
+fn default_acs_window_overlap_size() -> u32 {
+    256
+}
+
+fn default_acs_max_buffer_bytes() -> u64 {
+    262_144
+}
+
+fn default_acs_on_buffer_exceeded() -> String {
+    "fail_closed".to_owned()
+}
+
 /// Config block for `kind: "bedrock"`. Phase 1 stores the shape +
 /// passes it through `aisix-guardrails::build` which logs
 /// `bedrock not yet implemented` and skips the row.
@@ -173,6 +289,11 @@ pub enum GuardrailKind {
     /// indirect injection attacks via the `/contentsafety/text:shieldPrompt`
     /// API. P1 (PRD-09c §6 P1).
     AzureContentSafety(AzureContentSafetyConfig),
+    /// Azure AI Content Safety Text Moderation. Category-severity +
+    /// blocklist moderation via the `/contentsafety/text:analyze` API,
+    /// on input and/or output (including streaming output). P2
+    /// (PRD-09c §6 P2, #379).
+    AzureContentSafetyTextModeration(AzureContentSafetyTextModerationConfig),
 }
 
 /// Top-level `Guardrail` resource shape. Mirrors what cp-api writes
@@ -551,6 +672,67 @@ mod tests {
         match g.config {
             GuardrailKind::AzureContentSafety(ref c) => assert_eq!(c.timeout_ms, 5_000),
             _ => panic!("expected AzureContentSafety variant"),
+        }
+    }
+
+    #[test]
+    fn azure_text_moderation_kind_parses_with_defaults() {
+        // cp-api omits unset fields (omitempty); the DP must apply the
+        // documented defaults so a minimal row still moderates correctly.
+        let v = json!({
+            "name": "moderate",
+            "kind": "azure_content_safety_text_moderation",
+            "endpoint": "https://my-resource.cognitiveservices.azure.com",
+            "api_key": "plaintext-key"
+        });
+        let g: Guardrail = serde_json::from_value(v).unwrap();
+        match g.config {
+            GuardrailKind::AzureContentSafetyTextModeration(ref c) => {
+                assert_eq!(c.timeout_ms, 5_000);
+                assert_eq!(c.output_type, "FourSeverityLevels");
+                assert_eq!(c.severity_threshold, 2);
+                assert_eq!(c.categories.len(), 4);
+                assert_eq!(c.text_source, "concatenate_user_content");
+                assert_eq!(c.stream_processing_mode, "window");
+                assert_eq!(c.window_size, 10_000);
+                assert_eq!(c.window_overlap_size, 256);
+                assert_eq!(c.max_buffer_bytes, 262_144);
+                assert_eq!(c.on_buffer_exceeded, "fail_closed");
+                assert!(!c.output_fail_open);
+            }
+            _ => panic!("expected AzureContentSafetyTextModeration variant"),
+        }
+    }
+
+    #[test]
+    fn azure_text_moderation_kind_round_trips_set_fields() {
+        let v = json!({
+            "name": "moderate",
+            "kind": "azure_content_safety_text_moderation",
+            "endpoint": "https://e.cognitiveservices.azure.com",
+            "api_key": "k",
+            "output_type": "EightSeverityLevels",
+            "categories": ["Hate", "Violence"],
+            "severity_threshold": 0,
+            "severity_threshold_by_category": { "Violence": 6 },
+            "stream_processing_mode": "buffer_full",
+            "window_overlap_size": 0,
+            "output_fail_open": true
+        });
+        let g: Guardrail = serde_json::from_value(v).unwrap();
+        match g.config {
+            GuardrailKind::AzureContentSafetyTextModeration(ref c) => {
+                assert_eq!(c.output_type, "EightSeverityLevels");
+                assert_eq!(
+                    c.severity_threshold, 0,
+                    "explicit 0 must survive (not defaulted to 2)"
+                );
+                assert_eq!(c.severity_threshold_by_category.get("Violence"), Some(&6));
+                assert_eq!(c.stream_processing_mode, "buffer_full");
+                assert_eq!(c.window_overlap_size, 0, "explicit 0 overlap must survive");
+                assert!(c.output_fail_open);
+            }
+            _ => panic!("expected AzureContentSafetyTextModeration variant"),
         }
     }
 

@@ -409,7 +409,7 @@ fn guardrail_schema() -> Value {
             "enabled":    { "type": "boolean" },
             "hook_point": { "enum": ["input", "output", "both"] },
             "fail_open":  { "type": "boolean" },
-            "kind":       { "enum": ["keyword", "bedrock", "azure_content_safety"] }
+            "kind":       { "enum": ["keyword", "bedrock", "azure_content_safety", "azure_content_safety_text_moderation"] }
         },
         "oneOf": [
             {
@@ -450,6 +450,37 @@ fn guardrail_schema() -> Value {
                     "endpoint":   { "type": "string", "minLength": 1 },
                     "api_key":    { "type": "string", "minLength": 1 },
                     "timeout_ms": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295u64 }
+                }
+            },
+            {
+                // kind=azure_content_safety_text_moderation — text:analyze
+                // category-severity + blocklist moderation. P2 (#379).
+                // Connection block matches azure_content_safety; the
+                // moderation + streaming params are optional (cp-api applies
+                // defaults + strict validation on write).
+                "type": "object",
+                "required": ["kind", "endpoint", "api_key"],
+                "properties": {
+                    "kind":       { "const": "azure_content_safety_text_moderation" },
+                    "endpoint":   { "type": "string", "minLength": 1 },
+                    "api_key":    { "type": "string", "minLength": 1 },
+                    "timeout_ms": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295u64 },
+                    "output_type": { "enum": ["FourSeverityLevels", "EightSeverityLevels"] },
+                    "categories": {
+                        "type": "array",
+                        "items": { "enum": ["Hate", "Sexual", "SelfHarm", "Violence"] }
+                    },
+                    "severity_threshold": { "type": "integer", "minimum": 0, "maximum": 7 },
+                    "severity_threshold_by_category": { "type": "object" },
+                    "blocklist_names": { "type": "array", "items": { "type": "string" } },
+                    "halt_on_blocklist_hit": { "type": "boolean" },
+                    "text_source": { "enum": ["concatenate_user_content", "concatenate_all_content"] },
+                    "stream_processing_mode": { "enum": ["window", "buffer_full"] },
+                    "window_size": { "type": "integer", "minimum": 1, "maximum": 10_000 },
+                    "window_overlap_size": { "type": "integer", "minimum": 0 },
+                    "max_buffer_bytes": { "type": "integer", "minimum": 1 },
+                    "on_buffer_exceeded": { "enum": ["fail_closed", "fail_open"] },
+                    "output_fail_open": { "type": "boolean" }
                 }
             }
         ],

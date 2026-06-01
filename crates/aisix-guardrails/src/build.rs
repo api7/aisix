@@ -156,6 +156,23 @@ fn build_one(
             // Built without --features azure-content-safety. Skip + warn.
             Err(BuildError::FeatureDisabled("azure-content-safety"))
         }
+        #[cfg(feature = "azure-content-safety")]
+        GuardrailKind::AzureContentSafetyTextModeration(cfg) => {
+            // P2: HTTP-based text:analyze dispatcher. cp-api already
+            // decrypted the api_key at projection time; the config carries
+            // plaintext. Endpoint is per-row (each customer's own resource).
+            let g = crate::text_moderation::TextModerationGuardrail::new(
+                row.name.clone(),
+                cfg,
+                row.hook_point,
+                row.fail_open,
+            );
+            Ok(Some(Arc::new(g)))
+        }
+        #[cfg(not(feature = "azure-content-safety"))]
+        GuardrailKind::AzureContentSafetyTextModeration(_) => {
+            Err(BuildError::FeatureDisabled("azure-content-safety"))
+        }
     }
 }
 

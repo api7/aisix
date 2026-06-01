@@ -29,6 +29,8 @@ mod keyword;
 mod length;
 #[cfg(feature = "azure-content-safety")]
 mod prompt_shield;
+#[cfg(feature = "azure-content-safety")]
+mod text_moderation;
 
 use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
@@ -44,6 +46,8 @@ pub use keyword::{KeywordBlocklist, KeywordRule};
 pub use length::MaxContentLength;
 #[cfg(feature = "azure-content-safety")]
 pub use prompt_shield::PromptShieldGuardrail;
+#[cfg(feature = "azure-content-safety")]
+pub use text_moderation::TextModerationGuardrail;
 
 /// What a guardrail decided about a request or response.
 ///
