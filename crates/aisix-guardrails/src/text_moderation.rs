@@ -543,6 +543,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn all_content_source_includes_assistant_messages() {
+        let mut g = build("http://unused", true);
+        g.text_source = "concatenate_all_content".to_owned();
+        let c = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::user("user says hi"),
+                ChatMessage::assistant("assistant reply"),
+            ],
+        );
+        let text = g.collect_input_text(&c);
+        assert!(text.contains("user says hi"));
+        assert!(
+            text.contains("assistant reply"),
+            "concatenate_all_content must include assistant messages"
+        );
+    }
+
     // --- wiremock integration ---
 
     #[tokio::test]
