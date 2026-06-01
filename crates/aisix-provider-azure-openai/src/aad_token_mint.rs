@@ -154,14 +154,17 @@ impl AadCredentials {
             // is a valid origin. A real path segment would silently redirect
             // the token endpoint (e.g. `.../evil/{tenant}/oauth2/v2.0/token`).
             // A bare trailing slash is tolerated for symmetry with the Vertex
-            // `resolve_api_base` check. `host` has no `@`/`?`/`#` here, so
-            // echoing it is safe. Audit #434 LOW-1 / #435.
+            // `resolve_api_base` check. Backslashes are rejected too: the
+            // WHATWG URL parser the HTTP client uses normalizes `\` to `/` on
+            // http(s) URLs, so `host\evil` injects a path exactly like
+            // `host/evil`. `host` has no `@`/`?`/`#` here, so echoing it is
+            // safe. Audit #434 LOW-1 / #435 (+ #464 audit MEDIUM).
             let after_scheme = host
                 .split_once("://")
                 .map(|(_, rest)| rest)
                 .unwrap_or(host)
                 .trim_end_matches('/');
-            if after_scheme.contains('/') {
+            if after_scheme.contains('/') || after_scheme.contains('\\') {
                 return Err(BridgeError::Config(format!(
                     "azure aad credentials.authority_host must be a bare origin \
                      (scheme://host[:port]) with no path, got {host:?}"
@@ -670,6 +673,27 @@ mod tests {
                 authority_host: Some(host.into()),
             };
             assert!(creds.validate().is_ok(), "{host} should validate");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_authority_host_with_backslash_path() {
+        // #464 audit: the WHATWG URL parser the HTTP client uses normalizes
+        // `\` to `/` on http(s) URLs, so `host\evil` injects a path just like
+        // `host/evil` — it must be rejected the same way.
+        let creds = AadCredentials {
+            tenant_id: "t".into(),
+            client_id: "app".into(),
+            client_secret: "s".into(),
+            authority_host: Some("https://login.microsoftonline.us\\evil".into()),
+        };
+        let err = creds.validate().err().unwrap();
+        match err {
+            BridgeError::Config(msg) => assert!(
+                msg.contains("bare origin") && msg.contains("no path"),
+                "expected a bare-origin/no-path rejection; got {msg}"
+            ),
+            other => panic!("expected Config, got {other:?}"),
         }
     }
 

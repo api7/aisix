@@ -215,14 +215,17 @@ impl VertexBridge {
             // is a valid origin. A bare trailing slash is fine (trimmed
             // below); a real path segment (e.g. `.../evil`) would silently
             // redirect every upstream call onto the wrong path, so fail fast
-            // with a clear Config error. `b` has no `@`/`?`/`#` at this point
-            // (rejected above), so echoing it is safe. Audit #434 LOW-1 / #435.
+            // with a clear Config error. Backslashes are rejected too: the
+            // WHATWG URL parser the HTTP client uses normalizes `\` to `/` on
+            // http(s) URLs, so `host\evil` injects a path exactly like
+            // `host/evil`. `b` has no `@`/`?`/`#` here (rejected above), so
+            // echoing it is safe. Audit #434 LOW-1 / #435 (+ #464 audit MEDIUM).
             let after_scheme = b
                 .split_once("://")
                 .map(|(_, rest)| rest)
                 .unwrap_or(b)
                 .trim_end_matches('/');
-            if after_scheme.contains('/') {
+            if after_scheme.contains('/') || after_scheme.contains('\\') {
                 return Err(BridgeError::Config(format!(
                     "vertex provider_key api_base must be a bare origin \
                      (scheme://host[:port]) with no path, got {b:?}",
@@ -2131,6 +2134,27 @@ mod tests {
             .resolve_api_base("us-central1", Some("https://proxy.internal:8443"))
             .unwrap();
         assert_eq!(resolved, "https://proxy.internal:8443");
+    }
+
+    #[test]
+    fn resolve_api_base_rejects_backslash_path() {
+        // #464 audit: the WHATWG URL parser the HTTP client uses normalizes
+        // `\` to `/` on http(s) URLs, so `host\evil` injects a path just like
+        // `host/evil` — it must be rejected the same way.
+        let bridge = VertexBridge::new();
+        let err = bridge
+            .resolve_api_base("us-central1", Some("https://proxy.internal\\evil"))
+            .err()
+            .unwrap();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(
+                    msg.contains("bare origin") && msg.contains("no path"),
+                    "expected a bare-origin/no-path rejection; got {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
     }
 
     #[test]
