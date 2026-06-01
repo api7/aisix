@@ -5,11 +5,13 @@
 //! wire path. **Currently wired:** `google` (Gemini) chat + streaming
 //! (`:generateContent` / `:streamGenerateContent`); `anthropic`
 //! (Claude) chat + streaming via `:rawPredict` / `:streamRawPredict`
-//! (Anthropic Messages wire); and the **OpenAI-compatible MaaS family**
+//! (Anthropic Messages wire); the **OpenAI-compatible MaaS family**
 //! (Llama, DeepSeek, Qwen, gpt-oss, MiniMax, Moonshot, Z.ai) chat +
-//! streaming via the OpenAI shim (`endpoints/openapi/chat/completions`).
-//! The `:rawPredict` publishers `mistral` / `ai21` (D5.4) still surface
-//! clear `not yet implemented` errors — see crate-level docs.
+//! streaming via the OpenAI shim (`endpoints/openapi/chat/completions`);
+//! and **Mistral** (`mistralai`) + **AI21 Jamba** (`ai21`) chat +
+//! streaming via the partner `:rawPredict` / `:streamRawPredict` URL with
+//! an OpenAI-compatible body (model in BOTH the URL and the body). All
+//! five Vertex publisher rails are now wired.
 //!
 //! Credentials: `ProviderKey.secret` is a JSON-encoded
 //! `{access_token, project, region}` struct. The `access_token` is
@@ -286,17 +288,6 @@ impl VertexPublisher {
             Self::Ai21 => "publishers/ai21",
             Self::OpenAiCompat => return None,
         })
-    }
-
-    /// Human-readable name for the publisher-not-implemented error.
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Google => "google",
-            Self::Anthropic => "anthropic",
-            Self::OpenAiCompat => "openai-compat",
-            Self::Mistral => "mistralai",
-            Self::Ai21 => "ai21",
-        }
     }
 }
 
@@ -588,11 +579,10 @@ impl Bridge for VertexBridge {
             VertexPublisher::Google => self.chat_gemini(req, ctx, upstream_id).await,
             VertexPublisher::Anthropic => self.chat_anthropic(req, ctx, upstream_id).await,
             VertexPublisher::OpenAiCompat => self.chat_openai_shim(req, ctx, upstream_id).await,
-            other => Err(BridgeError::Config(format!(
-                "vertex publisher {publisher:?} not yet implemented — \
-                 tracked under api7/AISIX-Cloud#302 Phase E (D5.4, publisher={})",
-                other.name()
-            ))),
+            VertexPublisher::Mistral | VertexPublisher::Ai21 => {
+                self.chat_mistral_ai21(req, ctx, upstream_id, publisher)
+                    .await
+            }
         }
     }
 
@@ -615,11 +605,10 @@ impl Bridge for VertexBridge {
                 self.chat_openai_shim_stream(req, ctx, upstream_id).await
             }
             VertexPublisher::Anthropic => self.chat_anthropic_stream(req, ctx, upstream_id).await,
-            other => Err(BridgeError::Config(format!(
-                "vertex publisher {publisher:?} streaming not yet implemented — \
-                 tracked under api7/AISIX-Cloud#302 Phase E (D5.3/D5.4, publisher={})",
-                other.name()
-            ))),
+            VertexPublisher::Mistral | VertexPublisher::Ai21 => {
+                self.chat_mistral_ai21_stream(req, ctx, upstream_id, publisher)
+                    .await
+            }
         }
     }
 }
@@ -1037,6 +1026,197 @@ impl VertexBridge {
                 let parsed: OpenAiStreamChunk = serde_json::from_str(&data).map_err(|e| {
                     BridgeError::UpstreamDecode(format!(
                         "vertex openai-shim stream tail parse: {e}"
+                    ))
+                })?;
+                yield openai_stream_chunk_into_chat_chunk(parsed);
+            }
+        };
+
+        Ok(Box::pin(stream))
+    }
+
+    /// Build the `:rawPredict` / `:streamRawPredict` URL for the Mistral
+    /// (`publishers/mistralai`) and AI21 (`publishers/ai21`) partner rail.
+    /// UNLIKE the OpenAI shim (`endpoints/openapi/chat/completions`, no
+    /// model in the URL), these partners use a
+    /// `publishers/<vendor>/models/<model>:<action>` URL AND keep the
+    /// model in the OpenAI body — the model id appears in BOTH. `segment`
+    /// is `publisher.url_segment()` (`publishers/mistralai` |
+    /// `publishers/ai21`); `action` is `rawPredict` | `streamRawPredict`.
+    fn partner_rawpredict_url(
+        &self,
+        creds: &VertexSecret,
+        api_base: Option<&str>,
+        segment: &str,
+        model: &str,
+        action: &str,
+    ) -> Result<String, BridgeError> {
+        let base = self.resolve_api_base(&creds.region, api_base)?;
+        Ok(format!(
+            "{base}/v1/projects/{project}/locations/{region}/{segment}/models/{model}:{action}",
+            project = creds.project,
+            region = creds.region,
+        ))
+    }
+
+    /// Dispatch Mistral (`mistral-*` / `codestral-*`) and AI21 Jamba
+    /// (`jamba-*`) non-stream chat. Both speak an OpenAI-compatible body
+    /// over the partner `:rawPredict` URL — so reuse the OpenAI bridge's
+    /// serializer + response decoder verbatim. UNLIKE the OpenAI shim, the
+    /// model id is a URL path segment here (and is ALSO kept in the body),
+    /// so validate it as a URL token. Wire confirmed against the Vertex
+    /// Mistral docs
+    /// <https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/mistral>
+    /// and Google's Vertex AI21 sample (GoogleCloudPlatform/vertex-ai-samples
+    /// `ai21labs_intro.ipynb`): a `{model, messages, max_tokens, stream}`
+    /// body POSTed to `publishers/{mistralai|ai21}/models/<model>:rawPredict`.
+    async fn chat_mistral_ai21(
+        &self,
+        req: &ChatFormat,
+        ctx: &BridgeContext,
+        upstream_id: &str,
+        publisher: VertexPublisher,
+    ) -> Result<ChatResponse, BridgeError> {
+        let creds = VertexSecret::parse(&ctx.provider_key.secret)?;
+        validate_url_token("project", &creds.project)?;
+        validate_url_token("region", &creds.region)?;
+        // The model id is a URL path segment here (Mistral / AI21 ids are
+        // clean — no `/`, no `@` — so this never rejects a valid id).
+        validate_url_token("upstream_id", upstream_id)?;
+
+        let segment = publisher.url_segment().ok_or_else(|| {
+            BridgeError::Config(format!(
+                "vertex publisher {publisher:?} has no URL segment for the :rawPredict rail"
+            ))
+        })?;
+        let url = self.partner_rawpredict_url(
+            &creds,
+            ctx.provider_key.api_base.as_deref(),
+            segment,
+            upstream_id,
+            "rawPredict",
+        )?;
+
+        // OpenAI chat-completions body — same serializer the OpenAI-shim
+        // (Llama/MaaS) rail uses. The model is KEPT in the body (Mistral /
+        // AI21 on Vertex expect it in both the URL and the body).
+        let messages = openai_messages_from(req);
+        let typed = build_openai_request(req, upstream_id, &messages, false);
+        let body = serde_json::to_value(&typed)
+            .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
+
+        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let headers = build_request_headers(&access_token, &ctx.request_id)?;
+        let client = self.client.clone();
+        let started = Instant::now();
+
+        with_deadline(ctx.deadline, started, async move {
+            let resp = client
+                .post(&url)
+                .headers(headers)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| BridgeError::Transport(e.to_string()))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(map_http_error(status, resp).await);
+            }
+            let parsed: OpenAiResponse = resp
+                .json()
+                .await
+                .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
+            Ok(openai_response_into_chat_response(parsed))
+        })
+        .await
+    }
+
+    /// Streaming counterpart of [`Self::chat_mistral_ai21`]. Same OpenAI
+    /// body + decoders as the non-stream path, but the `:streamRawPredict`
+    /// action and `stream: true` kept in the body; the response is OpenAI
+    /// SSE (`data: {chunk}` terminated by `data: [DONE]`), decoded by the
+    /// shared [`SseDecoder`] + the OpenAI stream-chunk decoder.
+    async fn chat_mistral_ai21_stream(
+        &self,
+        req: &ChatFormat,
+        ctx: &BridgeContext,
+        upstream_id: &str,
+        publisher: VertexPublisher,
+    ) -> Result<ChatChunkStream, BridgeError> {
+        let creds = VertexSecret::parse(&ctx.provider_key.secret)?;
+        validate_url_token("project", &creds.project)?;
+        validate_url_token("region", &creds.region)?;
+        validate_url_token("upstream_id", upstream_id)?;
+
+        let segment = publisher.url_segment().ok_or_else(|| {
+            BridgeError::Config(format!(
+                "vertex publisher {publisher:?} has no URL segment for the :streamRawPredict rail"
+            ))
+        })?;
+        let url = self.partner_rawpredict_url(
+            &creds,
+            ctx.provider_key.api_base.as_deref(),
+            segment,
+            upstream_id,
+            "streamRawPredict",
+        )?;
+
+        let messages = openai_messages_from(req);
+        let typed = build_openai_request(req, upstream_id, &messages, true);
+        let body = serde_json::to_value(&typed)
+            .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
+
+        // Resolve bearer BEFORE entering the stream future so a
+        // token-mint error surfaces as a direct Err, not mid-stream.
+        let access_token = creds.resolve_access_token(&self.token_minter).await?;
+        let headers = build_request_headers(&access_token, &ctx.request_id)?;
+        let client = self.client.clone();
+        let started = Instant::now();
+
+        let resp = with_deadline(ctx.deadline, started, async move {
+            client
+                .post(&url)
+                .headers(headers)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| BridgeError::Transport(e.to_string()))
+        })
+        .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(map_http_error(status, resp).await);
+        }
+
+        let byte_stream = resp.bytes_stream();
+        let stream = async_stream::try_stream! {
+            let mut decoder = SseDecoder::new();
+            let mut byte_stream = Box::pin(byte_stream);
+
+            while let Some(item) = byte_stream.next().await {
+                let bytes: Bytes = item.map_err(|e| BridgeError::Transport(e.to_string()))?;
+                for event in decoder.feed(bytes.as_ref()) {
+                    match event {
+                        SseEvent::Data(data) => {
+                            let parsed: OpenAiStreamChunk =
+                                serde_json::from_str(&data).map_err(|e| {
+                                    BridgeError::UpstreamDecode(format!(
+                                        "vertex partner :streamRawPredict chunk parse: {e}"
+                                    ))
+                                })?;
+                            yield openai_stream_chunk_into_chat_chunk(parsed);
+                        }
+                        // OpenAI-compatible upstreams (Mistral / AI21)
+                        // terminate with `data: [DONE]`; stop on the sentinel.
+                        SseEvent::Done => {}
+                    }
+                }
+            }
+            if let Some(SseEvent::Data(data)) = decoder.finish() {
+                let parsed: OpenAiStreamChunk = serde_json::from_str(&data).map_err(|e| {
+                    BridgeError::UpstreamDecode(format!(
+                        "vertex partner :streamRawPredict tail parse: {e}"
                     ))
                 })?;
                 yield openai_stream_chunk_into_chat_chunk(parsed);
@@ -2211,29 +2391,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_with_non_google_publisher_errors_with_publisher_named() {
-        // Claude (anthropic) is now wired for non-stream chat, so use a
-        // still-deferred publisher (Mistral) to exercise the
-        // publisher-not-implemented path.
-        let bridge = VertexBridge::new();
-        let ctx = BridgeContext::new(
-            "req-1",
-            sample_model_with("mistral-large-2411"),
-            sample_pk_with_secret(valid_secret_json()),
-        );
-        let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
-        let err = bridge.chat(&req, &ctx).await.unwrap_err();
-        match err {
-            BridgeError::Config(msg) => {
-                assert!(msg.contains("not yet implemented"));
-                assert!(msg.contains("mistral"));
-                assert!(msg.contains("D5"));
-            }
-            other => panic!("expected Config error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn chat_with_invalid_secret_errors_before_dispatch() {
         let bridge = VertexBridge::new();
         let ctx = BridgeContext::new(
@@ -2282,68 +2439,34 @@ mod tests {
     #[tokio::test]
     async fn chat_ignores_req_model_and_uses_ctx_model_name() {
         let bridge = VertexBridge::new();
-        // Use a still-deferred publisher (Mistral) so the proof of
-        // "model_name is the source of truth" stays on the
-        // publisher-not-implemented path (Claude is now wired).
+        // All real publishers are wired now, so prove "model_name is the
+        // source of truth" via the publisher-UNKNOWN path: ctx carries an
+        // unrecognized upstream id, req.model carries a *different* bogus
+        // value. The resolver error must name the CTX id (not req.model),
+        // proving the bridge read model_name from ctx, not the request.
         let ctx = BridgeContext::new(
             "req-1",
-            sample_model_with("mistral-large-2411"),
+            sample_model_with("unknown-ctx-publisher-xyz"),
             sample_pk_with_secret(valid_secret_json()),
         );
-        // req.model set to a value the resolver would reject if it
-        // were the source of truth. Bridge must hit publisher-not-
-        // implemented (proving it read model_name).
-        let req = ChatFormat::new("totally-bogus", vec![ChatMessage::user("hi")]);
+        let req = ChatFormat::new("different-bogus-req-model", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
             BridgeError::Config(msg) => {
                 assert!(
-                    msg.contains("not yet implemented"),
-                    "must hit publisher-not-implemented (proving model_name was used); got {msg}"
+                    msg.contains("publisher unknown"),
+                    "must hit the publisher-unknown path; got {msg}"
+                );
+                assert!(
+                    msg.contains("unknown-ctx-publisher-xyz"),
+                    "error must name the CTX model id (proving model_name was used); got {msg}"
+                );
+                assert!(
+                    !msg.contains("different-bogus-req-model"),
+                    "error must NOT name req.model; got {msg}"
                 );
             }
             other => panic!("expected Config error, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn chat_stream_for_non_google_publishers_returns_clear_not_implemented_error() {
-        // Streaming is wired for Google (Gemini) only as of D5.2.b.
-        // Other publishers (anthropic / meta / mistral / ai21) must
-        // still surface the publisher-specific "not yet implemented"
-        // error pointing at D5.3 / D5.4 follow-ups so an operator who
-        // tries to stream Claude-on-Vertex sees the right tracking
-        // reference rather than a generic transport failure.
-        // Claude streaming is covered by a dedicated test below (it
-        // carries a publisher-specific message now that non-stream
-        // Claude is wired). The remaining publishers still surface the
-        // generic D5.3/D5.4 streaming-not-implemented error.
-        // Llama (and the rest of the OpenAI-shim MaaS family) streaming
-        // is now wired via the openapi shim, so only the `:rawPredict`
-        // publishers (Mistral, AI21) still surface the generic
-        // streaming-not-implemented error.
-        let bridge = VertexBridge::new();
-        for upstream in ["mistral-large-2411", "jamba-1.5-large"] {
-            let ctx = BridgeContext::new(
-                "req-1",
-                sample_model_with(upstream),
-                sample_pk_with_secret(valid_secret_json()),
-            );
-            let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
-            let err = bridge.chat_stream(&req, &ctx).await.err().unwrap();
-            match err {
-                BridgeError::Config(msg) => {
-                    assert!(
-                        msg.contains("streaming not yet implemented"),
-                        "upstream={upstream} unexpected message: {msg}"
-                    );
-                    assert!(
-                        msg.contains("D5.3/D5.4"),
-                        "upstream={upstream} missing D5.3/D5.4 reference: {msg}"
-                    );
-                }
-                other => panic!("upstream={upstream} expected Config error, got {other:?}"),
-            }
         }
     }
 
@@ -2832,6 +2955,166 @@ mod tests {
             obj.get("model").and_then(|v| v.as_str()),
             Some("meta/llama-3.3-70b-instruct-maas"),
             "model id stays in the body (never the URL) on the stream path: {body}"
+        );
+    }
+
+    /// D5.4 — Mistral on Vertex dispatches through the partner
+    /// `publishers/mistralai/models/<model>:rawPredict` URL (NOT the
+    /// OpenAI shim, NOT Gemini `:generateContent`) with an OpenAI-shape
+    /// body. Reuses the shared OpenAI responder (identical wire). Pin the
+    /// URL (publisher segment + model-in-URL + `:rawPredict` action),
+    /// Bearer, and that the model is ALSO kept in the body.
+    #[tokio::test]
+    async fn chat_mistral_dispatches_to_rawpredict_with_model_in_url_and_body() {
+        let server = MockServer::start().await;
+        let responder = CapturingOpenAiResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/mistralai/models/mistral-large-2411:rawPredict",
+            ))
+            .and(header("authorization", "Bearer ya29.test"))
+            .and(header("content-type", "application/json"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("mistral-large-2411"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-mistral", vec![ChatMessage::user("hi")]);
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+
+        // Response decoded from the OpenAI envelope (shared responder).
+        assert_eq!(chat.usage.total_tokens, 9);
+        assert!(!chat.message.content.is_empty());
+
+        // Wire-shape: the model id is kept in the OpenAI body (it rides in
+        // BOTH the URL — pinned by the matcher above — and the body).
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        let obj = body.as_object().expect("object body");
+        assert_eq!(
+            obj.get("model").and_then(|v| v.as_str()),
+            Some("mistral-large-2411"),
+            "Mistral keeps the model id in the OpenAI body (and the URL): {body}"
+        );
+        assert!(
+            obj.get("messages")
+                .and_then(|v| v.as_array())
+                .is_some_and(|m| !m.is_empty()),
+            "messages array must carry the user turn: {body}"
+        );
+    }
+
+    /// D5.4 — AI21 Jamba on Vertex dispatches through
+    /// `publishers/ai21/models/<model>:rawPredict` (a DISTINCT publisher
+    /// segment from Mistral) with the same OpenAI-shape body.
+    #[tokio::test]
+    async fn chat_ai21_dispatches_to_rawpredict_under_ai21_publisher_segment() {
+        let server = MockServer::start().await;
+        let responder = CapturingOpenAiResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/ai21/models/jamba-1.5-large:rawPredict",
+            ))
+            .and(header("authorization", "Bearer ya29.test"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("jamba-1.5-large"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-jamba", vec![ChatMessage::user("hi")]);
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+        assert_eq!(chat.usage.total_tokens, 9);
+
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        assert_eq!(
+            body.get("model").and_then(|v| v.as_str()),
+            Some("jamba-1.5-large"),
+            "AI21 keeps the model id in the OpenAI body (and the URL): {body}"
+        );
+    }
+
+    /// D5.4 — Mistral / AI21 streaming dispatches to `:streamRawPredict`
+    /// with `stream: true` kept in the OpenAI body; the OpenAI SSE
+    /// (terminated by `data: [DONE]`) decodes via the shared decoder.
+    /// Representative: Mistral (the rail is shared with AI21, differing
+    /// only in the publisher URL segment pinned by the non-stream tests).
+    #[tokio::test]
+    async fn chat_mistral_stream_dispatches_to_streamrawpredict_with_stream_in_body() {
+        let server = MockServer::start().await;
+        let responder = CapturingOpenAiStreamResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/mistralai/models/mistral-large-2411:streamRawPredict",
+            ))
+            .and(header("authorization", "Bearer ya29.test"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("mistral-large-2411"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-mistral", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+
+        let mut content = String::new();
+        let mut saw_finish = false;
+        while let Some(item) = stream.next().await {
+            let chunk = item.unwrap();
+            if let Some(delta) = chunk.delta.content.as_deref() {
+                content.push_str(delta);
+            }
+            if chunk.finish_reason.is_some() {
+                saw_finish = true;
+            }
+        }
+        assert_eq!(
+            content, "hello world",
+            "aggregated stream content decodes from the OpenAI SSE frames"
+        );
+        assert!(saw_finish, "stream surfaces a terminal finish_reason");
+
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        let obj = body.as_object().expect("object body");
+        assert_eq!(
+            obj.get("stream").and_then(|v| v.as_bool()),
+            Some(true),
+            "stream:true must ride in the body for :streamRawPredict: {body}"
+        );
+        assert_eq!(
+            obj.get("model").and_then(|v| v.as_str()),
+            Some("mistral-large-2411"),
+            "model id kept in the body (and the URL) on the stream path: {body}"
         );
     }
 
