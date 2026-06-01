@@ -1,157 +1,93 @@
 # CLAUDE.md
 
-Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
-
-**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
+Behavioral guidelines to reduce common LLM coding mistakes. Bias toward caution over speed; for trivial tasks, use judgment. Merge with project-specific instructions as needed.
 
 ## 1. Think Before Coding
 
 **Don't assume. Don't hide confusion. Surface tradeoffs.**
 
-Before implementing:
-- State your assumptions explicitly. If uncertain, ask.
-- If multiple interpretations exist, present them - don't pick silently.
+- State assumptions explicitly; if uncertain, ask.
+- If multiple interpretations exist, present them — don't pick silently.
 - If a simpler approach exists, say so. Push back when warranted.
-- If something is unclear, stop. Name what's confusing. Ask.
+- If something is unclear, stop, name what's confusing, and ask.
 
 ## 2. Simplicity First
 
 **Minimum code that solves the problem. Nothing speculative.**
 
-- No features beyond what was asked.
-- No abstractions for single-use code.
+- No features beyond what was asked; no abstractions for single-use code.
 - No "flexibility" or "configurability" that wasn't requested.
 - No error handling for impossible scenarios.
-- If you write 200 lines and it could be 50, rewrite it.
-
-Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+- If you write 200 lines and it could be 50, rewrite it. Would a senior engineer call it overcomplicated? Then simplify.
 
 ## 3. Surgical Changes
 
 **Touch only what you must. Clean up only your own mess.**
 
-When editing existing code:
-- Don't "improve" adjacent code, comments, or formatting.
-- Don't refactor things that aren't broken.
-- Match existing style, even if you'd do it differently.
-- If you notice unrelated dead code, mention it - don't delete it.
-
-When your changes create orphans:
-- Remove imports/variables/functions that YOUR changes made unused.
-- Don't remove pre-existing dead code unless asked.
-
-The test: Every changed line should trace directly to the user's request.
+- Don't "improve" adjacent code, comments, or formatting; don't refactor what isn't broken; match existing style, even if you'd do it differently.
+- Remove imports/variables/functions YOUR changes orphaned — but don't delete pre-existing dead code; mention it instead.
+- The test: every changed line traces directly to the user's request.
 
 ## 4. Goal-Driven Execution
 
 **Define success criteria. Loop until verified.**
 
-Transform tasks into verifiable goals:
-- "Add validation" → "Write tests for invalid inputs, then make them pass"
-- "Fix the bug" → "Write a test that reproduces it, then make it pass"
-- "Refactor X" → "Ensure tests pass before and after"
-
-For multi-step tasks, state a brief plan:
-```
-1. [Step] → verify: [check]
-2. [Step] → verify: [check]
-3. [Step] → verify: [check]
-```
-
-Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+- Turn tasks into verifiable goals: "add validation" → write tests for invalid inputs, then pass them; "fix the bug" → write a reproducing test first; "refactor X" → tests pass before and after.
+- For multi-step tasks, state a brief plan as `step → verify: check` lines.
+- Strong criteria let you loop independently; weak criteria ("make it work") require constant clarification.
 
 ## 5. Testing Discipline
 
 **E2E tests are the highest-priority signal. Cover the real user journey. Never silence failures.**
 
-- E2E tests are the most important test type — prioritize them over unit/integration when coverage is limited.
-- Design test cases around the user's actual usage path. Walk through the real flow end-to-end and do not skip steps a user would take.
-- For any project with a frontend UI, write E2E tests using **Playwright**.
-- Do **not** skip, disable, or `.only` any test case to make things green. A passing CI is not an excuse to hide flakiness — investigate the underlying bug in the code.
-- If a test case itself appears unreasonable or incorrect, do **not** silently delete or rewrite it. Flag it and ask a human to confirm before changing it.
-- Do **not** use mock data in E2E tests — they must run against real data and real services. If real data is genuinely unavailable and mocking is unavoidable, stop and get human confirmation before introducing any mock.
-- Every frontend E2E test **must** issue requests to a real backend API. No stubbed network layers, no fixture servers, no intercepted responses — the test must exercise the real backend end-to-end.
-- E2E tests must be **source-blind**. Design test cases from scenario reasonableness and combinations alone — what a real user would do, what edge cases their journey produces, what state combinations the product must handle. Do **not** read product source code to design assertions or pick expected values. The test verifies the externally observable contract, not the implementation.
-- **If an E2E test fails, the default conclusion is a bug in the code — not a flaw in the test.** Investigate and fix the product behavior. Do not weaken the assertion, relax the expected value, change the scenario, or read the source to "explain away" the failure. The only legitimate reason to change a failing test is if a human confirms the scenario itself is invalid.
+- Prioritize E2E over unit/integration when coverage is limited; design cases around the user's real path and don't skip steps.
+- For any frontend UI, write E2E with **Playwright**, issuing requests to a **real backend API** — no stubbed network, fixture servers, or intercepted responses.
+- Don't use mock data in E2E; run against real data and services. If mocking seems unavoidable, stop and get human confirmation first.
+- Never skip, disable, or `.only` a test to go green — investigate the underlying bug instead.
+- E2E tests must be **source-blind**: design assertions from scenario reasonableness alone, never by reading product source to pick expected values. The test verifies the observable contract, not the implementation.
+- **If an E2E test fails, the default conclusion is a bug in the code, not the test.** Fix the product; don't weaken the assertion, relax the expected value, change the scenario, or read the source to explain it away. Only change a failing test if a human confirms the scenario is invalid.
+- If a test case itself looks wrong, flag it and ask a human — don't silently delete or rewrite it.
 
 ## 6. Research Discipline
 
 **Verify against primary sources. Never guess or infer product behavior.**
 
-- When researching a product or feature, confirm details only via **official documentation** and **source code**.
-- Do not speculate, infer, or fill gaps with assumptions about how a product or API behaves.
-- If official docs and source code do not answer the question, say so explicitly and ask — do not invent an answer.
-- Cite the specific doc URL, file path, or commit/version when stating a fact about third-party behavior.
+- Confirm details only via **official documentation** and **source code**; don't speculate or fill gaps with assumptions.
+- If docs and source don't answer it, say so and ask — don't invent an answer.
+- Cite the specific doc URL, file path, or commit/version for any claim about third-party behavior.
 
 ## 7. Reference Implementations Before Building
 
-**Before implementing any feature, study how the established players did it. Avoid building a parallel reality that drifts from the ecosystem.**
+**Before implementing any feature, study how the established players did it — don't drift from the ecosystem.**
 
-This gateway sits between customer SDKs and upstream LLM providers. Both
-sides have decades of accumulated wire-shape decisions, edge cases, and
-backward-compat constraints. Re-deriving them from first principles is
-how you ship a half-spec-compliant version that breaks on the first SDK
-the customer tries.
+Before writing the first line of a new feature, read:
 
-**Before writing the first line of a new feature, read:**
+- **Mainstream AI gateway implementations** — research at least three established, mainstream AI gateways and study how each solves the problem. When in doubt about a request/response transform, read their sources for the same provider + endpoint and compare.
+- **Upstream provider docs** — the authoritative spec for any endpoint: OpenAI <https://platform.openai.com/docs/api-reference>, Anthropic <https://docs.anthropic.com/en/api>, Gemini <https://ai.google.dev/api>, DeepSeek <https://api-docs.deepseek.com>, Bedrock <https://docs.aws.amazon.com/bedrock/>.
+- **Upstream SDK source** — the real contract when docs are vague (`usage` sub-fields, streaming event order, error envelopes): the official `openai-python`, `anthropic-sdk-python`, and `generative-ai-python` repos.
 
-- **Reference gateway implementations** — at minimum
-  [LiteLLM](https://github.com/BerriAI/litellm) and
-  [Portkey](https://github.com/Portkey-AI/gateway). Both are open
-  source, both solve the multi-provider proxy problem, and both
-  encode years of "this provider returns X but actually means Y"
-  fixes. When in doubt about a request/response transform, search
-  their source for the same provider + endpoint and see how they
-  handle it.
-- **Upstream provider docs** — for any endpoint or feature, the
-  authoritative spec is the upstream provider's own docs:
-  - OpenAI: <https://platform.openai.com/docs/api-reference>
-  - Anthropic: <https://docs.anthropic.com/en/api>
-  - Google Gemini: <https://ai.google.dev/api>
-  - DeepSeek: <https://api-docs.deepseek.com>
-  - AWS Bedrock: <https://docs.aws.amazon.com/bedrock/>
-- **Upstream SDK source** — when the docs are vague (and they often
-  are about edge cases like `usage` block sub-fields, streaming
-  event ordering, or error envelope shape), the official SDK source
-  is the actual contract:
-  - <https://github.com/openai/openai-python>
-  - <https://github.com/anthropics/anthropic-sdk-python>
-  - <https://github.com/google-gemini/generative-ai-python>
+The rule:
 
-**The rule:**
-
-- Cite at least one reference implementation and one upstream-spec
-  source in the design notes / PR description for any new endpoint,
-  request transform, or response normalization.
-- If your design diverges from how LiteLLM / Portkey solve the same
-  problem, name the divergence explicitly and justify it. "I didn't
-  know they handled it" is not a reason; "they do X but we need Y
-  because of Z" is.
-- For any field, header, or status code you emit or parse, cite the
-  upstream doc URL or SDK file/line. Don't invent field names that
-  "feel right" — the ecosystem has already chosen one.
+- For any new endpoint, request transform, or response normalization, compare how at least three mainstream gateways approach it, cite one upstream-spec source, and summarize that comparison — plus where your design lands — in the design notes / PR description.
+- If your design diverges from how those gateways solve it, name the divergence and justify it ("they do X but we need Y because of Z" — not "I didn't know they handled it").
+- For any field, header, or status code you emit or parse, cite the upstream doc URL or SDK file/line. Don't invent names the ecosystem has already chosen.
+- Refer to other products generically in shipped artifacts (code, comments, commit messages, PR descriptions) — describe the approach, not the brand. Keep brand-specific notes to internal design discussion.
 
 ## 8. Independent Audit Before Merge
 
-**Every PR pushed must be reviewed by an independent third-party audit agent. Merge is blocked until all HIGH/MEDIUM findings are resolved or explicitly justified.**
+**Every PR pushed must be reviewed by an independent audit agent. Merge is blocked until all HIGH/MEDIUM findings are resolved or explicitly justified.**
 
-After every `gh pr create` or force-push that updates an existing PR, immediately spawn an `Agent` (`general-purpose` subagent) with no shared context. Brief it cold with the PR URL and the contract the PR claims to pin. The agent must review from these angles, each treated as a blocking concern:
+After every `gh pr create` or force-push, spawn a fresh `general-purpose` Agent with no shared context. Brief it cold with the PR URL and the contract the PR claims to pin. Treat each angle as blocking:
 
-- **Correctness** — does the change actually do what the description claims? Are assertions strong enough that a real regression would fail?
-- **Reliability** — race conditions, error handling, retry/timeout behavior, propagation timing on slow CI runners
-- **Security** — auth/authz checks, input validation at boundaries, injection vectors, header forwarding (and what's deliberately *not* forwarded)
-- **Sensitive-information leakage** — secrets in logs/error messages, internal taxonomy bleeding into client-visible output, upstream-provider details in user-facing fields, tokens/PII in test fixtures
-- **Breaking changes** — public API shape, on-disk format, wire protocol, default-behavior shifts; if the change is breaking, is it gated/versioned?
-- **E2E test coverage** — does the change have e2e coverage of the user-visible contract, not just unit-level happy-path? Are mocks tight enough that a regression on the unverified side (request body, headers) couldn't sneak through?
+- **Correctness** — does it do what the description claims? Would a real regression fail the assertions?
+- **Reliability** — races, error handling, retry/timeout, propagation timing on slow CI.
+- **Security** — auth/authz, input validation at boundaries, injection, header forwarding (and what's deliberately not forwarded).
+- **Sensitive-info leakage** — secrets in logs/errors, internal taxonomy or upstream-provider details in user-facing fields, tokens/PII in fixtures.
+- **Breaking changes** — API shape, on-disk format, wire protocol, default shifts; if breaking, is it gated/versioned?
+- **E2E coverage** — the user-visible contract, not just unit happy-path; mocks tight enough that a regression on the unverified side can't sneak through.
 
-Audit agent output: HIGH / MEDIUM / LOW per finding, with **concrete suggested code** (the actual line to add), not vague "consider".
-
-**Merge gate:** every HIGH and MEDIUM must be either (a) addressed by a code change, or (b) explicitly justified in the PR — e.g. "this exposes a feature gap, filed as #N for separate work, agreed not to block merge". "Looks fine" or silent merge is not enough.
-
-For findings that surface gateway/product behavior gaps (not test-author oversight), file separate feature/bug issues and link from the PR.
-
-This rule exists because the author cannot see their own blind spots — self-review without an independent agent has shipped real gaps (e.g. a cross-provider e2e PR that verified response translation while never asserting the gateway sent a request in the upstream's wire shape).
+Output HIGH/MEDIUM/LOW per finding with **concrete suggested code**, not vague "consider". **Merge gate:** every HIGH and MEDIUM is either fixed in code or explicitly justified in the PR (e.g. "feature gap, filed as #N, agreed not to block"); silent merge is not enough. For findings that surface gateway/product-behavior gaps, file separate issues and link them. Self-review misses the author's blind spots — an independent agent catches them.
 
 ---
 
-**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+**Working if:** fewer unnecessary diff lines, fewer overcomplication rewrites, and clarifying questions come before implementation rather than after mistakes.
