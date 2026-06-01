@@ -4574,4 +4574,159 @@ mod tests {
             "the Vertex anthropic_version shaping still runs after overrides; got {body}",
         );
     }
+
+    /// Build a Vertex `ProviderKey` carrying a `response` override block
+    /// (issue #302 §5) — `content_list_to_string` lives here even though it
+    /// reshapes the *request* body before send.
+    fn sample_pk_with_response_overrides(response: serde_json::Value) -> Arc<ProviderKey> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "display_name": "vertex-prod",
+                "secret": valid_secret_json(),
+                "response": response,
+            }))
+            .expect("provider_key with response overrides deserializes"),
+        )
+    }
+
+    #[tokio::test]
+    async fn openai_shim_stream_applies_default_body_fields() {
+        // Regression guard for the STREAMING body-build path: it serializes
+        // the body separately from the non-stream path, so it needs its own
+        // proof that the override pipeline reaches the wire.
+        let server = MockServer::start().await;
+        let responder = CapturingOpenAiStreamResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/endpoints/openapi/chat/completions",
+            ))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta/llama-3.3-70b-instruct-maas"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "default_body_fields": { "x_test_default": "injected" }
+            })),
+        );
+        let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        while let Some(item) = stream.next().await {
+            let _ = item.unwrap();
+        }
+
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        assert_eq!(
+            body.get("x_test_default").and_then(|v| v.as_str()),
+            Some("injected"),
+            "the streaming shim rail must apply default_body_fields too; got {body}",
+        );
+        assert_eq!(
+            body.get("stream").and_then(|v| v.as_bool()),
+            Some(true),
+            "stream:true stays in the body alongside the override; got {body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn mistral_request_applies_default_body_fields_and_keeps_model_in_body() {
+        // Regression guard for the partner `:rawPredict` URL builder rail,
+        // which is a distinct code path from the openapi shim.
+        let server = MockServer::start().await;
+        let responder = CapturingOpenAiResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/mistralai/models/mistral-large-2411:rawPredict",
+            ))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("mistral-large-2411"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "default_body_fields": { "x_test_default": "injected" }
+            })),
+        );
+        let req = ChatFormat::new("my-mistral", vec![ChatMessage::user("hi")]);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        assert_eq!(
+            body.get("x_test_default").and_then(|v| v.as_str()),
+            Some("injected"),
+            "the partner :rawPredict rail must apply default_body_fields; got {body}",
+        );
+        // Mistral / AI21 keep the model id in the body (it rides in BOTH the
+        // URL and the body) — overrides must not disturb it.
+        assert_eq!(
+            body.get("model").and_then(|v| v.as_str()),
+            Some("mistral-large-2411"),
+            "the override pipeline must keep the model the partner rail rides in-body; got {body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_shim_response_content_list_to_string_flattens_outbound_body() {
+        // The `content_list_to_string` branch is gated on the *response*
+        // override block, so it needs a PK with a `response` section and a
+        // multi-block message to observe the array -> string flatten.
+        let server = MockServer::start().await;
+        let responder = CapturingOpenAiResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/endpoints/openapi/chat/completions",
+            ))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta/llama-3.3-70b-instruct-maas"),
+            sample_pk_with_response_overrides(serde_json::json!({
+                "content_list_to_string": true
+            })),
+        );
+        // Multi-block text content: ["a", "b", "c"] must flatten to "abc".
+        let mut msg = ChatMessage::user("abc");
+        msg.content_blocks = Some(vec![
+            serde_json::json!({"type": "text", "text": "a"}),
+            serde_json::json!({"type": "text", "text": "b"}),
+            serde_json::json!({"type": "text", "text": "c"}),
+        ]);
+        let req = ChatFormat::new("my-llama", vec![msg]);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        assert_eq!(
+            body["messages"][0]["content"].as_str(),
+            Some("abc"),
+            "response.content_list_to_string must flatten array content to a string on the outbound body; got {body}",
+        );
+    }
 }
