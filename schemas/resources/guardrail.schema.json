@@ -106,6 +106,127 @@
           "minimum": 0.0
         }
       }
+    },
+    {
+      "description": "Azure AI Content Safety Text Moderation. Category-severity + blocklist moderation via the `/contentsafety/text:analyze` API, on input and/or output (including streaming output). P2 (PRD-09c §6 P2, #379).",
+      "type": "object",
+      "required": [
+        "api_key",
+        "endpoint",
+        "kind"
+      ],
+      "properties": {
+        "api_key": {
+          "description": "Subscription key (`Ocp-Apim-Subscription-Key`). Plaintext in memory only, never logged.",
+          "type": "string"
+        },
+        "blocklist_names": {
+          "description": "Azure CS blocklist names to match against.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "categories": {
+          "description": "Categories to analyze. Defaults to all four.",
+          "default": [
+            "Hate",
+            "Sexual",
+            "SelfHarm",
+            "Violence"
+          ],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "endpoint": {
+          "description": "Azure Cognitive Services resource endpoint. The DP appends `/contentsafety/text:analyze?api-version=2024-09-01`.",
+          "type": "string"
+        },
+        "halt_on_blocklist_hit": {
+          "description": "Forwarded to Azure's `haltOnBlocklistHit`.",
+          "default": false,
+          "type": "boolean"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "azure_content_safety_text_moderation"
+          ]
+        },
+        "max_buffer_bytes": {
+          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies. Default 262 144.",
+          "default": 262144,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "on_buffer_exceeded": {
+          "description": "`fail_closed` (default) or `fail_open` when the buffer cap is hit.",
+          "default": "fail_closed",
+          "type": "string"
+        },
+        "output_fail_open": {
+          "description": "Fail-open policy for the OUTPUT hook. Defaults `false` (fail-closed) so an Azure outage can't release unscanned model output.",
+          "default": false,
+          "type": "boolean"
+        },
+        "output_type": {
+          "description": "`FourSeverityLevels` (0,2,4,6; default) or `EightSeverityLevels` (0..7).",
+          "default": "FourSeverityLevels",
+          "type": "string"
+        },
+        "severity_threshold": {
+          "description": "General severity threshold; a category at or above it blocks.",
+          "default": 2,
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "severity_threshold_by_category": {
+          "description": "Per-category threshold overrides (take precedence over the general one).",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0.0
+          }
+        },
+        "stream_processing_mode": {
+          "description": "`window` (sliding-window incremental release; default) or `buffer_full` (whole-response hold-back).",
+          "default": "window",
+          "type": "string"
+        },
+        "text_source": {
+          "description": "Input-hook text selection: `concatenate_user_content` (default) or `concatenate_all_content`. Ignored on the output hook.",
+          "default": "concatenate_user_content",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "HTTP call timeout (ms); `fail_open` / `output_fail_open` govern the verdict when it elapses. See the `AzureContentSafetyConfig` note on why `0` means \"fire immediately\", not \"no timeout\".",
+          "default": 5000,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "window_overlap_size": {
+          "description": "Chars carried between windows so a span split across a boundary is still caught. Default 256.",
+          "default": 256,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "window_size": {
+          "description": "Sliding-window size in chars (window mode); cp-api caps it at the 10 000-char Azure limit. Default 10 000.",
+          "default": 10000,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
     }
   ],
   "required": [
