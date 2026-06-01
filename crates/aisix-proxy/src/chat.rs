@@ -2281,11 +2281,17 @@ where
                                 for e in pending.drain(..) {
                                     yield Ok::<_, Infallible>(e);
                                 }
+                                // Clamp the retained overlap to cc-1 so a
+                                // misconfigured overlap >= window can't keep
+                                // the whole buffer and re-scan every
+                                // subsequent token (cost/latency guard).
                                 let cc = window_buf.chars().count();
-                                if *overlap_chars < cc {
-                                    window_buf =
-                                        window_buf.chars().skip(cc - *overlap_chars).collect();
-                                }
+                                let keep = (*overlap_chars).min(cc.saturating_sub(1));
+                                window_buf = if keep > 0 {
+                                    window_buf.chars().skip(cc - keep).collect()
+                                } else {
+                                    String::new()
+                                };
                             }
                         }
                     }

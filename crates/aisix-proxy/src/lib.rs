@@ -2072,6 +2072,169 @@ data: [DONE]\n\n";
         );
     }
 
+    /// Drive a streaming chat through a seeded text-moderation guardrail
+    /// and return the raw SSE wire bytes. `guardrail_cfg` is the full
+    /// guardrail JSON (with the ACS mock endpoint already substituted).
+    async fn run_textmod_stream(guardrail_cfg: &str, upstream_sse: &str) -> String {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(upstream_sse.to_owned()),
+            )
+            .mount(&upstream)
+            .await;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+        seed_guardrail(&state.snapshot, "g-tm", guardrail_cfg);
+        let app = build_router(state);
+        let body = serde_json::json!({"model":"my-gpt4","messages":[{"role":"user","content":"hi"}],"stream":true});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut wire = Vec::new();
+        while let Some(c) = body_stream.next().await {
+            wire.extend_from_slice(c.unwrap().as_ref());
+        }
+        String::from_utf8(wire).expect("utf8")
+    }
+
+    async fn acs_mock(severity: u8) -> MockServer {
+        let acs = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/contentsafety/text:analyze"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "categoriesAnalysis": [{"category": "Hate", "severity": severity}],
+                "blocklistsMatch": []
+            })))
+            .mount(&acs)
+            .await;
+        acs
+    }
+
+    fn two_content_chunks(a: &str, b: &str) -> String {
+        format!(
+            "data: {{\"id\":\"u\",\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{a}\"}},\"finish_reason\":null}}]}}\n\n\
+data: {{\"id\":\"u\",\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{b}\"}},\"finish_reason\":null}}]}}\n\n\
+data: {{\"id\":\"u\",\"model\":\"gpt-4o\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n\
+data: [DONE]\n\n"
+        )
+    }
+
+    /// H1: Window mode blocks MID-STREAM (small window so the first window
+    /// trips before end-of-stream) and leaks nothing.
+    #[tokio::test]
+    async fn streaming_text_moderation_window_blocks_mid_stream() {
+        let acs = acs_mock(6).await;
+        let cfg = format!(
+            r#"{{"name":"tm","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k","stream_processing_mode":"window","window_size":5,"window_overlap_size":1}}"#,
+            acs.uri()
+        );
+        let wire = run_textmod_stream(&cfg, &two_content_chunks("hello ", "world!")).await;
+        assert!(
+            !wire.contains("hello"),
+            "mid-stream block must not leak window content; got:\n{wire}"
+        );
+        assert!(
+            !wire.contains("world"),
+            "mid-stream block must not leak later content; got:\n{wire}"
+        );
+        assert!(
+            wire.contains("event: error"),
+            "expected content_filter frame; got:\n{wire}"
+        );
+        assert!(
+            !wire.contains("data: [DONE]"),
+            "blocked stream omits [DONE]; got:\n{wire}"
+        );
+    }
+
+    /// H1: Window mode releases multiple clean windows (exercises the
+    /// mid-stream flush + overlap retention), ending with [DONE].
+    #[tokio::test]
+    async fn streaming_text_moderation_window_releases_clean_multiwindow() {
+        let acs = acs_mock(0).await;
+        let cfg = format!(
+            r#"{{"name":"tm","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k","stream_processing_mode":"window","window_size":5,"window_overlap_size":2}}"#,
+            acs.uri()
+        );
+        let wire = run_textmod_stream(&cfg, &two_content_chunks("hello ", "world!")).await;
+        assert!(
+            wire.contains("hello"),
+            "clean windows must be released; got:\n{wire}"
+        );
+        assert!(
+            wire.contains("world"),
+            "all clean content must be released; got:\n{wire}"
+        );
+        assert!(
+            wire.contains("data: [DONE]"),
+            "clean stream ends with [DONE]; got:\n{wire}"
+        );
+        assert!(
+            !wire.contains("event: error"),
+            "clean stream emits no error; got:\n{wire}"
+        );
+    }
+
+    /// H1: BufferFull cap exceeded with fail_closed → block, no leak.
+    #[tokio::test]
+    async fn streaming_text_moderation_buffer_full_cap_fail_closed_blocks() {
+        let acs = acs_mock(0).await; // severity irrelevant — the cap trips first
+        let cfg = format!(
+            r#"{{"name":"tm","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k","stream_processing_mode":"buffer_full","max_buffer_bytes":4,"on_buffer_exceeded":"fail_closed"}}"#,
+            acs.uri()
+        );
+        let wire = run_textmod_stream(&cfg, &two_content_chunks("abcd", "efghij")).await;
+        assert!(
+            !wire.contains("abcd"),
+            "fail-closed cap must not leak buffered content; got:\n{wire}"
+        );
+        assert!(
+            wire.contains("event: error"),
+            "cap fail-closed must emit content_filter; got:\n{wire}"
+        );
+        assert!(
+            !wire.contains("data: [DONE]"),
+            "cap-blocked stream omits [DONE]; got:\n{wire}"
+        );
+    }
+
+    /// H1: BufferFull cap exceeded with fail_open → release held + forward
+    /// the rest live, ending with [DONE].
+    #[tokio::test]
+    async fn streaming_text_moderation_buffer_full_cap_fail_open_releases() {
+        let acs = acs_mock(0).await;
+        let cfg = format!(
+            r#"{{"name":"tm","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k","stream_processing_mode":"buffer_full","max_buffer_bytes":4,"on_buffer_exceeded":"fail_open"}}"#,
+            acs.uri()
+        );
+        let wire = run_textmod_stream(&cfg, &two_content_chunks("abcd", "efghij")).await;
+        assert!(
+            wire.contains("abcd"),
+            "fail-open cap must release held content; got:\n{wire}"
+        );
+        assert!(
+            wire.contains("data: [DONE]"),
+            "fail-open released stream ends with [DONE]; got:\n{wire}"
+        );
+        assert!(
+            !wire.contains("event: error"),
+            "fail-open release emits no error; got:\n{wire}"
+        );
+    }
+
     // ---- regression coverage for issue #107 -------------------------
     // Pre-fix only /v1/chat/completions enforced rate-limit / budget;
     // every other LLM endpoint silently bypassed both. The test below
