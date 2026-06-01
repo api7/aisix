@@ -236,10 +236,10 @@ pub enum VertexPublisher {
     /// <https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/llama#openai>
     OpenAiCompat,
     /// `publishers/mistralai/models/mistral-*` — Mistral on Vertex
-    /// (`rawPredict`; not yet wired).
+    /// (OpenAI-compatible body over the `:rawPredict` rail).
     Mistral,
     /// `publishers/ai21/models/jamba-*` — AI21 Jamba family
-    /// (`rawPredict`; not yet wired).
+    /// (OpenAI-compatible body over the `:rawPredict` rail).
     Ai21,
 }
 
@@ -3115,6 +3115,74 @@ mod tests {
             obj.get("model").and_then(|v| v.as_str()),
             Some("mistral-large-2411"),
             "model id kept in the body (and the URL) on the stream path: {body}"
+        );
+    }
+
+    /// D5.4 — AI21 streaming symmetry: same shared rail as Mistral, but
+    /// pins the `publishers/ai21` segment on `:streamRawPredict` directly
+    /// (not only transitively via the `url_segment()` unit test).
+    #[tokio::test]
+    async fn chat_ai21_stream_dispatches_to_streamrawpredict_under_ai21_segment() {
+        let server = MockServer::start().await;
+        let responder = CapturingOpenAiStreamResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/ai21/models/jamba-1.5-large:streamRawPredict",
+            ))
+            .and(header("authorization", "Bearer ya29.test"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("jamba-1.5-large"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-jamba", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        let obj = body.as_object().expect("object body");
+        assert_eq!(
+            obj.get("stream").and_then(|v| v.as_bool()),
+            Some(true),
+            "stream:true must ride in the body for AI21 :streamRawPredict: {body}"
+        );
+        assert_eq!(
+            obj.get("model").and_then(|v| v.as_str()),
+            Some("jamba-1.5-large"),
+            "AI21 keeps the model id in the body (and the URL) on the stream path: {body}"
+        );
+    }
+
+    /// D5.4 — the partner rail is the one place the model id is BOTH
+    /// URL-interpolated and body-serialized, so a hostile `model_name`
+    /// must be rejected by the URL-token validator BEFORE any request is
+    /// sent. `mistral-large/...` still resolves to the Mistral publisher
+    /// (prefix match), then the `/` is rejected — proving no path/query
+    /// injection reaches the URL builder.
+    #[tokio::test]
+    async fn chat_mistral_rejects_model_with_path_injection() {
+        let bridge = VertexBridge::new();
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("mistral-large/../admin"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("x", vec![ChatMessage::user("hi")]);
+        let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        assert!(
+            matches!(err, BridgeError::Config(_)),
+            "path-injection model id must be rejected before dispatch; got {err:?}"
         );
     }
 
