@@ -242,6 +242,7 @@ dependencies = [
  "aisix-core",
  "aisix-gateway",
  "aisix-provider-anthropic",
+ "aisix-provider-openai",
  "async-stream",
  "async-trait",
  "aws-config",

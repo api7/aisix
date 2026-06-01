@@ -19,6 +19,10 @@ aisix-gateway = { path = "../aisix-gateway" }
 # AI21) and all streaming go through the unified Converse API
 # instead — see `chat_converse` / `chat_converse_stream`.
 aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
+# Reuse the per-ProviderKey request-override primitives (param_renames /
+# param_constraints / default_body_fields / content_list_to_string) so every
+# adapter applies the same wire transforms cp-api configures (#302 §5 / #340).
+aisix-provider-openai = { path = "../aisix-provider-openai" }
 async-stream = "0.3"
 async-trait.workspace = true
 thiserror.workspace = true

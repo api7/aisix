@@ -44,6 +44,20 @@ use aisix_provider_anthropic::wire::{
     build_request, response_into_chat_response, split_system, AnthropicResponse,
 };
 
+// Per-`ProviderKey` request override pipeline (#302 §5 / #340). The JSON-body
+// transforms reuse the shared primitives the OpenAI / Vertex bridges call;
+// `default_headers` ride a pre-signing interceptor (see
+// [`DefaultHeadersInterceptor`]) so they land inside the SigV4-signed
+// canonical request rather than being appended after the signature is computed.
+use aisix_core::RequestOverrides;
+use aisix_provider_openai::overrides::{
+    apply_content_list_to_string, apply_default_body_fields, apply_param_constraints,
+    apply_param_renames,
+};
+use aws_sdk_bedrockruntime::config::interceptors::BeforeTransmitInterceptorContextMut;
+use aws_sdk_bedrockruntime::config::{ConfigBag, Intercept, RuntimeComponents};
+use aws_smithy_runtime_api::box_error::BoxError;
+
 use crate::wire;
 
 /// Anthropic-on-Bedrock body-shape version pin per
@@ -310,6 +324,7 @@ impl BedrockSecret {
 fn build_client(
     creds: &BedrockSecret,
     endpoint_url: Option<&str>,
+    request: Option<&RequestOverrides>,
 ) -> Result<BedrockClient, BridgeError> {
     if creds.region.trim().is_empty() {
         return Err(BridgeError::Config(
@@ -336,7 +351,109 @@ fn build_client(
         builder = builder.endpoint_url(url);
     }
     let sdk_cfg = builder.build();
-    Ok(BedrockClient::new(&sdk_cfg))
+
+    // Register the default-headers interceptor only when the PK actually
+    // carries (non-reserved) default_headers, so the common no-override path
+    // builds the client byte-for-byte as before. The interceptor injects at
+    // `modify_before_signing`, so the headers are covered by the SigV4
+    // signature (#340).
+    let mut conf = aws_sdk_bedrockruntime::config::Builder::from(&sdk_cfg);
+    if let Some(r) = request {
+        let headers = filtered_default_headers(&r.default_headers);
+        if !headers.is_empty() {
+            conf = conf.interceptor(DefaultHeadersInterceptor { headers });
+        }
+    }
+    Ok(BedrockClient::from_conf(conf.build()))
+}
+
+/// Drop SigV4-owned headers ([`wire::reserved_sigv4_headers`]) from an
+/// operator-supplied `default_headers` block before they reach the signing
+/// interceptor. cp-api SHOULD reject these at write time (#302 §5), but the DP
+/// enforces it again here as defense-in-depth — an override naming e.g.
+/// `x-amz-date` or `authorization` must never perturb the signature. Matching
+/// is case-insensitive (HTTP header names are).
+fn filtered_default_headers(
+    defaults: &std::collections::HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let reserved = wire::reserved_sigv4_headers();
+    defaults
+        .iter()
+        .filter(|(name, _)| {
+            let lower = name.to_ascii_lowercase();
+            !reserved.contains(&lower.as_str())
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
+/// Apply the per-`ProviderKey` request/response **body** override pipeline to
+/// an already-serialized JSON body, mirroring `OpenAiBridge`'s order:
+/// `param_renames` -> `param_constraints` -> `default_body_fields` ->
+/// (`content_list_to_string`, when the response override sets it). Header
+/// overrides are NOT applied here — Bedrock signs via the AWS SDK, so
+/// `default_headers` ride [`DefaultHeadersInterceptor`] instead.
+///
+/// Only the `invoke_model` (Anthropic) path carries a JSON body; the Converse
+/// path builds its request through the SDK's typed `InferenceConfiguration`
+/// builder, which has no JSON body for these top-level-key transforms to act
+/// on (the operator clamps temperature etc. via the normal request fields).
+fn apply_body_overrides(body: &mut serde_json::Value, ctx: &BridgeContext) {
+    if let Some(r) = ctx.provider_key.request.as_ref() {
+        apply_param_renames(body, &r.param_renames);
+        if let Some(constraints) = &r.param_constraints {
+            apply_param_constraints(body, constraints);
+        }
+        apply_default_body_fields(body, &r.default_body_fields);
+    }
+    if ctx
+        .provider_key
+        .response
+        .as_ref()
+        .is_some_and(|r| r.content_list_to_string)
+    {
+        apply_content_list_to_string(body);
+    }
+}
+
+/// Injects `request.default_headers` into the outbound Bedrock request at
+/// `modify_before_signing`, so the headers are part of the SigV4-signed
+/// canonical request (#302 §5 / #340). The header list is pre-filtered by
+/// [`filtered_default_headers`] (SigV4-owned names removed) at construction.
+/// A header already present on the request is left untouched (the SDK / caller
+/// wins); names or values that fail header parsing are skipped silently — the
+/// block came from cp-api validation and an unparseable entry is a config
+/// error one layer up, not a runtime failure the dispatch should hard-fail on.
+#[derive(Debug)]
+struct DefaultHeadersInterceptor {
+    headers: Vec<(String, String)>,
+}
+
+impl Intercept for DefaultHeadersInterceptor {
+    fn name(&self) -> &'static str {
+        "AisixBedrockDefaultHeaders"
+    }
+
+    fn modify_before_signing(
+        &self,
+        context: &mut BeforeTransmitInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let request = context.request_mut();
+        for (name, value) in &self.headers {
+            if request.headers().contains_key(name.as_str()) {
+                continue;
+            }
+            // `try_insert` returns Err on a non-ASCII name / non-UTF-8 value;
+            // we already guarded `contains_key`, so a parse failure just skips
+            // this one entry rather than failing the whole request.
+            let _ = request
+                .headers_mut()
+                .try_insert(name.clone(), value.clone());
+        }
+        Ok(())
+    }
 }
 
 /// Pull the upstream model id off the BridgeContext.
@@ -558,6 +675,11 @@ impl BedrockBridge {
         let anthropic_req = build_request(req, upstream_id, system, messages, false);
         let mut body_value = serde_json::to_value(&anthropic_req)
             .map_err(|e| BridgeError::Config(format!("serialize Anthropic request body: {e}")))?;
+        // Apply the per-ProviderKey body override pipeline (#340) BEFORE the
+        // Vertex-style Bedrock shaping below, so the `model`/`stream` strip
+        // keeps the final say and an override can never reintroduce a
+        // URL-borne `model` into the /invoke body.
+        apply_body_overrides(&mut body_value, ctx);
         if let Some(obj) = body_value.as_object_mut() {
             obj.remove("model");
             obj.remove("stream");
@@ -607,7 +729,9 @@ impl BedrockBridge {
                 ctx.provider_key.api_base.as_deref()
             }
         };
-        build_client(&creds, endpoint_url)
+        // Converse paths carry no JSON body, but default_headers still apply
+        // (header-level, publisher-agnostic) via the signing interceptor.
+        build_client(&creds, endpoint_url, ctx.provider_key.request.as_ref())
     }
 
     /// Dispatch Bedrock chat via the unified Converse API.
@@ -2432,6 +2556,347 @@ mod tests {
         assert!(
             body.get("model").is_none(),
             "Converse body must NOT carry top-level `model` field; body={body}"
+        );
+    }
+
+    // ─── RequestOverrides applied on the wire (#340) ───────────────────
+    //
+    // Pin that the per-`ProviderKey` override pipeline actually reshapes the
+    // OUTBOUND Bedrock request. Body transforms ride the `/invoke` (Anthropic)
+    // JSON body; `default_headers` ride the pre-signing interceptor and land
+    // inside the SigV4-signed request on BOTH the /invoke and Converse paths.
+
+    /// Build a Bedrock `ProviderKey` carrying a `request` override block.
+    fn sample_pk_with_request_overrides(request: serde_json::Value) -> Arc<ProviderKey> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "display_name": "bedrock-prod",
+                "secret": valid_secret_json(),
+                "request": request,
+            }))
+            .expect("provider_key with request overrides deserializes"),
+        )
+    }
+
+    /// Build a Bedrock `ProviderKey` carrying a `response` override block.
+    fn sample_pk_with_response_overrides(response: serde_json::Value) -> Arc<ProviderKey> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "display_name": "bedrock-prod",
+                "secret": valid_secret_json(),
+                "response": response,
+            }))
+            .expect("provider_key with response overrides deserializes"),
+        )
+    }
+
+    /// Capturing responder for the Converse path: records request headers and
+    /// returns the canned Converse envelope so the SDK call succeeds.
+    #[derive(Clone, Default)]
+    struct CapturingConverseResponder {
+        captured_headers: std::sync::Arc<std::sync::Mutex<Option<http::HeaderMap>>>,
+    }
+
+    impl Respond for CapturingConverseResponder {
+        fn respond(&self, req: &MockRequest) -> ResponseTemplate {
+            *self.captured_headers.lock().unwrap() = Some(req.headers.clone());
+            default_converse_response_template()
+        }
+    }
+
+    #[tokio::test]
+    async fn bedrock_applies_param_renames() {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "param_renames": { "temperature": "temperature_legacy" }
+            })),
+        );
+        let mut req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        req.temperature = Some(0.5);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            body.get("temperature_legacy").and_then(|v| v.as_f64()),
+            Some(0.5),
+            "param_renames must move `temperature` to the renamed key on the /invoke body; got {body}",
+        );
+        assert!(
+            body.get("temperature").is_none(),
+            "the source key must be gone after the rename; got {body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_clamps_temperature_via_param_constraints() {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "param_constraints": { "temperature_max": 1.0 }
+            })),
+        );
+        let mut req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        req.temperature = Some(1.9);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            body.get("temperature").and_then(|v| v.as_f64()),
+            Some(1.0),
+            "param_constraints must clamp the over-max temperature; got {body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_fills_default_body_fields_when_caller_omits() {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "default_body_fields": { "top_k": 5 }
+            })),
+        );
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            body.get("top_k").and_then(|v| v.as_u64()),
+            Some(5),
+            "default_body_fields must inject the absent key into the /invoke body; got {body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_injects_default_headers() {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "default_headers": { "x-corp-trace": "abc123" }
+            })),
+        );
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let headers = responder.captured_headers.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            headers.get("x-corp-trace").and_then(|v| v.to_str().ok()),
+            Some("abc123"),
+            "default_headers must reach the outbound Bedrock request",
+        );
+        // The custom header must NOT have broken signing: a valid SigV4
+        // Authorization header is still present on the captured request.
+        assert!(
+            headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|a| a.starts_with("AWS4-HMAC-SHA256")),
+            "the request must still carry a valid SigV4 Authorization; headers={headers:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_default_headers_cannot_overwrite_x_amz_date() {
+        // SigV4 timestamp guard: an operator default_headers entry naming the
+        // reserved `x-amz-date` must be dropped, leaving the SDK's own signed
+        // timestamp intact. A non-reserved companion header still applies.
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "default_headers": {
+                    "x-amz-date": "20200101T000000Z",
+                    "x-ok": "1"
+                }
+            })),
+        );
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let headers = responder.captured_headers.lock().unwrap().clone().unwrap();
+        let amz_date = headers.get("x-amz-date").and_then(|v| v.to_str().ok());
+        assert!(
+            amz_date.is_some() && amz_date != Some("20200101T000000Z"),
+            "the SDK's signed x-amz-date must survive a reserved-header override; got {amz_date:?}",
+        );
+        assert_eq!(
+            headers.get("x-ok").and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "the non-reserved companion default header still applies",
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_default_headers_apply_on_converse_path() {
+        // The interceptor is registered on the client config, so default
+        // headers reach the Converse path (non-Anthropic publishers) too.
+        let server = MockServer::start().await;
+        let responder = CapturingConverseResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse$"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "default_headers": { "x-corp-trace": "xyz789" }
+            })),
+        );
+        let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let headers = responder.captured_headers.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            headers.get("x-corp-trace").and_then(|v| v.to_str().ok()),
+            Some("xyz789"),
+            "default_headers must reach the Converse path too",
+        );
+        assert!(
+            headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|a| a.starts_with("AWS4-HMAC-SHA256")),
+            "Converse request must still carry a valid SigV4 Authorization; headers={headers:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_overrides_run_before_model_strip() {
+        // The body pipeline runs BEFORE the Bedrock model/stream strip, so a
+        // default_body_fields block can never reintroduce a URL-borne model
+        // into the /invoke body — while a genuine extra field still lands.
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "default_body_fields": { "model": "should-be-stripped", "top_k": 5 }
+            })),
+        );
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        let obj = body.as_object().unwrap();
+        assert!(
+            !obj.contains_key("model"),
+            "model must stay stripped even when default_body_fields tries to set it; got {body}",
+        );
+        assert_eq!(
+            obj.get("top_k").and_then(|v| v.as_u64()),
+            Some(5),
+            "a genuine extra default body field still lands; got {body}",
+        );
+        assert_eq!(
+            obj.get("anthropic_version").and_then(|v| v.as_str()),
+            Some(BEDROCK_ANTHROPIC_VERSION),
+            "the Bedrock anthropic_version shaping still runs after overrides; got {body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn bedrock_response_content_list_to_string_flattens_outbound_body() {
+        // The `content_list_to_string` branch is gated on the response
+        // override block and flattens array content to a string on the body.
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/invoke$"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            sample_pk_with_response_overrides(serde_json::json!({
+                "content_list_to_string": true
+            })),
+        );
+        let mut msg = ChatMessage::user("abc");
+        msg.content_blocks = Some(vec![
+            serde_json::json!({"type": "text", "text": "a"}),
+            serde_json::json!({"type": "text", "text": "b"}),
+            serde_json::json!({"type": "text", "text": "c"}),
+        ]);
+        let req = ChatFormat::new("my-claude", vec![msg]);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            body["messages"][0]["content"].as_str(),
+            Some("abc"),
+            "response.content_list_to_string must flatten array content to a string; got {body}",
         );
     }
 }
