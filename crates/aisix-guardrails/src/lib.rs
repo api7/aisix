@@ -117,6 +117,94 @@ impl GuardrailVerdict {
     }
 }
 
+/// How a guardrail wants STREAMED output moderated. The proxy's SSE
+/// builder queries [`Guardrail::stream_output_policy`] on the resolved
+/// chain and applies the strictest member policy to decide whether to
+/// hold streamed content back until it scans clean.
+///
+/// `EndOfStreamCheck` is the pre-P2 behavior — chunks are forwarded
+/// live and `check_output` runs once at end-of-stream (so a block frame
+/// arrives *after* the content already reached the client). The
+/// hold-back variants buffer content until it passes.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum StreamOutputPolicy {
+    /// Forward live; check once at end-of-stream. No hold-back. Default.
+    #[default]
+    EndOfStreamCheck,
+    /// Sliding window: release a window of content only after it scans
+    /// clean; `overlap_chars` is carried between windows so a span split
+    /// across a boundary is still caught.
+    Window {
+        size_chars: usize,
+        overlap_chars: usize,
+    },
+    /// Hold the whole response; scan once; release all or block.
+    /// `max_buffer_bytes` caps the hold; `on_exceeded_fail_open` decides
+    /// release-vs-block when the cap is exceeded.
+    BufferFull {
+        max_buffer_bytes: usize,
+        on_exceeded_fail_open: bool,
+    },
+}
+
+impl StreamOutputPolicy {
+    /// `true` when this policy holds streamed content back until it
+    /// scans clean (i.e. anything other than `EndOfStreamCheck`).
+    pub fn holds_back(&self) -> bool {
+        !matches!(self, StreamOutputPolicy::EndOfStreamCheck)
+    }
+
+    /// Coarse strictness rank: more hold-back = higher.
+    fn rank(&self) -> u8 {
+        match self {
+            StreamOutputPolicy::EndOfStreamCheck => 0,
+            StreamOutputPolicy::Window { .. } => 1,
+            StreamOutputPolicy::BufferFull { .. } => 2,
+        }
+    }
+
+    /// Pick the stricter of two policies (used to fold a chain into one).
+    /// Higher rank wins; ties break toward the tighter parameters
+    /// (smaller window, smaller buffer cap).
+    pub fn stricter(self, other: Self) -> Self {
+        use StreamOutputPolicy::*;
+        match self.rank().cmp(&other.rank()) {
+            std::cmp::Ordering::Less => other,
+            std::cmp::Ordering::Greater => self,
+            std::cmp::Ordering::Equal => match (self, other) {
+                (
+                    Window {
+                        size_chars: a,
+                        overlap_chars: oa,
+                    },
+                    Window {
+                        size_chars: b,
+                        overlap_chars: ob,
+                    },
+                ) => Window {
+                    size_chars: a.min(b),
+                    overlap_chars: oa.max(ob),
+                },
+                (
+                    BufferFull {
+                        max_buffer_bytes: a,
+                        on_exceeded_fail_open: fa,
+                    },
+                    BufferFull {
+                        max_buffer_bytes: b,
+                        on_exceeded_fail_open: fb,
+                    },
+                ) => BufferFull {
+                    max_buffer_bytes: a.min(b),
+                    // fail-closed is stricter than fail-open.
+                    on_exceeded_fail_open: fa && fb,
+                },
+                (s, _) => s,
+            },
+        }
+    }
+}
+
 /// Pluggable content-policy hook. Production wires `Arc<dyn Guardrail>`
 /// in `ProxyState`; tests construct in-memory chains directly.
 #[async_trait]
@@ -141,6 +229,13 @@ pub trait Guardrail: Send + Sync + 'static {
     /// empty `GuardrailChain`) override to return `true`.
     fn is_empty(&self) -> bool {
         false
+    }
+
+    /// How this guardrail wants streamed OUTPUT moderated. Default:
+    /// [`StreamOutputPolicy::EndOfStreamCheck`] (no hold-back, pre-P2
+    /// behavior). Hold-back guardrails (Azure text moderation) override.
+    fn stream_output_policy(&self) -> StreamOutputPolicy {
+        StreamOutputPolicy::EndOfStreamCheck
     }
 }
 

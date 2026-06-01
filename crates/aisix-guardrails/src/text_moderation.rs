@@ -44,7 +44,7 @@ use aisix_gateway::{ChatFormat, ChatResponse, Role};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::{Guardrail, GuardrailVerdict};
+use crate::{Guardrail, GuardrailVerdict, StreamOutputPolicy};
 
 /// Maximum characters per `text:analyze` call. Azure CS enforces a
 /// 10 000-char limit on `text`.
@@ -80,6 +80,14 @@ pub struct TextModerationGuardrail {
     /// the input hook; `concatenate_all_content` scans every message.
     /// Ignored on the output hook (always the assistant message).
     text_source: String,
+
+    // --- streaming-output controls (surfaced via stream_output_policy;
+    // consumed by aisix-proxy's build_sse_stream) ---
+    stream_processing_mode: String,
+    window_size: u32,
+    window_overlap_size: u32,
+    max_buffer_bytes: u64,
+    on_buffer_exceeded: String,
 }
 
 impl TextModerationGuardrail {
@@ -108,6 +116,11 @@ impl TextModerationGuardrail {
             blocklist_names: cfg.blocklist_names.clone(),
             halt_on_blocklist_hit: cfg.halt_on_blocklist_hit,
             text_source: cfg.text_source.clone(),
+            stream_processing_mode: cfg.stream_processing_mode.clone(),
+            window_size: cfg.window_size,
+            window_overlap_size: cfg.window_overlap_size,
+            max_buffer_bytes: cfg.max_buffer_bytes,
+            on_buffer_exceeded: cfg.on_buffer_exceeded.clone(),
         }
     }
 
@@ -295,6 +308,20 @@ impl Guardrail for TextModerationGuardrail {
         "azure_content_safety_text_moderation"
     }
 
+    fn stream_output_policy(&self) -> StreamOutputPolicy {
+        match self.stream_processing_mode.as_str() {
+            "buffer_full" => StreamOutputPolicy::BufferFull {
+                max_buffer_bytes: self.max_buffer_bytes as usize,
+                on_exceeded_fail_open: self.on_buffer_exceeded == "fail_open",
+            },
+            // "window" (default) and any unexpected value → sliding window.
+            _ => StreamOutputPolicy::Window {
+                size_chars: self.window_size as usize,
+                overlap_chars: self.window_overlap_size as usize,
+            },
+        }
+    }
+
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
         if !matches!(
             self.hook_point,
@@ -437,6 +464,31 @@ mod tests {
     fn chunk_text_exact_limit_is_not_split() {
         let text: String = "a".repeat(MAX_TEXT_CHARS);
         assert_eq!(chunk_text(&text, MAX_TEXT_CHARS).len(), 1);
+    }
+
+    #[test]
+    fn stream_policy_reflects_config() {
+        // Defaults → sliding window 10000/256.
+        let g = build("http://unused", true);
+        assert_eq!(
+            g.stream_output_policy(),
+            StreamOutputPolicy::Window {
+                size_chars: 10_000,
+                overlap_chars: 256
+            }
+        );
+        // buffer_full mode surfaces the cap + on_exceeded policy.
+        let mut g2 = build("http://unused", true);
+        g2.stream_processing_mode = "buffer_full".to_owned();
+        g2.max_buffer_bytes = 1000;
+        g2.on_buffer_exceeded = "fail_open".to_owned();
+        assert_eq!(
+            g2.stream_output_policy(),
+            StreamOutputPolicy::BufferFull {
+                max_buffer_bytes: 1000,
+                on_exceeded_fail_open: true
+            }
+        );
     }
 
     // --- severity threshold logic (no HTTP) ---

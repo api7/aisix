@@ -12,7 +12,7 @@ use std::sync::Arc;
 use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 
-use crate::{Guardrail, GuardrailVerdict};
+use crate::{Guardrail, GuardrailVerdict, StreamOutputPolicy};
 
 #[derive(Clone)]
 pub struct GuardrailChain {
@@ -54,6 +54,19 @@ impl Guardrail for GuardrailChain {
 
     fn is_empty(&self) -> bool {
         self.guardrails.is_empty()
+    }
+
+    /// The strictest streamed-output policy across the chain's members.
+    /// If any member wants hold-back, the whole stream holds back and
+    /// the full chain's `check_output` runs on the held content.
+    fn stream_output_policy(&self) -> StreamOutputPolicy {
+        self.guardrails
+            .iter()
+            .map(|g| g.stream_output_policy())
+            .fold(
+                StreamOutputPolicy::EndOfStreamCheck,
+                StreamOutputPolicy::stricter,
+            )
     }
 
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
