@@ -64,6 +64,19 @@ use aisix_provider_openai::wire::{
     OpenAiStreamChunk,
 };
 
+// Per-`ProviderKey` request/response override pipeline (#302 §5 / #339).
+// The Vertex bridge mirrors `OpenAiBridge`'s apply order exactly and reuses
+// the same primitives, so cp-api captures a provider's quirks once and every
+// adapter honours the same wire shape. All primitives are no-ops when the
+// targeted keys are absent, so they are safe to call uniformly across the
+// five publisher rails (the Gemini `contents` shape simply does not match the
+// OpenAI-style top-level keys the request transforms look for).
+use aisix_core::RequestOverrides;
+use aisix_provider_openai::overrides::{
+    apply_content_list_to_string, apply_default_body_fields, apply_default_headers,
+    apply_param_constraints, apply_param_renames,
+};
+
 /// `anthropic_version` value Vertex's Claude `:rawPredict` endpoint
 /// requires in the request body. Distinct from the Bedrock value
 /// (`bedrock-2023-05-31`). Per Google's Vertex AI Claude reference
@@ -638,24 +651,36 @@ impl VertexBridge {
             model = upstream_id,
         );
 
-        let body = build_gemini_request(req);
+        let typed = build_gemini_request(req);
         // Audit LOW-4: Gemini requires `contents` to be a non-empty
         // array. If the caller passed system-only messages (lifted to
         // `systemInstruction`), `contents` ends up empty and Vertex
         // returns a generic 400. Fail fast with a clear error so the
         // operator can fix the request shape before the round trip.
-        if body.contents.is_empty() {
+        if typed.contents.is_empty() {
             return Err(BridgeError::Config(
                 "vertex chat: messages must include at least one user / \
                  assistant turn (system-only requests are not supported by Gemini)"
                     .into(),
             ));
         }
+        // Serialize to JSON, then apply the per-ProviderKey override
+        // pipeline (#339). The Gemini `contents` shape does not match the
+        // OpenAI-style top-level keys the request transforms target, so
+        // renames/clamps are usually no-ops here — but default_body_fields
+        // / default_headers still apply.
+        let mut body = serde_json::to_value(&typed)
+            .map_err(|e| BridgeError::Config(format!("serialize Gemini request body: {e}")))?;
+        apply_body_overrides(&mut body, ctx);
         // Resolve bearer: pre-minted token verbatim, or mint+cache
         // via the in-process token minter from SA JSON. Failure
         // surfaces as a Config error (operator-actionable).
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(&access_token, &ctx.request_id)?;
+        let headers = build_request_headers(
+            &access_token,
+            &ctx.request_id,
+            ctx.provider_key.request.as_ref(),
+        )?;
         let client = self.client.clone();
         let started = Instant::now();
 
@@ -732,6 +757,11 @@ impl VertexBridge {
         let anthropic_req = build_anthropic_request(req, upstream_id, system, messages, false);
         let mut body_value = serde_json::to_value(&anthropic_req)
             .map_err(|e| BridgeError::Config(format!("serialize Anthropic request body: {e}")))?;
+        // Apply the per-ProviderKey override pipeline (#339) before the
+        // Vertex-specific shaping below, so the `model`/`stream` strip keeps
+        // the final say and an override can never reintroduce a URL-borne
+        // `model` into the `:rawPredict` body.
+        apply_body_overrides(&mut body_value, ctx);
         if let Some(obj) = body_value.as_object_mut() {
             obj.remove("model");
             obj.remove("stream");
@@ -742,7 +772,11 @@ impl VertexBridge {
         }
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(&access_token, &ctx.request_id)?;
+        let headers = build_request_headers(
+            &access_token,
+            &ctx.request_id,
+            ctx.provider_key.request.as_ref(),
+        )?;
         let client = self.client.clone();
         let started = Instant::now();
 
@@ -811,6 +845,10 @@ impl VertexBridge {
         let anthropic_req = build_anthropic_request(req, upstream_id, system, messages, true);
         let mut body_value = serde_json::to_value(&anthropic_req)
             .map_err(|e| BridgeError::Config(format!("serialize Anthropic request body: {e}")))?;
+        // Apply the per-ProviderKey override pipeline (#339) before the
+        // Vertex-specific shaping below (see the non-stream path). Here
+        // `stream` is intentionally KEPT in the body.
+        apply_body_overrides(&mut body_value, ctx);
         if let Some(obj) = body_value.as_object_mut() {
             obj.remove("model");
             obj.insert(
@@ -822,7 +860,11 @@ impl VertexBridge {
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(&access_token, &ctx.request_id)?;
+        let headers = build_request_headers(
+            &access_token,
+            &ctx.request_id,
+            ctx.provider_key.request.as_ref(),
+        )?;
         let client = self.client.clone();
         let started = Instant::now();
 
@@ -922,11 +964,19 @@ impl VertexBridge {
 
         let messages = openai_messages_from(req);
         let typed = build_openai_request(req, upstream_id, &messages, false);
-        let body = serde_json::to_value(&typed)
+        let mut body = serde_json::to_value(&typed)
             .map_err(|e| BridgeError::Config(format!("serialize OpenAI shim request body: {e}")))?;
+        // Apply the per-ProviderKey override pipeline (#339). The shim
+        // speaks the OpenAI wire, so renames / clamps / default fields all
+        // apply directly; the model id is kept in the body.
+        apply_body_overrides(&mut body, ctx);
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(&access_token, &ctx.request_id)?;
+        let headers = build_request_headers(
+            &access_token,
+            &ctx.request_id,
+            ctx.provider_key.request.as_ref(),
+        )?;
         let client = self.client.clone();
         let started = Instant::now();
 
@@ -970,13 +1020,20 @@ impl VertexBridge {
 
         let messages = openai_messages_from(req);
         let typed = build_openai_request(req, upstream_id, &messages, true);
-        let body = serde_json::to_value(&typed)
+        let mut body = serde_json::to_value(&typed)
             .map_err(|e| BridgeError::Config(format!("serialize OpenAI shim request body: {e}")))?;
+        // Apply the per-ProviderKey override pipeline (#339); `stream: true`
+        // stays in the body.
+        apply_body_overrides(&mut body, ctx);
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(&access_token, &ctx.request_id)?;
+        let headers = build_request_headers(
+            &access_token,
+            &ctx.request_id,
+            ctx.provider_key.request.as_ref(),
+        )?;
         let client = self.client.clone();
         let started = Instant::now();
 
@@ -1102,11 +1159,18 @@ impl VertexBridge {
         // AI21 on Vertex expect it in both the URL and the body).
         let messages = openai_messages_from(req);
         let typed = build_openai_request(req, upstream_id, &messages, false);
-        let body = serde_json::to_value(&typed)
+        let mut body = serde_json::to_value(&typed)
             .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
+        // Apply the per-ProviderKey override pipeline (#339). The model id
+        // is kept in the body (Mistral / AI21 expect it in both URL + body).
+        apply_body_overrides(&mut body, ctx);
 
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(&access_token, &ctx.request_id)?;
+        let headers = build_request_headers(
+            &access_token,
+            &ctx.request_id,
+            ctx.provider_key.request.as_ref(),
+        )?;
         let client = self.client.clone();
         let started = Instant::now();
 
@@ -1163,13 +1227,20 @@ impl VertexBridge {
 
         let messages = openai_messages_from(req);
         let typed = build_openai_request(req, upstream_id, &messages, true);
-        let body = serde_json::to_value(&typed)
+        let mut body = serde_json::to_value(&typed)
             .map_err(|e| BridgeError::Config(format!("serialize OpenAI request body: {e}")))?;
+        // Apply the per-ProviderKey override pipeline (#339); `stream: true`
+        // stays in the body (model id rides in both URL + body).
+        apply_body_overrides(&mut body, ctx);
 
         // Resolve bearer BEFORE entering the stream future so a
         // token-mint error surfaces as a direct Err, not mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(&access_token, &ctx.request_id)?;
+        let headers = build_request_headers(
+            &access_token,
+            &ctx.request_id,
+            ctx.provider_key.request.as_ref(),
+        )?;
         let client = self.client.clone();
         let started = Instant::now();
 
@@ -1263,19 +1334,28 @@ impl VertexBridge {
             model = upstream_id,
         );
 
-        let body = build_gemini_request(req);
-        if body.contents.is_empty() {
+        let typed = build_gemini_request(req);
+        if typed.contents.is_empty() {
             return Err(BridgeError::Config(
                 "vertex chat: messages must include at least one user / \
                  assistant turn (system-only requests are not supported by Gemini)"
                     .into(),
             ));
         }
+        // Serialize + apply the per-ProviderKey override pipeline (#339)
+        // before sending (see the non-stream path for the rail caveat).
+        let mut body = serde_json::to_value(&typed)
+            .map_err(|e| BridgeError::Config(format!("serialize Gemini request body: {e}")))?;
+        apply_body_overrides(&mut body, ctx);
         // Resolve bearer (pre-minted OR minted-from-SA) BEFORE
         // entering the stream future so token-mint errors surface
         // as a direct Err return rather than being yielded mid-stream.
         let access_token = creds.resolve_access_token(&self.token_minter).await?;
-        let headers = build_request_headers(&access_token, &ctx.request_id)?;
+        let headers = build_request_headers(
+            &access_token,
+            &ctx.request_id,
+            ctx.provider_key.request.as_ref(),
+        )?;
         let client = self.client.clone();
         let started = Instant::now();
 
@@ -1457,7 +1537,17 @@ fn gemini_chunk_into_chat_chunks(
 /// for `access_token` would leak partial secret content. The bytes
 /// being validated ARE the customer's bearer token; the operator can
 /// reproduce locally without us echoing them back.
-fn build_request_headers(access_token: &str, request_id: &str) -> Result<HeaderMap, BridgeError> {
+///
+/// When the `ProviderKey` carries `request.default_headers`, they are
+/// applied last via [`apply_default_headers`], which refuses to overwrite
+/// any header already set here (the Bearer auth, content-type, and request
+/// id) and additionally drops reserved auth headers — so a misconfigured
+/// `default_headers` block can never clobber the Vertex OAuth Bearer.
+fn build_request_headers(
+    access_token: &str,
+    request_id: &str,
+    request: Option<&RequestOverrides>,
+) -> Result<HeaderMap, BridgeError> {
     if access_token.is_empty() {
         return Err(BridgeError::Config(
             "vertex provider_key.secret.access_token is empty".into(),
@@ -1475,7 +1565,39 @@ fn build_request_headers(access_token: &str, request_id: &str) -> Result<HeaderM
     let rid = HeaderValue::from_str(request_id)
         .map_err(|_| BridgeError::Config("request_id contains invalid header characters".into()))?;
     headers.insert(HeaderName::from_static("x-aisix-request-id"), rid);
+    if let Some(r) = request {
+        apply_default_headers(&mut headers, &r.default_headers);
+    }
     Ok(headers)
+}
+
+/// Apply the per-`ProviderKey` request/response override pipeline to an
+/// already-serialized outbound body, mirroring
+/// `OpenAiBridge::prepare_outbound_body` step-for-step:
+/// `param_renames` → `param_constraints` → `default_body_fields` →
+/// (`content_list_to_string`, when the response override sets it).
+///
+/// Called on every publisher rail immediately after the wire body is
+/// serialized to a [`serde_json::Value`] and **before** any Vertex-specific
+/// shaping (e.g. the Anthropic `model`/`stream` strip), so the rail-invariant
+/// shaping always has the final say and the override block can never
+/// reintroduce a URL-borne `model` into a `:rawPredict` body.
+fn apply_body_overrides(body: &mut serde_json::Value, ctx: &BridgeContext) {
+    if let Some(r) = ctx.provider_key.request.as_ref() {
+        apply_param_renames(body, &r.param_renames);
+        if let Some(constraints) = &r.param_constraints {
+            apply_param_constraints(body, constraints);
+        }
+        apply_default_body_fields(body, &r.default_body_fields);
+    }
+    if ctx
+        .provider_key
+        .response
+        .as_ref()
+        .is_some_and(|r| r.content_list_to_string)
+    {
+        apply_content_list_to_string(body);
+    }
 }
 
 // ─── Gemini wire shapes ────────────────────────────────────────────────
@@ -3590,8 +3712,8 @@ mod tests {
         // Newline in the access token would let it inject an extra
         // header — header builder must reject AND must not echo the
         // bad bytes back to the customer.
-        let err =
-            build_request_headers("ya29.X-DISTINCTIVE-LEAK-Y\nX-Evil: 1", "req-1").unwrap_err();
+        let err = build_request_headers("ya29.X-DISTINCTIVE-LEAK-Y\nX-Evil: 1", "req-1", None)
+            .unwrap_err();
         match err {
             BridgeError::Config(msg) => {
                 assert!(
@@ -3611,8 +3733,8 @@ mod tests {
 
     #[test]
     fn header_invalid_request_id_error_does_not_leak_bytes() {
-        let err =
-            build_request_headers("ya29.legit", "req-X-DISTINCTIVE-RID-LEAK-Y\nfoo").unwrap_err();
+        let err = build_request_headers("ya29.legit", "req-X-DISTINCTIVE-RID-LEAK-Y\nfoo", None)
+            .unwrap_err();
         match err {
             BridgeError::Config(msg) => {
                 assert!(
@@ -4170,5 +4292,441 @@ mod tests {
         );
         // wiremock's .expect(1) on the OAuth mock fires here at drop —
         // proves the cache prevented a second mint on the second chat.
+    }
+
+    // ─── RequestOverrides applied on the wire (#339) ───────────────────
+    //
+    // These pin that the per-`ProviderKey` override pipeline actually
+    // reshapes the OUTBOUND Vertex request — not just that the primitives
+    // exist (those are unit-tested in `aisix-provider-openai::overrides`).
+    // Each test drives a real chat through the bridge against a capturing
+    // mock and asserts the recorded body / headers reflect the override.
+
+    /// Build a Vertex `ProviderKey` carrying a `request` override block
+    /// (issue #302 §5). The block is supplied as JSON so the test exercises
+    /// the same on-disk deserialization cp-api writes to etcd.
+    fn sample_pk_with_request_overrides(request: serde_json::Value) -> Arc<ProviderKey> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "display_name": "vertex-prod",
+                "secret": valid_secret_json(),
+                "request": request,
+            }))
+            .expect("provider_key with request overrides deserializes"),
+        )
+    }
+
+    #[tokio::test]
+    async fn gemini_request_applies_default_body_fields() {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-1.5-pro:generateContent",
+            ))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "default_body_fields": { "x_test_default": "injected" }
+            })),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        assert_eq!(
+            body.get("x_test_default").and_then(|v| v.as_str()),
+            Some("injected"),
+            "default_body_fields must inject the absent top-level key into the Gemini body; got {body}",
+        );
+        // The override pipeline must not disturb the real Gemini payload.
+        assert!(
+            body.get("contents").and_then(|v| v.as_array()).is_some(),
+            "the Gemini `contents` array is preserved alongside the injected field; got {body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_request_applies_default_headers() {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-1.5-pro:generateContent",
+            ))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "default_headers": { "x-vertex-quirk": "on" }
+            })),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let headers = responder
+            .captured_headers
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request headers captured");
+        assert_eq!(
+            headers.get("x-vertex-quirk").and_then(|v| v.to_str().ok()),
+            Some("on"),
+            "default_headers must add the absent header to the outbound Vertex request",
+        );
+    }
+
+    #[tokio::test]
+    async fn default_headers_cannot_overwrite_vertex_bearer_auth() {
+        // Defense-in-depth: a misconfigured `default_headers` block that
+        // names `authorization` must NEVER clobber the minted Vertex OAuth
+        // Bearer. A non-reserved companion header still applies, proving the
+        // block was processed rather than skipped wholesale.
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/google/models/gemini-1.5-pro:generateContent",
+            ))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("gemini-1.5-pro"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "default_headers": {
+                    "authorization": "Bearer ya29.ATTACKER",
+                    "x-ok": "1"
+                }
+            })),
+        );
+        let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let headers = responder
+            .captured_headers
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request headers captured");
+        assert_eq!(
+            headers.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer ya29.test"),
+            "the real minted Bearer must survive a default_headers authorization override",
+        );
+        assert_eq!(
+            headers.get("x-ok").and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "the non-reserved companion default header still applies",
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_shim_request_applies_param_renames() {
+        let server = MockServer::start().await;
+        let responder = CapturingOpenAiResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/endpoints/openapi/chat/completions",
+            ))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta/llama-3.3-70b-instruct-maas"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "param_renames": { "temperature": "temperature_legacy" }
+            })),
+        );
+        let mut req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        req.temperature = Some(0.5);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        assert_eq!(
+            body.get("temperature_legacy").and_then(|v| v.as_f64()),
+            Some(0.5),
+            "param_renames must move `temperature` to the renamed key on the shim body; got {body}",
+        );
+        assert!(
+            body.get("temperature").is_none(),
+            "the source key must be gone after the rename; got {body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_shim_request_applies_param_constraints() {
+        let server = MockServer::start().await;
+        let responder = CapturingOpenAiResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/endpoints/openapi/chat/completions",
+            ))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta/llama-3.3-70b-instruct-maas"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "param_constraints": { "temperature_max": 1.0 }
+            })),
+        );
+        let mut req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        req.temperature = Some(1.9);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        assert_eq!(
+            body.get("temperature").and_then(|v| v.as_f64()),
+            Some(1.0),
+            "param_constraints must clamp the over-max temperature on the shim body; got {body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_request_overrides_run_before_model_strip() {
+        // The override pipeline runs BEFORE the Vertex `model` strip, so a
+        // `default_body_fields` block can never reintroduce a URL-borne
+        // `model` into the `:rawPredict` body — while a genuine extra field
+        // still lands.
+        let server = MockServer::start().await;
+        let responder = CapturingAnthropicResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/anthropic/models/claude-sonnet-4-5:rawPredict",
+            ))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("claude-sonnet-4-5"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "default_body_fields": { "model": "should-be-stripped", "top_k": 5 }
+            })),
+        );
+        let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        let obj = body.as_object().expect("object body");
+        assert!(
+            !obj.contains_key("model"),
+            "model must stay stripped even when default_body_fields tries to set it; got {body}",
+        );
+        assert_eq!(
+            obj.get("top_k").and_then(|v| v.as_u64()),
+            Some(5),
+            "a genuine extra default body field still lands on the Anthropic body; got {body}",
+        );
+        assert_eq!(
+            obj.get("anthropic_version").and_then(|v| v.as_str()),
+            Some(VERTEX_ANTHROPIC_VERSION),
+            "the Vertex anthropic_version shaping still runs after overrides; got {body}",
+        );
+    }
+
+    /// Build a Vertex `ProviderKey` carrying a `response` override block
+    /// (issue #302 §5) — `content_list_to_string` lives here even though it
+    /// reshapes the *request* body before send.
+    fn sample_pk_with_response_overrides(response: serde_json::Value) -> Arc<ProviderKey> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "display_name": "vertex-prod",
+                "secret": valid_secret_json(),
+                "response": response,
+            }))
+            .expect("provider_key with response overrides deserializes"),
+        )
+    }
+
+    #[tokio::test]
+    async fn openai_shim_stream_applies_default_body_fields() {
+        // Regression guard for the STREAMING body-build path: it serializes
+        // the body separately from the non-stream path, so it needs its own
+        // proof that the override pipeline reaches the wire.
+        let server = MockServer::start().await;
+        let responder = CapturingOpenAiStreamResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/endpoints/openapi/chat/completions",
+            ))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta/llama-3.3-70b-instruct-maas"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "default_body_fields": { "x_test_default": "injected" }
+            })),
+        );
+        let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        let mut stream = bridge.chat_stream(&req, &ctx).await.unwrap();
+        while let Some(item) = stream.next().await {
+            let _ = item.unwrap();
+        }
+
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        assert_eq!(
+            body.get("x_test_default").and_then(|v| v.as_str()),
+            Some("injected"),
+            "the streaming shim rail must apply default_body_fields too; got {body}",
+        );
+        assert_eq!(
+            body.get("stream").and_then(|v| v.as_bool()),
+            Some(true),
+            "stream:true stays in the body alongside the override; got {body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn mistral_request_applies_default_body_fields_and_keeps_model_in_body() {
+        // Regression guard for the partner `:rawPredict` URL builder rail,
+        // which is a distinct code path from the openapi shim.
+        let server = MockServer::start().await;
+        let responder = CapturingOpenAiResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/publishers/mistralai/models/mistral-large-2411:rawPredict",
+            ))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("mistral-large-2411"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "default_body_fields": { "x_test_default": "injected" }
+            })),
+        );
+        let req = ChatFormat::new("my-mistral", vec![ChatMessage::user("hi")]);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        assert_eq!(
+            body.get("x_test_default").and_then(|v| v.as_str()),
+            Some("injected"),
+            "the partner :rawPredict rail must apply default_body_fields; got {body}",
+        );
+        // Mistral / AI21 keep the model id in the body (it rides in BOTH the
+        // URL and the body) — overrides must not disturb it.
+        assert_eq!(
+            body.get("model").and_then(|v| v.as_str()),
+            Some("mistral-large-2411"),
+            "the override pipeline must keep the model the partner rail rides in-body; got {body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_shim_response_content_list_to_string_flattens_outbound_body() {
+        // The `content_list_to_string` branch is gated on the *response*
+        // override block, so it needs a PK with a `response` section and a
+        // multi-block message to observe the array -> string flatten.
+        let server = MockServer::start().await;
+        let responder = CapturingOpenAiResponder::default();
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/projects/my-proj/locations/us-central1/endpoints/openapi/chat/completions",
+            ))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = VertexBridge::new().with_api_base_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta/llama-3.3-70b-instruct-maas"),
+            sample_pk_with_response_overrides(serde_json::json!({
+                "content_list_to_string": true
+            })),
+        );
+        // Multi-block text content: ["a", "b", "c"] must flatten to "abc".
+        let mut msg = ChatMessage::user("abc");
+        msg.content_blocks = Some(vec![
+            serde_json::json!({"type": "text", "text": "a"}),
+            serde_json::json!({"type": "text", "text": "b"}),
+            serde_json::json!({"type": "text", "text": "c"}),
+        ]);
+        let req = ChatFormat::new("my-llama", vec![msg]);
+        bridge.chat(&req, &ctx).await.unwrap();
+
+        let body = responder
+            .captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("request body captured");
+        assert_eq!(
+            body["messages"][0]["content"].as_str(),
+            Some("abc"),
+            "response.content_list_to_string must flatten array content to a string on the outbound body; got {body}",
+        );
     }
 }
