@@ -2093,6 +2093,24 @@ where
         } else {
             None
         };
+        // P2 (#379): per-guardrail streamed-output policy. EndOfStreamCheck
+        // (default / no guardrail) leaves the live-forward path below
+        // byte-for-byte unchanged. Window / BufferFull hold content back
+        // until it scans clean.
+        let stream_policy = output_guardrail
+            .as_ref()
+            .map(|ctx| ctx.chain.stream_output_policy())
+            .unwrap_or_default();
+        let hold_back = stream_policy.holds_back();
+        // Rendered content events withheld from the wire until their
+        // window (or the whole response) scans clean. Hold-back path only.
+        let mut pending: Vec<Event> = Vec::new();
+        // Content accumulated since the last window flush (Window mode);
+        // bounded to ~window_size, unlike content_buffer (whole response).
+        let mut window_buf = String::new();
+        // Set when a BufferFull cap is exceeded with fail-open: stop
+        // holding and forward the remainder live.
+        let mut cap_released = false;
         // Accumulate the upstream's `usage` block + per-chunk metadata
         // across the stream. Providers typically populate `usage` on
         // the terminal chunk only; using "max" rather than "last" makes
@@ -2110,7 +2128,7 @@ where
         let mut errored = false;
         let mut first_chunk_seen = false;
         while let Some(item) = upstream.next().await {
-            let ev = match item {
+            let (ev, is_error_ev) = match item {
                 Ok(chunk) => {
                     // Record TTFT on the first chunk carrying generated
                     // output (content or tool calls). Skip role-only
@@ -2132,15 +2150,19 @@ where
                     if let Some(fr) = chunk.finish_reason.as_ref() {
                         comp.finish_reason = finish_reason_label(fr);
                     }
-                    // Per #204: accumulate the assistant's content
-                    // when an output guardrail is configured. Skip
-                    // entirely when none is configured to avoid the
-                    // allocation on the hot path.
-                    if let (Some(buf), Some(text)) = (
-                        content_buffer.as_mut(),
-                        chunk.delta.content.as_deref(),
-                    ) {
-                        buf.push_str(text);
+                    // Accumulate the assistant's content for the output
+                    // guardrail. Window mode keeps only the current window
+                    // (bounded memory); other modes accumulate the whole
+                    // response in content_buffer. No-op without a guardrail.
+                    if let Some(text) = chunk.delta.content.as_deref() {
+                        if matches!(
+                            stream_policy,
+                            aisix_guardrails::StreamOutputPolicy::Window { .. }
+                        ) {
+                            window_buf.push_str(text);
+                        } else if let Some(buf) = content_buffer.as_mut() {
+                            buf.push_str(text);
+                        }
                     }
                     if let Some(u) = chunk.usage.as_ref() {
                         if u.prompt_tokens > comp.prompt_tokens {
@@ -2168,24 +2190,137 @@ where
                     }
                     let rendered = render_chunk(created, chunk, &client_facing_model);
                     match serde_json::to_string(&rendered) {
-                        Ok(json) => Event::default().data(json),
+                        Ok(json) => (Event::default().data(json), false),
                         Err(err) => {
                             errored = true;
-                            Event::default()
-                                .event("error")
-                                .data(error_frame_payload("internal_error", &err.to_string()))
+                            (
+                                Event::default()
+                                    .event("error")
+                                    .data(error_frame_payload("internal_error", &err.to_string())),
+                                true,
+                            )
                         }
                     }
                 }
                 Err(err) => {
                     errored = true;
                     let etype = err.error_type();
-                    Event::default()
-                        .event("error")
-                        .data(error_frame_payload(etype, &err.to_string()))
+                    (
+                        Event::default()
+                            .event("error")
+                            .data(error_frame_payload(etype, &err.to_string())),
+                        true,
+                    )
                 }
             };
-            yield Ok::<_, Infallible>(ev);
+            if is_error_ev || !hold_back || cap_released {
+                // Error frames, the EndOfStreamCheck path, and a released
+                // BufferFull cap all forward straight to the wire. On the
+                // hold-back path an error drops the held (unscanned)
+                // content via the `errored` skip at end-of-stream (fail
+                // closed).
+                yield Ok::<_, Infallible>(ev);
+            } else {
+                // Hold-back: withhold this content event until its window
+                // (or the whole response) scans clean.
+                pending.push(ev);
+                match &stream_policy {
+                    aisix_guardrails::StreamOutputPolicy::Window {
+                        size_chars,
+                        overlap_chars,
+                    } => {
+                        if window_buf.chars().count() >= *size_chars {
+                            if let Some(ctx) = output_guardrail.as_ref() {
+                                let synthesized = {
+                                    let comp = guard.comp();
+                                    aisix_gateway::ChatResponse {
+                                        id: comp.provider_request_id.clone(),
+                                        model: comp.provider_model_version.clone(),
+                                        message: aisix_gateway::ChatMessage::assistant(
+                                            window_buf.clone(),
+                                        ),
+                                        finish_reason: aisix_gateway::FinishReason::Stop,
+                                        usage: aisix_gateway::UsageStats::new(
+                                            comp.prompt_tokens,
+                                            comp.completion_tokens,
+                                        ),
+                                    }
+                                };
+                                match ctx.chain.check_output(&synthesized).await {
+                                    aisix_guardrails::GuardrailVerdict::Block { reason } => {
+                                        tracing::warn!(
+                                            guardrail_hook = "output",
+                                            model = %ctx.model_name,
+                                            reason = %reason,
+                                            "guardrail blocked streaming response (window)",
+                                        );
+                                        errored = true;
+                                        guard.comp().guardrail_blocked = true;
+                                        yield Ok::<_, Infallible>(
+                                            Event::default().event("error").data(
+                                                error_frame_payload(
+                                                    "content_filter",
+                                                    "response blocked by content policy",
+                                                ),
+                                            ),
+                                        );
+                                        break;
+                                    }
+                                    aisix_guardrails::GuardrailVerdict::Bypass { reason } => {
+                                        let comp = guard.comp();
+                                        if comp.bypass_reason.is_empty() {
+                                            comp.bypass_reason = reason;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                // Clean (Allow / Bypass / Rewrite): release
+                                // this window's events, then keep the
+                                // trailing overlap as scan context for the
+                                // next window (its events were already sent).
+                                for e in pending.drain(..) {
+                                    yield Ok::<_, Infallible>(e);
+                                }
+                                let cc = window_buf.chars().count();
+                                if *overlap_chars < cc {
+                                    window_buf =
+                                        window_buf.chars().skip(cc - *overlap_chars).collect();
+                                }
+                            }
+                        }
+                    }
+                    aisix_guardrails::StreamOutputPolicy::BufferFull {
+                        max_buffer_bytes,
+                        on_exceeded_fail_open,
+                    } => {
+                        let buffered = content_buffer.as_ref().map_or(0, |b| b.len());
+                        if buffered > *max_buffer_bytes {
+                            if *on_exceeded_fail_open {
+                                cap_released = true;
+                                for e in pending.drain(..) {
+                                    yield Ok::<_, Infallible>(e);
+                                }
+                            } else {
+                                tracing::warn!(
+                                    guardrail_hook = "output",
+                                    max_buffer_bytes = *max_buffer_bytes,
+                                    "streaming response exceeded max_buffer_bytes; failing closed",
+                                );
+                                errored = true;
+                                guard.comp().guardrail_blocked = true;
+                                yield Ok::<_, Infallible>(
+                                    Event::default().event("error").data(error_frame_payload(
+                                        "content_filter",
+                                        "response blocked by content policy",
+                                    )),
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    aisix_guardrails::StreamOutputPolicy::EndOfStreamCheck => {}
+                }
+            }
             // Delivery is counted by the outer DeliveryCounter wrapper
             // at poll_next time, not here — async_stream's yield
             // suspends BEFORE the consumer has actually pulled, so
@@ -2210,8 +2345,69 @@ where
         // signaled the failure via SSE error event. Running the
         // guardrail on the partial would only add a second error
         // frame, not retroactively redact the leak.
-        if !errored {
-            if let (Some(content), Some(ctx)) = (content_buffer.as_ref(), output_guardrail.as_ref()) {
+        if !errored && !cap_released {
+            if hold_back {
+                // Final scan of the held content (the last partial window,
+                // or — for BufferFull — the whole response), then release
+                // the held events if it scans clean.
+                if let Some(ctx) = output_guardrail.as_ref() {
+                    let final_text = match &stream_policy {
+                        aisix_guardrails::StreamOutputPolicy::Window { .. } => window_buf.clone(),
+                        _ => content_buffer.clone().unwrap_or_default(),
+                    };
+                    let blocked = if final_text.is_empty() {
+                        false
+                    } else {
+                        let synthesized = {
+                            let comp = guard.comp();
+                            aisix_gateway::ChatResponse {
+                                id: comp.provider_request_id.clone(),
+                                model: comp.provider_model_version.clone(),
+                                message: aisix_gateway::ChatMessage::assistant(final_text),
+                                finish_reason: aisix_gateway::FinishReason::Stop,
+                                usage: aisix_gateway::UsageStats::new(
+                                    comp.prompt_tokens,
+                                    comp.completion_tokens,
+                                ),
+                            }
+                        };
+                        match ctx.chain.check_output(&synthesized).await {
+                            aisix_guardrails::GuardrailVerdict::Block { reason } => {
+                                tracing::warn!(
+                                    guardrail_hook = "output",
+                                    model = %ctx.model_name,
+                                    reason = %reason,
+                                    "guardrail blocked streaming response",
+                                );
+                                errored = true;
+                                guard.comp().guardrail_blocked = true;
+                                yield Ok::<_, Infallible>(
+                                    Event::default().event("error").data(error_frame_payload(
+                                        "content_filter",
+                                        "response blocked by content policy",
+                                    )),
+                                );
+                                true
+                            }
+                            aisix_guardrails::GuardrailVerdict::Bypass { reason } => {
+                                let comp = guard.comp();
+                                if comp.bypass_reason.is_empty() {
+                                    comp.bypass_reason = reason;
+                                }
+                                false
+                            }
+                            _ => false,
+                        }
+                    };
+                    if !blocked {
+                        for e in pending.drain(..) {
+                            yield Ok::<_, Infallible>(e);
+                        }
+                    }
+                }
+            } else if let (Some(content), Some(ctx)) =
+                (content_buffer.as_ref(), output_guardrail.as_ref())
+            {
                 let synthesized = aisix_gateway::ChatResponse {
                     id: guard.comp().provider_request_id.clone(),
                     model: guard.comp().provider_model_version.clone(),

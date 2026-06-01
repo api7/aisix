@@ -1915,6 +1915,163 @@ data: [DONE]\n\n";
         );
     }
 
+    /// P2 (#379): unlike the keyword guardrail above (EndOfStreamCheck,
+    /// which leaks pre-emitted chunks), `azure_content_safety_text_moderation`
+    /// uses a hold-back streaming policy — a blocked streaming response
+    /// NEVER puts the offending content on the wire.
+    #[tokio::test]
+    async fn streaming_text_moderation_blocks_and_holds_content_back_no_leak() {
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"this is harmful text\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        // Azure Content Safety mock returns high severity → block.
+        let acs = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/contentsafety/text:analyze"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "categoriesAnalysis": [{"category": "Hate", "severity": 6}],
+                "blocklistsMatch": []
+            })))
+            .mount(&acs)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+        seed_guardrail(
+            &state.snapshot,
+            "g-textmod-output",
+            &format!(
+                r#"{{"name":"textmod","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k"}}"#,
+                acs.uri()
+            ),
+        );
+        let app = build_router(state);
+
+        let body = serde_json::json!({"model":"my-gpt4","messages":[{"role":"user","content":"hi"}],"stream":true});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut wire = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            wire.extend_from_slice(chunk.unwrap().as_ref());
+        }
+        let wire_str = String::from_utf8(wire).expect("SSE bytes are utf8");
+
+        // The hold-back guarantee: the harmful content NEVER reached the
+        // wire (held in `pending`, dropped on block).
+        assert!(
+            !wire_str.contains("harmful text"),
+            "hold-back must keep blocked content off the wire; got:\n{wire_str}"
+        );
+        assert!(
+            wire_str.contains("event: error"),
+            "blocked stream must emit `event: error`; got:\n{wire_str}"
+        );
+        assert!(
+            !wire_str.contains("data: [DONE]"),
+            "blocked stream must omit [DONE]; got:\n{wire_str}"
+        );
+        let idx = wire_str.find("event: error\n").unwrap();
+        let data_line = wire_str[idx..]
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&data_line["data: ".len()..]).unwrap();
+        assert_eq!(parsed["error"]["type"], "content_filter");
+    }
+
+    /// Clean content is held back, scanned, then released in full + [DONE].
+    #[tokio::test]
+    async fn streaming_text_moderation_releases_clean_content() {
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"perfectly fine answer\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+        let acs = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/contentsafety/text:analyze"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "categoriesAnalysis": [{"category": "Hate", "severity": 0}],
+                "blocklistsMatch": []
+            })))
+            .mount(&acs)
+            .await;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+        seed_guardrail(
+            &state.snapshot,
+            "g-textmod-clean",
+            &format!(
+                r#"{{"name":"textmod","kind":"azure_content_safety_text_moderation","hook_point":"output","endpoint":"{}","api_key":"k"}}"#,
+                acs.uri()
+            ),
+        );
+        let app = build_router(state);
+        let body = serde_json::json!({"model":"my-gpt4","messages":[{"role":"user","content":"hi"}],"stream":true});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut wire = Vec::new();
+        while let Some(c) = body_stream.next().await {
+            wire.extend_from_slice(c.unwrap().as_ref());
+        }
+        let wire_str = String::from_utf8(wire).expect("utf8");
+        assert!(
+            wire_str.contains("perfectly fine answer"),
+            "clean content must be released after the scan; got:\n{wire_str}"
+        );
+        assert!(
+            wire_str.contains("data: [DONE]"),
+            "clean stream must end with [DONE]; got:\n{wire_str}"
+        );
+        assert!(
+            !wire_str.contains("event: error"),
+            "clean stream must not emit an error frame; got:\n{wire_str}"
+        );
+    }
+
     // ---- regression coverage for issue #107 -------------------------
     // Pre-fix only /v1/chat/completions enforced rate-limit / budget;
     // every other LLM endpoint silently bypassed both. The test below
