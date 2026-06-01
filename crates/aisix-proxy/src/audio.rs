@@ -1002,4 +1002,21 @@ mod tests {
         assert_eq!(event.model_id, "m-2");
         assert_eq!(event.inbound_protocol, "openai");
     }
+
+    /// gpt-4o-transcribe with a non-default `response_format` can return
+    /// the *duration* usage variant — `{"type":"duration","seconds":N}` —
+    /// which carries no `input_tokens`. `extract_token_usage` must degrade
+    /// that to `None` (→ a zero-token emit, never a panic or mis-parse),
+    /// consistent with the duration-cost being a cross-repo follow-up.
+    /// Per OpenAI's `usage` oneOf (TranscriptTextUsageTokens |
+    /// TranscriptTextUsageDuration):
+    /// <https://platform.openai.com/docs/api-reference/audio/json-object>
+    #[test]
+    fn extract_token_usage_ignores_duration_variant() {
+        let v = serde_json::json!({
+            "text": "hello world",
+            "usage": {"type": "duration", "seconds": 42.7}
+        });
+        assert_eq!(super::extract_token_usage(&v), None);
+    }
 }
