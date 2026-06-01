@@ -2730,12 +2730,23 @@ mod tests {
         );
         // The custom header must NOT have broken signing: a valid SigV4
         // Authorization header is still present on the captured request.
+        let auth = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .expect("a SigV4 Authorization header");
         assert!(
-            headers
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|a| a.starts_with("AWS4-HMAC-SHA256")),
-            "the request must still carry a valid SigV4 Authorization; headers={headers:?}",
+            auth.starts_with("AWS4-HMAC-SHA256"),
+            "the request must still carry a valid SigV4 Authorization; got {auth}",
+        );
+        // Prove the injected header was SIGNED — it appears in the SigV4
+        // `SignedHeaders=` list — rather than merely appended after signing.
+        // A post-signing injection would leave a valid-looking Authorization
+        // but omit `x-corp-trace` from SignedHeaders, so this assertion is
+        // what actually pins `modify_before_signing` ordering. (#462 audit LOW-1)
+        assert!(
+            auth.contains("SignedHeaders=") && auth.contains("x-corp-trace"),
+            "the injected default header must be covered by the SigV4 signature \
+             (present in SignedHeaders); auth={auth}",
         );
     }
 
