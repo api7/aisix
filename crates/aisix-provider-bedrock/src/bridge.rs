@@ -49,7 +49,7 @@ use aisix_provider_anthropic::wire::{
 // `default_headers` ride a pre-signing interceptor (see
 // [`DefaultHeadersInterceptor`]) so they land inside the SigV4-signed
 // canonical request rather than being appended after the signature is computed.
-use aisix_core::RequestOverrides;
+use aisix_core::{ParamConstraints, RequestOverrides};
 use aisix_provider_openai::overrides::{
     apply_content_list_to_string, apply_default_body_fields, apply_param_constraints,
     apply_param_renames,
@@ -397,7 +397,9 @@ fn filtered_default_headers(
 /// Only the `invoke_model` (Anthropic) path carries a JSON body; the Converse
 /// path builds its request through the SDK's typed `InferenceConfiguration`
 /// builder, which has no JSON body for these top-level-key transforms to act
-/// on (the operator clamps temperature etc. via the normal request fields).
+/// on. (`param_constraints`'s temperature clamp IS still re-applied on the
+/// Converse path via `build_inference_config` — see #463 — but `param_renames`
+/// / `default_body_fields` / `content_list_to_string` have no Converse target.)
 fn apply_body_overrides(body: &mut serde_json::Value, ctx: &BridgeContext) {
     if let Some(r) = ctx.provider_key.request.as_ref() {
         apply_param_renames(body, &r.param_renames);
@@ -781,7 +783,16 @@ impl BedrockBridge {
         // forwards these via build_request → AnthropicRequest;
         // dropping them on the Converse path is a silent
         // behavioural regression for every non-Anthropic customer.
-        if let Some(cfg) = build_inference_config(req) {
+        // #463: re-apply the PK's param_constraints temperature clamp here —
+        // only the /invoke body path runs apply_param_constraints otherwise,
+        // so without this a Bedrock-wide temperature ceiling silently no-ops
+        // for every Converse (non-Anthropic) publisher.
+        let constraints = ctx
+            .provider_key
+            .request
+            .as_ref()
+            .and_then(|r| r.param_constraints.as_ref());
+        if let Some(cfg) = build_inference_config(req, constraints) {
             call = call.inference_config(cfg);
         }
 
@@ -842,8 +853,14 @@ impl BedrockBridge {
         for mb in message_blocks {
             call = call.messages(mb);
         }
-        // Mirror chat_converse on the stream path — same audit fix.
-        if let Some(cfg) = build_inference_config(req) {
+        // Mirror chat_converse on the stream path — same audit fix +
+        // the #463 param_constraints temperature clamp.
+        let constraints = ctx
+            .provider_key
+            .request
+            .as_ref()
+            .and_then(|r| r.param_constraints.as_ref());
+        if let Some(cfg) = build_inference_config(req, constraints) {
             call = call.inference_config(cfg);
         }
 
@@ -1194,13 +1211,44 @@ where
 /// only attaches when `Some` so we don't ship an empty
 /// `inferenceConfig: {}` to Bedrock (some publishers tolerate it,
 /// others 400).
-fn build_inference_config(req: &ChatFormat) -> Option<InferenceConfiguration> {
+///
+/// `constraints` is the PK's `request.param_constraints` (#463). The
+/// Converse path carries no JSON body, so the `/invoke` body clamp
+/// (`apply_param_constraints`) never runs for it; we re-apply the
+/// `temperature_{min,max}` guardrail here against Converse's typed
+/// `inferenceConfig.temperature` so the clamp is uniform across every
+/// publisher routed through the PK. Applied as two independent
+/// comparisons (NOT `f32::clamp`, which panics when `min > max`) to
+/// mirror `apply_param_constraints` and stay panic-safe on a
+/// misconfigured `min > max`. `ParamConstraints` is temperature-only
+/// today, so `max_tokens` / `top_p` are forwarded unclamped (no
+/// constraint field exists for them).
+fn build_inference_config(
+    req: &ChatFormat,
+    constraints: Option<&ParamConstraints>,
+) -> Option<InferenceConfiguration> {
     if req.temperature.is_none() && req.max_tokens.is_none() && req.top_p.is_none() {
         return None;
     }
     let mut b = InferenceConfiguration::builder();
     if let Some(t) = req.temperature {
-        b = b.temperature(t);
+        let mut next = t;
+        if let Some(c) = constraints {
+            // Compare in f64-space (exact) and cast only on assignment, so
+            // an f64 bound not representable in f32 still clamps at the
+            // right boundary. Max-then-min order matches the /invoke path.
+            if let Some(max) = c.temperature_max {
+                if f64::from(next) > max {
+                    next = max as f32;
+                }
+            }
+            if let Some(min) = c.temperature_min {
+                if f64::from(next) < min {
+                    next = min as f32;
+                }
+            }
+        }
+        b = b.temperature(next);
     }
     if let Some(m) = req.max_tokens {
         // Bedrock's API uses i32; ChatFormat's u32 is always non-negative.
@@ -2908,6 +2956,122 @@ mod tests {
             body["messages"][0]["content"].as_str(),
             Some("abc"),
             "response.content_list_to_string must flatten array content to a string; got {body}",
+        );
+    }
+
+    // ─── #463: param_constraints temperature clamp on the Converse path ───
+    //
+    // The /invoke body path runs apply_param_constraints; the Converse path
+    // builds a typed inferenceConfig and must re-apply the same clamp so a
+    // Bedrock-wide temperature ceiling holds for non-Anthropic publishers too.
+    // These mirror the existing Converse wires-temperature test: drive a real
+    // SDK Converse round-trip, ignore the response, assert the CAPTURED request
+    // body's inferenceConfig.temperature.
+
+    #[tokio::test]
+    async fn chat_converse_clamps_temperature_via_param_constraints() {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse$"))
+            .respond_with(responder.clone())
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let mut req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        req.temperature = Some(1.9); // over the ceiling
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"), // Converse publisher
+            sample_pk_with_request_overrides(serde_json::json!({
+                "param_constraints": { "temperature_max": 1.0 }
+            })),
+        );
+        let _ = bridge.chat(&req, &ctx).await;
+
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        let cfg = body
+            .get("inferenceConfig")
+            .and_then(|v| v.as_object())
+            .expect("inferenceConfig must be set when temperature is carried");
+        assert_eq!(
+            cfg.get("temperature").and_then(|v| v.as_f64()),
+            Some(1.0),
+            "Converse temperature must be clamped to temperature_max; body={body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_converse_clamps_temperature_min_via_param_constraints() {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse$"))
+            .respond_with(responder.clone())
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let mut req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        req.temperature = Some(0.1); // under the floor
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "param_constraints": { "temperature_min": 0.5 }
+            })),
+        );
+        let _ = bridge.chat(&req, &ctx).await;
+
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        let cfg = body
+            .get("inferenceConfig")
+            .and_then(|v| v.as_object())
+            .expect("inferenceConfig must be set when temperature is carried");
+        assert_eq!(
+            cfg.get("temperature").and_then(|v| v.as_f64()),
+            Some(0.5),
+            "Converse temperature must be clamped up to temperature_min; body={body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_converse_temperature_clamp_does_not_panic_on_min_gt_max() {
+        // Panic-safety regression: a misconfigured `temperature_min >
+        // temperature_max` must NOT panic the request (`f32::clamp` would).
+        // The two-`if` clamp applies max then min, so min wins — matching the
+        // /invoke path's `apply_param_constraints`. The test merely completing
+        // (no panic) is the core assertion; the value pins the max-then-min order.
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse$"))
+            .respond_with(responder.clone())
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let mut req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
+        req.temperature = Some(0.5);
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_request_overrides(serde_json::json!({
+                "param_constraints": { "temperature_min": 1.0, "temperature_max": 0.0 }
+            })),
+        );
+        let _ = bridge.chat(&req, &ctx).await;
+
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        let cfg = body
+            .get("inferenceConfig")
+            .and_then(|v| v.as_object())
+            .expect("inferenceConfig must be set when temperature is carried");
+        assert_eq!(
+            cfg.get("temperature").and_then(|v| v.as_f64()),
+            Some(1.0),
+            "max-then-min order: min wins on a misconfigured min>max; body={body}",
         );
     }
 }
