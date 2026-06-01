@@ -13,7 +13,7 @@ jobs:
       - name: Trigger docs site production deploy
         uses: peter-evans/repository-dispatch@v3
         with:
-          token: ${{ secrets.APISIX_WEBSITE_GITHUB_TOKEN }}
+          token: ${{ secrets.API7_CROSS_REPO_GITHUB_TOKEN }}
           repository: api7/docs
           event-type: ai-gateway-docs-updated
           client-payload: >-
