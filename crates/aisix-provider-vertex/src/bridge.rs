@@ -211,6 +211,23 @@ impl VertexBridge {
                     "vertex provider_key api_base must not contain a fragment, got {b:?}",
                 )));
             }
+            // Reject an embedded path component — only `scheme://host[:port]`
+            // is a valid origin. A bare trailing slash is fine (trimmed
+            // below); a real path segment (e.g. `.../evil`) would silently
+            // redirect every upstream call onto the wrong path, so fail fast
+            // with a clear Config error. `b` has no `@`/`?`/`#` at this point
+            // (rejected above), so echoing it is safe. Audit #434 LOW-1 / #435.
+            let after_scheme = b
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or(b)
+                .trim_end_matches('/');
+            if after_scheme.contains('/') {
+                return Err(BridgeError::Config(format!(
+                    "vertex provider_key api_base must be a bare origin \
+                     (scheme://host[:port]) with no path, got {b:?}",
+                )));
+            }
             return Ok(b.trim_end_matches('/').to_string());
         }
         Ok(format!("https://{region}-aiplatform.googleapis.com"))
@@ -2082,6 +2099,38 @@ mod tests {
             }
             other => panic!("expected Config error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_api_base_rejects_embedded_path() {
+        // #435: an api_base with a real path segment would silently redirect
+        // every upstream call onto the wrong path — reject it with a clear
+        // Config error rather than 404-ing the operator later.
+        let bridge = VertexBridge::new();
+        let err = bridge
+            .resolve_api_base("us-central1", Some("https://proxy.internal/evil"))
+            .err()
+            .unwrap();
+        match err {
+            BridgeError::Config(msg) => {
+                assert!(
+                    msg.contains("bare origin") && msg.contains("no path"),
+                    "expected a bare-origin/no-path rejection; got {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_api_base_allows_bare_origin_with_port() {
+        // The path rejection must not false-positive on a `:port` origin —
+        // `host:port` has no `/` after the scheme.
+        let bridge = VertexBridge::new();
+        let resolved = bridge
+            .resolve_api_base("us-central1", Some("https://proxy.internal:8443"))
+            .unwrap();
+        assert_eq!(resolved, "https://proxy.internal:8443");
     }
 
     #[test]

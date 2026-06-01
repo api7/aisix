@@ -150,6 +150,23 @@ impl AadCredentials {
                      scheme, got {host:?}"
                 )));
             }
+            // Reject an embedded path component — only `scheme://host[:port]`
+            // is a valid origin. A real path segment would silently redirect
+            // the token endpoint (e.g. `.../evil/{tenant}/oauth2/v2.0/token`).
+            // A bare trailing slash is tolerated for symmetry with the Vertex
+            // `resolve_api_base` check. `host` has no `@`/`?`/`#` here, so
+            // echoing it is safe. Audit #434 LOW-1 / #435.
+            let after_scheme = host
+                .split_once("://")
+                .map(|(_, rest)| rest)
+                .unwrap_or(host)
+                .trim_end_matches('/');
+            if after_scheme.contains('/') {
+                return Err(BridgeError::Config(format!(
+                    "azure aad credentials.authority_host must be a bare origin \
+                     (scheme://host[:port]) with no path, got {host:?}"
+                )));
+            }
         }
         Ok(())
     }
@@ -614,6 +631,45 @@ mod tests {
         match err {
             BridgeError::Config(msg) => assert!(msg.contains("http:// or https://")),
             other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_authority_host_with_embedded_path() {
+        // #435: a path segment would silently redirect the token endpoint
+        // (e.g. `.../evil/{tenant}/oauth2/v2.0/token`) — reject it.
+        let creds = AadCredentials {
+            tenant_id: "t".into(),
+            client_id: "app".into(),
+            client_secret: "s".into(),
+            authority_host: Some("https://login.microsoftonline.us/evil".into()),
+        };
+        let err = creds.validate().err().unwrap();
+        match err {
+            BridgeError::Config(msg) => assert!(
+                msg.contains("bare origin") && msg.contains("no path"),
+                "expected a bare-origin/no-path rejection; got {msg}"
+            ),
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_allows_authority_host_bare_origin_with_port() {
+        // A `host:port` origin (no path) must still validate — the path
+        // rejection must not false-positive on the `:port` colon, and a
+        // bare trailing slash is tolerated (trimmed at URL-build time).
+        for host in [
+            "https://login.microsoftonline.us:8443",
+            "https://login.microsoftonline.us/",
+        ] {
+            let creds = AadCredentials {
+                tenant_id: "t".into(),
+                client_id: "app".into(),
+                client_secret: "s".into(),
+                authority_host: Some(host.into()),
+            };
+            assert!(creds.validate().is_ok(), "{host} should validate");
         }
     }
 
