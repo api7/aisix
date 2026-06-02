@@ -243,6 +243,15 @@ impl ProxyError {
             // body carries (prd-09b §5.8 retry_after_seconds), so the
             // header and body agree — SDKs back off on the header.
             ProxyError::BudgetExceeded(r) => r.retry_after_seconds,
+            // Forward an upstream 429's Retry-After hint so SDK clients
+            // back off on the provider's actual cool-down instead of a
+            // default. The hint is parsed into `UpstreamStatus.retry_after`
+            // by the bridge; only 429 carries a meaningful value.
+            ProxyError::Bridge(BridgeError::UpstreamStatus {
+                status: 429,
+                retry_after: Some(d),
+                ..
+            }) => Some(d.as_secs()),
             _ => None,
         }
     }
@@ -505,6 +514,37 @@ mod tests {
         let wrapped = ProxyError::Bridge(bridge_err);
         assert_eq!(wrapped.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(wrapped.kind(), "upstream_error");
+    }
+
+    #[test]
+    fn upstream_429_forwards_retry_after_hint() {
+        // An upstream 429 carrying a parsed Retry-After must surface
+        // through retry_after_secs so the response writer emits the
+        // header SDKs back off on (#144).
+        let wrapped = ProxyError::Bridge(BridgeError::upstream_status_with_retry_after(
+            429,
+            "rate limited",
+            Some(std::time::Duration::from_secs(30)),
+        ));
+        assert_eq!(wrapped.retry_after_secs(), Some(30));
+    }
+
+    #[test]
+    fn upstream_429_without_hint_has_no_retry_after() {
+        let wrapped = ProxyError::Bridge(BridgeError::upstream_status(429, "rate limited"));
+        assert_eq!(wrapped.retry_after_secs(), None);
+    }
+
+    #[test]
+    fn non_429_upstream_does_not_forward_retry_after() {
+        // Only 429 carries a meaningful hint; a stray Retry-After on a
+        // 5xx must not leak to the client.
+        let wrapped = ProxyError::Bridge(BridgeError::upstream_status_with_retry_after(
+            503,
+            "unavailable",
+            Some(std::time::Duration::from_secs(30)),
+        ));
+        assert_eq!(wrapped.retry_after_secs(), None);
     }
 
     #[test]
