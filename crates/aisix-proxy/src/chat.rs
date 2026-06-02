@@ -38,25 +38,12 @@ use crate::auth::AuthenticatedKey;
 use crate::error::ProxyError;
 use crate::render::{render_chunk, render_response};
 use crate::request_id::new_request_id;
-use crate::routing::is_retryable;
+use crate::routing::{is_retryable, resolve_attempt_models, AttemptModel};
 use crate::state::ProxyState;
 
 /// Header set on every non-streaming response indicating whether the
 /// response came from the cache (`hit`) or the upstream (`miss`).
 pub const CACHE_HEADER: &str = "x-aisix-cache";
-
-/// Default Retry-After (in seconds) returned to the client when every
-/// candidate is background-unhealthy and no cooldown timer is available
-/// to derive a more precise hint. Operators tune per-model cooldown
-/// TTLs via `cooldown.default_seconds`; this is only the all-unhealthy
-/// fallback for the `on_all_filtered: fail` path.
-const FALLBACK_ALL_UNHEALTHY_RETRY_AFTER: Duration = Duration::from_secs(30);
-
-#[derive(Clone)]
-struct AttemptModel {
-    id: String,
-    model: aisix_core::Model,
-}
 
 #[derive(Clone, Default)]
 struct RoutingTelemetry {
@@ -720,49 +707,15 @@ async fn dispatch(
     // Resolve the attempt-list of underlying Model entries. For a
     // routing model we walk targets per the configured strategy; for a
     // single-provider Model we just dispatch to it directly.
-    let attempt_models: Vec<AttemptModel> =
-        if let Some(routing) = virtual_entry.value.routing.as_ref() {
-            let names = state.routing.pick_targets(&req.model, routing);
-            if names.is_empty() {
-                return Err(with_model(ProxyError::InvalidRequest(
-                    "routing model has no targets".into(),
-                )));
-            }
-            let mut resolved = Vec::with_capacity(names.len());
-            for name in &names {
-                let target_entry = snapshot.models.get_by_name(name).ok_or_else(|| {
-                    with_model(ProxyError::InvalidRequest(format!(
-                        "routing target {name:?} does not resolve to a Model"
-                    )))
-                })?;
-                resolved.push(AttemptModel {
-                    id: target_entry.id.clone(),
-                    model: target_entry.value.clone(),
-                });
-            }
-            match filter_attempt_models(
-                &state.runtime_status,
-                resolved,
-                routing.on_all_filtered_or_default(),
-            ) {
-                FilterOutcome::Selected(list) => list,
-                FilterOutcome::AllUnhealthy { retry_after_secs } => {
-                    tracing::warn!(
-                        virtual_model = %req.model,
-                        retry_after_secs,
-                        "all routing candidates are unavailable; failing fast",
-                    );
-                    return Err(with_model(ProxyError::AllCandidatesUnavailable {
-                        retry_after_secs,
-                    }));
-                }
-            }
-        } else {
-            vec![AttemptModel {
-                id: virtual_entry.id.clone(),
-                model: virtual_entry.value.clone(),
-            }]
-        };
+    let attempt_models: Vec<AttemptModel> = resolve_attempt_models(
+        &state.routing,
+        &state.runtime_status,
+        &snapshot,
+        &req.model,
+        &virtual_entry.id,
+        &virtual_entry.value,
+    )
+    .map_err(&with_model)?;
 
     // For non-routing requests, surface a misconfigured bridge as a
     // proper 503 rather than burying it inside a generic Bridge error.
@@ -1482,88 +1435,6 @@ async fn dispatch(
         served_by_target,
         routing,
     })
-}
-
-/// Outcome of routing-candidate filtering. Lifts the "all candidates
-/// excluded" case out into a typed result so the dispatch loop can
-/// short-circuit to a 503 + Retry-After instead of sending traffic to
-/// a target we just confirmed is bad.
-enum FilterOutcome {
-    /// At least one candidate survived the filter. The returned vector
-    /// is the filtered attempt list, in the original strategy order
-    /// minus the excluded entries.
-    Selected(Vec<AttemptModel>),
-    /// Every candidate is currently background-unhealthy and the
-    /// routing model is configured with `on_all_filtered: fail`. The
-    /// caller should surface a 503 with the supplied Retry-After hint
-    /// (in seconds), if any.
-    AllUnhealthy { retry_after_secs: Option<u64> },
-}
-
-fn filter_attempt_models(
-    runtime_status: &crate::ModelRuntimeStatusTracker,
-    attempts: Vec<AttemptModel>,
-    policy: aisix_core::OnAllFilteredPolicy,
-) -> FilterOutcome {
-    use aisix_core::OnAllFilteredPolicy;
-
-    let mut healthy = Vec::new();
-    let mut cooldown_only = Vec::new();
-    let mut unhealthy_count = 0usize;
-
-    for attempt in attempts.iter().cloned() {
-        let stale_after = attempt
-            .model
-            .background_model_check
-            .as_ref()
-            .map(|cfg| Duration::from_secs(cfg.stale_after_seconds));
-        let snapshot = runtime_status.status_with_stale(&attempt.id, stale_after);
-        match snapshot.status {
-            crate::RuntimeStatus::Unhealthy => unhealthy_count += 1,
-            crate::RuntimeStatus::Cooldown => cooldown_only.push(attempt),
-            crate::RuntimeStatus::Healthy | crate::RuntimeStatus::NotApplicable => {
-                healthy.push(attempt)
-            }
-        }
-    }
-
-    if !healthy.is_empty() {
-        return FilterOutcome::Selected(healthy);
-    }
-    // No healthy candidates — prefer cooldown over unhealthy when
-    // some non-unhealthy candidates exist. Sending to a target whose
-    // cooldown timer hasn't expired is still better than sending to
-    // a target that an active probe just confirmed is broken.
-    if unhealthy_count < attempts.len() && !cooldown_only.is_empty() {
-        let filtered: Vec<AttemptModel> = attempts
-            .into_iter()
-            .filter(|attempt| {
-                let stale_after = attempt
-                    .model
-                    .background_model_check
-                    .as_ref()
-                    .map(|cfg| Duration::from_secs(cfg.stale_after_seconds));
-                runtime_status.should_skip_for_routing(&attempt.id, stale_after)
-                    != crate::RuntimeStatus::Unhealthy
-            })
-            .collect();
-        return FilterOutcome::Selected(filtered);
-    }
-    // All candidates are excluded. Policy decides.
-    //
-    // Retry-After for the fail path is a coarse fallback (30s by
-    // default — see FALLBACK_ALL_UNHEALTHY_RETRY_AFTER). We could
-    // try to derive it from per-candidate cooldown timers, but the
-    // categorisation above routes cooldown candidates into
-    // `cooldown_only` (returned via the Selected branch above), so
-    // by construction every candidate that reaches here is in the
-    // background-unhealthy state and has no cooldown timer to read.
-    match policy {
-        OnAllFilteredPolicy::Fail => FilterOutcome::AllUnhealthy {
-            retry_after_secs: Some(FALLBACK_ALL_UNHEALTHY_RETRY_AFTER.as_secs()),
-        },
-        OnAllFilteredPolicy::OriginalOrder => FilterOutcome::Selected(attempts),
-    }
 }
 
 /// Wire-shape label for `FinishReason`. cp-api stores this verbatim
@@ -2690,127 +2561,6 @@ mod cooldown_tests {
     fn config_error_never_cools_down() {
         // Misconfig = WE are wrong; cooling down doesn't help.
         assert!(decide_cooldown(&BridgeError::Config("bad key".into()), None).is_none());
-    }
-}
-
-#[cfg(test)]
-mod filter_tests {
-    use super::*;
-    use aisix_core::{Model, OnAllFilteredPolicy};
-    use std::time::Duration as StdDuration;
-
-    fn am(id: &str) -> AttemptModel {
-        let model: Model = serde_json::from_str(&format!(
-            r#"{{
-              "display_name": "{id}",
-              "provider": "openai",
-              "model_name": "gpt-4o-mini",
-              "provider_key_id": "pk-{id}"
-            }}"#
-        ))
-        .unwrap();
-        AttemptModel {
-            id: id.to_string(),
-            model,
-        }
-    }
-
-    #[test]
-    fn healthy_only_returns_all_healthy() {
-        let t = crate::ModelRuntimeStatusTracker::new();
-        let attempts = vec![am("a"), am("b")];
-        match filter_attempt_models(&t, attempts, OnAllFilteredPolicy::Fail) {
-            FilterOutcome::Selected(list) => {
-                assert_eq!(list.len(), 2);
-            }
-            other => panic!(
-                "expected Selected, got {:?}",
-                std::mem::discriminant(&other)
-            ),
-        }
-    }
-
-    #[test]
-    fn cooldown_skipped_when_healthy_present() {
-        let t = crate::ModelRuntimeStatusTracker::new();
-        t.mark_cooldown("a", StdDuration::from_secs(30), "retryable_failure");
-        let attempts = vec![am("a"), am("b")];
-        match filter_attempt_models(&t, attempts, OnAllFilteredPolicy::Fail) {
-            FilterOutcome::Selected(list) => {
-                assert_eq!(list.len(), 1);
-                assert_eq!(list[0].id, "b");
-            }
-            _ => panic!("expected Selected"),
-        }
-    }
-
-    #[test]
-    fn all_unhealthy_fail_policy_returns_retry_after_hint() {
-        // H3 contract: every candidate background-unhealthy, no
-        // cooldown timer → return 503 + fallback Retry-After (30s
-        // default). The dispatch loop converts this to a
-        // ProxyError::AllCandidatesUnavailable.
-        let t = crate::ModelRuntimeStatusTracker::new();
-        t.mark_unhealthy("a", Some(503), "background_check_failed");
-        t.mark_unhealthy("b", Some(503), "background_check_failed");
-        let attempts = vec![am("a"), am("b")];
-        match filter_attempt_models(&t, attempts, OnAllFilteredPolicy::Fail) {
-            FilterOutcome::AllUnhealthy { retry_after_secs } => {
-                assert_eq!(retry_after_secs, Some(30));
-            }
-            _ => panic!("expected AllUnhealthy"),
-        }
-    }
-
-    #[test]
-    fn one_cooldown_with_all_else_unhealthy_keeps_the_cooldown_candidate() {
-        // Mixed scenario: candidates a/b are background-unhealthy, c
-        // is in cooldown. The filter should pick c (cooldown beats
-        // unhealthy), not fail.
-        let t = crate::ModelRuntimeStatusTracker::new();
-        t.mark_unhealthy("a", Some(503), "background_check_failed");
-        t.mark_unhealthy("b", Some(503), "background_check_failed");
-        t.mark_cooldown("c", StdDuration::from_secs(30), "x");
-        let attempts = vec![am("a"), am("b"), am("c")];
-        match filter_attempt_models(&t, attempts, OnAllFilteredPolicy::Fail) {
-            FilterOutcome::Selected(list) => {
-                assert_eq!(list.len(), 1);
-                assert_eq!(list[0].id, "c");
-            }
-            _ => panic!("expected Selected with cooldown candidate"),
-        }
-    }
-
-    #[test]
-    fn all_unhealthy_original_order_policy_returns_full_list() {
-        // Legacy opt-in: send to all candidates regardless.
-        let t = crate::ModelRuntimeStatusTracker::new();
-        t.mark_unhealthy("a", Some(503), "background_check_failed");
-        t.mark_unhealthy("b", Some(503), "background_check_failed");
-        let attempts = vec![am("a"), am("b")];
-        match filter_attempt_models(&t, attempts, OnAllFilteredPolicy::OriginalOrder) {
-            FilterOutcome::Selected(list) => {
-                assert_eq!(list.len(), 2);
-            }
-            _ => panic!("expected Selected under OriginalOrder policy"),
-        }
-    }
-
-    #[test]
-    fn cooldown_no_unhealthy_returns_cooldown_candidates() {
-        // No healthy, no unhealthy — all candidates have a cooldown
-        // timer set. Routing should still pick from them (better than
-        // erroring out when we don't have evidence anyone is *broken*).
-        let t = crate::ModelRuntimeStatusTracker::new();
-        t.mark_cooldown("a", StdDuration::from_secs(30), "x");
-        t.mark_cooldown("b", StdDuration::from_secs(30), "x");
-        let attempts = vec![am("a"), am("b")];
-        match filter_attempt_models(&t, attempts, OnAllFilteredPolicy::Fail) {
-            FilterOutcome::Selected(list) => {
-                assert_eq!(list.len(), 2);
-            }
-            _ => panic!("expected Selected for cooldown-only"),
-        }
     }
 }
 

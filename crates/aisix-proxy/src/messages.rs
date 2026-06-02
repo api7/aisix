@@ -243,23 +243,38 @@ async fn dispatch(
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
     let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
-    let model = &model_entry.value;
-    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    // Resolve the attempt list. For a Model Group (routing model) this
+    // walks `routing.targets` and health-filters them; for a direct
+    // model it's just the model itself. Shared with /v1/chat/completions
+    // so both endpoints dispatch Model Groups identically (#471).
+    let attempt_models = crate::routing::resolve_attempt_models(
+        &state.routing,
+        &state.runtime_status,
+        &snapshot,
+        &model_name,
+        &model_entry.id,
+        &model_entry.value,
+    )?;
 
-    // Cross-provider path: when the resolved Model points at a non-
-    // Anthropic upstream, parse the Anthropic-shape body into the
-    // gateway's internal ChatFormat, dispatch through the Hub, and
-    // re-encode the bridge's response as Anthropic JSON or SSE.
-    // The Anthropic-upstream branch below stays as a byte-for-byte
-    // passthrough to preserve features (cache_control, thinking
-    // blocks, …) the cross-provider path can't lossily round-trip.
-    if model.provider.as_deref() != Some("anthropic") {
-        return cross_provider_dispatch(
+    let is_stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let retry_on_429 = model_entry
+        .value
+        .routing
+        .as_ref()
+        .map(|r| r.retry_on_429_or_default())
+        .unwrap_or(false);
+
+    // Streaming attempts only the first target (no mid-stream fallback),
+    // matching /v1/chat/completions.
+    if is_stream {
+        return dispatch_to_target(
             state,
+            &snapshot,
             body,
-            model,
-            &model_entry.id,
-            &pk_entry.value,
+            &attempt_models[0],
             &model_name,
             request_id,
             started,
@@ -270,7 +285,116 @@ async fn dispatch(
         .await;
     }
 
-    let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?;
+    // Non-streaming: walk targets, failing over to the next only on a
+    // retryable upstream failure. A 4xx / config error is returned
+    // as-is — retrying other targets won't help.
+    let n = attempt_models.len();
+    let mut last_err: Option<ProxyError> = None;
+    for (i, target) in attempt_models.iter().enumerate() {
+        match dispatch_to_target(
+            state,
+            &snapshot,
+            body,
+            target,
+            &model_name,
+            request_id,
+            started,
+            &auth.entry.id,
+            auth.key().team_id.clone(),
+            auth.key().user_id.clone(),
+        )
+        .await
+        {
+            Ok(outcome) => return Ok(outcome),
+            Err(e) => {
+                let retryable = matches!(
+                    &e,
+                    ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429)
+                );
+                last_err = Some(e);
+                if !(retryable && i + 1 < n) {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or(ProxyError::ProviderUnavailable))
+}
+
+/// Dispatch one concrete (non-routing) target Model. Branches on the
+/// target's provider: Anthropic upstreams go through the byte-for-byte
+/// passthrough, everything else through the cross-provider translation.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_to_target(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    body: &Value,
+    target: &crate::routing::AttemptModel,
+    model_name: &str,
+    request_id: &str,
+    started: Instant,
+    api_key_id: &str,
+    team_id: Option<String>,
+    user_id: Option<String>,
+) -> Result<DispatchOutcome, ProxyError> {
+    let model = &target.model;
+    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
+
+    if model.provider.as_deref() != Some("anthropic") {
+        return cross_provider_dispatch(
+            state,
+            body,
+            model,
+            &target.id,
+            &pk_entry.value,
+            model_name,
+            request_id,
+            started,
+            api_key_id,
+            team_id,
+            user_id,
+        )
+        .await;
+    }
+
+    anthropic_passthrough_dispatch(
+        state,
+        body,
+        model,
+        &target.id,
+        &pk_entry.value,
+        &pk_entry.id,
+        model_name,
+        request_id,
+        started,
+        api_key_id,
+        team_id,
+        user_id,
+    )
+    .await
+}
+
+/// Anthropic-protocol input -> Anthropic upstream: byte-for-byte
+/// passthrough to `{api_base}/v1/messages`. Adds the `x-api-key` +
+/// `anthropic-version` headers, rewrites the `model` field to the
+/// upstream id, and streams the SSE response verbatim.
+#[allow(clippy::too_many_arguments)]
+async fn anthropic_passthrough_dispatch(
+    state: &ProxyState,
+    body: &Value,
+    model: &aisix_core::Model,
+    model_id: &str,
+    pk_value: &aisix_core::ProviderKey,
+    pk_id: &str,
+    model_name: &str,
+    request_id: &str,
+    started: Instant,
+    api_key_id: &str,
+    team_id: Option<String>,
+    user_id: Option<String>,
+) -> Result<DispatchOutcome, ProxyError> {
+    let mut body = body.clone();
+    let api_key = crate::dispatch::require_secret(pk_value, model)?;
 
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
@@ -290,19 +414,22 @@ async fn dispatch(
     //
     // Apply order matches §5: renames → constraints → defaults. Each
     // primitive is a no-op when its configured map is empty.
-    if let Some(r) = pk_entry.value.request.as_ref() {
-        aisix_provider_openai::overrides::apply_param_renames(body, &r.param_renames);
+    if let Some(r) = pk_value.request.as_ref() {
+        aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
-            aisix_provider_openai::overrides::apply_param_constraints(body, constraints);
+            aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
         }
-        aisix_provider_openai::overrides::apply_default_body_fields(body, &r.default_body_fields);
+        aisix_provider_openai::overrides::apply_default_body_fields(
+            &mut body,
+            &r.default_body_fields,
+        );
     }
 
     // Build the target URL. build_v1_url tolerates the rare case
     // where the customer mistakenly puts `/v1` in the Anthropic
     // api_base (the dashboard placeholder uses the OpenAI form, so
     // this is a copy-paste hazard).
-    let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
+    let base = crate::dispatch::resolve_base_url(pk_value)?;
     let url = crate::dispatch::build_v1_url(&base, "/messages");
 
     // Check if the request wants streaming.
@@ -340,12 +467,12 @@ async fn dispatch(
         )))
     })?;
     headers.insert(HeaderName::from_static("x-aisix-request-id"), rid_hv);
-    if let Some(r) = pk_entry.value.request.as_ref() {
+    if let Some(r) = pk_value.request.as_ref() {
         aisix_provider_openai::overrides::apply_default_headers(&mut headers, &r.default_headers);
     }
 
     let client = crate::http_client::client();
-    let req_builder = client.post(&url).headers(headers).json(body);
+    let req_builder = client.post(&url).headers(headers).json(&body);
 
     let upstream_resp = req_builder
         .send()
@@ -353,7 +480,7 @@ async fn dispatch(
         .map_err(|e| {
             crate::cooldown::note_failure(
                 &state.runtime_status,
-                &model_entry.id,
+                model_id,
                 model.cooldown.as_ref(),
                 aisix_gateway::BridgeError::Transport(e.to_string()),
             )
@@ -383,9 +510,7 @@ async fn dispatch(
         // upstream. See `crate::cooldown` for the shared decision.
         if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
         {
-            state
-                .runtime_status
-                .mark_cooldown(&model_entry.id, ttl, reason);
+            state.runtime_status.mark_cooldown(model_id, ttl, reason);
         }
         return Err(ProxyError::Bridge(err));
     }
@@ -396,8 +521,8 @@ async fn dispatch(
     // that recovered via the Anthropic passthrough would stay in
     // `cooldown` on /admin/v1/models/status until its TTL naturally
     // expired (round-2 audit MEDIUM on PR #268).
-    state.health.record_success(&model_name);
-    state.runtime_status.mark_healthy(&model_entry.id);
+    state.health.record_success(model_name);
+    state.runtime_status.mark_healthy(model_id);
 
     let provider_label = "anthropic".to_string();
 
@@ -420,14 +545,14 @@ async fn dispatch(
         // CompleteOnDrop pattern as chat.rs::build_sse_stream).
         let state_c = state.clone();
         let request_id_c = request_id.to_string();
-        let model_id_c = model_entry.id.clone();
-        let api_key_id_c = auth.entry.id.clone();
+        let model_id_c = model_id.to_string();
+        let api_key_id_c = api_key_id.to_string();
         let provider_c = provider_label.clone();
-        let model_name_c = model_name.clone();
-        let provider_key_id_c = pk_entry.id.clone();
+        let model_name_c = model_name.to_string();
+        let provider_key_id_c = pk_id.to_string();
         let upstream_model_c = upstream_model.clone();
-        let team_id_c = auth.key().team_id.clone();
-        let user_id_c = auth.key().user_id.clone();
+        let team_id_c = team_id.clone();
+        let user_id_c = user_id.clone();
 
         let parsed_stream =
             build_anthropic_passthrough_stream(body_stream, started, move |usage| {
@@ -492,7 +617,7 @@ async fn dispatch(
         Ok(DispatchOutcome {
             response,
             provider_label,
-            provider_key_id: pk_entry.id.clone(),
+            provider_key_id: pk_id.to_string(),
             upstream_model: upstream_model.clone(),
             metrics: AnthropicUsageMetrics::default(),
             usage_handled_by_stream: true,
@@ -508,7 +633,7 @@ async fn dispatch(
             .map_err(|e| {
                 crate::cooldown::note_failure(
                     &state.runtime_status,
-                    &model_entry.id,
+                    model_id,
                     model.cooldown.as_ref(),
                     aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
                 )
@@ -522,14 +647,14 @@ async fn dispatch(
         if let Some(m) = json_body.get_mut("model") {
             // If the upstream echoes the model name, rewrite to the gateway name.
             if m.as_str().map(|s| s == upstream_model).unwrap_or(false) {
-                *m = Value::String(model_name.clone());
+                *m = Value::String(model_name.to_string());
             }
         }
 
         Ok(DispatchOutcome {
             response: Json(json_body).into_response(),
             provider_label,
-            provider_key_id: pk_entry.id.clone(),
+            provider_key_id: pk_id.to_string(),
             upstream_model,
             metrics,
             usage_handled_by_stream: false,

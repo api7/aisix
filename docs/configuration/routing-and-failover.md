@@ -10,6 +10,8 @@ This is the gateway's current virtual-model mechanism.
 
 Use it when you want to separate the caller contract from the individual upstream target that serves a given request.
 
+A routing alias works on both inbound protocols: `/v1/chat/completions` (OpenAI shape) and `/v1/messages` (Anthropic shape). Targets in one group may mix providers — e.g. an OpenAI target and an Anthropic target — and the gateway dispatches each target through the right path regardless of which endpoint the caller used. On `/v1/messages`, streaming requests attempt only the first target (no mid-stream fallback); non-streaming requests fail over across targets.
+
 ## Current Strategies
 
 - `failover`
@@ -161,7 +163,7 @@ The header applies to successful `/v1/chat/completions` responses. It is **absen
 - **Direct (non-routing) models.** The body's `response.model` already names the served model, so the header would be redundant — its presence is itself the routing signal.
 - **Cache hits.** A stored response is decoupled from whichever target produced it on the original miss; surfacing a stale name would lie. Operators inspecting routing must look at `x-aisix-cache` first.
 - **Error responses** (e.g. failover exhausted, every target unhealthy). No target served the request, so there is no name to report.
-- **Other endpoints.** The Anthropic-shape `/v1/messages` path is on a separate code path and does not currently emit this header.
+- **Other endpoints.** The Anthropic-shape `/v1/messages` path resolves routing groups (including failover) but is on a separate code path and does not currently emit this header.
 
 If a routing target's `display_name` contains bytes that are not valid HTTP header values (CR/LF or non-visible-ASCII), the header is omitted and the DP logs a `tracing::warn!` carrying the offending name. Rename the target with operator-side tools to restore the header.
 
