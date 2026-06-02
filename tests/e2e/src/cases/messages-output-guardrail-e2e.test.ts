@@ -77,12 +77,19 @@ describe("/v1/messages output guardrail (#448)", () => {
       return;
     }
     // The mock always replies "mock reply", so once the output guardrail
-    // is live every /v1/messages call should be blocked.
-    await waitConfigPropagation(async () => (await messages("ready-probe")).status >= 400);
+    // is live every /v1/messages call is blocked. Gate specifically on the
+    // guardrail block (422), not any 4xx, so transient propagation errors
+    // don't satisfy the gate.
+    await waitConfigPropagation(async () => (await messages("ready-probe")).status === 422);
 
     const res = await messages("anything at all");
-    expect(res.status, "output guardrail must block the forbidden reply").toBeGreaterThanOrEqual(400);
-    const body = await res.text();
-    expect(body).toContain("content");
+    // ContentFiltered → 422; on the Anthropic /v1/messages envelope a 422
+    // maps to error.type "invalid_request_error" (not OpenAI's
+    // "content_filter") — see error.rs anthropic_error_type.
+    expect(res.status, "output guardrail must block the forbidden reply").toBe(422);
+    const json = (await res.json()) as { type?: string; error?: { type?: string; message?: string } };
+    expect(json.type).toBe("error");
+    expect(json.error?.type).toBe("invalid_request_error");
+    expect(json.error?.message ?? "").toContain("content policy");
   });
 });
