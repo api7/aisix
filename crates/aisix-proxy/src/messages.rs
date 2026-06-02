@@ -521,7 +521,7 @@ async fn anthropic_passthrough_dispatch(
     // that recovered via the Anthropic passthrough would stay in
     // `cooldown` on /admin/v1/models/status until its TTL naturally
     // expired (round-2 audit MEDIUM on PR #268).
-    state.health.record_success(model_name);
+    state.health.record_success(&model.display_name);
     state.runtime_status.mark_healthy(model_id);
 
     let provider_label = "anthropic".to_string();
@@ -866,7 +866,7 @@ async fn cross_provider_dispatch(
         }
         ProxyError::Bridge(err)
     })?;
-    state.health.record_success(model_name);
+    state.health.record_success(&model.display_name);
     state.runtime_status.mark_healthy(model_id);
 
     let metrics = AnthropicUsageMetrics {

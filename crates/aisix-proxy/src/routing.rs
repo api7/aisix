@@ -206,20 +206,16 @@ pub(crate) fn filter_attempt_models(
     // some non-unhealthy candidates exist. Sending to a target whose
     // cooldown timer hasn't expired is still better than sending to
     // a target that an active probe just confirmed is broken.
+    //
+    // Reuse the single status read from the classification loop above:
+    // with `healthy` empty here, the non-unhealthy candidates are
+    // exactly the `cooldown_only` ones. Re-reading runtime_status to
+    // re-filter would add a redundant per-candidate query and open a
+    // race window — a candidate flipping to unhealthy between the two
+    // reads could yield an empty `Selected`, which streaming callers
+    // turn into a panic by indexing `attempt_models[0]`.
     if unhealthy_count < attempts.len() && !cooldown_only.is_empty() {
-        let filtered: Vec<AttemptModel> = attempts
-            .into_iter()
-            .filter(|attempt| {
-                let stale_after = attempt
-                    .model
-                    .background_model_check
-                    .as_ref()
-                    .map(|cfg| Duration::from_secs(cfg.stale_after_seconds));
-                runtime_status.should_skip_for_routing(&attempt.id, stale_after)
-                    != crate::RuntimeStatus::Unhealthy
-            })
-            .collect();
-        return FilterOutcome::Selected(filtered);
+        return FilterOutcome::Selected(cooldown_only);
     }
     // All candidates are excluded. Policy decides.
     //
