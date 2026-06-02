@@ -18,12 +18,31 @@
 //! plumbing flows naturally.
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, Model, ProviderKey};
 use aisix_gateway::{Bridge, Hub};
+use dashmap::DashSet;
 
 use crate::error::ProxyError;
+
+/// PK display names already warned about for compat-shim dispatch.
+/// Without this, a heavily-loaded customer with one un-migrated PK
+/// emits an identical warn on every request, drowning other signals
+/// (#377). De-duping per PK keeps the migration-debt signal (one line
+/// per un-migrated row) while dropping the per-request noise. The set
+/// is process-local, so a fresh deploy re-surfaces the warning if the
+/// debt still exists.
+static SHIM_WARNED_PKS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+
+/// Gate for the compat-shim warn: returns `true` only the first time a
+/// given PK is seen. Extracted so the once-per-PK behavior is
+/// unit-testable without capturing tracing output. `DashSet::insert`
+/// returns `true` when the key was newly inserted.
+fn should_warn_shim(seen: &DashSet<String>, pk_display_name: &str) -> bool {
+    seen.insert(pk_display_name.to_string())
+}
 
 /// Resolve the Bridge to dispatch this request through.
 ///
@@ -62,15 +81,18 @@ pub(crate) fn resolve_bridge(
                 // logs) can detect un-migrated PK rows still in the
                 // wild. The "one-cycle" deprecation promise is only
                 // enforceable if dispatching through the shim is
-                // observable.
-                tracing::warn!(
-                    target: "aisix_proxy::dispatch",
-                    pk_display_name = %provider_key.display_name,
-                    model_provider = %mp,
-                    "compat shim: pre-Phase-A PK row (empty `provider` + `adapter: None`) \
-                     dispatched via Model.provider fallback — re-save this PK to remove the \
-                     legacy code path"
-                );
+                // observable. Warn once per PK (not per request) so the
+                // signal doesn't drown the logs under load (#377).
+                if should_warn_shim(&SHIM_WARNED_PKS, &provider_key.display_name) {
+                    tracing::warn!(
+                        target: "aisix_proxy::dispatch",
+                        pk_display_name = %provider_key.display_name,
+                        model_provider = %mp,
+                        "compat shim: pre-Phase-A PK row (empty `provider` + `adapter: None`) \
+                         dispatched via Model.provider fallback — re-save this PK to remove the \
+                         legacy code path"
+                    );
+                }
                 return hub.get_specialized(mp);
             }
         }
@@ -248,6 +270,19 @@ pub(crate) fn require_secret<'a>(
 mod tests {
     use super::*;
     use aisix_core::resource::ResourceEntry;
+
+    #[test]
+    fn shim_warn_fires_once_per_pk() {
+        // Uses a local set (not the global static) so the test is
+        // order-independent. First sighting of a PK warns; repeats
+        // (the per-request flood) do not. A distinct PK warns again.
+        let seen = DashSet::new();
+        assert!(should_warn_shim(&seen, "legacy-pk"));
+        assert!(!should_warn_shim(&seen, "legacy-pk"));
+        assert!(!should_warn_shim(&seen, "legacy-pk"));
+        assert!(should_warn_shim(&seen, "another-legacy-pk"));
+        assert!(!should_warn_shim(&seen, "another-legacy-pk"));
+    }
 
     fn snapshot_with(provider_key_id: &str) -> AisixSnapshot {
         let snap = AisixSnapshot::new();
