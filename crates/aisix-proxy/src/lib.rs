@@ -133,10 +133,44 @@ async fn record_in_flight_request(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let endpoint = request.uri().path().to_string();
-    let inbound_protocol = inbound_protocol_for_endpoint(&endpoint).to_string();
-    let _guard = InFlightGuard::new(state.metrics.clone(), endpoint, inbound_protocol);
+    // Normalize to a bounded route template BEFORE using the path as a
+    // metric label. This middleware runs before authentication and before
+    // route matching, so the raw `request.uri().path()` is fully
+    // attacker-controlled — the `/passthrough/:provider/*rest` wildcard
+    // suffix (or any 404 path) would otherwise let an unauthenticated
+    // caller mint unbounded Prometheus time series (#451).
+    let endpoint = normalize_endpoint_label(request.uri().path());
+    let inbound_protocol = inbound_protocol_for_endpoint(endpoint).to_string();
+    let _guard = InFlightGuard::new(
+        state.metrics.clone(),
+        endpoint.to_string(),
+        inbound_protocol,
+    );
     next.run(request).await
+}
+
+/// Collapse a raw request path to a fixed route template so metric labels
+/// stay bounded regardless of caller-supplied path segments. Keep this
+/// allowlist in sync with the routes registered in `build_router`; any
+/// unrecognized path (including unmatched 404s) maps to `"other"`.
+fn normalize_endpoint_label(path: &str) -> &'static str {
+    match path {
+        "/livez" => "/livez",
+        "/v1/models" => "/v1/models",
+        "/v1/chat/completions" => "/v1/chat/completions",
+        "/v1/completions" => "/v1/completions",
+        "/v1/embeddings" => "/v1/embeddings",
+        "/v1/images/generations" => "/v1/images/generations",
+        "/v1/messages" => "/v1/messages",
+        "/v1/messages/count_tokens" => "/v1/messages/count_tokens",
+        "/v1/rerank" => "/v1/rerank",
+        "/v1/responses" => "/v1/responses",
+        "/v1/audio/transcriptions" => "/v1/audio/transcriptions",
+        "/v1/audio/translations" => "/v1/audio/translations",
+        "/v1/audio/speech" => "/v1/audio/speech",
+        _ if path.starts_with("/passthrough/") => "/passthrough/:provider/*rest",
+        _ => "other",
+    }
 }
 
 fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
@@ -288,6 +322,29 @@ async fn livez(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoint_label_is_bounded_for_arbitrary_paths() {
+        // Known routes pass through unchanged.
+        assert_eq!(
+            normalize_endpoint_label("/v1/chat/completions"),
+            "/v1/chat/completions"
+        );
+        assert_eq!(normalize_endpoint_label("/v1/messages"), "/v1/messages");
+        // Passthrough collapses regardless of provider/suffix — this is the
+        // unbounded-cardinality vector from #451.
+        assert_eq!(
+            normalize_endpoint_label("/passthrough/openai/anything/unique-123"),
+            "/passthrough/:provider/*rest"
+        );
+        assert_eq!(
+            normalize_endpoint_label("/passthrough/openai/other-unique-456"),
+            "/passthrough/:provider/*rest"
+        );
+        // Arbitrary unauthenticated paths bucket to a single label.
+        assert_eq!(normalize_endpoint_label("/random/x"), "other");
+        assert_eq!(normalize_endpoint_label("/random/y"), "other");
+    }
 
     use aisix_core::resource::ResourceEntry;
     use aisix_core::snapshot::SnapshotHandle;
