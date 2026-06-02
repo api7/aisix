@@ -367,6 +367,13 @@ impl<'a, C: Clock> MultiReservation<'a, C> {
     /// pre-fix streaming path dropped it at handler return; that released
     /// the concurrency permit before the stream finished, letting a key
     /// capped at N run many more than N simultaneous streams (#450).
+    ///
+    /// `limiter` MUST be the same [`Limiter`] this reservation was acquired
+    /// against (in the proxy there is exactly one, behind `state.limiter`);
+    /// the guard decrements `in_flight` on it at drop. A borrow can't be
+    /// upgraded to an `Arc`, so the caller supplies the owned handle.
+    #[must_use = "dropping the returned guard immediately releases the concurrency \
+                  permit, recreating the early-release bug this fixes"]
     pub fn into_stream_hold(mut self, limiter: Arc<Limiter<C>>) -> StreamConcurrencyGuard<C> {
         let keys = self.keys();
         // Defuse each reservation's Drop so it doesn't release the permit
