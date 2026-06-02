@@ -178,7 +178,12 @@ pub struct OpenAiResponseMessage {
     pub reasoning_content: Option<String>,
 }
 
+// `#[serde(default)]` at the container level so an upstream that omits
+// any token counter (OpenAI-compatible providers vary on which fields
+// they return) deserializes to 0 instead of failing the whole response
+// body decode with `502 upstream_decode_error` (#474).
 #[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct OpenAiUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -437,8 +442,12 @@ pub(crate) struct OpenAiEmbeddingObject {
     pub embedding: EmbeddingVector,
 }
 
-/// Usage block from OpenAI's embeddings response.
+/// Usage block from OpenAI's embeddings response. `#[serde(default)]`
+/// so a provider that returns only `total_tokens` (e.g. Jina) — or omits
+/// usage fields entirely — still deserializes instead of failing with
+/// `502 upstream_decode_error` (#474).
 #[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 pub(crate) struct OpenAiEmbedUsage {
     pub prompt_tokens: u32,
     pub total_tokens: u32,
@@ -988,6 +997,51 @@ mod tests {
                 panic!("float request must deserialize as EmbeddingVector::Float")
             }
         }
+    }
+
+    #[test]
+    fn embeddings_response_tolerates_missing_prompt_tokens_474() {
+        // Jina's /v1/embeddings returns `usage.total_tokens` only,
+        // omitting `prompt_tokens`. Pre-#474 the required field made the
+        // whole body fail to deserialize -> `502 upstream_decode_error`.
+        let body = r#"{
+            "object": "list",
+            "model": "jina-embeddings-v5-text-small",
+            "data": [{
+                "index": 0,
+                "object": "embedding",
+                "embedding": [0.1]
+            }],
+            "usage": { "total_tokens": 6 }
+        }"#;
+        let raw: OpenAiEmbedResponse =
+            serde_json::from_str(body).expect("embeddings without prompt_tokens must deserialize");
+        let resp = embed_response_into(raw);
+        assert_eq!(resp.usage.prompt_tokens, 0);
+        assert_eq!(resp.usage.total_tokens, 6);
+    }
+
+    #[test]
+    fn chat_response_tolerates_partial_usage_474() {
+        // Same bug class as embeddings: a chat usage object missing some
+        // counters must not fail the response decode.
+        let body = r#"{
+            "id": "x",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": { "total_tokens": 3 }
+        }"#;
+        let raw: OpenAiResponse =
+            serde_json::from_str(body).expect("chat with partial usage must deserialize");
+        let out = response_into_chat_response(raw);
+        assert_eq!(out.usage.prompt_tokens, 0);
+        assert_eq!(out.usage.completion_tokens, 0);
+        assert_eq!(out.usage.total_tokens, 3);
     }
 
     #[test]

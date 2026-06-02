@@ -400,7 +400,11 @@ pub enum AnthropicResponseBlock {
     Other,
 }
 
+// `#[serde(default)]` at the container level so a response missing any
+// token counter deserializes to 0 rather than failing the whole body
+// decode (same bug class as OpenAI usage, #474).
 #[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct AnthropicUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
