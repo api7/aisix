@@ -472,7 +472,7 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
     ctx.model
         .model_name
         .as_deref()
-        .ok_or_else(|| BridgeError::Config("model.model_name missing".into()))
+        .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
 }
 
 /// Redact embedded userinfo from a URL string before echoing it
@@ -773,7 +773,7 @@ impl VertexBridge {
         // Vertex `anthropic_version`). Mirrors the Bedrock `/invoke`
         // body shaping, differing only in the version string.
         let (system, messages) =
-            split_system(req).map_err(|e| BridgeError::Config(format!("{e}")))?;
+            split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
         let anthropic_req = build_anthropic_request(req, upstream_id, system, messages, false);
         let mut body_value = serde_json::to_value(&anthropic_req)
             .map_err(|e| BridgeError::Config(format!("serialize Anthropic request body: {e}")))?;
@@ -861,7 +861,7 @@ impl VertexBridge {
         // in the body (only `model` is stripped into the URL). Add the
         // Vertex `anthropic_version`.
         let (system, messages) =
-            split_system(req).map_err(|e| BridgeError::Config(format!("{e}")))?;
+            split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
         let anthropic_req = build_anthropic_request(req, upstream_id, system, messages, true);
         let mut body_value = serde_json::to_value(&anthropic_req)
             .map_err(|e| BridgeError::Config(format!("serialize Anthropic request body: {e}")))?;
@@ -2624,10 +2624,10 @@ mod tests {
         let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(msg.contains("model_name missing"));
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 

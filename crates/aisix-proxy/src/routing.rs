@@ -44,6 +44,9 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool) -> bool {
             }
             !(400..500).contains(status)
         }
+        // Customer-fixable config (#367) is the caller's mistake —
+        // retrying or failing over won't help, same as a non-429 4xx.
+        BridgeError::InvalidUpstreamConfig(_) => false,
         BridgeError::Timeout { .. }
         | BridgeError::Transport(_)
         | BridgeError::UpstreamDecode(_)
@@ -591,6 +594,11 @@ mod tests {
         ));
         assert!(is_retryable(&BridgeError::Config("bad key".into()), false));
         assert!(is_retryable(&BridgeError::StreamAborted, false));
+        // #367: customer-fixable config is a 4xx — not retryable.
+        assert!(!is_retryable(
+            &BridgeError::InvalidUpstreamConfig("no api_base".into()),
+            false
+        ));
     }
 
     // ── filter_attempt_models ─────────────────────────────────────

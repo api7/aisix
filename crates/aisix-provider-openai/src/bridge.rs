@@ -129,7 +129,7 @@ impl OpenAiBridge {
                          provider_metadata.api_base_url on the control plane; standalone: \
                          directly on the resource)."
                     );
-                    return Err(BridgeError::Config(format!(
+                    return Err(BridgeError::InvalidUpstreamConfig(format!(
                         "provider_key for vendor {pk_vendor_raw:?} has no upstream base URL \
                          configured"
                     )));
@@ -201,7 +201,9 @@ fn normalize_canonical_openai(base: &str) -> String {
 fn api_key(ctx: &BridgeContext) -> Result<&str, BridgeError> {
     let k = &ctx.provider_key.secret;
     if k.is_empty() {
-        Err(BridgeError::Config("provider_key.secret is empty".into()))
+        Err(BridgeError::InvalidUpstreamConfig(
+            "provider_key.secret is empty".into(),
+        ))
     } else {
         Ok(k.as_str())
     }
@@ -211,7 +213,7 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
     ctx.model
         .model_name
         .as_deref()
-        .ok_or_else(|| BridgeError::Config("model.model_name missing".into()))
+        .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
 }
 
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
@@ -332,8 +334,9 @@ fn build_request_headers(
     request: Option<&RequestOverrides>,
 ) -> Result<HeaderMap, BridgeError> {
     let mut headers = HeaderMap::new();
-    let auth = HeaderValue::from_str(&format!("Bearer {api_key_str}"))
-        .map_err(|e| BridgeError::Config(format!("api key contains invalid header chars: {e}")))?;
+    let auth = HeaderValue::from_str(&format!("Bearer {api_key_str}")).map_err(|e| {
+        BridgeError::InvalidUpstreamConfig(format!("api key contains invalid header chars: {e}"))
+    })?;
     headers.insert(header::AUTHORIZATION, auth);
     headers.insert(
         header::CONTENT_TYPE,
@@ -1074,7 +1077,7 @@ mod tests {
         let bridge = OpenAiBridge::new();
         let ctx = BridgeContext::new("req-1", sample_model(), Arc::new(pk));
         let err = bridge.chat(&req(), &ctx).await.unwrap_err();
-        assert!(matches!(err, BridgeError::Config(_)));
+        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
     }
 
     #[tokio::test]
@@ -1194,7 +1197,7 @@ data: [DONE]\n\n";
             let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
             let err = bridge.resolve_base(&ctx).unwrap_err();
             match err {
-                BridgeError::Config(msg) => {
+                BridgeError::InvalidUpstreamConfig(msg) => {
                     assert!(
                         msg.contains("base URL") && msg.contains(vendor.trim()),
                         "vendor {vendor:?}: error must name vendor + base URL; got: {msg}",
@@ -1210,7 +1213,9 @@ data: [DONE]\n\n";
                         );
                     }
                 }
-                other => panic!("vendor {vendor:?}: expected BridgeError::Config, got {other:?}"),
+                other => {
+                    panic!("vendor {vendor:?}: expected InvalidUpstreamConfig, got {other:?}")
+                }
             }
         }
     }

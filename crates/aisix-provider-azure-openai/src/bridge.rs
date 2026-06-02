@@ -394,7 +394,9 @@ impl AzureSecret {
     pub(crate) fn parse(secret: &str) -> Result<Self, BridgeError> {
         let trimmed = secret.trim();
         if trimmed.is_empty() {
-            return Err(BridgeError::Config("provider_key.secret is empty".into()));
+            return Err(BridgeError::InvalidUpstreamConfig(
+                "provider_key.secret is empty".into(),
+            ));
         }
         if trimmed.starts_with('{') {
             let creds: crate::aad_token_mint::AadCredentials = serde_json::from_str(trimmed)
@@ -430,7 +432,7 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
     ctx.model
         .model_name
         .as_deref()
-        .ok_or_else(|| BridgeError::Config("model.model_name missing".into()))
+        .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
 }
 
 /// Map an Azure HTTP error response to a customer-visible
@@ -600,7 +602,9 @@ fn build_request_headers(
     match (&auth.api_key, &auth.bearer_token) {
         (Some(key), None) => {
             let value = HeaderValue::from_str(key).map_err(|e| {
-                BridgeError::Config(format!("api key contains invalid header chars: {e}"))
+                BridgeError::InvalidUpstreamConfig(format!(
+                    "api key contains invalid header chars: {e}"
+                ))
             })?;
             headers.insert(HeaderName::from_static("api-key"), value);
         }
@@ -1328,7 +1332,7 @@ mod tests {
         // headers via the api-key value.
         let err = build_request_headers(&api_key_auth("legit\nx-evil: 1"), "req-1", false, None)
             .unwrap_err();
-        assert!(matches!(err, BridgeError::Config(_)));
+        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
     }
 
     #[test]
@@ -1366,10 +1370,10 @@ mod tests {
         let req = ChatFormat::new("customer-facing-name", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(msg.contains("secret is empty"), "got {msg}");
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -2039,7 +2043,7 @@ mod tests {
     #[test]
     fn azure_secret_rejects_empty_secret() {
         let err = AzureSecret::parse("   ").unwrap_err();
-        assert!(matches!(err, BridgeError::Config(_)));
+        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
     }
 
     #[test]

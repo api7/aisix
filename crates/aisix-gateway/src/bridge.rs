@@ -155,6 +155,15 @@ pub enum BridgeError {
     UpstreamDecode(String),
     #[error("bridge is misconfigured: {0}")]
     Config(String),
+    /// Customer-fixable upstream config — the admin's ProviderKey/Model
+    /// is set up wrong (empty secret, missing api_base, missing
+    /// model_name) or the caller's request/key is malformed. Maps to
+    /// 400, not 500: it's the caller's mistake, retrying won't help, and
+    /// a 5xx wrongly tells SDKs/monitoring it's a server fault (#367).
+    /// Contrast [`Config`], reserved for errors *we* cause
+    /// (serialization, our generated request_id) which stays 500.
+    #[error("invalid upstream configuration: {0}")]
+    InvalidUpstreamConfig(String),
     #[error("transport error: {0}")]
     Transport(String),
     #[error("upstream cancelled the response mid-stream")]
@@ -361,6 +370,7 @@ impl BridgeError {
             }
             BridgeError::UpstreamDecode(_) => 502,
             BridgeError::Config(_) => 500,
+            BridgeError::InvalidUpstreamConfig(_) => 400,
             BridgeError::Transport(_) => 502,
             BridgeError::StreamAborted => 502,
         }
@@ -373,6 +383,7 @@ impl BridgeError {
             BridgeError::UpstreamStatus { .. } => "upstream_error",
             BridgeError::UpstreamDecode(_) => "upstream_decode_error",
             BridgeError::Config(_) => "config_error",
+            BridgeError::InvalidUpstreamConfig(_) => "invalid_request_error",
             BridgeError::Transport(_) => "transport_error",
             BridgeError::StreamAborted => "stream_aborted",
         }
@@ -537,6 +548,20 @@ mod tests {
             BridgeError::Config("missing api_key".into()).http_status(),
             500
         );
+        assert_eq!(
+            BridgeError::Config("missing api_key".into()).error_type(),
+            "config_error"
+        );
+    }
+
+    #[test]
+    fn invalid_upstream_config_maps_to_400_invalid_request() {
+        // #367: customer-fixable config (empty secret, missing api_base,
+        // missing model_name, …) is a 400, not a 500 — retrying won't
+        // help and a 5xx wrongly reads as a server fault.
+        let e = BridgeError::InvalidUpstreamConfig("provider_key.secret is empty".into());
+        assert_eq!(e.http_status(), 400);
+        assert_eq!(e.error_type(), "invalid_request_error");
     }
 
     #[test]
