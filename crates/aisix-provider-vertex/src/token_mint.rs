@@ -76,25 +76,25 @@ impl ServiceAccountKey {
     /// the first mint will catch a malformed key with a clear message.
     pub fn validate(&self) -> Result<(), BridgeError> {
         if self.typ != "service_account" {
-            return Err(BridgeError::Config(format!(
+            return Err(BridgeError::InvalidUpstreamConfig(format!(
                 "vertex service_account_json.type = {:?}, want \"service_account\"",
                 self.typ
             )));
         }
         if !self.private_key.starts_with("-----BEGIN") {
-            return Err(BridgeError::Config(
+            return Err(BridgeError::InvalidUpstreamConfig(
                 "vertex service_account_json.private_key is not PEM-formatted \
                  (expected `-----BEGIN PRIVATE KEY-----` or `-----BEGIN RSA PRIVATE KEY-----`)"
                     .into(),
             ));
         }
         if self.client_email.is_empty() {
-            return Err(BridgeError::Config(
+            return Err(BridgeError::InvalidUpstreamConfig(
                 "vertex service_account_json.client_email is empty".into(),
             ));
         }
         if self.token_uri.is_empty() {
-            return Err(BridgeError::Config(
+            return Err(BridgeError::InvalidUpstreamConfig(
                 "vertex service_account_json.token_uri is empty".into(),
             ));
         }
@@ -450,10 +450,10 @@ mod tests {
         let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(server.uri());
         let err = minter.get_token(&sa).await.err().unwrap();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(msg.contains("not PEM-formatted"));
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -475,12 +475,12 @@ mod tests {
         let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(server.uri());
         let err = minter.get_token(&sa).await.err().unwrap();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(msg.contains("type"));
                 assert!(msg.contains("external_account"));
                 assert!(msg.contains("service_account"));
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 

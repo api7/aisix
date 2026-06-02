@@ -306,7 +306,7 @@ impl BedrockSecret {
     /// generic shape errors.
     fn parse(secret: &str) -> Result<Self, BridgeError> {
         if secret.trim().is_empty() {
-            return Err(BridgeError::Config(
+            return Err(BridgeError::InvalidUpstreamConfig(
                 "bedrock provider_key.secret is empty — \
                  expected JSON {access_key_id, secret_access_key, region, session_token?}"
                     .into(),
@@ -318,7 +318,7 @@ impl BedrockSecret {
             // "invalid character 'X' at position N" reveals what's
             // in the JSON). Generic shape hint is enough for the
             // operator who controls the registration.
-            BridgeError::Config(
+            BridgeError::InvalidUpstreamConfig(
                 "bedrock provider_key.secret must be valid JSON: \
                  {access_key_id, secret_access_key, region, session_token?}"
                     .into(),
@@ -335,7 +335,7 @@ fn build_client(
     request: Option<&RequestOverrides>,
 ) -> Result<BedrockClient, BridgeError> {
     if creds.region.trim().is_empty() {
-        return Err(BridgeError::Config(
+        return Err(BridgeError::InvalidUpstreamConfig(
             "bedrock provider_key.secret.region is empty — \
              AWS Bedrock dispatch is region-keyed and requires e.g. \"us-west-2\""
                 .into(),
@@ -1456,7 +1456,7 @@ mod tests {
     fn bedrock_secret_rejects_empty() {
         let err = BedrockSecret::parse("").unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(
                     msg.contains("secret is empty"),
                     "must mention empty secret; got {msg}"
@@ -1466,7 +1466,7 @@ mod tests {
                     "must hint at required JSON shape; got {msg}"
                 );
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -1474,13 +1474,13 @@ mod tests {
     fn bedrock_secret_rejects_non_json() {
         let err = BedrockSecret::parse("AKIA-test").unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(
                     msg.contains("must be valid JSON"),
                     "must mention JSON requirement; got {msg}"
                 );
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -1492,7 +1492,7 @@ mod tests {
         let secret_with_distinctive_bytes = "X-DISTINCTIVE-LEAK-MARKER-Y";
         let err = BedrockSecret::parse(secret_with_distinctive_bytes).unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(
                     !msg.contains("X-DISTINCTIVE-LEAK-MARKER-Y"),
                     "error must NOT echo raw secret bytes; got {msg}"
@@ -1502,7 +1502,7 @@ mod tests {
                     "error must NOT leak partial secret bytes; got {msg}"
                 );
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -1515,7 +1515,7 @@ mod tests {
         // required).
         let json = r#"{"access_key_id":"AKIA","secret_access_key":"sk"}"#;
         let err = BedrockSecret::parse(json).unwrap_err();
-        assert!(matches!(err, BridgeError::Config(_)));
+        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
     }
 
     // ─── Pre-dispatch validation tests ─────────────────────────────────
@@ -1586,10 +1586,10 @@ mod tests {
         let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(msg.contains("must be valid JSON"));
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -1604,10 +1604,10 @@ mod tests {
         let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(msg.contains("secret is empty"));
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
