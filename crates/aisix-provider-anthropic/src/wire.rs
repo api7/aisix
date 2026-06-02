@@ -545,6 +545,17 @@ pub enum AnthropicStreamEvent {
 pub struct AnthropicStreamStartMessage {
     pub id: String,
     pub model: String,
+    /// `message_start` carries the prompt token count in `usage.input_tokens`.
+    /// Anthropic only sends it on this first event, so we must capture it here
+    /// or prompt tokens are lost for the whole stream (TPM/budget/telemetry).
+    #[serde(default)]
+    pub usage: Option<AnthropicStreamStartUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnthropicStreamStartUsage {
+    #[serde(default)]
+    pub input_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -575,6 +586,10 @@ pub struct AnthropicStreamUsage {
 pub struct StreamState {
     pub id: String,
     pub model: String,
+    /// Prompt tokens captured from `message_start`; folded into the usage
+    /// emitted on the terminal `message_delta` so the final `UsageStats`
+    /// carries both prompt and completion (and a correct total).
+    pub input_tokens: u32,
 }
 
 impl StreamState {
@@ -582,6 +597,9 @@ impl StreamState {
         if let AnthropicStreamEvent::MessageStart { message } = event {
             self.id = message.id.clone();
             self.model = message.model.clone();
+            if let Some(input) = message.usage.as_ref().and_then(|u| u.input_tokens) {
+                self.input_tokens = input;
+            }
         }
     }
 
@@ -607,9 +625,10 @@ impl StreamState {
                     .stop_reason
                     .as_deref()
                     .map(|r| map_stop_reason(Some(r)));
-                let usage = usage
-                    .as_ref()
-                    .and_then(|u| u.output_tokens.map(|n| UsageStats::new(0, n)));
+                let usage = usage.as_ref().and_then(|u| {
+                    u.output_tokens
+                        .map(|n| UsageStats::new(self.input_tokens, n))
+                });
                 if finish.is_none() && usage.is_none() {
                     return None;
                 }
@@ -1739,6 +1758,7 @@ mod tests {
         let state = StreamState {
             id: "msg".into(),
             model: "claude".into(),
+            ..Default::default()
         };
         let end: AnthropicStreamEvent = serde_json::from_str(
             r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
@@ -1747,6 +1767,29 @@ mod tests {
         let chunk = state.to_chunk(&end).unwrap();
         assert_eq!(chunk.finish_reason, Some(FinishReason::Stop));
         assert_eq!(chunk.usage.unwrap().completion_tokens, 3);
+    }
+
+    #[test]
+    fn stream_state_carries_message_start_input_tokens_into_final_usage() {
+        // message_start input_tokens must survive into the usage emitted on
+        // the terminal message_delta — otherwise prompt tokens are dropped
+        // for the whole stream (TPM/budget/telemetry undercount). See #450.
+        let mut state = StreamState::default();
+        let start: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"message_start","message":{"id":"m","model":"claude","type":"message","role":"assistant","content":[],"stop_reason":null,"usage":{"input_tokens":37,"output_tokens":1}}}"#,
+        )
+        .unwrap();
+        state.update(&start);
+        assert_eq!(state.input_tokens, 37);
+
+        let end: AnthropicStreamEvent = serde_json::from_str(
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":52}}"#,
+        )
+        .unwrap();
+        let usage = state.to_chunk(&end).unwrap().usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 37);
+        assert_eq!(usage.completion_tokens, 52);
+        assert_eq!(usage.total_tokens, 89);
     }
 
     // ─── parse_inbound_request ────────────────────────────────────
