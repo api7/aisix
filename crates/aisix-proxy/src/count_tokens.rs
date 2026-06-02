@@ -318,19 +318,7 @@ async fn count_tokens_to_target(
         let status_u16 = status.as_u16();
         let retry_after = aisix_gateway::parse_retry_after(upstream_resp.headers());
         let message = upstream_resp.text().await.unwrap_or_default();
-        let truncated = if message.len() > 1024 {
-            // Truncate on a UTF-8 char boundary — slicing at the raw byte
-            // index 1024 panics when it splits a multibyte codepoint,
-            // which a non-ASCII upstream error body can trigger on this
-            // error path.
-            let end = (0..=1024)
-                .rev()
-                .find(|&i| message.is_char_boundary(i))
-                .unwrap_or(0);
-            format!("{}…", &message[..end])
-        } else {
-            message
-        };
+        let truncated = crate::util::truncate_on_char_boundary(&message, 1024);
         let err = aisix_gateway::BridgeError::upstream_status_with_retry_after(
             status_u16,
             truncated,

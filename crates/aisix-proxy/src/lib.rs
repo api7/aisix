@@ -49,6 +49,7 @@ mod rerank;
 mod responses;
 mod routing;
 mod state;
+mod util;
 
 pub use auth::AuthenticatedKey;
 pub use error::{ErrorEnvelope, ProxyError};
