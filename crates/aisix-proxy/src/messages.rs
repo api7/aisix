@@ -1051,6 +1051,11 @@ fn build_anthropic_sse_stream(
         // LiteLLM's streaming guardrail), so a blocked response is signalled
         // with a terminal `error` event rather than held back.
         let mut content_text = String::new();
+        // Also collect streamed tool-call fragments so tool-call output is
+        // scanned too (parity with the non-streaming path). Fragments are
+        // kept raw — the guardrail scans their serialized text, no need to
+        // reassemble by index.
+        let mut tool_call_fragments: Vec<serde_json::Value> = Vec::new();
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => {
@@ -1082,6 +1087,9 @@ fn build_anthropic_sse_stream(
                         if let Some(t) = chunk.delta.content.as_deref() {
                             content_text.push_str(t);
                         }
+                        if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
+                            tool_call_fragments.extend(tcs.iter().cloned());
+                        }
                     }
                     for ev in encoder.next_events(&chunk) {
                         yield Ok::<_, std::io::Error>(bytes::Bytes::from(ev.to_sse_string()));
@@ -1105,11 +1113,21 @@ fn build_anthropic_sse_stream(
         // assistant text and, on a block, emit a terminal Anthropic
         // `error` event instead of completing the stream cleanly.
         if let Some(chain) = output_guardrail.as_ref() {
-            if !content_text.is_empty() {
+            if !content_text.is_empty() || !tool_call_fragments.is_empty() {
+                let mut message =
+                    aisix_gateway::ChatMessage::assistant(std::mem::take(&mut content_text));
+                if !tool_call_fragments.is_empty() {
+                    // guardrail_output_text() serializes extra["tool_calls"],
+                    // so streamed tool-call arguments are scanned too.
+                    message.extra.insert(
+                        "tool_calls".to_string(),
+                        serde_json::Value::Array(std::mem::take(&mut tool_call_fragments)),
+                    );
+                }
                 let synth = aisix_gateway::ChatResponse {
                     id: String::new(),
                     model: model_label.clone(),
-                    message: aisix_gateway::ChatMessage::assistant(std::mem::take(&mut content_text)),
+                    message,
                     finish_reason: aisix_gateway::FinishReason::Stop,
                     usage: aisix_gateway::UsageStats::new(0, 0),
                 };
@@ -1404,14 +1422,31 @@ fn update_anthropic_usage(
                 *first_token_seen = true;
                 acc.ttft_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
             }
-            // Accumulate assistant text for the end-of-stream output
-            // guardrail (#448). text_delta carries `delta.text`.
-            if let Some(t) = json
-                .get("delta")
-                .and_then(|d| d.get("text"))
-                .and_then(Value::as_str)
-            {
-                acc.response_text.push_str(t);
+            // Accumulate assistant output for the end-of-stream output
+            // guardrail (#448). text streams as `delta.text`; tool_use
+            // streams its name in `content_block.{name,input}` on
+            // content_block_start and its arguments as `delta.partial_json`
+            // on input_json_delta — scan all of it.
+            if let Some(delta) = json.get("delta") {
+                if let Some(t) = delta.get("text").and_then(Value::as_str) {
+                    acc.response_text.push('\n');
+                    acc.response_text.push_str(t);
+                }
+                if let Some(pj) = delta.get("partial_json").and_then(Value::as_str) {
+                    acc.response_text.push_str(pj);
+                }
+            }
+            if let Some(cb) = json.get("content_block") {
+                if let Some(name) = cb.get("name").and_then(Value::as_str) {
+                    acc.response_text.push('\n');
+                    acc.response_text.push_str(name);
+                }
+                if let Some(input) = cb.get("input") {
+                    if !input.is_null() {
+                        acc.response_text.push('\n');
+                        acc.response_text.push_str(&input.to_string());
+                    }
+                }
             }
         }
         Some("message_delta") => {
