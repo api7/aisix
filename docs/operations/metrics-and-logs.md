@@ -16,6 +16,16 @@ This endpoint is unauthenticated by design on the private admin listener.
 
 Treat `/metrics` as infrastructure-facing, not as a public diagnostics surface.
 
+:::note `/metrics` is empty before the first request
+Metric families are registered lazily on first observation — the gateway does not pre-register `# HELP` / `# TYPE` lines at startup. Immediately after boot, `GET /metrics` returns an empty body. This is expected, not a misconfigured endpoint. To smoke-test, send one model request and then re-check `/metrics`; you should now see series such as `aisix_requests_total` and `aisix_tokens_consumed_total`.
+:::
+
+### Managed Data Plane Metrics
+
+The `/metrics` endpoint lives on the **admin listener**, which a Cloud managed data plane does not bind. So a managed DP does **not** expose `/metrics` for local scraping.
+
+To get metrics off a managed data plane into your own Prometheus/OTLP stack, configure an OTLP exporter through the AISIX Cloud control plane (the same `otlp_http` exporter resource described below). The data plane fans metrics/telemetry out to the configured collector rather than waiting to be scraped. Self-hosted standalone deployments keep using local `/metrics` scraping as usual.
+
 AISIX exposes native metric names with the `aisix_` prefix. Existing compatibility series remain:
 
 - `aisix_requests_total`
