@@ -830,11 +830,18 @@ async fn dispatch(
                 return Err(with_model(ProxyError::Bridge(err)).with_routing(routing));
             }
         };
-        // Drop the reservation now: concurrency releases on all layers.
-        // RPM was already counted by pre_commit. TPM is updated
-        // retroactively on stream-end by `add_tokens_post_stream`.
+        // Hold concurrency for the stream's full lifetime instead of
+        // releasing it at handler return. RPM was already counted by
+        // pre_commit; TPM is updated retroactively on stream-end by
+        // `add_tokens_post_stream`. The borrow-based reservation can't be
+        // carried into the stream, so convert it into an owned guard that
+        // releases the permit(s) on drop — i.e. when the stream completes
+        // or is cancelled (the guard is moved into the on_complete closure,
+        // which the CompleteOnDrop guard fires on both paths). Pre-fix the
+        // permit was released here, letting a key capped at N run far more
+        // than N simultaneous streams (#450).
         let post_stream_keys = reservation.keys();
-        drop(reservation);
+        let stream_concurrency_hold = reservation.into_stream_hold(Arc::clone(&state.limiter));
         // Capture everything the stream-completion callback needs so
         // it can fire `emit_usage_event` once the terminal SSE chunk
         // has yielded its `usage` block. Telemetry emission has to
@@ -987,6 +994,11 @@ async fn dispatch(
                     },
                     Duration::from_millis(u64::from(comp.ttft_ms)),
                 );
+                // Release the concurrency permit(s) now that the stream has
+                // completed (or was cancelled). on_complete is fired by the
+                // CompleteOnDrop guard on both paths, so the permit is held
+                // for the stream's full lifetime and never leaked (#450).
+                drop(stream_concurrency_hold);
             },
         );
         let response =

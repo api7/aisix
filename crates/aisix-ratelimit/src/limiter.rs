@@ -356,6 +356,69 @@ impl<'a, C: Clock> MultiReservation<'a, C> {
     pub fn keys(&self) -> Vec<String> {
         self.reservations.iter().map(|r| r.key.clone()).collect()
     }
+
+    /// Convert into an owned [`StreamConcurrencyGuard`] for the streaming
+    /// path. The per-layer concurrency permits stay held — they are NOT
+    /// released here — and are released only when the returned guard drops,
+    /// i.e. at stream completion or cancellation. Token accounting still
+    /// happens via [`Limiter::add_tokens_post_stream`].
+    ///
+    /// A borrow-based reservation can't outlive the request handler, so the
+    /// pre-fix streaming path dropped it at handler return; that released
+    /// the concurrency permit before the stream finished, letting a key
+    /// capped at N run many more than N simultaneous streams (#450).
+    pub fn into_stream_hold(mut self, limiter: Arc<Limiter<C>>) -> StreamConcurrencyGuard<C> {
+        let keys = self.keys();
+        // Defuse each reservation's Drop so it doesn't release the permit
+        // now; the returned guard owns release from here on.
+        for r in &mut self.reservations {
+            r.committed = true;
+        }
+        StreamConcurrencyGuard {
+            limiter,
+            keys,
+            released: false,
+        }
+    }
+}
+
+/// Owned concurrency hold for the streaming path. Holds an `Arc<Limiter>`
+/// and the reserved keys, and releases the concurrency permit(s) on drop —
+/// i.e. when the stream completes or is cancelled — instead of at handler
+/// return. See [`MultiReservation::into_stream_hold`].
+pub struct StreamConcurrencyGuard<C: Clock = SystemClock> {
+    limiter: Arc<Limiter<C>>,
+    keys: Vec<String>,
+    released: bool,
+}
+
+impl<C: Clock> StreamConcurrencyGuard<C> {
+    fn release_now(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        for key in &self.keys {
+            let state = self.limiter.state_for(key);
+            let mut s = state.lock();
+            s.in_flight = s.in_flight.saturating_sub(1);
+        }
+    }
+}
+
+impl<C: Clock> std::fmt::Debug for StreamConcurrencyGuard<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamConcurrencyGuard")
+            .field("keys", &self.keys)
+            .field("released", &self.released)
+            .finish()
+    }
+}
+
+impl<C: Clock> Drop for StreamConcurrencyGuard<C> {
+    fn drop(&mut self) {
+        self.release_now();
+    }
 }
 
 impl<'a, C: Clock> std::fmt::Debug for MultiReservation<'a, C> {
@@ -757,6 +820,29 @@ mod tests {
 
         assert!(limiter.pre_commit("k1", &l).is_ok());
         assert!(limiter.pre_commit("k2", &l).is_ok());
+    }
+
+    #[test]
+    fn stream_hold_keeps_concurrency_until_guard_drop() {
+        // #450: a streaming request must keep its concurrency permit for the
+        // stream's full lifetime, not release it at handler return.
+        let clock = TestClock::new(100);
+        let limiter = std::sync::Arc::new(Limiter::with_clock(clock.clone()));
+        let l = limits(None, None, Some(1));
+
+        let r = limiter.pre_commit("k", &l).unwrap();
+        let hold = MultiReservation::new(vec![r]).into_stream_hold(std::sync::Arc::clone(&limiter));
+
+        // Permit is still held while the stream runs — a second concurrent
+        // request is rejected.
+        assert!(matches!(
+            limiter.pre_commit("k", &l).unwrap_err(),
+            RateLimitError::Concurrency
+        ));
+
+        // Stream completes/cancels → guard drops → permit released.
+        drop(hold);
+        assert!(limiter.pre_commit("k", &l).is_ok());
     }
 
     #[test]
