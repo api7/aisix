@@ -77,6 +77,36 @@ async fn main() -> anyhow::Result<()> {
     run(cfg).await
 }
 
+/// Which managed-mode mTLS bootstrap path to take, given whether a
+/// bundle is persisted on disk and whether the env/file vars supply a
+/// fresh one. Pure so the precedence rule is unit-tested independently
+/// of the side-effecting boot.
+#[derive(Debug, PartialEq, Eq)]
+enum ManagedBootPath {
+    /// Neither a persisted bundle nor supplied certs — cannot boot.
+    MissingBundle,
+    /// Supplied certs take precedence: (re)provision from them,
+    /// overwriting any persisted bundle. This is what makes a CA
+    /// rotation land — the on-disk bundle may be stale (#265).
+    ProvisionFromEnv,
+    /// No supplied certs; reuse the bundle persisted by a prior boot.
+    ReusePersisted,
+}
+
+/// Supplied certs win over the persisted bundle. Before #265 a persisted
+/// bundle was preferred even when env vars carried freshly-rotated
+/// certs, so a rotated CP CA left the DP pinned to a stale CA and every
+/// etcd/heartbeat connection failed with `UnknownIssuer`.
+fn select_managed_boot_path(bundle_on_disk: bool, bundle_provided: bool) -> ManagedBootPath {
+    if bundle_provided {
+        ManagedBootPath::ProvisionFromEnv
+    } else if bundle_on_disk {
+        ManagedBootPath::ReusePersisted
+    } else {
+        ManagedBootPath::MissingBundle
+    }
+}
+
 /// Factored out of `main` so the integration tests can drive the full
 /// startup with a real config struct and still use `#[tokio::test]`.
 async fn run(mut cfg: Config) -> anyhow::Result<()> {
@@ -102,7 +132,8 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             mtls_dir = %cfg.managed.mtls_dir,
             "managed-mode bootstrap branch inputs",
         );
-        if !bundle_on_disk && !bundle_provided {
+        let boot_path = select_managed_boot_path(bundle_on_disk, bundle_provided);
+        if boot_path == ManagedBootPath::MissingBundle {
             // In managed mode we MUST have at least one of:
             //   - a persisted bundle in mtls_dir (subsequent boot)
             //   - cert + key + CA PEMs (api7ee parity, dashboard mint)
@@ -120,12 +151,11 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 cfg.managed.mtls_dir,
             );
         }
-        if !bundle_on_disk && bundle_provided {
-            // api7ee-parity bootstrap: operator minted a cert via the
-            // dashboard, inlined the three PEMs into env vars (or
-            // referenced files on disk). Materialise the bundle to
-            // `mtls_dir`, parse env_id + dp_id from the leaf SAN, and
-            // populate cfg.etcd.*. No /dp/register round-trip.
+        if boot_path == ManagedBootPath::ProvisionFromEnv {
+            // Supplied certs win over any persisted bundle: materialise
+            // them to `mtls_dir` (overwriting a stale bundle — the #265
+            // CA-rotation fix), parse env_id + dp_id from the leaf SAN,
+            // and populate cfg.etcd.*. No /dp/register round-trip.
             tracing::info!("managed mode: provisioning from supplied cert bundle (api7ee parity)");
             let p = cert_bundle::provision(&cfg.managed)
                 .await
@@ -175,7 +205,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                     extra_ca_pem: extra_ca_pem.clone(),
                 },
             ))
-        } else if bundle_on_disk {
+        } else if boot_path == ManagedBootPath::ReusePersisted {
             // Bundle persisted from a previous boot; load the dp_id
             // and env_id from disk and synthesise heartbeat config
             // from the configured cp_base_url. Registration doesn't
@@ -940,6 +970,32 @@ async fn wait_for_signal(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn supplied_certs_take_precedence_over_persisted_bundle() {
+        // The #265 fix: when env/file vars supply a fresh bundle it must
+        // win even if a (possibly stale) bundle is already on disk —
+        // otherwise a rotated CP CA leaves the DP pinned to the old one.
+        assert_eq!(
+            select_managed_boot_path(true, true),
+            ManagedBootPath::ProvisionFromEnv,
+        );
+        // Supplied-only (first boot): provision.
+        assert_eq!(
+            select_managed_boot_path(false, true),
+            ManagedBootPath::ProvisionFromEnv,
+        );
+        // Persisted-only (no env): reuse the disk bundle.
+        assert_eq!(
+            select_managed_boot_path(true, false),
+            ManagedBootPath::ReusePersisted,
+        );
+        // Neither: cannot boot.
+        assert_eq!(
+            select_managed_boot_path(false, false),
+            ManagedBootPath::MissingBundle,
+        );
+    }
 
     #[test]
     fn cli_requires_config_path() {
