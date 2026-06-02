@@ -340,7 +340,7 @@ impl Guardrail for BedrockGuardrail {
 fn collect_input_text(req: &ChatFormat) -> String {
     req.messages
         .iter()
-        .map(|m| m.content.as_str())
+        .map(crate::message_scan_text)
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
