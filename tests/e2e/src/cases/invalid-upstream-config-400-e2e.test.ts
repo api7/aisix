@@ -65,7 +65,7 @@ describe("invalid upstream config maps to 400 e2e", () => {
     await upstream?.close();
   });
 
-  test("empty provider_key secret surfaces as a 400, not a 500", async (ctx) => {
+  test("family-adapter PK without api_base surfaces as a 400, not a 500", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
       return;

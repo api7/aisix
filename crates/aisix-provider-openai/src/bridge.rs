@@ -201,12 +201,20 @@ fn normalize_canonical_openai(base: &str) -> String {
 fn api_key(ctx: &BridgeContext) -> Result<&str, BridgeError> {
     let k = &ctx.provider_key.secret;
     if k.is_empty() {
-        Err(BridgeError::InvalidUpstreamConfig(
+        return Err(BridgeError::InvalidUpstreamConfig(
             "provider_key.secret is empty".into(),
-        ))
-    } else {
-        Ok(k.as_str())
+        ));
     }
+    // Reject a secret that can't be a valid Authorization header value
+    // (control bytes etc.) up front as customer-fixable config. Several
+    // endpoints build the `Bearer {key}` header inline rather than via
+    // build_request_headers, so validating here covers them all (#367).
+    if HeaderValue::from_str(k).is_err() {
+        return Err(BridgeError::InvalidUpstreamConfig(
+            "provider_key.secret contains invalid header characters".into(),
+        ));
+    }
+    Ok(k.as_str())
 }
 
 fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
