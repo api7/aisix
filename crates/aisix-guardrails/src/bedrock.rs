@@ -207,11 +207,13 @@ impl BedrockGuardrail {
     }
 
     fn handle_failure(&self, failure: BedrockFailure) -> GuardrailVerdict {
-        let reason = failure.bypass_tag();
+        let (reason, error_detail, error_source) = failure.log_fields();
         tracing::warn!(
             row = %self.row_name,
             guardrail_id = %self.guardrail_id,
-            failure = ?failure,
+            failure_tag = reason,
+            error = error_detail,
+            source = error_source,
             fail_open = self.fail_open,
             "bedrock ApplyGuardrail call failed",
         );
@@ -230,12 +232,21 @@ impl BedrockGuardrail {
 /// Failure cause buckets that map onto `guardrail_bypassed_reason`
 /// telemetry tags. `Other` collapses every long-tail SDK error onto
 /// `bedrock_5xx` so an unrecognised AWS error doesn't leak its
-/// internal shape into our wire schema.
+/// internal shape into our wire schema — but it carries the original
+/// SDK error detail for the failure log line so operators can tell a
+/// network blip from an auth/validation error (#106).
 #[derive(Debug)]
 enum BedrockFailure {
     Timeout,
     Throttled,
-    Other,
+    Other {
+        /// Human-readable detail for logs: the modeled service error
+        /// (carries the exception code, e.g. AccessDeniedException) or
+        /// the dispatch/transport error Display.
+        detail: String,
+        /// The underlying cause (hyper/rustls/sigv4) when present.
+        source: Option<String>,
+    },
 }
 
 impl BedrockFailure {
@@ -245,15 +256,39 @@ impl BedrockFailure {
             if matches!(svc.err(), ApplyGuardrailError::ThrottlingException(_)) {
                 return Self::Throttled;
             }
+            // Surface the modeled service error — its Debug carries the
+            // exception code (AccessDeniedException, ValidationException,
+            // …) so the failure log is greppable.
+            return Self::Other {
+                detail: format!("{:?}", svc.err()),
+                source: std::error::Error::source(&err).map(|s| s.to_string()),
+            };
         }
-        Self::Other
+        // Dispatch / response / construction / timeout: the SdkError
+        // Display names the variant; source() reaches the underlying
+        // hyper/rustls/sigv4 error.
+        Self::Other {
+            detail: err.to_string(),
+            source: std::error::Error::source(&err).map(|s| s.to_string()),
+        }
     }
 
     fn bypass_tag(&self) -> &'static str {
         match self {
             Self::Timeout => "bedrock_timeout",
             Self::Throttled => "bedrock_throttled",
-            Self::Other => "bedrock_5xx",
+            Self::Other { .. } => "bedrock_5xx",
+        }
+    }
+
+    /// Fields for the failure log line: the wire-stable tag plus, for
+    /// `Other`, the captured SDK error detail and underlying source.
+    fn log_fields(&self) -> (&'static str, Option<&str>, Option<&str>) {
+        match self {
+            Self::Other { detail, source } => {
+                (self.bypass_tag(), Some(detail.as_str()), source.as_deref())
+            }
+            _ => (self.bypass_tag(), None, None),
         }
     }
 }
@@ -337,7 +372,35 @@ mod tests {
     fn bypass_tags_match_wire_contract() {
         assert_eq!(BedrockFailure::Timeout.bypass_tag(), "bedrock_timeout");
         assert_eq!(BedrockFailure::Throttled.bypass_tag(), "bedrock_throttled");
-        assert_eq!(BedrockFailure::Other.bypass_tag(), "bedrock_5xx");
+        assert_eq!(
+            BedrockFailure::Other {
+                detail: "x".into(),
+                source: None,
+            }
+            .bypass_tag(),
+            "bedrock_5xx",
+        );
+    }
+
+    /// #106: the `Other` bucket keeps the wire-stable `bedrock_5xx`
+    /// tag but surfaces the captured SDK error detail + source so the
+    /// failure log line is greppable. The non-`Other` buckets carry no
+    /// extra detail.
+    #[test]
+    fn other_failure_log_fields_carry_detail_and_source() {
+        let f = BedrockFailure::Other {
+            detail: "AccessDeniedException(...)".into(),
+            source: Some("dispatch failure: connection refused".into()),
+        };
+        let (tag, detail, source) = f.log_fields();
+        assert_eq!(tag, "bedrock_5xx");
+        assert_eq!(detail, Some("AccessDeniedException(...)"));
+        assert_eq!(source, Some("dispatch failure: connection refused"));
+
+        let (tag, detail, source) = BedrockFailure::Timeout.log_fields();
+        assert_eq!(tag, "bedrock_timeout");
+        assert_eq!(detail, None);
+        assert_eq!(source, None);
     }
 
     /// `handle_failure` is the integration point between the SDK
@@ -375,7 +438,10 @@ mod tests {
     #[tokio::test]
     async fn other_5xx_with_fail_open_true_tags_5xx() {
         let g = build_test(true);
-        let v = g.handle_failure(BedrockFailure::Other);
+        let v = g.handle_failure(BedrockFailure::Other {
+            detail: "AccessDeniedException(...)".into(),
+            source: None,
+        });
         match v {
             GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "bedrock_5xx"),
             other => panic!("expected Bypass, got {other:?}"),
