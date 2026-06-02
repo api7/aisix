@@ -36,7 +36,19 @@ pub fn parse<'a>(prefix: &str, key: &'a str) -> Result<ResourceKey<'a>, KeyError
             key: key.to_string(),
             prefix: prefix.to_string(),
         })?;
-    let rest = rest.trim_start_matches('/');
+    // Enforce a delimiter boundary after the prefix: the next character must
+    // be `/`. Without this, `strip_prefix` byte-matching would treat an
+    // adjacent key such as `/aisixmodels/x` as if it lived under `/aisix/`,
+    // letting a writer outside the configured namespace inject models or API
+    // keys. An exact-prefix match (`rest == ""`) falls through to the
+    // MissingSuffix check below.
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return Err(KeyError::PrefixMismatch {
+            key: key.to_string(),
+            prefix: prefix.to_string(),
+        });
+    }
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
 
     let (kind, id) = rest
         .split_once('/')
@@ -77,6 +89,31 @@ mod tests {
     fn prefix_mismatch_is_detected() {
         let err = parse("/aisix", "/other/models/a").unwrap_err();
         assert!(matches!(err, KeyError::PrefixMismatch { .. }));
+    }
+
+    #[test]
+    fn adjacent_prefix_without_delimiter_is_rejected() {
+        // `/aisixmodels/...` byte-starts with `/aisix` but is NOT a child of
+        // the `/aisix/` namespace — it must not be parsed as config.
+        for key in [
+            "/aisixmodels/models/m-1",
+            "/aisixapikeys/api_keys/k-1",
+            "/aisix-extra/models/m-1",
+            "/aisixfoo/bar/baz",
+        ] {
+            let err = parse("/aisix", key).unwrap_err();
+            assert!(
+                matches!(err, KeyError::PrefixMismatch { .. }),
+                "expected PrefixMismatch for {key:?}, got {err:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn child_of_namespace_is_accepted() {
+        let k = parse("/aisix", "/aisix/models/m-1").unwrap();
+        assert_eq!(k.kind, "models");
+        assert_eq!(k.id, "m-1");
     }
 
     #[test]
