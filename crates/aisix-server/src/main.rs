@@ -474,11 +474,14 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         let admin_router = aisix_admin::build_router(admin_state);
 
         let admin_addr: std::net::SocketAddr = cfg.admin.addr.parse()?;
-        let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
-        tracing::info!(admin = %admin_addr, "aisix admin listening");
-        let admin_serve = axum::serve(admin_listener, admin_router)
-            .with_graceful_shutdown(shutdown_signal(cancel_rx.clone(), "admin"));
-        Some(tokio::spawn(async move { admin_serve.await }))
+        let admin_tls = cfg.admin.tls.clone();
+        Some(tokio::spawn(serve_http(
+            admin_addr,
+            admin_router,
+            admin_tls,
+            cancel_rx.clone(),
+            "admin",
+        )))
     } else {
         // Drop unused shared components so the compiler can see they
         // don't escape managed mode. The health tracker exists on
@@ -490,18 +493,22 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
 
     // Step 9: bind + serve the proxy (always). Admin is handled above.
     let proxy_addr: std::net::SocketAddr = cfg.proxy.addr.parse()?;
-    let proxy_listener = tokio::net::TcpListener::bind(proxy_addr).await?;
-    tracing::info!(proxy = %proxy_addr, "aisix proxy listening");
-
-    let proxy_serve = axum::serve(proxy_listener, proxy_router)
-        .with_graceful_shutdown(shutdown_signal(cancel_rx.clone(), "proxy"));
+    let proxy_tls = cfg.proxy.tls.clone();
+    let proxy_serve = serve_http(
+        proxy_addr,
+        proxy_router,
+        proxy_tls,
+        cancel_rx.clone(),
+        "proxy",
+    );
 
     // Step 10: shutdown coordinator. Whichever of (signal, proxy, admin)
     // completes first triggers the rest.
     let signal_task = tokio::spawn(wait_for_signal(cancel_tx.clone(), livez_state));
 
-    let proxy_res = proxy_serve.await;
-    proxy_res.map_err(|e| anyhow::anyhow!("proxy serve error: {e}"))?;
+    proxy_serve
+        .await
+        .map_err(|e| anyhow::anyhow!("proxy serve error: {e}"))?;
     if let Some(handle) = admin_serve_handle {
         match handle.await {
             Ok(Ok(())) => {}
@@ -835,6 +842,57 @@ fn background_check_interval(snapshot: &aisix_core::AisixSnapshot) -> std::time:
 /// Completes when the process receives SIGINT or SIGTERM (best-effort on
 /// Windows — Ctrl+C only) OR when another part of the system has already
 /// flipped the cancel channel.
+/// Serve `router` on `addr`, choosing HTTPS when `tls` is configured and
+/// plain HTTP otherwise. Both variants honour the shared `cancel` watch for
+/// graceful shutdown so the proxy/admin surfaces stop in lockstep with the
+/// rest of the process. Wired for #473: `proxy.tls` / `admin.tls` were
+/// parsed but never reached the listener, so the documented config silently
+/// served plain HTTP.
+async fn serve_http(
+    addr: std::net::SocketAddr,
+    router: axum::Router,
+    tls: Option<aisix_core::TlsConfig>,
+    cancel: watch::Receiver<bool>,
+    label: &'static str,
+) -> anyhow::Result<()> {
+    match tls {
+        None => {
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            tracing::info!(%addr, label, "aisix listening (http)");
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown_signal(cancel, label))
+                .await?;
+            Ok(())
+        }
+        Some(tls) => {
+            let tls_config =
+                axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_file, &tls.key_file)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "{label}.tls: failed to load cert_file={:?} / key_file={:?}: {e}",
+                            tls.cert_file,
+                            tls.key_file
+                        )
+                    })?;
+            let handle = axum_server::Handle::new();
+            tokio::spawn({
+                let handle = handle.clone();
+                async move {
+                    shutdown_signal(cancel, label).await;
+                    handle.graceful_shutdown(Some(std::time::Duration::from_secs(10)));
+                }
+            });
+            tracing::info!(%addr, label, "aisix listening (https)");
+            axum_server::bind_rustls(addr, tls_config)
+                .handle(handle)
+                .serve(router.into_make_service())
+                .await?;
+            Ok(())
+        }
+    }
+}
+
 async fn shutdown_signal(mut cancel: watch::Receiver<bool>, label: &'static str) {
     loop {
         if *cancel.borrow() {
