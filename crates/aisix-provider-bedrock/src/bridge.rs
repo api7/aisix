@@ -199,8 +199,9 @@ const KNOWN_PUBLISHER_TAGS: &[&str] = &[
 
 impl BedrockPublisher {
     /// Resolve the publisher from the Bedrock model id, tolerating
-    /// cross-region inference profile prefixes (`us.`, `eu.`,
-    /// `apac.`, `global.`, `us-gov.`).
+    /// cross-region inference profile prefixes (`us.`, `eu.`, `apac.`,
+    /// `global.`, `us-gov.`, `au.`, `ca.`, `jp.`, …) — see
+    /// [`strip_region_prefix`] for the exact rule.
     pub fn from_model_id(model_id: &str) -> Option<Self> {
         let stripped = strip_region_prefix(model_id);
         let (publisher_tag, _rest) = stripped.split_once('.')?;
@@ -244,8 +245,15 @@ impl BedrockPublisher {
 
 /// Strip a leading cross-region inference profile prefix.
 ///
-/// Recognized prefixes (per AWS catalog as of 2026-05):
-/// `us.`, `eu.`, `apac.`, `global.`, `us-gov.`.
+/// Rather than hardcode AWS's region list (which grows over time),
+/// this strips any leading 2–7 char `[a-z0-9-]` token that is
+/// immediately followed by a known publisher tag. That covers every
+/// documented cross-region prefix without a code change when AWS adds
+/// a new region: `us.`, `eu.`, `apac.`, `global.`, `us-gov.`, `au.`
+/// (Australia), `ca.` (Canada), `jp.` (Japan), … The publisher-tag
+/// gate means a token that isn't a real prefix (no known publisher
+/// after it) is left untouched, so a plain `anthropic.claude-…` id is
+/// never mangled.
 fn strip_region_prefix(model_id: &str) -> &str {
     let Some((maybe_region, rest)) = model_id.split_once('.') else {
         return model_id;
@@ -1360,6 +1368,24 @@ mod tests {
         assert_eq!(
             BedrockPublisher::from_model_id("us-gov.anthropic.claude-3-5-sonnet-20241022-v2:0"),
             Some(BedrockPublisher::Anthropic),
+        );
+    }
+
+    #[test]
+    fn publisher_strips_au_ca_jp_cross_region_prefixes() {
+        // #412: Australia/Canada/Japan cross-region inference profiles
+        // must resolve to their publisher, same as us./eu./apac.
+        assert_eq!(
+            BedrockPublisher::from_model_id("au.meta.llama3-1-70b-instruct-v1:0"),
+            Some(BedrockPublisher::Meta),
+        );
+        assert_eq!(
+            BedrockPublisher::from_model_id("ca.anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            Some(BedrockPublisher::Anthropic),
+        );
+        assert_eq!(
+            BedrockPublisher::from_model_id("jp.amazon.nova-pro-v1:0"),
+            Some(BedrockPublisher::AmazonNova),
         );
     }
 
