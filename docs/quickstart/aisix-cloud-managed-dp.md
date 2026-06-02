@@ -49,7 +49,6 @@ The bundle is environment-scoped. The managed data plane uses it to connect to t
 In managed mode, the data plane is started with environment variables for:
 
 - `AISIX_MANAGED__CP_BASE_URL`
-- `AISIX_MANAGED__CP_ETCD_ENDPOINT`
 - `AISIX_MANAGED__CP_CERT_PEM`
 - `AISIX_MANAGED__CP_KEY_PEM`
 - `AISIX_MANAGED__CP_CA_PEM`
@@ -60,6 +59,28 @@ surface, for example `https://dpm.example.com:7944` or
 it at the browser dashboard or cp-api origin such as
 `http://api:8080`; heartbeat is always built as
 `<CP_BASE_URL>/dp/heartbeat`.
+
+`AISIX_MANAGED__CP_ETCD_ENDPOINT` is **optional** and most deployments
+should leave it unset. When it is not provided, the data plane derives
+the etcd endpoint from `CP_BASE_URL` (the control plane multiplexes the
+REST and etcd gRPC surfaces on the same `host:port`). Set it only when
+your control plane serves etcd on a different `host:port` than the
+`/dp/*` REST surface. Managing or knowing the control plane's etcd is
+not part of the normal Cloud user workflow.
+
+### Selecting the config file with `AISIX_CONFIG_PATH`
+
+The published container image's entrypoint selects which config file to
+load via `AISIX_CONFIG_PATH` (default `/etc/aisix/config.yaml`). For a
+managed data plane, point it at the baked managed config:
+
+```bash
+AISIX_CONFIG_PATH=/etc/aisix/config.managed.yaml
+```
+
+This variable is read by the image entrypoint, not the gateway binary
+itself — the binary's own `--config` flag (env `AISIX_CONFIG`) is the
+lower-level equivalent when you run the binary directly.
 
 For deployments that should not inline PEM material into environment
 variables, use the file-based equivalents instead:
@@ -116,7 +137,7 @@ Start with:
 
 - certificate bundle correctness
 - `AISIX_MANAGED__CP_BASE_URL`
-- `AISIX_MANAGED__CP_ETCD_ENDPOINT`
+- `AISIX_MANAGED__CP_ETCD_ENDPOINT` (only if you set it explicitly; otherwise it is derived from `CP_BASE_URL`)
 - trust chain in `AISIX_MANAGED__CP_CA_PEM`
 - writable state directory for `/var/lib/aisix`
 
