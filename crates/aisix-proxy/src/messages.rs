@@ -243,6 +243,47 @@ async fn dispatch(
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
     let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
+    // #448 (#22): /v1/messages must run input guardrails + the budget
+    // pre-check like /v1/chat/completions — previously prompts reached the
+    // upstream without any content/DLP check. Translate the Anthropic-
+    // shaped body into the internal ChatFormat and run the resolved input
+    // guardrail chain; a Block short-circuits before dispatch. (Input
+    // Rewrite/Bypass on this endpoint is not yet applied to the outgoing
+    // Anthropic body — only Block is enforced here.)
+    let guardrail_ctx = aisix_guardrails::RequestContext {
+        model_id: &model_entry.id,
+        api_key_id: &auth.entry.id,
+        team_id: auth.key().team_id.as_deref(),
+    };
+    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    if !resolved_chain.is_empty() {
+        if let Ok(chat) = aisix_provider_anthropic::parse_inbound_request(body) {
+            if let aisix_guardrails::GuardrailVerdict::Block { reason } =
+                aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+            {
+                tracing::warn!(
+                    guardrail_hook = "input",
+                    model = %model_name,
+                    reason = %reason,
+                    "guardrail blocked /v1/messages request",
+                );
+                return Err(ProxyError::ContentFiltered(
+                    "request blocked by content policy".into(),
+                ));
+            }
+        }
+    }
+
+    // Budget pre-check via cp-api (mirrors /v1/chat/completions).
+    let budget_decision = state.budgets.check(&auth.entry.id).await;
+    if !budget_decision.allowed {
+        return Err(ProxyError::BudgetExceeded(Box::new(
+            budget_decision.reason.unwrap_or_else(|| {
+                crate::budget::BudgetReason::message_only(auth.entry.id.clone())
+            }),
+        )));
+    }
+
     // Resolve the attempt list. For a Model Group (routing model) this
     // walks `routing.targets` and health-filters them; for a direct
     // model it's just the model itself. Shared with /v1/chat/completions
