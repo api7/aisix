@@ -282,9 +282,17 @@ struct AnalyzeRequest<'a> {
 
 #[derive(Deserialize)]
 struct AnalyzeResponse {
-    #[serde(rename = "categoriesAnalysis", default, deserialize_with = "null_as_empty")]
+    #[serde(
+        rename = "categoriesAnalysis",
+        default,
+        deserialize_with = "null_as_empty"
+    )]
     categories_analysis: Vec<CategoryAnalysis>,
-    #[serde(rename = "blocklistsMatch", default, deserialize_with = "null_as_empty")]
+    #[serde(
+        rename = "blocklistsMatch",
+        default,
+        deserialize_with = "null_as_empty"
+    )]
     blocklists_match: Vec<BlocklistMatch>,
 }
 
