@@ -63,7 +63,7 @@ struct ResponseUsage {
 pub async fn responses(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
-    Json(mut body): Json<Value>,
+    Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
     let request_id = new_request_id();
@@ -75,7 +75,7 @@ pub async fn responses(
         .unwrap_or("")
         .to_string();
 
-    match dispatch(&state, &auth, &mut body, &request_id).await {
+    match dispatch(&state, &auth, &body, &request_id).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
@@ -141,7 +141,7 @@ pub async fn responses(
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
-    body: &mut Value,
+    body: &Value,
     request_id: &str,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
     let snapshot = state.snapshot.load();
@@ -165,16 +165,103 @@ async fn dispatch(
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
     let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
-    let model = &model_entry.value;
+    // Resolve the attempt list (routing-aware). /v1/responses is
+    // OpenAI-only, so we attempt the group's OpenAI targets in order; a
+    // direct model resolves to itself (#471).
+    let attempt_models = crate::routing::resolve_attempt_models(
+        &state.routing,
+        &state.runtime_status,
+        &snapshot,
+        &model_name,
+        &model_entry.id,
+        &model_entry.value,
+    )?;
+    let retry_on_429 = model_entry
+        .value
+        .routing
+        .as_ref()
+        .map(|r| r.retry_on_429_or_default())
+        .unwrap_or(false);
 
-    // Responses API is only available for OpenAI.
-    if model.provider.as_deref() != Some("openai") {
-        return Err(ProxyError::InvalidRequest(format!(
+    let is_stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let not_openai = || {
+        ProxyError::InvalidRequest(format!(
             "model `{model_name}` is not an OpenAI provider; /v1/responses requires OpenAI"
-        )));
+        ))
+    };
+
+    // Streaming attempts the first eligible target only (no mid-stream
+    // fallback), matching /v1/chat/completions and /v1/messages.
+    if is_stream {
+        let target = attempt_models
+            .iter()
+            .find(|t| t.model.provider.as_deref() == Some("openai"))
+            .ok_or_else(not_openai)?;
+        return responses_to_target(
+            state,
+            &snapshot,
+            body,
+            &target.model,
+            &target.id,
+            request_id,
+        )
+        .await;
     }
 
-    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+    let mut last_err: Option<ProxyError> = None;
+    let mut any_openai = false;
+    for target in &attempt_models {
+        if target.model.provider.as_deref() != Some("openai") {
+            continue;
+        }
+        any_openai = true;
+        match responses_to_target(
+            state,
+            &snapshot,
+            body,
+            &target.model,
+            &target.id,
+            request_id,
+        )
+        .await
+        {
+            Ok(success) => return Ok(success),
+            Err(e) => {
+                let retryable = matches!(
+                    &e,
+                    ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429)
+                );
+                last_err = Some(e);
+                if !retryable {
+                    break;
+                }
+            }
+        }
+    }
+
+    if !any_openai {
+        return Err(not_openai());
+    }
+    Err(last_err.unwrap_or(ProxyError::ProviderUnavailable))
+}
+
+/// Dispatch one concrete OpenAI target's Responses-API passthrough to
+/// `{api_base}/v1/responses`. The caller has already confirmed
+/// `model.provider == openai`.
+async fn responses_to_target(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    body: &Value,
+    model: &aisix_core::Model,
+    model_id: &str,
+    request_id: &str,
+) -> Result<ResponseDispatchSuccess, ProxyError> {
+    let mut body = body.clone();
+    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?.to_string();
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
@@ -202,13 +289,13 @@ async fn dispatch(
         .header("authorization", format!("Bearer {api_key}"))
         .header("content-type", "application/json")
         .header("x-aisix-request-id", request_id)
-        .json(body)
+        .json(&body)
         .send()
         .await
         .map_err(|e| {
             crate::cooldown::note_failure(
                 &state.runtime_status,
-                &model_entry.id,
+                model_id,
                 model.cooldown.as_ref(),
                 aisix_gateway::BridgeError::Transport(e.to_string()),
             )
@@ -228,15 +315,13 @@ async fn dispatch(
         );
         if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
         {
-            state
-                .runtime_status
-                .mark_cooldown(&model_entry.id, ttl, reason);
+            state.runtime_status.mark_cooldown(model_id, ttl, reason);
         }
         return Err(ProxyError::Bridge(err));
     }
 
-    state.health.record_success(&model_name);
-    state.runtime_status.mark_healthy(&model_entry.id);
+    state.health.record_success(&model.display_name);
+    state.runtime_status.mark_healthy(model_id);
 
     let provider_label = "openai".to_string();
 
@@ -270,7 +355,7 @@ async fn dispatch(
             response,
             provider: provider_label,
             usage: None,
-            model_id: model_entry.id.to_string(),
+            model_id: model_id.to_string(),
         })
     } else {
         let json_body: Value = upstream_resp
@@ -279,7 +364,7 @@ async fn dispatch(
             .map_err(|e| {
                 crate::cooldown::note_failure(
                     &state.runtime_status,
-                    &model_entry.id,
+                    model_id,
                     model.cooldown.as_ref(),
                     aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
                 )
@@ -296,7 +381,7 @@ async fn dispatch(
             response: Json(json_body).into_response(),
             provider: provider_label,
             usage,
-            model_id: model_entry.id.to_string(),
+            model_id: model_id.to_string(),
         })
     }
 }

@@ -10,7 +10,9 @@ This is the gateway's current virtual-model mechanism.
 
 Use it when you want to separate the caller contract from the individual upstream target that serves a given request.
 
-A routing alias works on both inbound protocols: `/v1/chat/completions` (OpenAI shape) and `/v1/messages` (Anthropic shape). Targets in one group may mix providers — e.g. an OpenAI target and an Anthropic target — and the gateway dispatches each target through the right path regardless of which endpoint the caller used. On `/v1/messages`, streaming requests attempt only the first target (no mid-stream fallback); non-streaming requests fail over across targets.
+A routing alias works across the proxy's passthrough endpoints: `/v1/chat/completions` (OpenAI shape), `/v1/messages` (Anthropic shape), `/v1/responses`, and `/v1/messages/count_tokens`. Targets in one group may mix providers — e.g. an OpenAI target and an Anthropic target — and the gateway dispatches each target through the right path regardless of which endpoint the caller used. Streaming requests attempt only the first target (no mid-stream fallback); non-streaming requests fail over across targets.
+
+`/v1/responses` and `/v1/messages/count_tokens` are provider-restricted (OpenAI-only and Anthropic-only respectively). When a group is used on one of these endpoints, only the targets whose provider matches the endpoint are attempted, in order; if the group has no matching target the request is rejected with a 400.
 
 ## Current Strategies
 

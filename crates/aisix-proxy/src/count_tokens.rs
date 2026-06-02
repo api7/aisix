@@ -57,7 +57,7 @@ pub async fn count_tokens(
         Ok(a) => a,
         Err(e) => return e.into_anthropic_response(),
     };
-    let Json(mut body) = match body {
+    let Json(body) = match body {
         Ok(j) => j,
         Err(rej) => {
             return crate::error::proxy_error_from_json_rejection(
@@ -78,7 +78,7 @@ pub async fn count_tokens(
         .unwrap_or("")
         .to_string();
 
-    match dispatch(&state, &auth, &mut body, &request_id).await {
+    match dispatch(&state, &auth, &body, &request_id).await {
         Ok((resp, provider)) => {
             let elapsed = started.elapsed();
             let status = resp.status().as_u16();
@@ -127,7 +127,7 @@ pub async fn count_tokens(
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
-    body: &mut Value,
+    body: &Value,
     request_id: &str,
 ) -> Result<(Response, String), ProxyError> {
     let snapshot = state.snapshot.load();
@@ -151,20 +151,83 @@ async fn dispatch(
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
     let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
-    let model = &model_entry.value;
+    // Resolve the attempt list (routing-aware). count_tokens is
+    // Anthropic-only, so we attempt the group's Anthropic targets in
+    // order; a direct model resolves to itself (#471).
+    let attempt_models = crate::routing::resolve_attempt_models(
+        &state.routing,
+        &state.runtime_status,
+        &snapshot,
+        &model_name,
+        &model_entry.id,
+        &model_entry.value,
+    )?;
+    let retry_on_429 = model_entry
+        .value
+        .routing
+        .as_ref()
+        .map(|r| r.retry_on_429_or_default())
+        .unwrap_or(false);
 
-    // count_tokens is an Anthropic Messages sub-route; only Anthropic
-    // exposes it at `…/v1/messages/count_tokens`. Reject any other
-    // provider at the boundary with a 400 rather than dispatching to an
-    // upstream that would 404 (parallel to /v1/rerank's provider gate).
-    if model.provider.as_deref() != Some("anthropic") {
+    let mut last_err: Option<ProxyError> = None;
+    let mut any_anthropic = false;
+    for target in &attempt_models {
+        // count_tokens has no upstream equivalent for non-Anthropic
+        // providers; skip foreign targets in a mixed group rather than
+        // dispatching to an upstream that would 404.
+        if target.model.provider.as_deref() != Some("anthropic") {
+            continue;
+        }
+        any_anthropic = true;
+        match count_tokens_to_target(
+            state,
+            &snapshot,
+            body,
+            &target.model,
+            &target.id,
+            request_id,
+        )
+        .await
+        {
+            Ok(resp) => return Ok((resp, "anthropic".to_string())),
+            Err(e) => {
+                let retryable = matches!(
+                    &e,
+                    ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429)
+                );
+                last_err = Some(e);
+                if !retryable {
+                    break;
+                }
+            }
+        }
+    }
+
+    // No Anthropic target to serve count_tokens. Reject at the boundary
+    // with a 400 (parallel to /v1/rerank's provider gate) rather than
+    // dispatching to an upstream that would 404.
+    if !any_anthropic {
         return Err(ProxyError::InvalidRequest(format!(
             "model `{model_name}` is not an Anthropic provider; \
              /v1/messages/count_tokens requires an Anthropic-backed model"
         )));
     }
+    Err(last_err.unwrap_or(ProxyError::ProviderUnavailable))
+}
 
-    let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
+/// Dispatch one concrete Anthropic target's count_tokens passthrough to
+/// `{api_base}/v1/messages/count_tokens`. The caller has already
+/// confirmed `model.provider == anthropic`.
+async fn count_tokens_to_target(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    body: &Value,
+    model: &aisix_core::Model,
+    model_id: &str,
+    request_id: &str,
+) -> Result<Response, ProxyError> {
+    let mut body = body.clone();
+    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
     let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?;
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
@@ -182,11 +245,14 @@ async fn dispatch(
     // order matches §5: renames → constraints → defaults; each is a
     // no-op when its configured map is empty.
     if let Some(r) = pk_entry.value.request.as_ref() {
-        aisix_provider_openai::overrides::apply_param_renames(body, &r.param_renames);
+        aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
         if let Some(constraints) = &r.param_constraints {
-            aisix_provider_openai::overrides::apply_param_constraints(body, constraints);
+            aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
         }
-        aisix_provider_openai::overrides::apply_default_body_fields(body, &r.default_body_fields);
+        aisix_provider_openai::overrides::apply_default_body_fields(
+            &mut body,
+            &r.default_body_fields,
+        );
     }
 
     // `build_v1_url` tolerates an api_base with or without `/v1` (the
@@ -233,13 +299,13 @@ async fn dispatch(
     let upstream_resp = client
         .post(&url)
         .headers(headers)
-        .json(body)
+        .json(&body)
         .send()
         .await
         .map_err(|e| {
             crate::cooldown::note_failure(
                 &state.runtime_status,
-                &model_entry.id,
+                model_id,
                 model.cooldown.as_ref(),
                 aisix_gateway::BridgeError::Transport(e.to_string()),
             )
@@ -272,15 +338,13 @@ async fn dispatch(
         );
         if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
         {
-            state
-                .runtime_status
-                .mark_cooldown(&model_entry.id, ttl, reason);
+            state.runtime_status.mark_cooldown(model_id, ttl, reason);
         }
         return Err(ProxyError::Bridge(err));
     }
 
-    state.health.record_success(&model_name);
-    state.runtime_status.mark_healthy(&model_entry.id);
+    state.health.record_success(&model.display_name);
+    state.runtime_status.mark_healthy(model_id);
 
     // Forward the `{"input_tokens": <int>}` response body verbatim — the
     // gateway adds nothing to the token-counting contract.
@@ -291,7 +355,7 @@ async fn dispatch(
         .map_err(|e| {
             crate::cooldown::note_failure(
                 &state.runtime_status,
-                &model_entry.id,
+                model_id,
                 model.cooldown.as_ref(),
                 aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
             )
@@ -313,7 +377,7 @@ async fn dispatch(
             .insert(HeaderName::from_static("x-aisix-request-id"), hv);
     }
 
-    Ok((resp, "anthropic".to_string()))
+    Ok(resp)
 }
 
 fn emit_access_log(

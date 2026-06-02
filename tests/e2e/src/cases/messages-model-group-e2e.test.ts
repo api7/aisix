@@ -71,7 +71,7 @@ type MessagesResult = {
   };
 };
 
-describe("model group via /v1/messages e2e (#471)", () => {
+describe("model group via passthrough endpoints e2e (#471)", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
   let etcdReachable = false;
@@ -166,6 +166,37 @@ describe("model group via /v1/messages e2e (#471)", () => {
       }),
     });
     return { status: res.status, body: (await res.json()) as MessagesResult["body"] };
+  }
+
+  async function callCountTokens(
+    model: string,
+  ): Promise<{ status: number; body: { input_tokens?: number; error?: unknown } }> {
+    const res = await fetch(`${app?.proxyUrl}/v1/messages/count_tokens`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "count me" }],
+      }),
+    });
+    return { status: res.status, body: (await res.json()) as { input_tokens?: number } };
+  }
+
+  async function callResponses(
+    model: string,
+  ): Promise<{ status: number; body: { object?: string; error?: unknown } }> {
+    const res = await fetch(`${app?.proxyUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model, input: "hello" }),
+    });
+    return { status: res.status, body: (await res.json()) as { object?: string } };
   }
 
   async function waitUntilGroupRoutable(virtual: string): Promise<void> {
@@ -303,5 +334,85 @@ describe("model group via /v1/messages e2e (#471)", () => {
     // Anthropic target which served the response.
     expect(openaiDown.receivedRequests.length - openaiBaseline).toBe(1);
     expect(anthropicGood.receivedRequests.length - anthropicBaseline).toBe(1);
+  });
+
+  test("Anthropic group is reachable via /v1/messages/count_tokens", async (ctx) => {
+    if (!etcdReachable || !app || !admin) {
+      ctx.skip();
+      return;
+    }
+
+    const anthropic = await startOpenAiUpstream({
+      nonStreamBody: { input_tokens: 42 },
+    });
+    upstreams.push(anthropic);
+
+    await createAnthropicModel("mg-ct-anthropic", anthropic);
+    await admin.createModel({
+      display_name: "mg-count-tokens",
+      routing: {
+        strategy: "failover",
+        targets: [{ model: "mg-ct-anthropic" }],
+        max_fallbacks: 0,
+      },
+    });
+
+    let result: { status: number; body: { input_tokens?: number } } | undefined;
+    await waitConfigPropagation(async () => {
+      result = await callCountTokens("mg-count-tokens");
+      return result.status === 200;
+    });
+
+    // Pre-fix this 400'd: a routing model has no provider, so the
+    // Anthropic-only gate rejected it before walking targets.
+    expect(result?.status).toBe(200);
+    expect(result?.body.input_tokens).toBe(42);
+  });
+
+  test("OpenAI group is reachable via /v1/responses", async (ctx) => {
+    if (!etcdReachable || !app || !admin) {
+      ctx.skip();
+      return;
+    }
+
+    const openai = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "resp_mg_01",
+        object: "response",
+        status: "completed",
+        model: "gpt-4o-mini",
+        output: [
+          {
+            id: "msg_mg_01",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "grouped response" }],
+          },
+        ],
+        usage: { input_tokens: 5, output_tokens: 6, total_tokens: 11 },
+      },
+    });
+    upstreams.push(openai);
+
+    await createOpenAiModel("mg-resp-openai", openai);
+    await admin.createModel({
+      display_name: "mg-responses",
+      routing: {
+        strategy: "failover",
+        targets: [{ model: "mg-resp-openai" }],
+        max_fallbacks: 0,
+      },
+    });
+
+    let result: { status: number; body: { object?: string } } | undefined;
+    await waitConfigPropagation(async () => {
+      result = await callResponses("mg-responses");
+      return result.status === 200;
+    });
+
+    // Pre-fix this 400'd: a routing model has no provider, so the
+    // OpenAI-only gate rejected it before walking targets.
+    expect(result?.status).toBe(200);
+    expect(result?.body.object).toBe("response");
   });
 });
