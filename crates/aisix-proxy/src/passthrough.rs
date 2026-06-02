@@ -35,6 +35,11 @@ use crate::error::ProxyError;
 use crate::request_id::new_request_id;
 use crate::state::ProxyState;
 
+/// Bounded `model` metric label for passthrough requests. The wildcard
+/// `*rest` suffix is caller-controlled and must never be used directly as
+/// a label (unbounded Prometheus cardinality — #451).
+const PASSTHROUGH_MODEL_LABEL: &str = "passthrough";
+
 /// Headers that the passthrough endpoint ALWAYS strips before
 /// forwarding to upstream, regardless of customer configuration.
 ///
@@ -150,7 +155,11 @@ pub async fn passthrough(
             );
             state.metrics.record_request(
                 &provider_label,
-                &rest,
+                // The raw `rest` wildcard is caller-controlled; using it as
+                // the `model` label would create unbounded metric
+                // cardinality. Passthrough has no resolved model, so record
+                // a fixed sentinel (#451).
+                PASSTHROUGH_MODEL_LABEL,
                 status,
                 RequestOutcome::from_status(status),
                 elapsed,
@@ -171,7 +180,7 @@ pub async fn passthrough(
             );
             state.metrics.record_request(
                 &provider,
-                &rest,
+                PASSTHROUGH_MODEL_LABEL,
                 status,
                 RequestOutcome::from_status(status),
                 elapsed,
