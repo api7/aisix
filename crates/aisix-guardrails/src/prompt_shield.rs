@@ -328,8 +328,15 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
                 chunks.push(std::mem::take(&mut current));
             }
             if word_chars > max_chars {
-                // Single word longer than the limit — truncate and flush.
-                chunks.push(word.chars().take(max_chars).collect());
+                // Single word longer than the limit — split it into
+                // max_chars-sized pieces so the ENTIRE token is evaluated.
+                // Truncating to the first max_chars (the previous behavior)
+                // let the trailing part of an oversized whitespace-free
+                // input reach the model unscanned (#448).
+                let word_chars_vec: Vec<char> = word.chars().collect();
+                for piece in word_chars_vec.chunks(max_chars) {
+                    chunks.push(piece.iter().collect());
+                }
                 continue;
             }
         }
@@ -455,11 +462,19 @@ mod tests {
     }
 
     #[test]
-    fn chunk_text_single_oversized_word_is_truncated() {
+    fn chunk_text_single_oversized_word_is_fully_covered() {
+        // A whitespace-free token longer than the limit must be split so
+        // the ENTIRE token is evaluated — not truncated to the prefix,
+        // which let the trailing part reach the model unscanned (#448).
         let word: String = "x".repeat(15_000);
         let chunks = chunk_text(&word, MAX_PROMPT_CHARS);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].chars().count(), MAX_PROMPT_CHARS);
+        assert_eq!(chunks.len(), 2, "15k chars over a 10k limit → 2 chunks");
+        for c in &chunks {
+            assert!(c.chars().count() <= MAX_PROMPT_CHARS);
+        }
+        let total: usize = chunks.iter().map(|c| c.chars().count()).sum();
+        assert_eq!(total, 15_000, "no characters may be dropped");
+        assert_eq!(chunks.concat(), word, "chunks must reconstruct the input");
     }
 
     #[test]

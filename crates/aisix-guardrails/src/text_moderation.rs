@@ -354,7 +354,8 @@ impl Guardrail for TextModerationGuardrail {
 }
 
 /// Split `text` into chunks of at most `max_chars` characters on
-/// whitespace boundaries. A single word over the limit is hard-truncated.
+/// whitespace boundaries. A single word over the limit is split into
+/// max_chars-sized pieces so the entire token is evaluated (#448).
 /// (Forked from `prompt_shield::chunk_text`; see the module note.)
 fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
     if text.is_empty() {
@@ -373,7 +374,12 @@ fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
                 chunks.push(std::mem::take(&mut current));
             }
             if word_chars > max_chars {
-                chunks.push(word.chars().take(max_chars).collect());
+                // Split the oversized token fully instead of truncating to
+                // the prefix, which let the trailing part bypass scanning.
+                let word_chars_vec: Vec<char> = word.chars().collect();
+                for piece in word_chars_vec.chunks(max_chars) {
+                    chunks.push(piece.iter().collect());
+                }
                 continue;
             }
         }
