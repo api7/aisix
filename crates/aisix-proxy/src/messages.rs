@@ -322,6 +322,7 @@ async fn dispatch(
             &auth.entry.id,
             auth.key().team_id.clone(),
             auth.key().user_id.clone(),
+            &resolved_chain,
         )
         .await;
     }
@@ -343,6 +344,7 @@ async fn dispatch(
             &auth.entry.id,
             auth.key().team_id.clone(),
             auth.key().user_id.clone(),
+            &resolved_chain,
         )
         .await
         {
@@ -377,6 +379,7 @@ async fn dispatch_to_target(
     api_key_id: &str,
     team_id: Option<String>,
     user_id: Option<String>,
+    resolved_chain: &aisix_guardrails::GuardrailChain,
 ) -> Result<DispatchOutcome, ProxyError> {
     let model = &target.model;
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -394,6 +397,7 @@ async fn dispatch_to_target(
             api_key_id,
             team_id,
             user_id,
+            resolved_chain,
         )
         .await;
     }
@@ -411,6 +415,7 @@ async fn dispatch_to_target(
         api_key_id,
         team_id,
         user_id,
+        resolved_chain,
     )
     .await
 }
@@ -433,6 +438,7 @@ async fn anthropic_passthrough_dispatch(
     api_key_id: &str,
     team_id: Option<String>,
     user_id: Option<String>,
+    resolved_chain: &aisix_guardrails::GuardrailChain,
 ) -> Result<DispatchOutcome, ProxyError> {
     let mut body = body.clone();
     let api_key = crate::dispatch::require_secret(pk_value, model)?;
@@ -683,6 +689,49 @@ async fn anthropic_passthrough_dispatch(
 
         let metrics = anthropic_metrics_from_response_json(&json_body);
 
+        // #448 (#22): run output guardrails on the passthrough response.
+        // The body is forwarded verbatim, so extract its text (content
+        // blocks + the raw content array, which covers tool_use args) into
+        // a synthetic ChatResponse for inspection before returning it.
+        if !resolved_chain.is_empty() {
+            if let Some(content) = json_body.get("content").and_then(|v| v.as_array()) {
+                let mut out_text = String::new();
+                for block in content {
+                    if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                        if !out_text.is_empty() {
+                            out_text.push('\n');
+                        }
+                        out_text.push_str(t);
+                    }
+                }
+                if !out_text.is_empty() {
+                    out_text.push('\n');
+                }
+                out_text.push_str(&Value::Array(content.clone()).to_string());
+
+                let synth = aisix_gateway::ChatResponse {
+                    id: String::new(),
+                    model: model_name.to_string(),
+                    message: aisix_gateway::ChatMessage::assistant(out_text),
+                    finish_reason: aisix_gateway::FinishReason::Stop,
+                    usage: aisix_gateway::UsageStats::new(0, 0),
+                };
+                if let aisix_guardrails::GuardrailVerdict::Block { reason } =
+                    aisix_guardrails::Guardrail::check_output(resolved_chain, &synth).await
+                {
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        model = %model_name,
+                        reason = %reason,
+                        "guardrail blocked /v1/messages passthrough response",
+                    );
+                    return Err(ProxyError::ContentFiltered(
+                        "response blocked by content policy".into(),
+                    ));
+                }
+            }
+        }
+
         // Restore the gateway-facing model name so callers see what they asked for.
         let mut json_body = json_body;
         if let Some(m) = json_body.get_mut("model") {
@@ -770,6 +819,7 @@ async fn cross_provider_dispatch(
     api_key_id: &str,
     team_id: Option<String>,
     user_id: Option<String>,
+    resolved_chain: &aisix_guardrails::GuardrailChain,
 ) -> Result<DispatchOutcome, ProxyError> {
     use aisix_gateway::{Bridge, BridgeContext};
     use aisix_provider_anthropic::{
@@ -909,6 +959,25 @@ async fn cross_provider_dispatch(
     })?;
     state.health.record_success(&model.display_name);
     state.runtime_status.mark_healthy(model_id);
+
+    // #448 (#22): run output guardrails on the cross-provider response
+    // before rendering it back as Anthropic JSON — the response is
+    // client-visible output just like /v1/chat/completions.
+    if !resolved_chain.is_empty() {
+        if let aisix_guardrails::GuardrailVerdict::Block { reason } =
+            aisix_guardrails::Guardrail::check_output(resolved_chain, &resp).await
+        {
+            tracing::warn!(
+                guardrail_hook = "output",
+                model = %model_name,
+                reason = %reason,
+                "guardrail blocked /v1/messages response",
+            );
+            return Err(ProxyError::ContentFiltered(
+                "response blocked by content policy".into(),
+            ));
+        }
+    }
 
     let metrics = AnthropicUsageMetrics {
         prompt_tokens: resp.usage.prompt_tokens,
