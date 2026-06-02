@@ -70,6 +70,71 @@ Keep this terminal running. In a new terminal, you should now have:
 - proxy listener on `http://127.0.0.1:3000`
 - admin listener on `http://127.0.0.1:3001`
 
+## Alternative: Run with Docker Compose
+
+If you only want to run a standalone gateway locally and don't need a Rust toolchain, use the published gateway image with Docker Compose instead of Steps 1–3. This brings up etcd and AISIX together.
+
+Create a `config.yaml` next to the compose file. It is the same as the Step 2 config, except the etcd endpoint points at the `etcd` service name instead of `127.0.0.1`:
+
+```yaml title="config.yaml"
+etcd:
+  endpoints:
+    - "http://etcd:2379"
+  prefix: "/aisix"
+  dial_timeout_ms: 5000
+  request_timeout_ms: 5000
+
+proxy:
+  addr: "0.0.0.0:3000"
+  request_body_limit_bytes: 10485760
+
+admin:
+  addr: "0.0.0.0:3001"
+  admin_keys:
+    - "YOUR_ADMIN_KEY"
+
+observability:
+  service_name: "aisix"
+  log_level: "info"
+  access_log: true
+
+cache:
+  backend: "memory"
+```
+
+```yaml title="docker-compose.yml"
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    command:
+      - /usr/local/bin/etcd
+      - --advertise-client-urls=http://0.0.0.0:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+    ports:
+      - "2379:2379"
+
+  aisix:
+    image: ghcr.io/api7/ai-gateway:dev
+    command: ["--config", "/etc/aisix/config.yaml"]
+    volumes:
+      - ./config.yaml:/etc/aisix/config.yaml:ro
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+    depends_on:
+      - etcd
+```
+
+```bash title="Start the stack"
+docker compose up -d
+```
+
+:::note
+`ghcr.io/api7/ai-gateway:dev` tracks the `main` branch. For a reproducible deployment, pin a released version tag (for example `ghcr.io/api7/ai-gateway:v1.2.3`) once one is available.
+:::
+
+The proxy listener is now on `http://127.0.0.1:3000` and the admin listener on `http://127.0.0.1:3001`, the same as the local build, so the verification below applies unchanged. To stop the stack, run `docker compose down`.
+
 ## Step 4: Verify the listeners
 
 Both listeners expose an unauthenticated liveness route at `/livez`. The proxy and admin handlers share the same response shape, so you can probe either with the same expectation.
