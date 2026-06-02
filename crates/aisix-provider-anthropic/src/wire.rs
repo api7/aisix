@@ -597,9 +597,13 @@ impl StreamState {
         if let AnthropicStreamEvent::MessageStart { message } = event {
             self.id = message.id.clone();
             self.model = message.model.clone();
-            if let Some(input) = message.usage.as_ref().and_then(|u| u.input_tokens) {
-                self.input_tokens = input;
-            }
+            // Reset on every message_start so a later message_start without
+            // usage can't leave a stale prompt-token count from a prior one.
+            self.input_tokens = message
+                .usage
+                .as_ref()
+                .and_then(|u| u.input_tokens)
+                .unwrap_or(0);
         }
     }
 
