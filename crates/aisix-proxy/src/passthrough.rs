@@ -204,17 +204,31 @@ async fn dispatch(
     // Find a model for this provider so we can borrow its provider_key.
     let provider_lower = provider.to_lowercase();
     let all_models = snapshot.models.entries();
+    let matches_provider = |e: &aisix_core::resource::ResourceEntry<aisix_core::Model>| {
+        e.value
+            .provider
+            .as_deref()
+            .map(|p| p.eq_ignore_ascii_case(&provider_lower))
+            .unwrap_or(false)
+    };
+    let provider_has_model = all_models.iter().any(|e| matches_provider(e));
+    // Enforce the authenticated key's model ACL before lending this
+    // provider's credentials through generic passthrough: pick the first
+    // model of the provider the key is actually allowed to access.
+    // Without this any valid key could reach any configured provider's
+    // upstream credentials (#449). Mirrors LiteLLM, which enforces the
+    // key's model access on passthrough when a target is identifiable.
     let model_entry = all_models
         .into_iter()
-        .find(|e| {
-            e.value
-                .provider
-                .as_deref()
-                .map(|p| p.eq_ignore_ascii_case(&provider_lower))
-                .unwrap_or(false)
-        })
+        .find(|e| matches_provider(e) && auth.key().can_access(&e.value.display_name))
         .ok_or_else(|| {
-            ProxyError::ModelNotFound(format!("no model found for provider `{provider}`"))
+            if provider_has_model {
+                ProxyError::ModelForbidden(format!(
+                    "api key is not authorized for any model of provider `{provider}`"
+                ))
+            } else {
+                ProxyError::ModelNotFound(format!("no model found for provider `{provider}`"))
+            }
         })?;
 
     let model = &model_entry.value;
