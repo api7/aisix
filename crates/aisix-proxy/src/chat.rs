@@ -1053,6 +1053,28 @@ async fn dispatch(
         match cache.get(key).await {
             Ok(Some(cached)) => {
                 reservation.commit_tokens(0);
+                // #448: a cache hit is client-visible output just like a
+                // fresh upstream response, so it must run output guardrails
+                // before being returned — not bypass them.
+                match resolved_chain.check_output(&cached).await {
+                    GuardrailVerdict::Block { reason } => {
+                        tracing::warn!(
+                            guardrail_hook = "output",
+                            model = %req.model,
+                            reason = %reason,
+                            "guardrail blocked cached response",
+                        );
+                        return Err(with_model(ProxyError::ContentFiltered(
+                            "response blocked by content policy".into(),
+                        )));
+                    }
+                    GuardrailVerdict::Bypass { reason } => {
+                        if bypass_reason.is_none() {
+                            bypass_reason = Some(reason);
+                        }
+                    }
+                    _ => {}
+                }
                 let prompt = cached.usage.prompt_tokens as u64;
                 let completion = cached.usage.completion_tokens as u64;
                 let total = cached.usage.total_tokens as u64;

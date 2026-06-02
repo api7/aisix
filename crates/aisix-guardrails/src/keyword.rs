@@ -120,7 +120,9 @@ impl Guardrail for KeywordBlocklist {
         if !self.check_output_enabled {
             return GuardrailVerdict::Allow;
         }
-        match self.first_match(&resp.message.content) {
+        // Inspect content + tool-call output (#448), not just content.
+        let text = resp.guardrail_output_text();
+        match self.first_match(&text) {
             Some(rule) => GuardrailVerdict::Block {
                 reason: format!("output blocked by {}", rule.description()),
             },
@@ -195,6 +197,34 @@ mod tests {
         let g = KeywordBlocklist::new(vec![KeywordRule::literal("dangerous")]);
         let v = g.check_output(&resp("here is a dangerous answer")).await;
         assert!(v.is_block());
+    }
+
+    #[tokio::test]
+    async fn output_check_inspects_tool_call_arguments() {
+        // A forbidden word that appears ONLY inside tool_call arguments
+        // (message.content is empty) must still be blocked — tool-call
+        // output is client-visible and must not bypass guardrails (#448).
+        let g = KeywordBlocklist::new(vec![KeywordRule::literal("dangerous")]);
+        let mut msg = ChatMessage::assistant("");
+        msg.extra.insert(
+            "tool_calls".into(),
+            serde_json::json!([{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "run",
+                    "arguments": "{\"cmd\":\"do something dangerous\"}"
+                }
+            }]),
+        );
+        let r = ChatResponse {
+            id: "r".into(),
+            model: "m".into(),
+            message: msg,
+            finish_reason: FinishReason::Stop,
+            usage: UsageStats::new(0, 0),
+        };
+        assert!(g.check_output(&r).await.is_block());
     }
 
     #[tokio::test]

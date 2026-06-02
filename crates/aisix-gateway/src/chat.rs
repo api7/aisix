@@ -346,6 +346,33 @@ pub struct ChatResponse {
     pub usage: UsageStats,
 }
 
+impl ChatResponse {
+    /// The client-visible output text that content/DLP output guardrails
+    /// must inspect: the assistant `content` plus any `tool_calls`
+    /// material (function names + arguments, and Anthropic `tool_use`
+    /// normalized into the same `extra["tool_calls"]` slot). Tool-call
+    /// output is rendered to clients but would otherwise bypass output
+    /// guardrails that only read `message.content` (#448).
+    ///
+    /// Reasoning/thinking content is intentionally NOT included — it is
+    /// left out of output-guardrail scope by design.
+    pub fn guardrail_output_text(&self) -> String {
+        let mut out = self.message.content.clone();
+        if let Some(tool_calls) = self.message.extra.get("tool_calls") {
+            if !tool_calls.is_null() {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                // Serialize the whole tool-call payload so no function
+                // name or argument can escape inspection regardless of the
+                // provider-specific shape.
+                out.push_str(&tool_calls.to_string());
+            }
+        }
+        out
+    }
+}
+
 /// One streamed delta event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

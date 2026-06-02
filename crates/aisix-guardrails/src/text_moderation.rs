@@ -343,7 +343,7 @@ impl Guardrail for TextModerationGuardrail {
         ) {
             return GuardrailVerdict::Allow;
         }
-        let text = resp.message.content.clone();
+        let text = resp.guardrail_output_text();
         if text.is_empty() {
             return GuardrailVerdict::Allow;
         }
