@@ -1,0 +1,357 @@
+---
+title: AISIX AI Gateway
+description: Route AI requests through one OpenAI-compatible API with centralized provider keys, model aliases, routing, and traffic policy.
+sidebar_position: 1
+---
+
+<style>{`
+.aisixLanding {
+  display: grid;
+  gap: 2rem;
+}
+
+.aisixHero {
+  display: grid;
+  grid-template-columns: minmax(0, 0.95fr) minmax(340px, 1.05fr);
+  gap: 2rem;
+  align-items: stretch;
+  padding: 0.5rem 0 0;
+}
+
+.aisixEyebrow {
+  margin: 0 0 0.75rem;
+  color: #b91c1c;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.aisixLead {
+  margin: 0;
+  max-width: 42rem;
+  color: #111827;
+  font-size: 1.3rem;
+  line-height: 1.45;
+  font-weight: 650;
+}
+
+.aisixIntro {
+  margin: 1rem 0 0;
+  color: #374151;
+  font-size: 1rem;
+  line-height: 1.7;
+}
+
+.aisixActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 1.25rem;
+}
+
+.aisixButton,
+.aisixButtonSecondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2.5rem;
+  padding: 0.55rem 0.9rem;
+  border-radius: 6px;
+  font-weight: 650;
+  text-decoration: none !important;
+}
+
+.aisixButton {
+  color: #ffffff !important;
+  background: #b91c1c;
+}
+
+.aisixButton:hover {
+  background: #991b1b;
+}
+
+.aisixButtonSecondary {
+  color: #1f2937 !important;
+  border: 1px solid #d1d5db;
+  background: #ffffff;
+}
+
+.aisixButtonSecondary:hover {
+  border-color: #9ca3af;
+}
+
+.aisixTerminal {
+  overflow: hidden;
+  border: 1px solid #d8dee8;
+  border-radius: 10px;
+  background: #f8fafc;
+  box-shadow: 0 18px 36px rgba(17, 24, 39, 0.08);
+}
+
+.aisixTerminalBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.7rem 0.95rem;
+  color: #475569;
+  font-size: 0.78rem;
+  font-weight: 650;
+  border-bottom: 1px solid #e2e8f0;
+  background: #ffffff;
+}
+
+.aisixMethod {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.aisixMethod::before {
+  content: "POST";
+  padding: 0.12rem 0.35rem;
+  border-radius: 4px;
+  color: #ffffff;
+  background: #b91c1c;
+  font-size: 0.66rem;
+  line-height: 1.2;
+}
+
+.aisixTerminal pre {
+  margin: 0;
+  padding: 0.9rem 1rem 1rem;
+  color: #1f2937;
+  font-size: 0.86rem;
+  line-height: 1.65;
+  white-space: pre;
+  overflow-x: auto;
+  background:
+    linear-gradient(90deg, rgba(185, 28, 28, 0.05), rgba(49, 102, 221, 0.04)),
+    #ffffff;
+}
+
+.aisixTerminal code {
+  color: inherit;
+  background: transparent;
+  font-weight: 560;
+}
+
+.aisixSectionTitle {
+  margin: 0 0 0.75rem;
+  font-size: 1.55rem;
+}
+
+.aisixGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1.5rem;
+}
+
+.aisixPathGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1.5rem;
+}
+
+.aisixTile {
+  padding: 0 0 0 1rem;
+  border-left: 3px solid #d8dee8;
+}
+
+.aisixTile h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.aisixTile p {
+  margin: 0;
+  color: #4b5563;
+  line-height: 1.6;
+}
+
+.aisixTile a {
+  display: inline-flex;
+  margin-top: 0.8rem;
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.aisixDeploy {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1.5rem;
+}
+
+.aisixDeployBox {
+  padding: 0.9rem 0 0;
+  border-top: 1px solid #e5e7eb;
+}
+
+.aisixDeployBox h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.aisixDeployBox p {
+  margin: 0;
+  color: #4b5563;
+  line-height: 1.6;
+}
+
+.aisixFlow {
+  padding: 1rem 0 0;
+  border-top: 1px solid #e5e7eb;
+}
+
+.aisixFlow ol {
+  margin-bottom: 0;
+}
+
+.aisixLinks {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.aisixLinkBox {
+  padding: 0.9rem 0 0;
+  border-top: 1px solid #e5e7eb;
+}
+
+.aisixLinkBox strong {
+  display: block;
+  margin-bottom: 0.35rem;
+}
+
+.aisixLinkBox p {
+  margin: 0.35rem 0 0;
+  color: #4b5563;
+  font-size: 0.95rem;
+  line-height: 1.55;
+}
+
+@media (max-width: 996px) {
+  .aisixHero,
+  .aisixGrid,
+  .aisixPathGrid,
+  .aisixDeploy,
+  .aisixLinks {
+    grid-template-columns: 1fr;
+  }
+}
+`}</style>
+
+<div className="aisixLanding">
+  <section className="aisixHero">
+    <div>
+      <p className="aisixEyebrow">AI traffic gateway</p>
+      <p className="aisixLead">
+        Route AI requests through one OpenAI-compatible API instead of wiring every application to every provider.
+      </p>
+      <p className="aisixIntro">
+        AISIX AI Gateway sits between your application and upstream AI providers. Use it to manage provider keys, model aliases, routing, rate limits, caching, guardrails, and observability from one gateway layer.
+      </p>
+      <div className="aisixActions">
+        <a className="aisixButton" href="quickstart/">Send your first request</a>
+        <a className="aisixButtonSecondary" href="cloud/overview">Explore AISIX Cloud</a>
+      </div>
+    </div>
+
+    <div className="aisixTerminal" aria-label="OpenAI-compatible request example">
+      <div className="aisixTerminalBar">
+        <span className="aisixMethod">OpenAI-compatible request</span>
+        <span>localhost:3000</span>
+      </div>
+      <pre><code>{`curl -sS http://127.0.0.1:3000/v1/chat/completions \\
+  -H "Authorization: Bearer sk-demo-caller" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "gpt-4o-prod",
+    "messages": [
+      {"role": "user", "content": "Hello"}
+    ]
+  }'`}</code></pre>
+    </div>
+  </section>
+
+  <section>
+    <h2 className="aisixSectionTitle">Choose Your Path</h2>
+    <div className="aisixPathGrid">
+      <div className="aisixTile">
+        <h3>Build on the gateway</h3>
+        <p>Use the OpenAI-compatible API, Anthropic Messages, SDK guides, and streaming docs to point application traffic at AISIX.</p>
+        <a href="integration/openai-compatible-api">View client integration</a>
+      </div>
+      <div className="aisixTile">
+        <h3>Operate the gateway</h3>
+        <p>Boot the gateway, configure provider keys and model aliases, then add routing, rate limits, caching, and guardrails.</p>
+        <a href="quickstart/">Start with quickstart</a>
+      </div>
+      <div className="aisixTile">
+        <h3>Understand the system</h3>
+        <p>Learn the gateway model, deployment modes, configuration propagation, and how AISIX Cloud changes the control plane.</p>
+        <a href="overview/what-is-aisix-ai-gateway">Read the overview</a>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2 className="aisixSectionTitle">What The Gateway Handles</h2>
+    <div className="aisixGrid">
+      <div className="aisixTile">
+        <h3>Provider access</h3>
+        <p>Keep upstream provider credentials out of application code and resolve them through provider keys.</p>
+      </div>
+      <div className="aisixTile">
+        <h3>Model routing</h3>
+        <p>Expose stable model aliases to callers while changing upstream models or providers behind the gateway.</p>
+      </div>
+      <div className="aisixTile">
+        <h3>Traffic policy</h3>
+        <p>Apply rate limits, caching, guardrails, and observability controls at the gateway instead of every client.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2 className="aisixSectionTitle">Deployment Options</h2>
+    <div className="aisixDeploy">
+      <div className="aisixDeployBox">
+        <h3>Self-hosted gateway</h3>
+        <p>Run AISIX yourself, expose the proxy and admin listeners, and manage dynamic resources through the admin API and etcd.</p>
+      </div>
+      <div className="aisixDeployBox">
+        <h3>AISIX Cloud managed data plane</h3>
+        <p>Use AISIX Cloud as the managed control plane for environments, certificates, and data-plane configuration projection.</p>
+      </div>
+    </div>
+  </section>
+
+  <section className="aisixFlow">
+    <h2 className="aisixSectionTitle">How Requests Flow</h2>
+    <ol>
+      <li>Your application sends an OpenAI-compatible request to AISIX.</li>
+      <li>AISIX authenticates the caller and resolves the requested model alias.</li>
+      <li>AISIX forwards the request to the configured upstream provider and returns the provider response.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2 className="aisixSectionTitle">Where To Go Next</h2>
+    <div className="aisixLinks">
+      <div className="aisixLinkBox">
+        <strong><a href="quickstart/">Quickstart</a></strong>
+        <p>Boot the gateway locally, configure the first model and key, and send a proxied request.</p>
+      </div>
+      <div className="aisixLinkBox">
+        <strong><a href="integration/openai-compatible-api">OpenAI-Compatible API</a></strong>
+        <p>Review the client-facing routes and request shapes supported by the proxy.</p>
+      </div>
+      <div className="aisixLinkBox">
+        <strong><a href="configuration/models">Configure Models</a></strong>
+        <p>Learn how model aliases connect callers to upstream models and provider credentials.</p>
+      </div>
+    </div>
+  </section>
+</div>

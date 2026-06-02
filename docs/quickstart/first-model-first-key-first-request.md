@@ -1,10 +1,12 @@
 ---
 title: First Model, First Key, First Request
 description: Create a provider key, model, and API key through the AISIX AI Gateway admin API, then send your first successful proxy request.
-sidebar_position: 11
+sidebar_position: 12
 ---
 
-This guide shows how to move from a running self-hosted [gateway](../overview/glossary.md#gateway) to a working end-to-end request. You will create:
+This guide expands the main [Quickstart](quickstart.md) into a more explicit resource-by-resource walkthrough.
+
+It shows how to move from a running self-hosted [gateway](../overview/glossary.md#gateway) to a working end-to-end request. You will create:
 
 - one `ProviderKey`
 - one `Model`
@@ -16,10 +18,18 @@ Then you will verify that the new configuration is visible on the proxy surface.
 This guide uses the standalone `admin/v1` API on `127.0.0.1:3001`. A [Cloud managed data plane](aisix-cloud-managed-dp.md) only exposes proxy APIs locally and does **not** bind the standalone admin listener — create provider keys, models, and caller API keys through the AISIX Cloud control plane instead.
 :::
 
+## When To Use This Page
+
+Use this page when:
+
+- you already finished [Boot A Self-Hosted Gateway](self-hosted.md) and now want to configure traffic
+- you want more detail than the main [Quickstart](quickstart.md) gives about what each admin resource does
+- you want to verify both the positive path and the common auth and allowlist failure paths
+
 ## Prerequisites
 
-- A running gateway from the [Self-Hosted Quickstart](self-hosted.md)
-- An API key from an upstream provider (OpenAI, Anthropic, Google, DeepSeek, or another supported provider). The key looks like `sk-...` and is what you will paste into the `YOUR_PROVIDER_API_KEY` placeholder in Step 1. If you do not have one, sign up at the provider (for example, <https://platform.openai.com/api-keys>).
+- A running gateway from [Quickstart](quickstart.md) or [Boot A Self-Hosted Gateway](self-hosted.md)
+- An API key from an upstream provider (OpenAI, Anthropic, Google, DeepSeek, or another supported provider). The key looks like `sk-...` and is what you will paste into the `YOUR_PROVIDER_API_KEY` placeholder in Step 1. If you do not have one, sign up at the provider (for example, [OpenAI API keys](https://platform.openai.com/api-keys)).
 - Your admin key from the bootstrap config
 
 ## What This Quickstart Configures
@@ -110,7 +120,7 @@ The `display_name` is the model name your clients will send in proxy requests.
 The data plane stores `key_hash`, not plaintext API keys. Hash your chosen plaintext key first, then create the API key resource.
 
 ```bash title="Hash a plaintext caller key"
-printf 'sk-demo-caller' | sha256sum | cut -d' ' -f1
+printf '%s' 'sk-demo-caller' | shasum -a 256 | awk '{print $1}'
 ```
 
 Use the resulting hash in the admin API request:
@@ -259,7 +269,8 @@ Use the `id` values captured from each `POST` response. To remove the gateway it
 
 ## Related Pages
 
-- [Self-Hosted Quickstart](self-hosted.md)
+- [Quickstart](quickstart.md)
+- [Boot A Self-Hosted Gateway](self-hosted.md)
 - [OpenAI-Compatible API](../integration/openai-compatible-api.md)
 - [Bootstrap Configuration](../configuration/bootstrap-config.md)
 - [Admin API](../configuration/admin-api.md)

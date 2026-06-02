@@ -4,7 +4,22 @@ description: Learn what AISIX AI Gateway is, what problems it solves, and how it
 sidebar_position: 1
 ---
 
-AISIX AI Gateway is an AI [gateway](glossary.md#gateway) that sits between your applications and upstream LLM providers. It gives platform teams a single operational layer for routing, governing, and observing model traffic without forcing application teams to manage every provider integration directly.
+AISIX AI Gateway is an AI [gateway](glossary.md#gateway) that sits between your applications and upstream model providers. It gives platform teams a single operational layer for routing, governing, and observing model traffic without forcing every application team to own provider-specific integration details.
+
+This page provides a high-level overview of what the gateway does, the problems it is designed to solve, and how it fits into self-hosted and AISIX Cloud-managed environments.
+
+## Why Use AISIX AI Gateway
+
+As teams adopt more models and providers, direct client-to-provider integrations create operational sprawl. Credentials, rate limits, routing policy, and observability end up scattered across application code and service boundaries.
+
+AISIX AI Gateway is designed to centralize those concerns.
+
+| Challenge | How AISIX AI Gateway Helps |
+| --- | --- |
+| Provider-specific integration sprawl | Exposes a stable client-facing API while operators manage upstream credentials and routing centrally. |
+| Inconsistent traffic policy | Applies gateway-level controls such as model allowlists, rate limits, caching, and guardrails in one place. |
+| Limited observability across providers | Gives operators a single layer to monitor requests, behavior, and traffic patterns across upstreams. |
+| Application coupling to provider changes | Lets applications target gateway model aliases instead of embedding provider-specific choices directly. |
 
 ## What Problems It Solves
 
@@ -19,12 +34,12 @@ Use AISIX AI Gateway when you need to:
 
 Instead of embedding provider credentials and traffic policy into every client, you configure those concerns once at the gateway layer.
 
-## What It Looks Like In Practice
+## How It Works
 
-At runtime, AISIX AI Gateway serves two main surfaces:
+At runtime, AISIX AI Gateway exposes two primary surfaces:
 
 - a **proxy surface** for client traffic
-- an **admin surface** for operator-managed configuration
+- an **admin surface** for operator-managed configuration in standalone mode
 
 The proxy surface currently includes:
 
@@ -50,6 +65,8 @@ The admin surface currently manages:
 - cache policies
 - observability exporters
 
+In managed deployments, AISIX Cloud becomes the control plane and the standalone admin surface is not exposed on the data plane.
+
 ## Who It Is For
 
 ### Platform Engineers
@@ -72,18 +89,15 @@ Today, that includes:
 - Anthropic-style usage through `/v1/messages`
 - provider-specific escape hatches through `/passthrough/:provider/*rest`
 
-## Supported Providers Today
+## Current Provider Model
 
-The current provider enum includes:
+AISIX AI Gateway supports multiple upstream protocol families and provider integrations today. In practice, operators configure:
 
-- `openai`
-- `anthropic`
-- `google`
-- `deepseek`
-- `cohere`
-- `jina`
+- a provider key that stores upstream credentials and connection details
+- a model alias that callers use on the gateway surface
+- a provider or adapter combination that determines how the gateway talks to the upstream
 
-Provider support is not identical across every endpoint. The current high-level support summary is captured in the [Feature Matrix](feature-matrix.md), and the current provider-oriented reference lives in [Provider Compatibility](../reference/provider-compatibility.md).
+Support is not identical across every endpoint or provider family. Use [Feature Matrix](feature-matrix.md) for the high-level status and [Provider Compatibility](../reference/provider-compatibility.md) for provider-oriented details.
 
 ## Deployment Modes
 
@@ -115,4 +129,4 @@ Main docs describe current, verified behavior. Planned capabilities are tracked 
 - [Core Concepts](core-concepts.md)
 - [Feature Matrix](feature-matrix.md)
 - [Provider Compatibility](../reference/provider-compatibility.md)
-- [Self-Hosted Quickstart](../quickstart/self-hosted.md)
+- [Quickstart](../quickstart/quickstart.md)

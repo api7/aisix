@@ -8,6 +8,13 @@ AISIX AI Gateway supports two main deployment modes: a self-hosted gateway and a
 
 Use this page to decide which operating model fits your environment.
 
+## At A Glance
+
+| Mode | Best Fit |
+| --- | --- |
+| Self-hosted gateway | You want direct operational control over deployment, admin APIs, and configuration storage. |
+| AISIX Cloud managed data plane | You want a managed control plane for environments, certificates, and Cloud workflows while keeping gateway traffic on a data plane. |
+
 ## Self-Hosted Gateway
 
 In self-hosted mode, you run the gateway directly and expose both:

@@ -8,7 +8,7 @@
 Documentation lives under [`docs/`](docs/index.md). Start with:
 
 - [`docs/index.md`](docs/index.md)
-- [`docs/quickstart/self-hosted.md`](docs/quickstart/self-hosted.md)
+- [`docs/quickstart/quickstart.md`](docs/quickstart/quickstart.md)
 - [`docs/quickstart/first-model-first-key-first-request.md`](docs/quickstart/first-model-first-key-first-request.md)
 
 It runs in two modes from the same binary:

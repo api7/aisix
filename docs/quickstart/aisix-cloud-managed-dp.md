@@ -1,7 +1,7 @@
 ---
 title: AISIX Cloud Managed Data Plane Quickstart
 description: Understand the current AISIX Cloud managed data-plane bootstrap flow based on gateway certificates and mTLS.
-sidebar_position: 14
+sidebar_position: 15
 ---
 
 This guide explains the current managed data-plane bootstrap path for AISIX Cloud.

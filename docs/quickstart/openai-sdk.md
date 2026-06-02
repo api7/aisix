@@ -1,7 +1,7 @@
 ---
 title: OpenAI SDK Quickstart
 description: Configure the official OpenAI SDK to call AISIX AI Gateway through the OpenAI-compatible proxy surface.
-sidebar_position: 12
+sidebar_position: 13
 ---
 
 This quickstart shows the smallest working setup for the official OpenAI SDK against AISIX AI Gateway.
@@ -20,10 +20,20 @@ Use this page after you have already created:
 
 If you have not done that yet, start with [First Model, First Key, First Request](first-model-first-key-first-request.md).
 
+## Where This Fits In The Sequence
+
+Use this page after the main [Quickstart](quickstart.md) confirms that:
+
+- the gateway is running
+- `/v1/models` returns your alias
+- a direct `curl` call to `/v1/chat/completions` works with your caller key
+
+Once those three checks pass, this page shows how to swap the client from raw `curl` to the official OpenAI SDK.
+
 ## Prerequisites
 
 - A running gateway with at least one configured provider key, model alias, and caller-facing API key (see the prior quickstart pages).
-- **Node.js 18 or newer with `npm`.** Install from <https://nodejs.org> or via [nvm](https://github.com/nvm-sh/nvm) and verify with `node --version && npm --version`. The official OpenAI SDK used below requires Node.js 18+.
+- **Node.js 18 or newer with `npm`.** Install from [nodejs.org](https://nodejs.org) or via [nvm](https://github.com/nvm-sh/nvm) and verify with `node --version && npm --version`. The official OpenAI SDK used below requires Node.js 18+.
 
 ## What Changes In The SDK
 
@@ -191,6 +201,7 @@ Compare these three values first:
 
 ## Related Pages
 
+- [Quickstart](quickstart.md)
 - [First Model, First Key, First Request](first-model-first-key-first-request.md)
 - [OpenAI-Compatible API](../integration/openai-compatible-api.md)
 - [Streaming](../integration/streaming.md)

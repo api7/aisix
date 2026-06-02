@@ -1,7 +1,7 @@
 ---
 title: Anthropic SDK Quickstart
 description: Configure an Anthropic-compatible client against AISIX AI Gateway and the /v1/messages endpoint.
-sidebar_position: 13
+sidebar_position: 14
 ---
 
 This quickstart shows how to call AISIX AI Gateway through the Anthropic-style `POST /v1/messages` surface.
@@ -24,6 +24,12 @@ You should already have:
 - a caller-facing API key
 
 If not, start with [First Model, First Key, First Request](first-model-first-key-first-request.md).
+
+## Where This Fits In The Sequence
+
+Use this page after the main [Quickstart](quickstart.md) confirms that the gateway is running and you can already make a successful first request through the proxy.
+
+This page is not a bootstrap guide. It is the client-integration follow-up for applications that need Anthropic-style request and response shapes at the edge.
 
 ## Gateway Contract
 
@@ -130,6 +136,7 @@ That is expected today. The non-Anthropic translation path is currently stronges
 
 ## Related Pages
 
+- [Quickstart](quickstart.md)
 - [Anthropic Messages](../integration/anthropic-messages.md)
 - [Streaming](../integration/streaming.md)
 - [First Model, First Key, First Request](first-model-first-key-first-request.md)

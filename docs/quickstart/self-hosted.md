@@ -1,10 +1,16 @@
 ---
-title: Self-Hosted Quickstart
-description: Deploy a self-hosted AISIX AI Gateway instance and verify that the proxy and admin listeners are reachable.
-sidebar_position: 10
+title: Boot A Self-Hosted Gateway
+description: Start a self-hosted AISIX AI Gateway instance locally and verify that the proxy and admin listeners are reachable.
+sidebar_position: 11
 ---
 
-This guide shows how to start a self-hosted AISIX AI Gateway instance with the local example configuration and verify that both the proxy and admin surfaces are reachable.
+This guide shows how to start a self-hosted AISIX AI Gateway instance with the local example configuration and verify that both the proxy and admin listeners are reachable.
+
+Use this page when you only want to bootstrap the gateway process itself.
+
+If you want the full first-user path, including provider setup, model creation, caller API key creation, and a first proxied request, start with [Quickstart](quickstart.md).
+
+This page is intentionally narrower than the main quickstart. It stops once the process is healthy and the listeners respond.
 
 ## Prerequisites
 
@@ -181,7 +187,9 @@ If you created admin resources later (models, API keys, provider keys), delete t
 
 ## Next Steps
 
-- Review [What Is AISIX AI Gateway](../overview/what-is-aisix-ai-gateway.md).
-- Compare [Deployment Modes](../overview/deployment-modes.md).
-- Continue to [First Model, First Key, First Request](first-model-first-key-first-request.md).
-- Learn the current [OpenAI-Compatible API](../integration/openai-compatible-api.md).
+Continue in this order:
+
+1. [Quickstart](quickstart.md) for the full first-user path from local bootstrap to the first proxied request.
+2. [First Model, First Key, First Request](first-model-first-key-first-request.md) if you want the resource-by-resource version of that setup.
+3. [OpenAI SDK Quickstart](openai-sdk.md) after you have a working model alias and caller API key.
+4. [OpenAI-Compatible API](../integration/openai-compatible-api.md) when you are ready to look at the full client contract.

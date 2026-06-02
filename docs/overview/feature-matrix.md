@@ -21,7 +21,7 @@ Use it as a navigation aid, not as a replacement for detailed feature pages.
 | --- | --- | --- |
 | OpenAI-compatible proxy API | Available | Includes chat, completions, embeddings, images, audio, responses, rerank, and passthrough routes currently wired by the proxy router. |
 | Anthropic-style `/v1/messages` path | Available | Current behavior is implemented as a first-class route. Feature depth still varies by provider and message content shape. |
-| Multi-provider model support | Available | Current provider enum includes OpenAI, Anthropic, Google (Gemini), DeepSeek, Cohere, and Jina. |
+| Multi-provider model support | Available | The gateway supports multiple provider families and provider integrations, with endpoint depth varying by provider and route. |
 | Provider-specific passthrough | Available | Use `/passthrough/:provider/*rest` for unsupported or provider-native routes. |
 | Standalone admin API | Available | Current admin surface includes models, API keys, provider keys, guardrails, cache policies, observability exporters, health, metrics, OpenAPI, and playground. |
 | API key allowlist authz | Available | Uses hashed caller keys and model allowlists. |
@@ -34,6 +34,18 @@ Use it as a navigation aid, not as a replacement for detailed feature pages.
 | Redis-backed cache policy | Limited | Current code includes Redis backend selection and connection logic. Treat it as implemented with support caveats until the full cache docs land. |
 | Observability exporters | Available | Current admin surface and resource model include observability exporters. |
 
+## How To Use This Matrix
+
+Use the matrix to answer three questions:
+
+1. Is this capability part of the current product surface?
+2. Is it broadly documented as current behavior, or does it have important limits?
+3. Which detailed page should I read next before I depend on it?
+
+If a capability is marked **Available**, use the main docs as the current contract.
+
+If a capability is marked **Limited** or **Preview**, expect narrower scope, sharper edges, or workflow caveats and read the detailed page before you adopt it.
+
 ## AISIX Cloud
 
 | Capability | Status | Notes |
@@ -45,14 +57,6 @@ Use it as a navigation aid, not as a replacement for detailed feature pages.
 | Usage events and billing workflows | Available | Current Cloud e2e coverage includes usage-event and billing-oriented flows. |
 | Cloud playground | Preview | Current Cloud playground goes directly from the control plane to the upstream provider and does not represent full data-plane behavior. |
 | Advanced governance and team controls | Planned | Keep future governance detail on the roadmap until backed by current product behavior. |
-
-## How To Read This Matrix
-
-If a capability is marked **Available**, use the main docs.
-
-If a capability is marked **Limited** or **Preview**, read the corresponding page carefully for current boundaries.
-
-If a capability is marked **Planned**, use the [Roadmap](../roadmap.md) instead of expecting a full product page.
 
 ## Related Pages
 

@@ -382,7 +382,7 @@ event apply at info level when `access_log` is enabled.
 
 - **Per-key reads are not real-time.** A `POST /api/models` to
   cp-api returns OK only after kine accepts the write; the DP
-  observes it on the next watch event (typically <100ms, but not
+  observes it on the next watch event (typically under 100 ms, but not
   guaranteed instant). Code that requires "this model is
   immediately routable after create" must poll the DP's
   `/admin/v1/models` instead of relying on the cp-api response.
