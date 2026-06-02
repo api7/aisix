@@ -400,12 +400,12 @@ async fn responses_to_target(
 /// <https://platform.openai.com/docs/api-reference/responses/object>
 fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
     let usage = body.get("usage")?;
-    // Required field — gate emit on its presence (audit MEDIUM-1).
+    // input_tokens and output_tokens are both required on a
+    // spec-compliant 200. Gate emit on each so a malformed reply
+    // missing the output side is skipped rather than under-billed with
+    // a 0 (#429, audit MEDIUM-1).
     let prompt_tokens = usage.get("input_tokens").and_then(|v| v.as_u64())? as u32;
-    let completion_tokens = usage
-        .get("output_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
+    let completion_tokens = usage.get("output_tokens").and_then(|v| v.as_u64())? as u32;
     let reasoning_tokens = usage
         .get("output_tokens_details")
         .and_then(|d| d.get("reasoning_tokens"))
@@ -1027,6 +1027,58 @@ mod tests {
         if let Ok(Some(ev)) = recv {
             panic!(
                 "no UsageEvent should be emitted for malformed `usage: {{}}`, \
+                 got prompt_tokens={}",
+                ev.prompt_tokens,
+            );
+        }
+    }
+
+    /// #429: a 200 whose `usage` carries `input_tokens` but omits the
+    /// required `output_tokens` is malformed — emitting it would
+    /// under-bill the output side with a 0. It must be skipped.
+    #[tokio::test]
+    async fn skips_usage_event_when_output_tokens_missing() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let upstream_body = serde_json::json!({
+            "id": "resp-abc",
+            "object": "response",
+            "output": [],
+            "usage": { "input_tokens": 17 }  // missing output_tokens
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hi"
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        if let Ok(Some(ev)) = recv {
+            panic!(
+                "no UsageEvent should be emitted when output_tokens is missing, \
                  got prompt_tokens={}",
                 ev.prompt_tokens,
             );
