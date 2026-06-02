@@ -6,6 +6,10 @@ sidebar_position: 31
 
 The AISIX AI Gateway admin API is the operator-facing surface for managing the gateway's dynamic configuration.
 
+:::note Standalone only
+The `admin/v1` examples on this page apply to self-hosted standalone AISIX. A [Cloud managed data plane](../quickstart/aisix-cloud-managed-dp.md) only exposes proxy APIs locally and does **not** bind the standalone admin listener — provider keys, models, and caller API keys are managed through the AISIX Cloud control plane instead.
+:::
+
 Use this API when you need to:
 
 - create and update models

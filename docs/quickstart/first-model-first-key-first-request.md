@@ -12,6 +12,10 @@ This guide shows how to move from a running self-hosted [gateway](../overview/gl
 
 Then you will verify that the new configuration is visible on the proxy surface.
 
+:::note Standalone only
+This guide uses the standalone `admin/v1` API on `127.0.0.1:3001`. A [Cloud managed data plane](aisix-cloud-managed-dp.md) only exposes proxy APIs locally and does **not** bind the standalone admin listener — create provider keys, models, and caller API keys through the AISIX Cloud control plane instead.
+:::
+
 ## Prerequisites
 
 - A running gateway from the [Self-Hosted Quickstart](self-hosted.md)
