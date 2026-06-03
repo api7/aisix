@@ -209,24 +209,30 @@ async fn dispatch(
 }
 
 /// Pull the usage counters out of a legacy /v1/completions response
-/// body. Returns `None` when:
+/// body. Returns `None` only when:
 ///   - The `usage` block is missing entirely (non-conformant edge), or
 ///   - `usage.prompt_tokens` is missing / non-numeric (malformed)
 ///
-/// Both cases skip UsageEvent emission rather than attributing a
-/// zero-everything noise row to the api_key. Per the OpenAI spec,
-/// `prompt_tokens` is required on every successful completion
-/// response — its absence is upstream-malformed, not a legitimate
-/// zero-spend reply. Wire shape:
+/// Those cases skip UsageEvent emission rather than attributing a
+/// zero-everything noise row to the api_key. The `prompt_tokens` gate
+/// distinguishes "no upstream usage at all" from a legitimate reply.
+///
+/// `completion_tokens`, by contrast, defaults to 0 when absent: a 200
+/// that reports a prompt side but omits the completion side is still a
+/// real billable call (the prompt was processed) and must be recorded.
+/// This matches LiteLLM, which coerces a missing completion side to 0
+/// and still logs/bills the event (`completion_tokens=response["usage"].
+/// get("completion_tokens", 0)` in convert_dict_to_response.py) — see
+/// #429 follow-up. Dropping the whole event would under-record more than
+/// the zeroed-completion it was meant to avoid. Wire shape:
 /// <https://platform.openai.com/docs/api-reference/completions/object>
 fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
     let usage = body.get("usage")?;
-    // Both fields are required on a spec-compliant 200. Gate emit on
-    // each so a malformed reply (e.g. `usage: {prompt_tokens: 50}` with
-    // no completion side) is skipped rather than silently under-billed
-    // with a 0 (#429).
     let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64())? as u32;
-    let completion_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64())? as u32;
+    let completion_tokens = usage
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
     Some(CompletionUsage {
         prompt_tokens,
         completion_tokens,
@@ -603,12 +609,14 @@ mod tests {
         }
     }
 
-    /// #429: a 200 whose `usage` carries `prompt_tokens` but omits the
-    /// required `completion_tokens` is malformed — emitting it would
-    /// silently under-bill the completion side with a 0. It must be
-    /// skipped, same as a wholly-empty usage block.
+    /// #429 (LiteLLM-parity follow-up): a 200 whose `usage` carries
+    /// `prompt_tokens` but omits `completion_tokens` is still a real
+    /// billable call — the prompt was processed. It MUST emit a
+    /// UsageEvent with `completion_tokens = 0` (matching LiteLLM's
+    /// `get("completion_tokens", 0)`), NOT be dropped. Only a fully
+    /// absent / prompt-less usage block skips (see the two tests below).
     #[tokio::test]
-    async fn skips_usage_event_when_completion_tokens_missing() {
+    async fn emits_with_zero_completion_when_completion_tokens_missing() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -643,14 +651,15 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "no UsageEvent should be emitted when completion_tokens is missing, \
-                 but got prompt_tokens={}",
-                ev.prompt_tokens,
-            );
-        }
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must still be emitted when only completion_tokens is missing")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.prompt_tokens, 50, "prompt side must be recorded");
+        assert_eq!(
+            event.completion_tokens, 0,
+            "missing completion_tokens must default to 0, not drop the event"
+        );
     }
 
     /// Issue #403 negative pinning: 4xx / 5xx responses must NOT
