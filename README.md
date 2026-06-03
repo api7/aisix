@@ -162,4 +162,4 @@ cargo run -p aisix-server -- --config config.example.yaml
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache 2.0 — see [LICENSE](LICENSE).
