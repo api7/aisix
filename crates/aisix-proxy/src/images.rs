@@ -614,4 +614,90 @@ mod tests {
         assert_eq!(event.model_id, "m-1");
         assert_eq!(event.inbound_protocol, "openai");
     }
+
+    /// Issue #456 (#226 family): the 501 NotImplemented path (resolved
+    /// bridge doesn't support image generation) must NOT emit a
+    /// UsageEvent — no upstream call happened. Mirrors
+    /// `completions.rs::provider_lacking_complete_returns_501_without_emit`
+    /// and the embeddings sibling. Unlike those, /v1/images/generations
+    /// rejects non-OpenAI providers with 400 *before* dispatch (see
+    /// `non_openai_provider_returns_400_invalid_request`) and the real
+    /// `OpenAiBridge` overrides `generate_image`, so the only way to reach
+    /// the 501 default is an openai-provider Model whose resolved bridge
+    /// leaves `Bridge::generate_image` at the trait default. We register a
+    /// minimal stub under the "openai" key to exercise exactly that.
+    #[tokio::test]
+    async fn resolved_bridge_lacking_generate_image_returns_501_without_emit_issue_456() {
+        use aisix_gateway::{
+            Bridge, BridgeContext, BridgeError, ChatChunkStream, ChatFormat, ChatMessage,
+            ChatResponse, FinishReason, UsageStats,
+        };
+        use aisix_obs::UsageSink;
+
+        // Minimal openai-family bridge that satisfies the required chat
+        // methods but leaves `generate_image` at the 501 trait default.
+        struct NoImageBridge;
+
+        #[async_trait::async_trait]
+        impl Bridge for NoImageBridge {
+            fn name(&self) -> &'static str {
+                "no-image"
+            }
+
+            async fn chat(
+                &self,
+                req: &ChatFormat,
+                _ctx: &BridgeContext,
+            ) -> Result<ChatResponse, BridgeError> {
+                Ok(ChatResponse {
+                    id: "stub".into(),
+                    model: req.model.clone(),
+                    message: ChatMessage::assistant("stub"),
+                    finish_reason: FinishReason::Stop,
+                    usage: UsageStats::new(0, 0),
+                })
+            }
+
+            async fn chat_stream(
+                &self,
+                _req: &ChatFormat,
+                _ctx: &BridgeContext,
+            ) -> Result<ChatChunkStream, BridgeError> {
+                Ok(Box::pin(futures::stream::iter(Vec::new())))
+            }
+        }
+
+        let snap = new_snap("https://api.openai.com");
+        snap.models.insert(model_entry("stub-image"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(NoImageBridge));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({"model": "stub-image", "prompt": "a cat", "n": 1});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "a bridge without generate_image must surface /v1/images/generations as 501 \
+             (default Bridge::generate_image returns BridgeError::Config)",
+        );
+
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        if let Ok(Some(ev)) = recv {
+            panic!(
+                "501 NotImplemented must not emit UsageEvent, \
+                 got prompt_tokens={}, status_code={}",
+                ev.prompt_tokens, ev.status_code,
+            );
+        }
+    }
 }

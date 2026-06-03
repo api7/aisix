@@ -890,6 +890,69 @@ mod tests {
         );
     }
 
+    /// Issue #456 (#226 family): the 501 NotImplemented path (provider
+    /// doesn't support embeddings) must NOT emit a UsageEvent — no
+    /// upstream call happened, so there's nothing to attribute. Mirrors
+    /// the canonical `completions.rs::provider_lacking_complete_returns_501_without_emit`.
+    /// Triggers the path by routing /v1/embeddings at an Anthropic-backed
+    /// model; `AnthropicBridge` doesn't override `Bridge::embed()` so the
+    /// trait default returns `BridgeError::Config(...)` → 501. Without this
+    /// test, a regression flipping `upstream_called: false` → `true` (or
+    /// `usage: None` → `Some(zero)`) on the 501 branch would silently emit
+    /// a bogus zero event.
+    #[tokio::test]
+    async fn provider_lacking_embed_returns_501_without_emit_issue_456() {
+        use aisix_obs::UsageSink;
+        use aisix_provider_anthropic::AnthropicBridge;
+
+        const ANTHROPIC_PK_ID: &str = "22222222-2222-2222-2222-222222222222";
+
+        let anthropic_pk_json = r#"{"display_name":"anthropic-up","secret":"sk-ant-test","provider":"anthropic","adapter":"anthropic"}"#;
+        let anthropic_pk: aisix_core::ProviderKey =
+            serde_json::from_str(anthropic_pk_json).unwrap();
+        let anthropic_pk_entry = ResourceEntry::new(ANTHROPIC_PK_ID, anthropic_pk, 1);
+
+        let anthropic_model_json = format!(
+            r#"{{"display_name":"claude-embed","provider":"anthropic","model_name":"claude-3-haiku-20240307","provider_key_id":"{ANTHROPIC_PK_ID}"}}"#
+        );
+        let anthropic_model: Model = serde_json::from_str(&anthropic_model_json).unwrap();
+        let anthropic_model_entry = ResourceEntry::new("m-anthropic", anthropic_model, 1);
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(anthropic_pk_entry);
+        snap.models.insert(anthropic_model_entry);
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({"model": "claude-embed", "input": "hello"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "Anthropic-backed /v1/embeddings must surface as 501 \
+             (default Bridge::embed returns BridgeError::Config)",
+        );
+
+        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        if let Ok(Some(ev)) = recv {
+            panic!(
+                "501 NotImplemented must not emit UsageEvent, \
+                 got prompt_tokens={}, status_code={}",
+                ev.prompt_tokens, ev.status_code,
+            );
+        }
+    }
+
     /// Issue #226 audit M1: a 200 response with upstream-reported
     /// `prompt_tokens = 0` MUST still emit a UsageEvent. Pre-fix the
     /// handler gated emission on `prompt_tokens > 0`, conflating
