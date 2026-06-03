@@ -1207,9 +1207,10 @@ async fn dispatch(
         // is gone after #302 Phase A; a PK that matches neither tier is
         // a misconfiguration and surfaces as 503.
         let Some(bridge) = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value) else {
-            last_err = Some(BridgeError::Config(
-                "no bridge registered for provider".into(),
-            ));
+            last_err = Some(BridgeError::Config(format!(
+                "no bridge registered for provider_key provider={:?} adapter={:?}",
+                pk_entry.value.provider, pk_entry.value.adapter
+            )));
             continue;
         };
         let model_arc = Arc::new(model.clone());

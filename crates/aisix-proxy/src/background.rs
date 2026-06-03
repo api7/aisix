@@ -106,8 +106,12 @@ async fn check_direct_model(
         dispatch::require_provider(model).map_err(|e| BridgeError::Config(e.to_string()))?;
     let pk_entry = dispatch::resolve_provider_key(snapshot, model)
         .map_err(|e| BridgeError::Config(e.to_string()))?;
-    let bridge = dispatch::resolve_bridge(hub, &pk_entry.value)
-        .ok_or_else(|| BridgeError::Config("no bridge registered for provider".into()))?;
+    let bridge = dispatch::resolve_bridge(hub, &pk_entry.value).ok_or_else(|| {
+        BridgeError::Config(format!(
+            "no bridge registered for provider_key provider={:?} adapter={:?}",
+            pk_entry.value.provider, pk_entry.value.adapter
+        ))
+    })?;
 
     let req = ChatFormat {
         model: model.display_name.clone(),
