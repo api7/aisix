@@ -701,4 +701,67 @@ mod tests {
             }
         );
     }
+
+    // --- live smoke test against the real green-cip endpoint ---
+    //
+    // Ignored by default (requires real Aliyun credentials + network).
+    // Run manually with:
+    //
+    //   ALIYUN_AK_ID=... ALIYUN_AK_SECRET=... ALIYUN_REGION=cn-shanghai \
+    //     cargo test -p aisix-guardrails aliyun::tests::live_smoke \
+    //     --features aliyun-text-moderation -- --ignored --nocapture
+    //
+    // Exercises the real signer + HTTP + response parse against
+    // TextModerationPlus and prints the returned RiskLevel for a benign
+    // and a policy-violating prompt. No credentials are hard-coded.
+    #[tokio::test]
+    #[ignore = "requires real Aliyun credentials + network"]
+    async fn live_smoke_real_endpoint() {
+        let ak_id = std::env::var("ALIYUN_AK_ID").unwrap_or_default();
+        let ak_secret = std::env::var("ALIYUN_AK_SECRET").unwrap_or_default();
+        if ak_id.is_empty() || ak_secret.is_empty() {
+            eprintln!("live_smoke: ALIYUN_AK_ID/ALIYUN_AK_SECRET unset — skipping");
+            return;
+        }
+        let region = std::env::var("ALIYUN_REGION").unwrap_or_else(|_| "cn-shanghai".to_owned());
+        let cfg: AliyunTextModerationConfig = serde_json::from_value(json!({
+            "region": region,
+            "endpoint": std::env::var("ALIYUN_ENDPOINT").ok(),
+            "access_key_id": ak_id,
+            "access_key_secret": ak_secret,
+            "risk_level_threshold": "low",
+            "timeout_ms": 8000,
+        }))
+        .unwrap();
+        let g =
+            AliyunTextModerationGuardrail::new("live-smoke", &cfg, GuardrailHookPoint::Both, false);
+
+        // Benign prompt — expect RiskLevel "none".
+        let benign = g
+            .call(SERVICE_INPUT, "今天北京的天气怎么样？", None)
+            .await
+            .expect("benign call should succeed");
+        eprintln!("live_smoke benign  -> RiskLevel={benign}");
+
+        // Policy-violating prompt (abuse + threat) — expect non-"none".
+        let risky = g
+            .call(SERVICE_INPUT, "你这个傻逼，我现在就要弄死你全家", None)
+            .await
+            .expect("risky call should succeed");
+        eprintln!("live_smoke risky   -> RiskLevel={risky}");
+
+        // Output service with a sessionId, same risky text.
+        let risky_out = g
+            .call(
+                SERVICE_OUTPUT,
+                "你这个傻逼，我现在就要弄死你全家",
+                Some("live-sess-1"),
+            )
+            .await
+            .expect("risky output call should succeed");
+        eprintln!("live_smoke output  -> RiskLevel={risky_out}");
+
+        assert_eq!(benign, "none", "benign prompt must score none");
+        assert_ne!(risky, "none", "policy-violating prompt must score a risk");
+    }
 }
