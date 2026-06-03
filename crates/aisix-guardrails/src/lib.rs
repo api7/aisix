@@ -32,8 +32,33 @@ mod prompt_shield;
 #[cfg(feature = "azure-content-safety")]
 mod text_moderation;
 
-use aisix_gateway::{ChatFormat, ChatResponse};
+use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse};
 use async_trait::async_trait;
+
+/// The text a guardrail should scan for one message.
+///
+/// Prefers the flat `content` string; when it's empty, falls back to
+/// concatenating the `text`-type entries of `content_blocks`. A caller
+/// that sends the OpenAI content-block shape
+/// (`content: [{ "type": "text", "text": "…" }]`) with an empty
+/// top-level string would otherwise bypass moderation entirely (#465).
+/// Non-text blocks (image/audio) are out of scope — multimodal
+/// moderation is a separate feature. Every guardrail's input/output
+/// collector goes through this so the families can't drift.
+pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
+    if !m.content.is_empty() {
+        return m.content.clone();
+    }
+    match m.content_blocks.as_ref() {
+        Some(blocks) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => String::new(),
+    }
+}
 
 #[cfg(feature = "bedrock")]
 pub use bedrock::BedrockGuardrail;
@@ -242,6 +267,44 @@ pub trait Guardrail: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_scan_text_falls_back_to_content_blocks() {
+        // Flat content present → used verbatim.
+        let flat: ChatMessage =
+            serde_json::from_value(serde_json::json!({"role": "user", "content": "hello"}))
+                .unwrap();
+        assert_eq!(message_scan_text(&flat), "hello");
+
+        // The #465 bypass shape: empty top-level content with the text
+        // in an explicit content_blocks array (round-trip form). Must
+        // be scanned, not skipped.
+        let blocks_only: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": "",
+            "content_blocks": [
+                {"type": "text", "text": "first"},
+                {"type": "image_url", "image_url": {"url": "http://x"}},
+                {"type": "text", "text": "second"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(message_scan_text(&blocks_only), "first\nsecond");
+
+        // Empty content, only a non-text block → nothing to scan.
+        let image_only: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": "",
+            "content_blocks": [{"type": "image_url", "image_url": {"url": "http://x"}}]
+        }))
+        .unwrap();
+        assert_eq!(message_scan_text(&image_only), "");
+
+        // Empty content, no blocks → empty.
+        let empty: ChatMessage =
+            serde_json::from_value(serde_json::json!({"role": "user", "content": ""})).unwrap();
+        assert_eq!(message_scan_text(&empty), "");
+    }
 
     #[test]
     fn verdict_helpers() {

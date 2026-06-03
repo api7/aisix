@@ -236,7 +236,7 @@ impl TextModerationGuardrail {
         req.messages
             .iter()
             .filter(|m| all || m.role == Role::User)
-            .map(|m| m.content.as_str())
+            .map(crate::message_scan_text)
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("\n")
@@ -282,10 +282,33 @@ struct AnalyzeRequest<'a> {
 
 #[derive(Deserialize)]
 struct AnalyzeResponse {
-    #[serde(rename = "categoriesAnalysis", default)]
+    #[serde(
+        rename = "categoriesAnalysis",
+        default,
+        deserialize_with = "null_as_empty"
+    )]
     categories_analysis: Vec<CategoryAnalysis>,
-    #[serde(rename = "blocklistsMatch", default)]
+    #[serde(
+        rename = "blocklistsMatch",
+        default,
+        deserialize_with = "null_as_empty"
+    )]
     blocklists_match: Vec<BlocklistMatch>,
+}
+
+/// Deserialize an array field that may arrive as JSON `null` (or be
+/// absent) into an empty `Vec`. `#[serde(default)]` alone only covers
+/// an *absent* field; a field present as `null` fails with "invalid
+/// type: null, expected a sequence", which previously fail-closed the
+/// whole request as an Azure `ServerError`. Conformant Azure always
+/// sends `[]`, but a non-conformant upstream/proxy can send `null`
+/// (#470).
+fn null_as_empty<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
 }
 
 #[derive(Deserialize)]
@@ -407,6 +430,32 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[test]
+    fn analyze_response_tolerates_null_and_absent_arrays() {
+        // #470: a non-conformant upstream may send the arrays as JSON
+        // `null`; that must deserialize to empty, not fail-closed.
+        let from_null: AnalyzeResponse =
+            serde_json::from_value(json!({ "categoriesAnalysis": null, "blocklistsMatch": null }))
+                .expect("null arrays must deserialize to empty");
+        assert!(from_null.categories_analysis.is_empty());
+        assert!(from_null.blocklists_match.is_empty());
+
+        // Absent fields (today's path) still work.
+        let from_absent: AnalyzeResponse =
+            serde_json::from_value(json!({})).expect("absent arrays default to empty");
+        assert!(from_absent.categories_analysis.is_empty());
+        assert!(from_absent.blocklists_match.is_empty());
+
+        // Conformant Azure (`[]` + populated) is unaffected.
+        let from_conformant: AnalyzeResponse = serde_json::from_value(json!({
+            "categoriesAnalysis": [{ "category": "Hate", "severity": 4 }],
+            "blocklistsMatch": []
+        }))
+        .expect("conformant body must deserialize");
+        assert_eq!(from_conformant.categories_analysis.len(), 1);
+        assert!(from_conformant.blocklists_match.is_empty());
+    }
 
     fn cfg(endpoint: &str) -> AzureContentSafetyTextModerationConfig {
         // Mirrors what cp-api projects after applying its defaults.

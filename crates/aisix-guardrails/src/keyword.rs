@@ -105,7 +105,8 @@ impl Guardrail for KeywordBlocklist {
         let combined: String = req
             .messages
             .iter()
-            .map(|m| m.content.as_str())
+            .map(crate::message_scan_text)
+            .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
         match self.first_match(&combined) {
@@ -165,6 +166,23 @@ mod tests {
             .check_input(&req(&[("user", "say the FORBIDDEN word")]))
             .await;
         assert!(v.is_block());
+    }
+
+    #[tokio::test]
+    async fn matches_text_in_content_blocks_when_flat_content_empty() {
+        // #465: a message whose text lives only in content_blocks (empty
+        // top-level content — the round-trip shape) must still be
+        // scanned. Before the shared message_scan_text helper this
+        // bypassed moderation entirely.
+        let msg: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": "",
+            "content_blocks": [{"type": "text", "text": "the FORBIDDEN word"}]
+        }))
+        .unwrap();
+        let g = KeywordBlocklist::new(vec![KeywordRule::literal("Forbidden")]);
+        let v = g.check_input(&ChatFormat::new("m", vec![msg])).await;
+        assert!(v.is_block(), "content-block text must be scanned");
     }
 
     #[tokio::test]
