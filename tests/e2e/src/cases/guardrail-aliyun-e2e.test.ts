@@ -331,6 +331,9 @@ describe("aliyun guardrail e2e: TextModerationPlus blocks risky input/output", (
       ctx.skip();
       return;
     }
+    const outBefore = aliyun!.requests.filter(
+      (r) => r.service === "llm_response_moderation",
+    ).length;
     const res = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
       method: "POST",
       headers: {
@@ -359,5 +362,16 @@ describe("aliyun guardrail e2e: TextModerationPlus blocks risky input/output", (
       error?: { type?: unknown };
     };
     expect(parsed.error?.type).toBe("content_filter");
+
+    // Every windowed output call for this stream must carry one stable
+    // sessionId (the upstream's request id, "strm-risky"), proving the
+    // chunks of a single response correlate at Aliyun.
+    const streamOutCalls = aliyun!.requests
+      .filter((r) => r.service === "llm_response_moderation")
+      .slice(outBefore);
+    expect(streamOutCalls.length).toBeGreaterThan(0);
+    const sessionIds = new Set(streamOutCalls.map((r) => r.sessionId));
+    expect(sessionIds.size).toBe(1);
+    expect([...sessionIds][0]).toBe("strm-risky");
   });
 });
