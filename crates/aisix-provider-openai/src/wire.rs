@@ -176,6 +176,17 @@ pub struct OpenAiResponseMessage {
     /// `choices[0].message.reasoning_content`.
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// OpenRouter (and some other OpenAI-compatible aggregators) put a
+    /// reasoning model's chain-of-thought at `message.reasoning` —
+    /// NOT the DeepSeek-canonical `message.reasoning_content` (#648).
+    /// Captured here so `response_into_chat_response` can normalise it
+    /// into the canonical `reasoning_content` slot; without this, an
+    /// OpenRouter reasoning model that returns its whole answer as
+    /// reasoning surfaces empty `content` AND empty `reasoning_content`
+    /// to the customer. Default so non-OpenRouter upstreams (which omit
+    /// the field) parse unaffected.
+    #[serde(default)]
+    pub reasoning: Option<String>,
 }
 
 // `#[serde(default)]` at the container level so an upstream that omits
@@ -245,13 +256,24 @@ pub fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
             // streaming path's `delta.reasoning_content`. Skip empty
             // strings so a model that returns `""` doesn't add a noise
             // field.
-            if let Some(reasoning) = c.message.reasoning_content {
-                if !reasoning.is_empty() {
-                    extra.insert(
-                        "reasoning_content".to_string(),
-                        serde_json::Value::String(reasoning),
-                    );
-                }
+            //
+            // #648: normalise OpenRouter's `message.reasoning` into the same
+            // canonical `reasoning_content` slot. The DeepSeek-canonical
+            // `reasoning_content` takes precedence when present; otherwise we
+            // fall back to OpenRouter's `reasoning`. Without this an
+            // OpenRouter reasoning model that emits its whole answer as
+            // reasoning (empty `content`) reaches the customer with BOTH
+            // fields empty.
+            let reasoning_text = c
+                .message
+                .reasoning_content
+                .filter(|s| !s.is_empty())
+                .or(c.message.reasoning.filter(|s| !s.is_empty()));
+            if let Some(reasoning) = reasoning_text {
+                extra.insert(
+                    "reasoning_content".to_string(),
+                    serde_json::Value::String(reasoning),
+                );
             }
             (
                 ChatMessage {
@@ -750,6 +772,103 @@ mod tests {
         assert!(
             !out.message.extra.contains_key("reasoning_content"),
             "no reasoning_content field when upstream didn't send one",
+        );
+    }
+
+    /// #648: OpenRouter puts a reasoning model's chain-of-thought at
+    /// `message.reasoning` (not the DeepSeek-canonical
+    /// `message.reasoning_content`). The non-stream path must normalise it
+    /// into the canonical `reasoning_content` slot, so an OpenRouter
+    /// reasoning model that returns its whole answer as reasoning (empty
+    /// `content`) does NOT reach the customer with both fields empty.
+    #[test]
+    fn non_streaming_openrouter_reasoning_normalises_to_reasoning_content() {
+        let body = r#"{
+            "id": "gen-or",
+            "object": "chat.completion",
+            "model": "z-ai/glm-4.6",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning": "Step 1: parse. Step 2: answer. The capital is Paris."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 230, "total_tokens": 241}
+        }"#;
+        let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        let reasoning = out
+            .message
+            .extra
+            .get("reasoning_content")
+            .expect("OpenRouter `message.reasoning` must normalise into canonical reasoning_content (#648)")
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            reasoning,
+            "Step 1: parse. Step 2: answer. The capital is Paris."
+        );
+    }
+
+    /// #648: when an upstream sends BOTH the canonical `reasoning_content`
+    /// AND OpenRouter's `reasoning`, the canonical field wins (no
+    /// double-capture, no clobber).
+    #[test]
+    fn non_streaming_canonical_reasoning_content_takes_precedence_over_reasoning() {
+        let body = r#"{
+            "id": "gen-both",
+            "object": "chat.completion",
+            "model": "some-compat-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "ok",
+                    "reasoning_content": "canonical thoughts",
+                    "reasoning": "aggregator thoughts"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10}
+        }"#;
+        let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        let reasoning = out
+            .message
+            .extra
+            .get("reasoning_content")
+            .expect("reasoning_content must be present")
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            reasoning, "canonical thoughts",
+            "canonical reasoning_content must win over OpenRouter `reasoning`",
+        );
+    }
+
+    /// #648: an empty `reasoning` (alongside empty/absent reasoning_content)
+    /// must NOT add a noise field — same skip-empty rule as #466.
+    #[test]
+    fn non_streaming_empty_reasoning_adds_no_extra_field() {
+        let body = r#"{
+            "id": "gen-empty",
+            "object": "chat.completion",
+            "model": "z-ai/glm-4.6",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi", "reasoning": ""},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }"#;
+        let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        assert!(
+            !out.message.extra.contains_key("reasoning_content"),
+            "empty `reasoning` must not add a reasoning_content field",
         );
     }
 
