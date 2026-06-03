@@ -120,6 +120,8 @@ describe("model group via passthrough endpoints e2e (#471)", () => {
     if (!admin) throw new Error("admin client not initialized");
     const pk = await admin.createProviderKey({
       display_name: `${displayName}-pk`,
+      provider: "anthropic",
+      adapter: "anthropic",
       secret: "sk-ant-mock",
       // Anthropic bridge appends /v1/messages, so point at the bare host.
       api_base: upstream.baseUrl,

@@ -219,9 +219,8 @@ async fn dispatch(
     let provider = crate::dispatch::require_provider(model)?;
     let pk_entry = crate::dispatch::resolve_provider_key(&snapshot, model)?;
 
-    let bridge =
-        crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, model.provider.as_deref())
-            .ok_or(ProxyError::ProviderUnavailable)?;
+    let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
+        .ok_or(ProxyError::ProviderUnavailable)?;
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);

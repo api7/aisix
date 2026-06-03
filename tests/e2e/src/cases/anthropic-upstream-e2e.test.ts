@@ -67,6 +67,8 @@ describe("anthropic upstream e2e: OpenAI in, Anthropic out, OpenAI back to calle
     // these mixed up was the lesson from the unit-level matrix tests.
     const pk = await admin.createProviderKey({
       display_name: "an-e2e-pk",
+      provider: "anthropic",
+      adapter: "anthropic",
       secret: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });

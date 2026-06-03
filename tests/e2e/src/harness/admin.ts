@@ -25,7 +25,18 @@ export class AdminClient {
   async createProviderKey(
     pk: Record<string, unknown>,
   ): Promise<{ id: string; value: Record<string, unknown> }> {
-    return this.json("POST", "/admin/v1/provider_keys", pk);
+    // The DP dispatches a ProviderKey via its `provider` (specialized
+    // vendor) + `adapter` (protocol family) — cp-api always writes both
+    // in production, and the DP no longer carries a Model.provider
+    // fallback. So the harness mirrors cp-api and always sends them,
+    // defaulting to the OpenAI-compatible vendor/family that the bulk of
+    // the mock-upstream tests use. Tests against a non-OpenAI upstream
+    // (anthropic, etc.) pass `provider`/`adapter` explicitly.
+    return this.json("POST", "/admin/v1/provider_keys", {
+      provider: "openai",
+      adapter: "openai",
+      ...pk,
+    });
   }
 
   async listModels(): Promise<Array<Record<string, unknown>>> {

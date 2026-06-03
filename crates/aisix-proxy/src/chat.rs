@@ -730,9 +730,7 @@ async fn dispatch(
         // we commit to a long upstream call.
         let pk_entry =
             crate::dispatch::resolve_provider_key(&snapshot, only).map_err(with_model)?;
-        if crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, only.provider.as_deref())
-            .is_none()
-        {
+        if crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value).is_none() {
             return Err(with_model(ProxyError::ProviderUnavailable));
         }
     }
@@ -756,9 +754,8 @@ async fn dispatch(
         let provider = crate::dispatch::require_provider(model).map_err(with_model)?;
         let pk_entry =
             crate::dispatch::resolve_provider_key(&snapshot, model).map_err(with_model)?;
-        let bridge =
-            crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, model.provider.as_deref())
-                .ok_or_else(|| with_model(ProxyError::ProviderUnavailable))?;
+        let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
+            .ok_or_else(|| with_model(ProxyError::ProviderUnavailable))?;
         let model_arc = Arc::new(model.clone());
         let pk_arc = Arc::new(pk_entry.value.clone());
         let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
@@ -1207,14 +1204,9 @@ async fn dispatch(
         // Two-tier dispatch via `Hub::dispatch_two_tier`: specialized
         // vendor (ProviderKey.provider) first, then adapter family
         // (ProviderKey.adapter). The legacy `Provider`-keyed registry
-        // is gone after #302 Phase A. `resolve_bridge` carries a
-        // one-cycle compat shim for pre-Phase-A PK rows that still
-        // have empty `provider` and `adapter: None` on disk — those
-        // resolve via `Model.provider` (passed below). Once cp-api
-        // has backfilled every PK, the shim becomes unreachable.
-        let Some(bridge) =
-            crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value, model.provider.as_deref())
-        else {
+        // is gone after #302 Phase A; a PK that matches neither tier is
+        // a misconfiguration and surfaces as 503.
+        let Some(bridge) = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value) else {
             last_err = Some(BridgeError::Config(
                 "no bridge registered for provider".into(),
             ));

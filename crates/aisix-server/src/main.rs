@@ -836,20 +836,14 @@ fn build_hub() -> Hub {
     hub.register_family(Adapter::AzureOpenai, Arc::new(AzureOpenAiBridge::new()));
     hub.register_family(Adapter::Bedrock, Arc::new(BedrockBridge::new()));
 
-    // ─── Specialized vendor bridges (one-cycle compat shim) ──────────
+    // ─── Specialized vendor bridges ─────────────────────────────────
     //
-    // Pre-Phase-A ProviderKeys on disk may carry `provider` but no
-    // `adapter` field (cp-api started writing `adapter` at the same
-    // commit as Phase A — older rows haven't been resaved). Without
-    // these explicit specialized registrations, `dispatch_two_tier`
-    // would fall through to the None branch and 503 those PKs.
-    //
-    // Only `openai` and `anthropic` are registered — every other
-    // vendor only existed in the catalog post-Phase-A (Phase A added
-    // them as long-tail OpenAI-compat) and is guaranteed to have
-    // `adapter` populated, so the family bridge above already covers
-    // them. Once cp-api has resaved all pre-Phase-A rows these two
-    // entries become safe to delete.
+    // `openai` and `anthropic` are the two canonical vendors with a
+    // dedicated specialized bridge, so a ProviderKey whose `provider`
+    // is exactly `"openai"`/`"anthropic"` resolves through the
+    // specialized tier of `dispatch_two_tier`. Long-tail OpenAI-compat
+    // vendors (xai, openrouter, groq, deepseek, …) carry `adapter:
+    // openai` and resolve through the family tier above instead.
     hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
     hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
 
@@ -1290,46 +1284,36 @@ mod tests {
         );
     }
 
-    /// `build_hub()` MUST keep `register_specialized("openai", …)` so
-    /// `crates/aisix-proxy/src/dispatch.rs::resolve_bridge`'s
-    /// compat-shim fallback (`hub.get_specialized(Model.provider)`)
-    /// resolves a pre-Phase-A PK row (empty `provider`, no `adapter`).
-    /// A future PR that drops this registration prematurely — before
-    /// cp-api has re-saved every legacy PK — would silently 503 those
-    /// rows. This test pins the shim contract end-to-end against the
+    /// `build_hub()` MUST register the specialized `openai` vendor so a
+    /// ProviderKey with `provider: "openai"` dispatches to the dedicated
+    /// `OpenAiBridge`. This pins the registration end-to-end against the
     /// real `build_hub()` registry (not a stub Hub), so it fails the
     /// moment the registration disappears.
     #[test]
-    fn build_hub_compat_shim_resolves_pre_phase_a_openai_pk() {
+    fn build_hub_registers_specialized_openai_vendor() {
         let hub = build_hub();
         let bridge = hub
             .get_specialized("openai")
-            .expect("openai compat shim must dispatch pre-Phase-A PK rows");
+            .expect("openai vendor must be registered as specialized");
         assert_eq!(
             bridge.name(),
             "openai",
-            "specialized 'openai' compat shim MUST be `OpenAiBridge::new()` \
-             (returning bridge name 'openai') so pre-Phase-A PK rows with \
-             empty `provider` + no `adapter` resolve via \
-             `dispatch::resolve_bridge`'s `hub.get_specialized(Model.provider)` \
-             fallback",
+            "specialized 'openai' MUST be `OpenAiBridge::new()` (bridge name 'openai')",
         );
     }
 
-    /// Parallel of the openai compat-shim test, for the Anthropic side.
+    /// Parallel of the openai specialized-registration test, for the
+    /// Anthropic side.
     #[test]
-    fn build_hub_compat_shim_resolves_pre_phase_a_anthropic_pk() {
+    fn build_hub_registers_specialized_anthropic_vendor() {
         let hub = build_hub();
         let bridge = hub
             .get_specialized("anthropic")
-            .expect("anthropic compat shim must dispatch pre-Phase-A PK rows");
+            .expect("anthropic vendor must be registered as specialized");
         assert_eq!(
             bridge.name(),
             "anthropic",
-            "specialized 'anthropic' compat shim MUST be `AnthropicBridge::new()` \
-             so pre-Phase-A PK rows with empty `provider` + no `adapter` resolve \
-             via `dispatch::resolve_bridge`'s `hub.get_specialized(Model.provider)` \
-             fallback",
+            "specialized 'anthropic' MUST be `AnthropicBridge::new()` (bridge name 'anthropic')",
         );
     }
 }

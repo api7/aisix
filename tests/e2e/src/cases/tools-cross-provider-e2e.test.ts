@@ -93,6 +93,8 @@ describe("tools cross-provider e2e: OpenAI tools → Anthropic upstream tool_use
     // (mirrors anthropic-upstream-e2e convention).
     const pk = await admin.createProviderKey({
       display_name: "tools-xprov-pk",
+      provider: "anthropic",
+      adapter: "anthropic",
       secret: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });

@@ -182,6 +182,8 @@ describe("api_base tolerance e2e: endpoint suffix is stripped before dispatch", 
     //   `${baseUrl}/v1/messages/v1/messages`.
     const pk = await admin.createProviderKey({
       display_name: "anthropic-suffix-tolerance-pk",
+      provider: "anthropic",
+      adapter: "anthropic",
       secret: "sk-ant-mock",
       api_base: `${upstream.baseUrl}/v1/messages`,
     });

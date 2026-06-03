@@ -204,11 +204,10 @@ pub struct Model {
     ///    `dispatch::require_provider()` on every bridge-dispatching
     ///    endpoint (chat, completions, embeddings, images, audio,
     ///    rerank).
-    /// 4. The one-cycle compat shim in
-    ///    `crates/aisix-proxy/src/dispatch.rs::resolve_bridge` (called
-    ///    by every bridge-dispatching endpoint) that rescues pre-
-    ///    Phase-A on-disk PK rows (empty `provider` + `None` `adapter`)
-    ///    by falling back to `hub.get_specialized(Model.provider)`.
+    ///
+    /// Bridge dispatch itself is keyed on the ProviderKey's
+    /// `provider`/`adapter` (`Hub::dispatch_two_tier`), not on this
+    /// field.
     ///
     /// `None` for routing models.
     ///

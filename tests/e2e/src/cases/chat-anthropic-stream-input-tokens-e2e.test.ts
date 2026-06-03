@@ -60,6 +60,8 @@ describe("/v1/chat/completions anthropic streaming input tokens (#450)", () => {
     const admin = new AdminClient(app.adminUrl, app.adminKey);
     const pk = await admin.createProviderKey({
       display_name: "chat-anth-stream-pk",
+      provider: "anthropic",
+      adapter: "anthropic",
       secret: "sk-anth-mock",
       api_base: upstream.baseUrl,
     });

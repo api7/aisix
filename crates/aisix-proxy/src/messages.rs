@@ -844,9 +844,8 @@ async fn cross_provider_dispatch(
             ProxyError::InvalidRequest(format!("model `{model_name}` has no provider prefix"))
         })?
         .to_string();
-    let bridge: Arc<dyn Bridge> =
-        crate::dispatch::resolve_bridge(&state.hub, provider_key, model.provider.as_deref())
-            .ok_or(ProxyError::ProviderUnavailable)?;
+    let bridge: Arc<dyn Bridge> = crate::dispatch::resolve_bridge(&state.hub, provider_key)
+        .ok_or(ProxyError::ProviderUnavailable)?;
 
     // Parse the Anthropic-shape body into the gateway's normalised
     // ChatFormat. Errors here are 400 — the request is malformed
