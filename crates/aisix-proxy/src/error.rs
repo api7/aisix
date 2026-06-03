@@ -38,7 +38,7 @@
 //!   taxonomy because the Anthropic SDK's `ErrorType` is a strict
 //!   literal — emitting `"upstream_error"` would silently break
 //!   customers branching on `e.body['error']['type']`. See
-//!   [`anthropic_kind_from_status`] for the LiteLLM-aligned mapping
+//!   [`anthropic_kind_from_status`] for the ecosystem-aligned mapping
 //!   table.
 //!
 //! `ProxyError` is the internal error taxonomy; it implements
@@ -376,10 +376,9 @@ struct AnthropicErrorBody {
 /// canonical strings on `error.type` are static-type violations for
 /// any customer doing `isinstance(e, anthropic.RateLimitError)` plus
 /// `e.body['error']['type'] == 'rate_limit_error'`. Per CLAUDE.md §7
-/// reference-implementation rule, this mapping mirrors LiteLLM's
-/// `anthropic_interface/exceptions/exception_mapping_utils.py`
-/// status-to-type table verbatim — divergence from the established
-/// ecosystem here would silently break Claude SDK users.
+/// reference-implementation rule, this mapping mirrors the established
+/// ecosystem's Anthropic status-to-type table verbatim — divergence from
+/// the established ecosystem here would silently break Claude SDK users.
 ///
 /// (The OpenAI envelope's inner `error.type` keeps the DP-stable
 /// strings per ai-gateway#327; that contract is unchanged on
@@ -408,7 +407,7 @@ impl ProxyError {
     /// Render this error as an Anthropic-shape `{type:"error", error:
     /// {type, message}}` HTTP response. Used by `/v1/messages` so the
     /// Anthropic SDK's envelope parser sees a shape the official
-    /// SDK + LiteLLM both treat as canonical.
+    /// SDK and the broader ecosystem both treat as canonical.
     ///
     /// **Inner `error.type` policy:** maps from the HTTP status code
     /// to the Anthropic SDK's `ErrorType` literal via

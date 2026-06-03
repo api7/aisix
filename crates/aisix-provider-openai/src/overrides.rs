@@ -23,10 +23,9 @@
 //! stays here — it never serializes.
 //!
 //! Reference implementations consulted:
-//! - LiteLLM `convert_content_list_to_str` —
-//!   <https://github.com/BerriAI/litellm/blob/main/litellm/litellm_core_utils/prompt_templates/common_utils.py>
-//! - LiteLLM `convert_content_list_to_string` flag —
-//!   <https://github.com/BerriAI/litellm/blob/main/litellm/llms/openai_like/dynamic_config.py>
+//! - Established OpenAI-compatible gateways' content-block flattening
+//!   (`convert_content_list_to_str`-style) and the request-side
+//!   string-content config flag they expose.
 //! - DeepSeek reasoning shape (`delta.reasoning_content`) —
 //!   <https://api-docs.deepseek.com/guides/reasoning_model>
 //! - OpenAI SSE `data: [DONE]` terminator —
@@ -62,8 +61,8 @@ pub enum StreamDoneOutcome {
 ///
 /// **Collision semantics: source wins.** When both source and target
 /// are present in the body, the source value overwrites the target.
-/// Matches LiteLLM's convention across `databricks` / `openai_like` /
-/// `sambanova` / `dynamic_config` transformations — for the canonical
+/// Matches the established source-wins convention used by widely-deployed
+/// OpenAI-compatible gateways — for the canonical
 /// `max_completion_tokens → max_tokens` case the newer (source) value
 /// is what the caller intended; an accidentally-leftover deprecated
 /// `max_tokens` value should not shadow it.
@@ -215,8 +214,8 @@ pub fn apply_stream_done_marker_policy(
 /// entry's `content` is an array of `{type:"text", text:"..."}`
 /// blocks, replaces it with the concatenated text of those blocks.
 ///
-/// Matches LiteLLM's `convert_content_list_to_str`: text blocks are
-/// concatenated with no separator. Non-text blocks (image_url,
+/// Matches the common gateway `convert_content_list_to_str` behavior:
+/// text blocks are concatenated with no separator. Non-text blocks (image_url,
 /// audio, etc.) are skipped — same behavior as the reference — and
 /// if every block is non-text the field is left as-is, since
 /// flattening a vision payload to an empty string would silently
@@ -271,9 +270,9 @@ pub fn apply_content_list_to_string(body: &mut Value) {
 /// This intentionally does *not* mutate any other shape — the only
 /// guarantee is "after a successful call, the canonical
 /// `reasoning_content` slot reflects whatever the upstream put at
-/// `path`, when the upstream put a string there". Reference:
-/// LiteLLM normalizes vendor-specific reasoning fields onto
-/// `reasoning_content` in [`litellm/llms/ovhcloud/chat/transformation.py`](https://github.com/BerriAI/litellm/blob/main/litellm/llms/ovhcloud/chat/transformation.py).
+/// `path`, when the upstream put a string there". This mirrors the
+/// established ecosystem convention of normalizing vendor-specific
+/// reasoning fields onto the canonical `reasoning_content` slot.
 pub fn extract_reasoning_field(chunk: &mut Value, path: &str) {
     let segments: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
     if segments.is_empty() {
@@ -405,8 +404,8 @@ mod tests {
 
     #[test]
     fn rename_source_wins_when_both_present() {
-        // Both source and target keys are present in the body. Per
-        // LiteLLM convention (source wins), the source's value should
+        // Both source and target keys are present in the body. Per the
+        // established source-wins convention, the source's value should
         // overwrite the target's pre-existing value — for the canonical
         // max_completion_tokens → max_tokens case, the newer source
         // value 100 wins over the deprecated target value 50.
@@ -660,8 +659,8 @@ mod tests {
 
     #[test]
     fn flattens_two_text_blocks() {
-        // Matches LiteLLM's convert_content_list_to_str: text fields
-        // are concatenated with no separator.
+        // Matches the common gateway convert_content_list_to_str behavior:
+        // text fields are concatenated with no separator.
         let mut body = json!({
             "messages": [{
                 "role": "user",

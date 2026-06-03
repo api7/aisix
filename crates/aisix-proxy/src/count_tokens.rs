@@ -24,9 +24,9 @@
 //! - Anthropic Count Message Tokens API:
 //!   <https://platform.claude.com/docs/en/api/messages-count-tokens>
 //!   (`POST /v1/messages/count_tokens` → `{"input_tokens": <int>}`).
-//! - LiteLLM exposes the same route as a user-facing passthrough
-//!   (<https://docs.litellm.ai/docs/anthropic_count_tokens>) and had the
-//!   identical "route missing from the list" bug (BerriAI/litellm#15006).
+//! - Other OpenAI-compatible gateways expose the same route as a
+//!   user-facing passthrough and hit the identical "route missing from
+//!   the list" bug.
 
 use aisix_obs::{AccessLog, RequestOutcome};
 use axum::extract::rejection::JsonRejection;

@@ -283,8 +283,8 @@ where
 /// out the apply order: `param_renames` → `param_constraints` →
 /// `default_body_fields` (request side), `content_list_to_string`
 /// (response side flag, but it transforms the *request* body before
-/// send when the upstream only accepts string content per LiteLLM's
-/// convention). Anything not configured is a no-op.
+/// send when the upstream only accepts string content per the common
+/// gateway convention). Anything not configured is a no-op.
 fn prepare_outbound_body<T: serde::Serialize>(
     typed: &T,
     request: Option<&RequestOverrides>,
@@ -1335,7 +1335,7 @@ data: [DONE]\n\n";
     /// `param_renames` must rewrite the outbound body key. Build a
     /// request with `max_tokens=64`; configure rename
     /// `max_tokens → max_completion_tokens`; the bytes leaving the
-    /// bridge must carry the renamed key (LiteLLM source-wins).
+    /// bridge must carry the renamed key (source-wins convention).
     #[tokio::test]
     async fn chat_applies_param_renames_to_outbound_body() {
         use wiremock::matchers::body_partial_json;
@@ -1471,7 +1471,7 @@ data: [DONE]\n\n";
 
     /// `content_list_to_string=true` flattens the request body's
     /// `messages[*].content` array of text blocks into a string
-    /// before send (LiteLLM convention — applies to the request).
+    /// before send (common gateway convention — applies to the request).
     /// The outbound body must carry `content: "abc"`, not the array.
     #[tokio::test]
     async fn chat_content_list_to_string_flattens_text_blocks_in_outbound_body() {

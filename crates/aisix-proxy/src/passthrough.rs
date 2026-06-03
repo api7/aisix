@@ -216,8 +216,9 @@ async fn dispatch(
     // provider's credentials through generic passthrough: pick the first
     // model of the provider the key is actually allowed to access.
     // Without this any valid key could reach any configured provider's
-    // upstream credentials (#449). Mirrors LiteLLM, which enforces the
-    // key's model access on passthrough when a target is identifiable.
+    // upstream credentials (#449). Mirrors the established gateway behavior,
+    // which enforces the key's model access on passthrough when a target is
+    // identifiable.
     let model_entry = all_models
         .into_iter()
         .find(|e| matches_provider(e) && auth.key().can_access(&e.value.display_name))

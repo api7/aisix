@@ -17,7 +17,7 @@ A BYO endpoint uses the `openai` adapter family. The gateway sends a standard `P
 
 ## When to use this
 
-- Use this when you run an inference server that exposes the OpenAI chat-completions API (vLLM, SGLang, Ollama, LiteLLM-style proxies, or your own service).
+- Use this when you run an inference server that exposes the OpenAI chat-completions API (vLLM, SGLang, Ollama, other OpenAI-compatible proxies, or your own service).
 - Use this when you want a private or air-gapped model to share the gateway's auth, allowlist, rate limiting, and usage accounting.
 - Do not use this for AWS Bedrock, Google Vertex AI, or Azure OpenAI — those have native wire shapes and dedicated guides: [AWS Bedrock](../integration/upstream-bedrock.md), [Google Vertex AI](../integration/upstream-vertex.md), [Azure OpenAI](../integration/upstream-azure-openai.md).
 

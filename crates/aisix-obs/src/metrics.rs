@@ -12,7 +12,8 @@
 //!
 //! Newer AISIX-native series use `aisix_proxy_*` and `aisix_llm_*`
 //! names with bounded, DP-stable labels. They intentionally do not
-//! copy LiteLLM label names that the data plane does not have.
+//! copy label names from other LLM gateways that the data plane does
+//! not have.
 //!
 //! A single [`Metrics`] instance is held `Arc`'d inside `ObsState` and
 //! cloned into axum state. The exposition format is emitted via

@@ -33,7 +33,7 @@ AISIX exposes native metric names with the `aisix_` prefix. Existing compatibili
 - `aisix_ratelimit_rejections_total`
 - `aisix_tokens_consumed_total`
 
-The Prometheus integration also emits LiteLLM-category equivalents under AISIX-native names:
+The Prometheus integration also emits common LLM-gateway-category equivalents under AISIX-native names:
 
 - usage and cost: `aisix_llm_input_tokens_total`, `aisix_llm_output_tokens_total`, `aisix_llm_total_tokens_total`, `aisix_llm_spend_micro_usd_total`
 - request volume and latency: `aisix_llm_requests_total`, `aisix_llm_request_duration_seconds`, `aisix_llm_time_to_first_token_seconds`

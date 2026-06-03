@@ -13,7 +13,7 @@ import {
 // E2E: STREAMING /v1/messages runs output guardrails at end-of-stream
 // (#448 #22). The Anthropic passthrough forwards bytes verbatim, so a
 // blocked response is signalled with a terminal `error` event (mirroring
-// /v1/chat/completions and LiteLLM's streaming guardrail). We stream
+// /v1/chat/completions and the common streaming-guardrail pattern). We stream
 // Anthropic SSE whose text_delta carries a forbidden token and require
 // the response to end with a content_filter error event.
 
