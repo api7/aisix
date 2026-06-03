@@ -148,7 +148,7 @@ fn resolve_base(ctx: &BridgeContext) -> Result<String, BridgeError> {
 fn api_key(ctx: &BridgeContext) -> Result<&str, BridgeError> {
     let k = &ctx.provider_key.secret;
     if k.is_empty() {
-        return Err(BridgeError::InvalidUpstreamConfig(
+        return Err(BridgeError::InvalidUpstreamCredentials(
             "provider_key.secret is empty".into(),
         ));
     }
@@ -157,7 +157,7 @@ fn api_key(ctx: &BridgeContext) -> Result<&str, BridgeError> {
     // the openai / azure bridges — otherwise reqwest's `.header()` fails
     // later with an opaque builder error (#367).
     if header::HeaderValue::from_str(k).is_err() {
-        return Err(BridgeError::InvalidUpstreamConfig(
+        return Err(BridgeError::InvalidUpstreamCredentials(
             "provider_key.secret contains invalid header characters".into(),
         ));
     }
@@ -542,7 +542,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_api_key_is_a_config_error() {
+    async fn missing_api_key_is_a_credentials_error() {
         let mut pk: ProviderKey =
             serde_json::from_str(r#"{"display_name":"empty","secret":"placeholder"}"#).unwrap();
         pk.secret.clear();
@@ -550,25 +550,29 @@ mod tests {
         let bridge = AnthropicBridge::new();
         let ctx = BridgeContext::new("req-1", sample_model(), Arc::new(pk));
         let err = bridge.chat(&req(), &ctx).await.unwrap_err();
-        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
+        assert!(matches!(err, BridgeError::InvalidUpstreamCredentials(_)));
+        assert_eq!(err.http_status(), 401);
+        assert_eq!(err.error_type(), "authentication_error");
     }
 
     #[tokio::test]
-    async fn secret_with_control_chars_is_invalid_config() {
+    async fn secret_with_control_chars_is_credentials_error() {
         // A non-empty secret that can't be an x-api-key header value
-        // (control bytes) is customer-fixable config, not a 500 (#367).
+        // (control bytes) is a customer-fixable credential problem —
+        // a 401 authentication_error, not a 500 (#367 follow-up).
         let pk: ProviderKey =
             serde_json::from_str(r#"{"display_name":"bad","secret":"sk-live\n-injected"}"#)
                 .unwrap();
         let bridge = AnthropicBridge::new();
         let ctx = BridgeContext::new("req-1", sample_model(), Arc::new(pk));
         let err = bridge.chat(&req(), &ctx).await.unwrap_err();
-        match err {
-            BridgeError::InvalidUpstreamConfig(msg) => {
+        match &err {
+            BridgeError::InvalidUpstreamCredentials(msg) => {
                 assert!(msg.contains("invalid header characters"), "got {msg}");
             }
-            other => panic!("expected InvalidUpstreamConfig, got {other:?}"),
+            other => panic!("expected InvalidUpstreamCredentials, got {other:?}"),
         }
+        assert_eq!(err.http_status(), 401);
     }
 
     #[tokio::test]
