@@ -2032,7 +2032,17 @@ where
                     // Record TTFT on the first chunk carrying generated
                     // output (content or tool calls). Skip role-only
                     // chunks that OpenAI emits before actual tokens.
-                    if !first_chunk_seen
+                    //
+                    // #467: on the live-forward path the chunk is yielded to
+                    // the wire immediately below, so first-upstream == first-
+                    // delivered. On the hold-back path (Window / BufferFull)
+                    // the chunk is withheld in `pending` until its window (or
+                    // the whole response) scans clean, so stamping here would
+                    // misreport TTFT as time-to-first-*upstream*-token. Gate
+                    // this stamp to the live-forward path and stamp the
+                    // hold-back path at the release (drain) sites instead.
+                    if !hold_back
+                        && !first_chunk_seen
                         && (chunk.delta.content.is_some() || chunk.delta.tool_calls.is_some())
                     {
                         first_chunk_seen = true;
@@ -2177,6 +2187,15 @@ where
                                 // this window's events, then keep the
                                 // trailing overlap as scan context for the
                                 // next window (its events were already sent).
+                                // #467: this is the first content actually
+                                // reaching the wire on the hold-back path —
+                                // stamp TTFT here.
+                                if !first_chunk_seen && !pending.is_empty() {
+                                    first_chunk_seen = true;
+                                    guard.comp().ttft_ms =
+                                        started.elapsed().as_millis().min(u32::MAX as u128)
+                                            as u32;
+                                }
                                 for e in pending.drain(..) {
                                     yield Ok::<_, Infallible>(e);
                                 }
@@ -2202,6 +2221,14 @@ where
                         if buffered > *max_buffer_bytes {
                             if *on_exceeded_fail_open {
                                 cap_released = true;
+                                // #467: cap exceeded, fail-open releases the
+                                // held content to the wire — first delivery.
+                                if !first_chunk_seen && !pending.is_empty() {
+                                    first_chunk_seen = true;
+                                    guard.comp().ttft_ms =
+                                        started.elapsed().as_millis().min(u32::MAX as u128)
+                                            as u32;
+                                }
                                 for e in pending.drain(..) {
                                     yield Ok::<_, Infallible>(e);
                                 }
@@ -2305,6 +2332,18 @@ where
                         }
                     };
                     if !blocked {
+                        // #467: end-of-stream release of the held content. In
+                        // Window mode earlier clean windows already stamped
+                        // TTFT (first_chunk_seen set); in BufferFull mode this
+                        // end-of-stream drain is the first (and only) delivery,
+                        // so TTFT correctly reflects time-to-first-*delivered*-
+                        // token, not time-to-first-upstream-token. No need to
+                        // set first_chunk_seen here — nothing reads it after
+                        // end-of-stream.
+                        if !first_chunk_seen && !pending.is_empty() {
+                            guard.comp().ttft_ms =
+                                started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                        }
                         for e in pending.drain(..) {
                             yield Ok::<_, Infallible>(e);
                         }
@@ -2902,6 +2941,110 @@ mod delivery_counter_tests {
         assert_eq!(
             out.chunks_delivered, 4,
             "exact match — DeliveryCounter fires on every Ready(Some)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ttft_holdback_tests {
+    //! #467: TTFT must reflect time-to-first-*delivered*-token, not
+    //! time-to-first-*upstream*-token. Under a hold-back stream-output
+    //! policy (Window / BufferFull) the upstream's first content chunk is
+    //! withheld in `pending` until it scans clean, so stamping TTFT at
+    //! upstream arrival under-reports it badly. This drives the real
+    //! `build_sse_stream` with a BufferFull guardrail that allows, an
+    //! upstream that emits content early then idles before terminating,
+    //! and asserts the captured TTFT reflects the release (end-of-stream)
+    //! time, not the early arrival.
+    use super::{build_sse_stream, StreamCompletion, StreamGuardrailContext};
+    use aisix_gateway::{ChatChunk, ChatDelta, ChatResponse};
+    use aisix_guardrails::{Guardrail, GuardrailVerdict, StreamOutputPolicy};
+    use futures::StreamExt;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    struct BufferFullAllowGuardrail;
+
+    #[async_trait::async_trait]
+    impl Guardrail for BufferFullAllowGuardrail {
+        fn name(&self) -> &'static str {
+            "bufferfull-allow-test"
+        }
+        async fn check_output(&self, _r: &ChatResponse) -> GuardrailVerdict {
+            GuardrailVerdict::Allow
+        }
+        fn stream_output_policy(&self) -> StreamOutputPolicy {
+            StreamOutputPolicy::BufferFull {
+                max_buffer_bytes: 1_000_000,
+                on_exceeded_fail_open: true,
+            }
+        }
+    }
+
+    fn content_chunk(text: &str) -> ChatChunk {
+        ChatChunk {
+            id: "cmpl-test".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                role: None,
+                content: Some(text.into()),
+                tool_calls: None,
+                reasoning_content: None,
+            },
+            finish_reason: None,
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ttft_under_holdback_reflects_release_not_upstream_arrival() {
+        const IDLE: Duration = Duration::from_millis(150);
+
+        // Upstream emits content immediately, idles IDLE, then terminates.
+        let upstream = async_stream::stream! {
+            yield Ok(content_chunk("hello world"));
+            tokio::time::sleep(IDLE).await;
+            yield Ok(ChatChunk {
+                id: "cmpl-test".into(),
+                model: "m".into(),
+                delta: ChatDelta::default(),
+                finish_reason: Some(aisix_gateway::FinishReason::Stop),
+                usage: None,
+            });
+        };
+        let upstream: aisix_gateway::ChatChunkStream = Box::pin(upstream);
+
+        let captured: Arc<Mutex<Option<StreamCompletion>>> = Arc::new(Mutex::new(None));
+        let captured_cb = captured.clone();
+
+        let started = Instant::now();
+        let sse = build_sse_stream(
+            upstream,
+            0,
+            Some(StreamGuardrailContext {
+                chain: Arc::new(BufferFullAllowGuardrail),
+                model_name: "m".into(),
+            }),
+            started,
+            "m".into(),
+            move |c: StreamCompletion| {
+                *captured_cb.lock().unwrap() = Some(c);
+            },
+        );
+        futures::pin_mut!(sse);
+        // Drain fully so the held content is released at end-of-stream.
+        while sse.next().await.is_some() {}
+
+        let comp = captured.lock().unwrap().take().expect("on_complete fired");
+        // Pre-#467 the stamp landed at upstream arrival (~0ms); post-fix it
+        // lands at the end-of-stream release (>= IDLE). Use a margin below
+        // IDLE for scheduling slack but well above the ~0 of the bug.
+        assert!(
+            comp.ttft_ms as u128 >= IDLE.as_millis() - 30,
+            "TTFT under hold-back must reflect release time (>= ~{}ms), got {}ms — \
+             a low value means it was stamped at upstream arrival (the #467 bug)",
+            IDLE.as_millis(),
+            comp.ttft_ms,
         );
     }
 }
