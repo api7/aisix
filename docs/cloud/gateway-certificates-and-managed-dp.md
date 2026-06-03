@@ -1,65 +1,92 @@
 ---
-title: Gateway Certificates And Managed DP
-description: Set up and understand the current certificate-based managed data-plane flow in AISIX Cloud.
+title: Gateway Certificates and Managed Data Plane
+description: Set up and understand the certificate-based managed data-plane flow in AISIX Cloud.
 sidebar_position: 72
 ---
 
-Current AISIX Cloud managed bootstrap is certificate-based.
+AISIX Cloud uses certificate-based bootstrap for managed data planes. The
+data plane receives a certificate bundle, then authenticates to the
+Cloud data-plane-manager endpoints with mTLS.
 
-This is the key bootstrapping contract for current Cloud-managed data planes.
+When managed bootstrap fails, check certificate bundle, trust root,
+runtime state, and `/dp/*` connectivity before looking at higher-level
+routing or projection behavior.
 
-## Current Flow
+## Managed bootstrap flow
 
-At a high level:
+```mermaid
+sequenceDiagram
+  participant op as Operator
+  participant cloud as AISIX Cloud
+  participant dp as Managed data plane
 
-1. create or select an environment
-2. issue a gateway certificate bundle through the control plane
-3. provision the data plane with that certificate bundle
-4. let the data plane authenticate to `/dp/*` with mTLS
-5. observe heartbeat and config propagation
+  op->>cloud: Create or select environment
+  op->>cloud: Issue gateway certificate bundle
+  op->>dp: Start with certificate and CP URL
+  dp->>cloud: Connect to /dp/* with mTLS
+  cloud-->>dp: Accept identity and projected config
+  dp->>cloud: Heartbeat and telemetry
+```
 
-This flow replaces older mental models that assumed bearer-token registration on `/dp/register`.
+The managed flow is:
 
-The current `/dp/*` managed surface includes:
+1. Create or select an environment.
+2. Issue a gateway certificate bundle through the control plane.
+3. Start the data plane with the certificate bundle and data-plane
+   manager URL.
+4. Let the data plane authenticate to `/dp/*` routes with mTLS.
+5. Observe heartbeat, telemetry, and configuration projection.
 
-- `POST /dp/heartbeat`
-- `POST /dp/telemetry`
-- `POST /dp/rotate-cert`
-- `GET /dp/budget_check`
+The certificate bundle flow is the current managed bootstrap path. Do
+not assume a bearer-token registration path unless you are intentionally
+operating a legacy or custom setup.
 
-Each endpoint has a different purpose:
+## Bootstrap checklist
 
-- `heartbeat` proves liveness and identity from the data plane
-- `telemetry` sends usage-oriented data to the control plane
-- `rotate-cert` supports certificate lifecycle management
-- `budget_check` supports managed budget enforcement decisions
+Before starting the managed data plane, confirm:
 
-## Important Boundary
+| Check | Why it matters |
+| --- | --- |
+| The environment is the one you expect to serve | Projection is environment-scoped. |
+| The certificate, key, and CA come from the issued gateway bundle | `/dp/*` authentication uses this mTLS identity. |
+| `AISIX_MANAGED__CP_BASE_URL` points to the data-plane-manager origin | The data plane calls `/dp/heartbeat`, `/dp/telemetry`, `/dp/rotate-cert`, and `/dp/budget_check` there. |
+| The container can read certificate files or inline PEM values | The data plane cannot authenticate if the bundle is unreadable. |
+| The runtime state directory is writable | The data plane persists identity and mTLS state across restarts. |
+| Network policy allows outbound access to the data-plane-manager endpoint | Bootstrap can succeed only if `/dp/*` is reachable. |
 
-The legacy bearer-auth `/dp/register` path is no longer the current Cloud bootstrap contract. Treat the certificate bundle flow as authoritative for current Cloud docs.
+## Managed `/dp/*` endpoints
 
-## Operational Meaning
+The current managed surface includes several data-plane-manager routes.
 
-When diagnosing managed bootstrap, think certificate bundle, trust roots, and mTLS identity first.
+`POST /dp/heartbeat` reports data-plane liveness, identity, and resource
+status.
 
-Do not start with bearer-token assumptions unless your deployment intentionally uses a legacy or self-managed path.
+`POST /dp/telemetry` sends usage-oriented data to the control plane.
 
-## Runtime Configuration Notes
+`POST /dp/rotate-cert` supports certificate lifecycle management.
 
-`AISIX_MANAGED__CP_BASE_URL` must point at the control-plane
-data-plane-manager endpoint that serves `/dp/heartbeat`,
-`/dp/telemetry`, `/dp/rotate-cert`, and `/dp/budget_check`.
+`GET /dp/budget_check` supports managed budget enforcement decisions.
 
-For example:
+These endpoints belong to the data-plane-manager surface, not the
+browser-facing dashboard origin.
 
-- `https://dpm.example.com:7944` for an externally reachable DPM
-- `https://dpm:7944` when the DP joins the AISIX Cloud Compose network
+## Runtime configuration
 
-Do not use the browser-facing dashboard/cp-api origin such as
-`http://api:8080`; that service does not own the `/dp/*` heartbeat
-surface.
+`AISIX_MANAGED__CP_BASE_URL` must point to the data-plane-manager origin
+that serves `/dp/heartbeat`, `/dp/telemetry`, `/dp/rotate-cert`, and
+`/dp/budget_check`.
 
-The DP accepts either inline PEM values:
+Examples:
+
+- `https://dpm.example.com:7944` for an externally reachable
+  data-plane-manager endpoint
+- `https://dpm:7944` when the data plane joins the AISIX Cloud Compose
+  network
+
+Do not use the dashboard or control-plane API origin, such as
+`http://api:8080`, for this value.
+
+The data plane accepts either inline PEM values:
 
 - `AISIX_MANAGED__CP_CERT_PEM`
 - `AISIX_MANAGED__CP_KEY_PEM`
@@ -71,23 +98,48 @@ or file paths:
 - `AISIX_MANAGED__CP_KEY_FILE`
 - `AISIX_MANAGED__CP_CA_FILE`
 
-If file paths are used from a container, make sure the process user can
-read those files and can write the runtime state directory
-`/var/lib/aisix`. The state directory contains the persisted mTLS
-bundle and sidecar files such as the DP identity used on restart.
+If you use file paths from a container, make sure the process user can
+read the files and write the runtime state directory, typically
+`/var/lib/aisix`. The state directory stores the persisted mTLS bundle
+and data-plane identity used on restart.
+
+## Verify managed connectivity
+
+After the data plane starts, verify the managed path in this order:
+
+1. The data plane process starts without certificate or trust-chain errors.
+2. Cloud shows the data plane heartbeat for the expected environment.
+3. Resource projection reaches the data plane.
+4. A live proxy request through the managed data-plane endpoint succeeds.
+5. Telemetry or usage events appear in Cloud for that live request.
+
+If step 2 fails, stay on certificate, base URL, and network troubleshooting.
+If step 2 succeeds but step 3 or 4 fails, move to
+[Resource projection](/ai-gateway/cloud/resource-projection).
 
 ## Troubleshooting
 
 ### The data plane never appears healthy in Cloud
 
-Check certificate bundle correctness, trust roots, and mTLS connectivity before looking at higher-level projection issues.
+Check:
+
+- `AISIX_MANAGED__CP_BASE_URL` points to the data-plane-manager origin
+- the certificate, key, and CA values match the issued bundle
+- the container can read certificate files if file paths are used
+- the data plane can write its runtime state directory
+- network policy allows the data plane to reach the `/dp/*` surface
 
 ### `/dp/*` calls fail after initial success
 
-Inspect certificate rotation and trust-chain changes, not just application-level configuration.
+Inspect certificate rotation, trust-chain changes, and runtime state
+first. If identity is healthy but resources still do not apply, move to
+projection troubleshooting.
 
-## Related Pages
+## Next steps
 
-- [AISIX Cloud Overview](overview.md)
-- [Offline Resilience](offline-resilience.md)
-- [TLS And mTLS](../operations/tls-and-mtls.md)
+- [Resource projection](/ai-gateway/cloud/resource-projection) explains
+  how Cloud resources reach the data plane.
+- [Offline resilience](/ai-gateway/cloud/offline-resilience) explains
+  what happens during temporary Cloud connectivity loss.
+- [TLS and mTLS](/ai-gateway/operations/tls-and-mtls) covers transport
+  security concepts.

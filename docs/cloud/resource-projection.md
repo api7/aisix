@@ -4,40 +4,64 @@ description: Understand how AISIX Cloud projects environment resources into the 
 sidebar_position: 73
 ---
 
-AISIX Cloud manages resources at the control-plane layer and projects them into the managed data plane.
+AISIX Cloud stores environment-scoped resources in the control plane and
+projects them into the managed data plane. Projection is the Cloud
+equivalent of standalone configuration propagation, with an explicit
+control-plane to data-plane boundary.
 
-From the customer's point of view, the important behavior is:
+From an operator point of view, projection is the step that turns saved
+Cloud resource state into live data-plane behavior.
 
-- environment resources become available to the managed data plane after propagation
-- the data plane serves traffic from its current projected snapshot
-- propagation is asynchronous, not instantaneous
+## How projection reaches the data plane
 
-This is the Cloud equivalent of configuration propagation in standalone mode, but with an explicit control-plane to data-plane boundary.
+```mermaid
+flowchart LR
+  save[Save resource in Cloud] --> project[Project environment state]
+  project --> receive[Data plane receives snapshot]
+  receive --> serve[Live traffic uses new config]
+```
 
-## What Projection Means Operationally
+These are separate events:
 
-From an operator point of view, projection is the mechanism that turns control-plane resource state into live data-plane behavior.
+1. The resource is saved in Cloud.
+2. Cloud projects the environment state.
+3. The managed data plane receives the projected snapshot.
+4. Live traffic starts using the new configuration.
 
-That means these are separate events:
+Projection is usually fast, but it is asynchronous. A successful save in
+Cloud does not prove that every data-plane instance is already serving
+the new state.
 
-1. saving the resource in Cloud
-2. projecting it into the managed data plane
-3. serving traffic from the new projected snapshot
+## What to expect
 
-## What To Expect
-
-- configuration changes are fast, but not instantaneous
-- the data plane can continue serving from an older projected snapshot during transient control-plane issues
-- validation of live behavior should use the managed data plane, not just the control-plane UI or API response
+- A data plane can continue serving from its current projected snapshot
+  during temporary control-plane connectivity issues.
+- Validation of live behavior should use the managed data plane, not
+  only the Cloud UI or API response.
+- If multiple data-plane instances are attached, they can briefly
+  converge at different times.
 
 ## Troubleshooting
 
-### The control plane shows the new resource, but live traffic does not use it yet
+### Cloud shows the new resource, but live traffic does not use it
 
-Treat that as a projection/readiness problem first.
+Check:
 
-## Related Pages
+1. The resource belongs to the same environment as the target data plane.
+2. The data plane is healthy and connected.
+3. Projection has reached the data plane.
+4. The request is sent to the managed data plane, not to a preview-only
+   path.
 
-- [Organizations And Environments](organizations-and-environments.md)
-- [Offline Resilience](offline-resilience.md)
-- [Configuration Propagation](../configuration/configuration-propagation.md)
+If the resource is a model, also confirm the caller is using the expected
+model alias. If the resource is a provider key or policy, confirm the
+model references the updated resource.
+
+## Next steps
+
+- [Organizations and environments](/ai-gateway/cloud/organizations-and-environments)
+  explains Cloud resource scope.
+- [Offline resilience](/ai-gateway/cloud/offline-resilience) explains
+  behavior during temporary Cloud connectivity loss.
+- [Configuration propagation](/ai-gateway/configuration/configuration-propagation)
+  explains the standalone propagation model.

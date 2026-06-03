@@ -1,104 +1,128 @@
 ---
-title: Metrics And Logs
+title: Metrics and Logs
 description: Observe AISIX AI Gateway through admin metrics, access logs, usage events, and exporter fan-out.
 sidebar_position: 54
 ---
 
-The gateway currently exposes observability through multiple paths.
+AISIX AI Gateway exposes observability through metrics, logs, response
+headers, usage events, and optional exporter fan-out. Use these signals
+together; no single signal explains every failure mode.
 
-Use them together. No single signal tells the whole story.
+## Start with the right observability signal
 
-## Metrics
+Start with Prometheus metrics when you need trends: request volume,
+latency, rate-limit outcomes, token counters, cost counters, and exporter
+health.
 
-`GET /metrics` on the admin listener is the default Prometheus scrape endpoint. Operators can change it with `observability.metrics.prometheus.path`, or disable the endpoint with `observability.metrics.prometheus.enabled: false`.
+Use access logs when you need to diagnose one request. Logs can tie a
+caller-visible failure to the selected model, upstream provider, and
+gateway decision path.
+
+Use response headers for caller-visible hints, such as request
+correlation, cache outcome, or retry timing.
+
+Use usage events for accounting-oriented workflows, including usage,
+cost, budgets, and Cloud billing flows.
+
+Use OTLP exporters when telemetry needs to leave the data plane and flow
+into an external collector.
+
+## Prometheus metrics
+
+`GET /metrics` on the admin listener is the default Prometheus scrape
+endpoint. Operators can change the path with
+`observability.metrics.prometheus.path`, or disable the endpoint with
+`observability.metrics.prometheus.enabled: false`.
 
 This endpoint is unauthenticated by design on the private admin listener.
+Keep the admin listener private.
 
-Treat `/metrics` as infrastructure-facing, not as a public diagnostics surface.
-
-:::note `/metrics` is empty before the first request
-Metric families are registered lazily on first observation — the gateway does not pre-register `# HELP` / `# TYPE` lines at startup. Immediately after boot, `GET /metrics` returns an empty body. This is expected, not a misconfigured endpoint. To smoke-test, send one model request and then re-check `/metrics`; you should now see series such as `aisix_requests_total` and `aisix_tokens_consumed_total`.
+:::note Metrics are empty before the first request
+Metric families are registered lazily on first observation. Immediately
+after boot, `GET /metrics` can return an empty body. Send one model
+request, then check again for series such as `aisix_requests_total` and
+`aisix_tokens_consumed_total`.
 :::
 
-### Managed Data Plane Metrics
+AISIX emits native metric names with the `aisix_` prefix. Common metric
+families include:
 
-The `/metrics` endpoint lives on the **admin listener**, which a Cloud managed data plane does not bind. So a managed DP does **not** expose `/metrics` for local scraping.
+- request volume and latency, such as `aisix_requests_total` and
+  `aisix_request_duration_seconds`
+- token and cost counters, such as `aisix_llm_input_tokens_total`,
+  `aisix_llm_output_tokens_total`, and `aisix_llm_spend_micro_usd_total`
+- rate-limit and budget signals, such as
+  `aisix_ratelimit_rejections_total` and budget gauges
+- proxy health and in-flight request signals
+- routing, cache, Redis, usage-event, and exporter health signals when
+  those paths are used
 
-To get metrics off a managed data plane into your own Prometheus/OTLP stack, configure an OTLP exporter through the AISIX Cloud control plane (the same `otlp_http` exporter resource described below). The data plane fans metrics/telemetry out to the configured collector rather than waiting to be scraped. Self-hosted standalone deployments keep using local `/metrics` scraping as usual.
+Labels are limited to values the data plane can reliably know, such as
+`endpoint`, `inbound_protocol`, `provider`, `model`, `upstream_model`,
+`provider_key_id`, `api_key_id`, `team_id`, `user_id`, `status`, and
+`outcome`.
 
-AISIX exposes native metric names with the `aisix_` prefix. Existing compatibility series remain:
+## Managed data-plane metrics
 
-- `aisix_requests_total`
-- `aisix_request_duration_seconds`
-- `aisix_ratelimit_rejections_total`
-- `aisix_tokens_consumed_total`
+The local `/metrics` endpoint lives on the admin listener. A Cloud
+managed data plane does not bind the standalone admin listener and does
+not expose local `/metrics` scraping.
 
-The Prometheus integration also emits LiteLLM-category equivalents under AISIX-native names:
+To export metrics or telemetry from a managed data plane, configure an
+OTLP exporter through AISIX Cloud. The data plane sends telemetry to the
+configured collector instead of waiting to be scraped locally.
 
-- usage and cost: `aisix_llm_input_tokens_total`, `aisix_llm_output_tokens_total`, `aisix_llm_total_tokens_total`, `aisix_llm_spend_micro_usd_total`
-- request volume and latency: `aisix_llm_requests_total`, `aisix_llm_request_duration_seconds`, `aisix_llm_time_to_first_token_seconds`
-- proxy health: `aisix_proxy_requests_total`, `aisix_proxy_failed_requests_total`, `aisix_proxy_request_duration_seconds`, `aisix_proxy_in_flight_requests`
-- quotas and budgets: `aisix_ratelimit_remaining_requests`, `aisix_ratelimit_remaining_tokens`, and budget gauges when the control plane returns budget detail fields; `aisix_budget_details_present` tells scrapers whether the current budget response carried those optional fields
-- deployment and routing: `aisix_deployment_*` and `aisix_routing_*` metric families when the request path has those events
-- exporter/cache health: Redis, usage-event drop, and OTLP fan-out drop/failure counters
+## Logs and usage events
 
-Labels are limited to values the data plane has reliably: `endpoint`, `inbound_protocol`, `provider`, `model`, `upstream_model`, `provider_key_id`, `api_key_id`, `team_id`, `user_id`, `status`, and `outcome`. User email, team alias, and end-user labels are not fabricated by the data plane.
+Access logs answer what happened to a single request. Metrics answer what
+is happening over time. Usage events answer what accounting-oriented
+event was emitted for supported request paths.
 
-## Access Logs And Usage Signals
+For streaming chat completions, usage events can include `ttft_ms`, the
+elapsed time from request entry to the first upstream chunk that contains
+generated output. Role-only opening chunks are skipped so the value
+tracks time to actual output.
 
-Current proxy behavior emits:
+`ttft_ms` is meaningful only on streaming paths. Non-streaming,
+cache-hit, and error paths do not emit a TTFT value.
 
-- structured access logs
-- metrics updates
-- usage-event emission on request paths that support it
+## Response headers
 
-These signals answer different questions:
+Response headers can provide fast per-request hints:
 
-- access logs: what happened to one request
-- metrics: what is happening over time
-- usage events: what usage/accounting-oriented event was emitted on supported paths
-
-### Streaming TTFT
-
-For streaming chat completions, the per-request usage event carries `ttft_ms` — the elapsed milliseconds from request entry to the first upstream chunk that contains generated content (text or tool-call delta). Role-only opening chunks are skipped so the value reflects the time to actual output, not the time to the first SSE frame.
-
-`ttft_ms` is meaningful only on the streaming path. Non-streaming, cache-hit, and error paths do not surface a TTFT value.
-
-## Response Headers With Operational Value
-
-Current response headers include:
-
-- endpoint-specific correlation headers such as `x-aisix-call-id` or `x-aisix-request-id`
+- `x-aisix-call-id` or `x-aisix-request-id` for correlation
 - `x-aisix-cache` on chat cache hit or miss paths
-- `Retry-After` on rate-limit-style rejections when applicable
+- `Retry-After` on supported rate-limit rejections
 
-Those headers are often the fastest per-request debugging hints available to a client team.
+Use headers with logs and metrics. A header can identify the request; it
+does not replace backend observability.
 
 ## Exporters
 
-Observability exporters are dynamic resources configured through `/admin/v1/observability_exporters`.
+Observability exporters are dynamic resources configured through the
+admin API or, in managed operation, through AISIX Cloud. Current exporter
+support is `otlp_http`.
 
-Current exporter support is `otlp_http` only.
-
-## Operator Workflow
-
-1. use `/metrics` for scrape-based monitoring
-2. use access logs for request-level diagnosis
-3. use response headers for caller-visible operational hints
-4. use dynamic exporters when you need telemetry fan-out to external observability systems
+Use exporters when you need telemetry fan-out to an external
+observability system.
 
 ## Troubleshooting
 
 ### Metrics look healthy but callers report failures
 
-Inspect access logs and caller-visible headers for request-level evidence.
+Inspect access logs and caller-visible headers for request-level
+evidence. Metrics can hide individual failures inside aggregates.
 
 ### Exporters are configured but downstream traces are missing
 
-Validate exporter enablement, endpoint correctness, and outbound connectivity from the data plane.
+Check exporter enablement, endpoint correctness, outbound connectivity
+from the data plane, and exporter drop/failure counters.
 
-## Related Pages
+## Next steps
 
-- [Observability Exporters](../configuration/observability-exporters.md)
-- [Health Checks](health-checks.md)
-- [Reference: Headers And Error Codes](../reference/headers-and-error-codes.md)
+- [Observability exporters](/ai-gateway/configuration/observability-exporters)
+  explains exporter resources.
+- [Health checks](/ai-gateway/operations/health-checks) explains health
+  surfaces.
+- [Headers and error codes](/ai-gateway/reference/headers-and-error-codes)
+  documents caller-visible headers.

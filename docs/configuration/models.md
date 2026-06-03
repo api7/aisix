@@ -1,146 +1,74 @@
 ---
 title: Models
 description: Configure direct models and virtual routing models in AISIX AI Gateway.
-sidebar_position: 32
+sidebar_position: 33
 ---
 
-Models define what callers can ask the gateway to run.
+Models define the names that callers send to the gateway.
 
-This is the most important dynamic resource in the system because it defines the caller-visible contract.
+A model is either a direct upstream target or a virtual routing alias. Direct
+models hold provider wiring. Routing models point to other models and let the
+gateway choose a target per request.
 
-A model can be one of two shapes:
+Use direct models first. Add routing models when you need failover, round-robin,
+or weighted target selection behind one stable caller-facing name.
 
-- a **direct model** that maps one caller-visible alias to one upstream provider model
-- a **routing model** that maps one caller-visible alias to a routing strategy over multiple direct models
+## Prerequisites
 
-## Direct Models
+This page assumes you have:
 
-Use a direct model when you want one stable gateway alias for one upstream model.
+- a running self-hosted gateway with the admin listener available
+- an admin key for `Authorization: Bearer YOUR_ADMIN_KEY`
+- a provider key id to use as `provider_key_id`
 
-This is the right default for most first deployments.
+If you do not have a provider key yet, start with
+[Provider keys](provider-keys.md), then return to this page.
 
-Current required fields are:
+## Direct model
 
-- `display_name`
-- `provider`
-- `model_name`
-- `provider_key_id`
+A direct model maps one gateway alias to one upstream model.
 
-Optional fields include:
-
-- `timeout`
-- `rate_limit`
-- `cost`
-- `cooldown`
-- `background_model_check`
-
-Read those optional fields as metadata and policy hints layered onto the basic alias mapping.
-
-`cooldown` and `background_model_check` are the two runtime-status sources that feed [`GET /admin/v1/models/status`](../reference/admin-api-reference.md#runtime-model-status) and the [routing filter](routing-and-failover.md#runtime-filtering). Both are direct-model-only and rejected on routing models.
-
-Example:
-
-```bash title="Create a direct model"
+```shell
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
   -H "Authorization: Bearer YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
   -d '{
+    # highlight-start
     "display_name": "gpt-4o-prod",
     "provider": "openai",
     "model_name": "gpt-4o",
     "provider_key_id": "YOUR_PROVIDER_KEY_ID",
-    "timeout": 30000,
-    "cost": {
-      "input_per_1k": 0.005,
-      "output_per_1k": 0.015
-    }
+    # highlight-end
+    "timeout": 30000
   }'
 ```
 
-Optional direct-model background probing:
+For a direct model, the gateway expects `display_name`, `provider`,
+`model_name`, and `provider_key_id`.
 
-```json title="Direct model background_model_check"
-{
-  "background_model_check": {
-    "enabled": true,
-    "interval_seconds": 30,
-    "timeout_seconds": 10,
-    "prompt": "Respond with OK",
-    "max_tokens": 8,
-    "ignore_statuses": [408, 429],
-    "stale_after_seconds": 90
-  }
-}
-```
+| Field | Description |
+| --- | --- |
+| `display_name` | Caller-facing alias. Callers send this value as `model`, and the gateway echoes it as `response.model`. |
+| `provider` | Vendor label used for metrics, access logs, and endpoint-specific vendor gates. |
+| `model_name` | Upstream model id sent to the provider, such as `gpt-4o`, an Azure deployment name, or a Bedrock model id. |
+| `provider_key_id` | Provider key id that supplies the upstream credential, optional `api_base`, provider identity, and adapter family. |
 
-Current semantics:
+`provider` is an open label, not a closed enum. It must be lowercase, start
+with a letter or number, and use only letters, numbers, `.`, `_`, or `-`.
+The generated schema caps it at 64 characters.
 
-- only direct models may carry `background_model_check`
-- routing models reject `background_model_check`
-- `ignore_statuses` records the last probe result without marking the model unhealthy. If omitted, **no** statuses are ignored — a 408 or 429 probe response would mark the model unhealthy. For most deployments, `[408, 429]` is a reasonable starting point.
-- `stale_after_seconds` is a safety valve for old unhealthy probe state when the checker stops refreshing
-- `interval_seconds` has a minimum of `5`; `timeout_seconds`, `max_tokens`, and `stale_after_seconds` have a minimum of `1`
+## Routing model
 
-A failed probe transitions the model to `unhealthy` in the runtime status tracker. A subsequent successful probe clears that state. The routing filter excludes `unhealthy` candidates ahead of `cooldown` candidates.
+A routing model is a virtual alias. It has a `routing` block instead of direct
+upstream fields.
 
-### Cooldown
-
-`cooldown` is the request-path complement to `background_model_check`. Where the background probe sets `unhealthy` from out-of-band probes, `cooldown` sets a short-lived skip window from the failures observed on real traffic.
-
-```json title="Direct model cooldown"
-{
-  "cooldown": {
-    "enabled": true,
-    "default_seconds": 30,
-    "max_seconds": 600,
-    "honor_retry_after": true,
-    "trigger_statuses": [401, 408, 429, 500, 502, 503, 504],
-    "trigger_on_timeout": true,
-    "trigger_on_transport": true
-  }
-}
-```
-
-All fields are optional. The example shows the *effective* defaults the proxy applies; at the schema level every field is `null` until set, but every accessor falls back to the value shown above. Omitting the `cooldown` block entirely is equivalent to writing the example above verbatim.
-
-Field semantics:
-
-- `enabled` (default `true`) — set to `false` to keep the model in rotation no matter what request-path failures look like.
-- `default_seconds` (default `30`) — cooldown TTL when the upstream did not return a `Retry-After` header, or when `honor_retry_after` is `false`. Setting this to `0` disables cooldown for the model (alternative to `enabled: false`).
-- `max_seconds` (default `600`) — upper bound on the cooldown TTL. Caps a misbehaving upstream that returns an unreasonable `Retry-After` value.
-- `honor_retry_after` (default `true`) — when the upstream OpenAI / Anthropic bridge parses a `Retry-After: <seconds>` header, the cooldown layer uses that value (clamped by `max_seconds`).
-- `trigger_statuses` (default `[401, 408, 429, 500, 502, 503, 504]`) — upstream HTTP status codes that put the target into cooldown. The default set covers auth failures, request timeouts, rate limits, and transient server errors. Caller-mistake classes (`400`, `403`, `422`) are intentionally excluded so a single bad request does not cool down a healthy upstream.
-- `trigger_on_timeout` (default `true`) — request-path timeouts trigger cooldown.
-- `trigger_on_transport` (default `true`) — transport, decode, and stream-abort errors trigger cooldown.
-
-Cooldown triggers independently of whether the failure is retryable. A `429`, for example, cools the model down even when the request itself is not retried.
-
-Once a target enters cooldown, the routing filter prefers other targets within the same routing model. If every candidate is filtered, behavior is governed by [`routing.on_all_filtered`](routing-and-failover.md#all-targets-filtered-policy).
-
-## Routing Models
-
-Use a routing model when you want one caller-visible alias to choose among multiple target models.
-
-Routing models are virtual aliases. They do not directly hold upstream credential wiring the way direct models do.
-
-Current routing strategies are:
-
-- `failover`
-- `round_robin`
-- `weighted`
-
-For a routing model, `routing` is required and the direct upstream fields must be omitted.
-
-That is the easiest operator check for whether a model row is direct or virtual.
-
-Example:
-
-```bash title="Create a routing model"
+```shell
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
   -H "Authorization: Bearer YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "display_name": "chat-prod",
+    # highlight-start
     "routing": {
       "strategy": "failover",
       "targets": [
@@ -151,78 +79,215 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
       "max_fallbacks": 1,
       "retry_on_429": true
     }
+    # highlight-end
   }'
 ```
 
-## Field Notes
+Each `routing.targets[*].model` references another model's `display_name`. The
+targets should be direct models.
 
-- `display_name` is the alias clients send in proxy requests, and the value `response.model` echoes back. It is **not** the upstream model id.
-- `model_name` is the upstream model id — the literal string the upstream provider expects in its own `model` field (for example `gpt-4o`, `claude-sonnet-4-5`, an Azure deployment name, or a Bedrock model id). Despite the name, this field holds the upstream id, not a caller alias; the caller alias is `display_name`.
-- `provider` is a free-form vendor label, not a closed enum. The value must match the pattern `^[a-z0-9][a-z0-9._-]*$` (lowercase alphanumerics plus `.`, `-`, `_`, and no leading separator) and be at most 64 characters. In AISIX Cloud it is the catalog provider id (for example `openai`, `anthropic`, `deepseek`, `amazon-bedrock`); in the self-hosted gateway it can be any label you choose for a vendor or endpoint (for example `vllm`, `openrouter`, `xai`). Dispatch reads the referenced provider key's `adapter` and `provider`; this field also serves as a metrics and access-log label and gates a few vendor-specific endpoints. See [Adapter protocol families](../reference/adapters.md#how-a-model-resolves-to-a-bridge).
-- `provider_key_id` must reference an existing `ProviderKey` resource.
-- `timeout` is in milliseconds. `0` or omission means no timeout.
-- `cost` stores pricing metadata that AISIX Cloud's cp-api consumes when emitting usage events. The standalone OSS proxy does not consult this field at request time and always emits `cost_usd=0.0`; pricing-aware budget enforcement requires the AISIX Cloud control plane.
-- `background_model_check` drives direct-model runtime unhealthy state and the `/admin/v1/models/status` view.
-- `cooldown` drives direct-model request-path cooldown and is also surfaced through `/admin/v1/models/status`.
+| Strategy | Behavior |
+| --- | --- |
+| `failover` | Start with the first target, then walk forward on retryable failures. |
+| `round_robin` | Rotate the starting target per request for this routing alias. |
+| `weighted` | Choose the first target by weight, then fall forward in declaration order on retry. |
 
-Practical guidance:
+`retries` controls how many extra attempts stay on the current target before
+failover. `max_fallbacks` controls how many later targets may be attempted.
+When omitted, `retries` defaults to `0` and `max_fallbacks` allows all later
+targets. Set `max_fallbacks: 0` to disable fallback.
 
-- choose `display_name` as the public contract you want client teams to depend on
-- avoid leaking raw upstream naming into aliases unless that is intentional
-- use direct models first, then layer routing models on top once you know the target set you want to orchestrate
+By default, upstream `429` responses are not retried. Set `retry_on_429: true`
+when rate-limit responses should participate in retry and failover.
 
-## Routing Behavior
+## Direct and routing shapes
 
-Current routing behavior is:
+Do not mix direct-model fields and routing fields in the same model.
 
-- `failover` always starts with the first target, then walks forward only on retryable failures
-- `round_robin` advances the starting target per request for that virtual model
-- `weighted` uses target weights only for the first pick, then falls forward in declaration order on retry
+Use this shape for direct upstream targets:
 
-`retries` limits how many extra attempts stay on the current target before failover.
+```json
+{
+  "display_name": "gpt-4o-prod",
+  "provider": "openai",
+  "model_name": "gpt-4o",
+  "provider_key_id": "provider-key-id"
+}
+```
 
-`max_fallbacks` limits how many later targets are attempted per request.
+Use this shape for virtual routing aliases:
 
-- omitted `retries` means no same-target retry
-- omitted `max_fallbacks` means all later targets may be attempted
-- `max_fallbacks: 0` disables fallback
-- `retry_on_429: true` lets upstream `429` participate in retry and failover
+```json
+{
+  "display_name": "chat-prod",
+  "routing": {
+    "targets": [
+      {"model": "gpt-4o-primary"},
+      {"model": "gpt-4o-secondary"}
+    ]
+  }
+}
+```
 
-These fields are the main operator knobs for balancing resilience versus extra upstream cost and latency.
+The generated JSON Schema and the admin OpenAPI document are the source of
+truth for the accepted request and response shape.
 
-## What `/v1/models` Exposes
+## Timeout
 
-Only non-routing models are currently listed on `GET /v1/models`.
+`timeout` is measured in milliseconds. Omit it or set it to `0` for no
+per-request timeout at the model layer.
 
-Routing aliases are intentionally hidden from that list today, even though callers can still target them directly if they know the alias.
+Timeouts are direct-model behavior. A routing model dispatches through the
+selected target model, so configure timeouts on the direct targets.
 
-That means `/v1/models` is not currently a full discovery surface for every valid caller target.
+## Background model checks
 
-## Operational Notes
+`background_model_check` probes a direct model outside the request path and
+marks the target `unhealthy` when probes fail.
 
-- Admin writes become visible to the proxy asynchronously through the watch-driven snapshot path.
-- In practice, allow a short propagation delay or poll the target endpoint until the new model resolves.
-- Duplicate `display_name` values are rejected with `409`.
-- Runtime routing exclusion is exposed on `GET /admin/v1/models/status`, not on `GET /admin/v1/health`.
+```json
+{
+  # highlight-start
+  "background_model_check": {
+    "enabled": true,
+    "interval_seconds": 30,
+    "timeout_seconds": 10,
+    "prompt": "Respond with OK",
+    "max_tokens": 8,
+    "ignore_statuses": [408, 429],
+    "stale_after_seconds": 90
+  }
+  # highlight-end
+}
+```
+
+Only direct models may use `background_model_check`. Routing models reject it.
+
+| Field | Description |
+| --- | --- |
+| `interval_seconds` | How often AISIX probes the model. Minimum: `5`. |
+| `timeout_seconds` | Probe timeout. Minimum: `1`. |
+| `prompt` | Prompt sent by the probe. |
+| `max_tokens` | Maximum tokens for the probe response. Minimum: `1`. |
+| `ignore_statuses` | Upstream statuses that do not mark the model unhealthy. |
+| `stale_after_seconds` | How long a probe result remains fresh. Minimum: `1`. |
+
+If `ignore_statuses` is omitted, no statuses are ignored. `[408, 429]` is a
+common starting point when transient timeouts and rate limits should remain
+visible without immediately marking the model unhealthy.
+
+Runtime model status is exposed by `GET /admin/v1/models/status`. The generated
+admin API reference describes the route shape.
+
+## Cooldown
+
+`cooldown` is the request-path complement to background checks. It temporarily
+excludes a direct model after failures observed on real traffic.
+
+```json
+{
+  # highlight-start
+  "cooldown": {
+    "enabled": true,
+    "default_seconds": 30,
+    "max_seconds": 600,
+    "honor_retry_after": true,
+    "trigger_statuses": [401, 408, 429, 500, 502, 503, 504],
+    "trigger_on_timeout": true,
+    "trigger_on_transport": true
+  }
+  # highlight-end
+}
+```
+
+All fields are optional. Omitting the `cooldown` block uses the effective
+defaults shown above.
+
+| Field | Default |
+| --- | --- |
+| `enabled` | `true` |
+| `default_seconds` | `30` |
+| `max_seconds` | `600` |
+| `honor_retry_after` | `true` |
+| `trigger_statuses` | `[401, 408, 429, 500, 502, 503, 504]` |
+| `trigger_on_timeout` | `true` |
+| `trigger_on_transport` | `true` |
+
+Cooldown is independent of retry. For example, an upstream `429` can put a
+model into cooldown even when the current request is not retried.
+
+When a target enters cooldown, routing models prefer other available targets.
+If every candidate is filtered, behavior is controlled by
+[`routing.on_all_filtered`](routing-and-failover.md#all-targets-filtered-policy).
+
+## Cost metadata
+
+`cost` stores pricing metadata for usage and budget workflows.
+
+The standalone proxy does not price requests at dispatch time and emits
+`cost_usd=0.0`. Pricing-aware budget enforcement requires the AISIX Cloud
+control plane.
+
+## What `/v1/models` exposes
+
+`GET /v1/models` currently lists non-routing models.
+
+Routing aliases are intentionally hidden from this discovery response today,
+even though callers can target them directly on `/v1/chat/completions` if they
+know the alias.
+
+## Verify the model
+
+After creating a direct model, check that the admin API returns it:
+
+```shell
+curl -sS http://127.0.0.1:3001/admin/v1/models \
+  -H "Authorization: Bearer YOUR_ADMIN_KEY"
+```
+
+Then check that the proxy snapshot has seen the model by listing models with a
+caller key that is allowed to use it:
+
+```shell
+curl -sS http://127.0.0.1:3000/v1/models \
+  -H "Authorization: Bearer YOUR_CALLER_KEY"
+```
+
+If the admin API returns the model but the proxy does not, wait briefly and
+retry. Admin writes become visible through the watch-driven snapshot path.
+
+## Operational notes
+
+Admin writes become visible to the proxy asynchronously through the watch-driven
+snapshot path. After creating or updating a model, poll `/v1/models` with the
+caller key, or poll the target proxy endpoint, until the model resolves.
+
+Duplicate `display_name` values are rejected with `409`.
+
+Runtime routing exclusion is exposed by `GET /admin/v1/models/status`, not by
+`GET /admin/v1/health`.
 
 ## Troubleshooting
 
-### A model was created but callers get `404`
+### Callers get `404` after a model is created
 
-Most often, the new model has not propagated into the current proxy snapshot yet.
+Most often, the new model has not propagated into the current proxy snapshot
+yet. Wait briefly and retry, or check [Configuration propagation](configuration-propagation.md).
 
-### A direct model exists but dispatch still fails
+### A direct model exists but dispatch fails
 
-Check `provider_key_id`, upstream `api_base`, and provider/model-name alignment.
+Check the referenced `provider_key_id`, the provider key's `api_base`, and the
+relationship between `display_name`, `model_name`, `provider`, and `adapter`.
 
-### A routing alias works even though it is not listed in `/v1/models`
+### A routing alias works but does not appear in `/v1/models`
 
-That is expected with the current discovery boundary.
+That is expected with the current discovery boundary. `/v1/models` is not a
+complete list of every valid caller target.
 
-## Related Pages
+## Next steps
 
-- [Provider Keys](provider-keys.md)
-- [Adapter protocol families](../reference/adapters.md) — how `provider` and the provider key's `adapter` select an upstream bridge.
-- [API Keys](api-keys.md)
-- [Routing And Failover](routing-and-failover.md)
-- [Configuration Propagation](configuration-propagation.md)
+- [Provider keys](provider-keys.md) explains upstream credentials and base URLs.
+- [API keys](api-keys.md) lets callers use model aliases.
+- [Routing and failover](routing-and-failover.md) covers virtual model behavior.
+- [Configuration propagation](configuration-propagation.md) explains when admin writes become visible to the proxy.
+- [Adapter protocol families](../reference/adapters.md) explains how provider keys select upstream bridges.

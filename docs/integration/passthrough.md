@@ -1,7 +1,7 @@
 ---
 title: Provider Passthrough
 description: Use the raw provider passthrough route when you need an upstream endpoint that AISIX AI Gateway does not natively model.
-sidebar_position: 29
+sidebar_position: 30
 ---
 
 AISIX AI Gateway exposes `ANY /passthrough/:provider/*rest` as a raw provider passthrough route.
@@ -10,40 +10,43 @@ Use this when you need provider-specific endpoints that the gateway does not cur
 
 This is the escape hatch, not the preferred first choice.
 
-## Current Behavior
+## Current behavior
 
 The passthrough route:
 
 - accepts any HTTP method
-- forwards the request body and most headers to the upstream provider
-- strips the incoming proxy auth header
-- injects provider authentication from the configured provider key
+- forwards the request body and safe headers to the upstream provider
+- strips hop-by-hop headers and the provider key's configured `strip_headers`
+- injects provider authentication from the selected provider key
 - preserves the query string
+- relays upstream status, response body, and safe response headers
 
 Compared with first-class routes, passthrough does much less normalization on your behalf.
 
-## Provider Resolution
+## Provider resolution
 
-The `:provider` segment is used to select the first configured model for that provider so the gateway can borrow its provider key and base URL.
+The `:provider` segment is used to find a configured model whose `provider` matches that value and that the caller key is allowed to access. The gateway uses that model to borrow the provider key and base URL for the passthrough request.
 
 This route is provider-scoped, not model-scoped.
 
 That distinction matters because the route is not choosing a specific model alias the way `/v1/chat/completions` does.
 
-## Important Authorization Boundary
+If the selected provider key does not set `api_base`, the gateway uses a known default only for providers with built-in defaults such as OpenAI, Anthropic, Google, and DeepSeek. For other providers, configure `api_base` explicitly.
 
-Standard proxy authentication still applies, but this route does not enforce per-model authorization beyond validating the proxy API key itself.
+## Important authorization boundary
 
-If you need strict model-level access control, prefer the gateway's first-class modeled endpoints where possible.
+Standard proxy authentication still applies. The caller key must be allowed to access at least one configured model for the requested provider before AISIX lends that provider key through passthrough.
+
+Passthrough is still less precise than first-class routes because the path does not name a model alias. If you need strict model-level behavior for a specific model, prefer the gateway's first-class modeled endpoints where possible.
 
 ## Example
 
-```bash title="Call a provider-specific passthrough route"
-curl -sS -X GET "http://127.0.0.1:3000/passthrough/openai/fine_tuning/jobs" \
+```shell
+curl -sS -X GET "http://127.0.0.1:3000/passthrough/openai/v1/fine_tuning/jobs" \
   -H "Authorization: Bearer YOUR_CALLER_API_KEY"
 ```
 
-## When To Use Passthrough
+## When to use passthrough
 
 - provider-specific APIs not yet exposed as first-class gateway routes
 - exploratory integration work
@@ -59,14 +62,24 @@ Avoid it when:
 
 ### The call authenticates but hits the wrong upstream base
 
-Check which configured provider model is being used to borrow the provider key and base URL.
+Check which accessible configured model for that provider is being used to borrow the provider key and base URL.
+
+### The request returns `403`
+
+The caller key is valid, but it is not allowed to access any configured model for the requested provider.
+
+### The call returns `400` with no default base URL
+
+Set `api_base` on the provider key. Passthrough does not know defaults for every provider label.
 
 ### The route works but bypasses the model-level behavior you expected
 
 That is expected. Passthrough is intentionally thinner than first-class modeled routes.
 
-## Related Pages
+## Next steps
 
-- [OpenAI-Compatible API](openai-compatible-api.md)
-- [Errors And Retries](errors-and-retries.md)
-- [Roadmap](../roadmap.md)
+- [OpenAI-compatible API](openai-compatible-api.md)
+- [Provider keys](../configuration/provider-keys.md)
+- [Provider compatibility](../reference/provider-compatibility.md)
+- [Errors and retries](errors-and-retries.md)
+- [Proxy API reference](../reference/proxy-api-reference.md)

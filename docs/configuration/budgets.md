@@ -1,118 +1,159 @@
 ---
 title: Budgets
-description: Understand the current budget-enforcement boundary in AISIX AI Gateway and AISIX Cloud managed paths.
+description: Understand where budget decisions come from and how AISIX AI Gateway enforces them.
 sidebar_position: 37
 ---
 
-Budget enforcement in the current gateway runtime is driven by the managed budget-check path, not by a standalone in-process budget engine.
+Budgets protect an environment from unexpected AI spend. In AISIX AI Gateway,
+the data plane enforces budget decisions, but it does not own the budget ledger.
 
-## Current Runtime Model
+In managed deployments, the gateway asks the AISIX Cloud control plane whether a
+caller key may continue. In standalone self-hosted deployments, the budget
+client is disabled by default and allows requests through.
 
-Before dispatch, the proxy can call:
+## Budget enforcement at a glance
 
-- `GET {dpmgr_base}/dp/budget_check?api_key_id=<uuid>`
+| Deployment mode | Budget authority | Data-plane behavior |
+| --- | --- | --- |
+| Managed data plane | AISIX Cloud control plane | Checks the control plane before upstream dispatch and enforces the returned decision. |
+| Standalone self-hosted | No budget ledger by default | Allows requests unless a live budget-check client is explicitly wired. |
 
-This path is authenticated with the same managed mTLS bundle used by heartbeat.
+Use managed deployments when you need gateway-enforced spend controls. Treat
+standalone budgets as a product boundary unless your deployment has its own live
+budget-check path.
 
-The budget client caches decisions briefly and can fall back according to the last known fail mode if the control plane becomes unreachable.
+## Where decisions come from
 
-That design keeps the budget decision on the managed control-plane path rather than making the standalone data plane the source of truth for budget enforcement.
+Before the proxy dispatches a request upstream, a live managed data plane can
+call the budget-check endpoint:
 
-## Budget Scopes
+```text
+GET {dpmgr_base}/dp/budget_check?api_key_id=<uuid>
+```
 
-The control plane evaluates **up to six budget rows simultaneously** for a single request, and returns the most-restrictive deny. The gateway sees a single `{allow, fail_mode, reason}` reply per `/dp/budget_check` call; the `reason.scope` field tells you which budget was the proximate cause when a request was denied.
+The request uses the same managed mTLS bundle as data-plane heartbeat traffic.
+The control plane evaluates the current spend state and returns a compact
+decision:
 
-| `reason.scope` | What this row caps | Applies when |
-|---|---|---|
-| `org` | Every request in the whole org | always |
-| `environment` | Every request in this env | always |
-| `api_key` | Every request for this api_key | always |
-| `provider_key` | Every request whose model dispatches to that upstream credential | always |
-| `team` | Every request whose `api_key.team_id` equals this team | only if the api_key was created with a `team_id` |
-| `member` | Every request whose `api_key.user_id` equals this member | only if the api_key was created with a `user_id` |
+- whether the request is allowed
+- what fail mode the data plane should use if the control plane later becomes
+  unreachable
+- optional budget totals for metrics
+- an optional reason when the request is denied
 
-`org`, `environment`, `api_key`, and `provider_key` are env- or org-scoped; `team` and `member` are **org-scoped only** and aggregate spend across every environment the bound api_keys live in.
+That keeps budget calculation on the managed control-plane path. The gateway
+only needs the final decision.
 
-All six rows are peers — no row "wraps" or "overrides" another. Any applicable row with `hard_stop=true` and `spent_cents >= limit_cents` rejects the request with `429`. Warn-only rows never block but surface alerts on the dashboard.
+## How the data plane enforces a decision
 
-### Worked examples — coverage and calculation
+When the decision allows the request, the proxy continues with the normal
+request path. Budget checks run before upstream dispatch and before the caller
+receives any model output.
 
-The amounts and periods below are illustrative.
+When the decision denies the request, the proxy returns a caller-visible
+`429` response with an OpenAI-style error envelope:
 
-**1. Every applicable cap must have headroom — the tightest one wins.**
-A key `K` runs in environment `prod` and was created with `team_id = frontend` and `user_id = alice`. Five hard-stop budgets are configured:
+```json
+{
+  "error": {
+    "message": "team budget 'frontend' exceeded ($1.00/month). Resets soon.",
+    "type": "billing_error",
+    "code": "budget_exceeded"
+  }
+}
+```
 
-| Scope | Cap | Spent this period | Remaining |
-|---|---|---|---|
-| `org` | $1,000 / month | $610 | $390 |
-| `environment` `prod` | $400 / month | $300 | $100 |
-| `api_key` `K` | $50 / day | $12 | $38 |
-| `team` `frontend` | $200 / month | $185 | $15 |
-| `member` `alice` | $30 / month | $30 | **$0** |
+For OpenAI-compatible responses, the gateway can also include structured budget
+fields that the managed control plane returned, such as `scope`, `scope_ref`,
+`limit_usd`, `spent_usd`, `period`, `period_resets_at`, and
+`retry_after_seconds`.
 
-A request on `K` is checked against **all five** configured budgets — they all apply (this scenario has no `provider_key` budget; that's the sixth scope). `alice`'s member cap is exactly spent, so the request is **denied with `429`** even though the org, env, api_key, and team budgets still have room. `reason.scope` is `member`. A caller always feels the cap with the least remaining room.
+## Budget scopes
 
-**2. `team` and `member` totals span every environment; `environment` and `api_key` do not.**
-`team` / `member` budgets are org-scoped — they sum spend across *every* environment their bound keys run in. Team `frontend` owns `K1` in `prod` and `K2` in `staging`:
+The gateway accepts the scope details returned by the managed budget-check
+service. Common scopes include organization, environment, API key, provider key,
+team, and member.
 
-- `K1` (prod) spent $120 this month; `K2` (staging) spent $90.
-- The `team` `frontend` budget ($200 / month) sees **$210** — both envs combined — so it is over, and requests on **both** `K1` and `K2` are denied.
-- A `prod` `environment` budget, by contrast, counts only `K1`'s $120; an `api_key` budget on `K1` counts only `K1`.
+Those scopes are Cloud budget concepts, not standalone Admin API resources. If a
+request is denied, inspect the returned `reason.scope` and `reason.scope_ref` to
+see which budget caused the denial.
 
-**3. Which budgets apply is decided by the key's binding — there is no implicit membership.**
+Team and member budgets depend on the API key identity projected to the data
+plane. The runtime `ApiKey` row can carry `team_id` and `user_id`, and the proxy
+uses those values for metrics and managed budget decisions. The standalone
+`/admin/v1/apikeys` API does not currently set those fields, so team/member
+budget matching is a managed projection path today.
 
-| Key | `team_id` | `user_id` | Budgets that apply |
-|---|---|---|---|
-| `K-plain` | — | — | `org`, `environment`, `api_key`, `provider_key` |
-| `K-team` | `frontend` | — | …plus `team` `frontend` |
-| `K-member` | — | `alice` | …plus `member` `alice` |
-| `K-both` | `frontend` | `alice` | …plus `team` `frontend` **and** `member` `alice` |
+## Managed versus standalone
 
-A budget you create for team `frontend` does **not** apply to a key that wasn't given `team_id = frontend`, even if that key's owner belongs to the team — only the explicit binding on the key counts. See [API Keys](api-keys.md#budget-boundary) for setting it.
+Use managed deployments when you need live budget enforcement. A managed data
+plane wires the budget client from the same control-plane configuration used for
+heartbeat.
 
-**4. Warn-only watches; hard-stop blocks.**
-That same `team` `frontend` budget with `hard_stop = false` never returns `429` — traffic keeps flowing past $200 and the over-budget state surfaces on the dashboard, so you are alerted without an outage. With `hard_stop = true` the identical cap denies at $200.
+Standalone deployments use `BudgetClient::disabled()` unless a live client is
+explicitly wired by the runtime. Disabled mode is allow-all. It is useful for
+local development and self-hosted setups that do their own accounting, but it is
+not a hard-stop budget engine.
 
-**5. Spend follows the key's current binding.**
-Re-point `K` from team `frontend` to team `platform` (change its `team_id`). From then on `K`'s spend counts toward `platform`'s budget, not `frontend`'s — totals are computed from the key's *current* binding, so its existing spend moves with it. The same applies to `user_id` and `member` budgets.
+Do not promise standalone budget blocking to application teams unless your
+deployment has a live budget-check path configured.
 
-## Managed Versus Standalone
+## Control-plane outages
 
-Current boundary:
+The budget client caches live decisions briefly so the proxy does not need a
+round trip to the control plane for every repeated decision.
 
-- managed deployments can attach a live budget client through the managed data-plane path
-- standalone self-hosted deployments default to `BudgetClient::disabled()`, which allows requests through
+- Fresh cached decisions are reused for 5 seconds.
+- Cached decisions can be treated as usable stale decisions for up to
+  `AISIX_DP_BUDGET_STALE_MAX_SECONDS`; the default is `600`.
+- If the stale ceiling expires, the gateway applies the last returned fail mode:
+  `open`, `closed`, or `sticky`.
+- If there is no cached decision and the control plane is unreachable, the live
+  client denies by default on the sticky path.
 
-## Operator Guidance
+This behavior is only for live managed budget clients. Disabled standalone mode
+does not call the control plane and allows requests through.
 
-- treat managed mode as the real budget-enforcement path today
-- do not promise standalone hard-stop budgets to internal or external users unless your deployment has explicitly wired a managed budget client path
+## Metrics
 
-## Proxy Outcomes
+When the managed budget response includes totals, the proxy records budget
+gauges with the caller key identity. Labels include the API key ID and, when
+available, the projected `team_id` and `user_id`.
 
-When the budget decision denies a request, the proxy returns:
-
-- `429`
-- OpenAI-style error envelope
-- error code `budget_exceeded`
-
-This is a caller-visible denial, not just an internal accounting event.
-
-## Operational Notes
-
-- live budget decisions are cached for 5 seconds
-- stale cached decisions can be honored up to `AISIX_DP_BUDGET_STALE_MAX_SECONDS` with a default of `600`
-- without any cached decision, an unreachable control plane causes a deny on the sticky default path
-- `fail_mode` (`sticky` / `open` / `closed`) is a single org-level setting in AISIX Cloud — the same outage policy applies to all six scopes. Operators change it in the dashboard's **Settings → Budget** card. There is no per-scope or per-budget outage policy.
+If the decision does not include budget totals, the proxy clears the budget
+gauges for that key identity.
 
 ## Troubleshooting
 
-### A managed deployment denies traffic after control-plane instability
+### A managed deployment returns `budget_exceeded`
 
-Inspect budget-check freshness and the cached-decision behavior first.
+Check the error code and structured budget fields first. The denial came from
+the managed budget-check response, not from the standalone Admin API.
 
-## Related Pages
+Then check the Cloud budget configuration for the returned scope. If the
+returned scope looks wrong, investigate the control-plane budget calculation or
+the API-key projection that reached the data plane.
 
-- [API Keys](api-keys.md)
-- [AISIX Cloud Overview](../cloud/overview.md)
-- [Roadmap](../roadmap.md)
+### Traffic is denied after control-plane instability
+
+Check whether the data plane had a fresh cached decision, whether the stale
+ceiling elapsed, and which fail mode was last returned by the control plane.
+
+If the data plane had no cached decision, an unreachable control plane denies on
+the sticky default path.
+
+### Standalone traffic is not blocked by budgets
+
+That is expected for the default standalone runtime. The budget client is
+disabled and allows requests through unless a live managed budget client is
+wired.
+
+## Next steps
+
+- [API keys](api-keys.md) explains caller key identity and model access.
+- [Configuration overview](overview.md) explains how managed and standalone
+  configuration authority differs.
+- [AISIX Cloud overview](../cloud/overview.md) explains managed control-plane
+  operation.
+- [Feature status](../overview/feature-matrix.md) summarizes managed versus
+  standalone support.

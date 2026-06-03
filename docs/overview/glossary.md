@@ -4,9 +4,9 @@ description: Operational definitions of the cross-cutting AISIX AI Gateway and A
 sidebar_position: 5
 ---
 
-This page collects the cross-cutting terms used across AISIX AI Gateway and AISIX Cloud documentation. Each entry is a 1–3 sentence operational definition — what the term *does at runtime*, not marketing prose.
+This page defines the terms that appear across AISIX AI Gateway and AISIX Cloud docs. Each entry explains what the term does at runtime.
 
-Page-local codenames and one-off identifiers (for example, the `bedrock` guardrail kind or the `YOUR_ADMIN_KEY` placeholder format) are explained inline at first use on the page where they appear.
+Page-local identifiers, such as the `bedrock` guardrail kind or the `YOUR_ADMIN_KEY` placeholder format, are explained inline at first use on the page where they appear.
 
 ## gateway
 
@@ -14,39 +14,56 @@ The AISIX runtime binary that accepts caller traffic on the proxy listener and f
 
 ## data plane
 
-The request-handling tier — the gateway itself. Receives caller traffic, applies caching, guardrails, budgets, and routing, forwards to upstream providers, and returns responses.
+The request-handling tier. It receives caller traffic, applies authentication, model access checks, routing, rate limits, cache policies, guardrails, budget checks when enabled, and observability, then forwards requests to upstream providers.
 
 ## control plane
 
-The management tier. Stores model, API-key, provider-key, guardrail, and cache-policy rows in [etcd](#etcd); the data plane reads from etcd. In standalone deployments the control plane is the gateway's own admin listener. In AISIX Cloud the control plane is a separate hosted service that projects state down to the gateway via etcd-over-TLS.
+The management tier. In standalone deployments, the control plane is the gateway's admin listener, which writes dynamic resources to [etcd](#etcd). In AISIX Cloud, the control plane is a hosted service that projects environment-scoped configuration to managed data planes.
 
 ## AISIX Cloud
 
-The managed control-plane service operated separately from the OSS gateway. Provides multi-tenant team, project, and budget concepts that don't exist in standalone-only mode. See [Deployment Modes](deployment-modes.md) for the comparison.
+The managed control-plane service operated separately from the gateway runtime. It provides hosted environment management and Cloud-only controls such as budget checks. See [Deployment modes](deployment-modes.md) for the comparison.
+
+## model
+
+The caller-facing model alias clients send in the request body. A direct model maps that alias to an upstream provider key and upstream model name. A routing model maps the alias to one or more target models and lets the gateway choose the target at request time.
 
 ## API key
 
-Also called the **caller key**. The bearer token your clients send in the `Authorization` header on the proxy listener. Created via the admin API's `POST /admin/v1/apikeys`. The data plane stores `key_hash`, not plaintext — the caller chooses (or generates) the plaintext bearer and SHA-256-hashes it locally before submission, so the gateway never sees or returns the plaintext at create time. The only endpoint that emits a server-generated plaintext is `POST /admin/v1/apikeys/:id/rotate`, which returns the new plaintext exactly once.
+Also called the **caller key**. The bearer token your clients send in the `Authorization` header on the proxy listener.
+
+API keys are created through `POST /admin/v1/apikeys`. The data plane stores `key_hash`, not plaintext. In the standalone admin API, the operator chooses or generates the plaintext bearer, hashes it, and writes the SHA-256 hash to the API-key resource.
+
+The rotate endpoint, `POST /admin/v1/apikeys/:id/rotate`, is the only endpoint that returns a server-generated plaintext key. It returns that plaintext once.
 
 ## provider key
 
-The upstream provider's credential (for example an OpenAI `sk-...` key) the gateway uses to authenticate to the provider on outbound requests. Created via the admin API's `POST /admin/v1/provider_keys`. Distinct from the [API key](#api-key) your callers send to the gateway.
+The upstream provider credential the gateway uses on outbound requests. Created via the admin API's `POST /admin/v1/provider_keys`. Distinct from the [API key](#api-key) your callers send to the gateway.
+
+## rate-limit policy
+
+A standalone rate-limit rule that targets a scope such as API key, model, team, or member. The proxy evaluates matching policy rows together with inline limits on API keys and models.
 
 ## guardrail
 
-A request- or response-policy object applied by the gateway. Configured via the admin API's `/admin/v1/guardrails`. Current schema supports the in-process `keyword` backend and an AWS Bedrock backend behind a feature flag. See [Core Concepts § Guardrail](core-concepts.md#guardrail) for the full kind list.
+A request- or response-policy object applied by the gateway. Configured via the admin API's `/admin/v1/guardrails`. Current kinds include local `keyword` guardrails and remote guardrails for AWS Bedrock and Azure Content Safety. See [Core concepts § Guardrail](core-concepts.md#guardrail) for the current boundary.
 
-## Observability Exporter
+## cache policy
 
-A per-row admin resource that ships per-request span telemetry — derived from gateway `UsageEvent` records — over OTLP/HTTP to an external backend such as Grafana Tempo, Honeycomb, or Langfuse via OTLP. Configure one when you want a per-request trace of gateway proxy activity forwarded to your existing tracing backend. Distinct from process-wide bootstrap observability (service name, log level, Prometheus scrape endpoint) configured in [Bootstrap Configuration](../configuration/bootstrap-config.md).
+A policy object that controls when chat-completion response cache lookup and storage apply. The runtime cache backend is selected from bootstrap configuration; a policy controls matching and TTL, not the process-level backend.
+
+## observability exporter
+
+An admin resource that ships per-request span telemetry over OTLP/HTTP to an external backend such as Grafana Tempo, Honeycomb, or Langfuse via OTLP.
+
+Configure an observability exporter when you want request traces from gateway proxy activity in your tracing backend. This is separate from process-wide bootstrap observability such as service name, log level, and the Prometheus scrape endpoint. See [Bootstrap configuration](../configuration/bootstrap-config.md).
 
 ## etcd
 
-The key-value store the gateway uses for control-plane state. The admin listener writes dynamic resources (models, API keys, provider keys, guardrails, cache policies, observability exporters) into etcd; the data plane watches etcd for live config updates, so restart-free changes ride this path. The admin-side etcd client lives in `crates/aisix-admin/src/etcd_store.rs`.
+The key-value store the gateway uses for dynamic configuration. The data plane watches etcd for live resource updates, so most configuration changes do not require a gateway restart.
 
-## Related pages
+## Next steps
 
-- [What Is AISIX AI Gateway](what-is-aisix-ai-gateway.md)
-- [Core Concepts](core-concepts.md)
-- [Deployment Modes](deployment-modes.md)
-- [Bootstrap Configuration](../configuration/bootstrap-config.md)
+- [Core concepts](core-concepts.md) — see how the main resources fit together.
+- [Deployment modes](deployment-modes.md) — compare standalone and managed data-plane operation.
+- [Bootstrap configuration](../configuration/bootstrap-config.md) — configure the gateway process.

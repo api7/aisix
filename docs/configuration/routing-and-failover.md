@@ -1,35 +1,47 @@
 ---
-title: Routing And Failover
+title: Routing and Failover
 description: Configure virtual models, target selection strategies, and retry behavior in AISIX AI Gateway.
 sidebar_position: 35
 ---
 
-Routing lets one caller-visible model alias dispatch across multiple direct models.
+Routing lets one caller-visible model alias dispatch across multiple direct
+models. Use it when you want callers to keep one stable model name while the
+gateway handles failover, simple load distribution, or weighted target
+selection behind that name.
 
-This is the gateway's current virtual-model mechanism.
+Routing is the gateway's current virtual-model mechanism. Configure direct
+models first, then add a routing model that points at those direct model
+aliases.
 
-Use it when you want to separate the caller contract from the individual upstream target that serves a given request.
+## When to use routing
 
-A routing alias works across the proxy's passthrough endpoints: `/v1/chat/completions` (OpenAI shape), `/v1/messages` (Anthropic shape), `/v1/responses`, and `/v1/messages/count_tokens`. Targets in one group may mix providers — e.g. an OpenAI target and an Anthropic target — and the gateway dispatches each target through the right path regardless of which endpoint the caller used. Streaming requests attempt only the first target (no mid-stream fallback); non-streaming requests fail over across targets.
+Use a routing model when you need one stable caller contract in front of more
+than one direct model.
 
-`/v1/responses` and `/v1/messages/count_tokens` are provider-restricted (OpenAI-only and Anthropic-only respectively). When a group is used on one of these endpoints, only the targets whose provider matches the endpoint are attempted, in order; if the group has no matching target the request is rejected with a 400.
+| Goal | Recommended strategy | Operator note |
+| --- | --- | --- |
+| Keep a primary target with one or more backups | `failover` | Put the preferred target first and keep fallback count explicit. |
+| Spread traffic across similar targets | `round_robin` | Each request starts from the next target, but fallback still follows target order. |
+| Send unequal traffic shares | `weighted` | Weights affect the first target choice only; fallback still walks forward. |
 
-## Current Strategies
+Do not use routing to hide invalid caller requests. Upstream `4xx` responses are
+treated as caller-side problems and do not trigger retry or failover, except
+optional `429` handling when `retry_on_429` is enabled.
 
-- `failover`
-- `round_robin`
-- `weighted`
+## Prerequisites
 
-Each strategy answers a different operator question:
+Create the direct models that can serve traffic. A routing model only references
+other model aliases through `routing.targets[].model`; it does not carry
+`provider`, `model_name`, or `provider_key_id` itself.
 
-- `failover`: what should happen when the primary target is down or retryable-failing
-- `round_robin`: how should traffic spread across peers over time
-- `weighted`: how should the first target be biased when targets have different desired shares
+Keep the target aliases explicit and easy to reason about. Routing is most
+useful when you have a clear resilience or traffic-shaping goal.
 
-## Example: Failover Routing
+## Create a failover routing model
 
-```json title="Routing block"
+```json
 {
+  "display_name": "gpt-4o-prod",
   "routing": {
     "strategy": "failover",
     "targets": [
@@ -44,7 +56,14 @@ Each strategy answers a different operator question:
 }
 ```
 
-## Strategy Semantics
+This example makes `gpt-4o-prod` the caller-facing alias. The gateway starts
+with `gpt-4o-primary`; if that target has a retryable failure, it can retry once
+on the same target and then fail over once to `gpt-4o-secondary`.
+
+## Choose a strategy
+
+Each strategy decides the first target for a request. Fallback then walks
+forward through the target list, bounded by `max_fallbacks`.
 
 ### `failover`
 
@@ -68,25 +87,38 @@ Choose this when several targets are near-peers and you want simple distribution
 
 Choose this when you need unequal primary traffic share across targets.
 
-## Retry Behavior
+## Endpoint support
 
-`retries` controls how many extra attempts the proxy makes on the current target before failing over.
+Routing models apply to model-resolving proxy endpoints. The endpoint still
+decides which provider families are eligible after the routing alias expands:
 
-`max_fallbacks` controls how many later targets the proxy may attempt after the initial target.
+| Endpoint | Routing support | Provider boundary |
+| --- | --- | --- |
+| `/v1/chat/completions` | Yes | Uses the selected eligible target. |
+| `/v1/messages` | Yes | Uses Anthropic-style request handling for eligible targets. |
+| `/v1/messages/count_tokens` | Yes | Attempts only Anthropic-backed targets. |
+| `/v1/responses` | Yes | Attempts only OpenAI-backed targets. |
 
-Current rules:
+Non-streaming requests can fail over across eligible targets. Streaming requests
+on `/v1/chat/completions`, `/v1/messages`, and `/v1/responses` attempt only the
+first selected eligible target and do not perform mid-stream fallback.
 
-- omitted `retries` means no same-target retry
-- omitted `max_fallbacks` means all later targets may be attempted
-- `max_fallbacks: 0` disables cross-target failover
-- values above later-target count are clamped to the available later targets
-- `retry_on_429: true` lets upstream `429` participate in both same-target retry and cross-target failover
+## Set retry and fallback boundaries
 
-The proxy retries only on retryable upstream or transport failures. Upstream `4xx` responses are treated as caller-side problems and do not trigger retry or failover, except optional `429` handling when `retry_on_429` is enabled.
+`retries` controls how many extra attempts the proxy makes on the current target
+before failing over. `max_fallbacks` controls how many later targets the proxy
+may attempt after the initial target.
 
-This is an important operational boundary. Routing is not a way to mask bad caller requests or invalid model usage.
+| Field | Default behavior | Use when |
+| --- | --- | --- |
+| `retries` | No same-target retry when omitted. | A transient failure on the current target should get another attempt before fallback. |
+| `max_fallbacks` | All later targets may be attempted when omitted. | You want to cap how many backup targets a single request can try. |
+| `max_fallbacks: 0` | Disables cross-target failover. | You want target selection without fallback. |
+| `retry_on_429` | Upstream `429` is not retried when omitted or `false`. | Rate-limit responses should participate in retry and failover. |
 
-## Runtime Filtering
+Values above the later-target count are clamped to the available later targets.
+
+## Runtime target filtering
 
 Before dispatch, routing consults direct-model runtime state and produces the actual attempt list in this order:
 
@@ -103,7 +135,7 @@ Source of each state:
 - `unhealthy` comes from direct-model `background_model_check`
 - routing models themselves are never runtime-filtered and report `not_applicable`
 
-### All-Targets-Filtered Policy
+### All-targets-filtered policy
 
 `routing.on_all_filtered` decides what happens when step 4 of the filter loop is reached — every candidate is excluded by runtime status:
 
@@ -112,33 +144,20 @@ Source of each state:
 
 The `Retry-After` value on the `fail` path is a coarse fixed hint. By the time the filter reaches this branch, every candidate is in background-unhealthy state with no live cooldown timer to read.
 
-## Design Constraints
-
-- routing targets refer to other model aliases through `targets[].model`
-- routing models omit `provider`, `model_name`, and `provider_key_id`
-- direct models omit `routing`
-
-## Operator Guidance
-
-- start with direct models first
-- add routing only when you have a clear resilience or traffic-shaping goal
-- keep target aliases explicit and easy to reason about
-- set `retries` and `max_fallbacks` intentionally so resilience does not create surprise cost or latency
-
-## Response Shape
+## Verify the response shape
 
 Routing keeps the caller's view of the response stable across failover.
 
 ### `response.model`
 
-`response.model` always echoes the **model name the caller put on the request** — for a routing model that is the routing alias itself, not the underlying target's display name and not the upstream provider's raw id.
+On `POST /v1/chat/completions`, `response.model` echoes the **model name the caller put on the request** — for a routing model that is the routing alias itself, not the underlying target's display name and not the upstream provider's raw id.
 
 ```http
 POST /v1/chat/completions
 { "model": "failover-group-XYZ", ... }
 ```
 
-```json title="Response body"
+```json
 {
   "id": "chatcmpl-...",
   "model": "failover-group-XYZ",
@@ -152,9 +171,9 @@ Direct (non-routing) models follow the same contract — `response.model` echoes
 
 ### `x-aisix-served-by`
 
-The proxy emits an `x-aisix-served-by` response header on every routing-model response. The value is the display name of the target that actually served the request.
+For successful chat-completions routing responses, the proxy emits an `x-aisix-served-by` response header. The value is the display name of the target that actually served the request.
 
-```http title="Response headers"
+```http
 x-aisix-served-by: gpt-4o-secondary
 ```
 
@@ -165,9 +184,9 @@ The header applies to successful `/v1/chat/completions` responses. It is **absen
 - **Direct (non-routing) models.** The body's `response.model` already names the served model, so the header would be redundant — its presence is itself the routing signal.
 - **Cache hits.** A stored response is decoupled from whichever target produced it on the original miss; surfacing a stale name would lie. Operators inspecting routing must look at `x-aisix-cache` first.
 - **Error responses** (e.g. failover exhausted, every target unhealthy). No target served the request, so there is no name to report.
-- **Other endpoints.** The Anthropic-shape `/v1/messages` path resolves routing groups (including failover) but is on a separate code path and does not currently emit this header.
+- **Other endpoints.** `/v1/messages`, `/v1/messages/count_tokens`, and `/v1/responses` can resolve routing aliases, but they do not emit this chat-completions routing header today.
 
-If a routing target's `display_name` contains bytes that are not valid HTTP header values (CR/LF or non-visible-ASCII), the header is omitted and the DP logs a `tracing::warn!` carrying the offending name. Rename the target with operator-side tools to restore the header.
+If a routing target's `display_name` contains bytes that are not valid HTTP header values (CR/LF or non-visible-ASCII), the header is omitted and the data plane logs a warning carrying the offending name. Rename the target with operator-side tools to restore the header.
 
 ## Troubleshooting
 
@@ -181,17 +200,24 @@ Check whether the failure is retryable. Upstream `4xx` responses do not trigger 
 
 ### `response.model` shows the routing alias, not the target that served
 
-That is the documented contract — see [Response Shape](#response-shape). Read `x-aisix-served-by` to learn which target actually served the request.
+That is the documented contract — see [Verify the response shape](#verify-the-response-shape). Read `x-aisix-served-by` to learn which target actually served the request.
 
 ### `x-aisix-served-by` is missing on a routing-model response
 
 Check the response headers first:
 
 - `x-aisix-cache: hit` — header is intentionally absent on cache hits.
-- DP logs for a `tracing::warn!` mentioning `target_display_name` — your target's display name contains characters that are not valid in an HTTP header value. Rename the target.
+- Data-plane logs for a warning mentioning `target_display_name` — your target's display name contains characters that are not valid in an HTTP header value. Rename the target.
 
-## Related Pages
+### A routing alias fails on `/v1/messages/count_tokens` or `/v1/responses`
+
+Check the target providers in the routing group. `/v1/messages/count_tokens`
+requires at least one Anthropic-backed target, and `/v1/responses` requires at
+least one OpenAI-backed target. Mixed groups are allowed, but targets from the
+wrong provider family are skipped for those provider-specific endpoints.
+
+## Next steps
 
 - [Models](models.md)
-- [Rate Limits](rate-limits.md)
-- [Configuration Propagation](configuration-propagation.md)
+- [Rate limits](rate-limits.md)
+- [Configuration propagation](configuration-propagation.md)

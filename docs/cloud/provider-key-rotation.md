@@ -4,38 +4,70 @@ description: Rotate upstream provider credentials in AISIX Cloud without forcing
 sidebar_position: 76
 ---
 
-The current provider-key rotation pattern in AISIX Cloud is:
+Provider key rotation changes the upstream credential behind a model
+without changing the caller-facing API key or model alias.
 
-1. create a new provider key with the rotated upstream credential
-2. update the model to reference the new provider key
-3. let the change propagate to the managed data plane
-4. continue serving callers without reissuing caller API keys
+This separation is one of the main reasons to put AISIX between
+applications and AI providers. Callers keep using the same AISIX API key
+and model name while operators rotate the provider credential behind the
+gateway.
 
-This keeps caller-facing credentials stable while upstream credentials change.
+## Rotation flow
 
-## Why This Matters
+```mermaid
+flowchart LR
+  old[Old provider key] --> model[Model alias]
+  new[New provider key] --> update[Update model reference]
+  update --> model
+  model --> dp[Managed data plane]
+  caller[Caller API key] --> dp
+```
 
-This is one of the clearest examples of separating caller identity from upstream provider identity.
+The managed rotation sequence is:
 
-Callers continue using the same AISIX API key and model alias while the control plane changes which upstream credential backs that model.
+1. Create a new provider key with the rotated upstream credential.
+2. Update the model to reference the new provider key.
+3. Wait for projection to the managed data plane.
+4. Send a live request through the managed data plane.
+5. Remove or disable the old provider key after traffic is confirmed.
 
-## Operational Sequence
+## What stays stable
 
-The important operator checkpoints are:
+The caller does not need a new AISIX API key. The application also does
+not need to change the model alias if the model resource keeps the same
+name.
 
-1. create the replacement provider key correctly
-2. update the model reference
-3. wait for projection to the managed data plane
-4. verify that live traffic still succeeds
+What changes is the provider key reference used when AISIX dispatches
+the request upstream.
+
+## Verify
+
+After rotation:
+
+- confirm the model references the replacement provider key
+- confirm projection reached the managed data plane
+- send a request through the managed data-plane endpoint
+- check logs or usage events to confirm live traffic succeeds
+- only then remove the old credential from service
 
 ## Troubleshooting
 
-### Rotation is complete in Cloud, but live traffic still uses the old behavior
+### Cloud shows the new provider key, but live traffic still uses old behavior
 
-Check projection timing before assuming the model update itself failed.
+Check projection timing and the model's provider-key reference before
+assuming the new credential is invalid.
 
-## Related Pages
+### Live traffic fails after rotation
 
-- [Provider Keys](../configuration/provider-keys.md)
-- [Resource Projection](resource-projection.md)
-- [Configuration Propagation](../configuration/configuration-propagation.md)
+Check the new upstream credential, provider-specific auth shape, and
+model reference. If the provider key is valid but the data plane has not
+received the update, troubleshoot projection.
+
+## Next steps
+
+- [Provider keys](/ai-gateway/configuration/provider-keys) explains the
+  provider-key resource.
+- [Models](/ai-gateway/configuration/models) explains model aliases and
+  provider-key references.
+- [Resource projection](/ai-gateway/cloud/resource-projection) explains
+  how Cloud changes reach the managed data plane.

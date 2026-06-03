@@ -1,84 +1,96 @@
 ---
-title: TLS And mTLS
+title: TLS and mTLS
 description: Understand listener TLS, etcd TLS, and managed-mode mTLS bootstrap in AISIX AI Gateway.
 sidebar_position: 52
 ---
 
-AISIX AI Gateway uses TLS in three distinct places:
+AISIX AI Gateway uses TLS in three different places. Configure and
+troubleshoot them separately.
 
-- listener TLS for proxy and admin endpoints
-- etcd TLS or mTLS for config transport
-- managed-mode mTLS for data-plane communication with the control plane
+Listener TLS protects inbound proxy and admin traffic. Configure it with
+`proxy.tls` and `admin.tls`.
 
-Use this page to separate those three concerns clearly during deployment and debugging.
+etcd TLS or mTLS protects the configuration-store transport. Configure it
+with `etcd.tls`.
+
+Managed mTLS authenticates data-plane communication with AISIX Cloud. It
+uses the managed certificate bundle instead of the standalone listener TLS
+settings.
 
 ## Listener TLS
+
+Use listener TLS when the proxy or admin listener is exposed beyond local
+development.
 
 Bootstrap config supports optional TLS on:
 
 - `proxy.tls`
 - `admin.tls`
 
-Use listener TLS whenever these surfaces are exposed beyond local development.
-
-This is the correct place to secure inbound client and operator traffic.
+Listener TLS protects inbound caller and operator traffic. It does not
+prove that the gateway can connect to etcd or to AISIX Cloud.
 
 ## etcd TLS
 
-`etcd.tls` can provide:
+`etcd.tls` configures trust for the etcd client connection. It can
+include:
 
 - CA certificate
 - client certificate
 - client private key
 - optional domain name override
 
-This is the right path when your etcd deployment requires TLS or mTLS.
+Use etcd TLS or mTLS when your etcd deployment requires encrypted or
+mutually authenticated transport. Certificate files must be readable by
+the gateway process at startup.
 
-It is independent from listener TLS. A working HTTPS proxy listener does not tell you anything about etcd trust configuration.
+## Managed mTLS bundle
 
-## Managed mTLS Bundle
-
-Managed mode expects a bundle rooted in:
+Managed data planes authenticate to AISIX Cloud with a certificate
+bundle. The bundle contains:
 
 - `ca.crt`
 - `client.crt`
 - `client.key`
 
-The runtime stores and reads this bundle from the managed `mtls_dir`.
+The runtime stores and reads the bundle from the managed `mtls_dir`.
+For current AISIX Cloud operation, use the certificate-bundle bootstrap
+flow documented in [Gateway certificates and managed data plane](/ai-gateway/cloud/gateway-certificates-and-managed-dp).
 
-Current managed bootstrap paths include:
+## Failure signals
 
-- pre-provisioned certificate bundle
-- registration-token path still present in runtime
+If HTTPS proxy requests fail while the process is running, start with
+listener TLS.
 
-For current AISIX Cloud behavior, treat the certificate-bundle flow as the primary path.
+If startup fails while connecting to etcd, inspect the etcd TLS settings
+and the network path to etcd.
 
-## How To Think About Failures
+If watch freshness stalls after boot, focus on etcd TLS, network
+connectivity, and watch supervisor health.
 
-- listener TLS failures usually show up on inbound proxy or admin traffic
-- etcd TLS failures usually show up as bootstrap or watch/connectivity problems
-- managed mTLS failures usually show up on heartbeat, rotation, or budget-check paths
+If managed heartbeat never succeeds, inspect the managed mTLS bundle and
+the data-plane-manager URL.
 
-## Failure Signals
-
-Common TLS or mTLS failures surface as:
-
-- startup failures reading certificate files
-- outbound client build failures for heartbeat or budget check
-- etcd connection failures that can look like transport or DNS errors
+If budget checks or certificate rotation fail in managed mode, inspect
+managed mTLS and `/dp/*` connectivity.
 
 ## Troubleshooting
 
 ### The process fails at startup with certificate errors
 
-Check file readability and whether the configured cert/key pair matches the intended TLS use.
+Check file paths, file permissions, certificate/key pairing, and whether
+the certificate is configured for the correct TLS area.
 
 ### Managed mode starts but never heartbeats
 
-Treat that as a managed mTLS bundle or trust-root problem first.
+Check the managed certificate bundle, trust root, runtime state
+directory, and `AISIX_MANAGED__CP_BASE_URL`.
 
-## Related Pages
+## Next steps
 
-- [Production Deployment](production-deployment.md)
-- [Network And Security](network-and-security.md)
-- [Gateway Certificates And Managed DP](../cloud/gateway-certificates-and-managed-dp.md)
+- [Gateway certificates and managed data plane](/ai-gateway/cloud/gateway-certificates-and-managed-dp)
+  explains managed bootstrap.
+- [Network and security](/ai-gateway/operations/network-and-security)
+  explains listener exposure.
+- [Production deployment](/ai-gateway/operations/production-deployment)
+  covers production placement and verification.

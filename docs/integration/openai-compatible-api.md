@@ -6,87 +6,63 @@ sidebar_position: 20
 
 AISIX AI Gateway exposes an OpenAI-compatible proxy surface so existing SDKs and HTTP clients can talk to the gateway with minimal change.
 
-Use this page when you need to understand:
+This guide explains the OpenAI-compatible caller surface after the gateway can already serve a request through `/v1/chat/completions`.
 
-- how authentication works on the proxy surface
-- which client-facing endpoints are currently exposed
-- how model aliases are resolved
-- what the current error and authorization boundaries look like
+This page explains the caller-facing contract: how clients authenticate, how model names are resolved, which endpoints are mounted, and which gateway errors callers should handle.
 
-## Request Flow
+## Caller contract
 
-A `POST /v1/chat/completions` (or any other proxy endpoint) takes this path through the gateway:
+OpenAI-compatible clients call AISIX instead of calling a provider directly:
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Client
-    participant Proxy as AISIX proxy (:3000)
-    participant Hub as Provider bridge (hub)
-    participant Upstream as Upstream LLM
+- set the client base URL to the AISIX proxy listener
+- send a caller API key, not the upstream provider key
+- use an AISIX model alias in the request `model` field
 
-    Client->>Proxy: POST /v1/chat/completions (Bearer sk-...)
-    Note over Proxy: 1. hash bearer (SHA-256) and resolve ApiKey
-    Note over Proxy: 2. resolve req.model to a Model in the snapshot
-    Note over Proxy: 3. enforce allowed_models on the ApiKey
-    Note over Proxy: 4. run input guardrails
-    Note over Proxy: 5. budget pre-check (allow-all in standalone; cp-api /dp/budget_check in managed mode)
-    Note over Proxy: 6. enforce per-key / per-model rate limits
-    Note over Proxy: 7. cache lookup — on hit, return cached response and skip steps 8–10
-    Proxy->>Hub: dispatch by Model.provider
-    Hub->>Upstream: provider-native request shape
-    Upstream-->>Hub: provider-native response (JSON or SSE)
-    Hub-->>Proxy: normalised OpenAI-shaped response
-    Note over Proxy: 8. run output guardrails
-    Note over Proxy: 9. on cache miss, write the response into the CachePolicy backend
-    Note over Proxy: 10. emit metrics + access log + UsageEvent
-    Proxy-->>Client: 200 OK or proxy error envelope
-```
+AISIX resolves the caller key, model alias, provider key, upstream model name, routing, and policy at the gateway layer.
 
-Each step has its own failure path; see [Error boundaries](#error-boundaries) below for the matching status codes. The budget pre-check is a no-op in standalone mode (the DP runs an allow-all budget client) and a live call to cp-api over mTLS in managed mode — both modes traverse the same code path.
+## What changes for clients
 
-## Current Proxy Surface
+The application-level request stays familiar: clients send `Authorization`, `model`, `messages`, and other OpenAI-shaped fields to the AISIX proxy listener.
 
-The proxy router currently mounts:
+The important difference is where provider decisions live. The caller sends a gateway API key and a model alias. AISIX authenticates the caller, checks model access, applies policy, resolves the provider key and upstream model, and forwards the request.
 
-- `GET /livez`
-- `GET /v1/models`
-- `POST /v1/chat/completions`
-- `POST /v1/completions`
-- `POST /v1/embeddings`
-- `POST /v1/images/generations`
-- `POST /v1/messages`
-- `POST /v1/rerank`
-- `POST /v1/responses`
-- `POST /v1/audio/transcriptions`
-- `POST /v1/audio/translations`
-- `POST /v1/audio/speech`
-- `ANY /passthrough/:provider/*rest`
+The upstream provider credential is never sent by the caller. AISIX injects it from the configured provider key before forwarding the request upstream.
+
+## Supported endpoints
+
+The proxy router mounts several OpenAI-shaped routes, but they do not all have the same provider breadth. Treat `POST /v1/chat/completions` as the default route for OpenAI-compatible clients, then move to a specialized page when your application needs a narrower API family.
+
+| Need | Start with | Notes |
+| --- | --- | --- |
+| Chat requests from OpenAI SDKs | `POST /v1/chat/completions` | Broadest provider path and the default OpenAI-compatible entry point. |
+| Model discovery for a caller key | `GET /v1/models` | Returns non-routing aliases visible to the authenticated key. |
+| Embeddings, images, audio, responses, or rerank | Endpoint-specific integration pages | Provider support differs by route. Check the page before using a non-OpenAI upstream. |
+| Anthropic-style clients | [Anthropic-style Messages API](anthropic-messages.md) | Use `/v1/messages`, not the OpenAI-compatible chat path. |
+| Provider-native routes | [Provider passthrough](passthrough.md) | Use when AISIX does not model the provider route directly. |
+
+For the full mounted route list and current provider boundaries, see [Proxy API reference](../reference/proxy-api-reference.md) and [Provider compatibility](../reference/provider-compatibility.md).
 
 ## Authentication
 
 Proxy requests use a caller-facing API key.
 
-The request format is:
+Use the standard bearer format:
 
 ```http
 Authorization: Bearer YOUR_CALLER_API_KEY
 ```
 
+The proxy also accepts `x-api-key: YOUR_CALLER_API_KEY` as a compatibility fallback, but `Authorization: Bearer ...` is the recommended form for OpenAI-compatible clients.
+
 At runtime, the data plane hashes the bearer token and resolves it against the stored `key_hash` in the current snapshot.
 
-## Model Resolution
-
-For a request like `/v1/chat/completions`, the gateway:
-
-1. authenticates the caller API key
-2. resolves `req.model` against the current model table
-3. checks whether the API key can access that model
-4. dispatches to the configured provider bridge
+## Model resolution
 
 The model name seen by the caller is the configured `display_name`, not necessarily the upstream provider model identifier.
 
-## Current Behavior Of `/v1/models`
+For a direct model, AISIX forwards to the configured provider key and upstream model name. For a routing model, AISIX chooses a target model according to the configured routing strategy before dispatching.
+
+## `/v1/models`
 
 `GET /v1/models` returns the subset of models the authenticated API key is allowed to access.
 
@@ -96,29 +72,18 @@ The model name seen by the caller is the configured `display_name`, not necessar
 
 Example:
 
-```bash title="List models through the gateway"
+```shell
 curl -sS http://127.0.0.1:3000/v1/models \
   -H "Authorization: Bearer YOUR_CALLER_API_KEY"
 ```
 
-## Current Behavior Of `/v1/chat/completions`
+## `/v1/chat/completions`
 
 The chat-completions path is the main OpenAI-compatible entry point.
 
-At a high level, the request flow is:
-
-1. authenticate the caller key
-2. resolve the model
-3. enforce allowlist authorization
-4. run input guardrails
-5. enforce rate limits and, in managed mode, budget checks
-6. dispatch to the upstream bridge
-7. render an OpenAI-shaped response
-8. emit metrics, access logs, and usage events
-
 Example:
 
-```bash title="Send a chat completion request"
+```shell
 curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H "Authorization: Bearer YOUR_CALLER_API_KEY" \
   -H "Content-Type: application/json" \
@@ -130,7 +95,7 @@ curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
   }'
 ```
 
-## Error Boundaries
+## Error boundaries
 
 Important proxy-side outcomes include:
 
@@ -138,13 +103,17 @@ Important proxy-side outcomes include:
 - `401` if the caller key is missing or unknown
 - `403` if the key is valid but not allowed to access the requested model
 - `404` if the requested model alias is not found
+- `413` if the request body exceeds the configured proxy body-size limit
 - `422` if a guardrail blocks the content
 - `429` if the request is blocked by limits or budget policy
 - `503` if no bridge is registered for the resolved provider
 
-## Related Pages
+For the current error taxonomy and header behavior, see [Headers and error codes](../reference/headers-and-error-codes.md).
 
-- [First Model, First Key, First Request](../quickstart/first-model-first-key-first-request.md)
-- [Admin API](../configuration/admin-api.md)
-- [Feature Matrix](../overview/feature-matrix.md)
-- [Roadmap](../roadmap.md)
+## Next steps
+
+- [Understand admin resources](../quickstart/first-model-first-key-first-request.md) — review the resources that make this proxy request work.
+- [Models](../configuration/models.md) — configure caller-visible aliases and routing models.
+- [API keys](../configuration/api-keys.md) — control caller authentication and model access.
+- [Anthropic-style Messages API](anthropic-messages.md) — use the Anthropic-style proxy API.
+- [Provider compatibility](../reference/provider-compatibility.md) — check provider and endpoint boundaries.

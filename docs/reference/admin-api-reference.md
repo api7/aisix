@@ -1,80 +1,92 @@
 ---
-title: Admin API Reference
-description: Reference for the current standalone AISIX AI Gateway admin API surface.
-sidebar_position: 61
+title: Admin API Source Notes
+description: Understand where the generated AISIX AI Gateway Admin API reference comes from and what it covers.
+sidebar_label: Admin API source notes
+sidebar_position: 62
 ---
 
-## Public Admin-Listener Routes
+The standalone admin API publishes an OpenAPI 3.1 document from the gateway process.
 
-- `GET /livez`
-- `GET /metrics`
-- `GET /admin/openapi.json`
-- `GET /admin/openapi-scalar`
+Use the generated [Admin API reference](/ai-gateway/reference/admin-api) for the exact route list, request schemas, response schemas, and status-code details. This page explains where that generated reference comes from, how to export it, and which resource boundaries still live outside standalone admin CRUD.
 
-These are operator-facing helper and discovery routes, not dynamic-resource write paths.
+## Open the generated reference
 
-## Authenticated Operator Routes
+The docs site renders the generated OpenAPI document with Redoc:
 
-- `GET|POST /admin/v1/models`
-- `GET|PUT|DELETE /admin/v1/models/:id`
-- `GET /admin/v1/models/status`
-- `GET|POST /admin/v1/apikeys`
-- `GET|PUT|DELETE /admin/v1/apikeys/:id`
-- `POST /admin/v1/apikeys/:id/rotate`
-- `GET|POST /admin/v1/provider_keys`
-- `GET|PUT|DELETE /admin/v1/provider_keys/:id`
-- `GET|POST /admin/v1/guardrails`
-- `GET|PUT|DELETE /admin/v1/guardrails/:id`
-- `GET|POST /admin/v1/cache_policies`
-- `GET|PUT|DELETE /admin/v1/cache_policies/:id`
-- `GET|POST /admin/v1/observability_exporters`
-- `GET|PUT|DELETE /admin/v1/observability_exporters/:id`
-- `GET /admin/v1/health`
-- `POST /playground/chat/completions`
+```text
+/ai-gateway/reference/admin-api
+```
 
-Treat these as the standalone control surface for dynamic configuration.
+When you run a self-hosted gateway, you can also open the live Scalar UI on the admin listener:
 
-## Auth Model
+```text
+http://127.0.0.1:3001/admin/openapi-scalar
+```
 
-Current authenticated operator routes use:
+The UI loads the machine-readable OpenAPI document from:
 
-- `Authorization: Bearer <admin-key>`
-- `x-api-key: <admin-key>` fallback
+```text
+http://127.0.0.1:3001/admin/openapi.json
+```
 
-This auth model is separate from proxy caller API keys.
+You can also export the spec directly:
 
-`POST /playground/chat/completions` expects a proxy API key, not an admin key.
+```shell
+curl -sS http://127.0.0.1:3001/admin/openapi.json \
+  -o aisix-admin-openapi.json
+```
 
-## Route Groups
+## What the generated reference covers
 
-- public admin-listener routes: process visibility and OpenAPI discovery
-- CRUD resource routes: models, API keys, provider keys, guardrails, cache policies, exporters
-- runtime model-state route: `/admin/v1/models/status`
-- authenticated operator health route: `/admin/v1/health`
-- operator convenience route: `/playground/chat/completions`
+The generated document covers the routes mounted by the standalone admin router. This avoids maintaining a second hand-written route inventory in the docs site.
 
-## Resources Without Admin CRUD
+It includes:
 
-`RateLimitPolicy` rows are loaded from etcd directly and do not currently have admin API CRUD routes. Provision them through your control-plane projection or, in self-hosted setups, by writing under the etcd `rate_limit_policies/<id>` prefix. See [Rate Limits § Rate-Limit Policy Entities](../configuration/rate-limits.md#rate-limit-policy-entities).
+- public liveness, metrics, and OpenAPI discovery routes
+- authenticated admin CRUD routes for resources such as provider keys, models, caller API keys, guardrails, cache policies, and observability exporters
+- playground routes mounted on the admin listener
+- request and response schemas merged from generated resource schemas
 
-## Runtime Model Status
+The generated reference does not describe the proxy API surface. For proxy endpoints such as `/v1/chat/completions`, see [Proxy API reference](proxy-api-reference.md).
 
-`GET /admin/v1/models/status` returns one row per model in the current snapshot.
+## Source of truth
 
-Current behavior is:
+The admin API specification is generated from the AI Gateway repo and rendered by the docs site. Resource schemas are merged from:
 
-- direct models return runtime state keyed by their resolved model `id`
-- routing models return `kind = routing` and `status = not_applicable`
-- request-path retryable failures can mark a direct model `cooldown`
-- background checks can mark a direct model `unhealthy`
-- ignored background statuses like `408` or `429` remain visible through `last_check_status` and `status_reason = ignored_transient_error` without marking the model unhealthy
+```text
+schemas/resources/
+```
 
-This route is the routing-exclusion signal.
+If the generated reference and a prose guide disagree, prefer the generated reference for the exact route, request, response, and status-code contract. Then update the prose guide so operators do not have to reconcile two different descriptions.
 
-`GET /admin/v1/health` remains the higher-level aggregated health view and does not define runtime routing exclusion.
+## Auth boundary
 
-## Related Pages
+The public admin-listener routes are liveness, metrics, and OpenAPI discovery. Authenticated admin routes use the configured admin key:
 
-- [Admin API](../configuration/admin-api.md)
-- [Resource Schemas](resource-schemas.md)
-- [Headers And Error Codes](headers-and-error-codes.md)
+```http
+Authorization: Bearer <admin-key>
+```
+
+`x-api-key: <admin-key>` is also accepted on admin auth paths.
+
+This is separate from proxy caller API keys. `POST /playground/chat/completions` expects a proxy API key because it forwards through the proxy router.
+
+## Managed data-plane boundary
+
+The standalone admin API is not exposed on AISIX Cloud managed data planes.
+
+In managed mode, use the AISIX Cloud control plane for provider keys, models, caller API keys, and related configuration. The local data plane exposes proxy APIs, not the standalone admin listener.
+
+## Resources outside standalone admin CRUD
+
+Some runtime snapshot resources do not currently have standalone admin CRUD routes.
+
+`RateLimitPolicy` rows are loaded from etcd directly and can be projected by a control plane. In self-hosted setups where you manage etcd directly, write them under the etcd `rate_limit_policies/<id>` prefix. See [Rate limits](../configuration/rate-limits.md#add-a-policy-limit).
+
+`GuardrailAttachment` rows bind guardrail definitions to `env`, `model`, `api_key`, or `team` scopes and are loaded from `guardrail_attachments/<id>`. See [Guardrails](../configuration/guardrails.md#scope-guardrails).
+
+## Related docs
+
+- [Admin API](../configuration/admin-api.md) — operator workflow and examples.
+- [Resource schemas](resource-schemas.md) — resource shape reference.
+- [Headers and error codes](headers-and-error-codes.md) — admin error envelope and status boundaries.

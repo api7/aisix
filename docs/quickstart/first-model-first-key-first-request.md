@@ -1,172 +1,126 @@
 ---
-title: First Model, First Key, First Request
-description: Create a provider key, model, and API key through the AISIX AI Gateway admin API, then send your first successful proxy request.
-sidebar_position: 12
+title: Understand Admin Resources
+description: Learn how provider keys, model aliases, and caller API keys work together in AISIX AI Gateway.
+sidebar_position: 11
 ---
 
-This guide expands the main [Quickstart](quickstart.md) into a more explicit resource-by-resource walkthrough.
+This guide explains the resources you created in the [Quickstart](../quickstart) and shows how to prove that the proxy is enforcing them.
 
-It shows how to move from a running self-hosted [gateway](../overview/glossary.md#gateway) to a working end-to-end request. You will create:
+Use it as the second page in the getting-started path. The quickstart proves that one request can pass through the gateway; this page explains how to inspect the resource chain and diagnose the first layer that rejects a request.
 
-- one `ProviderKey`
-- one `Model`
-- one caller-facing `ApiKey`
+By the end of the guide, you will understand:
 
-Then you will verify that the new configuration is visible on the proxy surface.
+- which resource stores the upstream provider credential
+- which resource exposes the caller-facing model alias
+- which resource authenticates callers and limits model access
+- how to verify propagation, authentication, and authorization from the proxy surface
 
 :::note Standalone only
-This guide uses the standalone `admin/v1` API on `127.0.0.1:3001`. A [Cloud managed data plane](aisix-cloud-managed-dp.md) only exposes proxy APIs locally and does **not** bind the standalone admin listener — create provider keys, models, and caller API keys through the AISIX Cloud control plane instead.
+This guide uses the standalone `admin/v1` API on `127.0.0.1:3001`. A [Cloud managed data plane](aisix-cloud-managed-dp.md) only exposes proxy APIs locally and does **not** bind the standalone admin listener. In managed deployments, create provider keys, models, and caller API keys through the AISIX Cloud control plane.
 :::
 
-## When To Use This Page
+## Resource chain
 
-Use this page when:
+The minimum request path uses three dynamic resources:
 
-- you already finished [Boot A Self-Hosted Gateway](self-hosted.md) and now want to configure traffic
-- you want more detail than the main [Quickstart](quickstart.md) gives about what each admin resource does
-- you want to verify both the positive path and the common auth and allowlist failure paths
+```text
+caller bearer token
+  -> ApiKey.key_hash
+  -> ApiKey.allowed_models
+  -> Model.display_name
+  -> Model.provider_key_id
+  -> ProviderKey.secret
+  -> upstream provider
+```
+
+`ProviderKey` stores the upstream credential and provider connection details.
+
+`Model` exposes the model alias callers send to AISIX. In the quickstart, callers send `gpt-4o-prod`, while AISIX forwards the upstream model name `gpt-4o-mini`.
+
+`ApiKey` authenticates caller traffic. The gateway stores `key_hash`, the SHA-256 hash of the plaintext caller key, and uses `allowed_models` to decide which model aliases the caller can use.
 
 ## Prerequisites
 
-- A running gateway from [Quickstart](quickstart.md) or [Boot A Self-Hosted Gateway](self-hosted.md)
-- An API key from an upstream provider (OpenAI, Anthropic, Google, DeepSeek, or another supported provider). The key looks like `sk-...` and is what you will paste into the `YOUR_PROVIDER_API_KEY` placeholder in Step 1. If you do not have one, sign up at the provider (for example, [OpenAI API keys](https://platform.openai.com/api-keys)).
-- Your admin key from the bootstrap config
+Complete the [Quickstart](../quickstart) first, or start from a gateway that already has:
 
-## What This Quickstart Configures
+- a provider key
+- a direct model alias
+- a caller API key
 
-The standalone gateway uses:
+This guide uses the quickstart values:
 
-- **[provider keys](../overview/glossary.md#provider-key)** to store upstream credentials and optional base URLs
-- **models** to expose operator-defined model aliases on the proxy surface
-- **[API keys](../overview/glossary.md#api-key)** to control which callers can access which models
-
-## Step 1: Create a Provider Key
-
-Create a provider key that points at your upstream provider.
-
-:::warning Production credentials
-The standalone gateway stores `secret` as plaintext under the [etcd](../overview/glossary.md#etcd) `prefix` you configured in [`config.yaml`](self-hosted.md#step-2-create-a-bootstrap-config). For production, front etcd with encryption-at-rest, or use [AISIX Cloud](../overview/glossary.md#aisix-cloud)'s managed [Provider Key Rotation](../cloud/provider-key-rotation.md), which holds the secret in the [control plane](../overview/glossary.md#control-plane) and projects only what each environment needs.
-:::
-
-```bash title="Create a provider key"
-curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
-  -H "Authorization: Bearer YOUR_ADMIN_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "display_name": "openai-upstream",
-    "secret": "YOUR_PROVIDER_API_KEY",
-    "api_base": "https://api.openai.com/v1"
-  }'
+```shell
+export AISIX_ADMIN_KEY="admin-local-only-change-me"
+export CALLER_KEY="sk-demo-caller"
+export MODEL_ALIAS="gpt-4o-prod"
 ```
 
-:::caution `api_base` convention differs per provider
-Each provider has its own canonical form — do not generalize from this OpenAI example. `openai` expects `api_base` to include `/v1`; `deepseek` wants the bare host (`https://api.deepseek.com`); `google` wants the OpenAI-compat prefix (`https://generativelanguage.googleapis.com/v1beta/openai`); `anthropic` wants the bare host (the bridge appends `/v1/messages` itself). The gateway tolerates common paste-mistakes such as trailing slashes, full endpoint URLs, and (for the canonical OpenAI/DeepSeek hosts) the missing or extra `/v1` segment. See [Provider Keys § `api_base` Behavior](../configuration/provider-keys.md#api_base-behavior) for the full truth table and the tolerated forms.
-:::
+If you just completed the quickstart, keep the captured `PROVIDER_KEY_ID`, `MODEL_ID`, and `APIKEY_ID` variables in the same shell. The cleanup commands at the end of this guide use them.
 
-The admin envelope returns a `ResourceEntry` shape:
+## Inspect the resources
 
-```json
-{
-  "id": "...",
-  "revision": 1,
-  "value": {
-    "display_name": "openai-upstream",
-    "secret": "YOUR_PROVIDER_API_KEY",
-    "api_base": "https://api.openai.com/v1"
-  }
-}
+List the provider keys, models, and caller API keys that the admin API stores:
+
+```shell
+curl -sS http://127.0.0.1:3001/admin/v1/provider_keys \
+  -H "Authorization: Bearer ${AISIX_ADMIN_KEY}"
 ```
 
-Capture the returned `id` for use as `provider_key_id` in the next step — copy it by eye from the response above, or use this jq-capturing form **instead of** the curl above (running both creates a duplicate `display_name` and the second POST returns 409):
-
-```bash title="Create and capture the id in one shot"
-PROVIDER_KEY_ID=$(curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
-  -H "Authorization: Bearer YOUR_ADMIN_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"display_name":"openai-upstream","secret":"YOUR_PROVIDER_API_KEY","api_base":"https://api.openai.com/v1"}' \
-  | jq -r .id)
+```shell
+curl -sS http://127.0.0.1:3001/admin/v1/models \
+  -H "Authorization: Bearer ${AISIX_ADMIN_KEY}"
 ```
 
-The same pattern applies to the model `id` and API-key `id` captures in the next two steps.
-
-:::warning
-The `secret` field is returned as plaintext in this response. Treat the command output as sensitive — avoid pasting it into shared documents, issue trackers, or chat. The admin API also returns the plaintext on subsequent `GET /admin/v1/provider_keys/:id` calls, so the same handling applies any time you read this resource.
-:::
-
-## Step 2: Create a Model
-
-Create a model alias that the proxy will expose to callers.
-
-:::tip
-This guide uses `gpt-4o-mini` to minimize evaluation costs. Swap in any chat-completions-compatible model supported by your upstream provider.
-:::
-
-```bash title="Create a model"
-curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
-  -H "Authorization: Bearer YOUR_ADMIN_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "display_name": "gpt-4o-prod",
-    "provider": "openai",
-    "model_name": "gpt-4o-mini",
-    "provider_key_id": "YOUR_PROVIDER_KEY_ID"
-  }'
+```shell
+curl -sS http://127.0.0.1:3001/admin/v1/apikeys \
+  -H "Authorization: Bearer ${AISIX_ADMIN_KEY}"
 ```
 
-The `display_name` is the model name your clients will send in proxy requests.
+The provider-key response includes `secret` in plaintext. Treat provider-key command output as sensitive, including output from later `GET /admin/v1/provider_keys/:id` calls.
 
-## Step 3: Create a Caller API Key
+Check that the resources line up with the request path:
 
-The data plane stores `key_hash`, not plaintext API keys. Hash your chosen plaintext key first, then create the API key resource.
+- the provider key has `display_name: "openai-upstream"` and the OpenAI adapter settings
+- the model has `display_name: "gpt-4o-prod"` and references the provider key by using `provider_key_id`
+- the API key has `allowed_models: ["gpt-4o-prod"]`
 
-```bash title="Hash a plaintext caller key"
-printf '%s' 'sk-demo-caller' | shasum -a 256 | awk '{print $1}'
-```
+If one of those links is missing, fix the admin resource before debugging the proxy surface.
 
-Use the resulting hash in the admin API request:
+## Verify propagation to the proxy
 
-```bash title="Create a caller API key"
-curl -sS -X POST http://127.0.0.1:3001/admin/v1/apikeys \
-  -H "Authorization: Bearer YOUR_ADMIN_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "key_hash": "YOUR_CALLER_KEY_HASH",
-    "allowed_models": ["gpt-4o-prod"]
-  }'
-```
+Admin writes do not become visible to the proxy instantly. AISIX publishes dynamic resources through the watch-driven snapshot path, so propagation is fast but asynchronous.
 
-## Step 4: Wait For Configuration Propagation
+Poll the proxy until the model alias is visible to the caller key:
 
-Admin writes do not become visible to the proxy instantly. The gateway publishes dynamic resources through the watch-driven snapshot path. On a healthy local etcd this is typically under 500 ms; on a slow CI runner or a cold etcd it can be several seconds.
+```shell
+MODEL_VISIBLE=false
+for i in $(seq 1 20); do
+  MODELS_RESPONSE=$(curl -sS http://127.0.0.1:3000/v1/models \
+    -H "Authorization: Bearer ${CALLER_KEY}")
 
-A fixed sleep is fine for local evaluation:
-
-```bash title="Wait briefly for propagation"
-sleep 1
-```
-
-For automation or slow environments, poll the proxy until the model becomes visible — this is what the e2e harness does with its `waitConfigPropagation` helper:
-
-```bash title="Poll until the model is visible"
-until curl -sf http://127.0.0.1:3000/v1/models \
-  -H "Authorization: Bearer sk-demo-caller" \
-  | grep -q '"gpt-4o-prod"'; do
-  sleep 1
+  if echo "${MODELS_RESPONSE}" \
+    | jq -e --arg model "${MODEL_ALIAS}" \
+      '.data[]? | select(.id == $model)' >/dev/null; then
+    MODEL_VISIBLE=true
+    echo "model alias is visible"
+    break
+  fi
+  sleep 0.5
 done
+
+if [ "${MODEL_VISIBLE}" != "true" ]; then
+  echo "model alias is not visible yet; check the admin resources and proxy logs" >&2
+fi
 ```
 
-If a subsequent proxy call returns `404 model_not_found`, propagation is still in flight — wait longer or switch to the polling form.
+Then inspect the visible models:
 
-## Step 5: Verify `/v1/models`
-
-Call the proxy with the plaintext caller key you chose before hashing it.
-
-```bash title="List visible models"
+```shell
 curl -sS http://127.0.0.1:3000/v1/models \
-  -H "Authorization: Bearer sk-demo-caller"
+  -H "Authorization: Bearer ${CALLER_KEY}"
 ```
 
-Expected result:
+Expected response shape:
 
 ```json
 {
@@ -182,13 +136,15 @@ Expected result:
 }
 ```
 
-`created` is the gateway-side unix timestamp at response time, not when the model resource was provisioned. The OpenAI SDK accepts it as-is.
+`created` is a gateway-side unix timestamp, so the exact value differs between runs.
 
-## Step 6: Send The First Chat Request
+## Verify the proxy contract
 
-```bash title="Send a chat completion request"
+If the final quickstart request already succeeded, you can skip to [Verify auth and allowlist enforcement](#verify-auth-and-allowlist-enforcement). Otherwise, send one normal request with the caller key and the allowed model alias:
+
+```shell
 curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
-  -H "Authorization: Bearer sk-demo-caller" \
+  -H "Authorization: Bearer ${CALLER_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-4o-prod",
@@ -198,21 +154,27 @@ curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
   }'
 ```
 
-If the upstream provider is reachable and the model is configured correctly, the response follows the OpenAI chat-completions shape.
+With a valid upstream provider key, the response follows the OpenAI chat-completions shape.
 
-## Step 7: Verify The Auth And Allowlist Contract
+The important boundary is that the application never sends the upstream provider key. The caller sends only the gateway-issued caller key. AISIX resolves the model alias and uses the provider key on the upstream side.
 
-Two negative-path checks prove the proxy is doing the work the configuration claims it is doing.
+## Verify auth and allowlist enforcement
+
+Two negative-path checks prove the proxy is enforcing the admin resources, not only forwarding traffic.
 
 ### Missing bearer returns `401`
 
-```bash title="Verify missing-bearer rejection"
+Send the same request without `Authorization`:
+
+```shell
 curl -sS -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4o-prod","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-Expected: `401`. The response body uses the proxy error envelope:
+Expected status: `401`.
+
+The proxy response body uses the OpenAI-compatible error envelope:
 
 ```json
 {
@@ -223,54 +185,80 @@ Expected: `401`. The response body uses the proxy error envelope:
 }
 ```
 
-### Unauthorized model returns `403`
+### Unauthorized model returns `403` or `404`
 
-Ask for a model alias the caller key is **not** in `allowed_models` for:
+Ask for a model alias the caller key cannot use:
 
-```bash title="Verify unauthorized-model rejection"
+```shell
 curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
-  -H "Authorization: Bearer sk-demo-caller" \
+  -H "Authorization: Bearer ${CALLER_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"model":"some-model-not-in-allowed-models","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-Expected: `403` with `"type": "permission_denied"`. Or `404` with `"type": "model_not_found"` if the alias does not exist in the snapshot at all.
+Expected result:
 
-These two paths exercise the same authentication and authorization code paths that gate every production request — passing them proves the gateway is correctly enforcing the caller key and the `allowed_models` list, not just returning `200` because the upstream happens to be reachable.
+- `403` with `"type": "permission_denied"` if the alias exists but is not listed in `allowed_models`
+- `404` with `"type": "model_not_found"` if the alias does not exist in the current proxy snapshot
 
-## Verification Notes
+These checks exercise the same authentication and authorization path that gates production traffic.
 
-- `401` (`invalid_api_key`) — the caller key is missing, malformed, or unknown to the snapshot.
-- `403` (`permission_denied`) — the key exists, but the resolved model is not in its `allowed_models`.
-- `404` (`model_not_found`) — the model alias does not resolve in the current snapshot.
-- `503` (`provider_unavailable`) — no provider bridge is registered for the resolved provider.
-- Admin errors (`/admin/v1/*`) use a different envelope: `{"error_msg": "..."}`. See [Admin API](../configuration/admin-api.md).
+## Troubleshoot the resource chain
 
-## Cleanup
+Use the first failing status code to locate the failing part of the chain:
 
-Delete the resources you created so they don't leak into other work. Delete in reverse dependency order — caller key first (so the model can no longer be reached), then the model, then the provider key.
+- `401 invalid_api_key` means the caller key is missing, malformed, or unknown to the proxy snapshot.
+- `403 permission_denied` means the key exists, but the resolved model alias is not in `allowed_models`.
+- `404 model_not_found` means the model alias does not resolve in the current proxy snapshot.
+- `503 provider_unavailable` means no provider bridge is registered for the resolved provider, or every routing candidate is unavailable.
 
-```bash title="Delete the caller API key"
-curl -sS -X DELETE http://127.0.0.1:3001/admin/v1/apikeys/YOUR_APIKEY_ID \
-  -H "Authorization: Bearer YOUR_ADMIN_KEY"
+Admin API errors use a different envelope:
+
+```json
+{
+  "error_msg": "..."
+}
 ```
 
-```bash title="Delete the model"
-curl -sS -X DELETE http://127.0.0.1:3001/admin/v1/models/YOUR_MODEL_ID \
-  -H "Authorization: Bearer YOUR_ADMIN_KEY"
+See [Headers and error codes](../reference/headers-and-error-codes.md) for the proxy and admin error boundaries.
+
+## Clean up when done
+
+:::warning Keep the quickstart resources if you are still learning
+Do not clean up if you want to continue to the SDK quickstarts. [OpenAI SDK quickstart](openai-sdk.md) reuses the same caller key and model alias, and [Anthropic SDK quickstart](anthropic-sdk.md) can reuse the same caller key after you add an Anthropic-backed alias.
+:::
+
+Skip this section if you want to continue with the same local gateway, caller key, and model alias.
+
+Delete the quickstart resources in reverse dependency order:
+
+```shell
+curl -sS -X DELETE http://127.0.0.1:3001/admin/v1/apikeys/${APIKEY_ID} \
+  -H "Authorization: Bearer ${AISIX_ADMIN_KEY}"
 ```
 
-```bash title="Delete the provider key"
-curl -sS -X DELETE http://127.0.0.1:3001/admin/v1/provider_keys/YOUR_PROVIDER_KEY_ID \
-  -H "Authorization: Bearer YOUR_ADMIN_KEY"
+```shell
+curl -sS -X DELETE http://127.0.0.1:3001/admin/v1/models/${MODEL_ID} \
+  -H "Authorization: Bearer ${AISIX_ADMIN_KEY}"
 ```
 
-Use the `id` values captured from each `POST` response. To remove the gateway itself, see the [self-hosted cleanup](self-hosted.md#cleanup).
+```shell
+curl -sS -X DELETE http://127.0.0.1:3001/admin/v1/provider_keys/${PROVIDER_KEY_ID} \
+  -H "Authorization: Bearer ${AISIX_ADMIN_KEY}"
+```
 
-## Related Pages
+Then remove the local gateway stack:
 
-- [Quickstart](quickstart.md)
-- [Boot A Self-Hosted Gateway](self-hosted.md)
-- [OpenAI-Compatible API](../integration/openai-compatible-api.md)
-- [Bootstrap Configuration](../configuration/bootstrap-config.md)
-- [Admin API](../configuration/admin-api.md)
+```shell
+docker compose down -v
+```
+
+## Next steps
+
+- [What is AISIX AI Gateway](../overview/what-is-aisix-ai-gateway.md) — learn where the gateway fits and when to use it.
+- [Core concepts](../overview/core-concepts.md) — learn the broader resource model.
+- [Client APIs overview](../integration/overview.md) — choose the caller-facing API surface for your application.
+- [OpenAI SDK quickstart](openai-sdk.md) — call the gateway from an OpenAI SDK client.
+- [Anthropic SDK quickstart](anthropic-sdk.md) — call the gateway from an Anthropic-style client.
+- [Models](../configuration/models.md) — configure direct and routing model aliases.
+- [API keys](../configuration/api-keys.md) — configure caller access and model allowlists.

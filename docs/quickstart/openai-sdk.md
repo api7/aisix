@@ -1,67 +1,60 @@
 ---
 title: OpenAI SDK Quickstart
 description: Configure the official OpenAI SDK to call AISIX AI Gateway through the OpenAI-compatible proxy surface.
-sidebar_position: 13
+sidebar_position: 12
 ---
 
-This quickstart shows the smallest working setup for the official OpenAI SDK against AISIX AI Gateway.
+This quickstart shows how to point the official OpenAI SDK at AISIX AI Gateway instead of sending requests directly to an upstream provider.
 
-Use it when:
+This guide continues from the [Quickstart](../quickstart) and shows how to call the gateway with the OpenAI SDK. If you cleaned up the quickstart resources, run the quickstart again first.
 
-- your application already uses the official OpenAI SDK
-- you want to keep OpenAI request and response shapes unchanged
-- you want AISIX to own provider selection, upstream credentials, and policy enforcement
+By the end of this guide, your OpenAI SDK client will:
 
-Use this page after you have already created:
-
-- a [provider key](../overview/glossary.md#provider-key)
-- a model alias
-- a caller-facing [API key](../overview/glossary.md#api-key)
-
-If you have not done that yet, start with [First Model, First Key, First Request](first-model-first-key-first-request.md).
-
-## Where This Fits In The Sequence
-
-Use this page after the main [Quickstart](quickstart.md) confirms that:
-
-- the gateway is running
-- `/v1/models` returns your alias
-- a direct `curl` call to `/v1/chat/completions` works with your caller key
-
-Once those three checks pass, this page shows how to swap the client from raw `curl` to the official OpenAI SDK.
+- authenticate to AISIX with a caller API key
+- send requests to the gateway's `/v1` proxy surface
+- use an AISIX model alias instead of a raw upstream model ID
+- receive OpenAI-compatible chat-completions responses
 
 ## Prerequisites
 
-- A running gateway with at least one configured provider key, model alias, and caller-facing API key (see the prior quickstart pages).
-- **Node.js 18 or newer with `npm`.** Install from [nodejs.org](https://nodejs.org) or via [nvm](https://github.com/nvm-sh/nvm) and verify with `node --version && npm --version`. The official OpenAI SDK used below requires Node.js 18+.
+- A running gateway with one provider key, model alias, and caller-facing API key. If you have not created them yet, start with the [Quickstart](../quickstart).
+- The quickstart caller key and model alias. This guide uses `sk-demo-caller` and `gpt-4o-prod`.
+- Node.js 20 LTS or newer with `npm`. Verify with `node --version && npm --version`.
 
-## What Changes In The SDK
+## What changes in your application
 
-Point the SDK at the gateway instead of the upstream provider:
+Keep the OpenAI SDK surface, but change the gateway-facing inputs:
 
-- keep your caller-facing AISIX API key as `apiKey`
-- set `baseURL` to the gateway's `/v1` prefix
-- use the gateway model alias in `model`
+| SDK setting | Use this value |
+|---|---|
+| `apiKey` | AISIX caller API key, such as `sk-demo-caller` |
+| `baseURL` | Gateway `/v1` proxy URL, such as `http://127.0.0.1:3000/v1` |
+| `model` | AISIX model alias, such as `gpt-4o-prod` |
 
-What does **not** change:
+Your code still calls `client.chat.completions.create(...)`, sends OpenAI-style `messages`, and receives OpenAI-compatible JSON or SSE chunks.
 
-- you still call `client.chat.completions.create(...)`
-- you still send OpenAI-style `messages`
-- you still receive OpenAI-style JSON or SSE chunks
+## Install the SDK
 
-## Install The SDK
+Create a small demo project:
 
-All commands below run from the same project directory. Create one first:
-
-```bash title="Create the demo project directory"
+```shell
 mkdir aisix-openai-demo && cd aisix-openai-demo
+npm init -y
 ```
 
-```bash title="Install openai"
+```shell
 npm install openai
 ```
 
-## Minimal Example
+Set the gateway values that the examples use:
+
+```shell
+export AISIX_API_KEY="sk-demo-caller"
+export AISIX_MODEL="gpt-4o-prod"
+export AISIX_BASE_URL="http://127.0.0.1:3000/v1"
+```
+
+## Minimal example
 
 Use the `.mjs` extension so Node treats top-level `await` and `import` as ES modules without extra configuration.
 
@@ -70,28 +63,24 @@ import OpenAI from "openai";
 
 const client = new OpenAI({
   apiKey: process.env.AISIX_API_KEY,
-  baseURL: "http://127.0.0.1:3000/v1",
+  baseURL: process.env.AISIX_BASE_URL,
 });
 
 const response = await client.chat.completions.create({
-  model: "gpt-4o-prod",
+  model: process.env.AISIX_MODEL ?? "gpt-4o-prod",
   messages: [{ role: "user", content: "Say hello from AISIX." }],
 });
 
 console.log(response.choices[0]?.message.content);
 ```
 
-## Run It
+## Run it
 
-```bash title="Run the OpenAI SDK example"
-AISIX_API_KEY=sk-demo-caller node openai-sdk-example.mjs
+```shell
+node openai-sdk-example.mjs
 ```
 
-:::note
-If you prefer TypeScript, save the file as `openai-sdk-example.ts` and run it with `npx tsx openai-sdk-example.ts`. Plain `node openai-sdk-example.ts` does not work because Node cannot execute TypeScript without a loader such as `tsx` or `ts-node`.
-:::
-
-## Expected Result
+You should see a short assistant response. The exact text depends on the upstream model.
 
 If the gateway can resolve `gpt-4o-prod` and the upstream provider is reachable, the SDK returns a standard OpenAI chat-completions object.
 
@@ -103,7 +92,11 @@ The important caller-visible properties are:
 
 At the gateway layer, AISIX resolves `gpt-4o-prod` to the configured upstream model and injects the provider credential from the stored `ProviderKey`.
 
-## Streaming Example
+:::note
+If you prefer TypeScript, save the file as `openai-sdk-example.ts` and run it with `npx tsx openai-sdk-example.ts`. Plain `node openai-sdk-example.ts` does not work because Node cannot execute TypeScript without a loader such as `tsx` or `ts-node`.
+:::
+
+## Streaming example
 
 The same `baseURL` works for streaming.
 
@@ -112,12 +105,12 @@ import OpenAI from "openai";
 
 const client = new OpenAI({
   apiKey: process.env.AISIX_API_KEY,
-  baseURL: "http://127.0.0.1:3000/v1",
+  baseURL: process.env.AISIX_BASE_URL,
   maxRetries: 0,
 });
 
 const stream = await client.chat.completions.create({
-  model: "gpt-4o-prod",
+  model: process.env.AISIX_MODEL ?? "gpt-4o-prod",
   messages: [{ role: "user", content: "Stream a short greeting." }],
   stream: true,
 });
@@ -127,61 +120,35 @@ for await (const chunk of stream) {
 }
 ```
 
-```bash title="Run the streaming example"
-AISIX_API_KEY=sk-demo-caller node openai-sdk-streaming.mjs
+```shell
+node openai-sdk-streaming.mjs
 ```
 
-## When To Use This Quickstart
+You should see streamed text printed to the terminal.
 
-Choose this path when your client code is already built around:
+## Production setup pattern
 
-- OpenAI SDKs
-- OpenAI-compatible chat-completions requests
-- OpenAI-style streaming consumers
+In most deployments, application code needs only three gateway-facing inputs:
 
-If you instead want Claude-style request and response shapes, use [Anthropic SDK Quickstart](anthropic-sdk.md).
+- gateway base URL
+- AISIX caller API key
+- AISIX model alias
 
-## Common Setup Pattern
-
-In most deployments, your application should know only three gateway-specific inputs:
-
-- gateway URL such as `http://127.0.0.1:3000`
-- AISIX caller API key such as `sk-demo-caller`
-- AISIX model alias such as `gpt-4o-prod`
-
-Everything else stays behind the gateway:
+The upstream details stay behind the gateway:
 
 - upstream provider API key
 - upstream base URL
 - upstream model identifier
-- routing and failover policy
+- routing or failover policy
 - rate limits, guardrails, and observability hooks
 
-## What Stays The Same
-
-- request and response shapes follow the OpenAI chat-completions API
-- the SDK still sends requests to `/chat/completions` under the configured `baseURL`
-- streaming remains SSE-based
-
-## What Changes At The Gateway Layer
-
-- authentication uses the AISIX caller API key, not the upstream provider key
-- `model` is the AISIX model alias such as `gpt-4o-prod`
-- the gateway resolves the alias to the configured upstream model and provider key
-
-## Verification Notes
-
-- `401` means the AISIX caller API key is missing or invalid
-- `403` means the key cannot access the requested model alias
-- `404` means the model alias is not present in the current gateway snapshot
-- upstream `4xx` errors are returned in the proxy error envelope
-- upstream `5xx` errors collapse to `502`
+This separation lets operators rotate provider credentials, change upstream model IDs, or add gateway policy without changing the SDK call site.
 
 ## Troubleshooting
 
 ### The SDK still talks to OpenAI directly
 
-Check `baseURL`. It must point to the gateway, not to `api.openai.com`.
+Check `baseURL`. It must point to the gateway `/v1` proxy prefix, not to `https://api.openai.com/v1`.
 
 ### The request fails with `404`
 
@@ -195,14 +162,15 @@ The caller key exists, but its `allowed_models` list does not include the alias 
 
 Compare these three values first:
 
-- `apiKey`
-- `baseURL`
-- `model`
+- `AISIX_API_KEY`
+- `AISIX_BASE_URL`
+- `AISIX_MODEL`
 
-## Related Pages
+If `curl` and the SDK use the same values, compare the SDK request body with the request that passed in the [Quickstart](../quickstart#step-11-send-your-first-proxy-request).
 
-- [Quickstart](quickstart.md)
-- [First Model, First Key, First Request](first-model-first-key-first-request.md)
-- [OpenAI-Compatible API](../integration/openai-compatible-api.md)
-- [Streaming](../integration/streaming.md)
-- [Tool Calling](../integration/tool-calling.md)
+## Next steps
+
+- [OpenAI-compatible API](../integration/openai-compatible-api.md) — review the full OpenAI-compatible proxy contract.
+- [Streaming](../integration/streaming.md) — use SSE responses through AISIX.
+- [Tool calling](../integration/tool-calling.md) — pass tool definitions through supported OpenAI-compatible paths.
+- [Anthropic SDK quickstart](anthropic-sdk.md) — use the Anthropic Messages surface when your application expects Claude-style requests.

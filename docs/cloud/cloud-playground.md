@@ -1,48 +1,68 @@
 ---
 title: Cloud Playground
-description: Understand the current AISIX Cloud playground behavior and its current limitations relative to the managed data plane.
+description: Understand AISIX Cloud playground behavior and its limitations relative to the managed data plane.
 sidebar_position: 74
 ---
 
-The current AISIX Cloud playground is a preview path.
+The AISIX Cloud playground is a preview surface for trying a model or
+checking early configuration. It is not a production-path simulator.
 
-Use it as a fast configuration or model-selection preview, not as a production-path simulator.
+Use the playground for quick feedback while setting up resources. Use
+live requests through the managed data plane when you need to validate
+routing, cache, guardrails, rate limits, budgets, or observability.
 
-## Current Behavior
+## How the playground differs
 
-The control plane sends the playground request directly to the upstream provider.
+The current playground path sends the request from the control plane to
+the upstream provider. It does not exercise the managed data plane's:
 
-That means the current playground path does **not** exercise the managed data plane's:
+- model routing path
+- response cache
+- guardrail execution
+- rate-limit enforcement
+- budget enforcement on live data-plane traffic
+- data-plane access logs and metrics path
 
-- routing
-- cache
-- guardrails
-- rate limits
+That boundary matters when a playground request succeeds but the live
+managed request behaves differently.
 
-It is best understood as a control-plane convenience feature.
+## When to use the playground
 
-Use it as a preview and configuration-checking surface, not as a perfect production-path simulation.
+Use it for:
 
-## When To Use It
+- quick model-selection checks
+- early provider credential validation
+- exploratory prompts from the Cloud UI
+- confirming that a basic provider call can succeed
 
-- quick sanity checks
-- early model configuration validation
-- exploratory prompt testing from the Cloud UI path
+## When to use live data-plane traffic
 
-## When Not To Use It As Proof
+Use the managed data plane for:
 
-- validating managed data-plane routing behavior
+- validating caller API keys
+- validating model aliases and routing rules
 - validating cache behavior
-- validating guardrail behavior
-- validating live budget or rate-limit behavior
+- validating guardrails
+- validating budgets and rate limits
+- checking the actual request logs and metrics path
 
 ## Troubleshooting
 
-### The Cloud playground succeeds but real managed traffic behaves differently
+### The playground succeeds but real managed traffic behaves differently
 
-That is expected with the current preview-only boundary.
+Treat the playground result as a provider/configuration preview, then
+check the live data-plane path:
 
-## Related Pages
+1. Confirm the resource belongs to the right environment.
+2. Confirm projection reached the data plane.
+3. Send the request through the managed data-plane endpoint.
+4. Check data-plane logs, metrics, and gateway response headers.
 
-- [AISIX Cloud Overview](overview.md)
-- [Roadmap](../roadmap.md)
+## Next steps
+
+- [Resource projection](/ai-gateway/cloud/resource-projection) explains
+  how saved Cloud state reaches live traffic.
+- [Metrics and logs](/ai-gateway/operations/metrics-and-logs) explains
+  live data-plane observability.
+- [Feature Status](/ai-gateway/overview/feature-matrix) shows the current
+  support boundary for Cloud features.

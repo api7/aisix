@@ -1,6 +1,6 @@
 ---
 title: Admin API
-description: Use the AISIX AI Gateway admin API to manage models, API keys, provider keys, guardrails, cache policies, observability exporters, health, metrics, and the in-process playground.
+description: Use the AISIX AI Gateway admin API to manage models, API keys, provider keys, guardrails, cache policies, observability exporters, health, metrics, and the standalone playground.
 sidebar_position: 31
 ---
 
@@ -20,7 +20,7 @@ Use this API when you need to:
 
 Use it as the write path for standalone deployments, not as a caller-facing integration surface.
 
-## Listener And Auth Model
+## Listener and auth model
 
 In standalone mode, the admin API runs on the admin listener configured in bootstrap config.
 
@@ -39,7 +39,7 @@ The following routes are currently public on the admin listener:
 
 Example:
 
-```bash title="Authenticated admin request"
+```shell
 curl -sS http://127.0.0.1:3001/admin/v1/models \
   -H "Authorization: Bearer YOUR_ADMIN_KEY"
 ```
@@ -51,37 +51,26 @@ Operationally, there are two very different key types in this product:
 
 Do not mix them.
 
-## Current Admin Surface
+## Admin surface
 
-The current admin router exposes:
+Think about the admin surface in four groups.
 
-- `GET /livez`
-- `GET /metrics`
-- `GET /admin/openapi.json`
-- `GET /admin/openapi-scalar`
-- `GET|POST /admin/v1/models`
-- `GET|PUT|DELETE /admin/v1/models/:id`
-- `GET|POST /admin/v1/apikeys`
-- `GET|PUT|DELETE /admin/v1/apikeys/:id`
-- `POST /admin/v1/apikeys/:id/rotate`
-- `GET|POST /admin/v1/provider_keys`
-- `GET|PUT|DELETE /admin/v1/provider_keys/:id`
-- `GET|POST /admin/v1/guardrails`
-- `GET|PUT|DELETE /admin/v1/guardrails/:id`
-- `GET|POST /admin/v1/cache_policies`
-- `GET|PUT|DELETE /admin/v1/cache_policies/:id`
-- `GET|POST /admin/v1/observability_exporters`
-- `GET|PUT|DELETE /admin/v1/observability_exporters/:id`
-- `GET /admin/v1/health`
-- `POST /playground/chat/completions`
+Public operator helpers cover liveness, metrics, and OpenAPI discovery.
 
-Think about these routes in three groups:
+CRUD resources cover models, API keys, provider keys, guardrails, cache
+policies, and observability exporters.
 
-- public operator helpers: livez, metrics, and OpenAPI discovery
-- CRUD resources: models, API keys, provider keys, guardrails, cache policies, exporters
-- convenience operator workflow: the in-process playground
+Runtime status endpoints expose per-model runtime status and aggregated admin
+health.
 
-## Error Envelope
+The operator playground forwards a local chat-completions request through the
+proxy path for debugging.
+
+Not every runtime resource has standalone admin CRUD today. `RateLimitPolicy` rows and `GuardrailAttachment` rows are loaded from the config store and can be projected by a control plane, but they are not exposed as `/admin/v1/rate_limit_policies` or `/admin/v1/guardrail_attachments` routes in the current standalone admin router.
+
+For the exact route list, request schemas, and response schemas, use the generated [Admin API reference](/ai-gateway/reference/admin-api). To export the OpenAPI document or understand which standalone resources it covers, see [Admin API source notes](../reference/admin-api-reference.md).
+
+## Error envelope
 
 The admin API does **not** use the OpenAI-style proxy error shape.
 
@@ -121,7 +110,7 @@ Use model CRUD when you need to change caller-visible routing behavior. A model 
 
 Example:
 
-```bash title="Create a model"
+```shell
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
   -H "Authorization: Bearer YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
@@ -133,7 +122,7 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
   }'
 ```
 
-## API Keys
+## API keys
 
 `/admin/v1/apikeys` manages caller-facing API keys.
 
@@ -145,17 +134,15 @@ Important current behavior:
 
 This makes API-key creation and rotation an operator workflow with one-time secret reveal semantics. Treat the rotate response as the only chance to capture the new plaintext key.
 
-## Provider Keys
+## Provider keys
 
 `/admin/v1/provider_keys` manages upstream credentials reused by models.
 
-Current fields include:
+Provider keys should be reused across related models where that matches your
+operational ownership boundary. That keeps upstream credential rotation
+separate from model alias changes.
 
-- `display_name`
-- `secret`
-- optional `api_base`
-
-Provider keys should be reused across related models where that matches your operational ownership boundary. That keeps upstream credential rotation separate from model alias changes.
+See [Provider keys](provider-keys.md).
 
 ## Guardrails
 
@@ -165,39 +152,30 @@ Current resource kinds are:
 
 - `keyword`
 - `bedrock`
+- `azure_content_safety`
 
 Current operator guidance:
 
 - use `keyword` for current in-process blocking behavior
-- treat `bedrock` as a schema-backed but limited runtime path
+- treat `bedrock` and `azure_content_safety` as remote guardrails that require provider credentials, network access, relevant build features, and an explicit `fail_open` decision
 
 Create guardrails only when you are also clear about where they execute today. The current live guardrail path is narrower than the full schema surface.
 
+Guardrail scoping is handled by `GuardrailAttachment` rows in the runtime snapshot. The standalone admin API does not expose CRUD routes for those attachment rows yet, so standalone-created guardrails with no attachment rows currently apply environment-wide through the compatibility fallback. See [Guardrails](guardrails.md#scope-guardrails).
+
 See [Guardrails](guardrails.md).
 
-## Cache Policies
+## Cache policies
 
 `/admin/v1/cache_policies` manages cache-policy resources.
 
-Current fields include:
-
-- `name`
-- `enabled`
-- `backend`
-- `ttl_seconds`
-- `applies_to`
-
-Current documented `applies_to` forms are:
-
-- `all`
-- `model:<display_name>`
-- `api_key:<api_key_id>`
-
-Cache policies are a matching layer, not a guarantee that every request will be cached. They must line up with the bootstrap cache backend and the current request shape.
+Cache policies are a matching layer, not a guarantee that every request will be
+cached. They must line up with the bootstrap cache backend and the current
+request shape.
 
 See [Caching](caching.md).
 
-## Observability Exporters
+## Observability exporters
 
 `/admin/v1/observability_exporters` manages exporter resources.
 
@@ -208,9 +186,9 @@ Current behavior:
 
 Use dynamic exporters when you want request telemetry fan-out to be configurable without restarting the gateway process.
 
-See [Observability Exporters](observability-exporters.md).
+See [Observability exporters](observability-exporters.md).
 
-## Health, Metrics, And Playground
+## Health, metrics, and playground
 
 ### `GET /admin/v1/health`
 
@@ -230,26 +208,26 @@ This is the Prometheus scrape endpoint on the admin listener.
 
 ### `POST /playground/chat/completions`
 
-The standalone admin playground is an in-process proxy to `/v1/chat/completions`.
+The standalone admin playground forwards requests to `/v1/chat/completions` through the local proxy router.
 
 Important current behavior:
 
 - it expects a **proxy** API key, not an admin key
-- it forwards into the proxy router inside the same process
+- it forwards into the same proxy path used by normal caller traffic
 - it runs the full proxy middleware path
 
 This is useful for operator debugging because it exercises the normal proxy stack while avoiding a separate client setup step.
 
-## Verification
+## Verify
 
 Verify that the admin surface is reachable:
 
-```bash title="Check admin health"
+```shell
 curl -sS http://127.0.0.1:3001/admin/v1/health \
   -H "Authorization: Bearer YOUR_ADMIN_KEY"
 ```
 
-Then create a provider key, model, and API key as shown in [First Model, First Key, First Request](../quickstart/first-model-first-key-first-request.md).
+Then create a provider key, model, and API key as shown in [Understand admin resources](../quickstart/first-model-first-key-first-request.md).
 
 ## Troubleshooting
 
@@ -259,21 +237,20 @@ Check the bootstrap admin key first. Do not test with a proxy caller key.
 
 ### A resource is created but proxy traffic still fails
 
-That is usually a configuration propagation delay, not a failed admin write.
+Check configuration propagation before recreating the resource. Poll
+`/v1/models` with the caller key, or retry the target proxy endpoint, until the
+updated snapshot is visible.
 
 ### `409` on create
 
 The most common cause is a duplicate logical name such as `display_name`.
 
-## Related Pages
+## Next steps
 
-- [Bootstrap Configuration](bootstrap-config.md)
-- [Models](models.md)
-- [Provider Keys](provider-keys.md)
-- [API Keys](api-keys.md)
-- [Guardrails](guardrails.md)
-- [Caching](caching.md)
-- [Observability Exporters](observability-exporters.md)
-- [First Model, First Key, First Request](../quickstart/first-model-first-key-first-request.md)
-- [OpenAI-Compatible API](../integration/openai-compatible-api.md)
-- [Roadmap](../roadmap.md)
+- [Configuration overview](overview.md) — understand where the admin API fits
+  in the configuration model.
+- [Bootstrap configuration](bootstrap-config.md) — configure the admin listener and bootstrap admin keys.
+- [Provider keys](provider-keys.md), [Models](models.md), and [API keys](api-keys.md) — create the minimum resources for proxy traffic.
+- [Guardrails](guardrails.md), [Caching](caching.md), and [Observability exporters](observability-exporters.md) — add policy and telemetry resources.
+- [Understand admin resources](../quickstart/first-model-first-key-first-request.md) — follow a resource-by-resource setup walkthrough.
+- [OpenAI-compatible API](../integration/openai-compatible-api.md) — call the proxy after resources are configured.

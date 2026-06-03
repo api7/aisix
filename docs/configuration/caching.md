@@ -4,107 +4,166 @@ description: Configure cache policies, TTL scope matching, and current cache-bac
 sidebar_position: 39
 ---
 
-Caching is controlled by dynamic `CachePolicy` resources plus the bootstrap cache backend selection.
+Caching has two layers:
 
-Use this page to answer two separate questions:
+The process cache backend decides whether the data plane has a cache available.
+The `CachePolicy` resources decide which requests are allowed to use that
+cache.
 
-- is a cache backend available in the process
-- which requests are allowed to use it
+Current runtime caching is exact-match response caching for non-streaming
+chat-completions requests. Streaming responses are not cached.
 
-## Current Fields
+## Caching at a glance
 
-- `name`
-- `enabled`
-- `backend`
-- `ttl_seconds`
-- `applies_to`
+| Layer | Configured by | What it controls |
+| --- | --- | --- |
+| Process cache backend | Bootstrap configuration | Whether the data plane uses in-memory cache or Redis. |
+| Cache policy | Dynamic `CachePolicy` resource | Which non-streaming chat-completions requests may use the configured backend. |
 
-Example:
+Both layers must line up before a response can be cached. A Redis value on a
+policy does not move that policy to Redis; the process backend is selected at
+startup.
 
-```bash title="Create a cache policy"
+## Configure the process backend
+
+The server selects one cache backend at startup.
+
+Memory cache is the default in-process backend. It is useful for a single data
+plane instance or local testing.
+
+Redis can be configured through bootstrap config when multiple data-plane
+instances should share cached responses. The current Redis path uses a
+single-node connection. Cluster and sentinel modes are not exposed through
+bootstrap config today.
+
+```yaml title="config.yaml"
+cache:
+  backend: redis
+  redis:
+    url: redis://127.0.0.1:6379/
+```
+
+See [Bootstrap configuration](bootstrap-config.md) for process configuration.
+
+## Create a cache policy
+
+A cache policy opens the cache gate for matching requests.
+
+```shell
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/cache_policies \
   -H "Authorization: Bearer YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "default-chat-cache",
-    "backend": "memory",
+    "enabled": true,
     "ttl_seconds": 3600,
-    "applies_to": "all"
+    "applies_to": "model:gpt-4o-prod"
   }'
 ```
 
-This example only defines the policy. The process also needs a compatible bootstrap cache backend.
+This policy does not choose the process backend. It only says that matching
+requests may use whichever cache backend the process was started with.
 
-## Scope Matching
+## Scope matching
 
-`applies_to` currently supports:
+`applies_to` controls which requests match the policy.
 
-- `all`
-- `model:<display_name>`
-- `api_key:<api_key_id>`
+Use `all` to match every non-streaming chat-completions request:
 
-Current matching is done against:
+```json
+{
+  "applies_to": "all"
+}
+```
 
-- the caller-visible model alias in the request
-- the authenticated API key resource `id`
+Use `model:<display_name>` to match the caller-visible model alias:
 
-Unknown `applies_to` prefixes currently fall back to `all` on the data-plane side, so operators should rely on the documented forms only.
+```json
+{
+  "applies_to": "model:gpt-4o-prod"
+}
+```
 
-That means undocumented matcher prefixes are unsafe from an operator predictability standpoint.
+Use `api_key:<api_key_id>` to match the authenticated API-key resource id:
 
-## Runtime Behavior
+```json
+{
+  "applies_to": "api_key:550e8400-e29b-41d4-a716-446655440000"
+}
+```
 
-Current cache gating behavior is:
+The runtime matcher compares against the request's model alias and the
+authenticated API-key id. For routing models, the cache key uses the virtual
+model alias the caller requested, not the direct target that served the miss.
 
-- the proxy selects the first enabled policy whose `applies_to` matcher accepts the request
-- the selected policy's `ttl_seconds` is used for the cache write
-- if no policy matches, the cache gate stays closed for that request
+Avoid undocumented matcher prefixes. The data plane currently treats unknown
+forms as `all`, so a typo can make a policy broader than intended.
 
-On chat responses, the proxy can emit `x-aisix-cache` with:
+## Runtime behavior
 
-- `hit`
-- `miss`
+For each non-streaming chat-completions request, the proxy finds the first
+enabled cache policy whose `applies_to` matcher accepts the request.
 
-Those headers are the easiest caller-visible sign that the request participated in the cache path.
+If a policy matches, the proxy checks the cache. A miss is written back with the
+policy's `ttl_seconds`. If no enabled policy matches, the cache path stays
+closed for that request.
 
-If no enabled policy matches the request, the response should not be treated as a cache hit or miss path.
+When the request participates in caching, the proxy can emit:
 
-## Backend Boundary
+```text
+x-aisix-cache: miss
+x-aisix-cache: hit
+```
 
-Current schema supports:
+If no policy matches, the response should not be treated as a cache hit or
+miss.
 
-- `memory`
-- `redis`
+## Backend field on a policy
 
-Current runtime boundary:
+The `CachePolicy` schema includes `backend` with `memory` and `redis` values.
 
-- `memory` is the reliable default path
-- bootstrap config can wire a Redis backend at process start
-- the dynamic `CachePolicy.backend` field should still be treated conservatively because broader Redis support boundaries are still being expanded
+Treat this as a persisted hint, not as a per-policy backend selector. Runtime
+traffic uses the backend selected by bootstrap config for the whole process.
+Changing `backend` on an individual policy does not move that policy to a
+different cache backend.
 
-Note: the per-policy `backend` field is parsed and stored on the `CachePolicy` row but is not consulted by the runtime proxy — the proxy always uses the cache backend selected by bootstrap-config (`cache.backend`) regardless of what each policy specifies. The field is preserved for forward compatibility; do not depend on it to override the runtime backend.
+## Operator guidance
 
-## Operator Guidance
+Start with a narrow policy, such as `model:<alias>` or `api_key:<id>`.
 
-- start with `memory` plus a narrowly scoped policy
-- use `all` only when you truly want broad cache participation
-- prefer `model:<alias>` or `api_key:<id>` when you need targeted rollout
+Use `all` only when every non-streaming chat-completions request in the
+environment should participate in caching.
+
+Use Redis at bootstrap time when several data-plane instances should share
+cached responses.
+
+Disable a policy with `enabled: false` when you want to stage or temporarily
+turn off caching without deleting the policy.
 
 ## Troubleshooting
 
 ### Responses never show `x-aisix-cache`
 
-Check both sides:
+Check all three gates:
 
-- a bootstrap cache backend must be available
+- the process must have a cache backend
 - an enabled cache policy must match the request
+- the request must be a non-streaming chat-completions request
 
 ### A policy matches too broadly
 
-Revisit `applies_to` and avoid undocumented matcher forms.
+Check `applies_to`. Unknown matcher prefixes currently fall back to `all`, so
+stick to `all`, `model:<display_name>`, or `api_key:<api_key_id>`.
 
-## Related Pages
+### Redis is configured on the policy but traffic still uses memory
 
-- [Bootstrap Configuration](bootstrap-config.md)
-- [Admin API](admin-api.md)
-- [Roadmap](../roadmap.md)
+Set Redis in bootstrap config. `CachePolicy.backend` is not a runtime selector
+for individual policies.
+
+## Next steps
+
+- [Bootstrap configuration](bootstrap-config.md) configures process-level cache backend settings.
+- [Configuration overview](overview.md) explains the split between bootstrap
+  settings and dynamic resources.
+- [Admin API](admin-api.md) explains standalone admin writes.
+- [Rate limits](rate-limits.md) covers another request-control policy layer.

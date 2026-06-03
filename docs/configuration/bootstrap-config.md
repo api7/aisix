@@ -6,11 +6,9 @@ sidebar_position: 30
 
 Bootstrap configuration defines the static settings the gateway needs at startup. Dynamic resources such as models, API keys, provider keys, guardrails, cache policies, and observability exporters are loaded later from etcd.
 
-Use this page to understand the config file that starts the gateway process.
+This guide explains the config file that starts the gateway process. Bootstrap config is for values that must exist before the process accepts traffic, not for day-to-day model and credential management.
 
-Use bootstrap config for values that should exist before the process accepts traffic, not for day-to-day model and credential management.
-
-## Loading Model
+## Loading order
 
 Bootstrap configuration is loaded in this order:
 
@@ -21,15 +19,15 @@ Bootstrap configuration is loaded in this order:
 This makes bootstrap config suitable for both:
 
 - local file-based development
-- containerized deployment where secrets and listener addresses are injected through environment variables
+- containerized deployment where listener addresses and secret references are injected through environment variables
 
 Example:
 
-```bash title="Override the proxy listener address"
+```shell
 export AISIX_PROXY__ADDR="0.0.0.0:3000"
 ```
 
-## Root Sections
+## Root sections
 
 The current root config includes:
 
@@ -47,7 +45,7 @@ As a practical split:
 - `observability` and `cache` define process-wide runtime helpers
 - `managed` switches the bootstrap mode from standalone to control-plane-managed
 
-## Minimal Self-Hosted Example
+## Minimal self-hosted example
 
 ```yaml title="config.yaml" {1-22}
 etcd:
@@ -93,14 +91,14 @@ This section is the source of truth for where the gateway reads dynamic configur
 
 Important fields:
 
-| Field | Description | Default |
-| --- | --- | --- |
-| `endpoints` | etcd endpoints the gateway should connect to | required |
-| `prefix` | base resource namespace, usually `/aisix` | `"/aisix"` |
-| `env_id` | optional environment scope for env-scoped keys | `""` (legacy / unscoped) |
-| `dial_timeout_ms` | connection timeout | `5000` |
-| `request_timeout_ms` | request timeout | `5000` |
-| `tls` | optional etcd TLS or mTLS configuration | none |
+- `endpoints` is required and lists the etcd endpoints the gateway
+  should connect to.
+- `prefix` is the base resource namespace. The default is `"/aisix"`.
+- `env_id` is the optional environment scope for env-scoped keys. The
+  default is `""`, which means legacy or unscoped operation.
+- `dial_timeout_ms` controls connection timeout. The default is `5000`.
+- `request_timeout_ms` controls request timeout. The default is `5000`.
+- `tls` configures optional etcd TLS or mTLS. It is absent by default.
 
 Operator guidance:
 
@@ -116,11 +114,11 @@ This is the only listener your callers need for model traffic.
 
 Important fields:
 
-| Field | Description | Default |
-| --- | --- | --- |
-| `addr` | proxy listener address | required |
-| `request_body_limit_bytes` | request-body limit enforced by the proxy listener | `10485760` (10 MiB) |
-| `tls` | optional TLS certificate and key for the proxy listener | none |
+- `addr` is required and sets the proxy listener address.
+- `request_body_limit_bytes` sets the request-body limit enforced by the
+  proxy listener. The default is `10485760` bytes, or 10 MiB.
+- `tls` configures an optional TLS certificate and key for the proxy
+  listener. It is absent by default.
 
 Recommended pattern:
 
@@ -135,11 +133,13 @@ In standalone mode, this listener owns the write path for dynamic resources.
 
 Important fields:
 
-| Field | Description | Default |
-| --- | --- | --- |
-| `addr` | admin listener address | `"127.0.0.1:0"` (intentionally non-routable; standalone deployments must override) |
-| `admin_keys` | static admin keys accepted by the admin auth layer | `[]` (must be non-empty for standalone) |
-| `tls` | optional TLS certificate and key for the admin listener | none |
+- `addr` sets the admin listener address. The default is
+  `"127.0.0.1:0"`, which is intentionally non-routable; standalone
+  deployments must override it.
+- `admin_keys` lists static admin keys accepted by the admin auth layer.
+  The default is `[]`, and it must be non-empty for standalone mode.
+- `tls` configures an optional TLS certificate and key for the admin
+  listener. It is absent by default.
 
 Admin keys are static bootstrap configuration. They are not stored in the dynamic `ApiKey` table.
 
@@ -151,24 +151,35 @@ Recommended pattern:
 
 ## `observability`
 
-Use `observability` to set process-wide telemetry knobs. Today `service_name`, `log_level`, and the `metrics.prometheus.*` block are consulted at runtime; the other fields have varying current behavior — see the `Status` column below.
+Use `observability` to set process-wide telemetry knobs.
 
-Important fields:
+`service_name` is wired and sets the service-name attribute on the
+tracing subscriber initialized at boot. The default is `"aisix"`.
 
-| Field | Description | Default | Status |
-| --- | --- | --- | --- |
-| `service_name` | service-name attribute on the tracing subscriber initialised at boot | `"aisix"` | wired |
-| `log_level` | fallback `EnvFilter` directive when `RUST_LOG` is not set in the environment | `"info"` | wired |
-| `access_log` | reserved field; access logs are currently emitted by every proxy handler regardless of this setting | `true` | reserved (not yet consulted) |
-| `metrics.prometheus.enabled` | controls whether the admin listener mounts the Prometheus scrape endpoint; when `false`, no `/metrics` route is registered | `true` | wired |
-| `metrics.prometheus.path` | mount path for the Prometheus scrape endpoint | `"/metrics"` | wired |
-| `metrics.otlp.enabled` | reserved field; no OTLP metrics export pipeline is installed in the current release | `false` | reserved (not yet wired) |
-| `metrics.otlp.endpoint` | OTLP/gRPC metrics endpoint | none | reserved (not yet wired) |
-| `tracing.otlp.enabled` | boot-time endpoint validation; OTLP traces pipeline deferred | `false` | partial (validation only) |
-| `tracing.otlp.endpoint` | OTLP/gRPC collector endpoint for traces | none | partial (validation only) |
-| `tracing.otlp.sample_ratio` | head-based sampling ratio reserved for the future OTLP traces pipeline | `1.0` | reserved (not yet wired) |
+`log_level` is wired and sets the fallback `EnvFilter` directive when
+`RUST_LOG` is not set. The default is `"info"`.
 
-Bootstrap observability settings are process-wide. They are different from dynamic `ObservabilityExporter` rows, which control per-request span fan-out via OTLP/HTTP at runtime. For per-row dynamic exporters added at runtime via the admin API, see [Observability Exporters](observability-exporters.md).
+`access_log` is currently reserved. Access logs are emitted by every
+proxy handler regardless of this setting. The default is `true`.
+
+`metrics.prometheus.enabled` is wired and controls whether the admin
+listener mounts the Prometheus scrape endpoint. When it is `false`, no
+`/metrics` route is registered. The default is `true`.
+
+`metrics.prometheus.path` is wired and sets the Prometheus scrape path.
+The default is `"/metrics"`.
+
+`metrics.otlp.enabled` and `metrics.otlp.endpoint` are reserved. No OTLP
+metrics export pipeline is installed in the current release.
+`metrics.otlp.enabled` defaults to `false`.
+
+`tracing.otlp.enabled`, `tracing.otlp.endpoint`, and
+`tracing.otlp.sample_ratio` are partially wired for boot-time endpoint
+validation, but the OTLP traces pipeline is deferred.
+`tracing.otlp.enabled` defaults to `false`, and
+`tracing.otlp.sample_ratio` defaults to `1.0`.
+
+Bootstrap observability settings are process-wide. They are different from dynamic `ObservabilityExporter` rows, which control per-request span fan-out via OTLP/HTTP at runtime. For per-row dynamic exporters added at runtime via the admin API, see [Observability exporters](observability-exporters.md).
 
 ## `cache`
 
@@ -176,12 +187,13 @@ Use `cache` to choose the bootstrap cache backend.
 
 Important fields:
 
-| Field | Description | Default |
-| --- | --- | --- |
-| `backend` | which cache backend the process uses (`memory` or `redis`) | `memory` |
-| `redis` | Redis connection block (`url`, optional `mode`); only consulted when `backend: redis` | none |
+- `backend` selects which cache backend the process uses. The current
+  options are `memory` and `redis`; the default is `memory`.
+- `redis` configures the Redis connection block, including `url` and
+  optional `mode`. It is only consulted when `backend: redis` and is
+  absent by default.
 
-`memory` is the default path. `redis` has runtime backend selection and connection logic, but the broader cache docs and support boundaries are still being expanded.
+`memory` is the default path. Use `redis` when several data-plane instances should share cached responses. The current Redis bootstrap path connects to a single Redis URL; cluster and sentinel modes are not exposed through bootstrap config.
 
 Use bootstrap cache settings to decide whether the process has a cache backend available at all. Use dynamic cache policies to decide which requests actually participate in caching.
 
@@ -204,7 +216,7 @@ The current config schema supports both:
 
 `AISIX Cloud` currently uses the certificate-based managed bootstrap flow. The registration-token path remains in the gateway runtime, but should be treated as a legacy or self-managed bootstrap path unless your deployment explicitly uses it.
 
-## Choosing Between Standalone And Managed Bootstrap
+## Choosing between standalone and managed bootstrap
 
 - use standalone when you want local operator control through `:3001`
 - use managed when AISIX Cloud is the control plane and the gateway should not expose a standalone admin write surface
@@ -217,17 +229,17 @@ Use `bedrock_endpoint_url` only when you need a deployment-wide override for Bed
 
 This is a deployment concern, not a per-guardrail-row field.
 
-## Verification
+## Verify
 
 After updating the bootstrap config, start the gateway and verify:
 
-```bash title="Verify proxy bootstrap"
+```shell
 curl -s http://127.0.0.1:3000/livez
 ```
 
 For standalone mode, also verify:
 
-```bash title="Verify admin bootstrap"
+```shell
 curl -s http://127.0.0.1:3001/livez
 ```
 
@@ -245,9 +257,11 @@ Check whether `managed.enabled = true`. In managed mode, the standalone admin AP
 
 Confirm the `AISIX_` prefix and nested `__` separator are correct.
 
-## Related Pages
+## Next steps
 
-- [Self-Hosted Quickstart](../quickstart/self-hosted.md)
-- [First Model, First Key, First Request](../quickstart/first-model-first-key-first-request.md)
-- [Admin API](admin-api.md)
-- [Roadmap](../roadmap.md)
+- [Configuration overview](overview.md) — understand the split between
+  bootstrap settings and dynamic resources.
+- [Quickstart](../quickstart) — run a local gateway with a working config file.
+- [Admin API](admin-api.md) — manage dynamic resources after bootstrap.
+- [Understand admin resources](../quickstart/first-model-first-key-first-request.md) — create provider keys, models, and caller keys.
+- [Configuration propagation](configuration-propagation.md) — understand how dynamic resources reach the proxy.

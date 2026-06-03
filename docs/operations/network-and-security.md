@@ -1,64 +1,100 @@
 ---
-title: Network And Security
+title: Network and Security
 description: Operate AISIX AI Gateway with correct listener exposure, admin isolation, and credential handling boundaries.
 sidebar_position: 51
 ---
 
-AISIX AI Gateway has two main listener surfaces in standalone mode:
+AISIX AI Gateway has different network surfaces for caller traffic,
+operator traffic, configuration storage, and managed data-plane
+communication. Treat those surfaces as separate trust zones.
 
-- the public proxy listener
-- the operator-facing admin listener
+## Separate the listener trust zones
 
-Operate them as different trust zones.
+In standalone mode, AISIX has two main listeners:
 
-## Listener Exposure
+- **Proxy listener**: caller-facing API traffic, such as
+  `/v1/chat/completions`.
+- **Admin listener**: operator-facing admin API, health, metrics, and
+  OpenAPI surfaces.
 
-Recommended boundary:
+Expose the proxy listener only to intended callers or to the ingress tier
+that fronts caller traffic.
 
-- expose the proxy listener to callers
-- keep the admin listener private to operators and internal networks
+Keep the admin listener on loopback, a private subnet, or an
+operator-only network. Do not place it on the public network.
 
-Do not assume admin auth alone is enough protection. Current admin design intentionally leaves some routes unauthenticated on that private listener.
+Keep etcd on a private network reachable only by the gateway and
+operators who manage gateway configuration.
 
-Current admin design intentionally leaves `/livez`, `/metrics`, and OpenAPI endpoints unauthenticated on that private listener, so network placement matters.
+In managed deployments, treat the `/dp/*` path as a private
+mTLS-authenticated connection between the data plane and AISIX Cloud.
 
-## Secrets And Credentials
+Do not rely on admin authentication alone as the network boundary. Some
+admin-listener routes, such as `/livez`, `/metrics`, and OpenAPI
+endpoints, are intentionally available on the private admin listener.
 
-Current credential handling differs by resource type:
+## Protect secrets and credentials
 
-- caller API keys are stored as `key_hash`, not plaintext
-- provider keys store plaintext upstream secrets on the standalone path
-- OTLP exporter headers are plaintext in the current resource model
+Credential handling differs by resource type:
 
-This means etcd protection and admin-surface protection are both part of your secrets boundary.
+- caller API keys are stored as hashes
+- provider keys store upstream credentials on the standalone path
+- OTLP exporter headers are stored as plaintext in the resource model
 
-## etcd Boundary
+Protect both the admin surface and etcd. Anyone who can read the
+standalone etcd keyspace can read sensitive provider credentials and
+exporter headers.
 
-Dynamic resources live in etcd and are consumed through the watch supervisor. Protect etcd as part of the gateway trust boundary.
+In AISIX Cloud managed operation, provider-key handling is controlled by
+the Cloud control plane and projected into the managed data plane. The
+operator-facing boundary is different, but credentials should still be
+treated as sensitive operational data.
 
-If etcd TLS or mTLS is enabled, bootstrap config must point to readable certificate files.
+## Protect the etcd boundary
 
-Protect etcd as though it were part of the control plane, not just a backing store.
+Dynamic resources live in etcd and are consumed through the watch
+supervisor. Protect etcd as part of the gateway control-plane boundary.
 
-## Managed Security Boundary
+Use network isolation and TLS or mTLS where appropriate. If etcd TLS is
+enabled, bootstrap config must point to certificate files that the
+gateway process can read.
 
-Managed AISIX Cloud deployments use mTLS-authenticated `/dp/*` paths and managed etcd access. The data plane authenticates as a certificate-bearing component, not with a bearer token.
+## Understand the managed security boundary
 
-## Recommended Security Posture
+Managed AISIX Cloud deployments use mTLS-authenticated `/dp/*` paths.
+The data plane authenticates with its certificate bundle, not with a
+caller bearer token.
 
-1. expose only the proxy listener to callers
-2. keep admin on loopback or a private subnet
-3. protect etcd with network isolation and TLS where appropriate
-4. treat provider-key secrets and exporter headers as sensitive operator data
+When diagnosing managed connectivity, check certificate identity, trust
+root, and data-plane-manager URL before investigating higher-level
+resource projection.
+
+## Start with this security posture
+
+1. Expose only the proxy listener to callers.
+2. Keep admin on loopback or a private operator network.
+3. Protect etcd with network isolation and TLS where appropriate.
+4. Treat provider-key secrets and exporter headers as sensitive data.
+5. Validate managed data-plane identity through the certificate-based
+   bootstrap path.
 
 ## Troubleshooting
 
-### Sensitive routes are reachable from the public network
+### Admin or metrics routes are reachable from the public network
 
-Fix network placement first. Do not rely on application logic alone to compensate for bad listener exposure.
+Fix listener placement first. Do not rely on application logic to
+compensate for a public admin surface.
 
-## Related Pages
+### Provider credentials appear in an unexpected place
 
-- [TLS And mTLS](tls-and-mtls.md)
-- [Health Checks](health-checks.md)
-- [AISIX Cloud Overview](../cloud/overview.md)
+Check etcd access, admin API access, and any backup or logging pipeline
+that can read dynamic resource payloads.
+
+## Next steps
+
+- [TLS and mTLS](/ai-gateway/operations/tls-and-mtls) explains transport
+  security boundaries.
+- [Gateway certificates and managed data plane](/ai-gateway/cloud/gateway-certificates-and-managed-dp)
+  explains managed bootstrap.
+- [Production deployment](/ai-gateway/operations/production-deployment)
+  gives the production baseline checklist.

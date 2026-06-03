@@ -4,29 +4,17 @@ description: Configure OTLP/HTTP observability exporters for AISIX AI Gateway da
 sidebar_position: 40
 ---
 
-Observability exporters let the data plane send request telemetry directly to your OTLP/HTTP endpoint.
+Observability exporters send request telemetry from the data plane to an
+OTLP/HTTP traces endpoint.
 
-Current scope is `kind: "otlp_http"` only.
+Use an exporter when you want telemetry delivery to be configurable through
+dynamic resources instead of only through process bootstrap settings.
 
-Use this page when you want request-level telemetry fan-out without restarting the process for every endpoint change.
+Current scope is `kind: "otlp_http"`.
 
-## Current Fields
+## Create an exporter
 
-- `name`
-- `enabled`
-- `kind`
-- `endpoint`
-- optional `headers`
-
-The basic operator questions for this resource are:
-
-- where should telemetry be sent
-- what auth headers are required for that destination
-- should the exporter currently participate in fan-out
-
-Example:
-
-```bash title="Create an OTLP exporter"
+```shell
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/observability_exporters \
   -H "Authorization: Bearer YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
@@ -40,51 +28,91 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/observability_exporters \
   }'
 ```
 
-## Endpoint Restriction
+The endpoint must be the full OTLP/HTTP traces URL. The gateway does not append
+`/v1/traces`, because vendors can use different paths.
 
-The admin validation layer currently rejects plain `http://` endpoints unless they point to an allowed loopback-style target.
+Set `enabled: false` to keep the exporter in the snapshot but skip fan-out.
 
-Allowed non-TLS development cases include:
+## Endpoint restrictions
+
+Use `https://` for non-local exporter endpoints.
+
+The admin validation layer allows plain `http://` only for local-development
+targets:
 
 - `http://127.0.0.1/...`
 - `http://localhost/...`
 - `http://mock-otlp/...`
 - `http://otel-collector/...`
 
-For non-loopback deployments, use `https://...`.
+This prevents accidentally sending telemetry over plaintext HTTP to a remote
+destination.
 
-This protects against accidentally configuring plain HTTP exporters for non-local destinations.
+## Headers and credentials
 
-## Runtime Model
+Use `headers` for static destination credentials, such as:
 
-Current exporter behavior:
+```json
+{
+  "headers": {
+    "Authorization": "Bearer YOUR_OTLP_TOKEN"
+  }
+}
+```
 
-- exporters are environment-scoped dynamic resources
-- the data plane, not the control plane, sends the HTTP export traffic
-- disabled exporters remain in the snapshot but are skipped
+or vendor-specific headers:
 
-This means the request content and telemetry egress path stay with the data plane.
+```json
+{
+  "headers": {
+    "x-honeycomb-team": "YOUR_TEAM_KEY"
+  }
+}
+```
 
-This keeps sensitive prompt and response content on the data plane egress path.
+Header values are plaintext in the runtime resource. Treat them with the same
+care as provider-key secrets: restrict access to the config store and keep the
+data-plane trust boundary explicit.
 
-## Operator Guidance
+## Runtime behavior
 
-- start with one exporter and verify delivery before adding several
-- keep credentials in `headers` aligned with the destination's OTLP/HTTP auth model
-- disable exporters rather than deleting them immediately when you are diagnosing delivery issues
+Exporter traffic is sent by the data plane. The control plane does not open an
+HTTP connection to your exporter endpoint.
+
+Current fan-out is metadata-oriented. It includes request status, token counts,
+model and provider identifiers, request ids, finish reason, and timing. Prompt
+and response bodies are not included in the OTLP/HTTP span payload.
+
+Disabled exporters remain in the snapshot and are skipped.
+
+## Operator guidance
+
+Start with one exporter and verify delivery before adding several destinations.
+
+Keep destination credentials scoped to telemetry export only.
+
+Disable an exporter before deleting it when you are diagnosing delivery issues.
+That keeps the endpoint and headers available for rollback.
 
 ## Troubleshooting
 
 ### The exporter saves but no telemetry appears downstream
 
-Check endpoint correctness, destination auth headers, and whether the exporter is enabled.
+Check that the endpoint is the full OTLP/HTTP traces URL, the destination
+headers are valid, and the exporter is enabled.
 
 ### The admin API rejects an `http://` endpoint
 
-That is expected unless the destination is one of the allowed local-development forms.
+That is expected for non-local destinations. Use `https://`, or use one of the
+allowed local-development hostnames.
 
-## Related Pages
+### The downstream service expects a different path
 
-- [Admin API](admin-api.md)
-- [Metrics And Logs](../operations/metrics-and-logs.md)
-- [Reference: Resource Schemas](../reference/resource-schemas.md)
+Set `endpoint` to the exact receiver path. The gateway does not rewrite or
+append the OTLP path.
+
+## Next steps
+
+- [Admin API](admin-api.md) explains standalone admin writes.
+- [Metrics and logs](../operations/metrics-and-logs.md) covers runtime telemetry.
+- [Resource schemas](../reference/resource-schemas.md) explains generated schema source of truth.

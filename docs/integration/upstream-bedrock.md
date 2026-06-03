@@ -1,5 +1,5 @@
 ---
-title: AWS Bedrock upstream
+title: AWS Bedrock Upstream
 description: Route AISIX AI Gateway to AWS Bedrock with SigV4 credentials, including Anthropic and Converse publisher dispatch, cross-region inference profiles, and an end-to-end chat example.
 sidebar_position: 31
 keywords:
@@ -54,13 +54,23 @@ sequenceDiagram
 
 ## Prerequisites
 
-- A running self-hosted gateway (admin on `:3001`, proxy on `:3000`). See the [Self-Hosted Quickstart](../quickstart/self-hosted.md).
+- A running gateway (admin on `:3001`, proxy on `:3000`). See the [Quickstart](../quickstart).
 - Your admin key from the bootstrap config.
 - AWS credentials with `bedrock:InvokeModel` (and `bedrock:Converse`) permission, and a Bedrock model you have requested access to in the target region.
 
-## Configuration
+## Values to collect
 
-### Step 1: Create the Bedrock provider key
+Before creating AISIX resources, collect these upstream values:
+
+| Value | Where it is used |
+| --- | --- |
+| AWS access key id and secret access key | `secret.access_key_id` and `secret.secret_access_key` on the provider key |
+| AWS region | `secret.region`; also determines the standard Bedrock Runtime host |
+| Optional STS session token | `secret.session_token` when you use temporary credentials |
+| Bedrock model id or inference profile id | `model_name` on the model resource |
+| Caller-facing alias | `display_name` on the model resource and `allowed_models` on the caller API key |
+
+## Create a Bedrock provider key
 
 The `secret` is a JSON-encoded AWS credential blob. The base URL is not part of the secret — leave `api_base` unset for standard AWS, or set it to a private Bedrock endpoint (VPC endpoint) if you have one.
 
@@ -68,7 +78,7 @@ The `secret` is a JSON-encoded AWS credential blob. The base URL is not part of 
 The standalone gateway stores `secret` as plaintext under the etcd `prefix` from [`config.yaml`](../configuration/bootstrap-config.md). For production, front etcd with encryption-at-rest, restrict etcd network access to the gateway, or use AISIX Cloud's managed [Provider Key Rotation](../cloud/provider-key-rotation.md), where the secret stays in the control plane and only the projected reference reaches the data plane.
 :::
 
-```bash title="Create a Bedrock provider key"
+```shell
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
   -H "Authorization: Bearer YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
@@ -80,24 +90,22 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
   }'
 ```
 
-The `secret` value is a JSON string. Its fields are:
+The `secret` value is a JSON string. It must include `access_key_id`,
+`secret_access_key`, and `region`. Bedrock's endpoint is region-keyed, for
+example `bedrock-runtime.us-west-2.amazonaws.com`, so the region is required.
 
-| Field | Required | Description |
-|---|---|---|
-| `access_key_id` | Yes | AWS access key id. |
-| `secret_access_key` | Yes | AWS secret access key. |
-| `region` | Yes | AWS region the dispatch targets, e.g. `us-west-2`. Bedrock's endpoint is region-keyed (`bedrock-runtime.<region>.amazonaws.com`), so this is required. |
-| `session_token` | No | AWS STS session token. Set it for assume-role / temporary credentials; omit it for long-lived static keys. |
+Include `session_token` when you use temporary STS credentials. Omit it for
+long-lived static keys.
 
 `adapter` must be `bedrock` — this is the dispatch key that routes the provider key to the Bedrock bridge. `provider` is a free-form vendor label (`amazon-bedrock` matches the AISIX Cloud catalog id).
 
 Capture the returned `id` for the next step.
 
-### Step 2: Create the model
+## Create a model
 
 `model_name` is the Bedrock model id. The customer-facing alias is `display_name`.
 
-```bash title="Create a model for Claude on Bedrock"
+```shell
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
   -H "Authorization: Bearer YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
@@ -111,11 +119,11 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
 
 For a Converse-path model, set `model_name` to the publisher's Bedrock id, for example `meta.llama3-3-70b-instruct-v1:0` or `amazon.nova-pro-v1:0`.
 
-#### Cross-region inference profiles
+### Use Cross-Region Inference Profiles
 
 To use a [cross-region inference profile](https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference.html), prefix the model id with the geography (`us.`, `eu.`, `apac.`, `global.`, or `us-gov.`):
 
-```json title="Cross-region model_name"
+```json
 {
   "model_name": "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 }
@@ -123,13 +131,17 @@ To use a [cross-region inference profile](https://docs.aws.amazon.com/bedrock/la
 
 The gateway uses the prefix only to resolve the publisher; the full prefixed id is passed to Bedrock verbatim on the outbound call.
 
-### Step 3: Create a caller API key
+## Create a caller API key
 
-```bash title="Hash a plaintext caller key"
-printf 'sk-demo-caller' | sha256sum | cut -d' ' -f1
+```shell
+if command -v sha256sum >/dev/null 2>&1; then
+  printf '%s' 'sk-demo-caller' | sha256sum | cut -d' ' -f1
+else
+  printf '%s' 'sk-demo-caller' | shasum -a 256 | awk '{print $1}'
+fi
 ```
 
-```bash title="Create a caller API key"
+```shell
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/apikeys \
   -H "Authorization: Bearer YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
@@ -139,11 +151,11 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/apikeys \
   }'
 ```
 
-### Step 4: Send a request
+## Send a Request
 
-Allow about a second for the configuration to propagate to the proxy, then call the gateway.
+Admin writes propagate to the proxy asynchronously. Before sending traffic, poll `/v1/models` until the alias appears for the caller key.
 
-```bash title="Send a chat completion to Bedrock"
+```shell
 curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H "Authorization: Bearer sk-demo-caller" \
   -H "Content-Type: application/json" \
@@ -157,7 +169,7 @@ curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
 
 Expected response (OpenAI-shaped, alias restored):
 
-```json title="200 OK"
+```json
 {
   "id": "msg_01...",
   "object": "chat.completion",
@@ -173,13 +185,13 @@ Expected response (OpenAI-shaped, alias restored):
 }
 ```
 
-## Verification
+## Verify
 
 Confirm the two observable facts a `200` does not, by itself, prove.
 
 ### `response.model` is the alias, not the Bedrock id
 
-```bash title="Confirm alias restore"
+```shell
 curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H "Authorization: Bearer sk-demo-caller" \
   -H "Content-Type: application/json" \
@@ -191,9 +203,9 @@ Expected: `"model":"claude-bedrock"` — your alias, not `anthropic.claude-3-5-s
 
 ### The outbound request is SigV4-signed against the Converse or invoke route
 
-The gateway's own e2e coverage asserts the outbound shape against a mock Bedrock: the request carries an `Authorization: AWS4-HMAC-SHA256 Credential=...` header (SigV4, **not** a Bearer token) and hits `/model/<modelId>/converse` for Converse-path publishers (or `/model/<modelId>/invoke` for `anthropic.*`). You cannot read AWS's inbound headers directly, but you can confirm the signing path indirectly:
+The gateway sends an `Authorization: AWS4-HMAC-SHA256 Credential=...` header (SigV4, **not** a Bearer token) and calls `/model/<modelId>/converse` for Converse-path publishers, or `/model/<modelId>/invoke` for `anthropic.*`. You cannot read AWS's inbound headers directly, but you can confirm the signing path indirectly:
 
-```bash title="Negative check — bad credentials surface as upstream auth failure"
+```shell
 curl -sS -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H "Authorization: Bearer sk-demo-caller" \
   -H "Content-Type: application/json" \
@@ -206,10 +218,12 @@ With a correctly-scoped key, expect `200`. With invalid AWS credentials on the p
 
 - **Streaming** dispatches all publishers through the Converse stream API (`/converse-stream`). Confirm streaming behavior against your specific publisher.
 - **Anthropic on Bedrock** uses the legacy `/invoke` route for non-streaming chat to preserve the Anthropic Messages body shape; other publishers use Converse.
+- **Converse-path publishers** require at least one user or assistant turn. System-only requests are rejected before dispatch because Bedrock Converse does not accept an empty `messages` array.
 - Upstream error detail from AWS is intentionally redacted in the customer-visible error to avoid leaking operator-internal identifiers (ARNs, region, account id).
 
-## Related pages
+## Next steps
 
+- [Choose a provider upstream](provider-upstreams.md) — compare upstream setup paths.
 - [Adapter protocol families](../reference/adapters.md) — where Bedrock fits among the five adapters.
 - [Provider keys](../configuration/provider-keys.md) — the credential resource and `api_base` behavior.
 - [OpenAI-compatible API](openai-compatible-api.md) — the proxy surface callers use.

@@ -4,32 +4,58 @@ description: Use proxy and admin liveness endpoints plus the per-model health en
 sidebar_position: 53
 ---
 
-AISIX AI Gateway currently exposes three health surfaces. Use them for different jobs — they are not interchangeable.
+AISIX AI Gateway exposes multiple health surfaces. Use each one for the
+job it is designed to answer.
 
-## Proxy Liveness — `GET /livez`
+Use `GET /livez` on the proxy listener as the caller-facing liveness
+probe. It is unauthenticated and only confirms that the proxy listener is
+up.
 
-`GET /livez` on the proxy listener is the public, unauthenticated liveness check.
+Use `GET /livez` on the admin listener to confirm that the private admin
+listener is reachable in standalone mode. It is also unauthenticated, so
+keep the admin listener private.
 
-Use it to confirm:
+Use `GET /admin/v1/health` on the admin listener when you need
+authenticated operator detail, including model health and configuration
+freshness.
 
-- the proxy listener is up
-- the process is not shutting down
+## Proxy liveness
 
-It returns `200 OK` with the plain-text body `ok` on a healthy process. During graceful shutdown it returns `500 Internal Server Error` with a body ending in `livez check failed`, which Kubernetes liveness probes and load balancers can match on.
+`GET /livez` on the proxy listener confirms that the proxy listener is up
+and the process is not shutting down.
 
-Append `?verbose=1` for a multi-line plain-text body that ends with `livez check passed` (healthy) or includes the shutdown reason (failed). The verbose body is intended for human operators using `curl`, not for automated probes.
+Healthy response:
 
-The body is intentionally minimal — snapshot counts, provider bridge counts, and configuration metadata are **not** exposed on this route. Operators looking for that information should use the authenticated admin endpoints below.
+```text
+200 OK
+ok
+```
 
-## Admin Liveness — `GET /livez`
+During graceful shutdown, the route returns `500 Internal Server Error`
+with a body ending in `livez check failed`. This lets Kubernetes probes
+and load balancers stop routing traffic during drain.
 
-The admin listener exposes the same `/livez` route with the same response contract. Use it to confirm the admin listener is reachable and the process is not shutting down. The admin-listener liveness is independent of the proxy listener so a probe failure points at the specific socket.
+Append `?verbose=1` for a multi-line body intended for operators using
+`curl`. Do not depend on the verbose body for automated probes.
 
-## Per-Model Health — `GET /admin/v1/health`
+Proxy liveness is intentionally narrow. It does not expose snapshot
+counts, provider bridge counts, provider credentials, or model health.
 
-`GET /admin/v1/health` is the authenticated operator-facing endpoint. It requires an admin-key bearer token and returns one entry per model in the current snapshot plus an optional config-freshness block.
+## Admin liveness
 
-Response shape:
+The admin listener exposes the same `/livez` route. Use it to confirm the
+admin listener is reachable in standalone mode.
+
+Because proxy and admin listeners are separate sockets, a failure on one
+does not necessarily mean the other listener is unhealthy.
+
+## Per-model health
+
+`GET /admin/v1/health` is the authenticated operator endpoint. It
+requires an admin-key bearer token and returns per-model health from the
+current snapshot.
+
+Example response:
 
 ```json
 {
@@ -45,44 +71,50 @@ Response shape:
 }
 ```
 
-Per-model `health` levels:
+Model health levels:
 
-- `0` — Healthy (no recent failures)
-- `1` — Degraded (4 to 7 consecutive upstream failures)
-- `2` — Down (8 or more consecutive upstream failures)
+- `0`: healthy, with no recent upstream failure streak
+- `1`: degraded, after 4 to 7 consecutive upstream failures
+- `2`: down, after 8 or more consecutive upstream failures
 
-The `config` block surfaces the etcd watch supervisor's freshness state. `snapshot_revision` is the highest etcd revision currently reflected in the snapshot. `snapshot_age_seconds` is `null` before the first apply and a number afterwards; a large value (for example, more than 300) suggests a stalled watch. The whole `config` block is omitted when the supervisor is not wired into admin state.
+The optional `config` block reports snapshot freshness. A growing
+`snapshot_age_seconds` can indicate a stalled watch or delayed
+configuration propagation. The block is omitted when the watch supervisor
+is not wired into the admin state. When the supervisor is wired but has no
+age yet, `snapshot_age_seconds` can be `null`.
 
-## Why Config Freshness Matters
+## Minimal runbook
 
-Per-model upstream health alone does not tell you whether the gateway is serving fresh configuration. The watch-status block helps detect a frozen snapshot, a stalled watch stream, or a delayed config apply path. See [Configuration Propagation](../configuration/configuration-propagation.md) for how admin writes reach the proxy.
-
-## Operational Use
-
-Use `/livez` (proxy or admin) for liveness-style probes — Kubernetes `livenessProbe`, load balancer health checks, container orchestration restart triggers.
-
-Use `/admin/v1/health` for operator diagnosis, rollout verification, and debugging propagation or watch issues.
-
-## Minimal Runbook
-
-1. If proxy `GET /livez` fails, treat it as a process or listener problem.
-2. If admin `GET /livez` fails, inspect admin binding, mTLS settings (in managed mode), and deployment topology.
-3. If both liveness routes succeed but traffic still fails, inspect `GET /admin/v1/health` for per-model degradation.
-4. If admin health reports a stale `snapshot_age_seconds`, focus on configuration propagation and etcd watch freshness.
-5. If model health is degraded but the snapshot is fresh, focus on upstream provider path issues (credentials, network, provider outages).
+1. If proxy `GET /livez` fails, inspect process state and proxy listener
+   binding.
+2. If admin `GET /livez` fails in standalone mode, inspect admin binding,
+   network placement, and listener TLS.
+3. If liveness is green but traffic fails, inspect `GET /admin/v1/health`
+   for model degradation in standalone mode.
+4. If `snapshot_age_seconds` keeps growing, focus on etcd connectivity
+   and watch freshness.
+5. If model health is degraded but config is fresh, focus on upstream
+   provider credentials, network, and provider availability.
 
 ## Troubleshooting
 
 ### Liveness is green but requests still fail
 
-That is expected in some failure modes. Liveness is intentionally narrow — process up, not shutting down — and is independent of snapshot, upstream health, and provider credentials. Use `GET /admin/v1/health` to see whether specific models are degraded.
+That can happen. Liveness only proves that the process and listener are
+up. It does not prove that a model alias exists, a provider key is valid,
+or an upstream provider is reachable.
 
 ### `snapshot_age_seconds` keeps growing
 
-Indicates a stalled etcd watch. Check etcd connectivity and the supervisor logs.
+Treat this as a configuration propagation issue. Check etcd connectivity,
+watch supervisor logs, and whether the gateway can read the configured
+etcd TLS files.
 
-## Related Pages
+## Next steps
 
-- [Configuration Propagation](../configuration/configuration-propagation.md)
-- [Metrics And Logs](metrics-and-logs.md)
-- [Troubleshooting](troubleshooting.md)
+- [Configuration propagation](/ai-gateway/configuration/configuration-propagation)
+  explains how admin writes reach the proxy.
+- [Metrics and logs](/ai-gateway/operations/metrics-and-logs) explains
+  observability signals.
+- [Troubleshooting](/ai-gateway/operations/troubleshooting) gives a
+  broader diagnosis flow.

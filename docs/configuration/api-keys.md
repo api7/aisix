@@ -4,47 +4,40 @@ description: Configure caller-facing API keys, model access, rate limits, and cu
 sidebar_position: 34
 ---
 
-API keys are the caller-facing credentials used on the proxy surface.
+API keys authenticate callers on the proxy surface.
 
-The gateway does not store plaintext caller keys in the `ApiKey` resource. It stores `key_hash`, which is the SHA-256 hex digest of the plaintext bearer token.
+Clients send the plaintext key in `Authorization: Bearer <key>` or `x-api-key`.
+The gateway stores only `key_hash`, the SHA-256 hex digest of that plaintext
+key. On each request, the proxy hashes the presented key and looks up the
+matching `ApiKey` resource.
 
-This resource controls who can call the proxy and which model aliases they can use.
+## Prerequisites
 
-## Current Fields
+This page assumes you have:
 
-- `key_hash`
-- `allowed_models`
-- optional `rate_limit`
-- optional `team_id`
-- optional `user_id`
+- a running self-hosted gateway with the admin and proxy listeners available
+- an admin key for `Authorization: Bearer YOUR_ADMIN_KEY`
+- at least one model alias the caller should be allowed to use
 
-Think of those fields as four distinct control layers:
+If you have not created a model yet, configure [Provider keys](provider-keys.md)
+and [Models](models.md) first.
 
-- identity: `key_hash`
-- authorization: `allowed_models`
-- inline policy: `rate_limit`
-- bucket identity: `team_id` and `user_id`
+## Create a caller key
 
-`team_id` and `user_id` are not access controls in themselves. They are the bucket keys that scoped policies on the control plane match against. Set them when you want a policy to span all keys belonging to the same team or to the same member.
+Choose the plaintext key you will give to the caller, then hash it before
+writing the admin resource.
 
-Two policy families match against these buckets today:
-
-- `team`-scoped and `member`-scoped [`RateLimitPolicy`](rate-limits.md#rate-limit-policy-entities) rows.
-- `team`-scoped and `member`-scoped [budget](budgets.md#budget-scopes) rows.
-
-Setting `team_id` opts the key into both the team rate-limit pool and the team budget (if either exists). Setting `user_id` does the same on the member side. Leaving them null means the key is unbound — the team and member rows of either policy family simply don't apply to it.
-
-## Create A Caller Key
-
-Hash the plaintext key first:
-
-```bash title="Hash a caller API key"
-printf 'sk-demo-caller' | sha256sum | cut -d' ' -f1
+```shell
+if command -v sha256sum >/dev/null 2>&1; then
+  printf '%s' 'sk-demo-caller' | sha256sum | cut -d' ' -f1
+else
+  printf '%s' 'sk-demo-caller' | shasum -a 256 | awk '{print $1}'
+fi
 ```
 
-Then create the admin resource:
+Create the API key resource with that hash:
 
-```bash title="Create an API key"
+```shell
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/apikeys \
   -H "Authorization: Bearer YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
@@ -58,32 +51,84 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/apikeys \
   }'
 ```
 
-The plaintext bearer token is the value your clients will send in `Authorization: Bearer ...`.
+Give the plaintext key to the caller. Do not give the caller `key_hash`.
 
-## Model Authorization
+## Verify access
+
+First, check what the caller key can see:
+
+```shell
+curl -sS http://127.0.0.1:3000/v1/models \
+  -H "Authorization: Bearer sk-demo-caller"
+```
+
+Then send a request to an allowed model alias. The caller uses the plaintext
+key, not the hash:
+
+```shell
+curl -sS http://127.0.0.1:3000/v1/chat/completions \
+  -H "Authorization: Bearer sk-demo-caller" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o-prod",
+    "messages": [
+      {"role": "user", "content": "Hello"}
+    ]
+  }'
+```
+
+If the key was created successfully but the proxy still returns `401` or `403`,
+wait briefly for configuration propagation and then use the troubleshooting
+section below.
+
+## Model access
 
 `allowed_models` controls which model aliases the caller may use.
 
-Current behavior:
+Use explicit allowlists for ordinary callers:
 
-- `["*"]` allows access to every model alias visible to that key
-- an explicit list allows only those model aliases
-- an empty array is valid but denies every model
+```json
+{
+  "allowed_models": ["gpt-4o-prod", "chat-prod"]
+}
+```
 
-Choose explicit allowlists unless you intentionally want a wildcard operator or internal key.
+Use `["*"]` only when the key should access every model visible to it.
 
-## Rotation
+```json
+{
+  "allowed_models": ["*"]
+}
+```
 
-`POST /admin/v1/apikeys/:id/rotate` generates a new plaintext bearer, stores only its hash, and returns the plaintext exactly once.
+An empty array is valid and denies every model.
 
-That means rotation is both a security action and a distribution event. You need a plan for getting the new plaintext into the caller before the old one is retired.
+```json
+{
+  "allowed_models": []
+}
+```
 
-Example response shape:
+`GET /v1/models` applies the same access boundary. A wildcard key sees all
+non-routing models. A restricted key sees only allowed non-routing models. An
+empty allowlist returns an empty list.
+
+## Rotate a key
+
+`POST /admin/v1/apikeys/:id/rotate` generates a new plaintext bearer, stores
+only its hash, and returns the plaintext once.
+
+```shell
+curl -sS -X POST http://127.0.0.1:3001/admin/v1/apikeys/API_KEY_ID/rotate \
+  -H "Authorization: Bearer YOUR_ADMIN_KEY"
+```
+
+Example response:
 
 ```json
 {
   "entry": {
-    "id": "...",
+    "id": "API_KEY_ID",
     "revision": 2,
     "value": {
       "key_hash": "...",
@@ -94,53 +139,80 @@ Example response shape:
 }
 ```
 
-## Rate Limits
+Capture `plaintext` immediately. Later reads return only the hash. The old key
+stops working after the updated resource propagates to the proxy snapshot.
 
-The inline rate-limit object on `ApiKey` supports:
+## Rate limits
 
-- `tpm`
-- `tpd`
-- `rpm`
-- `rpd`
-- `concurrency`
+`ApiKey.rate_limit` is an inline policy on the caller key.
 
-`ApiKey.rate_limit` is one of three layers the proxy enforces. The other two are `Model.rate_limit` (inline on the resolved model) and standalone `RateLimitPolicy` rows. All applicable layers are AND-combined per request.
+It can limit:
 
-See [Rate Limits](rate-limits.md) for the full enforcement model and for `team`/`member`-scope policies that match against `team_id` / `user_id`.
+- `rps`, `rpm`, `rph`, and `rpd` for request count
+- `tpm` and `tpd` for token count
+- `concurrency` for in-flight requests
 
-## Budget Boundary
+The proxy combines all applicable rate-limit layers with AND semantics:
 
-Managed budget enforcement exists on the managed `/dp/budget_check` path.
+- `ApiKey.rate_limit`
+- `Model.rate_limit`
+- matching `RateLimitPolicy` rows
 
-Up to six budget rows can apply to a single request — see [Budget Scopes](budgets.md#budget-scopes) for the full list and applicability rules. The `team_id` and `user_id` fields on this api_key control which of the `team` and `member` scope rows apply:
+The tightest applicable layer wins in practice. See [Rate limits](rate-limits.md)
+for the full enforcement model.
 
-- `team_id = null` and `user_id = null` → only `org`, `environment`, `api_key`, `provider_key` scope rows apply
-- `team_id = T` → `team` scope rows whose `scope_ref = T` also apply
-- `user_id = M` → `member` scope rows whose `scope_ref = M` also apply
+## Team and member bindings
 
-Adding a user to a team does **not** by itself make that user's keys count against the team budget — only the explicit `team_id` on the api_key does. If you want a key to contribute to a team's budget, set `team_id` at creation time.
+The runtime `ApiKey` schema includes optional `team_id` and `user_id`.
 
-Current standalone boundary:
+Those fields are bucket identities, not access controls by themselves. The data
+plane uses them to match `team`-scoped and `member`-scoped rate-limit policies
+and managed budget rows.
 
-- standalone self-hosted deployments default to a disabled budget client, which is allow-all
+The standalone admin API currently accepts and returns only `key_hash`,
+`allowed_models`, and `rate_limit`. It does not set `team_id` or `user_id` on
+`/admin/v1/apikeys` requests.
+
+That means team and member bindings are currently a managed control-plane
+projection concern, or a direct config-store concern for self-hosted operators
+who intentionally write runtime rows outside the standalone admin API.
+
+## Budget boundary
+
+Managed budget enforcement runs on the managed `/dp/budget_check` path.
+
+In standalone self-hosted deployments, the budget client defaults to disabled
+and allows requests. The standalone admin API also does not set `team_id` or
+`user_id`, so team and member budget scopes do not match keys created through
+`/admin/v1/apikeys`.
+
+For budget scope details, see [Budgets](budgets.md).
 
 ## Troubleshooting
 
 ### A valid key gets `403`
 
-Check `allowed_models` first. That is an authorization failure, not an authentication failure.
+Check `allowed_models` first. `403` usually means the key authenticated but is
+not allowed to use the requested model alias.
+
+### A caller gets `401`
+
+Check that the client is sending the plaintext key, not `key_hash`. Also check
+that the updated API-key resource has propagated to the proxy snapshot.
 
 ### The caller lost access after rotation
 
-Make sure the client is using the newly returned plaintext key, not the old one.
+Make sure the client is using the newly returned plaintext key. The old
+plaintext no longer matches the stored hash after rotation propagates.
 
 ### Rate-limit behavior is not matching the layer you configured
 
-The proxy combines `ApiKey.rate_limit`, `Model.rate_limit`, and matching `RateLimitPolicy` rows on every request. If a layer looks silent, check whether another layer is the actual gating one — a tighter `ApiKey.rate_limit` will trip before a looser `Model.rate_limit`. See [Rate Limits § Troubleshooting](rate-limits.md#troubleshooting).
+Remember that key, model, and scoped policy layers are combined. If one layer
+appears silent, another tighter layer may be the one rejecting requests.
 
-## Related Pages
+## Next steps
 
-- [Models](models.md)
-- [Rate Limits](rate-limits.md)
-- [Budgets](budgets.md)
-- [OpenAI-Compatible API](../integration/openai-compatible-api.md)
+- [Models](models.md) defines the aliases API keys can access.
+- [Rate limits](rate-limits.md) explains inline and scoped request controls.
+- [Budgets](budgets.md) explains managed budget boundaries.
+- [OpenAI-compatible API](../integration/openai-compatible-api.md) shows proxy calls with caller keys.

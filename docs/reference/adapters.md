@@ -1,6 +1,6 @@
 ---
-title: Adapter protocol families
-description: Reference for the five adapter protocol families in AISIX AI Gateway — how each upstream wire shape is dispatched, and how catalog and bring-your-own providers map onto them.
+title: Adapter Protocol Families
+description: Reference for the upstream protocol families AISIX AI Gateway uses to dispatch provider requests.
 sidebar_position: 66
 keywords:
   - AISIX AI Gateway
@@ -11,94 +11,182 @@ keywords:
   - AI gateway
 ---
 
-An **adapter** is the upstream wire shape AISIX AI Gateway encodes a request into when it dispatches to a provider. The gateway knows a closed set of five adapter protocol families. Every upstream — whether it comes from the curated catalog or you bring your own endpoint — resolves to exactly one of them.
+An **adapter** is the upstream protocol family AISIX uses after it resolves a
+caller-facing model alias to a provider key.
 
-This page explains the five families, how a model resolves to a bridge at request time, and how the catalog and bring-your-own (BYO) modes select an adapter. Use it to decide which integration guide to follow and what credential shape a given upstream needs.
+This reference explains how one model alias can dispatch to OpenAI,
+Anthropic, Bedrock, Vertex AI, Azure OpenAI, or an OpenAI-compatible endpoint
+without changing the caller-facing API.
 
-## The five adapter families
+For endpoint-by-endpoint support, see [Provider compatibility](provider-compatibility.md).
 
-The adapter set is fixed in code as a closed enum (`Adapter` in `aisix-core`). It serializes in `kebab-case`, so the Azure family is the wire string `azure-openai`.
+## Choose the right adapter
 
-| Adapter | Wire shape | Bridge crate | Auth | Integration guide |
-|---|---|---|---|---|
-| `openai` | OpenAI chat completions (`POST /chat/completions`) | `aisix-provider-openai` | `Authorization: Bearer` (`api-key` reuse for OpenAI-compatible vendors) | [OpenAI-compatible API](../integration/openai-compatible-api.md), [BYO endpoint](../configuration/byo-endpoint.md) |
-| `anthropic` | Anthropic Messages (`POST /v1/messages`) | `aisix-provider-anthropic` | `x-api-key` + `anthropic-version` | [Anthropic Messages](../integration/anthropic-messages.md) |
-| `bedrock` | AWS Bedrock Runtime — Converse (`/converse`) and the Anthropic `/invoke` route | `aisix-provider-bedrock` | AWS SigV4 | [AWS Bedrock upstream](../integration/upstream-bedrock.md) |
-| `vertex` | Google Vertex AI Gemini (`:generateContent`) | `aisix-provider-vertex` | OAuth2 Bearer (GCP) | [Google Vertex AI upstream](../integration/upstream-vertex.md) |
-| `azure-openai` | Azure OpenAI Service (`/openai/deployments/<deployment>/chat/completions`) | `aisix-provider-azure-openai` | `api-key` header **or** Entra ID (AAD) Bearer | [Azure OpenAI upstream](../integration/upstream-azure-openai.md) |
+Choose the adapter that matches the upstream wire shape, not the marketing name
+of the provider.
 
-The `openai` family is the broadest. Besides OpenAI itself, every OpenAI-compatible catalog vendor (DeepSeek, Groq, Mistral, Together.ai, Fireworks, Perplexity, and others) and every BYO OpenAI-compatible endpoint (vLLM, SGLang, Ollama, a self-hosted proxy) dispatches through the same OpenAI bridge — they differ only in `api_base` and credential.
+| If the upstream speaks | Use `adapter` | Common examples |
+| --- | --- | --- |
+| OpenAI-compatible chat-completions | `openai` | OpenAI, DeepSeek, Groq, Mistral, Together.ai, Fireworks, Perplexity, vLLM, SGLang, Ollama, private OpenAI-compatible endpoints |
+| Anthropic Messages | `anthropic` | Anthropic native Messages API |
+| AWS Bedrock Runtime | `bedrock` | Anthropic Claude on Bedrock, Bedrock Converse publishers |
+| Google Vertex AI publisher routes | `vertex` | Gemini, Anthropic Claude on Vertex, Vertex MaaS publisher rails |
+| Azure OpenAI Service | `azure-openai` | Azure OpenAI deployments with API-key or Entra ID authentication |
 
-## Specialized bridges, not one generic client
+If a provider exposes an OpenAI-compatible API, it usually uses
+`adapter: "openai"` even when its `provider` value is not `openai`. For
+example, a DeepSeek provider key can use `provider: "deepseek"` and
+`adapter: "openai"`.
 
-Each adapter family is a distinct `Bridge` implementation. The gateway does not normalize every provider into one OpenAI-shaped HTTP call. Instead, a per-family bridge owns the request encoding, the auth scheme, the URL construction, and the response decoding for that upstream's native protocol:
+## Understand each adapter family
 
-- The **OpenAI** and **Azure OpenAI** bridges speak the OpenAI chat-completions wire. Azure differs on the URL pattern (deployment-keyed), the auth header (`api-key` instead of `Authorization`), and tolerance for Azure's `prompt_filter_results` / `content_filter_results` response extensions.
-- The **Anthropic** bridge speaks the Anthropic Messages wire and translates Anthropic-shaped requests bidirectionally for non-Anthropic upstreams (see [Anthropic Messages](../integration/anthropic-messages.md)).
-- The **Bedrock** bridge dispatches through the AWS SDK with SigV4 signing. Anthropic-on-Bedrock models use the legacy `/invoke` route with an Anthropic Messages body; all other publishers use the unified Converse API.
-- The **Vertex** bridge builds Gemini's `:generateContent` request body and authenticates with a GCP OAuth2 Bearer token — either minted in-process from a service-account credential and cached, or supplied pre-minted (see [Google Vertex AI upstream § Token minting](../integration/upstream-vertex.md#token-minting)).
+### `openai`
 
-Whatever the upstream protocol, the customer-facing contract stays OpenAI-shaped: the response is rendered back as an OpenAI chat-completions envelope, and `response.model` echoes your model alias rather than the upstream id. That alias restore is gateway-wide and applies identically across all five families.
+Uses the OpenAI chat-completions wire shape.
+
+This is the broadest family. It covers OpenAI itself, public
+OpenAI-compatible providers, and private OpenAI-compatible endpoints.
+Authentication usually uses `Authorization: Bearer`, although some compatible
+providers use provider-specific credential headers behind the same family.
+
+See [OpenAI-compatible API](../integration/openai-compatible-api.md),
+[OpenAI-compatible vendor upstream](../integration/upstream-openai-compat.md),
+and [Bring your own endpoint](../configuration/byo-endpoint.md).
+
+### `anthropic`
+
+Uses the Anthropic Messages wire shape.
+
+Authentication uses `x-api-key` and `anthropic-version`. Use this family when
+the upstream provider is Anthropic-native, not merely when the caller sends an
+Anthropic-style request to AISIX.
+
+See [Anthropic Messages](../integration/anthropic-messages.md).
+
+### `bedrock`
+
+Uses AWS Bedrock Runtime.
+
+AISIX signs outbound requests with AWS SigV4. Anthropic Claude on Bedrock uses
+the Bedrock `/invoke` path with an Anthropic Messages body. Other supported
+publishers use Bedrock Converse.
+
+See [AWS Bedrock upstream](../integration/upstream-bedrock.md).
+
+### `vertex`
+
+Uses Google Vertex AI publisher routes.
+
+AISIX authenticates with a GCP OAuth2 Bearer token, either minted from a
+service-account credential or supplied as a pre-minted token. The bridge then
+routes to publisher-specific Vertex paths such as `:generateContent`,
+`:rawPredict`, or OpenAI-compatible MaaS endpoints.
+
+See [Google Vertex AI upstream](../integration/upstream-vertex.md).
+
+### `azure-openai`
+
+Uses Azure OpenAI Service deployment routes.
+
+AISIX builds Azure URLs from the provider key's resource host and the model's
+upstream deployment name. Authentication uses either Azure's `api-key` header or
+an Entra ID Bearer token.
+
+See [Azure OpenAI upstream](../integration/upstream-azure-openai.md).
+
+## Keep `provider` and `adapter` separate
+
+`provider` identifies the upstream vendor or endpoint. It is an open string,
+such as `openai`, `anthropic`, `deepseek`, `amazon-bedrock`, `google-vertex`,
+`azure`, or an internal endpoint label.
+
+`adapter` identifies the protocol family AISIX knows how to encode. It is the
+closed set listed above.
+
+This distinction lets AISIX support long-tail providers without changing the
+data plane for every new vendor. A new OpenAI-compatible provider can keep its
+own provider identity, base URL, telemetry metadata, and model IDs while still
+using the OpenAI adapter family.
+
+For the generated provider-key contract, see
+[Provider key schema](provider-key-schema.md).
+
+## How dispatch works
+
+A direct [model](../configuration/models.md) references a
+[provider key](../configuration/provider-keys.md) through `provider_key_id`.
+When a request reaches AISIX, dispatch follows this shape:
+
+1. The caller sends a gateway API key and a model alias.
+2. AISIX authenticates the caller and checks that the key can use the alias.
+3. AISIX resolves the alias to a model and its provider key.
+4. AISIX first looks for a provider-specific bridge keyed by the provider key's
+   `provider`.
+5. If no provider-specific bridge matches, AISIX falls back to the bridge for
+   the provider key's `adapter`.
+6. The selected bridge builds the provider-native request and renders the
+   caller-facing response.
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    participant Client
-    participant Proxy as AISIX proxy (:3000)
-    participant Hub as Bridge hub
-    participant Bridge as Family bridge
-    participant Upstream as Upstream provider
+flowchart LR
+  Client["Client request<br/>model: prod-chat"]
+  Key["Caller API key<br/>allowed models"]
+  Model["Model alias<br/>display_name: prod-chat"]
+  ProviderKey["ProviderKey<br/>provider + adapter + secret + api_base"]
+  Bridge["Selected bridge<br/>provider override or adapter family"]
+  Upstream["Upstream provider"]
 
-    Client->>Proxy: POST /v1/chat/completions (model = your-alias)
-    Note over Proxy: resolve alias → Model + ProviderKey
-    Proxy->>Hub: dispatch by adapter
-    Hub->>Bridge: select family bridge
-    Bridge->>Upstream: provider-native request (SigV4 / Bearer / api-key)
-    Upstream-->>Bridge: provider-native response
-    Bridge-->>Proxy: normalized chat response
-    Note over Proxy: restore response.model = your-alias
-    Proxy-->>Client: OpenAI-shaped JSON
+  Client --> Key --> Model --> ProviderKey --> Bridge --> Upstream
 ```
 
-## How a model resolves to a bridge
-
-A direct [model](../configuration/models.md) references a [provider key](../configuration/provider-keys.md) by `provider_key_id`. At dispatch time the gateway selects the bridge from the provider key in two tiers:
-
-1. **Specialized vendor lookup** — keyed on the provider key's `provider` (vendor identity). Only `openai` and `anthropic` are registered as specialized vendors today; this tier mainly serves pre-existing keys.
-2. **Adapter family lookup** — keyed on the provider key's `adapter` field. This is how `bedrock`, `vertex`, and `azure-openai` keys reach their bridge, and how any OpenAI-compatible vendor reaches the OpenAI bridge.
-
-For the three specialized upstreams (Bedrock, Vertex, Azure OpenAI), set `adapter` on the provider key to `bedrock`, `vertex`, or `azure-openai`. The bridge then reads the model's `model_name` as the upstream id (Bedrock model id, Vertex publisher model, or Azure deployment name) and the provider key's `secret` / `api_base` for credentials and endpoint.
+Only `openai` and `anthropic` are registered as provider-specific bridges
+today, mainly to keep older provider-key rows routable during upgrade. The
+adapter-family tier is the normal path for Bedrock, Vertex AI, Azure OpenAI,
+and OpenAI-compatible providers whose provider value is not `openai`.
 
 :::note
-The `adapter` field is the dispatch key for the specialized families. The `model_name` on a model is always the **upstream** identifier; the customer-facing alias is the model's `display_name`, which is what the caller sends in `model` and what `response.model` echoes back.
+The caller-facing model name is the model's `display_name`. The upstream model
+ID is the model's `model_name`. For normalized chat responses,
+`response.model` echoes the caller-facing alias, not the upstream model ID.
 :::
 
-## Catalog versus bring-your-own
+## Cloud catalog and self-hosted providers
 
-A provider key's telemetry tags carry a `kind` of either `catalog` or `byo` (the `telemetry_tags.kind` field). The two modes choose an adapter differently:
+In AISIX Cloud, the control plane maps catalog providers to adapter families and
+projects provider keys to the data plane. Operators select the provider in the
+managed workflow; the adapter and base URL are populated by the control plane.
 
-- **Catalog** — the upstream comes from a curated, models.dev-driven catalog. In AISIX Cloud, the control plane maps each catalog provider to its adapter automatically (for example, `amazon-bedrock` → `bedrock`, `azure` → `azure-openai`, `google-vertex` → `vertex`, `deepseek` → `openai`). You select a provider; the adapter is implied.
-- **Bring-your-own (BYO)** — the upstream is a private or self-hosted endpoint that is not in the catalog. You set the adapter explicitly. In the self-hosted gateway you set `provider` + `api_base` (and, for the specialized families, `adapter`) directly on the provider key through the admin API. In AISIX Cloud, BYO endpoints are admitted through a BYO path that lets you pick one of the five adapters for the endpoint.
+In self-hosted deployments, you set `provider`, `adapter`, `api_base`, and
+`secret` directly on each provider key.
 
-### Featured versus non-featured catalog providers
+Featured or community catalog status affects dashboard presentation. It does
+not change data-plane dispatch. Dispatch depends on the resolved model,
+provider key, provider identity, adapter, and connection settings.
 
-Within the catalog, a subset of providers is **featured** — the curated, ranked set the dashboard surfaces first (OpenAI, Anthropic, Amazon Bedrock, Azure, Google Vertex, DeepSeek, and others). Non-featured catalog providers still resolve to an adapter through the same catalog mapping; they are simply not promoted in the dashboard's ranked list. Featured status affects discovery and presentation, not dispatch — both featured and non-featured providers run through the same five bridges.
+## Capability boundaries
 
-:::note Self-hosted versus Cloud
-The catalog mapping and the featured ranking are AISIX Cloud control-plane behavior. The self-hosted gateway does not ship a catalog: you set `provider`, `api_base`, and `adapter` on each provider key yourself. The dispatch tiers above are identical in both modes — only the source of the field values differs.
-:::
+Adapters describe the upstream protocol family. They do not guarantee that
+every proxy endpoint supports every provider.
 
-## Current capability per family
+For example:
 
-Each integration guide documents the exact current behavior, including per-family limitations. In summary:
+- `/v1/chat/completions` is the broadest normalized chat path.
+- `/v1/responses` and `/v1/images/generations` are OpenAI-provider paths, not
+  generic `openai` adapter paths.
+- `/v1/rerank` is keyed by provider labels such as `openai`, `cohere`, and
+  `jina` and bypasses normal chat-bridge dispatch.
+- `/passthrough/:provider/*rest` borrows a configured provider key and performs
+  less gateway normalization.
 
-- **Bedrock** — chat is wired for Anthropic (Claude on Bedrock, via `/invoke`) and for all other publishers through the Converse API. Cross-region inference profile prefixes (`us.`, `eu.`, `apac.`, `global.`, `us-gov.`) are supported.
-- **Vertex** — Gemini chat and streaming are wired. Anthropic-on-Vertex and Llama-on-Vertex are not yet implemented; see [Google Vertex AI upstream § Limitations](../integration/upstream-vertex.md#limitations) and the [Roadmap](../roadmap.md).
-- **Azure OpenAI** — chat and streaming are wired for both the `api-key` and the Entra ID (AAD) `client_credentials` auth schemes.
+Use [Provider compatibility](provider-compatibility.md) before depending on a
+specific provider and endpoint combination.
 
-## Related pages
+## Next steps
 
-- [Provider keys](../configuration/provider-keys.md) — the credential resource every adapter dispatch reads from.
-- [Provider compatibility](provider-compatibility.md) — the current provider set and per-endpoint support boundaries.
-- [BYO endpoint](../configuration/byo-endpoint.md) — point the OpenAI adapter at a private or self-hosted endpoint.
-- [AWS Bedrock upstream](../integration/upstream-bedrock.md), [Google Vertex AI upstream](../integration/upstream-vertex.md), [Azure OpenAI upstream](../integration/upstream-azure-openai.md) — the three specialized-family guides.
+- [Provider keys](../configuration/provider-keys.md) explains how to configure
+  credentials, base URLs, providers, and adapters.
+- [Provider compatibility](provider-compatibility.md) explains endpoint support
+  boundaries.
+- [Bring your own endpoint](../configuration/byo-endpoint.md) points the
+  `openai` adapter at a private or self-hosted endpoint.
+- [AWS Bedrock upstream](../integration/upstream-bedrock.md), [Google Vertex AI upstream](../integration/upstream-vertex.md), and [Azure OpenAI upstream](../integration/upstream-azure-openai.md) cover specialized provider families.

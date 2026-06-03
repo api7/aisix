@@ -1,5 +1,5 @@
 ---
-title: Azure OpenAI upstream
+title: Azure OpenAI Upstream
 description: Route AISIX AI Gateway to Azure OpenAI Service with either an api-key or Entra ID (AAD) credential, including deployment URLs, national-cloud authority hosts, and end-to-end chat examples.
 sidebar_position: 33
 keywords:
@@ -63,25 +63,35 @@ sequenceDiagram
 
 ## Prerequisites
 
-- A running self-hosted gateway (admin on `:3001`, proxy on `:3000`). See the [Self-Hosted Quickstart](../quickstart/self-hosted.md).
+- A running gateway (admin on `:3001`, proxy on `:3000`). See the [Quickstart](../quickstart).
 - Your admin key from the bootstrap config.
 - An Azure OpenAI resource and a deployment, plus either the resource api-key or an Entra ID app registration (`tenant_id`, `client_id`, `client_secret`) granted access to the resource.
 
-## Configuration
+## Values to collect
 
-Both auth schemes share the same model and caller-key steps; only the provider-key `secret` differs.
+Before creating AISIX resources, collect these upstream values:
+
+| Value | Where it is used |
+| --- | --- |
+| Azure OpenAI resource host or bare resource name | `api_base` on the provider key |
+| Resource api-key, or Entra ID tenant/client/secret | `secret` on the provider key |
+| Optional national-cloud authority host | `secret.authority_host` for Entra ID credentials |
+| Azure deployment name | `model_name` on the model resource |
+| Caller-facing alias | `display_name` on the model resource and `allowed_models` on the caller API key |
 
 :::warning Production credentials
 The standalone gateway stores `secret` as plaintext under the etcd `prefix` from [`config.yaml`](../configuration/bootstrap-config.md). For production, front etcd with encryption-at-rest, restrict etcd network access to the gateway, or use AISIX Cloud's managed [Provider Key Rotation](../cloud/provider-key-rotation.md), where the secret stays in the control plane and only the projected reference reaches the data plane.
 :::
 
-### Step 1: Create the Azure provider key
+## Create an Azure Provider Key
 
-#### Option A — api-key auth
+Both auth schemes share the same model and caller-key steps; only the provider-key `secret` differs.
+
+### Use api-key Auth
 
 The `secret` is the verbatim resource api-key string. `api_base` is the resource host.
 
-```bash title="Create an Azure provider key (api-key auth)"
+```shell
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
   -H "Authorization: Bearer YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
@@ -94,11 +104,11 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
   }'
 ```
 
-#### Option B — Entra ID (AAD) auth
+### Use Entra ID (AAD) Auth
 
 The `secret` is a JSON object. Its `{` prefix is what tells the gateway to use the AAD `client_credentials` flow.
 
-```bash title="Create an Azure provider key (AAD auth)"
+```shell
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
   -H "Authorization: Bearer YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
@@ -111,18 +121,19 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
   }'
 ```
 
-The AAD `secret` fields are:
+The AAD `secret` must include `tenant_id`, `client_id`, and `client_secret`.
+`tenant_id` can be a tenant UUID or vanity domain. `client_secret` is the secret
+value, not the secret id.
 
-| Field | Required | Description |
-|---|---|---|
-| `tenant_id` | Yes | Entra ID tenant UUID (or vanity domain). Interpolated into the token endpoint path. |
-| `client_id` | Yes | App-registration (application) UUID. |
-| `client_secret` | Yes | The client secret value (not the secret id). |
-| `authority_host` | No | AAD authority origin. Omit for public Azure (defaults to `https://login.microsoftonline.com`). Set it for a national / sovereign cloud — `https://login.microsoftonline.us` (US Government) or `https://login.chinacloudapi.cn` (China, 21Vianet). Must be a bare http(s) origin; the gateway appends the tenant and the `/oauth2/v2.0/token` path. |
+Use `authority_host` only for a national or sovereign cloud. Omit it for public
+Azure, where the gateway defaults to `https://login.microsoftonline.com`. For
+example, use `https://login.microsoftonline.us` for US Government or
+`https://login.chinacloudapi.cn` for China, 21Vianet. The value must be a bare
+HTTP(S) origin; AISIX appends the tenant and `/oauth2/v2.0/token` path.
 
 For a national-cloud tenant, add `authority_host` to the JSON secret:
 
-```json title="AAD secret with national-cloud authority host"
+```json
 {
   "tenant_id": "YOUR_TENANT_ID",
   "client_id": "YOUR_CLIENT_ID",
@@ -135,21 +146,21 @@ The minted token is cached in-process, keyed by `(tenant_id, client_id)`, and re
 
 For both options, `adapter` must be `azure-openai` and `provider` is a free-form vendor label (`azure` matches the AISIX Cloud catalog id). Capture the returned `id` for the next step.
 
-#### `api_base` and the API version
+### Configure `api_base` and the API Version
 
 `api_base` is the Azure resource host. The gateway accepts three shapes:
 
 - The canonical resource URL `https://<resource>.openai.azure.com` (the resource name is extracted from the host).
 - A bare resource name (for example `acme-west`).
-- A verbatim override URL whose host does **not** end in `.openai.azure.com` — used for a corporate proxy, a private-VPC endpoint, or a mock. The gateway appends `/openai/deployments/<deployment>/chat/completions?api-version=<version>` to whatever you supply. (Verbatim overrides must not embed userinfo, a query string, or a fragment.)
+- A verbatim override URL whose host does **not** end in `.openai.azure.com` — used for a corporate proxy, a private-VPC endpoint, or a mock. The override may include a path prefix. The gateway rejects userinfo, query strings, and fragments, then appends `/openai/deployments/<deployment>/chat/completions?api-version=<version>`.
 
 The gateway pins a GA `api-version` default (`2024-10-21`). Azure deprecates older API versions on a [published schedule](https://learn.microsoft.com/en-us/azure/ai-services/openai/api-version-deprecation), so treat the default as a stop-gap and plan to track the version your deployment requires.
 
-### Step 2: Create the model
+## Create a model
 
 `model_name` is the Azure **deployment** name (the name you gave the deployment in the Azure portal), not the underlying model id. The customer-facing alias is `display_name`.
 
-```bash title="Create a model for an Azure deployment"
+```shell
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
   -H "Authorization: Bearer YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
@@ -161,13 +172,17 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
   }'
 ```
 
-### Step 3: Create a caller API key
+## Create a caller API key
 
-```bash title="Hash a plaintext caller key"
-printf 'sk-demo-caller' | sha256sum | cut -d' ' -f1
+```shell
+if command -v sha256sum >/dev/null 2>&1; then
+  printf '%s' 'sk-demo-caller' | sha256sum | cut -d' ' -f1
+else
+  printf '%s' 'sk-demo-caller' | shasum -a 256 | awk '{print $1}'
+fi
 ```
 
-```bash title="Create a caller API key"
+```shell
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/apikeys \
   -H "Authorization: Bearer YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
@@ -177,11 +192,11 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/apikeys \
   }'
 ```
 
-### Step 4: Send a request
+## Send a Request
 
-Allow about a second for the configuration to propagate, then call the gateway. The request is identical regardless of which auth scheme the provider key uses.
+Admin writes propagate to the proxy asynchronously. Before sending traffic, poll `/v1/models` until the alias appears for the caller key. The request is identical regardless of which auth scheme the provider key uses.
 
-```bash title="Send a chat completion to Azure"
+```shell
 curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H "Authorization: Bearer sk-demo-caller" \
   -H "Content-Type: application/json" \
@@ -195,7 +210,7 @@ curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
 
 Expected response (OpenAI-shaped, alias restored):
 
-```json title="200 OK"
+```json
 {
   "id": "cmpl-azure-...",
   "object": "chat.completion",
@@ -211,13 +226,13 @@ Expected response (OpenAI-shaped, alias restored):
 }
 ```
 
-## Verification
+## Verify
 
 Confirm the observable facts a `200` does not, by itself, prove.
 
 ### `response.model` is the alias, not the deployment name
 
-```bash title="Confirm alias restore"
+```shell
 curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H "Authorization: Bearer sk-demo-caller" \
   -H "Content-Type: application/json" \
@@ -229,11 +244,11 @@ Expected: `"model":"gpt-4o-azure"` — your alias, not the deployment `gpt4o-pro
 
 ### The outbound auth header matches the credential scheme
 
-The gateway's e2e coverage asserts the outbound shape against a mock Azure: for an api-key provider key the request carries the `api-key` header (and **no** `Authorization` header); for an AAD provider key it carries `Authorization: Bearer <minted-token>`. In both cases the outbound URL is `/openai/deployments/<deployment>/chat/completions?api-version=<version>` with the deployment taken from the model's `model_name`.
+For an api-key provider key, the gateway sends the Azure `api-key` header and does **not** send an `Authorization` header. For an AAD provider key, the gateway sends `Authorization: Bearer <minted-token>`. In both cases, the outbound URL is `/openai/deployments/<deployment>/chat/completions?api-version=<version>` with the deployment taken from the model's `model_name`.
 
 Confirm the auth path indirectly:
 
-```bash title="Negative check — bad credentials surface as upstream auth failure"
+```shell
 curl -sS -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H "Authorization: Bearer sk-demo-caller" \
   -H "Content-Type: application/json" \
@@ -252,8 +267,9 @@ Azure attaches `prompt_filter_results` and `content_filter_results` blocks to su
 - Verbatim `api_base` overrides accept any reachable host; a typo routes traffic to wherever that host resolves. Double-check the override URL.
 - The AAD path mints a token per `(tenant_id, client_id)` and caches it; a revoked client secret surfaces as an upstream auth failure on the next mint.
 
-## Related pages
+## Next steps
 
+- [Choose a provider upstream](provider-upstreams.md) — compare upstream setup paths.
 - [Adapter protocol families](../reference/adapters.md) — where Azure OpenAI fits among the five adapters.
 - [Provider keys](../configuration/provider-keys.md) — the credential resource and `api_base` behavior.
 - [AWS Bedrock upstream](upstream-bedrock.md) and [Google Vertex AI upstream](upstream-vertex.md) — the other specialized-family guides.

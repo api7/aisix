@@ -1,28 +1,40 @@
 ---
-title: Boot A Self-Hosted Gateway
-description: Start a self-hosted AISIX AI Gateway instance locally and verify that the proxy and admin listeners are reachable.
-sidebar_position: 11
+title: Run from Source
+description: Build AISIX AI Gateway from the repository checkout, start it locally, and verify that the proxy and admin listeners are reachable.
+sidebar_position: 16
 ---
 
-This guide shows how to start a self-hosted AISIX AI Gateway instance with the local example configuration and verify that both the proxy and admin listeners are reachable.
+This guide shows how to build AISIX AI Gateway from the repository checkout, start it with the local example configuration, and verify that the proxy and admin listeners are reachable.
 
-Use this page when you only want to bootstrap the gateway process itself.
+This guide shows how to run AISIX directly from the repository so you can inspect or modify the gateway while it is running. For the fastest container-based path, start with the [Quickstart](../quickstart).
 
-If you want the full first-user path, including provider setup, model creation, caller API key creation, and a first proxied request, start with [Quickstart](quickstart.md).
+By the end of this guide, you will have:
 
-This page is intentionally narrower than the main quickstart. It stops once the process is healthy and the listeners respond.
+1. Started local etcd.
+2. Built and started the `aisix` binary from source.
+3. Verified the proxy and admin listeners.
+
+This page stops at gateway bootstrap. A source-built gateway still needs the same provider key, model alias, and caller API key as the container quickstart before it can proxy model traffic.
 
 ## Prerequisites
 
+- Git
 - **Rust 1.93 or newer with `cargo`.** Install via [rustup](https://rustup.rs) and verify with `cargo --version`. The repo pins this version through `rust-toolchain.toml`, so `rustup` selects the right channel automatically.
 - Docker
-- A reachable [etcd](../overview/glossary.md#etcd) instance
+- curl
 
-## Step 1: Start etcd
+## Step 1: Clone the repository
+
+```shell
+git clone https://github.com/api7/ai-gateway.git
+cd ai-gateway
+```
+
+## Step 2: Start etcd
 
 For local development, start etcd in Docker:
 
-```bash title="Start etcd"
+```shell
 docker run -d \
   --name aisix-etcd \
   -p 2379:2379 \
@@ -33,131 +45,52 @@ docker run -d \
   --listen-client-urls=http://0.0.0.0:2379
 ```
 
-## Step 2: Create a bootstrap config
+## Step 3: Create the bootstrap config
 
-Create a local `config.yaml` based on the example config. Place this file in the repo root — Step 3's `cargo run` looks for `config.yaml` relative to your current working directory.
+Create a local `config.yaml` based on the example config:
 
-```yaml title="config.yaml" {2-7,9-14}
-etcd:
-  endpoints:
-    - "http://127.0.0.1:2379"
-  prefix: "/aisix"
-  dial_timeout_ms: 5000
-  request_timeout_ms: 5000
-
-proxy:
-  addr: "0.0.0.0:3000"
-  request_body_limit_bytes: 10485760
-
-admin:
-  addr: "127.0.0.1:3001"
-  admin_keys:
-    - "YOUR_ADMIN_KEY"
-
-observability:
-  service_name: "aisix"
-  log_level: "info"
-  access_log: true
-
-cache:
-  backend: "memory"
+```shell
+cp config.example.yaml config.yaml
 ```
 
-## Step 3: Start the gateway
+The example configuration points at local etcd and binds:
 
-```bash title="Build and run locally"
-cargo run -p aisix-server --bin aisix -- --config config.yaml
+- proxy listener on `0.0.0.0:3000`
+- admin listener on `127.0.0.1:3001`
+- admin key `admin-local-only-change-me`
+
+If either port is already in use on your machine, update `proxy.addr` or `admin.addr` in `config.yaml` before starting the gateway.
+
+## Step 4: Build and start the gateway
+
+```shell
+cargo run -p aisix-server -- --config config.yaml
 ```
 
-The first time you run this, `cargo` will compile several hundred dependencies before the gateway starts, which typically takes 3–5 minutes on common hardware. Subsequent runs are incremental and much faster.
+The package defines `aisix` as its binary, so `cargo run -p aisix-server` starts the gateway. The first run compiles the Rust workspace and can take several minutes; later runs are incremental and much faster.
 
 Keep this terminal running. In a new terminal, you should now have:
 
 - proxy listener on `http://127.0.0.1:3000`
 - admin listener on `http://127.0.0.1:3001`
 
-## Alternative: Run with Docker Compose
-
-If you only want to run a standalone gateway locally and don't need a Rust toolchain, use the published gateway image with Docker Compose instead of Steps 1–3. This brings up etcd and AISIX together.
-
-Create a `config.yaml` next to the compose file. It is the same as the Step 2 config, except the etcd endpoint points at the `etcd` service name instead of `127.0.0.1`:
-
-```yaml title="config.yaml"
-etcd:
-  endpoints:
-    - "http://etcd:2379"
-  prefix: "/aisix"
-  dial_timeout_ms: 5000
-  request_timeout_ms: 5000
-
-proxy:
-  addr: "0.0.0.0:3000"
-  request_body_limit_bytes: 10485760
-
-admin:
-  addr: "0.0.0.0:3001"
-  admin_keys:
-    - "YOUR_ADMIN_KEY"
-
-observability:
-  service_name: "aisix"
-  log_level: "info"
-  access_log: true
-
-cache:
-  backend: "memory"
-```
-
-```yaml title="docker-compose.yml"
-services:
-  etcd:
-    image: quay.io/coreos/etcd:v3.5.18
-    command:
-      - /usr/local/bin/etcd
-      - --advertise-client-urls=http://0.0.0.0:2379
-      - --listen-client-urls=http://0.0.0.0:2379
-    ports:
-      - "2379:2379"
-
-  aisix:
-    image: ghcr.io/api7/ai-gateway:dev
-    command: ["--config", "/etc/aisix/config.yaml"]
-    volumes:
-      - ./config.yaml:/etc/aisix/config.yaml:ro
-    ports:
-      - "3000:3000"
-      - "3001:3001"
-    depends_on:
-      - etcd
-```
-
-```bash title="Start the stack"
-docker compose up -d
-```
-
-:::note
-`ghcr.io/api7/ai-gateway:dev` tracks the `main` branch. For a reproducible deployment, pin a released version tag (for example `ghcr.io/api7/ai-gateway:v1.2.3`) once one is available.
-:::
-
-The proxy listener is now on `http://127.0.0.1:3000` and the admin listener on `http://127.0.0.1:3001`, the same as the local build, so the verification below applies unchanged. To stop the stack, run `docker compose down`.
-
-## Step 4: Verify the listeners
+## Step 5: Verify the listeners
 
 Both listeners expose an unauthenticated liveness route at `/livez`. The proxy and admin handlers share the same response shape, so you can probe either with the same expectation.
 
 Verify the proxy listener:
 
-```bash title="Check proxy liveness"
+```shell
 curl -sS http://127.0.0.1:3000/livez
 ```
 
 Verify the admin listener:
 
-```bash title="Check admin liveness"
+```shell
 curl -sS http://127.0.0.1:3001/livez
 ```
 
-## Expected Result
+## Expected result
 
 A healthy gateway returns `200 OK` with the plain-text body `ok` on both listeners:
 
@@ -169,27 +102,36 @@ The body is intentionally minimal — the unauthenticated liveness route does no
 
 For more detail, append `?verbose=1`. The verbose body is human-readable plain text suitable for `curl`, ending with `livez check passed` when the process is healthy.
 
-For authenticated per-model operator health after boot, use `GET /admin/v1/health`. That endpoint returns the per-model `health` level (`0` healthy, `1` degraded, `2` down) for every model in the current snapshot. See [Health Checks](../operations/health-checks.md) for the operator-facing routes.
+For authenticated per-model operator health after boot, use `GET /admin/v1/health`. That endpoint returns the per-model `health` level (`0` healthy, `1` degraded, `2` down) for every model in the current snapshot. See [Health checks](../operations/health-checks.md) for the operator-facing routes.
 
 :::note
 This quickstart only verifies gateway bootstrap. Dynamic resources such as models, API keys, provider keys, guardrails, cache policies, and observability exporters are managed after boot through the admin API.
 :::
 
+## Create traffic resources next
+
+At this point, the gateway process is running but no model traffic can pass through it yet. Create the same minimum resources used by the main quickstart:
+
+- a provider key for the upstream credential
+- a model alias that callers send to AISIX
+- a caller API key that is allowed to use that alias
+
+Continue with [Step 6 of the Quickstart](../quickstart#step-6-export-your-local-variables), using the admin listener at `http://127.0.0.1:3001` and the proxy listener at `http://127.0.0.1:3000`.
+
 ## Cleanup
 
 Stop the gateway process (Ctrl-C in its terminal) and remove the etcd container so you don't leak local state:
 
-```bash title="Stop the etcd container"
+```shell
 docker rm -f aisix-etcd
 ```
 
 If you created admin resources later (models, API keys, provider keys), delete them through the admin API before stopping etcd, or remove the etcd `--prefix` keyspace if you want a clean slate.
 
-## Next Steps
+## Next steps
 
 Continue in this order:
 
-1. [Quickstart](quickstart.md) for the full first-user path from local bootstrap to the first proxied request.
-2. [First Model, First Key, First Request](first-model-first-key-first-request.md) if you want the resource-by-resource version of that setup.
-3. [OpenAI SDK Quickstart](openai-sdk.md) after you have a working model alias and caller API key.
-4. [OpenAI-Compatible API](../integration/openai-compatible-api.md) when you are ready to look at the full client contract.
+1. [Quickstart Step 6](../quickstart#step-6-export-your-local-variables) to create a provider key, model alias, and caller API key.
+2. [OpenAI SDK quickstart](openai-sdk.md) after you have a working model alias and caller API key.
+3. [OpenAI-compatible API](../integration/openai-compatible-api.md) when you are ready to look at the full client contract.

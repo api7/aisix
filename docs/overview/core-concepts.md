@@ -1,156 +1,199 @@
 ---
 title: Core Concepts
-description: Understand the core AISIX AI Gateway and AISIX Cloud concepts, including models, provider keys, API keys, routing models, guardrails, cache policies, and observability exporters.
-sidebar_position: 3
+description: Understand the resource model behind AISIX AI Gateway.
+sidebar_position: 2
 ---
 
-This page defines the core objects and terms used across AISIX AI Gateway and AISIX Cloud.
+AISIX AI Gateway is configured through a small set of resources. The most
+important relationship is the path from caller credential to upstream provider.
 
-## Model
+## Request path
 
-A `Model` is the resource clients target through the [gateway](glossary.md#gateway).
+```text
+caller token
+  -> API key
+  -> allowed model alias
+  -> model
+  -> provider key
+  -> upstream provider
+```
 
-For direct models, a model includes:
+Read this page after the [Quickstart](../quickstart) when you
+want the mental model behind the resources you created. Use the configuration
+guides and generated schemas for exact field contracts.
 
-- `display_name` — the alias your callers send as the API request's `model` field
-- `provider`
-- `model_name` — the upstream model ID the gateway forwards to the provider (for example, `"gpt-4o"`)
-- `provider_key_id`
-- optional timeout, rate limit, and cost metadata
+If you just completed the quickstart, the abstract chain above maps to the
+resources you created like this:
 
-The current provider enum includes:
+| Concept | Quickstart value | What it does |
+| --- | --- | --- |
+| Caller token | `sk-demo-caller` | The bearer token the application sends to AISIX. |
+| API key | `ApiKey.key_hash` for `sk-demo-caller` | Authenticates the caller and limits which aliases it can use. |
+| Model alias | `gpt-4o-prod` | The stable model name callers put in the proxy request. |
+| Model | Direct `Model` row | Maps the caller-facing alias to the upstream model. |
+| Provider key | `openai-upstream` | Stores the upstream credential and adapter settings. |
+| Upstream provider | OpenAI with `gpt-4o-mini` | Receives the provider-authenticated request from AISIX. |
 
-- `openai`
-- `anthropic`
-- `google`
-- `deepseek`
-- `cohere`
-- `jina`
+## Traffic resources
 
-## Provider Key
+Most gateway setup starts with three resources.
 
-A `Provider Key` stores an upstream provider credential and optional base URL override.
+### Model
 
-It exists so multiple models can reuse one upstream credential instead of embedding provider secrets per model.
+A `Model` is the name callers send in the request's `model` field.
 
-Current provider key fields include:
+For a direct model, `display_name` is the caller-facing alias and `model_name` is
+the upstream provider's model ID. This is the most important distinction in the
+resource model: callers should not need to know whether `prod-chat` maps to
+`gpt-4o`, a DeepSeek model, an internal vLLM model, or a routing group.
 
-- `display_name`
-- `secret`
-- optional `api_base`
+A direct model also references a `ProviderKey` through `provider_key_id`. Timeout
+settings, inline rate limits, health-check behavior, cooldown behavior, and cost
+metadata can be attached to the model when you need them.
 
-## API Key
+See [Models](../configuration/models.md).
 
-An `API Key` is the caller-facing credential used to access the gateway.
+### Provider key
 
-Current data-plane behavior is based on `key_hash`, not plaintext storage. The proxy hashes the incoming bearer token and resolves it against the stored `key_hash`.
+A `ProviderKey` stores the upstream credential and connection settings.
 
-The plaintext bearer is chosen (or generated) by the caller and SHA-256-hashed locally before submission — the gateway never sees or returns the plaintext at create time, only the stored `key_hash`. The one endpoint that emits a server-generated plaintext is `POST /admin/v1/apikeys/:id/rotate`, which returns the new plaintext exactly once in its response under a `plaintext` field; capture it then, because subsequent reads only include the hash.
+It keeps secrets out of model definitions and lets multiple models reuse the
+same upstream credential. The provider key also tells the gateway which wire
+shape to use through `adapter`, such as `openai`, `anthropic`, `bedrock`,
+`vertex`, or `azure-openai`.
 
-An API key also carries:
+Provider identity and adapter family are not the same thing. For example, a
+DeepSeek or internal vLLM endpoint can use the OpenAI-compatible wire shape
+without pretending to be OpenAI.
 
-- `allowed_models`
-- optional `rate_limit`
-- optional `team_id` and `user_id`
+See [Provider keys](../configuration/provider-keys.md).
 
-`team_id` and `user_id` are bucket identifiers consumed by `team`-scoped and `member`-scoped [`RateLimitPolicy`](#rate-limit-policy) rows and by `team` / `member` budget rows. They are not access controls on their own.
+### API key
 
-An empty `allowed_models` list denies access to every model. A wildcard entry `"*"` allows access to every model in scope.
+An `ApiKey` is the caller credential.
 
-## Rate Limit Policy
+The proxy never stores the plaintext caller token in the API key resource. It
+hashes the incoming bearer token and compares it with `key_hash`. The rotate
+endpoint returns a generated plaintext key exactly once; later reads only expose
+the hash.
 
-A `RateLimitPolicy` is a standalone rate-limit rule stored in [etcd](glossary.md#etcd). Each policy targets a single subject through `(scope, scope_ref)`:
+`allowed_models` is the access boundary. An empty list denies access to every
+model. A wildcard entry, `"*"`, allows access to every model in scope.
 
-- `api_key` — match by `ApiKey` entry id
-- `model` — match by `Model` entry id
-- `team` — match by `ApiKey.team_id`
-- `member` — match by `ApiKey.user_id`
+The runtime API key row can also carry `team_id` and `user_id`. These are bucket
+identifiers for team-scoped and member-scoped policy and metrics. They are not
+access controls by themselves.
 
-The proxy enforces all matching policies alongside the inline `ApiKey.rate_limit` and `Model.rate_limit` layers. Any layer with a configured limit can reject a request with `429`. See [Rate Limits](../configuration/rate-limits.md) for the full enforcement model.
+See [API keys](../configuration/api-keys.md).
 
-## Routing Model
+## Routing models
 
-A routing model, sometimes called a virtual model, is a model with a `routing` block instead of direct provider fields.
+A routing model is a model alias backed by a `routing` block instead of a single
+upstream provider model.
 
-Current routing strategies include:
+Callers still send one stable alias. At request time, AISIX chooses a target
+model using the configured strategy:
 
-- `failover`
-- `round_robin`
-- `weighted`
+- `failover` tries targets in priority order.
+- `round_robin` rotates traffic across targets.
+- `weighted` selects targets according to configured weights.
 
-The gateway resolves the routing model to one of its target models at request time.
+Routing models are useful when you want to change upstream selection without
+changing application code.
 
-## Guardrail
+See [Routing and failover](../configuration/routing-and-failover.md).
 
-A `Guardrail` is a request or response policy object applied by the gateway.
+## Policy resources
 
-Current schema supports:
+Policy resources add gateway behavior around the key-model-provider path.
 
-- `keyword`
-- `bedrock` (the codename for the AWS Bedrock guardrails integration — see the Guardrails reference for setup)
+### Rate-limit policy
 
-Important current boundary:
+A `RateLimitPolicy` is a standalone rate-limit rule. It can match an API key,
+model, team, or member identity, and it is enforced alongside inline API-key and
+model limits.
 
-- `keyword` guardrails are the current in-process guardrail path.
-- `bedrock` has runtime implementation behind the `bedrock` feature and should be treated as an advanced capability with support and deployment caveats rather than as a planned-only feature.
+Any matching layer can reject a request with `429`.
 
-## Cache Policy
+See [Rate limits](../configuration/rate-limits.md).
 
-A `Cache Policy` controls when prompt-response cache lookup and storage apply.
+### Guardrail
 
-Current fields include:
+A `Guardrail` checks request or response content.
 
-- `name`
-- `enabled`
-- `backend`
-- `ttl_seconds`
-- `applies_to`
+Keyword guardrails run locally in the data plane. Bedrock and Azure Content
+Safety guardrails use remote provider services, so they require credentials,
+network reachability, and an explicit outage posture.
 
-Current `applies_to` matching understands:
+See [Guardrails](../configuration/guardrails.md).
 
-- `all`
-- `model:<name>`
-- `api_key:<id>`
+### Cache policy
 
-Important current boundary:
+A `CachePolicy` controls prompt-response cache lookup and storage.
 
-- `memory` is the default cache backend.
-- `redis` has runtime connection and backend selection logic today, but should be treated as a limited capability until the broader cache documentation and support boundaries are fully written down.
+Cache policy matching can apply globally, to a caller-facing model alias, or to
+an API key entry. The process-level cache backend is selected from bootstrap
+configuration; the policy shape includes a `backend` field, but that field does
+not switch the runtime backend per policy today.
 
-## Observability Exporter
+See [Caching](../configuration/caching.md).
 
-An `Observability Exporter` ships per-request span telemetry — derived from gateway `UsageEvent` records — to an OTLP/HTTP-compatible backend (Grafana Tempo, Honeycomb, Langfuse via OTLP, and so on). Configure one when you want a per-request trace of gateway proxy activity forwarded to your existing tracing backend.
+### Observability exporter
 
-## Environment
+An `ObservabilityExporter` sends gateway trace data to an OTLP/HTTP-compatible
+backend.
 
-An `Environment` is a first-class [AISIX Cloud](glossary.md#aisix-cloud) [control-plane](glossary.md#control-plane) concept.
+Exporter traffic is sent by the data plane. It is metadata-oriented gateway
+telemetry, not prompt or response body export.
 
-The managed data plane watches configuration scoped to its environment. In Cloud mode, projection rules ensure the data plane only sees the resources intended for that environment.
+See [Observability exporters](../configuration/observability-exporters.md).
 
-## Managed Data Plane
+## Managed concepts
 
-The managed data plane is still `AISIX AI Gateway`, but it runs under AISIX Cloud control-plane workflows.
+AISIX Cloud adds managed control-plane concepts around the gateway runtime.
 
-In this mode:
+### Environment
 
-- the admin listener is not bound
-- dynamic resources come from the Cloud-managed etcd path
-- control-plane communication uses mTLS-authenticated `/dp/*` endpoints
+An environment scopes the resources projected to a managed data plane. Projection
+rules ensure a data plane only receives the resources intended for that
+environment.
 
-## Playground
+### Managed data plane
 
-The playground is an in-process proxy endpoint mounted on the admin listener that forwards requests to the proxy router so model rows can be smoke-tested without a network hop. Auth uses a proxy API key (not the admin key); the full proxy middleware stack — auth, rate limit, bridge, guardrails — still runs.
+A managed data plane still runs AISIX AI Gateway, but it is operated through the
+AISIX Cloud control plane.
 
-There are two different playground concepts:
+In managed mode, the standalone admin listener is not exposed as the operator
+write path. Dynamic resources come from the Cloud-managed configuration path,
+and control-plane communication uses mTLS-authenticated `/dp/*` endpoints.
 
-- the standalone gateway has an in-process playground endpoint on the admin listener
-- AISIX Cloud has a control-plane playground path that currently talks directly to the upstream provider and is **not** data-plane-equivalent
+### Playground
 
-Do not treat these as the same behavior.
+The standalone gateway playground is mounted on the admin listener and forwards
+requests through the local proxy router. It uses a proxy API key, not the admin
+key, and the proxy middleware stack still runs.
 
-## Related Pages
+The AISIX Cloud playground is a control-plane feature. Do not assume Cloud
+playground behavior is identical to managed data-plane traffic unless the
+specific feature says so.
 
-- [What Is AISIX AI Gateway](what-is-aisix-ai-gateway.md)
-- [Deployment Modes](deployment-modes.md)
-- [Feature Matrix](feature-matrix.md)
-- [Roadmap](../roadmap.md)
+## Source of truth
+
+Concept pages explain how the pieces fit together. They are not the exact API
+contract.
+
+Use these sources when you need the precise accepted shape:
+
+- [Admin API reference](/ai-gateway/reference/admin-api) for the generated
+  OpenAPI reference.
+- [Resource schemas](../reference/resource-schemas.md) for generated resource
+  schemas.
+- The configuration guide for the workflow you are implementing.
+
+## Next steps
+
+- [Provider keys](../configuration/provider-keys.md) — store upstream credentials and connection details.
+- [Models](../configuration/models.md) — configure direct and routing model aliases.
+- [API keys](../configuration/api-keys.md) — authenticate callers and control model access.
+- [Rate limits](../configuration/rate-limits.md) — apply gateway-level traffic controls.
+- [Routing and failover](../configuration/routing-and-failover.md) — configure virtual models and routing strategies.

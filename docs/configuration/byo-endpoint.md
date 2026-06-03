@@ -1,5 +1,5 @@
 ---
-title: Bring your own endpoint
+title: Bring Your Own Endpoint
 description: Route AISIX AI Gateway to a private or self-hosted OpenAI-compatible endpoint such as vLLM, SGLang, or Ollama, including custom per-token pricing for budget tracking.
 sidebar_position: 42
 keywords:
@@ -30,11 +30,16 @@ A BYO endpoint is configured through two resources, exactly like a catalog upstr
 
 The difference from a catalog provider is that **you set `api_base` explicitly**. The OpenAI-family bridge only falls back to `https://api.openai.com` when the provider key's vendor identity is `openai` (or empty). For any other vendor it refuses to guess a base URL and returns an error, so a BYO key without `api_base` will fail dispatch. Set `api_base` to your endpoint's root.
 
-Outside the canonical OpenAI host, the gateway trusts your `api_base` verbatim — it appends the endpoint path (`/chat/completions`) but does not synthesize a `/v1` segment. If your server serves the OpenAI API at `http://10.0.0.5:8000/v1`, set exactly that. See [Provider keys § `api_base` behavior](provider-keys.md#api_base-behavior) for the full normalization rules.
+Outside the canonical OpenAI host, set `api_base` to the root where your server
+serves the OpenAI-compatible API. If your server serves the OpenAI API at
+`http://10.0.0.5:8000/v1`, set exactly that. See
+[Provider keys](provider-keys.md#base-url) for base URL guidance and
+[URL normalization](provider-keys.md#url-normalization) for the full
+normalization rules.
 
 ## Prerequisites
 
-- A running self-hosted gateway (admin on `:3001`, proxy on `:3000`). See the [Self-Hosted Quickstart](../quickstart/self-hosted.md).
+- A running gateway (admin on `:3001`, proxy on `:3000`). See the [Quickstart](../quickstart).
 - Your admin key from the bootstrap config.
 - A reachable OpenAI-compatible endpoint. The examples below assume vLLM at `http://10.0.0.5:8000/v1` serving the model id `meta-llama/Llama-3.1-8B-Instruct`.
 
@@ -46,9 +51,7 @@ Outside the canonical OpenAI host, the gateway trusts your `api_base` verbatim �
 Use the `/v1` form for all three. The gateway appends `/chat/completions` to whatever you supply.
 :::
 
-## Configuration
-
-### Step 1: Create the provider key
+## Create a provider key
 
 Many self-hosted inference servers do not require an API key. The `secret` field is required by the schema, so use a non-empty placeholder when your endpoint is unauthenticated — the bridge sends it as the bearer token and your server ignores it.
 
@@ -56,7 +59,7 @@ Many self-hosted inference servers do not require an API key. The `secret` field
 The standalone gateway stores `secret` as plaintext under the etcd `prefix` from [`config.yaml`](bootstrap-config.md). For production, front etcd with encryption-at-rest, restrict etcd network access to the gateway, or use AISIX Cloud's managed [Provider Key Rotation](../cloud/provider-key-rotation.md), where the secret stays in the control plane and only the projected reference reaches the data plane.
 :::
 
-```bash title="Create a BYO provider key"
+```shell
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
   -H "Authorization: Bearer YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
@@ -69,19 +72,22 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
   }'
 ```
 
-Field notes:
+Use any short `provider` label that makes sense for your environment, such as
+`vllm`, `sglang`, `ollama`, or `internal-proxy`. Do not set `provider` to
+`openai` unless the upstream is actually OpenAI; that label can allow fallback to
+the public OpenAI host if `api_base` is removed.
 
-- `provider` is a free-form vendor identity. Use any short label (`vllm`, `sglang`, `ollama`, `internal-proxy`); it is for your own readability and metrics. It must not be `openai` unless you genuinely point at OpenAI, because that would let the bridge fall back to the public OpenAI host if `api_base` were ever cleared.
-- `adapter` pins the wire shape to `openai`. For a BYO OpenAI-compatible endpoint this is the only valid value.
-- `api_base` is required and trusted verbatim.
+Set `adapter` to `openai` for a BYO OpenAI-compatible endpoint. Set `api_base`
+to the endpoint root your server expects, including `/v1` when that is part of
+the server's OpenAI-compatible route.
 
-Capture the returned `id` for the next step. The admin API returns a `ResourceEntry` with an `id` field; the [first-request quickstart](../quickstart/first-model-first-key-first-request.md#step-1-create-a-provider-key) shows a `jq`-capturing one-liner if you want to script it.
+Capture the returned `id` for the next step. The admin API returns a `ResourceEntry` with an `id` field; [Understand admin resources](../quickstart/first-model-first-key-first-request.md#inspect-the-resources) shows a `jq`-capturing one-liner if you want to script it.
 
-### Step 2: Create the model
+## Create a model
 
 Map a caller-facing alias to the upstream model id your endpoint serves.
 
-```bash title="Create a model for the BYO endpoint"
+```shell
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
   -H "Authorization: Bearer YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
@@ -101,15 +107,19 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
 - `model_name` is the upstream id your endpoint expects — for vLLM and SGLang this is the served model name; for Ollama it is the local model tag (for example `llama3.1:8b`).
 - `cost` is optional; see [BYO pricing](#byo-pricing) below.
 
-### Step 3: Create a caller API key
+## Create a caller API key
 
 The data plane stores `key_hash`, not plaintext. Hash a plaintext caller key, then create the key resource scoped to your new alias.
 
-```bash title="Hash a plaintext caller key"
-printf 'sk-demo-caller' | sha256sum | cut -d' ' -f1
+```shell
+if command -v sha256sum >/dev/null 2>&1; then
+  printf '%s' 'sk-demo-caller' | sha256sum | cut -d' ' -f1
+else
+  printf '%s' 'sk-demo-caller' | shasum -a 256 | awk '{print $1}'
+fi
 ```
 
-```bash title="Create a caller API key"
+```shell
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/apikeys \
   -H "Authorization: Bearer YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
@@ -119,11 +129,11 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/apikeys \
   }'
 ```
 
-### Step 4: Send a request
+## Send a Request
 
-Admin writes propagate to the proxy asynchronously; allow about a second, or poll `/v1/models` until the alias appears.
+Admin writes propagate to the proxy asynchronously. Before sending traffic, poll `/v1/models` until the alias appears for the caller key.
 
-```bash title="Send a chat completion to the BYO endpoint"
+```shell
 curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H "Authorization: Bearer sk-demo-caller" \
   -H "Content-Type: application/json" \
@@ -139,7 +149,7 @@ curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
 
 Catalog providers carry pricing from the models.dev catalog. A BYO endpoint is not in that catalog, so the gateway has no price for it unless you set one. Attach a `cost` block to the model to enable per-token budget accounting:
 
-```json title="Model cost block"
+```json
 {
   "cost": {
     "input_per_1k": 0.10,
@@ -151,16 +161,20 @@ Catalog providers carry pricing from the models.dev catalog. A BYO endpoint is n
 Both values are in USD per 1,000 tokens. `input_per_1k` applies to prompt tokens and `output_per_1k` to completion tokens; the gateway multiplies each token count by its rate and sums them. Both fields are required when the `cost` block is present.
 
 :::note Pricing is enforced in AISIX Cloud, not standalone
-The standalone OSS proxy stores `cost` but does not consult it at request time — it always emits `cost_usd=0.0`. Pricing-aware budget enforcement runs through the AISIX Cloud control plane, which reads the `cost` block when emitting usage events. Set `cost` on a BYO model so that a future managed deployment, or your own usage-event consumer, has the per-token rate available. See [Models § field notes](models.md#field-notes) and [Budgets](budgets.md).
+The standalone OSS proxy stores `cost` but does not consult it at request time —
+it emits `cost_usd=0.0` and leaves pricing calculation to the managed
+control-plane path. Set `cost` on a BYO model so a future managed deployment, or
+your own usage-event consumer, has the per-token rate available. See
+[Models](models.md#cost-metadata) and [Budgets](budgets.md).
 :::
 
-## Verification
+## Verify
 
 A `200` alone does not prove the gateway reached your endpoint and applied the alias contract. Verify the two observable facts that do.
 
 ### The alias is restored on `response.model`
 
-```bash title="Confirm response.model echoes your alias"
+```shell
 curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H "Authorization: Bearer sk-demo-caller" \
   -H "Content-Type: application/json" \
@@ -174,7 +188,7 @@ Expected: `"model":"llama-3-internal"` — your caller-facing alias, **not** the
 
 Confirm the request reached your server, not the public OpenAI host. Check your endpoint's access log for a `POST /v1/chat/completions` entry, or temporarily point `api_base` at an unreachable host and confirm the gateway returns an upstream error rather than a `200`:
 
-```bash title="Negative check — unreachable endpoint surfaces an upstream error"
+```shell
 curl -sS -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H "Authorization: Bearer sk-demo-caller" \
   -H "Content-Type: application/json" \
@@ -189,8 +203,9 @@ With a healthy endpoint, expect `200`. With `api_base` pointing at a dead host, 
 - A missing `api_base` on a non-`openai` vendor fails dispatch with a configuration error. Always set `api_base` for BYO.
 - Standalone deployments record but do not enforce `cost`; see [BYO pricing](#byo-pricing).
 
-## Related pages
+## Next steps
 
+- [Choose a provider upstream](../integration/provider-upstreams.md) — compare upstream setup paths.
 - [Provider keys](provider-keys.md) — the credential resource and the full `api_base` normalization rules.
 - [Models](models.md) — direct and routing model configuration, including the `cost` block.
 - [Adapter protocol families](../reference/adapters.md) — why a BYO OpenAI-compatible endpoint uses the `openai` adapter.

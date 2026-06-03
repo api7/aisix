@@ -4,62 +4,90 @@ description: Understand what AISIX Cloud adds on top of AISIX AI Gateway for man
 sidebar_position: 70
 ---
 
-AISIX Cloud adds a managed control plane on top of AISIX AI Gateway.
+AISIX Cloud adds a managed control plane for AISIX AI Gateway. Instead
+of managing every gateway resource through a local admin API, you manage
+organization and environment resources in Cloud and let the managed data
+plane receive projected configuration.
 
-Current Cloud-specific value includes:
+Use AISIX Cloud when you want AISIX gateway behavior with managed
+environment scope, certificate-based data-plane bootstrap, telemetry,
+budget workflows, and Cloud-side operational visibility.
 
-- organizations and environments
-- managed gateway certificate issuance
-- resource projection into the managed data plane
-- usage-event ingestion and billing workflows
-- control-plane-managed resilience paths
+## What Cloud adds to gateway operation
 
-Use AISIX Cloud when you want the gateway runtime but do not want every environment to be managed only through a local standalone admin API.
+AISIX Cloud adds these managed workflows on top of the gateway runtime:
 
-## Current Managed DP Boundary
+| Workflow | What Cloud owns | What the data plane does |
+| --- | --- | --- |
+| Organization and environment scope | Tenant and deployment boundaries | Serves the environment it is attached to. |
+| Gateway certificate issuance | Managed identity and trust material | Authenticates to `/dp/*` routes with mTLS. |
+| Resource projection | Environment-scoped resource state | Receives projected snapshots and serves traffic from them. |
+| Usage and budget workflows | Usage ingestion, billing workflows, and budget decisions | Emits telemetry and enforces returned budget decisions. |
+| Offline resilience | Control-plane recovery workflow | Continues serving from the current accepted snapshot during temporary connectivity loss. |
 
-Current AISIX Cloud managed data-plane behavior is centered on:
+The gateway still serves live AI traffic in the data plane. Cloud changes
+how resources are scoped, delivered, observed, and managed.
 
-- gateway certificate issuance through the control plane
-- mTLS-authenticated `/dp/*` routes
-- config propagation from the control plane into the data plane
+## How the managed path works
 
-That means the center of operational control moves from local admin writes to control-plane-managed environment state.
+```mermaid
+flowchart LR
+  user[Operator] --> cloud[AISIX Cloud]
+  cloud --> env[Environment resources]
+  cloud --> cert[Gateway certificate bundle]
+  cert --> dp[Managed data plane]
+  env --> project[Resource projection]
+  project --> dp
+  dp -->|"AI traffic"| providers[(AI providers)]
+  dp -->|"heartbeat and telemetry"| cloud
+```
 
-## Typical Customer Journey
+At a high level, the Cloud path is:
 
-At a high level, the current Cloud path looks like this:
+1. Create or select an organization and environment.
+2. Define environment-scoped gateway resources.
+3. Issue a gateway certificate bundle.
+4. Start the managed data plane with the Cloud bootstrap inputs.
+5. Wait for projection, heartbeat, and ready traffic flow.
 
-1. create or select an organization and environment
-2. define environment-scoped resources in the control plane
-3. issue a gateway certificate bundle for the managed data plane
-4. start the data plane with the managed bootstrap inputs
-5. wait for projection, heartbeat, and ready traffic flow
+## When to use Cloud
 
-## When To Choose Cloud
+Choose AISIX Cloud when:
 
-- you want control-plane-managed environments
-- you want managed certificate issuance and mTLS-managed data-plane flows
-- you want Cloud-side usage-event, billing, and budget workflows
+- you want environment-scoped gateway management
+- you do not want to expose or operate the standalone admin API as the
+  primary management surface
+- you want managed certificate issuance and mTLS data-plane workflows
+- you want Cloud-side usage, billing, and budget features
 
-## What Cloud Does Not Mean
+Choose self-hosted AISIX when you want direct local ownership of the
+gateway process, etcd, bootstrap config, and admin API.
 
-It does not mean every control-plane feature is identical to the standalone data-plane execution path.
+## Important boundaries
 
-The clearest example today is the Cloud playground, which is preview-oriented and does not represent the full managed data-plane path.
+Cloud and self-hosted deployments share the gateway runtime, but they do
+not have the same operational model. In Cloud mode, the control plane
+projects resources into the data plane asynchronously. A saved resource
+in Cloud is not the same event as that resource being active on a
+specific data-plane instance.
 
-## Troubleshooting Pointers
+The Cloud playground also has its own boundary: it is useful for preview
+checks, but it does not exercise every managed data-plane feature such as
+routing, cache, guardrails, and rate limits.
 
-### The managed data plane is running but does not reflect recent control-plane changes
+When debugging Cloud-managed behavior, confirm three things before
+changing resource definitions:
 
-Treat that first as a projection or propagation issue, not as a generic proxy failure.
+1. The resource belongs to the environment served by the data plane.
+2. The managed data plane is healthy and connected.
+3. The live request is sent through the managed data-plane endpoint, not
+   only through a preview surface.
 
-### The Cloud playground behaves differently from live DP traffic
+## Next steps
 
-That is expected with the current product boundary.
-
-## Related Pages
-
-- [Organizations And Environments](organizations-and-environments.md)
-- [Gateway Certificates And Managed DP](gateway-certificates-and-managed-dp.md)
-- [Cloud Vs Self-Hosted](cloud-vs-self-hosted.md)
+- [Organizations and environments](/ai-gateway/cloud/organizations-and-environments)
+  explains Cloud resource scope.
+- [Gateway certificates and managed data plane](/ai-gateway/cloud/gateway-certificates-and-managed-dp)
+  explains managed bootstrap.
+- [Cloud vs. self-hosted](/ai-gateway/cloud/cloud-vs-self-hosted)
+  compares the two operating models.

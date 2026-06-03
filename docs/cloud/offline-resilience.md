@@ -1,40 +1,68 @@
 ---
 title: Offline Resilience
-description: Understand the current AISIX Cloud and managed data-plane offline-resilience behavior.
+description: Understand AISIX Cloud and managed data-plane behavior during temporary control-plane connectivity loss.
 sidebar_position: 77
 ---
 
-AISIX Cloud and the managed data plane are designed so that transient control-plane loss does not immediately erase the data plane's ability to serve from its current config state.
+AISIX Cloud and the managed data plane are designed so that temporary
+control-plane connectivity loss does not immediately remove the data
+plane's ability to serve from its current accepted configuration.
 
-Current resilience signals in code and e2e coverage include:
+Once a managed data plane has a valid projected snapshot, it can continue
+serving live traffic from that snapshot while Cloud connectivity is being
+restored.
 
-- on-disk snapshot cache behavior
-- serving from previously projected config while control-plane paths are unavailable
-- heartbeat and managed connectivity recovering when the control plane comes back
+## What remains available
 
-## What This Means Operationally
+During a temporary control-plane outage, the managed data plane can keep
+serving requests from its current projected configuration. That includes
+the models, keys, policies, and routing state already accepted by the
+data plane.
 
-The managed data plane should not depend on a perfectly available control plane for every request once it has a valid projected snapshot.
+On restart, the data plane can use its persisted snapshot state while it
+reconnects. This helps avoid turning every transient Cloud connectivity
+issue into an immediate traffic outage.
 
-That gives operators two important properties:
+## What still depends on Cloud
 
-- transient control-plane issues do not necessarily mean immediate traffic outage
-- recovery should preserve the ability to resume heartbeat and control-plane coordination when connectivity returns
+Offline resilience does not make the control plane optional. These
+workflows still depend on restoring managed connectivity:
 
-## What Offline Resilience Does Not Mean
+- new configuration changes
+- projection of updated environment resources
+- certificate rotation workflows
+- usage telemetry delivery
+- fresh budget decisions from Cloud
+- heartbeat and managed health reporting
 
-It does not mean the control plane is irrelevant.
-
-New configuration changes, billing-oriented workflows, certificate rotation, and fresh control-plane decisions still depend on restoring the managed connection.
+Use offline resilience as a continuity mechanism for already-projected
+state, not as a long-term disconnected operating mode.
 
 ## Troubleshooting
 
-### Traffic still flows during control-plane loss, but new changes do not apply
+### Traffic still flows, but new changes do not apply
 
-That is consistent with the current resilience model.
+That is consistent with the resilience model. The data plane can serve
+from its current snapshot while new projected state waits for Cloud
+connectivity to recover.
 
-## Related Pages
+Check:
 
-- [Resource Projection](resource-projection.md)
-- [Gateway Certificates And Managed DP](gateway-certificates-and-managed-dp.md)
-- [Troubleshooting](../operations/troubleshooting.md)
+1. Connectivity from the data plane to the data-plane-manager endpoint.
+2. Certificate validity and trust chain.
+3. Heartbeat recovery.
+4. Projection status after connectivity returns.
+
+### Usage or budget state looks delayed
+
+Check telemetry delivery and budget-check connectivity. Live request
+success does not prove that every Cloud-side workflow is healthy.
+
+## Next steps
+
+- [Resource projection](/ai-gateway/cloud/resource-projection) explains
+  how new Cloud state reaches live traffic.
+- [Gateway certificates and managed data plane](/ai-gateway/cloud/gateway-certificates-and-managed-dp)
+  explains managed connectivity and mTLS bootstrap.
+- [Troubleshooting](/ai-gateway/operations/troubleshooting) lists common
+  diagnosis steps.

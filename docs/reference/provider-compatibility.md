@@ -1,83 +1,104 @@
 ---
-title: Provider compatibility
-description: Reference for current adapter-family coverage and compatibility boundaries in AISIX AI Gateway — which wire shape backs each provider and what each family supports.
+title: Provider Compatibility
+description: Reference for current proxy endpoint support and provider compatibility boundaries in AISIX AI Gateway.
 sidebar_position: 64
 ---
 
-This page is the lookup reference for which upstreams AISIX AI Gateway can reach and what each one currently supports. Compatibility is organized around the five [adapter protocol families](adapters.md), not a flat provider list: every upstream — catalog or bring-your-own — resolves to exactly one adapter, and the adapter determines the wire shape and the supported endpoints.
+This reference shows which proxy endpoints can be used with a
+provider-backed model.
 
-## Adapter families
+AISIX has two compatibility layers:
 
-The gateway encodes requests against a closed set of five adapter families. Vendor identity (`provider`) is a free-form string; the adapter is the closed enum that picks the bridge.
+- **Adapter families** decide how chat-style requests are encoded for upstream providers. See [Adapter protocol families](adapters.md).
+- **Endpoint gates** decide whether a specific proxy route accepts the resolved model at all.
 
-| Adapter | Upstream wire shape | Example upstreams |
-|---|---|---|
-| `openai` | OpenAI chat completions | OpenAI, plus every OpenAI-compatible vendor (DeepSeek, Groq, Mistral, Together.ai, Fireworks, Perplexity, …) and BYO endpoints (vLLM, SGLang, Ollama) |
-| `anthropic` | Anthropic Messages | Anthropic (Claude) |
-| `bedrock` | AWS Bedrock Runtime (Converse + Anthropic `/invoke`) | Claude, and other Bedrock publishers via Converse |
-| `vertex` | Google Vertex AI Gemini | Gemini on Vertex |
-| `azure-openai` | Azure OpenAI Service | Azure OpenAI deployments |
+That distinction matters. A model can work on `/v1/chat/completions` and still be rejected on `/v1/responses`, `/v1/images/generations`, or `/v1/rerank`.
 
-The `openai` family is the broadest: any vendor or self-hosted server that speaks the OpenAI chat-completions wire dispatches through it, differing only in `api_base` and credential. See [OpenAI-compatible vendor upstream](../integration/upstream-openai-compat.md) and [Bring your own endpoint](../configuration/byo-endpoint.md).
+## Start with this quick check
 
-## Coverage matrix
+Start here when choosing a route.
 
-Support depth varies by adapter family. The matrix below summarizes the current state; each integration guide documents the exact behavior.
+| If you need | Use | Current provider boundary |
+| --- | --- | --- |
+| Broad chat compatibility | `/v1/chat/completions` | OpenAI, Anthropic, Bedrock, Vertex, Azure OpenAI, and OpenAI-compatible providers through their configured adapter. |
+| Anthropic-style clients | `/v1/messages` | Anthropic upstreams natively; non-Anthropic upstreams through translation with narrower feature coverage. |
+| Streaming chat | `/v1/chat/completions` or `/v1/messages` with `stream: true` | Same provider boundary as the chosen endpoint. Streaming uses the first selected target and does not fail over mid-stream. |
+| Embeddings | `/v1/embeddings` | OpenAI-family bridge support. Other bridges return `501 not_implemented` unless they implement embeddings later. |
+| OpenAI Responses API | `/v1/responses` | OpenAI provider only. OpenAI-compatible vendors are not enough unless the model's `provider` is `openai`. |
+| Image generation | `/v1/images/generations` | OpenAI provider only. |
+| Audio | `/v1/audio/transcriptions`, `/v1/audio/translations`, `/v1/audio/speech` | OpenAI-style upstream audio routes. AISIX forwards the audio shape; it does not translate audio across provider families. |
+| Rerank | `/v1/rerank` | OpenAI, Cohere, and Jina provider labels. |
+| Provider-native routes | `/passthrough/:provider/*rest` | Any configured provider key, with less gateway normalization. |
 
-| Capability | `openai` | `anthropic` | `bedrock` | `vertex` | `azure-openai` |
-|---|---|---|---|---|---|
-| Chat completions | Yes | Yes (Messages) | Yes | Yes (Gemini) | Yes |
-| Streaming (SSE) | Yes | Yes | Yes | Yes (Gemini) | Yes |
-| Embeddings | Yes (OpenAI / OpenAI-compatible) | No | No | No | No |
-| Images, audio, responses | Yes (OpenAI / OpenAI-compatible) | No | No | No | No |
-| Rerank | Yes (Cohere / Jina native surface) | No | No | No | No |
+## Broad chat routes
 
-Notes on the matrix:
+`POST /v1/chat/completions` is the broadest proxy route. It accepts OpenAI-shaped caller requests, resolves the model alias, dispatches through the configured provider key, and returns an OpenAI-shaped chat-completions response.
 
-- The image, audio, `/v1/responses`, and embeddings endpoints are gated to OpenAI-shaped upstreams. A request that resolves to a non-OpenAI model on those endpoints is rejected rather than mis-dispatched. The gate keys on the literal `provider: "openai"` (plus the OpenAI embeddings/native surfaces), **not** the whole `openai` adapter family — an OpenAI-compatible vendor (for example a DeepSeek model on the `openai` adapter) works on `/v1/chat/completions` but is rejected on `/v1/responses`, images, and audio.
-- `/v1/rerank` is served by the Cohere and Jina native rerank surfaces, which bypass the chat bridge; it is keyed on the model's `provider`.
-- `/v1/messages` accepts non-Anthropic models through a cross-provider translation path; see [Anthropic Messages](../integration/anthropic-messages.md).
+For non-OpenAI upstreams, the provider-facing request is not necessarily OpenAI-shaped. Bedrock, Vertex, Azure OpenAI, and Anthropic-backed models use their own bridge behavior behind the gateway.
 
-## Per-family limitations
+Streaming chat uses server-sent events. It follows the same model resolution rules as non-streaming chat, but streaming requests use the first selected target and do not fail over mid-stream.
 
-- **`openai`** — vendor-specific response extensions beyond the OpenAI envelope are not normalized. Reasoning-style fields can be lifted per key via the `response.reasoning_field` override (see [Provider key schema § response overrides](runtime-config-schema.md#response-overrides)).
-- **`anthropic`** — the family speaks the Messages wire; it is not the OpenAI embeddings/images/audio surface.
-- **`bedrock`** — Anthropic-on-Bedrock (Claude) models dispatch through the legacy `/invoke` route with an Anthropic Messages body; all other publishers use the unified Converse API. Cross-region inference profile prefixes (`us.`, `eu.`, `apac.`, `global.`, `us-gov.`) are supported. See [AWS Bedrock upstream](../integration/upstream-bedrock.md).
-- **`vertex`** — Gemini chat and streaming are wired. **Anthropic-on-Vertex and Llama-on-Vertex are not yet implemented.** See [Google Vertex AI upstream § Limitations](../integration/upstream-vertex.md#limitations) and the [Roadmap](../roadmap.md).
-- **`azure-openai`** — chat and streaming are wired for both the `api-key` and the Entra ID (AAD) `client_credentials` auth schemes. See [Azure OpenAI upstream](../integration/upstream-azure-openai.md).
+## Provider-specific routes
 
-## Featured versus non-featured catalog providers
+Some proxy routes intentionally stay narrow because their upstream API shape is provider-specific.
 
-In AISIX Cloud, the catalog distinguishes **featured** providers (the ranked set the dashboard surfaces first) from non-featured (Community) providers. Featured status affects discovery and presentation only — both featured and non-featured providers resolve to one of the five adapters through the same catalog mapping and run through the same bridges. The self-hosted gateway ships no catalog and has no featured concept; you set `provider`, `adapter`, and `api_base` on each provider key yourself. See [Adapter protocol families § Catalog versus bring-your-own](adapters.md#catalog-versus-bring-your-own).
+### OpenAI-only routes
 
-## Compatibility boundary
+`POST /v1/responses` and `POST /v1/images/generations` require the resolved model to have `provider: "openai"`.
 
-Provider support is not identical across every endpoint and behavior surface.
+This is stricter than using the `openai` adapter. For example, an OpenAI-compatible vendor can work on `/v1/chat/completions` with `adapter: "openai"` and still be rejected on `/v1/responses` or `/v1/images/generations` if its provider label is not `openai`.
 
-Current reference point:
+### OpenAI-style forwarding routes
 
-- the gateway exposes a mixed OpenAI-compatible and Anthropic-style surface
-- support depth varies by adapter family and endpoint
+`POST /v1/embeddings` uses the bridge `embed` implementation. The OpenAI bridge implements embeddings today; bridges that keep the default implementation return `501 not_implemented`.
 
-This means provider compatibility is not a single yes/no question.
+The audio endpoints forward OpenAI-style audio requests to the resolved provider base URL and return the upstream response shape. Use them with upstreams that expose matching OpenAI-style audio routes.
 
-The real questions are:
+### Rerank
 
-- which endpoint family are you using
-- which adapter backs the resolved model
-- whether the path is provider-native or translated
+`POST /v1/rerank` bypasses the chat bridge and is keyed on the model's `provider` label. The current accepted provider labels are `openai`, `cohere`, and `jina`.
 
-## Practical reading guide
+### Anthropic Messages
 
-- start with integration docs for endpoint-family behavior
-- use the feature matrix for current breadth versus limited support
-- use roadmap items for parity you expect but do not yet see documented
+`POST /v1/messages` accepts Anthropic models natively and accepts non-Anthropic models through translation. Use this route when the caller is already built around the Anthropic Messages API. For OpenAI-style clients, prefer `/v1/chat/completions`.
 
-Use the feature matrix and integration docs as the current contract, and treat broader provider parity as ongoing work.
+## Check these compatibility boundaries
 
-## Related pages
+Provider compatibility is not a single yes-or-no question. Check all of these before depending on a path:
+
+**Caller endpoint family**
+
+The caller route determines whether the request enters an OpenAI-compatible, Anthropic-style, rerank, audio, or passthrough path.
+
+**Adapter behind the resolved model**
+
+The adapter determines the upstream wire shape and bridge capability.
+
+**Provider-native versus translated path**
+
+Some routes forward the provider's native shape. Others translate between API families. Translation support is narrower than native forwarding.
+
+**Provider-specific response extensions**
+
+Vendor-specific response extensions beyond the OpenAI envelope are not normalized. Reasoning-style fields can be lifted per key through the `response.reasoning_field` override. See [Provider key schema](provider-key-schema.md#runtime-overrides).
+
+**Usage accounting**
+
+Usage events vary by endpoint and upstream response. For example, non-streaming Responses API requests emit usage when the upstream response includes a recognized `usage` block; streaming Responses API requests are passed through without stream parsing on this path today.
+
+## Featured and community catalog providers
+
+In AISIX Cloud, the catalog distinguishes **featured** providers from community providers. Featured status affects discovery and dashboard presentation only.
+
+Both featured and community providers resolve to one of the adapter families and run through the same bridge path. The self-hosted gateway has no provider catalog and no featured concept; configure `provider`, `adapter`, and `api_base` on each provider key yourself. See [Adapter protocol families](adapters.md#catalog-and-bring-your-own-providers).
+
+## How to use this reference
+
+Start with the integration doc for the caller endpoint family. Then check this page for the endpoint gate. Finally, use [Feature Status](../overview/feature-matrix.md) for the current product boundary.
+
+## Next steps
 
 - [Adapter protocol families](adapters.md) — the five families and how a model resolves to a bridge.
-- [Feature Matrix](../overview/feature-matrix.md)
-- [OpenAI-Compatible API](../integration/openai-compatible-api.md)
-- [Roadmap](../roadmap.md)
+- [Proxy API reference](proxy-api-reference.md)
+- [Feature Status](../overview/feature-matrix.md)
+- [OpenAI-compatible API](../integration/openai-compatible-api.md)

@@ -2,9 +2,10 @@
 title: Quickstart
 description: Run AISIX AI Gateway locally, create your first model and API key, and send your first proxy request.
 sidebar_position: 10
+slug: /quickstart
 ---
 
-This quickstart walks you through running AISIX AI Gateway locally, configuring the minimum resources required for traffic, and sending your first request through the proxy.
+This quickstart shows you how to run AISIX AI Gateway locally, configure the minimum resources required for traffic, and send one request through the proxy.
 
 By the end of this guide, you will have:
 
@@ -13,86 +14,129 @@ By the end of this guide, you will have:
 3. Verified that the proxy can see the configured model.
 4. Sent a request through the OpenAI-compatible API.
 
-**Time to complete**: about 15 minutes if Rust is already installed. Allow longer for the first Rust build.
+**Time to complete**: about 10 minutes.
 
-## Before You Start
+## Request path
 
-This page is the main first-user path for the self-hosted gateway.
+The first working request path needs three dynamic resources:
 
-If you only want to verify local bootstrap, use [Boot A Self-Hosted Gateway](self-hosted.md) instead.
+```text
+caller key -> model alias -> provider key -> upstream model
+```
 
-If you want the same first-request flow with more explanation about each admin resource and the failure modes to verify, continue to [First Model, First Key, First Request](first-model-first-key-first-request.md) after you finish this page.
+In this quickstart:
+
+- `sk-demo-caller` is the caller key your application sends to AISIX.
+- `gpt-4o-prod` is the model alias your application uses on the proxy API.
+- `openai-upstream` is the provider key AISIX uses to call OpenAI.
+- `gpt-4o-mini` is the upstream model AISIX sends to OpenAI.
+
+The caller never sends the upstream provider key. AISIX keeps that credential on the provider side of the gateway.
 
 ## Prerequisites
 
-| Requirement | Notes |
-|---|---|
-| Git | Needed to clone the repository. |
-| Rust | Install through [rustup](https://rustup.rs). The repo pins its toolchain in `rust-toolchain.toml`. |
-| Docker | Used to run a local etcd instance. |
-| curl | Used to verify the admin and proxy APIs. |
-| Upstream provider API key | Required for the final successful LLM request. OpenAI is used in the example below. |
+Before you start, make sure you have:
 
-## Step 1: Clone the repository
+- Docker with Docker Compose, used to run AISIX AI Gateway and etcd locally.
+- `curl`, used to verify the admin and proxy APIs.
+- `jq`, used to capture IDs from admin API responses.
+- An upstream provider API key. This guide uses OpenAI for the final LLM request.
 
-```bash title="Clone the repository"
-git clone https://github.com/api7/ai-gateway.git
-cd ai-gateway
+## Step 1: Create a working directory
+
+```shell
+mkdir aisix-quickstart
+cd aisix-quickstart
 ```
 
-## Step 2: Start etcd
+## Step 2: Create a local config
 
-Start a local etcd 3.5 instance in Docker. AISIX AI Gateway uses etcd as its configuration store in self-hosted mode.
+Create `config.yaml` for the local gateway container:
 
-```bash title="Start etcd"
-docker run -d \
-  --name aisix-etcd \
-  -p 2379:2379 \
-  -p 2380:2380 \
-  quay.io/coreos/etcd:v3.5.18 \
-  /usr/local/bin/etcd \
-  --advertise-client-urls=http://0.0.0.0:2379 \
-  --listen-client-urls=http://0.0.0.0:2379
+```yaml title="config.yaml"
+etcd:
+  endpoints:
+    - "http://etcd:2379"
+  prefix: "/aisix"
+  dial_timeout_ms: 5000
+  request_timeout_ms: 5000
+
+proxy:
+  addr: "0.0.0.0:3000"
+  request_body_limit_bytes: 10485760
+
+admin:
+  addr: "0.0.0.0:3001"
+  admin_keys:
+    - "admin-local-only-change-me"
+
+observability:
+  service_name: "aisix"
+  log_level: "info"
+  access_log: true
+
+cache:
+  backend: "memory"
 ```
 
-Verify that the container is running:
+AISIX uses etcd as its configuration store in self-hosted mode. In this Compose stack, the gateway reaches etcd through the service name `etcd`.
 
-```bash title="Check the etcd container"
-docker ps --filter name=aisix-etcd
+## Step 3: Create the Compose stack
+
+Create `docker-compose.yml`:
+
+```yaml title="docker-compose.yml"
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    command:
+      - /usr/local/bin/etcd
+      - --advertise-client-urls=http://0.0.0.0:2379
+      - --listen-client-urls=http://0.0.0.0:2379
+    ports:
+      - "2379:2379"
+
+  aisix:
+    image: ghcr.io/api7/ai-gateway:dev
+    volumes:
+      - ./config.yaml:/etc/aisix/config.yaml:ro
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+    depends_on:
+      - etcd
 ```
 
-## Step 3: Create a local config
-
-Copy the example configuration:
-
-```bash title="Create a local config"
-cp config.example.yaml config.yaml
-```
-
-The example configuration already points at local etcd and binds:
-
-- proxy listener on `127.0.0.1:3000`
-- admin listener on `127.0.0.1:3001`
-
-If either port is already in use on your machine, update `proxy.addr` or `admin.addr` in `config.yaml` before starting the gateway.
+:::note
+`ghcr.io/api7/ai-gateway:dev` tracks the `main` branch. For a reproducible deployment, pin a released version tag once one is available.
+:::
 
 ## Step 4: Start the gateway
 
-```bash title="Run the gateway"
-cargo run -p aisix-server --bin aisix -- --config config.yaml
+```shell
+docker compose up -d
 ```
 
-The first run downloads dependencies and compiles the workspace, so it can take several minutes. Keep this terminal open while the gateway is running.
+Verify that both containers are running:
+
+```shell
+docker compose ps
+```
+
+The gateway exposes:
+
+- proxy listener on `http://127.0.0.1:3000`
+- admin listener on `http://127.0.0.1:3001`
 
 ## Step 5: Verify the listeners
 
 In a new terminal, verify that both listeners are healthy:
 
-```bash title="Check the proxy listener"
+```shell
 curl -sS http://127.0.0.1:3000/livez
 ```
 
-```bash title="Check the admin listener"
+```shell
 curl -sS http://127.0.0.1:3001/livez
 ```
 
@@ -102,21 +146,21 @@ Expected response:
 ok
 ```
 
-If you only want to verify local bootstrap, you can stop here. The remaining steps configure a real provider-backed request path.
+The remaining steps configure a real provider-backed request path.
 
 ## Step 6: Export your local variables
 
 Export the values used by the remaining commands:
 
-```bash title="Set local variables"
+```shell
 export AISIX_ADMIN_KEY="admin-local-only-change-me"
 export OPENAI_API_KEY="YOUR_OPENAI_API_KEY"
 export CALLER_KEY="sk-demo-caller"
 ```
 
-Replace `YOUR_OPENAI_API_KEY` with a real upstream key. Without a valid provider credential, the admin resources below can still be created, but the final proxy request will fail at the upstream call.
+Replace `YOUR_OPENAI_API_KEY` with a real upstream key. Without a valid provider credential, the admin resources can still be created, but the final proxy request will fail when AISIX calls the upstream provider.
 
-The remaining steps create three distinct resources:
+The remaining steps create three resources:
 
 - a **provider key** for the upstream credential
 - a **model alias** that callers use on the proxy API
@@ -124,29 +168,35 @@ The remaining steps create three distinct resources:
 
 ## Step 7: Create a provider key
 
-```bash title="Create a provider key"
-curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
+```shell
+PROVIDER_KEY_ID=$(curl -sS -X POST http://127.0.0.1:3001/admin/v1/provider_keys \
   -H "Authorization: Bearer ${AISIX_ADMIN_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "display_name": "openai-upstream",
+    "provider": "openai",
+    "adapter": "openai",
     "secret": "'"${OPENAI_API_KEY}"'",
     "api_base": "https://api.openai.com/v1"
-  }'
+  }' | jq -r .id)
 ```
 
-This creates the upstream credential the gateway will use when it forwards requests to OpenAI.
+This creates the upstream credential AISIX uses when it forwards requests to OpenAI and stores the returned resource ID in `PROVIDER_KEY_ID`.
 
-Copy the returned `id` field and export it:
+:::warning Production credentials
+In standalone self-hosted mode, AISIX stores provider-key `secret` values as plaintext under the configured etcd `prefix`. For production, protect etcd with the same care as any secret store, including encryption at rest and restricted access. In AISIX Cloud managed deployments, provider credentials are managed by the control plane and projected to data planes.
+:::
 
-```bash title="Capture the provider key id"
-export PROVIDER_KEY_ID="YOUR_PROVIDER_KEY_ID"
-```
+:::note Provider base URL
+This quickstart uses OpenAI, so `api_base` is `https://api.openai.com/v1`. Do not reuse that value for every provider. Provider base URL requirements differ; see [Provider keys](../configuration/provider-keys.md#base-url) and [URL normalization](../configuration/provider-keys.md#url-normalization).
+:::
 
 ## Step 8: Create a model alias
 
-```bash title="Create a model"
-curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
+In this resource, `display_name` is the model alias callers send to AISIX. `model_name` is the upstream model ID that AISIX sends to the provider.
+
+```shell
+MODEL_ID=$(curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
   -H "Authorization: Bearer ${AISIX_ADMIN_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
@@ -154,73 +204,76 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
     "provider": "openai",
     "model_name": "gpt-4o-mini",
     "provider_key_id": "'"${PROVIDER_KEY_ID}"'"
-  }'
+  }' | jq -r .id)
 ```
 
-Copy the returned `id` field and export it:
-
-```bash title="Capture the model id"
-export MODEL_ID="YOUR_MODEL_ID"
-```
-
-Clients will use `gpt-4o-prod` as the `model` value on the proxy API.
+Clients will use `gpt-4o-prod` as the `model` value on the proxy API. The upstream provider receives `gpt-4o-mini`.
 
 ## Step 9: Create a caller API key
 
 AISIX stores a hash of the caller key rather than the plaintext value. Hash the caller key first:
 
-```bash title="Hash the caller key"
-CALLER_KEY_HASH=$(printf '%s' "${CALLER_KEY}" | shasum -a 256 | awk '{print $1}')
+```shell
+if command -v sha256sum >/dev/null 2>&1; then
+  CALLER_KEY_HASH=$(printf '%s' "${CALLER_KEY}" | sha256sum | cut -d' ' -f1)
+else
+  CALLER_KEY_HASH=$(printf '%s' "${CALLER_KEY}" | shasum -a 256 | awk '{print $1}')
+fi
 ```
 
 Then create the API key resource:
 
-```bash title="Create the caller API key"
-curl -sS -X POST http://127.0.0.1:3001/admin/v1/apikeys \
+```shell
+APIKEY_ID=$(curl -sS -X POST http://127.0.0.1:3001/admin/v1/apikeys \
   -H "Authorization: Bearer ${AISIX_ADMIN_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "key_hash": "'"${CALLER_KEY_HASH}"'",
     "allowed_models": ["gpt-4o-prod"]
-  }'
+  }' | jq -r .id)
 ```
 
-Copy the returned `id` field and export it:
+Verify that all three resource IDs were captured:
 
-```bash title="Capture the API key id"
-export APIKEY_ID="YOUR_APIKEY_ID"
+```shell
+printf 'provider key: %s\nmodel: %s\napi key: %s\n' \
+  "${PROVIDER_KEY_ID}" "${MODEL_ID}" "${APIKEY_ID}"
 ```
 
-## Step 10: Wait for propagation
+If any value is empty or `null`, check the previous command output for an `error_msg` before continuing.
+
+## Step 10: Verify model visibility
 
 The admin API writes to etcd first. The proxy picks up those changes through the watch-driven snapshot path.
 
-For local setup, a short wait is usually enough:
+Poll `/v1/models` until the model alias is visible to the caller key:
 
-```bash title="Wait for propagation"
-sleep 1
+```shell
+MODEL_VISIBLE=false
+for i in $(seq 1 20); do
+  if curl -sS http://127.0.0.1:3000/v1/models \
+    -H "Authorization: Bearer ${CALLER_KEY}" \
+    | jq -e '.data[]? | select(.id == "gpt-4o-prod")' >/dev/null; then
+    MODEL_VISIBLE=true
+    echo "model alias is visible"
+    break
+  fi
+  sleep 0.5
+done
+
+if [ "${MODEL_VISIBLE}" != "true" ]; then
+  echo "model alias is not visible yet; check the admin resources and proxy logs" >&2
+fi
 ```
 
-## Step 11: Verify model visibility
+Optionally inspect the caller-visible model list:
 
-```bash title="Check /v1/models"
+```shell
 curl -sS http://127.0.0.1:3000/v1/models \
   -H "Authorization: Bearer ${CALLER_KEY}"
 ```
 
-Expected response shape:
-
-```json
-{
-  "object": "list",
-  "data": [
-    {
-      "id": "gpt-4o-prod",
-      "object": "model"
-    }
-  ]
-}
-```
+The response should include `gpt-4o-prod`.
 
 At this point, you have verified that:
 
@@ -228,9 +281,11 @@ At this point, you have verified that:
 - the admin API accepted your resources
 - the proxy can see the resolved model alias
 
-## Step 12: Send your first proxy request
+You have not called the upstream provider yet. `/v1/models` proves that caller authentication, model allowlisting, and configuration propagation are working. The next step sends real AI traffic through the provider key.
 
-```bash title="Send a chat completion request"
+## Step 11: Send your first proxy request
+
+```shell
 curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H "Authorization: Bearer ${CALLER_KEY}" \
   -H "Content-Type: application/json" \
@@ -242,45 +297,20 @@ curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
   }'
 ```
 
-With a valid upstream provider key, the response follows the OpenAI chat-completions shape.
+With a valid upstream provider key, the response follows the OpenAI chat-completions shape and includes the model alias `gpt-4o-prod`.
 
 The gateway authenticates to the upstream provider with the provider key you created earlier, while the caller authenticates to AISIX with the caller API key. This separation is one of the core operating patterns in AISIX AI Gateway.
 
-## Clean up
-
-Delete the created resources in reverse dependency order:
-
-```bash title="Delete the caller API key"
-curl -sS -X DELETE http://127.0.0.1:3001/admin/v1/apikeys/${APIKEY_ID} \
-  -H "Authorization: Bearer ${AISIX_ADMIN_KEY}"
-```
-
-```bash title="Delete the model"
-curl -sS -X DELETE http://127.0.0.1:3001/admin/v1/models/${MODEL_ID} \
-  -H "Authorization: Bearer ${AISIX_ADMIN_KEY}"
-```
-
-```bash title="Delete the provider key"
-curl -sS -X DELETE http://127.0.0.1:3001/admin/v1/provider_keys/${PROVIDER_KEY_ID} \
-  -H "Authorization: Bearer ${AISIX_ADMIN_KEY}"
-```
-
-Then stop the local etcd container:
-
-```bash title="Stop etcd"
-docker rm -f aisix-etcd
-```
+Keep this local stack and these resources running if you want to continue through the next docs. The follow-up pages reuse the same caller key and model alias.
 
 ## Next steps
 
-Follow the docs in this order if you want to keep going:
+Follow the docs in this order:
 
-1. [First Model, First Key, First Request](first-model-first-key-first-request.md) for the same flow with more detail about the resource contract, propagation behavior, and negative-path checks.
-2. [OpenAI SDK Quickstart](openai-sdk.md) if your application already uses the OpenAI SDK.
-3. [Anthropic SDK Quickstart](anthropic-sdk.md) if your application expects the Anthropic-style `messages` API.
-4. [OpenAI-Compatible API](../integration/openai-compatible-api.md) for the broader proxy contract.
-5. [Bootstrap Configuration](../configuration/bootstrap-config.md) before adapting the local config for a shared environment.
+1. [Understand admin resources](first-model-first-key-first-request.md) to inspect the resource chain, propagation behavior, negative-path checks, and cleanup.
+2. [What is AISIX AI Gateway](../overview/what-is-aisix-ai-gateway.md) to understand where the gateway fits and when to use it instead of direct provider integrations or AI plugins on normal API gateway routes.
+3. [Client APIs overview](../integration/overview.md) to choose the caller-facing API surface for your application.
+4. [Configuration overview](../configuration/overview.md) before adapting the local config for a shared environment.
+5. [Operations overview](../operations/overview.md) when you are preparing a runtime for real traffic.
 
-- [Boot A Self-Hosted Gateway](self-hosted.md) for the narrower bootstrap-only flow.
-- [First Model, First Key, First Request](first-model-first-key-first-request.md) for a deeper walkthrough of the admin resources.
-- [OpenAI SDK Quickstart](openai-sdk.md) if you want to switch from `curl` to an SDK client.
+If you want to build and run the gateway from source, use [Boot a self-hosted gateway](self-hosted.md).

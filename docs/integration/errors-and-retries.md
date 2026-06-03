@@ -1,21 +1,19 @@
 ---
-title: Errors And Retries
-description: Understand the shared proxy error envelope, endpoint-specific status boundaries, and retry behavior on AISIX AI Gateway.
-sidebar_position: 30
+title: Errors and Retries
+description: Understand proxy error envelopes, upstream error mapping, and retry behavior in AISIX AI Gateway.
+sidebar_position: 24
 ---
 
-AISIX AI Gateway uses a shared proxy error envelope across its client-facing proxy endpoints.
+AISIX AI Gateway returns protocol-shaped errors to callers. Most proxy endpoints
+use an OpenAI-compatible error envelope; Anthropic Messages uses an
+Anthropic-shaped envelope.
 
-Use this page to understand what a caller should do after a failed request, not just what status code was returned.
+This guide explains whether a caller should fix the request, change
+configuration, back off, or retry.
 
-**Exceptions:**
+## Proxy error envelope
 
-- errors on `POST /v1/messages` use the Anthropic-shape envelope instead of the OpenAI envelope — see [Anthropic Messages — Error Shape](anthropic-messages.md#error-shape) for the shape and the gateway's emitted type-string subset.
-- errors on `ANY /passthrough/:provider/*rest` are forwarded from the upstream provider verbatim after the proxy's own auth and provider resolution complete — see [Provider Passthrough](passthrough.md).
-
-## Error Envelope
-
-The proxy returns an OpenAI-compatible error body:
+Most proxy endpoints return an OpenAI-compatible body:
 
 ```json
 {
@@ -28,30 +26,52 @@ The proxy returns an OpenAI-compatible error body:
 }
 ```
 
-In practice, `param` and `code` are omitted when they are not set, so client code should not assume those fields are always present.
+`param` and `code` are omitted when they are not set. Client code should not
+assume those fields are always present.
 
-The admin surface (`/admin/v1/*`) uses a **different**, simpler envelope: `{"error_msg": "..."}`. Treat them as distinct contracts — the proxy envelope is the OpenAI-compatible one above; the admin envelope is operator-facing.
+`POST /v1/messages` and `POST /v1/messages/count_tokens` use the Anthropic error
+shape instead. See [Anthropic-style Messages API](anthropic-messages.md#error-shape).
 
-## Gateway Status Codes And Error Types
+`ANY /passthrough/:provider/*rest` keeps the upstream status and body after proxy
+authentication and provider resolution complete. See [Provider passthrough](passthrough.md).
 
-The proxy emits the following gateway-generated failures. The `error.type` strings are stable and match upstream OpenAI conventions where possible:
+The admin API is a separate operator surface and uses `{"error_msg": "..."}`.
+Do not treat admin and proxy errors as the same contract.
 
-| Status | `error.type`             | Trigger |
-|--------|--------------------------|---------|
-| `400`  | `invalid_request_error`  | Malformed payload or endpoint-specific invalid usage |
-| `401`  | `invalid_api_key`        | Missing, malformed, or unknown caller API key |
-| `403`  | `permission_denied`      | Valid key, but the resolved model is not in `allowed_models` |
-| `404`  | `model_not_found`        | The requested model alias does not resolve in the current snapshot |
-| `413`  | `invalid_request_error`  | Request body exceeded `proxy.request_body_limit_bytes` |
-| `422`  | `content_filter`         | Guardrail blocked the request or response content |
-| `429`  | `rate_limit_exceeded`    | Rate-limit rejection (per-key or per-model) |
-| `429`  | `billing_error` (with `code: "budget_exceeded"`) | Budget rejection from the managed budget controller |
-| `503`  | `provider_unavailable`   | No provider bridge is registered for the resolved provider |
-| `503`  | `all_candidates_unavailable` | Every routing candidate was excluded by runtime status (cooldown or background-unhealthy) and the routing model is configured with `on_all_filtered: fail`. The response carries `Retry-After: 30`. See [Routing And Failover § All-Targets-Filtered Policy](../configuration/routing-and-failover.md#all-targets-filtered-policy) |
+## Gateway-generated failures
 
-Bridge-level upstream failures inherit their `status` and `error.type` from the upstream provider response (see "Upstream Error Mapping" below).
+Gateway-generated errors use a stable `error.type` taxonomy.
 
-The `billing_error` row is the one case where `error.code` is set on the wire. The envelope looks like:
+Request and configuration problems are not retryable without a change:
+
+- `400 invalid_request_error` for malformed payloads or invalid endpoint usage.
+- `401 invalid_api_key` for a missing, malformed, or unknown caller API key.
+- `403 permission_denied` when a valid key is not allowed to use the resolved
+  model.
+- `404 model_not_found` when the model alias does not exist in the current
+  snapshot.
+- `413 invalid_request_error` when the request body exceeds
+  `proxy.request_body_limit_bytes`.
+
+Gateway policy and runtime state can produce retryable or conditionally
+retryable failures:
+
+- `422 content_filter` when a guardrail blocks request or response content.
+- `429 rate_limit_exceeded` when a rate limit rejects the request.
+- `429 billing_error` with `code: "budget_exceeded"` when a managed budget check
+  rejects the request.
+- `503 provider_unavailable` when no provider bridge is registered for the
+  resolved provider on the direct-dispatch path.
+- `503 all_candidates_unavailable` when every routing target is filtered out by
+  runtime state and the routing model uses `on_all_filtered: fail`.
+
+`all_candidates_unavailable` includes `Retry-After: 30`. See
+[Routing and failover](../configuration/routing-and-failover.md#all-targets-filtered-policy).
+
+## Budget errors
+
+Budget denials are the one gateway-generated path that sets a stable
+`error.code`:
 
 ```json
 {
@@ -63,61 +83,96 @@ The `billing_error` row is the one case where `error.code` is set on the wire. T
 }
 ```
 
-`503 provider_unavailable` is emitted on the direct-dispatch path when no bridge is registered for the resolved provider. On a routing model the same condition is absorbed into the retry/failover loop and surfaces through the per-target runtime state on `GET /admin/v1/models/status` rather than as a top-level `503` to the caller.
+When the managed control plane returns structured budget detail, the OpenAI
+envelope can also include fields such as `scope`, `scope_ref`, `limit_usd`,
+`spent_usd`, `period`, `period_resets_at`, and `retry_after_seconds`.
 
-`503 all_candidates_unavailable` is the routing-model fail-fast response when every candidate has been removed by the runtime filter. This is distinct from `provider_unavailable`: the bridge is registered and the model is well-configured, but every target is currently in cooldown or has been marked unhealthy by `background_model_check`.
+See [Budgets](../configuration/budgets.md).
 
-## Upstream Error Mapping
+## Upstream errors
 
-When the upstream returns `4xx`, that client-visible error class is preserved through the proxy mapping.
+Upstream-originated errors are rendered differently from gateway-generated
+errors.
 
-When the upstream returns `5xx`, the proxy collapses that class to `502`.
+For upstream `4xx` responses, AISIX preserves the client-visible failure class
+but normalizes the OpenAI-shaped `error.type` to `upstream_error`. When the
+upstream protocol exposes a useful retry or recovery code, AISIX puts that value
+in `error.code`.
 
-That design keeps transient upstream failures out of the caller-visible `5xx` taxonomy and presents them as gateway-bad-upstream behavior.
+For example, an Anthropic upstream `rate_limit_error`, a Bedrock
+`ThrottlingException`, or a Vertex `RESOURCE_EXHAUSTED` response can become an
+OpenAI-shaped response with:
+
+```json
+{
+  "error": {
+    "message": "...",
+    "type": "upstream_error",
+    "code": "rate_limit_exceeded"
+  }
+}
+```
+
+For upstream `5xx` responses, AISIX returns `502` and suppresses upstream error
+details that may contain provider-internal information. Operators can inspect
+gateway logs for the upstream body.
 
 ## Retry-After
 
-For rate-limit-style rejections, the proxy may return a `Retry-After` header.
+The proxy may return `Retry-After` for rate-limit-style failures, budget
+failures, and routing candidates that are temporarily unavailable.
 
-Use that header as the first retry signal when present.
+Use `Retry-After` as the first retry signal when it is present. If your client
+also has automatic retry logic, prefer the server-provided delay.
 
-If your client has both automatic retry logic and server-provided delay handling, prefer the server hint.
+## Endpoint-specific notes
 
-## Endpoint-Specific Notes
+- `/v1/embeddings`, `/v1/completions`, and `/v1/images/generations` can return
+  `501 not_implemented` when the resolved provider does not support that
+  endpoint.
+- `/v1/images/generations` and `/v1/responses` return `400` when the resolved
+  model is not an OpenAI provider.
+- `/v1/rerank` returns `400` unless the resolved model provider is `openai`,
+  `cohere`, or `jina`.
+- `/v1/audio/*` forwards to the resolved provider base URL and returns upstream
+  failures when the provider does not expose the requested OpenAI-style audio
+  route.
+- `/passthrough/:provider/*rest` follows its own upstream status-and-body relay
+  behavior after proxy auth and provider resolution.
 
-- `/v1/embeddings`, `/v1/completions`, and `/v1/images/generations` can return `501` with error type `not_implemented` when the resolved provider does not support that endpoint
-- `/v1/responses` returns `400` when the resolved model is not an OpenAI provider
-- `/passthrough/:provider/*rest` follows its own raw upstream status behavior after proxy auth and provider resolution
+## Retry guidance
 
-## Caller Strategy
+Treat `400`, `401`, `403`, and `404` as request or configuration bugs. Do not
+retry them without changing the request, key, model, or configuration.
 
-As a practical rule:
+Treat `429` as backoff-and-retry territory. Honor `Retry-After` when it is
+present.
 
-- treat `400`, `401`, `403`, and `404` as configuration or request bugs
-- treat `429` as backoff-and-retry territory
-- treat `502` as an upstream/transient class worth cautious retry
-- treat `501` as a capability mismatch that needs a different provider or endpoint choice
+Treat `502` as an upstream or transient provider class. Retry cautiously and
+consider idempotency, streaming behavior, and client timeout budgets.
 
-## Retry Guidance
-
-Safe retry behavior depends on the failure class:
-
-- retry `429` using backoff and `Retry-After` when present
-- retry transient transport or `502` errors carefully with idempotency in mind
-- do not retry `400`, `401`, `403`, or `404` without changing the request or configuration
+Treat `501` as a capability mismatch. Choose a different provider, adapter, or
+endpoint.
 
 ## Troubleshooting
 
 ### The same request sometimes returns `429`
 
-Inspect caller-key rate limits or budget checks first.
+Inspect caller-key rate limits, model limits, matching rate-limit policies, and
+managed budget checks.
 
 ### The same request returns `502` only for one upstream-backed model
 
-That usually points to upstream-side instability or provider-path issues rather than caller auth.
+That usually points to upstream instability, provider-path issues, or a provider
+endpoint mismatch rather than caller authentication.
 
-## Related Pages
+### Upstream errors all show `type: "upstream_error"`
 
-- [OpenAI-Compatible API](openai-compatible-api.md)
-- [Provider Passthrough](passthrough.md)
-- [Headers And Error Codes](../reference/headers-and-error-codes.md)
+That is expected for OpenAI-shaped proxy responses. Use `error.code`, HTTP
+status, and operator logs for more specific retry or diagnosis decisions.
+
+## Next steps
+
+- [OpenAI-compatible API](openai-compatible-api.md)
+- [Provider passthrough](passthrough.md)
+- [Headers and error codes](../reference/headers-and-error-codes.md)

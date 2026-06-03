@@ -1,21 +1,39 @@
 ---
 title: Deployment Modes
 description: Compare self-hosted AISIX AI Gateway and AISIX Cloud managed data-plane deployments.
-sidebar_position: 2
+sidebar_position: 3
 ---
 
 AISIX AI Gateway supports two main deployment modes: a self-hosted gateway and a managed data-plane model coordinated by AISIX Cloud.
 
-Use this page to decide which operating model fits your environment.
+This overview compares the available operating models so you can choose the one that fits your environment.
 
-## At A Glance
+## How to choose
 
-| Mode | Best Fit |
-| --- | --- |
-| Self-hosted gateway | You want direct operational control over deployment, admin APIs, and configuration storage. |
-| AISIX Cloud managed data plane | You want a managed control plane for environments, certificates, and Cloud workflows while keeping gateway traffic on a data plane. |
+Choose **self-hosted gateway** when you want a standalone runtime that you
+operate end to end. You manage the process, admin API, configuration store,
+provider credentials, network exposure, and upgrades.
 
-## Self-Hosted Gateway
+Choose **AISIX Cloud managed data plane** when you want AISIX Cloud to manage
+the control-plane workflow while the gateway data plane still handles traffic in
+your network. You bootstrap the data plane with gateway certificates, and AISIX
+Cloud projects environment-scoped configuration to it.
+
+If you are evaluating AISIX for the first time, start with the self-hosted
+quickstart. It exposes both listeners locally and makes the resource model
+visible. Move to the managed data-plane path when you are ready to use AISIX
+Cloud as the control plane.
+
+## At a glance
+
+| Question | Self-hosted gateway | AISIX Cloud managed data plane |
+| --- | --- | --- |
+| Who manages configuration? | You write resources through the standalone admin API. | AISIX Cloud manages and projects environment-scoped resources. |
+| Does the gateway expose an admin listener? | Yes, when configured. | No. The data plane exposes proxy traffic, not the standalone admin write path. |
+| Where do provider credentials live? | In your self-hosted configuration store. | In the Cloud control plane and projected to the data plane. |
+| What is the bootstrap focus? | Local gateway config, admin keys, proxy/admin listeners, and etcd. | Gateway certificates, mTLS control-plane communication, and environment binding. |
+
+## Self-hosted gateway
 
 In self-hosted mode, you run the gateway directly and expose both:
 
@@ -31,7 +49,9 @@ This mode is a good fit when you want:
 - self-managed etcd and credentials
 - a local or private operational model without a managed control plane
 
-## AISIX Cloud Managed Data Plane
+For the hands-on path, see [Run from source](../quickstart/self-hosted.md).
+
+## AISIX Cloud managed data plane
 
 In managed mode, AISIX Cloud becomes the control plane and AISIX AI Gateway runs as the data plane.
 
@@ -41,41 +61,24 @@ At the gateway level, this changes several behaviors:
 - the standalone playground endpoint is not exposed
 - dynamic configuration is read from the managed etcd path over an mTLS channel
 
-From the current AISIX Cloud implementation, managed data-plane bootstrap is centered on **gateway certificates** and mTLS-authenticated `/dp/*` endpoints. The current Cloud e2e flow creates an environment, issues a gateway certificate bundle, starts the data plane with that bundle, and then confirms DP heartbeats and config propagation.
+Managed data-plane bootstrap is centered on **gateway certificates** and mTLS-authenticated `/dp/*` endpoints. The Cloud flow creates an environment, issues a gateway certificate bundle, starts the data plane with that bundle, and then confirms data-plane heartbeats and configuration propagation.
 
-## Comparison
+For the hands-on path, see [Connect a managed data plane](../quickstart/aisix-cloud-managed-dp.md).
 
-| Dimension | Self-Hosted Gateway | AISIX Cloud Managed Data Plane |
-| --- | --- | --- |
-| Product boundary | Gateway only | Gateway plus managed control plane |
-| Admin API | Exposed by the gateway | Not exposed on the data plane |
-| Dynamic resource management | Gateway admin API + etcd | AISIX Cloud control plane |
-| Data-plane auth to control plane | Operator-managed | mTLS certificate flow |
-| Environment model | Operator-defined | First-class Cloud environment |
-| Cloud billing and usage workflows | Not built in | Managed by AISIX Cloud |
-
-## How To Choose
-
-Choose **self-hosted** when you want a standalone gateway that you control end to end.
-
-Choose **AISIX Cloud** when you want:
-
-- centralized environment management
-- managed certificate and control-plane workflows
-- usage-event and billing integration at the Cloud layer
-
-## Important Boundary
+## Important boundary
 
 Do not assume that every Cloud feature is a gateway feature.
 
 For example, the current AISIX Cloud playground is a control-plane preview path and does **not** send traffic through the managed data plane. That means it does not exercise data-plane cache, guardrails, rate limiting, or routing behavior.
 
-See the dedicated Cloud section for current managed control-plane and managed data-plane documentation.
+See [Cloud vs. self-hosted](../cloud/cloud-vs-self-hosted.md) for the deeper
+comparison, and use the dedicated AISIX Cloud section for current managed
+control-plane and managed data-plane documentation.
 
-## Related Pages
+## Next steps
 
-- [What Is AISIX AI Gateway](what-is-aisix-ai-gateway.md)
-- [Core Concepts](core-concepts.md)
-- [Feature Matrix](feature-matrix.md)
-- [AISIX Cloud Overview](../cloud/overview.md)
-- [Roadmap](../roadmap.md)
+- [Core concepts](core-concepts.md) — learn the resources operators configure in either deployment mode.
+- [Cloud vs. self-hosted](../cloud/cloud-vs-self-hosted.md) — compare the operating models in more detail.
+- [Connect a managed data plane](../quickstart/aisix-cloud-managed-dp.md) — understand the Cloud bootstrap path.
+- [AISIX Cloud overview](../cloud/overview.md) — review the managed control-plane workflow.
+- [Feature status](feature-matrix.md) — check current feature status and boundaries.

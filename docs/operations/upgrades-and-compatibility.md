@@ -1,53 +1,77 @@
 ---
-title: Upgrades And Compatibility
+title: Upgrades and Compatibility
 description: Upgrade AISIX AI Gateway conservatively and validate runtime compatibility across config, snapshot, and provider behavior.
-sidebar_position: 56
+sidebar_position: 57
 ---
 
-Upgrade the gateway conservatively when dynamic configuration and provider behavior matter to production traffic.
+Upgrade AISIX AI Gateway conservatively when production traffic depends
+on dynamic configuration and provider behavior.
 
-Treat upgrades as behavior changes to be verified, not just binary replacements.
+Treat an upgrade as a behavior change to verify, not only as a binary
+replacement.
 
-## Compatibility Principles
+## What compatibility means
 
-- bootstrap config must still parse on the new binary
-- dynamic resources in etcd must remain readable by the new loader
-- client-visible proxy behavior must be validated on real request paths
+Before widening traffic to a new version, verify that:
 
-## Practical Upgrade Checks
+- bootstrap config still parses
+- etcd-backed dynamic resources are still readable
+- model aliases resolve as expected
+- caller-facing proxy behavior still matches your applications
+- provider-specific upstream behavior still works for the endpoint
+  families you use
+- managed bootstrap and projection still work in managed deployments
 
-Before and after an upgrade, verify:
+## Suggested upgrade flow
 
-1. `GET /livez`
-2. admin-listener `GET /livez`
-3. `GET /admin/v1/health`
-4. `GET /v1/models`
-5. one real request on each critical endpoint your clients use
+1. Review release notes or change notes for config, provider, and
+   endpoint behavior.
+2. Start the new version without sending full production traffic.
+3. Confirm proxy liveness and, in standalone mode, admin health.
+4. Confirm `GET /v1/models` with a representative caller API key.
+5. Send one real request on each endpoint family your clients use.
+6. Check logs, metrics, headers, and usage events for the upgraded path.
+7. Widen traffic only after the request path is verified.
 
-If you use several endpoint families in production, test each one you depend on rather than assuming chat-completions success proves all compatibility.
+## Areas to treat carefully
 
-## Areas To Treat Carefully
-
-- managed-mode bootstrap path
+- bootstrap config fields
 - etcd TLS and trust roots
+- dynamic resource schemas
 - cache backend selection
-- dynamic resources written by a newer or older control plane
+- provider adapter behavior
+- managed certificate bootstrap and `/dp/*` connectivity
+- Cloud projection and budget workflows
 
-## Suggested Upgrade Flow
+If you use several endpoint families, test each one. A successful
+chat-completions request does not prove that embeddings, streaming,
+Anthropic Messages, or passthrough behavior is compatible.
 
-1. verify bootstrap config parses with the new binary
-2. start the new instance without sending full traffic
-3. confirm health, config freshness, and one real request per critical path
-4. only then widen traffic exposure
+## Rollback considerations
+
+Before upgrading, make sure you know:
+
+- which bootstrap config version will be used for rollback
+- whether dynamic resources written during the upgrade remain readable by
+  the previous version
+- whether provider-key, model, or policy changes were made during the
+  rollout
+- whether managed projection state needs time to converge after rollback
 
 ## Troubleshooting
 
-### The new binary starts but behaves differently on one endpoint family
+### The new version starts but one endpoint behaves differently
 
-Treat that as a compatibility issue even if health checks are green.
+Treat this as a compatibility issue even if health checks are green.
+Compare the failing endpoint against a known-good request path, then
+inspect provider adapter behavior, request headers, response shape, and
+policy resources.
 
-## Related Pages
+## Next steps
 
-- [Production Deployment](production-deployment.md)
-- [Testing And Verification](testing-and-verification.md)
-- [Roadmap](../roadmap.md)
+- [Production deployment](/ai-gateway/operations/production-deployment)
+  gives the production baseline.
+- [Testing and verification](/ai-gateway/operations/testing-and-verification)
+  gives the validation flow.
+- [Feature Status](/ai-gateway/overview/feature-matrix) shows the current
+  product boundary.
