@@ -849,6 +849,43 @@ mod tests {
         );
     }
 
+    /// #648: an EMPTY canonical `reasoning_content` ("") alongside a real
+    /// OpenRouter `reasoning` must fall through to `reasoning` — the empty
+    /// canonical must not be treated as "present and winning". This is the
+    /// one branch with real precedence logic (`.filter(!empty).or(...)`), so
+    /// it's the discriminating guard: it FAILS against the pre-fix
+    /// canonical-only code (which ignored `reasoning` entirely).
+    #[test]
+    fn non_streaming_empty_canonical_falls_through_to_openrouter_reasoning() {
+        let body = r#"{
+            "id": "gen-fallthrough",
+            "object": "chat.completion",
+            "model": "z-ai/glm-4.6",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "",
+                    "reasoning": "real openrouter thoughts"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }"#;
+        let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        assert_eq!(
+            out.message
+                .extra
+                .get("reasoning_content")
+                .expect("empty canonical reasoning_content must fall through to OpenRouter `reasoning` (#648)")
+                .as_str()
+                .unwrap(),
+            "real openrouter thoughts",
+        );
+    }
+
     /// #648: an empty `reasoning` (alongside empty/absent reasoning_content)
     /// must NOT add a noise field — same skip-empty rule as #466.
     #[test]
