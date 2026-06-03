@@ -242,7 +242,7 @@ impl AzureUpstreamRef {
 
         let base = api_base.unwrap_or_default().trim();
         if base.is_empty() {
-            return Err(BridgeError::Config(
+            return Err(BridgeError::InvalidUpstreamConfig(
                 "azure provider_key has no api_base — \
                  expected https://<resource>.openai.azure.com, a bare resource name, \
                  or a verbatim override URL (https://<host>[:<port>])"
@@ -286,20 +286,20 @@ impl AzureUpstreamRef {
                 // `rest` is post-scheme; an `@` here means userinfo
                 // (`user:pass@host`). Operators must use the
                 // api-key / AAD path for auth, never URL-embedded.
-                return Err(BridgeError::Config(format!(
+                return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "azure api_base {base:?} must not embed userinfo (@); use the \
                      api-key / AAD credentials in `provider_key.secret` instead"
                 )));
             }
             if base.contains('?') {
-                return Err(BridgeError::Config(format!(
+                return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "azure api_base {base:?} must not contain a query string \
                      (the bridge appends `?api-version=…`; an operator-supplied \
                      query would either merge or override the pinned api-version)"
                 )));
             }
             if base.contains('#') {
-                return Err(BridgeError::Config(format!(
+                return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "azure api_base {base:?} must not contain a fragment"
                 )));
             }
@@ -351,7 +351,7 @@ impl AzureUpstreamRef {
 /// (e.g. `?api-version=evil` to override the bridge's version pin).
 fn validate_url_token(name: &str, value: &str) -> Result<(), BridgeError> {
     if value.is_empty() {
-        return Err(BridgeError::Config(format!(
+        return Err(BridgeError::InvalidUpstreamConfig(format!(
             "azure {name} is empty (expected an identifier matching [A-Za-z0-9_-]+)"
         )));
     }
@@ -359,7 +359,7 @@ fn validate_url_token(name: &str, value: &str) -> Result<(), BridgeError> {
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
-        return Err(BridgeError::Config(format!(
+        return Err(BridgeError::InvalidUpstreamConfig(format!(
             "azure {name} {value:?} contains URL-control characters — \
              must match [A-Za-z0-9_-]+ (no spaces, slashes, dots, query params, or hash)"
         )));
@@ -394,12 +394,14 @@ impl AzureSecret {
     pub(crate) fn parse(secret: &str) -> Result<Self, BridgeError> {
         let trimmed = secret.trim();
         if trimmed.is_empty() {
-            return Err(BridgeError::Config("provider_key.secret is empty".into()));
+            return Err(BridgeError::InvalidUpstreamConfig(
+                "provider_key.secret is empty".into(),
+            ));
         }
         if trimmed.starts_with('{') {
             let creds: crate::aad_token_mint::AadCredentials = serde_json::from_str(trimmed)
                 .map_err(|_e| {
-                    BridgeError::Config(
+                    BridgeError::InvalidUpstreamConfig(
                         "azure provider_key.secret looks JSON-shaped but failed to parse \
                          as AAD client_credentials \
                          {tenant_id, client_id, client_secret}"
@@ -430,7 +432,7 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
     ctx.model
         .model_name
         .as_deref()
-        .ok_or_else(|| BridgeError::Config("model.model_name missing".into()))
+        .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
 }
 
 /// Map an Azure HTTP error response to a customer-visible
@@ -600,7 +602,9 @@ fn build_request_headers(
     match (&auth.api_key, &auth.bearer_token) {
         (Some(key), None) => {
             let value = HeaderValue::from_str(key).map_err(|e| {
-                BridgeError::Config(format!("api key contains invalid header chars: {e}"))
+                BridgeError::InvalidUpstreamConfig(format!(
+                    "api key contains invalid header chars: {e}"
+                ))
             })?;
             headers.insert(HeaderName::from_static("api-key"), value);
         }
@@ -919,13 +923,13 @@ mod tests {
     fn resolve_rejects_empty_deployment() {
         let err = AzureUpstreamRef::resolve("", Some("https://acme.openai.azure.com")).unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(
                     msg.contains("deployment name is empty"),
                     "must call out empty deployment; got {msg}"
                 );
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -933,13 +937,13 @@ mod tests {
     fn resolve_rejects_missing_api_base() {
         let err = AzureUpstreamRef::resolve("dep", None).unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(
                     msg.contains("no api_base"),
                     "must call out missing api_base; got {msg}"
                 );
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -947,10 +951,10 @@ mod tests {
     fn resolve_rejects_empty_api_base() {
         let err = AzureUpstreamRef::resolve("dep", Some("   ")).unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(msg.contains("no api_base"));
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -972,29 +976,29 @@ mod tests {
     fn resolve_rejects_deployment_with_query_injection() {
         let err = AzureUpstreamRef::resolve("foo?api-version=evil", Some("acme-east")).unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(msg.contains("URL-control characters"), "got {msg}");
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
     #[test]
     fn resolve_rejects_deployment_with_slash_injection() {
         let err = AzureUpstreamRef::resolve("foo/bar/chat", Some("acme")).unwrap_err();
-        assert!(matches!(err, BridgeError::Config(_)));
+        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
     }
 
     #[test]
     fn resolve_rejects_deployment_with_hash_fragment() {
         let err = AzureUpstreamRef::resolve("foo#bar", Some("acme")).unwrap_err();
-        assert!(matches!(err, BridgeError::Config(_)));
+        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
     }
 
     #[test]
     fn resolve_rejects_resource_with_query_injection() {
         let err = AzureUpstreamRef::resolve("dep", Some("acme?evil=1")).unwrap_err();
-        assert!(matches!(err, BridgeError::Config(_)));
+        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
     }
 
     #[test]
@@ -1056,13 +1060,13 @@ mod tests {
             AzureUpstreamRef::resolve("dep", Some("https://proxy.acme.internal?api-version=evil"))
                 .unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(
                     msg.contains("query string"),
                     "must call out the query rejection; got {msg}"
                 );
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -1070,7 +1074,7 @@ mod tests {
     fn resolve_rejects_override_with_fragment() {
         let err = AzureUpstreamRef::resolve("dep", Some("https://proxy.acme.internal#fragment"))
             .unwrap_err();
-        assert!(matches!(err, BridgeError::Config(_)));
+        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
     }
 
     #[test]
@@ -1081,13 +1085,13 @@ mod tests {
         let err = AzureUpstreamRef::resolve("dep", Some("https://user:pass@proxy.acme.internal"))
             .unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(
                     msg.contains("userinfo"),
                     "must call out the userinfo rejection; got {msg}"
                 );
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -1328,7 +1332,7 @@ mod tests {
         // headers via the api-key value.
         let err = build_request_headers(&api_key_auth("legit\nx-evil: 1"), "req-1", false, None)
             .unwrap_err();
-        assert!(matches!(err, BridgeError::Config(_)));
+        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
     }
 
     #[test]
@@ -1345,10 +1349,10 @@ mod tests {
         let req = ChatFormat::new("customer-facing-name", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(msg.contains("no api_base"), "got {msg}");
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -1366,10 +1370,10 @@ mod tests {
         let req = ChatFormat::new("customer-facing-name", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(msg.contains("secret is empty"), "got {msg}");
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -2039,14 +2043,14 @@ mod tests {
     #[test]
     fn azure_secret_rejects_empty_secret() {
         let err = AzureSecret::parse("   ").unwrap_err();
-        assert!(matches!(err, BridgeError::Config(_)));
+        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
     }
 
     #[test]
     fn azure_secret_rejects_json_missing_required_aad_fields() {
         let err = AzureSecret::parse(r#"{"tenant_id":"t"}"#).unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 // Message must NOT echo raw secret bytes (audit-aware).
                 assert!(msg.contains("looks JSON-shaped"));
                 assert!(!msg.contains("tenant-uuid-aaa"));

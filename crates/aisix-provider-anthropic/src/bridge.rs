@@ -135,7 +135,7 @@ fn resolve_base(ctx: &BridgeContext) -> Result<String, BridgeError> {
                      provider_metadata.api_base_url on the control plane; standalone: \
                      directly on the resource)."
                 );
-                return Err(BridgeError::Config(format!(
+                return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "provider_key for vendor {pk_vendor_raw:?} has no upstream base URL \
                      configured"
                 )));
@@ -148,17 +148,27 @@ fn resolve_base(ctx: &BridgeContext) -> Result<String, BridgeError> {
 fn api_key(ctx: &BridgeContext) -> Result<&str, BridgeError> {
     let k = &ctx.provider_key.secret;
     if k.is_empty() {
-        Err(BridgeError::Config("provider_key.secret is empty".into()))
-    } else {
-        Ok(k.as_str())
+        return Err(BridgeError::InvalidUpstreamConfig(
+            "provider_key.secret is empty".into(),
+        ));
     }
+    // Reject a secret that can't be a valid `x-api-key` header value
+    // (control bytes etc.) up front as customer-fixable config, mirroring
+    // the openai / azure bridges — otherwise reqwest's `.header()` fails
+    // later with an opaque builder error (#367).
+    if header::HeaderValue::from_str(k).is_err() {
+        return Err(BridgeError::InvalidUpstreamConfig(
+            "provider_key.secret contains invalid header characters".into(),
+        ));
+    }
+    Ok(k.as_str())
 }
 
 fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
     ctx.model
         .model_name
         .as_deref()
-        .ok_or_else(|| BridgeError::Config("model.model_name missing".into()))
+        .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
 }
 
 async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
@@ -237,7 +247,7 @@ impl Bridge for AnthropicBridge {
         let upstream = upstream_model(ctx)?;
 
         let (system, messages) =
-            split_system(req).map_err(|e| BridgeError::Config(e.to_string()))?;
+            split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
         let body = build_request(req, upstream, system, messages, false);
         let url = format!("{base}/v1/messages");
         let client = self.client.clone();
@@ -281,7 +291,7 @@ impl Bridge for AnthropicBridge {
         let upstream = upstream_model(ctx)?;
 
         let (system, messages) =
-            split_system(req).map_err(|e| BridgeError::Config(e.to_string()))?;
+            split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
         let body = build_request(req, upstream, system, messages, true);
         let url = format!("{base}/v1/messages");
         let client = self.client.clone();
@@ -540,7 +550,25 @@ mod tests {
         let bridge = AnthropicBridge::new();
         let ctx = BridgeContext::new("req-1", sample_model(), Arc::new(pk));
         let err = bridge.chat(&req(), &ctx).await.unwrap_err();
-        assert!(matches!(err, BridgeError::Config(_)));
+        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn secret_with_control_chars_is_invalid_config() {
+        // A non-empty secret that can't be an x-api-key header value
+        // (control bytes) is customer-fixable config, not a 500 (#367).
+        let pk: ProviderKey =
+            serde_json::from_str(r#"{"display_name":"bad","secret":"sk-live\n-injected"}"#)
+                .unwrap();
+        let bridge = AnthropicBridge::new();
+        let ctx = BridgeContext::new("req-1", sample_model(), Arc::new(pk));
+        let err = bridge.chat(&req(), &ctx).await.unwrap_err();
+        match err {
+            BridgeError::InvalidUpstreamConfig(msg) => {
+                assert!(msg.contains("invalid header characters"), "got {msg}");
+            }
+            other => panic!("expected InvalidUpstreamConfig, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -565,7 +593,7 @@ mod tests {
             }],
         );
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
-        assert!(matches!(err, BridgeError::Config(_)));
+        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
     }
 
     #[tokio::test]
@@ -718,7 +746,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             let ctx = BridgeContext::new("rid", sample_model(), Arc::new(pk));
             let err = resolve_base(&ctx).unwrap_err();
             match err {
-                BridgeError::Config(msg) => {
+                BridgeError::InvalidUpstreamConfig(msg) => {
                     assert!(
                         msg.contains("base URL") && msg.contains(vendor.trim()),
                         "vendor {vendor:?}: error must name vendor + base URL; got: {msg}",
@@ -734,7 +762,9 @@ data: {\"type\":\"message_stop\"}\n\n";
                         );
                     }
                 }
-                other => panic!("vendor {vendor:?}: expected BridgeError::Config, got {other:?}"),
+                other => {
+                    panic!("vendor {vendor:?}: expected InvalidUpstreamConfig, got {other:?}")
+                }
             }
         }
     }

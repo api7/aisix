@@ -184,7 +184,7 @@ impl VertexBridge {
         }
         if let Some(b) = ctx_api_base.map(str::trim).filter(|s| !s.is_empty()) {
             if !(b.starts_with("https://") || b.starts_with("http://")) {
-                return Err(BridgeError::Config(format!(
+                return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "vertex provider_key api_base must use http:// or https:// scheme, got {b:?}",
                 )));
             }
@@ -194,20 +194,20 @@ impl VertexBridge {
                 // that operator-pasted credentials shouldn't appear in
                 // logs. Audit #392 re-audit LOW-1.
                 let redacted = redact_userinfo(b);
-                return Err(BridgeError::Config(format!(
+                return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "vertex provider_key api_base must not embed userinfo (@); use the request's \
                      Authorization header instead, got {redacted:?}",
                 )));
             }
             if b.contains('?') {
-                return Err(BridgeError::Config(format!(
+                return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "vertex provider_key api_base must not contain a query string (the bridge \
                      appends `?alt=sse` on streaming; an operator query would silently merge), \
                      got {b:?}",
                 )));
             }
             if b.contains('#') {
-                return Err(BridgeError::Config(format!(
+                return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "vertex provider_key api_base must not contain a fragment, got {b:?}",
                 )));
             }
@@ -226,7 +226,7 @@ impl VertexBridge {
                 .unwrap_or(b)
                 .trim_end_matches('/');
             if after_scheme.contains('/') || after_scheme.contains('\\') {
-                return Err(BridgeError::Config(format!(
+                return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "vertex provider_key api_base must be a bare origin \
                      (scheme://host[:port]) with no path, got {b:?}",
                 )));
@@ -472,7 +472,7 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
     ctx.model
         .model_name
         .as_deref()
-        .ok_or_else(|| BridgeError::Config("model.model_name missing".into()))
+        .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
 }
 
 /// Redact embedded userinfo from a URL string before echoing it
@@ -773,7 +773,7 @@ impl VertexBridge {
         // Vertex `anthropic_version`). Mirrors the Bedrock `/invoke`
         // body shaping, differing only in the version string.
         let (system, messages) =
-            split_system(req).map_err(|e| BridgeError::Config(format!("{e}")))?;
+            split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
         let anthropic_req = build_anthropic_request(req, upstream_id, system, messages, false);
         let mut body_value = serde_json::to_value(&anthropic_req)
             .map_err(|e| BridgeError::Config(format!("serialize Anthropic request body: {e}")))?;
@@ -861,7 +861,7 @@ impl VertexBridge {
         // in the body (only `model` is stripped into the URL). Add the
         // Vertex `anthropic_version`.
         let (system, messages) =
-            split_system(req).map_err(|e| BridgeError::Config(format!("{e}")))?;
+            split_system(req).map_err(|e| BridgeError::InvalidUpstreamConfig(format!("{e}")))?;
         let anthropic_req = build_anthropic_request(req, upstream_id, system, messages, true);
         let mut body_value = serde_json::to_value(&anthropic_req)
             .map_err(|e| BridgeError::Config(format!("serialize Anthropic request body: {e}")))?;
@@ -1994,13 +1994,15 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("expected error for api_base={bad:?}"));
             match err {
-                BridgeError::Config(msg) => {
+                BridgeError::InvalidUpstreamConfig(msg) => {
                     assert!(
                         msg.contains("http"),
                         "error message should name the http(s) requirement; got: {msg}"
                     );
                 }
-                other => panic!("expected Config error for api_base={bad:?}, got {other:?}"),
+                other => panic!(
+                    "expected InvalidUpstreamConfig error for api_base={bad:?}, got {other:?}"
+                ),
             }
         }
     }
@@ -2018,7 +2020,7 @@ mod tests {
             .err()
             .unwrap();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(msg.contains("userinfo") || msg.contains("@"));
                 // Defense-in-depth: the error message MUST NOT echo
                 // the original userinfo back into log output (re-audit
@@ -2034,7 +2036,7 @@ mod tests {
                     "error message should redact userinfo: {msg}"
                 );
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -2082,10 +2084,10 @@ mod tests {
             .err()
             .unwrap();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(msg.contains("query") || msg.contains('?'));
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -2097,10 +2099,10 @@ mod tests {
             .err()
             .unwrap();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(msg.contains("fragment") || msg.contains('#'));
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -2115,13 +2117,13 @@ mod tests {
             .err()
             .unwrap();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(
                     msg.contains("bare origin") && msg.contains("no path"),
                     "expected a bare-origin/no-path rejection; got {msg}"
                 );
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -2147,13 +2149,13 @@ mod tests {
             .err()
             .unwrap();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(
                     msg.contains("bare origin") && msg.contains("no path"),
                     "expected a bare-origin/no-path rejection; got {msg}"
                 );
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
@@ -2624,10 +2626,10 @@ mod tests {
         let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(msg.contains("model_name missing"));
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
         }
     }
 
