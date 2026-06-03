@@ -20,6 +20,8 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+#[cfg(feature = "aliyun-text-moderation")]
+mod aliyun;
 #[cfg(feature = "bedrock")]
 mod bedrock;
 mod build;
@@ -60,6 +62,8 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
     }
 }
 
+#[cfg(feature = "aliyun-text-moderation")]
+pub use aliyun::AliyunTextModerationGuardrail;
 #[cfg(feature = "bedrock")]
 pub use bedrock::BedrockGuardrail;
 pub use build::{

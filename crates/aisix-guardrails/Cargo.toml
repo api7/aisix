@@ -35,8 +35,18 @@ aws-smithy-types = { workspace = true, optional = true }
 # so a slim build can opt out.
 reqwest = { workspace = true, optional = true }
 
+# kind=aliyun_text_moderation guardrail (#603). The Aliyun green-cip
+# TextModerationPlus call is signed (RPC signature v1, HMAC-SHA1) and POSTed
+# over the shared reqwest client. There is no official Aliyun Rust SDK, so the
+# RPC signature is hand-rolled with these primitives (all workspace deps).
+hmac = { workspace = true, optional = true }
+sha1 = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+
 [features]
-default = ["bedrock", "azure-content-safety"]
+default = ["bedrock", "azure-content-safety", "aliyun-text-moderation"]
 bedrock = [
     "dep:aws-config",
     "dep:aws-sdk-bedrockruntime",
@@ -46,6 +56,14 @@ bedrock = [
     "dep:aws-smithy-types",
 ]
 azure-content-safety = ["dep:reqwest"]
+aliyun-text-moderation = [
+    "dep:reqwest",
+    "dep:hmac",
+    "dep:sha1",
+    "dep:base64",
+    "dep:chrono",
+    "dep:uuid",
+]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

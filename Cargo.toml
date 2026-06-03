@@ -100,6 +100,8 @@ base64 = "0.22"
 
 # Crypto (M6 v3 CP register flow + ApiKey hash auth)
 sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 hex = "0.4"
 
