@@ -173,6 +173,24 @@ fn build_one(
         GuardrailKind::AzureContentSafetyTextModeration(_) => {
             Err(BuildError::FeatureDisabled("azure-content-safety"))
         }
+        #[cfg(feature = "aliyun-text-moderation")]
+        GuardrailKind::AliyunTextModeration(cfg) => {
+            // #603: HTTP-based TextModerationPlus dispatcher. cp-api already
+            // decrypted the access_key_secret at projection time; the config
+            // carries plaintext. Endpoint is per-row (derived from the row's
+            // region, or an explicit override for tests/dev).
+            let g = crate::aliyun::AliyunTextModerationGuardrail::new(
+                row.name.clone(),
+                cfg,
+                row.hook_point,
+                row.fail_open,
+            );
+            Ok(Some(Arc::new(g)))
+        }
+        #[cfg(not(feature = "aliyun-text-moderation"))]
+        GuardrailKind::AliyunTextModeration(_) => {
+            Err(BuildError::FeatureDisabled("aliyun-text-moderation"))
+        }
     }
 }
 

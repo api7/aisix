@@ -91,10 +91,45 @@ This is the key difference between schema support and dependable runtime support
 
 Keep Bedrock runtime support in the roadmap and limited-capability framing, not as fully available behavior.
 
+## Aliyun Text Moderation Guardrails
+
+`kind: "aliyun_text_moderation"` calls Aliyun's content-safety guardrail
+(`TextModerationPlus`) on the `green-cip.<region>.aliyuncs.com` endpoint. The
+input hook uses the `llm_query_moderation` service, the output hook
+`llm_response_moderation`. The data plane blocks when the returned `RiskLevel`
+(`none` < `low` < `medium` < `high`) reaches `risk_level_threshold` (default
+`high`). It runs on input and output, including streaming output (windowed,
+with the response's request id reused as Aliyun's `sessionId` so the chunks of
+one stream correlate).
+
+Example shape:
+
+```json title="Aliyun text-moderation guardrail"
+{
+  "name": "aliyun-review",
+  "kind": "aliyun_text_moderation",
+  "hook_point": "both",
+  "fail_open": false,
+  "region": "cn-shanghai",
+  "access_key_id": "YOUR_ACCESS_KEY_ID",
+  "access_key_secret": "YOUR_ACCESS_KEY_SECRET",
+  "risk_level_threshold": "high"
+}
+```
+
+- `region` builds the endpoint; set `endpoint` to override it (e.g. a private
+  proxy) — the override wins over `region`.
+- `output_fail_open` defaults `false` so an Aliyun outage cannot release
+  unscanned model output; the request-level `fail_open` governs the input hook.
+- streaming controls (`stream_processing_mode`, `window_size`,
+  `window_overlap_size`, `max_buffer_bytes`, `on_buffer_exceeded`) mirror the
+  Azure text-moderation guardrail.
+
 ## Operator Guidance
 
 - use `keyword` for production behavior you need to rely on today
 - treat `bedrock` rows as an advanced or staged capability until your own deployment proves the runtime path you want
+- use `aliyun_text_moderation` when your safety stack standardizes on Aliyun's content-safety guardrail; tune `risk_level_threshold` to trade off precision vs. recall
 
 ## Troubleshooting
 
