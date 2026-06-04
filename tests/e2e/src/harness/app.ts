@@ -18,6 +18,16 @@ export interface AppOverrides {
   prometheusPath?: string;
   /** Extra raw config keys merged into the YAML at the top level. */
   extra?: Record<string, unknown>;
+  /**
+   * `proxy.real_ip` block (#492). Merged into the base proxy config so
+   * the listener addr is preserved. Configures nginx-style trusted-proxy
+   * real-client-IP resolution from `x-forwarded-for`.
+   */
+  realIp?: {
+    trusted_proxies?: string[];
+    recursive?: boolean;
+    header?: string;
+  };
 }
 
 export interface SpawnedApp {
@@ -61,7 +71,11 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
       dial_timeout_ms: 5000,
       request_timeout_ms: 5000,
     },
-    proxy: { addr: `127.0.0.1:${proxyPort}`, request_body_limit_bytes: 10485760 },
+    proxy: {
+      addr: `127.0.0.1:${proxyPort}`,
+      request_body_limit_bytes: 10485760,
+      ...(overrides.realIp ? { real_ip: overrides.realIp } : {}),
+    },
     admin: { addr: `127.0.0.1:${adminPort}`, admin_keys: [adminKey] },
     observability: {
       service_name: "aisix-e2e",

@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::auth::AuthenticatedKey;
+use crate::client_ip::ClientContext;
 use crate::error::{ErrorEnvelope, ProxyError};
 use crate::request_id::new_request_id;
 use crate::state::ProxyState;
@@ -48,6 +49,7 @@ struct ImageDispatchSuccess {
 pub async fn image_generations(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
+    client: ClientContext,
     Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
@@ -97,6 +99,7 @@ pub async fn image_generations(
                     elapsed,
                     prompt_tokens,
                     completion_tokens,
+                    &client,
                 );
             }
             success.response
@@ -243,6 +246,7 @@ fn emit_usage_event(
     elapsed: Duration,
     prompt_tokens: u32,
     completion_tokens: u32,
+    client: &ClientContext,
 ) {
     let event = UsageEvent {
         request_id: request_id.to_string(),
@@ -254,6 +258,8 @@ fn emit_usage_event(
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
+        client_source_ip: client.source_ip.clone(),
+        client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
     // Handler label "images" — bucketed prometheus counter (#408).
@@ -312,6 +318,7 @@ mod tests {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
+            real_ip: Default::default(),
             tls: None,
         }
     }

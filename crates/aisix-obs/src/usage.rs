@@ -265,6 +265,22 @@ pub struct UsageEvent {
     /// other based on `provider_kind`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub byo_label: String,
+
+    // ─── Client attribution (#492) ───
+    /// Source IP of the downstream caller as resolved by the proxy's
+    /// real-ip chain: the TCP peer, or the first untrusted address found
+    /// walking the configured forwarded header (default `x-forwarded-for`)
+    /// right-to-left when the peer is a trusted proxy (nginx
+    /// `set_real_ip_from` + `real_ip_recursive` parity). Empty when the
+    /// peer address was unavailable. cp-api stores empty as NULL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_source_ip: String,
+
+    /// Client `User-Agent` header verbatim (control chars stripped,
+    /// length-capped). Surfaces the client type (e.g. `codex-cli/1.2`).
+    /// Empty when the client sent none. cp-api stores empty as NULL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_user_agent: String,
 }
 
 #[inline]
@@ -717,6 +733,23 @@ mod tests {
         assert!(!json.contains("branded_provider"));
         assert!(!json.contains("pk_label"));
         assert!(!json.contains("byo_label"));
+        // Client attribution (#492): absent when the proxy couldn't
+        // resolve a peer / the client sent no User-Agent.
+        assert!(!json.contains("client_source_ip"));
+        assert!(!json.contains("client_user_agent"));
+    }
+
+    #[test]
+    fn client_attribution_fields_serialise_when_set() {
+        let ev = UsageEvent {
+            request_id: "req-client".into(),
+            client_source_ip: "203.0.113.7".into(),
+            client_user_agent: "codex-cli/1.2".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""client_source_ip":"203.0.113.7""#));
+        assert!(json.contains(r#""client_user_agent":"codex-cli/1.2""#));
     }
 
     #[test]

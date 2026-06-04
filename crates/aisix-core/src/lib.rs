@@ -24,7 +24,7 @@ pub mod snapshot;
 
 pub use config::{
     AdminConfig, CacheBackend, CacheConfig, Config, EtcdConfig, EtcdTlsConfig, ManagedConfig,
-    ObservabilityConfig, ProxyConfig, TlsConfig,
+    ObservabilityConfig, ProxyConfig, RealIpConfig, TlsConfig,
 };
 pub use error::{
     AdminError, AdminErrorEnvelope, BootstrapError, ProxyError, ProxyErrorEnvelope, RateLimitScope,

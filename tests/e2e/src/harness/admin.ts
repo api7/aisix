@@ -39,6 +39,12 @@ export class AdminClient {
     });
   }
 
+  async createObservabilityExporter(
+    exporter: Record<string, unknown>,
+  ): Promise<{ id: string; value: Record<string, unknown> }> {
+    return this.json("POST", "/admin/v1/observability_exporters", exporter);
+  }
+
   async listModels(): Promise<Array<Record<string, unknown>>> {
     // GET /admin/v1/models returns a bare JSON array of
     // ResourceEntry<Model> objects (`{id, value, revision}`).

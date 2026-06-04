@@ -29,6 +29,7 @@ mod auth;
 pub mod background;
 pub mod budget;
 mod chat;
+mod client_ip;
 mod completions;
 pub(crate) mod cooldown;
 mod count_tokens;
@@ -365,6 +366,7 @@ mod tests {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
+            real_ip: Default::default(),
             tls: None,
         }
     }

@@ -315,6 +315,21 @@ fn build_otlp_traces_payload(event: &UsageEvent, exporter_name: &str) -> Value {
     if event.ttft_ms > 0 {
         attributes.push(attr_int("aisix.ttft_ms", event.ttft_ms as i64));
     }
+    // Downstream client attribution (#492). Custom attrs so exporters
+    // can slice by source IP / client type; the OTLP encoder is an
+    // explicit allowlist, so new UsageEvent fields must be added here.
+    if !event.client_source_ip.is_empty() {
+        attributes.push(attr_string(
+            "aisix.client_source_ip",
+            &event.client_source_ip,
+        ));
+    }
+    if !event.client_user_agent.is_empty() {
+        attributes.push(attr_string(
+            "aisix.client_user_agent",
+            &event.client_user_agent,
+        ));
+    }
 
     json!({
         "resourceSpans": [{
@@ -533,6 +548,38 @@ mod tests {
         assert!(keys.contains(&"aisix.model_id"));
         assert!(keys.contains(&"aisix.exporter_name"));
         assert!(keys.contains(&"aisix.request_id"));
+    }
+
+    #[test]
+    fn payload_carries_client_attribution_when_present() {
+        let mut ev = sample_event();
+        ev.client_source_ip = "203.0.113.7".into();
+        ev.client_user_agent = "codex-cli/1.2".into();
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap();
+        let ip = attrs.iter().find(|a| a["key"] == "aisix.client_source_ip");
+        let ua = attrs.iter().find(|a| a["key"] == "aisix.client_user_agent");
+        assert_eq!(
+            ip.expect("client_source_ip attr")["value"]["stringValue"],
+            "203.0.113.7"
+        );
+        assert_eq!(
+            ua.expect("client_user_agent attr")["value"]["stringValue"],
+            "codex-cli/1.2"
+        );
+    }
+
+    #[test]
+    fn payload_omits_client_attribution_when_empty() {
+        let body = build_otlp_traces_payload(&sample_event(), "x");
+        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap();
+        let keys: Vec<&str> = attrs.iter().map(|a| a["key"].as_str().unwrap()).collect();
+        assert!(!keys.contains(&"aisix.client_source_ip"));
+        assert!(!keys.contains(&"aisix.client_user_agent"));
     }
 
     #[test]

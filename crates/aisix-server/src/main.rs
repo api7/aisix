@@ -883,9 +883,15 @@ async fn serve_http(
         None => {
             let listener = tokio::net::TcpListener::bind(addr).await?;
             tracing::info!(%addr, label, "aisix listening (http)");
-            axum::serve(listener, router)
-                .with_graceful_shutdown(shutdown_signal(cancel, label))
-                .await?;
+            // ConnectInfo<SocketAddr> exposes the TCP peer to the proxy's
+            // real-ip resolver (#492). Harmless for the admin listener,
+            // which ignores it.
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal(cancel, label))
+            .await?;
             Ok(())
         }
         Some(tls) => {
@@ -910,7 +916,7 @@ async fn serve_http(
             tracing::info!(%addr, label, "aisix listening (https)");
             axum_server::bind_rustls(addr, tls_config)
                 .handle(handle)
-                .serve(router.into_make_service())
+                .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
                 .await?;
             Ok(())
         }

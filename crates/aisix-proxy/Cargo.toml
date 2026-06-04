@@ -55,6 +55,8 @@ chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+# Real-ip resolver: trusted-proxy CIDR matching for x-forwarded-for (#492)
+ipnet.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

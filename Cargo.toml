@@ -45,6 +45,8 @@ hyper-util = "0.1"
 http = "1.2"
 http-body-util = "0.1"
 mime = "0.3"
+# Trusted-proxy CIDR matching for real-ip resolution (#492)
+ipnet = "2"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "multipart"] }

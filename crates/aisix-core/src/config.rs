@@ -319,11 +319,66 @@ pub struct ProxyConfig {
     pub request_body_limit_bytes: usize,
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+    /// Real-client-IP resolution from forwarded headers (#492). Default
+    /// trusts nothing, so the logged source IP is always the immediate
+    /// TCP peer. Configure `trusted_proxies` when the gateway sits behind
+    /// an L7 LB / ingress that sets `x-forwarded-for`.
+    #[serde(default)]
+    pub real_ip: RealIpConfig,
 }
 
 impl ProxyConfig {
     const fn default_body_limit() -> usize {
         10 * 1024 * 1024
+    }
+}
+
+/// nginx `set_real_ip_from` + `real_ip_recursive` equivalent. Resolves
+/// the downstream client IP for usage logs (#492) from a forwarded
+/// header, trusting only addresses inside `trusted_proxies`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RealIpConfig {
+    /// Trusted upstream proxy CIDRs (e.g. `["10.0.0.0/8", "127.0.0.1/32"]`).
+    /// When the immediate TCP peer matches one of these, the configured
+    /// forwarded header is trusted and walked to find the real client.
+    /// Empty (the default) = trust nothing → always log the TCP peer.
+    pub trusted_proxies: Vec<String>,
+    /// nginx `real_ip_recursive`. When true, walk the forwarded header
+    /// right-to-left skipping every trusted address; the first untrusted
+    /// one is the client. When false, take the rightmost header entry
+    /// once the peer is trusted.
+    pub recursive: bool,
+    /// Forwarded header to consult. Defaults to `x-forwarded-for`.
+    pub header: String,
+}
+
+impl Default for RealIpConfig {
+    fn default() -> Self {
+        Self {
+            trusted_proxies: Vec::new(),
+            recursive: false,
+            header: Self::default_header(),
+        }
+    }
+}
+
+impl RealIpConfig {
+    fn default_header() -> String {
+        "x-forwarded-for".into()
+    }
+
+    /// Parse `trusted_proxies` strings into CIDRs, rejecting malformed
+    /// entries. A bare IP (no `/prefix`) is accepted as a host route.
+    pub fn parse_trusted(&self) -> Result<Vec<ipnet::IpNet>, String> {
+        self.trusted_proxies
+            .iter()
+            .map(|s| {
+                s.parse::<ipnet::IpNet>()
+                    .or_else(|_| s.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+                    .map_err(|_| s.clone())
+            })
+            .collect()
     }
 }
 
@@ -568,6 +623,11 @@ impl Config {
                 self.proxy.addr
             )));
         }
+        if let Err(bad) = self.proxy.real_ip.parse_trusted() {
+            return Err(BootstrapError::Config(format!(
+                "proxy.real_ip.trusted_proxies invalid CIDR/IP: {bad}"
+            )));
+        }
         Ok(())
     }
 }
@@ -602,6 +662,59 @@ admin:
         assert_eq!(cfg.proxy.request_body_limit_bytes, 10 * 1024 * 1024);
         assert!(cfg.observability.metrics.prometheus.enabled);
         assert_eq!(cfg.cache.backend, CacheBackend::Memory);
+        // real_ip defaults: trust nothing, non-recursive, x-forwarded-for.
+        assert!(cfg.proxy.real_ip.trusted_proxies.is_empty());
+        assert!(!cfg.proxy.real_ip.recursive);
+        assert_eq!(cfg.proxy.real_ip.header, "x-forwarded-for");
+        assert!(cfg.proxy.real_ip.parse_trusted().unwrap().is_empty());
+    }
+
+    #[test]
+    fn loads_real_ip_block() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  real_ip:
+    trusted_proxies: ["10.0.0.0/8", "127.0.0.1"]
+    recursive: true
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert!(cfg.proxy.real_ip.recursive);
+        // bare IP normalises to a /32 host route.
+        let nets = cfg.proxy.real_ip.parse_trusted().unwrap();
+        assert_eq!(nets.len(), 2);
+        assert!(nets.iter().any(|n| n.to_string() == "10.0.0.0/8"));
+    }
+
+    #[test]
+    fn rejects_malformed_trusted_proxy_cidr() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+  real_ip:
+    trusted_proxies: ["not-a-cidr"]
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(
+            format!("{err}").contains("trusted_proxies"),
+            "error should name the bad field: {err}"
+        );
     }
 
     #[test]
