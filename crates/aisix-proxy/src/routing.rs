@@ -44,9 +44,10 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool) -> bool {
             }
             !(400..500).contains(status)
         }
-        // Customer-fixable config (#367) is the caller's mistake —
-        // retrying or failing over won't help, same as a non-429 4xx.
-        BridgeError::InvalidUpstreamConfig(_) => false,
+        // Customer-fixable config / credentials (#367) is the caller's
+        // mistake — retrying or failing over won't help, same as a
+        // non-429 4xx.
+        BridgeError::InvalidUpstreamConfig(_) | BridgeError::InvalidUpstreamCredentials(_) => false,
         BridgeError::Timeout { .. }
         | BridgeError::Transport(_)
         | BridgeError::UpstreamDecode(_)

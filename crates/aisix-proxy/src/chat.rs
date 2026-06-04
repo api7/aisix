@@ -93,6 +93,7 @@ fn routing_error_class(err: &BridgeError) -> &'static str {
         BridgeError::UpstreamDecode(_) => "upstream_decode",
         BridgeError::Config(_) => "config",
         BridgeError::InvalidUpstreamConfig(_) => "invalid_config",
+        BridgeError::InvalidUpstreamCredentials(_) => "invalid_credentials",
         BridgeError::Transport(_) => "transport",
         BridgeError::StreamAborted => "stream_aborted",
     }
