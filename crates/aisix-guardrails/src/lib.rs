@@ -345,7 +345,10 @@ mod tests {
         // inherits a hold-back default, so an output-blocking guardrail can't
         // live-forward streamed content before its check (secure-by-default).
         let p = DefaultPolicyGuardrail.stream_output_policy();
-        assert!(p.holds_back(), "default streamed-output policy must hold back");
+        assert!(
+            p.holds_back(),
+            "default streamed-output policy must hold back"
+        );
         assert!(matches!(
             p,
             StreamOutputPolicy::BufferFull {

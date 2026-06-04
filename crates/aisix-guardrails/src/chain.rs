@@ -286,9 +286,9 @@ mod tests {
         // #466 regression: the trait default stream policy is now BufferFull
         // (secure-by-default), but a chain whose only member is input-only must
         // NOT buffer the response stream — it never inspects output.
-        let input_only = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::input_only(
-            vec![KeywordRule::literal("x")],
-        ))]);
+        let input_only = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::input_only(vec![
+            KeywordRule::literal("x"),
+        ]))]);
         assert!(!input_only.runs_on_output());
         assert!(
             !input_only.stream_output_policy().holds_back(),
@@ -308,8 +308,12 @@ mod tests {
         // A mixed chain (input-only + output) still holds back because of the
         // output member; the input-only member is skipped, not the driver.
         let mixed = GuardrailChain::new(vec![
-            Arc::new(KeywordBlocklist::input_only(vec![KeywordRule::literal("x")])),
-            Arc::new(KeywordBlocklist::output_only(vec![KeywordRule::literal("y")])),
+            Arc::new(KeywordBlocklist::input_only(vec![KeywordRule::literal(
+                "x",
+            )])),
+            Arc::new(KeywordBlocklist::output_only(vec![KeywordRule::literal(
+                "y",
+            )])),
         ]);
         assert!(mixed.runs_on_output());
         assert!(mixed.stream_output_policy().holds_back());
