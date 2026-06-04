@@ -187,6 +187,17 @@ pub struct OpenAiResponseMessage {
     /// the field) parse unaffected.
     #[serde(default)]
     pub reasoning: Option<String>,
+    /// gpt-4o-audio chat models return generated audio at `message.audio`
+    /// (`{ id, data, transcript, expires_at }`) when the request asks for the
+    /// audio output modality (`modalities:["text","audio"]` + `audio:{…}`).
+    /// Without modeling it here the field is dropped at deserialize — the same
+    /// closed-struct gap that dropped `reasoning_content`/`reasoning` (#684,
+    /// cf #466/#648). Captured as a raw value (we don't model the sub-shape:
+    /// `id`/`data`/`transcript`/`expires_at`) and surfaced verbatim to the
+    /// client via `ChatMessage.extra`. Default so non-audio upstreams (which
+    /// omit the field) parse unaffected.
+    #[serde(default)]
+    pub audio: Option<serde_json::Value>,
 }
 
 // `#[serde(default)]` at the container level so an upstream that omits
@@ -274,6 +285,18 @@ pub fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
                     "reasoning_content".to_string(),
                     serde_json::Value::String(reasoning),
                 );
+            }
+            // #684: surface gpt-4o-audio's generated audio. The audio chat
+            // models return `message.audio` (`{ id, data, transcript,
+            // expires_at }`) when the audio output modality is requested
+            // (the request-side `modalities`/`audio` params already pass
+            // through via `extra`). Stash it in `extra` so RenderedMessage
+            // (which flattens `extra`) emits it as `message.audio` on the
+            // wire. A null/absent audio adds no field.
+            if let Some(audio) = c.message.audio {
+                if !audio.is_null() {
+                    extra.insert("audio".to_string(), audio);
+                }
             }
             (
                 ChatMessage {
@@ -796,6 +819,91 @@ mod tests {
         assert!(
             !out.message.extra.contains_key("reasoning_content"),
             "no reasoning_content field when upstream didn't send one",
+        );
+    }
+
+    /// #684: gpt-4o-audio chat models return generated audio at
+    /// `message.audio`. The non-stream path must surface it to the client via
+    /// `extra` — without this it's dropped at deserialize and the customer
+    /// gets a 200 with no audio despite requesting the audio modality. This is
+    /// the discriminating guard: it FAILS against the pre-fix struct that did
+    /// not model `audio`.
+    #[test]
+    fn non_streaming_audio_message_surfaces_to_extra() {
+        let body = r#"{
+            "id": "chatcmpl-audio",
+            "object": "chat.completion",
+            "model": "gpt-audio",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "audio": {
+                        "id": "audio_abc",
+                        "data": "UklGRiQAAABXQVZF",
+                        "transcript": "Pineapple.",
+                        "expires_at": 1234567890
+                    }
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }"#;
+        let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        let audio = out
+            .message
+            .extra
+            .get("audio")
+            .expect("gpt-4o-audio message.audio must be surfaced to the client (#684)");
+        assert_eq!(audio["data"], "UklGRiQAAABXQVZF");
+        assert_eq!(audio["transcript"], "Pineapple.");
+        assert_eq!(audio["id"], "audio_abc");
+    }
+
+    /// #684 companion: a response WITHOUT audio (the common text-only case)
+    /// must not add a spurious `audio` field.
+    #[test]
+    fn non_streaming_without_audio_adds_no_extra_field() {
+        let body = r#"{
+            "id": "chatcmpl-noaudio",
+            "object": "chat.completion",
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }"#;
+        let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        assert!(
+            !out.message.extra.contains_key("audio"),
+            "no audio field when upstream didn't send one",
+        );
+    }
+
+    /// #684 companion: an explicit `audio: null` must not add a noise field.
+    #[test]
+    fn non_streaming_null_audio_adds_no_extra_field() {
+        let body = r#"{
+            "id": "chatcmpl-nullaudio",
+            "object": "chat.completion",
+            "model": "gpt-audio",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi", "audio": null},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }"#;
+        let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        assert!(
+            !out.message.extra.contains_key("audio"),
+            "explicit null audio adds no field",
         );
     }
 
