@@ -34,9 +34,10 @@ flowchart LR
 
 `ProviderKey` stores the upstream credential and provider connection details.
 
-`Model` exposes the model alias callers send to AISIX. In the quickstart,
-callers send `gpt-4o-prod`, while AISIX forwards the upstream model name
-`gpt-4o-mini`.
+`Model` exposes the model alias callers send to AISIX. In the quickstart, the
+AISIX model alias and the upstream OpenAI model are both `gpt-4o-mini`. In
+later configurations, the caller-facing alias can differ from the upstream
+model name.
 
 `ApiKey` authenticates caller traffic. The gateway stores `key_hash`, the
 SHA-256 hash of the plaintext caller key, and uses `allowed_models` to decide
@@ -52,7 +53,7 @@ Use these quickstart values:
 ```shell
 export AISIX_ADMIN_KEY="admin-local-only-change-me"
 export CALLER_KEY="sk-demo-caller"
-export MODEL_ALIAS="gpt-4o-prod"
+export MODEL_ALIAS="gpt-4o-mini"
 ```
 
 If you completed the quickstart, keep the captured `PROVIDER_KEY_ID`,
@@ -89,9 +90,9 @@ command output as sensitive, including output from later
 
 Check that the resources line up with the request path. The provider key should
 have `display_name: "openai-upstream"` and the OpenAI adapter settings. The
-model should have `display_name: "gpt-4o-prod"` and reference the provider key
+model should have `display_name: "gpt-4o-mini"` and reference the provider key
 with `provider_key_id`. The API key should include
-`allowed_models: ["gpt-4o-prod"]`.
+`allowed_models: ["gpt-4o-mini"]`.
 
 If one of those links is missing, fix the admin resource before debugging the
 proxy API.
@@ -139,7 +140,7 @@ A successful response uses this format:
   "object": "list",
   "data": [
     {
-      "id": "gpt-4o-prod",
+      "id": "gpt-4o-mini",
       "object": "model",
       "created": 1715000000,
       "owned_by": "openai"
@@ -163,7 +164,7 @@ curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H "Authorization: Bearer ${CALLER_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4o-prod",
+    "model": "gpt-4o-mini",
     "messages": [
       {"role": "user", "content": "Say hello from AISIX."}
     ]
@@ -189,7 +190,7 @@ Send the same request without `Authorization`:
 ```shell
 curl -sS -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4o-prod","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 Expected status: `401`.

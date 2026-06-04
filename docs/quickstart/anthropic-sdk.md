@@ -23,7 +23,7 @@ prepare the quickstart admin key and caller key. The examples use
 API key, Python 3.8 or later, and `curl` plus `jq` for creating and verifying
 the example alias.
 
-The main quickstart creates an OpenAI-backed alias named `gpt-4o-prod`. This
+The main quickstart creates an OpenAI-backed alias named `gpt-4o-mini`. This
 quickstart adds a second alias, `claude-prod`, backed by Anthropic.
 
 ## What Changes in Your Application
@@ -134,7 +134,7 @@ The caller sends `claude-prod` to AISIX. The upstream provider receives
 ### Allow the Caller Key to Use the Alias
 
 Update the quickstart API key so the same caller key can access both
-`gpt-4o-prod` and `claude-prod`:
+`gpt-4o-mini` and `claude-prod`:
 
 ```shell
 curl -sS -X PUT http://127.0.0.1:3001/admin/v1/apikeys/${APIKEY_ID} \
@@ -142,7 +142,7 @@ curl -sS -X PUT http://127.0.0.1:3001/admin/v1/apikeys/${APIKEY_ID} \
   -H "Content-Type: application/json" \
   -d '{
     "key_hash": "'"${CALLER_KEY_HASH}"'",
-    "allowed_models": ["gpt-4o-prod", "'"${AISIX_ANTHROPIC_ALIAS}"'"]
+    "allowed_models": ["gpt-4o-mini", "'"${AISIX_ANTHROPIC_ALIAS}"'"]
   }'
 ```
 

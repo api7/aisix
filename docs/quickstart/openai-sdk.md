@@ -20,7 +20,7 @@ model ID, and receives OpenAI-compatible chat-completions responses.
 Before you start, run the gateway with one provider key, model alias, and
 caller-facing API key. If you have not created them yet, start with the
 [Quickstart](../quickstart). The examples use the quickstart caller key
-`sk-demo-caller` and model alias `gpt-4o-prod`. You also need Node.js 20 LTS or
+`sk-demo-caller` and model alias `gpt-4o-mini`. You also need Node.js 20 LTS or
 newer with `npm`; verify with `node --version && npm --version`.
 
 ## What Changes in Your Application
@@ -31,7 +31,7 @@ Keep the OpenAI SDK client, but change the gateway-facing inputs:
 | --- | --- |
 | `apiKey` | AISIX caller API key, such as `sk-demo-caller` |
 | `baseURL` | Gateway `/v1` proxy URL, such as `http://127.0.0.1:3000/v1` |
-| `model` | AISIX model alias, such as `gpt-4o-prod` |
+| `model` | AISIX model alias, such as `gpt-4o-mini` |
 
 Your code still calls `client.chat.completions.create(...)`, sends OpenAI-style
 `messages`, and receives OpenAI-compatible JSON or SSE chunks.
@@ -58,7 +58,7 @@ Set the gateway values that the examples use:
 
 ```shell
 export AISIX_API_KEY="sk-demo-caller"
-export AISIX_MODEL="gpt-4o-prod"
+export AISIX_MODEL="gpt-4o-mini"
 export AISIX_BASE_URL="http://127.0.0.1:3000/v1"
 ```
 
@@ -76,7 +76,7 @@ const client = new OpenAI({
 });
 
 const response = await client.chat.completions.create({
-  model: process.env.AISIX_MODEL ?? "gpt-4o-prod",
+  model: process.env.AISIX_MODEL ?? "gpt-4o-mini",
   messages: [{ role: "user", content: "Say hello from AISIX." }],
 });
 
@@ -92,14 +92,14 @@ node openai-sdk-example.mjs
 You should see a short assistant response. The exact text depends on the
 upstream model.
 
-If the gateway can resolve `gpt-4o-prod` and the upstream provider is
+If the gateway can resolve `gpt-4o-mini` and the upstream provider is
 reachable, the SDK returns a standard OpenAI chat-completions object.
 
 The response should have `response.object` set to `chat.completion`,
 `response.choices[0].message.role` set to `assistant`, and
 `response.choices[0].message.content` populated with model output.
 
-At the gateway layer, AISIX resolves `gpt-4o-prod` to the configured upstream
+At the gateway layer, AISIX resolves `gpt-4o-mini` to the configured upstream
 model and injects the provider credential from the stored `ProviderKey`.
 
 :::note
@@ -123,7 +123,7 @@ const client = new OpenAI({
 });
 
 const stream = await client.chat.completions.create({
-  model: process.env.AISIX_MODEL ?? "gpt-4o-prod",
+  model: process.env.AISIX_MODEL ?? "gpt-4o-mini",
   messages: [{ role: "user", content: "Stream a short greeting." }],
   stream: true,
 });
