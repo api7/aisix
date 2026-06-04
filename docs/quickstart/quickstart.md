@@ -14,6 +14,13 @@ AISIX AI Gateway uses etcd for self-hosted configuration storage. In this
 guide, Docker Compose starts a local etcd container and a local AISIX AI
 Gateway container.
 
+This guide uses three keys:
+
+* The **admin key** authorizes local configuration requests to AISIX.
+* The **OpenAI API key** is stored in AISIX and used only when AISIX calls
+  OpenAI.
+* The **AISIX API key** is sent by the client application when it calls AISIX.
+
 The request you build in this guide follows this path:
 
 <div className="aisixQuickstartDiagram">
@@ -24,8 +31,8 @@ sequenceDiagram
     participant AISIX as AISIX AI Gateway
     participant OpenAI as OpenAI
 
-    Client->>AISIX: caller key sk-demo-caller, model gpt-4o-mini
-    Note over AISIX: Authenticate caller key<br/>Resolve AISIX model name<br/>Use stored provider key
+    Client->>AISIX: AISIX API key, model gpt-4o-mini
+    Note over AISIX: Authenticate AISIX API key<br/>Resolve AISIX model name<br/>Use stored provider key
     AISIX->>OpenAI: provider key, upstream model gpt-4o-mini
     OpenAI-->>AISIX: model response
     AISIX-->>Client: OpenAI-compatible response
@@ -33,12 +40,12 @@ sequenceDiagram
 
 </div>
 
-The client sends the gateway-issued caller key and the AISIX model name
-`gpt-4o-mini`. AISIX authenticates the caller and uses the stored provider key
-to call OpenAI with the same upstream model. The caller never sends the
-upstream provider key.
+The client sends the AISIX API key and the AISIX model name
+`gpt-4o-mini`. AISIX authenticates the client and uses the stored provider key
+to call OpenAI with the same upstream model. The client never sends the
+upstream OpenAI key.
 
-## Prerequisite(s)
+## Prerequisites
 
 * Install [Docker](https://docs.docker.com/get-docker/) with Docker Compose to
   start local **etcd** and **AISIX AI Gateway** containers.
@@ -133,6 +140,8 @@ docker compose ps
 
 When the stack is running, the gateway exposes the proxy listener on
 `http://127.0.0.1:3000` and the admin listener on `http://127.0.0.1:3001`.
+Applications send AI requests to the proxy listener. You use the admin listener
+in this local quickstart to create the gateway resources.
 
 ## Verify Installation
 
@@ -172,16 +181,19 @@ Export the values used by the commands in this section:
 ```shell
 export AISIX_ADMIN_KEY="admin-local-only-change-me"
 export OPENAI_API_KEY="YOUR_OPENAI_API_KEY"
-export CALLER_KEY="sk-demo-caller"
+export AISIX_API_KEY="sk-demo-caller"
 ```
+
+`AISIX_ADMIN_KEY` matches the local admin key in `config.yaml`.
+`AISIX_API_KEY` is the example AISIX API key you will allow through AISIX.
 
 Replace `YOUR_OPENAI_API_KEY` with a real upstream key. Without a valid
 provider credential, the admin resources can still be created, but the final
 proxy request will fail when AISIX calls the upstream provider.
 
 Next, you will create three resources: a **provider key** for the upstream
-credential, an **AISIX model name** that callers use on the proxy API, and a
-**caller API key** that authenticates client traffic to AISIX.
+credential, an **AISIX model name** that clients use on the proxy API, and a
+**client API key** that authenticates client traffic to AISIX.
 
 ### Create a Provider Key
 
@@ -210,17 +222,15 @@ access. In AISIX Cloud managed deployments, provider credentials are managed by
 the control plane and projected to data planes.
 :::
 
-:::note Provider Base URL
 This quickstart uses OpenAI, so `api_base` is `https://api.openai.com/v1`. Do
 not reuse that value for every provider. Provider base URL requirements differ;
 see [Provider Keys](../configuration/provider-keys.md#configure-the-base-url)
 and
 [Base URL Normalization](../configuration/provider-keys.md#base-url-normalization).
-:::
 
 ### Create a Model
 
-This resource connects the caller-facing AISIX model name to the upstream
+This resource connects the client-facing AISIX model name to the upstream
 OpenAI model. In this first example, both names are `gpt-4o-mini`.
 
 ```shell
@@ -238,20 +248,20 @@ MODEL_ID=$(curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
 Clients use `gpt-4o-mini` as the `model` value on the proxy API. The upstream
 provider receives the same model name.
 
-### Create a Caller API Key
+### Create a Client API Key
 
-AISIX stores a hash of the caller key rather than the plaintext value. Hash the
-caller key first:
+AISIX stores a hash of the client API key rather than the plaintext value. Hash
+the client API key first:
 
 ```shell
 if command -v sha256sum >/dev/null 2>&1; then
-  CALLER_KEY_HASH=$(printf '%s' "${CALLER_KEY}" | sha256sum | cut -d' ' -f1)
+  AISIX_API_KEY_HASH=$(printf '%s' "${AISIX_API_KEY}" | sha256sum | cut -d' ' -f1)
 else
-  CALLER_KEY_HASH=$(printf '%s' "${CALLER_KEY}" | shasum -a 256 | awk '{print $1}')
+  AISIX_API_KEY_HASH=$(printf '%s' "${AISIX_API_KEY}" | shasum -a 256 | awk '{print $1}')
 fi
 ```
 
-Then create the API key resource that allows the caller key to use
+Then create the API key resource that allows the AISIX API key to use
 `gpt-4o-mini`:
 
 ```shell
@@ -259,7 +269,7 @@ APIKEY_ID=$(curl -sS -X POST http://127.0.0.1:3001/admin/v1/apikeys \
   -H "Authorization: Bearer ${AISIX_ADMIN_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
-    "key_hash": "'"${CALLER_KEY_HASH}"'",
+    "key_hash": "'"${AISIX_API_KEY_HASH}"'",
     "allowed_models": ["gpt-4o-mini"]
   }' | jq -r .id)
 ```
@@ -282,13 +292,13 @@ Admin API writes land in etcd first, and the proxy applies those changes
 asynchronously. Give the proxy a moment to receive the new resources before you
 send traffic.
 
-Poll `/v1/models` until the AISIX model name is visible to the caller key:
+Poll `/v1/models` until the AISIX model name is visible to the AISIX API key:
 
 ```shell
 MODEL_VISIBLE=false
 for i in $(seq 1 20); do
   if curl -sS http://127.0.0.1:3000/v1/models \
-    -H "Authorization: Bearer ${CALLER_KEY}" \
+    -H "Authorization: Bearer ${AISIX_API_KEY}" \
     | jq -e '.data[]? | select(.id == "gpt-4o-mini")' >/dev/null; then
     MODEL_VISIBLE=true
     echo "model is visible"
@@ -302,17 +312,17 @@ if [ "${MODEL_VISIBLE}" != "true" ]; then
 fi
 ```
 
-You can also inspect the caller-visible model list:
+You can also inspect the client-visible model list:
 
 ```shell
 curl -sS http://127.0.0.1:3000/v1/models \
-  -H "Authorization: Bearer ${CALLER_KEY}"
+  -H "Authorization: Bearer ${AISIX_API_KEY}"
 ```
 
 The response should include `gpt-4o-mini`.
 
 When `gpt-4o-mini` appears, the gateway is running and the proxy can see the
-configured model. `/v1/models` confirms caller authentication, model
+configured model. `/v1/models` confirms client authentication, model
 allowlisting, and configuration propagation. The next request sends traffic
 through the provider key to the upstream provider.
 
@@ -320,7 +330,7 @@ through the provider key to the upstream provider.
 
 ```shell
 curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
-  -H "Authorization: Bearer ${CALLER_KEY}" \
+  -H "Authorization: Bearer ${AISIX_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-4o-mini",
@@ -334,10 +344,10 @@ With a valid upstream provider key, you should receive an OpenAI
 chat-completions response that includes the model `gpt-4o-mini`.
 
 The gateway authenticates to the upstream provider with the provider key you
-created earlier, while the caller authenticates to AISIX with the caller API
+created earlier, while the client authenticates to AISIX with the AISIX API
 key. This separation is one of the core operating patterns in AISIX AI Gateway.
 
-You can now reuse this local gateway, caller key, and AISIX model name in the
+You can now reuse this local gateway, AISIX API key, and AISIX model name in the
 SDK quickstarts.
 
 ## Next Steps

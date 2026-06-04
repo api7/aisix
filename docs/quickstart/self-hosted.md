@@ -11,13 +11,16 @@ reachable. For the fastest container-based path, start with the
 [Quickstart](../quickstart).
 
 A source-built gateway still needs the same provider key, model alias, and
-caller API key as the container quickstart before it can proxy model traffic.
+AISIX API key as the container quickstart before it can proxy model traffic.
 
 ## Prerequisites
 
-Before you start, install Git, Docker, `curl`, and Rust 1.93 or newer with
-`cargo`. Install Rust with [rustup](https://rustup.rs). The repository pins the
-required Rust version through `rust-toolchain.toml`.
+* Install Git to clone the AISIX AI Gateway repository.
+* Install [Docker](https://docs.docker.com/get-docker/) to start local **etcd**.
+* Install [cURL](https://curl.se/) to verify the proxy and admin listeners.
+* Install Rust 1.93 or newer with `cargo`. Install Rust with
+  [rustup](https://rustup.rs). The repository pins the required Rust version
+  through `rust-toolchain.toml`.
 
 ## Prepare the Source Checkout
 
@@ -77,7 +80,7 @@ Leave the gateway process running. In a new terminal, verify the proxy listener
 at `http://127.0.0.1:3000` and the admin listener at
 `http://127.0.0.1:3001`.
 
-## Verify the Listeners
+## Verify Installation
 
 Both listeners expose an unauthenticated liveness route at `/livez`. The proxy
 and admin handlers share the same response format, so you can probe either with
@@ -117,7 +120,7 @@ exporters are managed after boot through the admin API.
 At this point, the gateway process is running but no model traffic can pass
 through it yet. Create the same minimum resources used by the main quickstart:
 a provider key for the upstream credential, a model alias for the model name
-callers send to AISIX, and a caller API key that can use that alias.
+clients send to AISIX, and an AISIX API key that can use that alias.
 
 Continue with [Export Local Variables](../quickstart#export-local-variables) in
 the Quickstart, using the admin listener at `http://127.0.0.1:3001` and the
@@ -136,9 +139,9 @@ If you created admin resources such as models, API keys, or provider keys,
 delete them through the admin API before stopping etcd, or remove the etcd
 `--prefix` keyspace if you want a clean slate.
 
-## Related Reading
+## Next Steps
 
-For the minimum provider key, model alias, and caller key, see
+For the minimum provider key, model alias, and AISIX API key, see
 [Quickstart](../quickstart). To call the gateway from application code,
 continue with [OpenAI SDK Quickstart](openai-sdk.md) or
 [Anthropic SDK Quickstart](anthropic-sdk.md).

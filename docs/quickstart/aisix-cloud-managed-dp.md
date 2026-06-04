@@ -10,6 +10,10 @@ certificate bundle and mTLS. The data plane receives Cloud-projected
 configuration and serves proxy traffic without exposing the standalone admin
 API.
 
+In managed mode, the data plane is the gateway runtime that handles local AI
+traffic. AISIX Cloud owns the configuration workflow and projects approved
+resources to the data plane.
+
 :::note
 AISIX Cloud handles environment creation, certificate issuance, and management
 workflows. The bootstrap instructions below cover data-plane runtime startup.
@@ -17,11 +21,12 @@ workflows. The bootstrap instructions below cover data-plane runtime startup.
 
 ## Prerequisites
 
-Before you start, prepare an AISIX Cloud environment, a gateway certificate
-bundle issued for that environment, the AISIX AI Gateway container image or
-binary, a writable runtime state directory such as `/var/lib/aisix`, and
-network access from the data plane to the AISIX Cloud data-plane-manager
-endpoint.
+* Prepare an AISIX Cloud environment.
+* Prepare a gateway certificate bundle issued for that environment.
+* Prepare the AISIX AI Gateway container image or binary.
+* Prepare a writable runtime state directory, such as `/var/lib/aisix`.
+* Confirm network access from the data plane to the AISIX Cloud
+  data-plane-manager endpoint.
 
 ## Bootstrap Model
 
@@ -42,7 +47,7 @@ bearer-token pattern is not used for this bootstrap path.
 When debugging bootstrap failures, check for a certificate bundle and mTLS
 connection settings rather than a bearer registration token.
 
-## Prepare Bootstrap Inputs
+## Prepare the Bootstrap Inputs
 
 Collect the certificate bundle, Cloud endpoint, config selection, and runtime
 state path before starting the data plane.
@@ -191,7 +196,7 @@ Focus on control-plane projection and environment-scoped resource visibility.
 Managed mode uses Cloud-managed configuration rather than the standalone admin
 API.
 
-## Related Reading
+## Next Steps
 
 For certificate issuance and bootstrap details, see
 [Gateway certificates and managed data plane](../cloud/gateway-certificates-and-managed-dp.md).

@@ -1,31 +1,31 @@
 ---
 title: Understand Admin Resources
-description: Learn how provider keys, model aliases, and caller API keys work together in AISIX AI Gateway.
+description: Learn how provider keys, model aliases, and AISIX API keys work together in AISIX AI Gateway.
 sidebar_position: 11
 toc_max_heading_level: 2
 ---
 
-Review the resources created in the [Quickstart](../quickstart) and verify how
-the proxy enforces them. The request path connects the caller key, model alias,
-provider key, propagation state, and authorization checks behind the first
-successful request.
+In this guide, you will review the resources created in the
+[Quickstart](../quickstart) and verify how the proxy enforces them. The request
+path connects the AISIX API key, model alias, provider key, propagation state,
+and authorization checks behind the first successful request.
 
 :::note Standalone Only
 The standalone `admin/v1` API listens on `127.0.0.1:3001`. A
 [Cloud managed data plane](aisix-cloud-managed-dp.md) only exposes proxy APIs
 locally and does **not** bind the standalone admin listener. In managed
-deployments, create provider keys, models, and caller API keys through the
+deployments, create provider keys, models, and AISIX API keys through the
 AISIX Cloud control plane.
 :::
 
 ## How Resources Connect
 
-A request moves through the caller key, model alias, and provider key before
+A request moves through the AISIX API key, model alias, and provider key before
 AISIX sends it to the upstream model:
 
 ```mermaid
 flowchart LR
-    Caller["Caller API key"] --> Allowlist["Allowed model aliases"]
+    Caller["AISIX API key"] --> Allowlist["Allowed model aliases"]
     Allowlist --> Alias["Model alias"]
     Alias --> ProviderKey["Provider key"]
     ProviderKey --> Credential["Upstream credential"]
@@ -34,25 +34,25 @@ flowchart LR
 
 `ProviderKey` stores the upstream credential and provider connection details.
 
-`Model` exposes the model alias callers send to AISIX. In the quickstart, the
+`Model` exposes the model alias clients send to AISIX. In the quickstart, the
 AISIX model alias and the upstream OpenAI model are both `gpt-4o-mini`. In
-later configurations, the caller-facing alias can differ from the upstream
+later configurations, the client-facing alias can differ from the upstream
 model name.
 
-`ApiKey` authenticates caller traffic. The gateway stores `key_hash`, the
-SHA-256 hash of the plaintext caller key, and uses `allowed_models` to decide
-which model aliases the caller can use.
+`ApiKey` authenticates client traffic. The gateway stores `key_hash`, the
+SHA-256 hash of the plaintext AISIX API key, and uses `allowed_models` to
+decide which model aliases the key can use.
 
 ## Prerequisites
 
 Complete the [Quickstart](../quickstart) first, or start from a gateway that
-already has a provider key, a direct model alias, and a caller API key.
+already has a provider key, a direct model alias, and an AISIX API key.
 
 Use these quickstart values:
 
 ```shell
 export AISIX_ADMIN_KEY="admin-local-only-change-me"
-export CALLER_KEY="sk-demo-caller"
+export AISIX_API_KEY="sk-demo-caller"
 export MODEL_ALIAS="gpt-4o-mini"
 ```
 
@@ -63,11 +63,11 @@ below use them.
 ## Verify the Request Path
 
 Start with the admin resources, then confirm that the proxy has loaded the
-model alias and can serve a request with the caller key.
+model alias and can serve a request with the AISIX API key.
 
 ### Inspect the Resources
 
-List the provider keys, models, and caller API keys that the admin API stores:
+List the provider keys, models, and AISIX API keys that the admin API stores:
 
 ```shell
 curl -sS http://127.0.0.1:3001/admin/v1/provider_keys \
@@ -103,13 +103,13 @@ Admin writes do not become visible to the proxy instantly. AISIX applies
 dynamic resources asynchronously, so propagation is usually fast but not
 instantaneous.
 
-Poll the proxy until the model alias is visible to the caller key:
+Poll the proxy until the model alias is visible to the AISIX API key:
 
 ```shell
 MODEL_VISIBLE=false
 for i in $(seq 1 20); do
   MODELS_RESPONSE=$(curl -sS http://127.0.0.1:3000/v1/models \
-    -H "Authorization: Bearer ${CALLER_KEY}")
+    -H "Authorization: Bearer ${AISIX_API_KEY}")
 
   if echo "${MODELS_RESPONSE}" \
     | jq -e --arg model "${MODEL_ALIAS}" \
@@ -130,7 +130,7 @@ Then inspect the visible models:
 
 ```shell
 curl -sS http://127.0.0.1:3000/v1/models \
-  -H "Authorization: Bearer ${CALLER_KEY}"
+  -H "Authorization: Bearer ${AISIX_API_KEY}"
 ```
 
 A successful response uses this format:
@@ -156,12 +156,12 @@ runs.
 
 If the final quickstart request already succeeded, you can skip to
 [Verify auth and allowlist enforcement](#verify-auth-and-allowlist-enforcement).
-Otherwise, send one normal request with the caller key and the allowed model
+Otherwise, send one normal request with the AISIX API key and the allowed model
 alias:
 
 ```shell
 curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
-  -H "Authorization: Bearer ${CALLER_KEY}" \
+  -H "Authorization: Bearer ${AISIX_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-4o-mini",
@@ -174,9 +174,9 @@ curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
 With a valid upstream provider key, the response follows the OpenAI
 chat-completions format.
 
-The application never sends the upstream provider key. The caller sends only
-the gateway-issued caller key. AISIX resolves the model alias and uses the
-provider key on the upstream side.
+The application never sends the upstream provider key. The client sends only
+the AISIX API key. AISIX resolves the model alias and uses the provider key on
+the upstream side.
 
 ## Verify Auth and Allowlist Enforcement
 
@@ -208,11 +208,11 @@ The proxy response body uses the OpenAI-compatible error envelope:
 
 ### Unauthorized Model Is Rejected
 
-Ask for a model alias the caller key cannot use:
+Ask for a model alias the AISIX API key cannot use:
 
 ```shell
 curl -sS -X POST http://127.0.0.1:3000/v1/chat/completions \
-  -H "Authorization: Bearer ${CALLER_KEY}" \
+  -H "Authorization: Bearer ${AISIX_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"model":"some-model-not-in-allowed-models","messages":[{"role":"user","content":"hi"}]}'
 ```
@@ -233,7 +233,7 @@ Use the first failing status code to locate the failing part of the chain:
 
 | Status and type | Likely cause |
 | --- | --- |
-| `401 invalid_api_key` | The caller key is missing, malformed, or unknown to the loaded proxy configuration. |
+| `401 invalid_api_key` | The AISIX API key is missing, malformed, or unknown to the loaded proxy configuration. |
 | `403 permission_denied` | The key exists, but the resolved model alias is not in `allowed_models`. |
 | `404 model_not_found` | The model alias does not resolve in the loaded proxy configuration. |
 | `503 provider_unavailable` | No provider adapter is available for the resolved provider, or every routing candidate is unavailable. |
@@ -252,7 +252,7 @@ proxy and admin error handling.
 ## Clean Up When Done
 
 :::warning Cleanup Timing
-The SDK quickstarts reuse the local gateway, caller key, and model alias from
+The SDK quickstarts reuse the local gateway, AISIX API key, and model alias from
 this walkthrough. Run the cleanup commands after any local SDK walkthroughs you
 want to complete.
 :::
@@ -280,7 +280,7 @@ Then remove the local gateway stack:
 docker compose down -v
 ```
 
-## Related Reading
+## Next Steps
 
 Read [Core concepts](../overview/core-concepts.md) for the resource model, or
 continue with the [OpenAI SDK Quickstart](openai-sdk.md) or

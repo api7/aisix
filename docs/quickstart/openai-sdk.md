@@ -5,21 +5,18 @@ toc_max_heading_level: 2
 sidebar_position: 12
 ---
 
-Point the official OpenAI SDK at AISIX AI Gateway instead of sending requests
-directly to an upstream provider.
+In this quickstart, you will point the official OpenAI SDK at AISIX AI Gateway
+instead of sending requests directly to an upstream provider.
 
-Continue from the [Quickstart](../quickstart). If you cleaned up the quickstart
-resources, run the quickstart again first.
-
-The example authenticates to AISIX with a caller API key, sends requests to the
-gateway's `/v1` proxy API, uses an AISIX model alias instead of the upstream
-model ID, and receives OpenAI-compatible chat-completions responses.
+The example authenticates to AISIX with an AISIX API key, sends requests to the
+gateway's `/v1` proxy API, uses an AISIX model alias, and receives
+OpenAI-compatible chat-completions responses.
 
 ## Prerequisites
 
-Before you start, run the gateway with one provider key, model alias, and
-caller-facing API key. If you have not created them yet, start with the
-[Quickstart](../quickstart). The examples use the quickstart caller key
+Before you start, run the gateway with one provider key, model alias, and AISIX
+API key. If you have not created them yet, start with the
+[Quickstart](../quickstart). The examples use the quickstart AISIX API key
 `sk-demo-caller` and model alias `gpt-4o-mini`. You also need Node.js 20 LTS or
 newer with `npm`; verify with `node --version && npm --version`.
 
@@ -29,7 +26,7 @@ Keep the OpenAI SDK client, but change the gateway-facing inputs:
 
 | SDK Setting | Use This Value |
 | --- | --- |
-| `apiKey` | AISIX caller API key, such as `sk-demo-caller` |
+| `apiKey` | AISIX API key, such as `sk-demo-caller` |
 | `baseURL` | Gateway `/v1` proxy URL, such as `http://127.0.0.1:3000/v1` |
 | `model` | AISIX model alias, such as `gpt-4o-mini` |
 
@@ -141,8 +138,8 @@ You should see streamed text printed to the terminal.
 
 ## Production Setup Pattern
 
-In most deployments, application code needs only the gateway base URL, AISIX
-caller API key, and AISIX model alias. Upstream credentials, base URLs, model
+In most deployments, application code needs only the gateway base URL, AISIX API
+key, and AISIX model alias. Upstream credentials, base URLs, model
 identifiers, routing policies, rate limits, guardrails, and observability hooks
 stay behind the gateway.
 
@@ -163,8 +160,8 @@ unless they are intentionally the same.
 
 ### The Request Fails With `403`
 
-The caller key exists, but its `allowed_models` list does not include the alias
-you requested.
+The AISIX API key exists, but its `allowed_models` list does not include the
+alias you requested.
 
 ### The Request Works in `cURL` but Not in the SDK
 
@@ -172,7 +169,7 @@ Check `AISIX_API_KEY`, `AISIX_BASE_URL`, and `AISIX_MODEL` first. If `curl` and
 the SDK use the same values, compare the SDK request body with the request that
 passed in [Send a Proxy Request](../quickstart#send-a-proxy-request).
 
-## Related Reading
+## Next Steps
 
 For OpenAI-compatible proxy behavior, see
 [OpenAI-compatible API](../integration/openai-compatible-api.md). For SSE

@@ -5,12 +5,13 @@ sidebar_position: 13
 toc_max_heading_level: 2
 ---
 
-Point an Anthropic-style SDK client at AISIX AI Gateway.
+In this quickstart, you will point an Anthropic-style SDK client at AISIX AI
+Gateway. Use this path when your application already uses Claude-style request
+and response formats.
 
-Call AISIX from the Anthropic SDK when your application already uses
-Claude-style request and response formats. The setup adds an Anthropic-backed
-model alias to the local gateway, allows the quickstart caller key to use it,
-and calls `POST /v1/messages` through the Anthropic Python SDK.
+The setup adds an Anthropic-backed model alias to the local gateway, allows the
+quickstart AISIX API key to use it, and calls `POST /v1/messages` through the
+Anthropic Python SDK.
 
 If your application is already built around OpenAI SDKs, use
 [OpenAI SDK Quickstart](openai-sdk.md) instead.
@@ -18,7 +19,7 @@ If your application is already built around OpenAI SDKs, use
 ## Prerequisites
 
 Before you start, run the gateway from the [Quickstart](../quickstart) and
-prepare the quickstart admin key and caller key. The examples use
+prepare the quickstart admin key and AISIX API key. The examples use
 `admin-local-only-change-me` and `sk-demo-caller`. You also need an Anthropic
 API key, Python 3.8 or later, and `curl` plus `jq` for creating and verifying
 the example alias.
@@ -39,7 +40,7 @@ flowchart LR
     ProviderKey --> Upstream["Upstream model"]
 ```
 
-The application sends the AISIX caller key `sk-demo-caller`, the AISIX model
+The application sends the AISIX API key `sk-demo-caller`, the AISIX model
 alias `claude-prod`, and the gateway base URL `http://127.0.0.1:3000`.
 
 AISIX resolves `claude-prod` to the upstream Anthropic model and injects the
@@ -48,7 +49,7 @@ stored provider credential on the upstream side.
 ## Configure the Gateway
 
 Create an Anthropic provider key, add a `claude-prod` model alias, and allow
-the quickstart caller key to use that alias.
+the quickstart AISIX API key to use that alias.
 
 ### Set Environment Variables
 
@@ -56,7 +57,7 @@ Export the values used by the admin commands:
 
 ```shell
 export AISIX_ADMIN_KEY="admin-local-only-change-me"
-export CALLER_KEY="sk-demo-caller"
+export AISIX_API_KEY="sk-demo-caller"
 export ANTHROPIC_API_KEY="YOUR_ANTHROPIC_API_KEY"
 export ANTHROPIC_MODEL="claude-sonnet-4-6"
 export AISIX_ANTHROPIC_ALIAS="claude-prod"
@@ -65,29 +66,29 @@ export AISIX_ANTHROPIC_ALIAS="claude-prod"
 Replace `YOUR_ANTHROPIC_API_KEY` with a real Anthropic API key.
 
 `ANTHROPIC_MODEL` is the upstream model ID AISIX sends to Anthropic.
-`AISIX_ANTHROPIC_ALIAS` is the caller-facing model name your application sends
+`AISIX_ANTHROPIC_ALIAS` is the client-facing model name your application sends
 to AISIX.
 
 ### Find the API Key Resource
 
-If you are reusing the quickstart caller key, recover the matching API key
+If you are reusing the quickstart AISIX API key, recover the matching API key
 resource from the admin API:
 
 ```shell
 if command -v sha256sum >/dev/null 2>&1; then
-  CALLER_KEY_HASH=$(printf '%s' "${CALLER_KEY}" | sha256sum | cut -d' ' -f1)
+  AISIX_API_KEY_HASH=$(printf '%s' "${AISIX_API_KEY}" | sha256sum | cut -d' ' -f1)
 else
-  CALLER_KEY_HASH=$(printf '%s' "${CALLER_KEY}" | shasum -a 256 | awk '{print $1}')
+  AISIX_API_KEY_HASH=$(printf '%s' "${AISIX_API_KEY}" | shasum -a 256 | awk '{print $1}')
 fi
 
 APIKEY_ID=$(curl -sS http://127.0.0.1:3001/admin/v1/apikeys \
   -H "Authorization: Bearer ${AISIX_ADMIN_KEY}" \
-  | jq -r --arg hash "${CALLER_KEY_HASH}" \
+  | jq -r --arg hash "${AISIX_API_KEY_HASH}" \
     '.[] | select(.value.key_hash == $hash) | .id' \
   | head -n 1)
 
 if [ -z "${APIKEY_ID}" ]; then
-  echo "No API key resource found for ${CALLER_KEY}; rerun the main quickstart API-key step." >&2
+  echo "No API key resource found for ${AISIX_API_KEY}; rerun the main quickstart API-key step." >&2
   exit 1
 fi
 ```
@@ -114,7 +115,7 @@ AISIX appends `/v1/messages` to `api_base`, so use the bare host
 
 ### Create an Anthropic-Backed Model Alias
 
-Create the caller-facing model alias:
+Create the client-facing model alias:
 
 ```shell
 ANTHROPIC_MODEL_ID=$(curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
@@ -128,12 +129,12 @@ ANTHROPIC_MODEL_ID=$(curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
   }' | jq -r .id)
 ```
 
-The caller sends `claude-prod` to AISIX. The upstream provider receives
+The client sends `claude-prod` to AISIX. The upstream provider receives
 `claude-sonnet-4-6`.
 
-### Allow the Caller Key to Use the Alias
+### Allow the AISIX API Key to Use the Alias
 
-Update the quickstart API key so the same caller key can access both
+Update the quickstart API key so the same AISIX API key can access both
 `gpt-4o-mini` and `claude-prod`:
 
 ```shell
@@ -141,20 +142,20 @@ curl -sS -X PUT http://127.0.0.1:3001/admin/v1/apikeys/${APIKEY_ID} \
   -H "Authorization: Bearer ${AISIX_ADMIN_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
-    "key_hash": "'"${CALLER_KEY_HASH}"'",
+    "key_hash": "'"${AISIX_API_KEY_HASH}"'",
     "allowed_models": ["gpt-4o-mini", "'"${AISIX_ANTHROPIC_ALIAS}"'"]
   }'
 ```
 
 ### Verify the Alias Is Visible
 
-Poll `/v1/models` until the new alias appears for the caller key:
+Poll `/v1/models` until the new alias appears for the AISIX API key:
 
 ```shell
 ANTHROPIC_ALIAS_VISIBLE=false
 for i in $(seq 1 20); do
   if curl -sS http://127.0.0.1:3000/v1/models \
-    -H "Authorization: Bearer ${CALLER_KEY}" \
+    -H "Authorization: Bearer ${AISIX_API_KEY}" \
     | jq -e --arg model "${AISIX_ANTHROPIC_ALIAS}" \
       '.data[]? | select(.id == $model)' >/dev/null; then
     ANTHROPIC_ALIAS_VISIBLE=true
@@ -192,7 +193,7 @@ python -m pip install anthropic
 ### Create a Client Example
 
 Use your Anthropic-compatible client with the gateway base URL and your AISIX
-caller key:
+API key:
 
 ```python title="anthropic-sdk-example.py"
 import os
@@ -241,7 +242,7 @@ At the client edge, the SDK sends the request to `POST /v1/messages`; `model`
 is the AISIX model alias, and `messages` plus `max_tokens` follow the
 Anthropic Messages format.
 
-At the gateway layer, AISIX authenticates the caller key, checks
+At the gateway layer, AISIX authenticates the AISIX API key, checks
 `allowed_models`, resolves the alias, and injects the upstream Anthropic
 provider key.
 
@@ -268,7 +269,7 @@ the upstream Anthropic model ID.
 
 ### Client Receives `403`
 
-The caller key is valid, but its `allowed_models` list does not include the
+The AISIX API key is valid, but its `allowed_models` list does not include the
 alias you requested.
 
 ### Client Works With cURL but Not the SDK
@@ -296,7 +297,7 @@ To remove every local quickstart resource, run the cleanup section in
 [Understand Admin Resources](first-model-first-key-first-request.md#clean-up-when-done),
 then stop the local stack.
 
-## Related Reading
+## Next Steps
 
 For `/v1/messages` behavior, see
 [Anthropic-style Messages API](../integration/anthropic-messages.md). For SSE
