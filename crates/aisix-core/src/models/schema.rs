@@ -409,7 +409,7 @@ fn guardrail_schema() -> Value {
             "enabled":    { "type": "boolean" },
             "hook_point": { "enum": ["input", "output", "both"] },
             "fail_open":  { "type": "boolean" },
-            "kind":       { "enum": ["keyword", "bedrock", "azure_content_safety", "azure_content_safety_text_moderation"] }
+            "kind":       { "enum": ["keyword", "bedrock", "azure_content_safety", "azure_content_safety_text_moderation", "aliyun_text_moderation"] }
         },
         "oneOf": [
             {
@@ -481,6 +481,31 @@ fn guardrail_schema() -> Value {
                     "max_buffer_bytes": { "type": "integer", "minimum": 1 },
                     "on_buffer_exceeded": { "enum": ["fail_closed", "fail_open"] },
                     "output_fail_open": { "type": "boolean" }
+                }
+            },
+            {
+                // kind=aliyun_text_moderation — Aliyun content-safety
+                // guardrail (TextModerationPlus). Mirrors
+                // AliyunTextModerationConfig in guardrail.rs: region +
+                // access keys required, endpoint override + threshold +
+                // streaming params optional (cp-api applies defaults +
+                // strict validation on write). #603.
+                "type": "object",
+                "required": ["kind", "region", "access_key_id", "access_key_secret"],
+                "properties": {
+                    "kind":              { "const": "aliyun_text_moderation" },
+                    "region":            { "type": "string", "minLength": 1 },
+                    "endpoint":          { "type": "string", "minLength": 1 },
+                    "access_key_id":     { "type": "string", "minLength": 1 },
+                    "access_key_secret": { "type": "string", "minLength": 1 },
+                    "risk_level_threshold": { "enum": ["low", "medium", "high"] },
+                    "timeout_ms":        { "type": "integer", "minimum": 0, "maximum": 4_294_967_295u64 },
+                    "output_fail_open":  { "type": "boolean" },
+                    "stream_processing_mode": { "enum": ["window", "buffer_full"] },
+                    "window_size":       { "type": "integer", "minimum": 1, "maximum": 2_000 },
+                    "window_overlap_size": { "type": "integer", "minimum": 0 },
+                    "max_buffer_bytes":  { "type": "integer", "minimum": 1 },
+                    "on_buffer_exceeded": { "enum": ["fail_closed", "fail_open"] }
                 }
             }
         ],
@@ -1209,6 +1234,61 @@ mod tests {
             "endpoint": "https://r.cognitiveservices.azure.com",
             "api_key": "k",
             "timeout_ms": 4_294_967_296u64
+        });
+        assert!(validate_guardrail(&v).is_err());
+    }
+
+    #[test]
+    fn guardrail_aliyun_text_moderation_passes() {
+        // Minimal row: region + access keys. Optional fields (endpoint,
+        // threshold, streaming params) omitted — the struct applies defaults.
+        let v = json!({
+            "name": "aliyun-guard",
+            "kind": "aliyun_text_moderation",
+            "hook_point": "both",
+            "region": "cn-shanghai",
+            "access_key_id": "LTAI_EXAMPLE",
+            "access_key_secret": "plaintext-secret"
+        });
+        validate_guardrail(&v).unwrap();
+    }
+
+    #[test]
+    fn guardrail_aliyun_text_moderation_with_optional_fields_passes() {
+        let v = json!({
+            "name": "aliyun-guard",
+            "kind": "aliyun_text_moderation",
+            "region": "cn-beijing",
+            "endpoint": "http://127.0.0.1:8080",
+            "access_key_id": "id",
+            "access_key_secret": "secret",
+            "risk_level_threshold": "medium",
+            "timeout_ms": 3000,
+            "stream_processing_mode": "buffer_full"
+        });
+        validate_guardrail(&v).unwrap();
+    }
+
+    #[test]
+    fn guardrail_aliyun_text_moderation_missing_secret_rejected() {
+        let v = json!({
+            "name": "g",
+            "kind": "aliyun_text_moderation",
+            "region": "cn-shanghai",
+            "access_key_id": "id"
+        });
+        assert!(validate_guardrail(&v).is_err());
+    }
+
+    #[test]
+    fn guardrail_aliyun_text_moderation_bad_threshold_rejected() {
+        let v = json!({
+            "name": "g",
+            "kind": "aliyun_text_moderation",
+            "region": "cn-shanghai",
+            "access_key_id": "id",
+            "access_key_secret": "s",
+            "risk_level_threshold": "none"
         });
         assert!(validate_guardrail(&v).is_err());
     }

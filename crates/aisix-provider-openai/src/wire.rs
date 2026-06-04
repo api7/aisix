@@ -116,7 +116,7 @@ pub fn messages_from(req: &ChatFormat) -> Vec<OpenAiMessage<'_>> {
             // string. See `ChatMessage::content_blocks` doc.
             content: match m.content_blocks.as_deref() {
                 Some(blocks) => OpenAiContent::Blocks(blocks),
-                None => OpenAiContent::Text(&m.content),
+                None => OpenAiContent::Text(m.content_str()),
             },
             name: m.name.as_deref(),
             tool_call_id: m.tool_call_id.as_deref(),
@@ -278,7 +278,11 @@ pub fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
             (
                 ChatMessage {
                     role: role_from_str(&c.message.role),
-                    content: c.message.content.unwrap_or_default(),
+                    // #395: carry the upstream `string | null` through
+                    // verbatim. A tool_calls response returns
+                    // `content: null`; collapsing it to `""` here is the
+                    // divergence we're fixing.
+                    content: c.message.content,
                     content_blocks: None,
                     name: None,
                     tool_call_id: None,
@@ -387,6 +391,15 @@ pub struct OpenAiStreamDelta {
     /// string lands here.
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    /// OpenRouter (and some OpenAI-compatible aggregators) stream the
+    /// chain-of-thought at `delta.reasoning` — NOT the DeepSeek-canonical
+    /// `delta.reasoning_content` (#502, streaming parity with the
+    /// non-stream #648 fix). Normalised into the canonical
+    /// `reasoning_content` slot in [`stream_chunk_into_chat_chunk`] with no
+    /// per-key config required. Default so non-OpenRouter upstreams (which
+    /// omit the field) parse unaffected.
+    #[serde(default)]
+    pub reasoning: Option<String>,
 }
 
 pub fn stream_chunk_into_chat_chunk(mut raw: OpenAiStreamChunk) -> ChatChunk {
@@ -397,7 +410,15 @@ pub fn stream_chunk_into_chat_chunk(mut raw: OpenAiStreamChunk) -> ChatChunk {
                 role: c.delta.role.as_deref().map(role_from_str),
                 content: c.delta.content,
                 tool_calls: c.delta.tool_calls,
-                reasoning_content: c.delta.reasoning_content,
+                // #648 canonical precedence, mirrored on the streaming path
+                // (#502): DeepSeek-canonical `reasoning_content` wins; fall
+                // back to OpenRouter's `reasoning`. Skip empties so a model
+                // that streams `""` doesn't emit a noise field.
+                reasoning_content: c
+                    .delta
+                    .reasoning_content
+                    .filter(|s| !s.is_empty())
+                    .or(c.delta.reasoning.filter(|s| !s.is_empty())),
             },
             c.finish_reason
                 .as_deref()
@@ -556,7 +577,7 @@ mod tests {
         assert_eq!(out.id, "cmpl-1");
         assert_eq!(out.model, "gpt-4o");
         assert_eq!(out.message.role, Role::Assistant);
-        assert_eq!(out.message.content, "hi there");
+        assert_eq!(out.message.content_str(), "hi there");
         assert_eq!(out.finish_reason, FinishReason::Stop);
         assert_eq!(out.usage.total_tokens, 6);
         // No cache / reasoning details on this minimal response →
@@ -589,6 +610,9 @@ mod tests {
         let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
         let out = response_into_chat_response(raw);
         assert_eq!(out.finish_reason, FinishReason::ToolCalls);
+        // #395: upstream `content: null` must be carried through as
+        // `None`, not collapsed to `Some("")`.
+        assert_eq!(out.message.content, None);
         let tc = out
             .message
             .extra
@@ -702,7 +726,7 @@ mod tests {
         }"#;
         let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
         let out = response_into_chat_response(raw);
-        assert_eq!(out.message.content, "The answer is 42.");
+        assert_eq!(out.message.content_str(), "The answer is 42.");
         let reasoning = out
             .message
             .extra
@@ -1030,6 +1054,95 @@ mod tests {
         assert_eq!(tc.len(), 1);
         assert_eq!(tc[0]["id"], "call_abc");
         assert_eq!(tc[0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn stream_chunk_canonical_reasoning_content_propagates() {
+        let body = r#"{
+            "id": "cmpl-r",
+            "model": "deepseek-reasoner",
+            "choices": [{
+                "index": 0,
+                "delta": {"reasoning_content": "thinking..."},
+                "finish_reason": null
+            }]
+        }"#;
+        let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
+        let chunk = stream_chunk_into_chat_chunk(raw);
+        assert_eq!(
+            chunk.delta.reasoning_content.as_deref(),
+            Some("thinking...")
+        );
+    }
+
+    #[test]
+    fn stream_chunk_openrouter_reasoning_normalises_to_reasoning_content() {
+        // OpenRouter streams the chain-of-thought at `delta.reasoning`, with
+        // no per-key override configured. #502: it must surface in the
+        // canonical `delta.reasoning_content` slot, matching non-stream #648.
+        let body = r#"{
+            "id": "cmpl-or",
+            "model": "openrouter/some-reasoner",
+            "choices": [{
+                "index": 0,
+                "delta": {"reasoning": "let me reason about this"},
+                "finish_reason": null
+            }]
+        }"#;
+        let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
+        let chunk = stream_chunk_into_chat_chunk(raw);
+        assert_eq!(
+            chunk.delta.reasoning_content.as_deref(),
+            Some("let me reason about this")
+        );
+    }
+
+    #[test]
+    fn stream_chunk_canonical_reasoning_wins_over_openrouter_reasoning() {
+        let body = r#"{
+            "id": "cmpl-both",
+            "model": "x",
+            "choices": [{
+                "index": 0,
+                "delta": {"reasoning_content": "canonical", "reasoning": "fallback"},
+                "finish_reason": null
+            }]
+        }"#;
+        let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
+        let chunk = stream_chunk_into_chat_chunk(raw);
+        assert_eq!(chunk.delta.reasoning_content.as_deref(), Some("canonical"));
+    }
+
+    #[test]
+    fn stream_chunk_empty_canonical_falls_through_to_openrouter_reasoning() {
+        let body = r#"{
+            "id": "cmpl-empty",
+            "model": "x",
+            "choices": [{
+                "index": 0,
+                "delta": {"reasoning_content": "", "reasoning": "fallback"},
+                "finish_reason": null
+            }]
+        }"#;
+        let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
+        let chunk = stream_chunk_into_chat_chunk(raw);
+        assert_eq!(chunk.delta.reasoning_content.as_deref(), Some("fallback"));
+    }
+
+    #[test]
+    fn stream_chunk_without_reasoning_leaves_slot_empty() {
+        let body = r#"{
+            "id": "cmpl-none",
+            "model": "x",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "hi"},
+                "finish_reason": null
+            }]
+        }"#;
+        let raw: OpenAiStreamChunk = serde_json::from_str(body).unwrap();
+        let chunk = stream_chunk_into_chat_chunk(raw);
+        assert!(chunk.delta.reasoning_content.is_none());
     }
 
     #[test]

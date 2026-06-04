@@ -32,6 +32,10 @@
 //!   * `azure_content_safety` - calls Azure AI Content Safety Prompt
 //!     Shield (`/contentsafety/text:shieldPrompt`). Detects jailbreak
 //!     and indirect injection attacks. P1 (PRD-09c section 6 P1).
+//!   * `aliyun_text_moderation` - calls Aliyun's content-safety
+//!     guardrail (`TextModerationPlus` on `green-cip.<region>.aliyuncs.com`).
+//!     Risk-level moderation on input (`llm_query_moderation`) and output
+//!     (`llm_response_moderation`). #603.
 //!
 //! See `aisix-guardrails/src/keyword.rs` for the runtime semantics
 //! the snapshot is parsed into.
@@ -256,6 +260,83 @@ fn default_acs_on_buffer_exceeded() -> String {
     "fail_closed".to_owned()
 }
 
+/// Config block for `kind: "aliyun_text_moderation"`. Calls Aliyun's
+/// content-safety guardrail (`TextModerationPlus`, action version
+/// `2022-03-02`) on the `green-cip.<region>.aliyuncs.com` endpoint for
+/// category-risk moderation on input and/or output (including streaming
+/// output). Issue #603.
+///
+/// The input hook uses the `llm_query_moderation` service code, the
+/// output hook `llm_response_moderation`. Aliyun grades each call with a
+/// `RiskLevel` (`none`/`low`/`medium`/`high`); the DP blocks when the
+/// returned level reaches `risk_level_threshold`.
+///
+/// Only `access_key_secret` is a secret (decrypted by cp-api before kine
+/// projection; plaintext in DP memory only, never logged); every other
+/// field travels in the clear.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AliyunTextModerationConfig {
+    /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The DP
+    /// builds the endpoint `https://green-cip.<region>.aliyuncs.com`.
+    pub region: String,
+    /// Explicit endpoint override (full URL, no trailing slash). When set
+    /// it wins over `region`; used by tests/dev to point at a mock server.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Aliyun AccessKey ID.
+    pub access_key_id: String,
+    /// Aliyun AccessKey secret. Decrypted by cp-api before kine projection;
+    /// plaintext in memory only, never logged. Used to sign the request.
+    pub access_key_secret: String,
+    /// Minimum risk level that triggers a block: `low`, `medium`, or
+    /// `high` (default). A returned level at or above this blocks.
+    #[serde(default = "default_aliyun_risk_level_threshold")]
+    pub risk_level_threshold: String,
+    /// HTTP call timeout (ms); `fail_open` / `output_fail_open` govern the
+    /// verdict when it elapses. See the `AzureContentSafetyConfig` note on
+    /// why `0` means "fire immediately", not "no timeout".
+    #[serde(default = "default_acs_timeout_ms")]
+    pub timeout_ms: u32,
+    /// Fail-open policy for the OUTPUT hook. Defaults `false` (fail-closed)
+    /// so an Aliyun outage can't release unscanned model output.
+    #[serde(default)]
+    pub output_fail_open: bool,
+
+    // --- streaming-output controls (consumed by aisix-proxy build_sse_stream) ---
+    /// `window` (sliding-window incremental release; default) or
+    /// `buffer_full` (whole-response hold-back).
+    #[serde(default = "default_acs_stream_processing_mode")]
+    pub stream_processing_mode: String,
+    /// Sliding-window size in chars (window mode). Default 2 000; Aliyun's
+    /// `llm_response_moderation` per-call content cap.
+    #[serde(default = "default_aliyun_window_size")]
+    pub window_size: u32,
+    /// Chars carried between windows so a span split across a boundary is
+    /// still caught. Default 128.
+    #[serde(default = "default_aliyun_window_overlap_size")]
+    pub window_overlap_size: u32,
+    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded`
+    /// applies. Default 262 144.
+    #[serde(default = "default_acs_max_buffer_bytes")]
+    pub max_buffer_bytes: u64,
+    /// `fail_closed` (default) or `fail_open` when the buffer cap is hit.
+    #[serde(default = "default_acs_on_buffer_exceeded")]
+    pub on_buffer_exceeded: String,
+}
+
+fn default_aliyun_risk_level_threshold() -> String {
+    "high".to_owned()
+}
+
+fn default_aliyun_window_size() -> u32 {
+    2_000
+}
+
+fn default_aliyun_window_overlap_size() -> u32 {
+    128
+}
+
 /// Config block for `kind: "bedrock"`. Phase 1 stores the shape +
 /// passes it through `aisix-guardrails::build` which logs
 /// `bedrock not yet implemented` and skips the row.
@@ -294,6 +375,10 @@ pub enum GuardrailKind {
     /// on input and/or output (including streaming output). P2
     /// (PRD-09c section 6 P2, #379).
     AzureContentSafetyTextModeration(AzureContentSafetyTextModerationConfig),
+    /// Aliyun content-safety guardrail. Risk-level moderation via the
+    /// `TextModerationPlus` action on `green-cip.<region>.aliyuncs.com`,
+    /// on input and/or output (including streaming output). #603.
+    AliyunTextModeration(AliyunTextModerationConfig),
 }
 
 /// Top-level `Guardrail` resource shape. Mirrors what cp-api writes
@@ -733,6 +818,68 @@ mod tests {
                 assert!(c.output_fail_open);
             }
             _ => panic!("expected AzureContentSafetyTextModeration variant"),
+        }
+    }
+
+    #[test]
+    fn aliyun_text_moderation_kind_parses_with_defaults() {
+        // cp-api omits unset fields (omitempty); the DP must apply the
+        // documented defaults so a minimal row still moderates correctly.
+        let v = json!({
+            "name": "aliyun-guard",
+            "kind": "aliyun_text_moderation",
+            "region": "cn-shanghai",
+            "access_key_id": "LTAI_EXAMPLE",
+            "access_key_secret": "PLAINTEXT_FOR_TEST"
+        });
+        let g: Guardrail = serde_json::from_value(v).unwrap();
+        match g.config {
+            GuardrailKind::AliyunTextModeration(ref c) => {
+                assert_eq!(c.region, "cn-shanghai");
+                assert_eq!(c.access_key_id, "LTAI_EXAMPLE");
+                assert_eq!(c.access_key_secret, "PLAINTEXT_FOR_TEST");
+                assert_eq!(c.endpoint, None);
+                assert_eq!(c.risk_level_threshold, "high");
+                assert_eq!(c.timeout_ms, 5_000);
+                assert!(!c.output_fail_open);
+                assert_eq!(c.stream_processing_mode, "window");
+                assert_eq!(c.window_size, 2_000);
+                assert_eq!(c.window_overlap_size, 128);
+                assert_eq!(c.max_buffer_bytes, 262_144);
+                assert_eq!(c.on_buffer_exceeded, "fail_closed");
+            }
+            _ => panic!("expected AliyunTextModeration variant"),
+        }
+    }
+
+    #[test]
+    fn aliyun_text_moderation_kind_round_trips_set_fields() {
+        let v = json!({
+            "name": "aliyun-guard",
+            "kind": "aliyun_text_moderation",
+            "region": "cn-beijing",
+            "endpoint": "http://127.0.0.1:8080",
+            "access_key_id": "id",
+            "access_key_secret": "secret",
+            "risk_level_threshold": "medium",
+            "timeout_ms": 3000,
+            "output_fail_open": true,
+            "stream_processing_mode": "buffer_full",
+            "window_size": 1000,
+            "window_overlap_size": 0
+        });
+        let g: Guardrail = serde_json::from_value(v).unwrap();
+        match g.config {
+            GuardrailKind::AliyunTextModeration(ref c) => {
+                assert_eq!(c.endpoint.as_deref(), Some("http://127.0.0.1:8080"));
+                assert_eq!(c.risk_level_threshold, "medium");
+                assert_eq!(c.timeout_ms, 3000);
+                assert!(c.output_fail_open);
+                assert_eq!(c.stream_processing_mode, "buffer_full");
+                assert_eq!(c.window_size, 1000);
+                assert_eq!(c.window_overlap_size, 0, "explicit 0 overlap must survive");
+            }
+            _ => panic!("expected AliyunTextModeration variant"),
         }
     }
 

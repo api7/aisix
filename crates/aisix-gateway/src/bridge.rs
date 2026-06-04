@@ -156,14 +156,25 @@ pub enum BridgeError {
     #[error("bridge is misconfigured: {0}")]
     Config(String),
     /// Customer-fixable upstream config — the admin's ProviderKey/Model
-    /// is set up wrong (empty secret, missing api_base, missing
-    /// model_name) or the caller's request/key is malformed. Maps to
+    /// is set up wrong (missing api_base, missing model_name) or the
+    /// caller's request is malformed (e.g. split_system shape). Maps to
     /// 400, not 500: it's the caller's mistake, retrying won't help, and
     /// a 5xx wrongly tells SDKs/monitoring it's a server fault (#367).
     /// Contrast [`Config`], reserved for errors *we* cause
     /// (serialization, our generated request_id) which stays 500.
     #[error("invalid upstream configuration: {0}")]
     InvalidUpstreamConfig(String),
+    /// Customer-fixable upstream *credential* problem — the admin's
+    /// ProviderKey secret/credential is missing, empty, or malformed
+    /// (empty secret, api key with invalid HTTP-header bytes, unparseable
+    /// service-account / AAD / Bedrock credential JSON). Maps to 401
+    /// `authentication_error`, not 400: this is an auth-material problem,
+    /// and 401 matches LiteLLM's canonical mapping for the same providers
+    /// (Anthropic/OpenAI/Azure raise `AuthenticationError`). Non-retryable
+    /// (#367 follow-up). Distinct from [`InvalidUpstreamConfig`] (400),
+    /// which is request/routing shape, not credentials.
+    #[error("invalid upstream credentials: {0}")]
+    InvalidUpstreamCredentials(String),
     #[error("transport error: {0}")]
     Transport(String),
     #[error("upstream cancelled the response mid-stream")]
@@ -371,6 +382,7 @@ impl BridgeError {
             BridgeError::UpstreamDecode(_) => 502,
             BridgeError::Config(_) => 500,
             BridgeError::InvalidUpstreamConfig(_) => 400,
+            BridgeError::InvalidUpstreamCredentials(_) => 401,
             BridgeError::Transport(_) => 502,
             BridgeError::StreamAborted => 502,
         }
@@ -384,6 +396,7 @@ impl BridgeError {
             BridgeError::UpstreamDecode(_) => "upstream_decode_error",
             BridgeError::Config(_) => "config_error",
             BridgeError::InvalidUpstreamConfig(_) => "invalid_request_error",
+            BridgeError::InvalidUpstreamCredentials(_) => "authentication_error",
             BridgeError::Transport(_) => "transport_error",
             BridgeError::StreamAborted => "stream_aborted",
         }
@@ -556,12 +569,23 @@ mod tests {
 
     #[test]
     fn invalid_upstream_config_maps_to_400_invalid_request() {
-        // #367: customer-fixable config (empty secret, missing api_base,
-        // missing model_name, …) is a 400, not a 500 — retrying won't
-        // help and a 5xx wrongly reads as a server fault.
-        let e = BridgeError::InvalidUpstreamConfig("provider_key.secret is empty".into());
+        // #367: customer-fixable config (missing api_base, missing
+        // model_name, request-shape …) is a 400, not a 500 — retrying
+        // won't help and a 5xx wrongly reads as a server fault.
+        let e = BridgeError::InvalidUpstreamConfig("provider_key has no api_base".into());
         assert_eq!(e.http_status(), 400);
         assert_eq!(e.error_type(), "invalid_request_error");
+    }
+
+    #[test]
+    fn invalid_upstream_credentials_maps_to_401_authentication() {
+        // #367 follow-up: auth-material problems (empty/invalid secret,
+        // unparseable credential JSON) are a 401 authentication_error,
+        // not a 400 — they're a distinct class from request/routing shape
+        // and match LiteLLM's AuthenticationError mapping.
+        let e = BridgeError::InvalidUpstreamCredentials("provider_key.secret is empty".into());
+        assert_eq!(e.http_status(), 401);
+        assert_eq!(e.error_type(), "authentication_error");
     }
 
     #[test]

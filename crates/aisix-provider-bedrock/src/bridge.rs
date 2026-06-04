@@ -306,7 +306,7 @@ impl BedrockSecret {
     /// generic shape errors.
     fn parse(secret: &str) -> Result<Self, BridgeError> {
         if secret.trim().is_empty() {
-            return Err(BridgeError::InvalidUpstreamConfig(
+            return Err(BridgeError::InvalidUpstreamCredentials(
                 "bedrock provider_key.secret is empty — \
                  expected JSON {access_key_id, secret_access_key, region, session_token?}"
                     .into(),
@@ -318,7 +318,7 @@ impl BedrockSecret {
             // "invalid character 'X' at position N" reveals what's
             // in the JSON). Generic shape hint is enough for the
             // operator who controls the registration.
-            BridgeError::InvalidUpstreamConfig(
+            BridgeError::InvalidUpstreamCredentials(
                 "bedrock provider_key.secret must be valid JSON: \
                  {access_key_id, secret_access_key, region, session_token?}"
                     .into(),
@@ -910,8 +910,9 @@ fn build_converse_inputs(
     for msg in &req.messages {
         match msg.role {
             Role::System => {
-                if !msg.content.is_empty() {
-                    systems.push(SystemContentBlock::Text(msg.content.clone()));
+                let content = msg.content_str();
+                if !content.is_empty() {
+                    systems.push(SystemContentBlock::Text(content.to_string()));
                 }
             }
             Role::User | Role::Assistant => {
@@ -922,7 +923,7 @@ fn build_converse_inputs(
                 };
                 let m = BedrockMessage::builder()
                     .role(role)
-                    .content(ContentBlock::Text(msg.content.clone()))
+                    .content(ContentBlock::Text(msg.content_str().to_string()))
                     .build()
                     .map_err(|e| {
                         BridgeError::Config(format!("bedrock converse: build message: {e}"))
@@ -1455,8 +1456,9 @@ mod tests {
     #[test]
     fn bedrock_secret_rejects_empty() {
         let err = BedrockSecret::parse("").unwrap_err();
+        assert_eq!(err.http_status(), 401);
         match err {
-            BridgeError::InvalidUpstreamConfig(msg) => {
+            BridgeError::InvalidUpstreamCredentials(msg) => {
                 assert!(
                     msg.contains("secret is empty"),
                     "must mention empty secret; got {msg}"
@@ -1466,21 +1468,22 @@ mod tests {
                     "must hint at required JSON shape; got {msg}"
                 );
             }
-            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamCredentials error, got {other:?}"),
         }
     }
 
     #[test]
     fn bedrock_secret_rejects_non_json() {
         let err = BedrockSecret::parse("AKIA-test").unwrap_err();
+        assert_eq!(err.http_status(), 401);
         match err {
-            BridgeError::InvalidUpstreamConfig(msg) => {
+            BridgeError::InvalidUpstreamCredentials(msg) => {
                 assert!(
                     msg.contains("must be valid JSON"),
                     "must mention JSON requirement; got {msg}"
                 );
             }
-            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamCredentials error, got {other:?}"),
         }
     }
 
@@ -1492,7 +1495,7 @@ mod tests {
         let secret_with_distinctive_bytes = "X-DISTINCTIVE-LEAK-MARKER-Y";
         let err = BedrockSecret::parse(secret_with_distinctive_bytes).unwrap_err();
         match err {
-            BridgeError::InvalidUpstreamConfig(msg) => {
+            BridgeError::InvalidUpstreamCredentials(msg) => {
                 assert!(
                     !msg.contains("X-DISTINCTIVE-LEAK-MARKER-Y"),
                     "error must NOT echo raw secret bytes; got {msg}"
@@ -1502,7 +1505,7 @@ mod tests {
                     "error must NOT leak partial secret bytes; got {msg}"
                 );
             }
-            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamCredentials error, got {other:?}"),
         }
     }
 
@@ -1515,7 +1518,7 @@ mod tests {
         // required).
         let json = r#"{"access_key_id":"AKIA","secret_access_key":"sk"}"#;
         let err = BedrockSecret::parse(json).unwrap_err();
-        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
+        assert!(matches!(err, BridgeError::InvalidUpstreamCredentials(_)));
     }
 
     // ─── Pre-dispatch validation tests ─────────────────────────────────
@@ -1586,10 +1589,10 @@ mod tests {
         let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
-            BridgeError::InvalidUpstreamConfig(msg) => {
+            BridgeError::InvalidUpstreamCredentials(msg) => {
                 assert!(msg.contains("must be valid JSON"));
             }
-            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamCredentials error, got {other:?}"),
         }
     }
 
@@ -1603,11 +1606,12 @@ mod tests {
         );
         let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        assert_eq!(err.http_status(), 401);
         match err {
-            BridgeError::InvalidUpstreamConfig(msg) => {
+            BridgeError::InvalidUpstreamCredentials(msg) => {
                 assert!(msg.contains("secret is empty"));
             }
-            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamCredentials error, got {other:?}"),
         }
     }
 
@@ -1746,7 +1750,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "hello from bedrock");
+        assert_eq!(chat.message.content_str(), "hello from bedrock");
         assert_eq!(chat.usage.total_tokens, 9);
     }
 
@@ -1880,7 +1884,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "calling tool");
+        assert_eq!(chat.message.content_str(), "calling tool");
         // Tool calls translated into OpenAI shape via the reused
         // anthropic crate's converter.
         let tool_calls = chat
@@ -2067,7 +2071,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "cross-region ok");
+        assert_eq!(chat.message.content_str(), "cross-region ok");
     }
 
     /// Audit M6: cross-region dispatch coverage was only `us.`; the
@@ -2101,7 +2105,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "us-gov ok");
+        assert_eq!(chat.message.content_str(), "us-gov ok");
     }
 
     #[tokio::test]
@@ -2129,7 +2133,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "global ok");
+        assert_eq!(chat.message.content_str(), "global ok");
     }
 
     // Removed `chat_publisher_not_implemented_error_includes_model_id_and_publisher_name`
@@ -2271,7 +2275,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "hello from converse");
+        assert_eq!(chat.message.content_str(), "hello from converse");
         assert_eq!(chat.usage.prompt_tokens, 7);
         assert_eq!(chat.usage.completion_tokens, 3);
         assert_eq!(chat.usage.total_tokens, 10);
@@ -2303,7 +2307,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-nova", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "hello from converse");
+        assert_eq!(chat.message.content_str(), "hello from converse");
     }
 
     #[tokio::test]

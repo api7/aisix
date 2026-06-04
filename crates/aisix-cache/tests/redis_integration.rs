@@ -41,8 +41,45 @@ async fn put_then_get_round_trips_against_real_redis() {
     let key = "fp-roundtrip";
     cache.put(key, sample("hello back")).await.unwrap();
     let got = cache.get(key).await.unwrap().expect("hit");
-    assert_eq!(got.message.content, "hello back");
+    assert_eq!(got.message.content_str(), "hello back");
     assert_eq!(got.usage.total_tokens, 8);
+}
+
+#[tokio::test]
+async fn put_then_get_preserves_null_content_through_cache() {
+    // #395: a tool_calls response carries `message.content == None`. The
+    // cache persists `ChatResponse` as JSON; this proves `None`
+    // survives the store→load round-trip as `None` (not coerced to
+    // `Some("")`), so a cache hit serves the same `content: null` the
+    // upstream returned.
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: CACHE_TEST_REDIS_URL not set");
+        return;
+    };
+
+    let cache = RedisCache::connect(&url)
+        .await
+        .expect("redis connect")
+        .with_prefix(format!("aisix:test:{}", uuid_like()));
+
+    let message: ChatMessage =
+        serde_json::from_str(r#"{"role":"assistant","content":null}"#).unwrap();
+    assert!(message.content.is_none());
+    let resp = ChatResponse {
+        id: "cmpl-null-1".into(),
+        model: "openai/gpt-4o".into(),
+        message,
+        finish_reason: FinishReason::ToolCalls,
+        usage: UsageStats::new(3, 5),
+    };
+
+    let key = "fp-null-content";
+    cache.put(key, resp).await.unwrap();
+    let got = cache.get(key).await.unwrap().expect("hit");
+    assert!(
+        got.message.content.is_none(),
+        "null content must round-trip as None, not Some(\"\")"
+    );
 }
 
 #[tokio::test]

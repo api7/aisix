@@ -387,25 +387,28 @@ async fn responses_to_target(
 }
 
 /// Pull the usage counters out of a Responses-API non-streaming
-/// response body. Returns `None` when:
+/// response body. Returns `None` only when:
 ///   - The `usage` block is missing entirely, OR
 ///   - `usage.input_tokens` is missing / non-numeric
 ///
-/// Both cases skip UsageEvent emission rather than attributing a
-/// zero-everything noise row to the api_key. Per the OpenAI
-/// Responses API spec, `input_tokens` is required on every
-/// successful non-streaming 200 — its absence (e.g. `usage: {}`)
-/// is upstream-malformed, not a legitimate zero-spend reply.
-/// Audit MEDIUM-1 on this PR. Spec:
+/// Those cases skip UsageEvent emission rather than attributing a
+/// zero-everything noise row to the api_key. The `input_tokens` gate
+/// distinguishes "no upstream usage at all" from a legitimate reply.
+///
+/// `output_tokens`, by contrast, defaults to 0 when absent: a 200 that
+/// reports an input side but omits the output side is still a real
+/// billable call and must be recorded. This matches LiteLLM, which
+/// coerces a missing completion/output side to 0 and still logs/bills
+/// the event (#429 follow-up; mirrors the tolerant wire-layer decode of
+/// #474). Spec:
 /// <https://platform.openai.com/docs/api-reference/responses/object>
 fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
     let usage = body.get("usage")?;
-    // input_tokens and output_tokens are both required on a
-    // spec-compliant 200. Gate emit on each so a malformed reply
-    // missing the output side is skipped rather than under-billed with
-    // a 0 (#429, audit MEDIUM-1).
     let prompt_tokens = usage.get("input_tokens").and_then(|v| v.as_u64())? as u32;
-    let completion_tokens = usage.get("output_tokens").and_then(|v| v.as_u64())? as u32;
+    let completion_tokens = usage
+        .get("output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
     let reasoning_tokens = usage
         .get("output_tokens_details")
         .and_then(|d| d.get("reasoning_tokens"))
@@ -1033,11 +1036,13 @@ mod tests {
         }
     }
 
-    /// #429: a 200 whose `usage` carries `input_tokens` but omits the
-    /// required `output_tokens` is malformed — emitting it would
-    /// under-bill the output side with a 0. It must be skipped.
+    /// #429 (LiteLLM-parity follow-up): a 200 whose `usage` carries
+    /// `input_tokens` but omits `output_tokens` is still a real billable
+    /// call. It MUST emit a UsageEvent with `completion_tokens = 0`
+    /// (matching LiteLLM's coerce-missing-to-0), NOT be dropped. Only a
+    /// fully absent / input-less usage block skips.
     #[tokio::test]
-    async fn skips_usage_event_when_output_tokens_missing() {
+    async fn emits_with_zero_output_when_output_tokens_missing() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -1075,13 +1080,14 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "no UsageEvent should be emitted when output_tokens is missing, \
-                 got prompt_tokens={}",
-                ev.prompt_tokens,
-            );
-        }
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must still be emitted when only output_tokens is missing")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.prompt_tokens, 17, "input side must be recorded");
+        assert_eq!(
+            event.completion_tokens, 0,
+            "missing output_tokens must default to 0, not drop the event"
+        );
     }
 }

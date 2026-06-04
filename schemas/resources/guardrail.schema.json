@@ -227,6 +227,92 @@
           "minimum": 0.0
         }
       }
+    },
+    {
+      "description": "Aliyun content-safety guardrail. Risk-level moderation via the `TextModerationPlus` action on `green-cip.<region>.aliyuncs.com`, on input and/or output (including streaming output). #603.",
+      "type": "object",
+      "required": [
+        "access_key_id",
+        "access_key_secret",
+        "kind",
+        "region"
+      ],
+      "properties": {
+        "access_key_id": {
+          "description": "Aliyun AccessKey ID.",
+          "type": "string"
+        },
+        "access_key_secret": {
+          "description": "Aliyun AccessKey secret. Decrypted by cp-api before kine projection; plaintext in memory only, never logged. Used to sign the request.",
+          "type": "string"
+        },
+        "endpoint": {
+          "description": "Explicit endpoint override (full URL, no trailing slash). When set it wins over `region`; used by tests/dev to point at a mock server.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "aliyun_text_moderation"
+          ]
+        },
+        "max_buffer_bytes": {
+          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies. Default 262 144.",
+          "default": 262144,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "on_buffer_exceeded": {
+          "description": "`fail_closed` (default) or `fail_open` when the buffer cap is hit.",
+          "default": "fail_closed",
+          "type": "string"
+        },
+        "output_fail_open": {
+          "description": "Fail-open policy for the OUTPUT hook. Defaults `false` (fail-closed) so an Aliyun outage can't release unscanned model output.",
+          "default": false,
+          "type": "boolean"
+        },
+        "region": {
+          "description": "Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The DP builds the endpoint `https://green-cip.<region>.aliyuncs.com`.",
+          "type": "string"
+        },
+        "risk_level_threshold": {
+          "description": "Minimum risk level that triggers a block: `low`, `medium`, or `high` (default). A returned level at or above this blocks.",
+          "default": "high",
+          "type": "string"
+        },
+        "stream_processing_mode": {
+          "description": "`window` (sliding-window incremental release; default) or `buffer_full` (whole-response hold-back).",
+          "default": "window",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "HTTP call timeout (ms); `fail_open` / `output_fail_open` govern the verdict when it elapses. See the `AzureContentSafetyConfig` note on why `0` means \"fire immediately\", not \"no timeout\".",
+          "default": 5000,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "window_overlap_size": {
+          "description": "Chars carried between windows so a span split across a boundary is still caught. Default 128.",
+          "default": 128,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "window_size": {
+          "description": "Sliding-window size in chars (window mode). Default 2 000; Aliyun's `llm_response_moderation` per-call content cap.",
+          "default": 2000,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
     }
   ],
   "required": [

@@ -394,14 +394,14 @@ impl AzureSecret {
     pub(crate) fn parse(secret: &str) -> Result<Self, BridgeError> {
         let trimmed = secret.trim();
         if trimmed.is_empty() {
-            return Err(BridgeError::InvalidUpstreamConfig(
+            return Err(BridgeError::InvalidUpstreamCredentials(
                 "provider_key.secret is empty".into(),
             ));
         }
         if trimmed.starts_with('{') {
             let creds: crate::aad_token_mint::AadCredentials = serde_json::from_str(trimmed)
                 .map_err(|_e| {
-                    BridgeError::InvalidUpstreamConfig(
+                    BridgeError::InvalidUpstreamCredentials(
                         "azure provider_key.secret looks JSON-shaped but failed to parse \
                          as AAD client_credentials \
                          {tenant_id, client_id, client_secret}"
@@ -602,7 +602,7 @@ fn build_request_headers(
     match (&auth.api_key, &auth.bearer_token) {
         (Some(key), None) => {
             let value = HeaderValue::from_str(key).map_err(|e| {
-                BridgeError::InvalidUpstreamConfig(format!(
+                BridgeError::InvalidUpstreamCredentials(format!(
                     "api key contains invalid header chars: {e}"
                 ))
             })?;
@@ -1332,7 +1332,8 @@ mod tests {
         // headers via the api-key value.
         let err = build_request_headers(&api_key_auth("legit\nx-evil: 1"), "req-1", false, None)
             .unwrap_err();
-        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
+        assert!(matches!(err, BridgeError::InvalidUpstreamCredentials(_)));
+        assert_eq!(err.http_status(), 401);
     }
 
     #[test]
@@ -1369,11 +1370,12 @@ mod tests {
         let ctx = BridgeContext::new("req-1", sample_model(), pk);
         let req = ChatFormat::new("customer-facing-name", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
+        assert_eq!(err.http_status(), 401);
         match err {
-            BridgeError::InvalidUpstreamConfig(msg) => {
+            BridgeError::InvalidUpstreamCredentials(msg) => {
                 assert!(msg.contains("secret is empty"), "got {msg}");
             }
-            other => panic!("expected InvalidUpstreamConfig error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamCredentials error, got {other:?}"),
         }
     }
 
@@ -1461,7 +1463,7 @@ mod tests {
         let ctx = canonical_test_ctx();
         let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "hi from azure");
+        assert_eq!(chat.message.content_str(), "hi from azure");
 
         // Audit M3: assert `Authorization` is absent on the wire (not
         // just absent from the helper's output).
@@ -1560,7 +1562,7 @@ mod tests {
         let ctx = canonical_test_ctx();
         let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "filtered ok");
+        assert_eq!(chat.message.content_str(), "filtered ok");
         assert_eq!(chat.usage.total_tokens, 7);
     }
 
@@ -2043,19 +2045,21 @@ mod tests {
     #[test]
     fn azure_secret_rejects_empty_secret() {
         let err = AzureSecret::parse("   ").unwrap_err();
-        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
+        assert!(matches!(err, BridgeError::InvalidUpstreamCredentials(_)));
+        assert_eq!(err.http_status(), 401);
     }
 
     #[test]
     fn azure_secret_rejects_json_missing_required_aad_fields() {
         let err = AzureSecret::parse(r#"{"tenant_id":"t"}"#).unwrap_err();
+        assert_eq!(err.http_status(), 401);
         match err {
-            BridgeError::InvalidUpstreamConfig(msg) => {
+            BridgeError::InvalidUpstreamCredentials(msg) => {
                 // Message must NOT echo raw secret bytes (audit-aware).
                 assert!(msg.contains("looks JSON-shaped"));
                 assert!(!msg.contains("tenant-uuid-aaa"));
             }
-            other => panic!("expected Config, got {other:?}"),
+            other => panic!("expected InvalidUpstreamCredentials, got {other:?}"),
         }
     }
 
@@ -2109,7 +2113,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
         let resp = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(resp.message.content, "hello via aad");
+        assert_eq!(resp.message.content_str(), "hello via aad");
 
         let headers = captured_headers
             .lock()

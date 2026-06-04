@@ -95,6 +95,12 @@ impl Guardrail for KeywordBlocklist {
         "keyword_blocklist"
     }
 
+    /// Only force streamed-output hold-back when this blocklist actually
+    /// checks output (#466). An input-only keyword guard must not buffer.
+    fn runs_on_output(&self) -> bool {
+        self.check_output_enabled
+    }
+
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
         if !self.check_input_enabled {
             return GuardrailVerdict::Allow;

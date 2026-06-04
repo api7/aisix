@@ -19,6 +19,7 @@ Guardrails run on `POST /v1/chat/completions` and `POST /v1/messages`.
 | `keyword` | You need deterministic local blocking for literals or regex patterns. | Runs inside the data plane and does not depend on an external provider. |
 | `bedrock` | You already operate AWS Bedrock guardrails and want AISIX to call Bedrock `ApplyGuardrail` during proxy handling. | Requires Bedrock credentials, network reachability, and the default `bedrock` build feature. |
 | `azure_content_safety` | You want Azure AI Content Safety Prompt Shield checks for jailbreak or indirect prompt-injection detection. | Requires Azure Content Safety credentials, network reachability, and the default `azure-content-safety` build feature. |
+| `aliyun_text_moderation` | You use Aliyun content-safety moderation for prompt or response review. | Requires Aliyun credentials, network reachability, and the Aliyun guardrail runtime feature. |
 
 Remote guardrails depend on external services. Treat credentials, network
 reachability, timeouts, and `fail_open` as part of the policy.
@@ -130,6 +131,34 @@ on the configured endpoint and authenticates with
 
 `timeout_ms` defaults to `5000`. A timeout, throttling response, 5xx response,
 or configuration error follows `fail_open`.
+
+### Create an Aliyun Text Moderation Guardrail
+
+`kind: "aliyun_text_moderation"` calls Aliyun's content-safety guardrail
+(`TextModerationPlus`) on the `green-cip.<region>.aliyuncs.com` endpoint:
+
+```json title="Aliyun text-moderation guardrail"
+{
+  "name": "aliyun-review",
+  "kind": "aliyun_text_moderation",
+  "hook_point": "both",
+  "fail_open": false,
+  "region": "cn-shanghai",
+  "access_key_id": "YOUR_ACCESS_KEY_ID",
+  "access_key_secret": "YOUR_ACCESS_KEY_SECRET",
+  "risk_level_threshold": "high"
+}
+```
+
+The input hook uses `llm_query_moderation`; the output hook uses
+`llm_response_moderation`. AISIX blocks when Aliyun returns a `RiskLevel` at or
+above `risk_level_threshold`. The default threshold is `high`.
+
+| Field | Behavior |
+| --- | --- |
+| `region` | Builds the default endpoint. Set `endpoint` to override it for a private proxy or custom endpoint. |
+| `output_fail_open` | Defaults to `false`, so an Aliyun outage cannot release unscanned model output. The request-level `fail_open` field governs the input hook. |
+| Streaming controls | `stream_processing_mode`, `window_size`, `window_overlap_size`, `max_buffer_bytes`, and `on_buffer_exceeded` control streaming-output moderation. |
 
 ## Runtime Behavior
 

@@ -331,6 +331,15 @@ impl Guardrail for TextModerationGuardrail {
         "azure_content_safety_text_moderation"
     }
 
+    /// Its streamed-output hold-back policy applies only when it inspects
+    /// output (#466); an input-only attachment must not buffer the response.
+    fn runs_on_output(&self) -> bool {
+        matches!(
+            self.hook_point,
+            GuardrailHookPoint::Output | GuardrailHookPoint::Both
+        )
+    }
+
     fn stream_output_policy(&self) -> StreamOutputPolicy {
         match self.stream_processing_mode.as_str() {
             "buffer_full" => StreamOutputPolicy::BufferFull {

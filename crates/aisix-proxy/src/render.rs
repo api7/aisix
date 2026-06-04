@@ -50,7 +50,14 @@ pub struct NonStreamChoice {
 #[derive(Debug, Serialize)]
 pub struct RenderedMessage {
     pub role: &'static str,
-    pub content: String,
+    /// `Option<String>` — NOT `#[serde(skip_serializing_if)]`. OpenAI
+    /// emits an explicit `"content": null` on a `tool_calls` response
+    /// (the assistant chose to call a tool, there is no text reply), so
+    /// `None` MUST serialize as JSON `null`, not be omitted (#395).
+    /// Contrast the streaming `RenderedDelta.content`, which correctly
+    /// uses `skip_serializing_if` because OpenAI omits `delta.content`
+    /// on tool-call chunks.
+    pub content: Option<String>,
     /// Forward-compatible bag for OpenAI message-level fields the
     /// gateway doesn't model directly on `ChatMessage` (e.g.
     /// `tool_calls` for cross-provider tool-use translation,
@@ -339,6 +346,54 @@ mod tests {
         );
         assert!(json["usage"].get("completion_tokens_details").is_none());
         assert!(json["usage"].get("prompt_cache_hit_tokens").is_none());
+    }
+
+    /// #395: a tool_calls response carries `content: null` from the
+    /// upstream. The renderer MUST emit an explicit JSON `null` (the
+    /// OpenAI documented shape) — not `""` and not an omitted field.
+    #[test]
+    fn render_response_emits_explicit_null_content_on_tool_calls() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "tool_calls".into(),
+            serde_json::json!([{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{}"}
+            }]),
+        );
+        let message = ChatMessage {
+            role: Role::Assistant,
+            content: None,
+            content_blocks: None,
+            name: None,
+            tool_call_id: None,
+            extra,
+        };
+        let r = ChatResponse {
+            id: "cmpl-1".into(),
+            model: "m".into(),
+            message,
+            finish_reason: FinishReason::ToolCalls,
+            usage: UsageStats::new(3, 2),
+        };
+        let out = render_response(0, r, "m");
+
+        // Serialized JSON must contain `"content":null`, not `""` and
+        // not an omitted key.
+        let raw = serde_json::to_string(&out).unwrap();
+        assert!(
+            raw.contains("\"content\":null"),
+            "tool_calls content must serialize as explicit null: {raw}"
+        );
+        assert!(!raw.contains("\"content\":\"\""));
+
+        let json = serde_json::to_value(&out).unwrap();
+        let msg = &json["choices"][0]["message"];
+        assert!(msg.get("content").is_some(), "content key must be present");
+        assert!(msg["content"].is_null());
+        assert_eq!(msg["tool_calls"][0]["id"], "call_1");
+        assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
     }
 
     /// Issue #542 (OpenAI half): when the gateway has a non-zero

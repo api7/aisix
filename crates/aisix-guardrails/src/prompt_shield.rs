@@ -260,6 +260,16 @@ struct AttackAnalysis {
 
 #[async_trait]
 impl Guardrail for PromptShieldGuardrail {
+    /// Its streamed-output hold-back policy applies only when it inspects
+    /// output (#466); prompt shield is normally input-only, so it must not
+    /// buffer the response unless attached on the output hook.
+    fn runs_on_output(&self) -> bool {
+        matches!(
+            self.hook_point,
+            GuardrailHookPoint::Output | GuardrailHookPoint::Both
+        )
+    }
+
     fn name(&self) -> &'static str {
         // Static name keeps metric cardinality bounded; the row's own
         // name is surfaced via tracing fields on failure paths.

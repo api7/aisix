@@ -189,3 +189,108 @@ describe("anthropic upstream e2e: OpenAI in, Anthropic out, OpenAI back to calle
     expect(messagesReq!.headers["anthropic-version"]).toBeDefined();
   });
 });
+
+// E2E (#395): an Anthropic upstream that returns ONLY a `tool_use` block
+// (no text block) must surface `choices[0].message.content === null` on
+// the OpenAI shape — not `""`. The text-block join produced `""` before
+// the fix; we now map empty/absent text to `null` to match OpenAI's
+// documented `string | null` shape and LiteLLM's behaviour.
+const TOOL_CALLER_PLAINTEXT = "sk-an-e2e-toolnull-caller";
+const TOOL_CALLER_KEY_HASH = createHash("sha256")
+  .update(TOOL_CALLER_PLAINTEXT)
+  .digest("hex");
+
+describe("anthropic upstream e2e: tool_use-only response surfaces content:null (#395)", () => {
+  let app: SpawnedApp | undefined;
+  let upstream: OpenAiUpstream | undefined;
+  let admin: AdminClient | undefined;
+  let etcdReachable = false;
+
+  beforeAll(async () => {
+    etcdReachable = await new EtcdClient().ping();
+    if (!etcdReachable) return;
+
+    upstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "msg_toolonly_01",
+        type: "message",
+        role: "assistant",
+        // Only a tool_use block, no text block — the bug-class case.
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_abc",
+            name: "get_weather",
+            input: { location: "SF" },
+          },
+        ],
+        model: "claude-3-5-haiku-20241022",
+        stop_reason: "tool_use",
+        usage: { input_tokens: 7, output_tokens: 3 },
+      },
+    });
+    app = await spawnApp();
+    admin = new AdminClient(app.adminUrl, app.adminKey);
+
+    const pk = await admin.createProviderKey({
+      display_name: "an-e2e-toolnull-pk",
+      provider: "anthropic",
+      adapter: "anthropic",
+      secret: "sk-ant-mock",
+      api_base: upstream.baseUrl,
+    });
+    await admin.createModel({
+      display_name: "an-e2e-toolnull",
+      provider: "anthropic",
+      model_name: "claude-3-5-haiku-20241022",
+      provider_key_id: pk.id,
+    });
+    await admin.createApiKey({
+      key_hash: TOOL_CALLER_KEY_HASH,
+      allowed_models: ["an-e2e-toolnull"],
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+  });
+
+  test("tool_use-only Anthropic response → content is exactly null on OpenAI shape", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
+      ctx.skip();
+      return;
+    }
+
+    const client = new OpenAI({
+      apiKey: TOOL_CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await client.chat.completions.create({
+          model: "an-e2e-toolnull",
+          messages: [{ role: "user", content: "ready-probe" }],
+        });
+        return r.choices[0]?.message.role === "assistant";
+      } catch {
+        return false;
+      }
+    });
+
+    const completion = await client.chat.completions.create({
+      model: "an-e2e-toolnull",
+      messages: [{ role: "user", content: "weather in SF?" }],
+    });
+
+    expect(completion.choices[0]?.finish_reason).toBe("tool_calls");
+    // The tool_use block translates to OpenAI tool_calls.
+    expect(completion.choices[0]?.message.tool_calls?.[0]?.function.name).toBe(
+      "get_weather",
+    );
+    // The fix: content must be exactly null, not "".
+    expect(completion.choices[0]?.message.content).toBeNull();
+  });
+});

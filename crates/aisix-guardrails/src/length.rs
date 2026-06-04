@@ -51,11 +51,26 @@ impl Guardrail for MaxContentLength {
         "max_content_length"
     }
 
+    /// Only inspects output when an output cap is set; otherwise `check_output`
+    /// is a guaranteed `Allow`, so it must not force streamed-output hold-back
+    /// (#466). Mirrors the `max_output_chars` gate in `check_output`.
+    fn runs_on_output(&self) -> bool {
+        self.max_output_chars.is_some()
+    }
+
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
         let Some(cap) = self.max_input_chars else {
             return GuardrailVerdict::Allow;
         };
-        let total: usize = req.messages.iter().map(|m| m.content.chars().count()).sum();
+        // Use the shared scan-text normaliser so text carried only in
+        // `content_blocks` (the typed-block shape) is counted too —
+        // otherwise a blocks-only message could evade the length cap
+        // while the rest of the guardrail stack still scans it.
+        let total: usize = req
+            .messages
+            .iter()
+            .map(|m| crate::message_scan_text(m).chars().count())
+            .sum();
         if total > cap {
             return GuardrailVerdict::Block {
                 reason: format!("input exceeds {cap} chars (was {total})"),
@@ -68,7 +83,7 @@ impl Guardrail for MaxContentLength {
         let Some(cap) = self.max_output_chars else {
             return GuardrailVerdict::Allow;
         };
-        let len = resp.message.content.chars().count();
+        let len = crate::message_scan_text(&resp.message).chars().count();
         if len > cap {
             return GuardrailVerdict::Block {
                 reason: format!("output exceeds {cap} chars (was {len})"),
@@ -146,6 +161,23 @@ mod tests {
         let g = MaxContentLength::output_only(100);
         let v = g.check_output(&resp("ok")).await;
         assert_eq!(v, GuardrailVerdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn input_counts_text_in_content_blocks() {
+        // A message whose text lives ONLY in the typed-block array
+        // (`content: [{type:"text", text}]`, bare `content` empty) must
+        // still be counted, or the length cap can be evaded while the
+        // rest of the guardrail stack scans the same text.
+        let blocks_only: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"text","text":"1234567890"}]}"#,
+        )
+        .unwrap();
+        let g = MaxContentLength::input_only(5);
+        let v = g
+            .check_input(&ChatFormat::new("m", vec![blocks_only]))
+            .await;
+        assert!(v.is_block(), "blocks-only text must count toward the cap");
     }
 
     #[tokio::test]

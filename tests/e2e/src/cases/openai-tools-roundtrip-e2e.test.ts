@@ -306,12 +306,11 @@ describe("OpenAI tools round-trip (#220 + #202)", () => {
 
     expect(completion.choices[0]?.finish_reason).toBe("tool_calls");
     // OpenAI's `message.content` is documented as `string | null`
-    // (<https://platform.openai.com/docs/api-reference/chat/object>);
-    // when tool_calls fires, both `null` and `""` are valid no-text
-    // signals and the SDK treats them identically. The gateway
-    // currently surfaces an empty string here — a minor wire-shape
-    // divergence tracked separately; not the #220 contract.
-    expect(completion.choices[0]?.message.content).toBeFalsy();
+    // (<https://platform.openai.com/docs/api-reference/chat/object>).
+    // On a tool_calls response the upstream returns `content: null` to
+    // signal "the assistant chose to call a tool, no text reply"; the
+    // gateway must surface exactly `null`, not `""` (#395).
+    expect(completion.choices[0]?.message.content).toBeNull();
   });
 
   test("streaming: delta.tool_calls fragments survive upstream → gateway → caller (#202)", async (ctx) => {

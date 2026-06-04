@@ -20,6 +20,8 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+#[cfg(feature = "aliyun-text-moderation")]
+mod aliyun;
 #[cfg(feature = "bedrock")]
 mod bedrock;
 mod build;
@@ -46,8 +48,9 @@ use async_trait::async_trait;
 /// moderation is a separate feature. Every guardrail's input/output
 /// collector goes through this so the families can't drift.
 pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
-    if !m.content.is_empty() {
-        return m.content.clone();
+    let content = m.content_str();
+    if !content.is_empty() {
+        return content.to_string();
     }
     match m.content_blocks.as_ref() {
         Some(blocks) => blocks
@@ -60,6 +63,8 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
     }
 }
 
+#[cfg(feature = "aliyun-text-moderation")]
+pub use aliyun::AliyunTextModerationGuardrail;
 #[cfg(feature = "bedrock")]
 pub use bedrock::BedrockGuardrail;
 pub use build::{
@@ -230,6 +235,11 @@ impl StreamOutputPolicy {
     }
 }
 
+/// Default whole-response hold-back cap for output guardrails that don't
+/// configure their own streaming policy (keyword, prompt shield, bedrock).
+/// Matches the Azure text-moderation buffer-mode default.
+pub const DEFAULT_STREAM_OUTPUT_BUFFER_BYTES: usize = 262_144;
+
 /// Pluggable content-policy hook. Production wires `Arc<dyn Guardrail>`
 /// in `ProxyState`; tests construct in-memory chains directly.
 #[async_trait]
@@ -257,10 +267,27 @@ pub trait Guardrail: Send + Sync + 'static {
     }
 
     /// How this guardrail wants streamed OUTPUT moderated. Default:
-    /// [`StreamOutputPolicy::EndOfStreamCheck`] (no hold-back, pre-P2
-    /// behavior). Hold-back guardrails (Azure text moderation) override.
+    /// hold the whole response back ([`StreamOutputPolicy::BufferFull`],
+    /// fail-closed) so an output-blocking guardrail can't leak content
+    /// onto the wire before its check runs (#466 — secure-by-default).
+    /// Guardrails that want partial streaming (Azure text moderation)
+    /// override with `Window`.
     fn stream_output_policy(&self) -> StreamOutputPolicy {
-        StreamOutputPolicy::EndOfStreamCheck
+        StreamOutputPolicy::BufferFull {
+            max_buffer_bytes: DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+            on_exceeded_fail_open: false,
+        }
+    }
+
+    /// Whether this guardrail actually inspects the OUTPUT hook. Drives
+    /// whether its `stream_output_policy` participates in the streamed-output
+    /// hold-back fold (#466): an input-only guardrail must NOT force output
+    /// buffering — it never looks at the response, so holding the stream back
+    /// for it is pure latency with no security benefit. Default: `true`
+    /// (assume output-relevant, secure-leaning); input-only impls override
+    /// to gate on their hook.
+    fn runs_on_output(&self) -> bool {
+        true
     }
 }
 
@@ -304,6 +331,32 @@ mod tests {
         let empty: ChatMessage =
             serde_json::from_value(serde_json::json!({"role": "user", "content": ""})).unwrap();
         assert_eq!(message_scan_text(&empty), "");
+    }
+
+    struct DefaultPolicyGuardrail;
+    impl Guardrail for DefaultPolicyGuardrail {
+        fn name(&self) -> &'static str {
+            "default-policy"
+        }
+    }
+
+    #[test]
+    fn default_stream_output_policy_holds_back() {
+        // #466: a guardrail that doesn't override stream_output_policy
+        // inherits a hold-back default, so an output-blocking guardrail can't
+        // live-forward streamed content before its check (secure-by-default).
+        let p = DefaultPolicyGuardrail.stream_output_policy();
+        assert!(
+            p.holds_back(),
+            "default streamed-output policy must hold back"
+        );
+        assert!(matches!(
+            p,
+            StreamOutputPolicy::BufferFull {
+                on_exceeded_fail_open: false,
+                ..
+            }
+        ));
     }
 
     #[test]

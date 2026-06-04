@@ -142,18 +142,18 @@ pub fn split_system<'a>(
                     // System messages interleaved with user/assistant
                     // turns don't map cleanly; append as a user turn to
                     // preserve semantics without silently dropping them.
-                    messages.push(AnthropicMessage::text("user", &m.content));
+                    messages.push(AnthropicMessage::text("user", m.content_str()));
                 } else {
-                    system_parts.push(&m.content);
+                    system_parts.push(m.content_str());
                 }
             }
             Role::User => {
                 seen_non_system = true;
-                messages.push(AnthropicMessage::text("user", &m.content));
+                messages.push(AnthropicMessage::text("user", m.content_str()));
             }
             Role::Assistant => {
                 seen_non_system = true;
-                messages.push(AnthropicMessage::text("assistant", &m.content));
+                messages.push(AnthropicMessage::text("assistant", m.content_str()));
             }
             Role::Tool => {
                 seen_non_system = true;
@@ -161,7 +161,7 @@ pub fn split_system<'a>(
                     .tool_call_id
                     .as_deref()
                     .ok_or(TranslateError::MissingToolCallId)?;
-                messages.push(AnthropicMessage::tool_result(tool_use_id, &m.content));
+                messages.push(AnthropicMessage::tool_result(tool_use_id, m.content_str()));
             }
         }
     }
@@ -418,15 +418,25 @@ pub struct AnthropicUsage {
 }
 
 pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
+    let mut saw_text_block = false;
     let text = raw
         .content
         .iter()
         .filter_map(|b| match b {
-            AnthropicResponseBlock::Text { text } => Some(text.as_str()),
+            AnthropicResponseBlock::Text { text } => {
+                saw_text_block = true;
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect::<Vec<_>>()
         .join("");
+    // #395: when an Anthropic upstream returns only `tool_use` blocks
+    // (no text block at all), surface `content: null` on the OpenAI
+    // shape rather than `""` — same wire-shape parity fix as the OpenAI
+    // passthrough. An explicit empty text block (`text: ""`) is distinct
+    // and preserved as `Some("")`.
+    let content = saw_text_block.then_some(text);
 
     // Translate Anthropic `tool_use` content blocks into OpenAI's
     // `message.tool_calls` shape so OpenAI-SDK callers see a
@@ -499,7 +509,7 @@ pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
         model: raw.model,
         message: ChatMessage {
             role: Role::Assistant,
-            content: text,
+            content,
             content_blocks: None,
             name: None,
             tool_call_id: None,
@@ -820,8 +830,8 @@ pub fn chat_response_into_anthropic_json(
 
     let mut content: Vec<serde_json::Value> = Vec::new();
 
-    if !resp.message.content.is_empty() {
-        content.push(serde_json::json!({"type": "text", "text": resp.message.content}));
+    if let Some(text) = resp.message.content.as_deref().filter(|s| !s.is_empty()) {
+        content.push(serde_json::json!({"type": "text", "text": text}));
     }
 
     // Translate OpenAI-shape tool_calls from message.extra into
@@ -1263,7 +1273,7 @@ mod tests {
             "claude",
             vec![ChatMessage {
                 role: Role::Tool,
-                content: "x".into(),
+                content: Some("x".into()),
                 content_blocks: None,
                 name: None,
                 tool_call_id: None,
@@ -1289,7 +1299,7 @@ mod tests {
                 // (skipping the assistant turn for brevity in test setup)
                 ChatMessage {
                     role: Role::Tool,
-                    content: "72F, sunny".into(),
+                    content: Some("72F, sunny".into()),
                     content_blocks: None,
                     name: None,
                     tool_call_id: Some("toolu_abc".into()),
@@ -1349,9 +1359,9 @@ mod tests {
 
         // stop_reason "tool_use" → finish_reason ToolCalls.
         assert_eq!(out.finish_reason, FinishReason::ToolCalls);
-        // Text content is empty when only tool_use blocks were
-        // emitted (no text blocks present).
-        assert_eq!(out.message.content, "");
+        // #395: when only tool_use blocks are emitted (no text), the
+        // OpenAI-shape content is `null`, not `""`.
+        assert_eq!(out.message.content, None);
 
         // tool_calls translation lives in `message.extra` so the
         // proxy renderer flattens it onto the wire as a top-level
@@ -1398,8 +1408,28 @@ mod tests {
         }"#;
         let raw: AnthropicResponse = serde_json::from_str(body).unwrap();
         let out = response_into_chat_response(raw);
-        assert_eq!(out.message.content, "Let me check the weather.");
+        assert_eq!(out.message.content_str(), "Let me check the weather.");
         assert!(out.message.extra.get("tool_calls").is_some());
+    }
+
+    #[test]
+    fn explicit_empty_text_block_stays_empty_string_not_null() {
+        // #395 refinement: distinguish "no text block at all" (→ null)
+        // from an explicit empty text block (→ ""). A response carrying
+        // a `{"type":"text","text":""}` block must surface `Some("")`,
+        // not `None`.
+        let body = r#"{
+            "id": "msg_empty_text_01",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-3-5-sonnet-20241022",
+            "content": [{"type": "text", "text": ""}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 3, "output_tokens": 0}
+        }"#;
+        let raw: AnthropicResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        assert_eq!(out.message.content, Some(String::new()));
     }
 
     #[test]
@@ -1644,7 +1674,7 @@ mod tests {
         let raw: AnthropicResponse = serde_json::from_str(body).unwrap();
         let out = response_into_chat_response(raw);
         assert_eq!(out.id, "msg_01A");
-        assert_eq!(out.message.content, "hello");
+        assert_eq!(out.message.content_str(), "hello");
         assert_eq!(out.finish_reason, FinishReason::Stop);
         assert_eq!(out.usage.total_tokens, 5);
     }
@@ -1708,7 +1738,7 @@ mod tests {
         }"#;
         let raw: AnthropicResponse = serde_json::from_str(body).unwrap();
         let out = response_into_chat_response(raw);
-        assert_eq!(out.message.content, "done");
+        assert_eq!(out.message.content_str(), "done");
     }
 
     #[test]
@@ -1813,7 +1843,7 @@ mod tests {
         assert_eq!(chat.model, "claude-sonnet-4-5");
         assert_eq!(chat.messages.len(), 1);
         assert_eq!(chat.messages[0].role, Role::User);
-        assert_eq!(chat.messages[0].content, "hi");
+        assert_eq!(chat.messages[0].content_str(), "hi");
         assert_eq!(chat.max_tokens, Some(100));
     }
 
@@ -1827,7 +1857,7 @@ mod tests {
         let chat = parse_inbound_request(&body).unwrap();
         assert_eq!(chat.messages.len(), 2);
         assert_eq!(chat.messages[0].role, Role::System);
-        assert_eq!(chat.messages[0].content, "you are helpful");
+        assert_eq!(chat.messages[0].content_str(), "you are helpful");
         assert_eq!(chat.messages[1].role, Role::User);
     }
 
@@ -1843,7 +1873,7 @@ mod tests {
         });
         let chat = parse_inbound_request(&body).unwrap();
         assert_eq!(chat.messages[0].role, Role::System);
-        assert_eq!(chat.messages[0].content, "line1\nline2");
+        assert_eq!(chat.messages[0].content_str(), "line1\nline2");
     }
 
     #[test]
@@ -1861,7 +1891,7 @@ mod tests {
         });
         let chat = parse_inbound_request(&body).unwrap();
         // Image block silently skipped; text concatenates.
-        assert_eq!(chat.messages[0].content, "hello world");
+        assert_eq!(chat.messages[0].content_str(), "hello world");
     }
 
     #[test]

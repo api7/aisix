@@ -201,7 +201,7 @@ fn normalize_canonical_openai(base: &str) -> String {
 fn api_key(ctx: &BridgeContext) -> Result<&str, BridgeError> {
     let k = &ctx.provider_key.secret;
     if k.is_empty() {
-        return Err(BridgeError::InvalidUpstreamConfig(
+        return Err(BridgeError::InvalidUpstreamCredentials(
             "provider_key.secret is empty".into(),
         ));
     }
@@ -210,7 +210,7 @@ fn api_key(ctx: &BridgeContext) -> Result<&str, BridgeError> {
     // endpoints build the `Bearer {key}` header inline rather than via
     // build_request_headers, so validating here covers them all (#367).
     if HeaderValue::from_str(k).is_err() {
-        return Err(BridgeError::InvalidUpstreamConfig(
+        return Err(BridgeError::InvalidUpstreamCredentials(
             "provider_key.secret contains invalid header characters".into(),
         ));
     }
@@ -343,7 +343,9 @@ fn build_request_headers(
 ) -> Result<HeaderMap, BridgeError> {
     let mut headers = HeaderMap::new();
     let auth = HeaderValue::from_str(&format!("Bearer {api_key_str}")).map_err(|e| {
-        BridgeError::InvalidUpstreamConfig(format!("api key contains invalid header chars: {e}"))
+        BridgeError::InvalidUpstreamCredentials(format!(
+            "api key contains invalid header chars: {e}"
+        ))
     })?;
     headers.insert(header::AUTHORIZATION, auth);
     headers.insert(
@@ -779,7 +781,7 @@ mod tests {
 
         assert_eq!(resp.id, "cmpl-1");
         assert_eq!(resp.message.role, Role::Assistant);
-        assert_eq!(resp.message.content, "hello back");
+        assert_eq!(resp.message.content_str(), "hello back");
         assert_eq!(resp.finish_reason, FinishReason::Stop);
         assert_eq!(resp.usage.total_tokens, 4);
     }
@@ -1074,10 +1076,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_api_key_is_a_config_error() {
+    async fn missing_api_key_is_a_credentials_error() {
         // Bridge's own guard: ProviderKey with an empty `secret` must
-        // surface a Config error rather than calling upstream with a
-        // bare bearer.
+        // surface a 401 authentication_error rather than calling
+        // upstream with a bare bearer (#367 follow-up).
         let mut pk: ProviderKey =
             serde_json::from_str(r#"{"display_name":"empty","secret":"placeholder"}"#).unwrap();
         pk.secret.clear();
@@ -1085,7 +1087,9 @@ mod tests {
         let bridge = OpenAiBridge::new();
         let ctx = BridgeContext::new("req-1", sample_model(), Arc::new(pk));
         let err = bridge.chat(&req(), &ctx).await.unwrap_err();
-        assert!(matches!(err, BridgeError::InvalidUpstreamConfig(_)));
+        assert!(matches!(err, BridgeError::InvalidUpstreamCredentials(_)));
+        assert_eq!(err.http_status(), 401);
+        assert_eq!(err.error_type(), "authentication_error");
     }
 
     #[tokio::test]

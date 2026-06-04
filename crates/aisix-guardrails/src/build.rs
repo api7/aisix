@@ -24,7 +24,7 @@ use async_trait::async_trait;
 
 use crate::index::{GuardrailIndex, RequestContext, ScopeKind};
 use crate::keyword::{KeywordBlocklist, KeywordRule};
-use crate::{Guardrail, GuardrailChain, GuardrailVerdict};
+use crate::{Guardrail, GuardrailChain, GuardrailVerdict, StreamOutputPolicy};
 
 /// Build a chain from a snapshot's `guardrails` table.
 ///
@@ -173,6 +173,24 @@ fn build_one(
         GuardrailKind::AzureContentSafetyTextModeration(_) => {
             Err(BuildError::FeatureDisabled("azure-content-safety"))
         }
+        #[cfg(feature = "aliyun-text-moderation")]
+        GuardrailKind::AliyunTextModeration(cfg) => {
+            // #603: HTTP-based TextModerationPlus dispatcher. cp-api already
+            // decrypted the access_key_secret at projection time; the config
+            // carries plaintext. Endpoint is per-row (derived from the row's
+            // region, or an explicit override for tests/dev).
+            let g = crate::aliyun::AliyunTextModerationGuardrail::new(
+                row.name.clone(),
+                cfg,
+                row.hook_point,
+                row.fail_open,
+            );
+            Ok(Some(Arc::new(g)))
+        }
+        #[cfg(not(feature = "aliyun-text-moderation"))]
+        GuardrailKind::AliyunTextModeration(_) => {
+            Err(BuildError::FeatureDisabled("aliyun-text-moderation"))
+        }
     }
 }
 
@@ -278,6 +296,20 @@ impl Guardrail for LiveGuardrailChain {
 
     async fn check_output(&self, resp: &ChatResponse) -> GuardrailVerdict {
         self.current().check_output(resp).await
+    }
+
+    /// Delegate streamed-output gating to the live inner chain so this exported
+    /// wrapper can't silently diverge from `GuardrailChain`'s hold-back
+    /// semantics if it is ever used directly as a streaming chain (#466).
+    /// Without these it would inherit the trait defaults (`BufferFull` +
+    /// `runs_on_output() == true`) and always hold back, ignoring its inner
+    /// members' hooks.
+    fn stream_output_policy(&self) -> StreamOutputPolicy {
+        self.current().stream_output_policy()
+    }
+
+    fn runs_on_output(&self) -> bool {
+        self.current().runs_on_output()
     }
 }
 
