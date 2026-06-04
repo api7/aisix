@@ -51,6 +51,13 @@ impl Guardrail for MaxContentLength {
         "max_content_length"
     }
 
+    /// Only inspects output when an output cap is set; otherwise `check_output`
+    /// is a guaranteed `Allow`, so it must not force streamed-output hold-back
+    /// (#466). Mirrors the `max_output_chars` gate in `check_output`.
+    fn runs_on_output(&self) -> bool {
+        self.max_output_chars.is_some()
+    }
+
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
         let Some(cap) = self.max_input_chars else {
             return GuardrailVerdict::Allow;

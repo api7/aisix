@@ -1992,10 +1992,11 @@ where
         } else {
             None
         };
-        // P2 (#379): per-guardrail streamed-output policy. EndOfStreamCheck
-        // (default / no guardrail) leaves the live-forward path below
-        // byte-for-byte unchanged. Window / BufferFull hold content back
-        // until it scans clean.
+        // P2 (#379) / #466: streamed-output policy folded over the output-hook
+        // guardrails. EndOfStreamCheck (reached only when no output-hook
+        // guardrail is present) leaves the live-forward path below byte-for-byte
+        // unchanged. Window / BufferFull hold content back until it scans clean
+        // (BufferFull is now the secure default for output-blocking guardrails).
         let stream_policy = output_guardrail
             .as_ref()
             .map(|ctx| ctx.chain.stream_output_policy())

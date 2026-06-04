@@ -1847,32 +1847,24 @@ data: <not valid json>\n\n";
         );
     }
 
-    /// Issue #204: streaming responses MUST run output guardrails at
-    /// end-of-stream (buffer-then-check). Pre-fix the streaming path
-    /// skipped output guardrails entirely — a `kind: "keyword"`
-    /// deny-list could be trivially bypassed by setting `stream:
-    /// true`. This test pins:
+    /// Issue #204: streaming responses MUST run output guardrails — pre-fix
+    /// the streaming path skipped them, so a `kind: "keyword"` deny-list was
+    /// bypassable by setting `stream: true`.
+    ///
+    /// Issue #466: output guardrails must also HOLD content back while
+    /// streaming. `keyword` now inherits the default hold-back policy
+    /// ([`StreamOutputPolicy::BufferFull`], fail-closed), so a blocked
+    /// streaming response NEVER puts the forbidden content on the wire.
+    /// This test pins:
     ///
     ///   - 200 OK + SSE wire shape (the request itself is well-formed)
     ///   - upstream IS hit (output guardrails run AFTER the upstream call)
-    ///   - the response wire bytes contain an SSE `event: error` frame
-    ///     with the OpenAI envelope shape
-    ///   - the wire bytes contain NO terminal `[DONE]` (per docs §5
-    ///     pattern: a guardrail block is an abnormal termination)
-    ///   - the matched literal does NOT appear anywhere in the
-    ///     wire bytes that follow the error frame (the redaction
-    ///     mirrors #153's non-streaming contract)
-    ///
-    /// Note: the pre-emitted `data: ...` chunks DO contain "secret"
-    /// (the assistant's content reaching the caller's iterator
-    /// before the buffer-then-check completes). That's the
-    /// fundamental trade-off the issue's fix-shape discussion calls
-    /// out for buffer-then-check; preventing prefix bytes from
-    /// reaching the wire would require holding ALL chunks server-
-    /// side until the check fires, which negates streaming's
-    /// latency-to-first-token benefit. The buffer-then-check
-    /// guarantee is "no `[DONE]` and an error event signals the
-    /// block" — what we assert here.
+    ///   - an SSE `event: error` frame with the OpenAI `content_filter` envelope
+    ///   - NO terminal `[DONE]` (a guardrail block is an abnormal termination)
+    ///   - the matched literal "secret-string" does NOT appear ANYWHERE on
+    ///     the wire — the hold-back means the offending content is never
+    ///     emitted (the #466 fix; previously the live-forwarded chunks
+    ///     leaked it before the end-of-stream check).
     #[tokio::test]
     async fn streaming_output_guardrail_blocks_with_sse_error_event_and_no_done() {
         let upstream = MockServer::start().await;
@@ -1928,6 +1920,14 @@ data: [DONE]\n\n";
         }
         let wire_str = String::from_utf8(wire).expect("SSE bytes are utf8");
 
+        // #466: the default hold-back policy means the forbidden content is
+        // never forwarded — the matched literal appears NOWHERE on the wire
+        // (pre-fix the live-forwarded chunks leaked it before the check).
+        assert!(
+            !wire_str.contains("secret-string"),
+            "hold-back guardrail leaked the matched content onto the wire; got:\n{wire_str}"
+        );
+
         // Per docs §5 abnormal-termination contract (the guardrail
         // block is the streaming-equivalent of an abnormal close):
         // NO `[DONE]` after the error event. SDK consumers that key
@@ -1973,9 +1973,10 @@ data: [DONE]\n\n";
         );
     }
 
-    /// P2 (#379): unlike the keyword guardrail above (EndOfStreamCheck,
-    /// which leaks pre-emitted chunks), `azure_content_safety_text_moderation`
-    /// uses a hold-back streaming policy — a blocked streaming response
+    /// P2 (#379): like the keyword guardrail above (which now holds back by
+    /// default, #466), `azure_content_safety_text_moderation` keeps offending
+    /// content off the wire — here via the configurable `Window` policy
+    /// rather than the default `BufferFull`. A blocked streaming response
     /// NEVER puts the offending content on the wire.
     #[tokio::test]
     async fn streaming_text_moderation_blocks_and_holds_content_back_no_leak() {
