@@ -29,6 +29,8 @@ regex.workspace = true
 # against the snapshot's `key_hash` column.
 sha2.workspace = true
 hex.workspace = true
+# Trusted-proxy CIDR parsing/validation for proxy.real_ip (#492)
+ipnet.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

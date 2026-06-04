@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::AuthenticatedKey;
+use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::render::{render_chunk, render_response};
 use crate::request_id::new_request_id;
@@ -114,6 +115,7 @@ use crate::cooldown::decide_cooldown;
 pub async fn chat_completions(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
+    client: ClientContext,
     // Issue #324: catch the JSON-extractor rejection here so we can
     // map it to OpenAI's documented 400 invalid_request_error wire
     // shape. Axum's `Json<T>` extractor returns 422 on JsonDataError
@@ -159,7 +161,7 @@ pub async fn chat_completions(
     let api_key_id = auth.entry.id.clone();
     let model_name = req.model.clone();
 
-    let outcome = dispatch(&state, &auth, &req, &request_id, started).await;
+    let outcome = dispatch(&state, &auth, &req, &request_id, started, &client).await;
 
     match outcome {
         Ok(mut success) => {
@@ -226,6 +228,7 @@ pub async fn chat_completions(
                     },
                     success.cost_usd,
                     /* guardrail_blocked */ false,
+                    &client,
                 );
             }
             // Inject x-ratelimit-* headers so OpenAI SDK clients see the
@@ -375,6 +378,7 @@ pub async fn chat_completions(
                 extras,
                 /* cost_usd */ 0.0,
                 guardrail_blocked,
+                &client,
             );
             err.into_response()
         }
@@ -608,6 +612,7 @@ async fn dispatch(
     req: &ChatFormat,
     request_id: &str,
     started: Instant,
+    client: &ClientContext,
 ) -> Result<Success, DispatchFailure> {
     if req.messages.is_empty() {
         return Err(DispatchFailure::new(
@@ -820,6 +825,9 @@ async fn dispatch(
         let provider_key_id_for_telem = pk_entry.id.clone();
         let upstream_model_for_metrics = model.upstream_model().unwrap_or("unknown").to_string();
         let bypass_reason_for_telem = bypass_reason.clone().unwrap_or_default();
+        // Downstream client attribution (#492) moved into the on_complete
+        // closure so streamed responses log the same IP/UA as non-streaming.
+        let client_for_telem = client.clone();
         let stream_routing = if virtual_entry.value.routing.is_some() {
             RoutingTelemetry {
                 served_by_model: model.display_name.clone(),
@@ -912,6 +920,7 @@ async fn dispatch(
                     },
                     /* cost_usd */ 0.0,
                     comp.guardrail_blocked,
+                    &client_for_telem,
                 );
                 metrics_for_stream.record_llm_usage(
                     UsageLabels {
@@ -1577,6 +1586,7 @@ fn emit_usage_event(
     extras: UsageExtras,
     cost_usd: f64,
     guardrail_blocked: bool,
+    client: &ClientContext,
 ) {
     // Look up per-PK telemetry attribution tags from the live snapshot.
     // Empty `provider_key_id` (pre-dispatch error paths) → default
@@ -1638,6 +1648,10 @@ fn emit_usage_event(
         branded_provider: sanitize_tag(tags.branded_provider.unwrap_or_default()),
         pk_label: sanitize_tag(tags.pk_label.unwrap_or_default()),
         byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
+        // Downstream client attribution (#492). Already sanitised in the
+        // extractor (control-char strip + cap); IP is a formatted addr.
+        client_source_ip: client.source_ip.clone(),
+        client_user_agent: client.user_agent.clone(),
     };
     // Handler label "chat" matches the documented enumeration for
     // `aisix_usage_events_emitted_total` (#408). Keep `&'static str`

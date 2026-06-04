@@ -60,6 +60,10 @@ etcd:
 proxy:
   addr: "0.0.0.0:3000"
   request_body_limit_bytes: 10485760
+  real_ip:
+    trusted_proxies: ["10.0.0.0/8", "127.0.0.1/32"]
+    recursive: true
+    header: x-forwarded-for
 
 admin:
   addr: "127.0.0.1:3001"
@@ -121,11 +125,27 @@ Important fields:
 | `addr` | proxy listener address | required |
 | `request_body_limit_bytes` | request-body limit enforced by the proxy listener | `10485760` (10 MiB) |
 | `tls` | optional TLS certificate and key for the proxy listener | none |
+| `real_ip` | downstream client-IP resolution from a forwarded header (see below) | trust nothing (log the TCP peer) |
 
 Recommended pattern:
 
 - bind `0.0.0.0` only when the process is intentionally network-reachable
 - keep `request_body_limit_bytes` large enough for your expected request families, but avoid setting it arbitrarily high without a reason
+
+### `proxy.real_ip`
+
+Use `real_ip` to recover the original client IP for usage logs when the gateway sits behind an L7 load balancer or K8s ingress that sets `x-forwarded-for`. The resolution mirrors nginx's `set_real_ip_from` + `real_ip_recursive`: the immediate TCP peer is the client unless it matches a configured trusted proxy, in which case the forwarded header is walked to find the originating address. The resolved value is recorded as `client_source_ip` on each usage event.
+
+| Field | Description | Default |
+| --- | --- | --- |
+| `trusted_proxies` | list of trusted upstream proxy CIDRs (a bare IP is treated as a `/32`/`/128` host route); malformed entries are rejected at startup | `[]` (trust nothing → always log the TCP peer) |
+| `recursive` | when true, walk the forwarded header right-to-left skipping trusted addresses and take the first untrusted one; when false, take the rightmost header entry once the peer is trusted | `false` |
+| `header` | forwarded header to consult | `"x-forwarded-for"` |
+
+Operator guidance:
+
+- leave `real_ip` unset for direct-to-client deployments — the TCP peer is already the real client
+- set `trusted_proxies` to the CIDRs of your ingress / load balancer only; trusting too broad a range lets clients spoof `x-forwarded-for`
 
 ## `admin`
 

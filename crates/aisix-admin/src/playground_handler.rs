@@ -77,6 +77,7 @@ mod tests {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
+            real_ip: Default::default(),
             tls: None,
         }
     }

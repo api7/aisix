@@ -28,6 +28,7 @@ use serde_json::Value;
 use std::time::{Duration, Instant};
 
 use crate::auth::AuthenticatedKey;
+use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::request_id::new_request_id;
 use crate::state::ProxyState;
@@ -55,6 +56,7 @@ struct AudioDispatchSuccess {
 pub async fn transcriptions(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
+    client: ClientContext,
     multipart: Multipart,
 ) -> Response {
     let started = Instant::now();
@@ -91,7 +93,7 @@ pub async fn transcriptions(
                 RequestOutcome::Success,
                 elapsed,
             );
-            emit_audio_usage(&state, &request_id, &success, &api_key_id, elapsed);
+            emit_audio_usage(&state, &request_id, &success, &api_key_id, elapsed, &client);
             success.response
         }
         Err(err) => {
@@ -126,6 +128,7 @@ pub async fn transcriptions(
 pub async fn translations(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
+    client: ClientContext,
     multipart: Multipart,
 ) -> Response {
     let started = Instant::now();
@@ -162,7 +165,7 @@ pub async fn translations(
                 RequestOutcome::Success,
                 elapsed,
             );
-            emit_audio_usage(&state, &request_id, &success, &api_key_id, elapsed);
+            emit_audio_usage(&state, &request_id, &success, &api_key_id, elapsed, &client);
             success.response
         }
         Err(err) => {
@@ -197,6 +200,7 @@ pub async fn translations(
 pub async fn speech(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
+    client: ClientContext,
     Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
@@ -242,6 +246,7 @@ pub async fn speech(
                 elapsed,
                 0,
                 0,
+                &client,
             );
             resp
         }
@@ -564,6 +569,7 @@ fn emit_audio_usage(
     success: &AudioDispatchSuccess,
     api_key_id: &str,
     elapsed: Duration,
+    client: &ClientContext,
 ) {
     let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
     emit_usage_event(
@@ -575,6 +581,7 @@ fn emit_audio_usage(
         elapsed,
         prompt_tokens,
         completion_tokens,
+        client,
     );
 }
 
@@ -595,6 +602,7 @@ fn emit_usage_event(
     elapsed: Duration,
     prompt_tokens: u32,
     completion_tokens: u32,
+    client: &ClientContext,
 ) {
     let event = UsageEvent {
         request_id: request_id.to_string(),
@@ -606,6 +614,8 @@ fn emit_usage_event(
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
+        client_source_ip: client.source_ip.clone(),
+        client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
     // Handler label "audio" — bucketed prometheus counter (#408).
@@ -674,6 +684,7 @@ mod tests {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 10_485_760, // 10 MB for audio
+            real_ip: Default::default(),
             tls: None,
         }
     }

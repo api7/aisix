@@ -50,6 +50,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthenticatedKey;
 use crate::chat::sanitize_tag;
+use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::request_id::new_request_id;
 use crate::state::ProxyState;
@@ -62,6 +63,7 @@ pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub async fn messages(
     State(state): State<ProxyState>,
     auth: Result<AuthenticatedKey, ProxyError>,
+    client: ClientContext,
     body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     // Catch extractor rejections (auth fail / malformed JSON) HERE
@@ -106,7 +108,7 @@ pub async fn messages(
         .unwrap_or_default();
     drop(snapshot);
 
-    match dispatch(&state, &auth, &mut body, &request_id, started).await {
+    match dispatch(&state, &auth, &mut body, &request_id, started, &client).await {
         Ok(DispatchOutcome {
             response,
             provider_label,
@@ -163,6 +165,7 @@ pub async fn messages(
                     status,
                     elapsed,
                     metrics,
+                    &client,
                 );
             }
             response
@@ -203,6 +206,7 @@ pub async fn messages(
                 status,
                 elapsed,
                 AnthropicUsageMetrics::default(),
+                &client,
             );
             // /v1/messages must return Anthropic-shape error envelope
             // `{type:"error", error:{type, message}}` so Claude SDKs
@@ -220,6 +224,7 @@ async fn dispatch(
     body: &mut Value,
     request_id: &str,
     started: Instant,
+    client: &ClientContext,
 ) -> Result<DispatchOutcome, ProxyError> {
     let snapshot = state.snapshot.load();
 
@@ -325,6 +330,7 @@ async fn dispatch(
             auth.key().team_id.clone(),
             auth.key().user_id.clone(),
             resolved_chain.clone(),
+            client,
         )
         .await;
     }
@@ -347,6 +353,7 @@ async fn dispatch(
             auth.key().team_id.clone(),
             auth.key().user_id.clone(),
             resolved_chain.clone(),
+            client,
         )
         .await
         {
@@ -382,6 +389,7 @@ async fn dispatch_to_target(
     team_id: Option<String>,
     user_id: Option<String>,
     resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
+    client: &ClientContext,
 ) -> Result<DispatchOutcome, ProxyError> {
     let model = &target.model;
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -400,6 +408,7 @@ async fn dispatch_to_target(
             team_id,
             user_id,
             resolved_chain,
+            client,
         )
         .await;
     }
@@ -418,6 +427,7 @@ async fn dispatch_to_target(
         team_id,
         user_id,
         resolved_chain,
+        client,
     )
     .await
 }
@@ -441,6 +451,7 @@ async fn anthropic_passthrough_dispatch(
     team_id: Option<String>,
     user_id: Option<String>,
     resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
+    client_ctx: &ClientContext,
 ) -> Result<DispatchOutcome, ProxyError> {
     let mut body = body.clone();
     let api_key = crate::dispatch::require_secret(pk_value, model)?;
@@ -598,6 +609,8 @@ async fn anthropic_passthrough_dispatch(
         let upstream_model_c = upstream_model.clone();
         let team_id_c = team_id.clone();
         let user_id_c = user_id.clone();
+        // #492: log the same client IP/UA on streamed responses.
+        let client_ctx_c = client_ctx.clone();
 
         let stream_guardrail = if resolved_chain.is_empty() {
             None
@@ -637,6 +650,7 @@ async fn anthropic_passthrough_dispatch(
                     200,
                     started.elapsed(),
                     metrics,
+                    &client_ctx_c,
                 );
             },
         );
@@ -828,6 +842,7 @@ async fn cross_provider_dispatch(
     team_id: Option<String>,
     user_id: Option<String>,
     resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
+    client: &ClientContext,
 ) -> Result<DispatchOutcome, ProxyError> {
     use aisix_gateway::{Bridge, BridgeContext};
     use aisix_provider_anthropic::{
@@ -904,6 +919,8 @@ async fn cross_provider_dispatch(
         let team_id_for_telem = team_id;
         let user_id_for_telem = user_id;
         let started_for_telem = started;
+        // #492: log the same client IP/UA on streamed responses.
+        let client_for_telem = client.clone();
         let stream_guardrail = if resolved_chain.is_empty() {
             None
         } else {
@@ -940,6 +957,7 @@ async fn cross_provider_dispatch(
                     200,
                     started_for_telem.elapsed(),
                     metrics,
+                    &client_for_telem,
                 );
             },
         );
@@ -1246,6 +1264,7 @@ fn emit_anthropic_usage_event(
     status_code: u16,
     elapsed: Duration,
     metrics: AnthropicUsageMetrics,
+    client: &ClientContext,
 ) {
     // Per-PK telemetry attribution (#302 M17 / AISIX-Cloud#436).
     // Same shape as chat.rs's emit_usage_event — look up the
@@ -1282,6 +1301,8 @@ fn emit_anthropic_usage_event(
         branded_provider: sanitize_tag(tags.branded_provider.unwrap_or_default()),
         pk_label: sanitize_tag(tags.pk_label.unwrap_or_default()),
         byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
+        client_source_ip: client.source_ip.clone(),
+        client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
     // Handler label "messages" — Anthropic /v1/messages inbound
@@ -1747,6 +1768,7 @@ mod tests {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
+            real_ip: Default::default(),
             tls: None,
         }
     }

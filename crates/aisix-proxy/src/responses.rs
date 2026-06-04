@@ -21,6 +21,7 @@ use serde_json::Value;
 use std::time::{Duration, Instant};
 
 use crate::auth::AuthenticatedKey;
+use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::request_id::new_request_id;
 use crate::state::ProxyState;
@@ -63,6 +64,7 @@ struct ResponseUsage {
 pub async fn responses(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
+    client: ClientContext,
     Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
@@ -111,6 +113,7 @@ pub async fn responses(
                     status,
                     elapsed,
                     &usage,
+                    &client,
                 );
             }
             success.response
@@ -445,6 +448,7 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
 ///   - provider_kind / provider_featured / branded_provider /
 ///     pk_label / byo_label — per-PK telemetry attribution wired
 ///     for chat only today (same deferred gap as #402)
+#[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
     request_id: &str,
@@ -453,6 +457,7 @@ fn emit_usage_event(
     status_code: u16,
     elapsed: Duration,
     usage: &ResponseUsage,
+    client: &ClientContext,
 ) {
     let event = UsageEvent {
         request_id: request_id.to_string(),
@@ -466,6 +471,8 @@ fn emit_usage_event(
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
+        client_source_ip: client.source_ip.clone(),
+        client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
     state.usage_sink.try_emit("responses", event.clone());
@@ -523,6 +530,7 @@ mod tests {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
+            real_ip: Default::default(),
             tls: None,
         }
     }

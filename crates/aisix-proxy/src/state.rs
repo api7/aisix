@@ -24,6 +24,7 @@ use aisix_ratelimit::Limiter;
 use std::sync::Arc;
 
 use crate::budget::BudgetClient;
+use crate::client_ip::ResolvedRealIp;
 use crate::health::{HealthTracker, LivezState, ModelRuntimeStatusTracker};
 use crate::routing::RoutingRegistry;
 
@@ -64,6 +65,10 @@ pub struct ProxyState {
     /// no-exporters case = empty snapshot table = no spawned tasks).
     pub otlp_fan_out: OtlpHttpFanOut,
     pub request_body_limit_bytes: usize,
+    /// Pre-parsed `proxy.real_ip` config for resolving the downstream
+    /// client IP on each request (#492). Default = trust nothing → the
+    /// logged source IP is the immediate TCP peer.
+    pub real_ip: Arc<ResolvedRealIp>,
 }
 
 impl ProxyState {
@@ -84,6 +89,7 @@ impl ProxyState {
             usage_sink: UsageSink::disabled(),
             otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
+            real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
         }
     }
 
@@ -111,6 +117,7 @@ impl ProxyState {
             usage_sink: UsageSink::disabled(),
             otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
+            real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
         }
     }
 
@@ -141,6 +148,7 @@ impl ProxyState {
             usage_sink: UsageSink::disabled(),
             otlp_fan_out: OtlpHttpFanOut::new(),
             request_body_limit_bytes: cfg.request_body_limit_bytes,
+            real_ip: Arc::new(ResolvedRealIp::from_config(&cfg.real_ip)),
         }
     }
 

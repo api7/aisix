@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::auth::AuthenticatedKey;
+use crate::client_ip::ClientContext;
 use crate::error::{ErrorEnvelope, ProxyError};
 use crate::request_id::new_request_id;
 use crate::state::ProxyState;
@@ -64,6 +65,7 @@ impl InputField {
 pub async fn embeddings(
     State(state): State<ProxyState>,
     auth: AuthenticatedKey,
+    client: ClientContext,
     // Issue #401 (follow-up to #324): catch the JSON-extractor
     // rejection here so we can map it to OpenAI's documented 400
     // invalid_request_error wire shape. Axum's `Json<T>` extractor
@@ -148,6 +150,7 @@ pub async fn embeddings(
                     status,
                     elapsed,
                     success.prompt_tokens,
+                    &client,
                 );
             }
             success.response
@@ -349,6 +352,7 @@ fn emit_access_log(
 /// Issue #226. /v1/embeddings is the first non-chat handler to gain
 /// emission; follow-ups for completions / responses / rerank /
 /// audio / images each get their own PR with the same shape.
+#[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
     request_id: &str,
@@ -357,6 +361,7 @@ fn emit_usage_event(
     status_code: u16,
     elapsed: Duration,
     prompt_tokens: u32,
+    client: &ClientContext,
 ) {
     // Only populate fields meaningful to /v1/embeddings; rely on
     // UsageEvent's `#[derive(Default)]` for everything else. Wire-level
@@ -389,6 +394,8 @@ fn emit_usage_event(
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
+        client_source_ip: client.source_ip.clone(),
+        client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
     // Handler label "embeddings" — bucketed prometheus counter (#408).
@@ -421,6 +428,7 @@ mod tests {
         ProxyConfig {
             addr: "127.0.0.1:0".into(),
             request_body_limit_bytes: 1_048_576,
+            real_ip: Default::default(),
             tls: None,
         }
     }
