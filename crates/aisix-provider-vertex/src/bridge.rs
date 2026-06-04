@@ -1680,17 +1680,17 @@ fn build_gemini_request(req: &ChatFormat) -> GeminiGenerateContentRequest {
     let mut contents: Vec<GeminiContent> = Vec::new();
     for m in &req.messages {
         match m.role {
-            Role::System => system_parts.push(m.content.clone()),
+            Role::System => system_parts.push(m.content_str().to_string()),
             Role::User | Role::Tool => contents.push(GeminiContent {
                 role: "user",
                 parts: vec![GeminiPart {
-                    text: m.content.clone(),
+                    text: m.content_str().to_string(),
                 }],
             }),
             Role::Assistant => contents.push(GeminiContent {
                 role: "model",
                 parts: vec![GeminiPart {
-                    text: m.content.clone(),
+                    text: m.content_str().to_string(),
                 }],
             }),
         }
@@ -2469,7 +2469,7 @@ mod tests {
         )
         .unwrap();
         let chat = gemini_response_into_chat_response(raw, "gemini-1.5-pro");
-        assert_eq!(chat.message.content, "hello");
+        assert_eq!(chat.message.content_str(), "hello");
         assert_eq!(chat.message.role, Role::Assistant);
         assert_eq!(chat.finish_reason, FinishReason::Stop);
         assert_eq!(chat.usage.total_tokens, 6);
@@ -2724,7 +2724,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "hello from gemini");
+        assert_eq!(chat.message.content_str(), "hello from gemini");
         assert_eq!(chat.usage.total_tokens, 6);
     }
 
@@ -2777,7 +2777,7 @@ mod tests {
         let chat = bridge.chat(&req, &ctx).await.unwrap();
 
         // Customer-visible response decoded from the Anthropic envelope.
-        assert_eq!(chat.message.content, "hello from claude on vertex");
+        assert_eq!(chat.message.content_str(), "hello from claude on vertex");
         assert_eq!(chat.usage.total_tokens, 8);
 
         // Wire-shape: Anthropic Messages body with the Vertex
@@ -3010,7 +3010,7 @@ mod tests {
         let chat = bridge.chat(&req, &ctx).await.unwrap();
 
         // Customer-visible response decoded from the OpenAI envelope.
-        assert_eq!(chat.message.content, "hello from llama on vertex");
+        assert_eq!(chat.message.content_str(), "hello from llama on vertex");
         assert_eq!(chat.usage.total_tokens, 9);
 
         // Wire-shape: OpenAI chat body with the model id IN the body
@@ -3187,7 +3187,7 @@ mod tests {
 
         // Response decoded from the OpenAI envelope (shared responder).
         assert_eq!(chat.usage.total_tokens, 9);
-        assert!(!chat.message.content.is_empty());
+        assert!(!chat.message.content_str().is_empty());
 
         // Wire-shape: the model id is kept in the OpenAI body (it rides in
         // BOTH the URL — pinned by the matcher above — and the body).
@@ -3414,7 +3414,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "hello from gemini");
+        assert_eq!(chat.message.content_str(), "hello from gemini");
     }
 
     /// Same as above but exercises the trailing-slash trim — a
@@ -3445,7 +3445,7 @@ mod tests {
         let chat = bridge.chat(&req, &ctx).await.unwrap();
         // Body shape unaffected — the assertion is the wiremock's
         // `expect(1)` on the exact path (no `//` doubling).
-        assert_eq!(chat.message.content, "hello from gemini");
+        assert_eq!(chat.message.content_str(), "hello from gemini");
     }
 
     #[tokio::test]
@@ -3883,7 +3883,7 @@ mod tests {
         let req = ChatFormat::new("my-gemini", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
         assert_eq!(chat.finish_reason, FinishReason::Length);
-        assert_eq!(chat.message.content, "truncated...");
+        assert_eq!(chat.message.content_str(), "truncated...");
     }
 
     // ─── Streaming (:streamGenerateContent?alt=sse) ─────────────────

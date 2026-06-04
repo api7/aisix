@@ -135,7 +135,7 @@ mod tests {
         let cache = MemoryCache::with_defaults();
         cache.put("k1", sample_response()).await.unwrap();
         let got = cache.get("k1").await.unwrap().unwrap();
-        assert_eq!(got.message.content, "hi back");
+        assert_eq!(got.message.content_str(), "hi back");
         assert_eq!(got.usage.total_tokens, 5);
     }
 
@@ -164,10 +164,10 @@ mod tests {
         let cache = MemoryCache::with_defaults();
         cache.put("k", sample_response()).await.unwrap();
         let mut updated = sample_response();
-        updated.message.content = "second".into();
+        updated.message.content = Some("second".into());
         cache.put("k", updated).await.unwrap();
         let got = cache.get("k").await.unwrap().unwrap();
-        assert_eq!(got.message.content, "second");
+        assert_eq!(got.message.content_str(), "second");
     }
 
     /// Per-entry TTL: two keys inserted at the same time with

@@ -781,7 +781,7 @@ mod tests {
 
         assert_eq!(resp.id, "cmpl-1");
         assert_eq!(resp.message.role, Role::Assistant);
-        assert_eq!(resp.message.content, "hello back");
+        assert_eq!(resp.message.content_str(), "hello back");
         assert_eq!(resp.finish_reason, FinishReason::Stop);
         assert_eq!(resp.usage.total_tokens, 4);
     }

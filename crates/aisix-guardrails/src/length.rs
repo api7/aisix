@@ -62,7 +62,11 @@ impl Guardrail for MaxContentLength {
         let Some(cap) = self.max_input_chars else {
             return GuardrailVerdict::Allow;
         };
-        let total: usize = req.messages.iter().map(|m| m.content.chars().count()).sum();
+        let total: usize = req
+            .messages
+            .iter()
+            .map(|m| m.content_str().chars().count())
+            .sum();
         if total > cap {
             return GuardrailVerdict::Block {
                 reason: format!("input exceeds {cap} chars (was {total})"),
@@ -75,7 +79,7 @@ impl Guardrail for MaxContentLength {
         let Some(cap) = self.max_output_chars else {
             return GuardrailVerdict::Allow;
         };
-        let len = resp.message.content.chars().count();
+        let len = resp.message.content_str().chars().count();
         if len > cap {
             return GuardrailVerdict::Block {
                 reason: format!("output exceeds {cap} chars (was {len})"),

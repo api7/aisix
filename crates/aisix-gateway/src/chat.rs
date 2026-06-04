@@ -62,7 +62,15 @@ pub enum Role {
 #[serde(from = "ChatMessageRaw")]
 pub struct ChatMessage {
     pub role: Role,
-    pub content: String,
+    /// Assistant/text content. `Option<String>` (not `String`) so the
+    /// OpenAI `string | null` shape round-trips faithfully: a `tool_calls`
+    /// response upstream returns `content: null` and we must surface
+    /// exactly `null` to the SDK caller, not `""` (#395). On the request
+    /// path callers always send a string; `None` only arises on the
+    /// response-projection path (or an inbound `content: null` from a
+    /// history-replay assistant message).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
     /// Raw content-block array when the caller sent
     /// `content: [{type, ...}, ...]`. `None` for the bare-string and
     /// `null` content shapes. Bridges that support content blocks
@@ -134,20 +142,21 @@ impl From<ChatMessageRaw> for ChatMessage {
 
 /// Split a wire-form `content` value into the gateway's
 /// `(extracted_text, raw_blocks)` representation:
-///   * String → (string, None)
-///   * null → ("", None) — OpenAI's assistant-with-tool_calls history
-///     shape per <https://platform.openai.com/docs/api-reference/chat/create>
-///   * Array → (concatenated text from `{type:"text", text}` blocks,
-///     Some(raw array)) — vision / multimodal input. Non-text blocks
-///     (e.g. `image_url`) are skipped on the text-extraction path but
-///     preserved verbatim in the raw array for forwarding.
-///   * Anything else → ("", None) — defensive default; unexpected
-///     shapes don't fail the request, they degrade to an empty text
+///   * String → (Some(string), None)
+///   * null → (None, None) — OpenAI's assistant-with-tool_calls history
+///     shape per <https://platform.openai.com/docs/api-reference/chat/create>.
+///     Preserved as `None` so it round-trips back to `null` (#395).
+///   * Array → (Some(concatenated text from `{type:"text", text}`
+///     blocks), Some(raw array)) — vision / multimodal input. Non-text
+///     blocks (e.g. `image_url`) are skipped on the text-extraction path
+///     but preserved verbatim in the raw array for forwarding.
+///   * Anything else → (None, None) — defensive default; unexpected
+///     shapes don't fail the request, they degrade to absent text
 ///     so the bridge can still dispatch.
-fn split_content(v: Value) -> (String, Option<Vec<Value>>) {
+fn split_content(v: Value) -> (Option<String>, Option<Vec<Value>>) {
     match v {
-        Value::String(s) => (s, None),
-        Value::Null => (String::new(), None),
+        Value::String(s) => (Some(s), None),
+        Value::Null => (None, None),
         Value::Array(blocks) => {
             let text = blocks
                 .iter()
@@ -161,9 +170,9 @@ fn split_content(v: Value) -> (String, Option<Vec<Value>>) {
                 })
                 .collect::<Vec<_>>()
                 .join("");
-            (text, Some(blocks))
+            (Some(text), Some(blocks))
         }
-        _ => (String::new(), None),
+        _ => (None, None),
     }
 }
 
@@ -171,7 +180,7 @@ impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,
-            content: content.into(),
+            content: Some(content.into()),
             content_blocks: None,
             name: None,
             tool_call_id: None,
@@ -182,7 +191,7 @@ impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: Role::User,
-            content: content.into(),
+            content: Some(content.into()),
             content_blocks: None,
             name: None,
             tool_call_id: None,
@@ -193,12 +202,19 @@ impl ChatMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
-            content: content.into(),
+            content: Some(content.into()),
             content_blocks: None,
             name: None,
             tool_call_id: None,
             extra: serde_json::Map::new(),
         }
+    }
+
+    /// The text content as a `&str`, treating absent (`null`) content as
+    /// `""`. Use this for bridges/guardrails that need a plain string and
+    /// for which the string-vs-null distinction is irrelevant.
+    pub fn content_str(&self) -> &str {
+        self.content.as_deref().unwrap_or("")
     }
 }
 
@@ -357,7 +373,7 @@ impl ChatResponse {
     /// Reasoning/thinking content is intentionally NOT included — it is
     /// left out of output-guardrail scope by design.
     pub fn guardrail_output_text(&self) -> String {
-        let mut out = self.message.content.clone();
+        let mut out = self.message.content.clone().unwrap_or_default();
         if let Some(tool_calls) = self.message.extra.get("tool_calls") {
             if !tool_calls.is_null() {
                 if !out.is_empty() {
@@ -542,15 +558,18 @@ mod tests {
     #[test]
     fn content_accepts_string() {
         let m: ChatMessage = serde_json::from_str(r#"{"role": "user", "content": "hi"}"#).unwrap();
-        assert_eq!(m.content, "hi");
+        assert_eq!(m.content.as_deref(), Some("hi"));
         assert!(m.content_blocks.is_none());
     }
 
     #[test]
-    fn content_accepts_null_collapsing_to_empty_string() {
+    fn content_null_preserved_as_none() {
+        // #395: `content: null` (OpenAI's assistant-with-tool_calls shape)
+        // is preserved as `None` so it round-trips back to JSON `null`,
+        // not `""`.
         let m: ChatMessage =
             serde_json::from_str(r#"{"role": "assistant", "content": null}"#).unwrap();
-        assert_eq!(m.content, "");
+        assert_eq!(m.content, None);
         assert!(m.content_blocks.is_none());
     }
 
@@ -569,7 +588,7 @@ mod tests {
         )
         .unwrap();
         // Concatenated text from text blocks (non-text blocks skipped).
-        assert_eq!(m.content, "What's in this image?");
+        assert_eq!(m.content.as_deref(), Some("What's in this image?"));
         // Raw blocks preserved verbatim for forwarding.
         let blocks = m.content_blocks.expect("blocks should be Some");
         assert_eq!(blocks.len(), 2);
@@ -589,7 +608,9 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(m.content, "");
+        // An array of only non-text blocks yields empty-but-present text
+        // (the array form is never `null`); blocks are preserved.
+        assert_eq!(m.content.as_deref(), Some(""));
         assert!(m.content_blocks.is_some());
     }
 
@@ -605,7 +626,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(m.content, "line one\nline two");
+        assert_eq!(m.content.as_deref(), Some("line one\nline two"));
     }
 
     #[test]
@@ -706,7 +727,7 @@ mod tests {
         }"#;
         let m: ChatMessage = serde_json::from_str(json).expect("must accept tool_calls");
         assert_eq!(m.role, Role::Assistant);
-        assert_eq!(m.content, ""); // null collapses to empty string
+        assert_eq!(m.content, None); // null preserved as None (#395)
         assert!(m.extra.contains_key("tool_calls"));
     }
 
@@ -740,11 +761,13 @@ mod tests {
     #[test]
     fn chat_message_accepts_null_content() {
         // The OpenAI assistant-with-tool_calls shape uses content: null;
-        // we collapse to "" so downstream Bridges that don't accept null
-        // (Anthropic, Gemini) still get a string.
+        // we preserve it as `None` (#395) so it round-trips to JSON null.
+        // Bridges that can't accept null (Anthropic, Gemini) read
+        // `content_str()` which maps `None → ""`.
         let json = r#"{"role": "assistant", "content": null}"#;
         let m: ChatMessage = serde_json::from_str(json).expect("must accept null content");
-        assert_eq!(m.content, "");
+        assert_eq!(m.content, None);
+        assert_eq!(m.content_str(), "");
     }
 
     #[test]

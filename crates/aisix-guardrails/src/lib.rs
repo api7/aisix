@@ -48,8 +48,9 @@ use async_trait::async_trait;
 /// moderation is a separate feature. Every guardrail's input/output
 /// collector goes through this so the families can't drift.
 pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
-    if !m.content.is_empty() {
-        return m.content.clone();
+    let content = m.content_str();
+    if !content.is_empty() {
+        return content.to_string();
     }
     match m.content_blocks.as_ref() {
         Some(blocks) => blocks

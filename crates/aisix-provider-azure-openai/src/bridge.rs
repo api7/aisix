@@ -1463,7 +1463,7 @@ mod tests {
         let ctx = canonical_test_ctx();
         let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "hi from azure");
+        assert_eq!(chat.message.content_str(), "hi from azure");
 
         // Audit M3: assert `Authorization` is absent on the wire (not
         // just absent from the helper's output).
@@ -1562,7 +1562,7 @@ mod tests {
         let ctx = canonical_test_ctx();
         let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "filtered ok");
+        assert_eq!(chat.message.content_str(), "filtered ok");
         assert_eq!(chat.usage.total_tokens, 7);
     }
 
@@ -2113,7 +2113,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-azure-gpt4", vec![ChatMessage::user("hi")]);
         let resp = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(resp.message.content, "hello via aad");
+        assert_eq!(resp.message.content_str(), "hello via aad");
 
         let headers = captured_headers
             .lock()

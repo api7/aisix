@@ -116,7 +116,7 @@ pub fn messages_from(req: &ChatFormat) -> Vec<OpenAiMessage<'_>> {
             // string. See `ChatMessage::content_blocks` doc.
             content: match m.content_blocks.as_deref() {
                 Some(blocks) => OpenAiContent::Blocks(blocks),
-                None => OpenAiContent::Text(&m.content),
+                None => OpenAiContent::Text(m.content_str()),
             },
             name: m.name.as_deref(),
             tool_call_id: m.tool_call_id.as_deref(),
@@ -278,7 +278,11 @@ pub fn response_into_chat_response(mut raw: OpenAiResponse) -> ChatResponse {
             (
                 ChatMessage {
                     role: role_from_str(&c.message.role),
-                    content: c.message.content.unwrap_or_default(),
+                    // #395: carry the upstream `string | null` through
+                    // verbatim. A tool_calls response returns
+                    // `content: null`; collapsing it to `""` here is the
+                    // divergence we're fixing.
+                    content: c.message.content,
                     content_blocks: None,
                     name: None,
                     tool_call_id: None,
@@ -573,7 +577,7 @@ mod tests {
         assert_eq!(out.id, "cmpl-1");
         assert_eq!(out.model, "gpt-4o");
         assert_eq!(out.message.role, Role::Assistant);
-        assert_eq!(out.message.content, "hi there");
+        assert_eq!(out.message.content_str(), "hi there");
         assert_eq!(out.finish_reason, FinishReason::Stop);
         assert_eq!(out.usage.total_tokens, 6);
         // No cache / reasoning details on this minimal response →
@@ -606,6 +610,9 @@ mod tests {
         let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
         let out = response_into_chat_response(raw);
         assert_eq!(out.finish_reason, FinishReason::ToolCalls);
+        // #395: upstream `content: null` must be carried through as
+        // `None`, not collapsed to `Some("")`.
+        assert_eq!(out.message.content, None);
         let tc = out
             .message
             .extra
@@ -719,7 +726,7 @@ mod tests {
         }"#;
         let raw: OpenAiResponse = serde_json::from_str(body).unwrap();
         let out = response_into_chat_response(raw);
-        assert_eq!(out.message.content, "The answer is 42.");
+        assert_eq!(out.message.content_str(), "The answer is 42.");
         let reasoning = out
             .message
             .extra

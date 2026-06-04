@@ -41,7 +41,7 @@ async fn put_then_get_round_trips_against_real_redis() {
     let key = "fp-roundtrip";
     cache.put(key, sample("hello back")).await.unwrap();
     let got = cache.get(key).await.unwrap().expect("hit");
-    assert_eq!(got.message.content, "hello back");
+    assert_eq!(got.message.content_str(), "hello back");
     assert_eq!(got.usage.total_tokens, 8);
 }
 

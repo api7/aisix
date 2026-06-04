@@ -133,7 +133,7 @@ fn message_pair(m: &ChatMessage) -> (String, String) {
     // differences don't cause spurious cache misses.
     let content_repr = match m.content_blocks.as_ref() {
         Some(blocks) => canonical_json_string(&serde_json::Value::Array(blocks.clone())),
-        None => m.content.clone(),
+        None => m.content_str().to_string(),
     };
     (role_str(m.role).to_string(), content_repr)
 }

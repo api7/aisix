@@ -178,7 +178,7 @@ mod tests {
         let req = ChatFormat::new("t", vec![ChatMessage::user("hi")]);
 
         let resp = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(resp.message.content, "stubbed");
+        assert_eq!(resp.message.content_str(), "stubbed");
         assert_eq!(resp.finish_reason, FinishReason::Stop);
     }
 

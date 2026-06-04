@@ -423,7 +423,7 @@ mod tests {
 
         assert_eq!(resp.id, "msg_01");
         assert_eq!(resp.message.role, Role::Assistant);
-        assert_eq!(resp.message.content, "hello back");
+        assert_eq!(resp.message.content_str(), "hello back");
         assert_eq!(resp.finish_reason, FinishReason::Stop);
         assert_eq!(resp.usage.prompt_tokens, 2);
         assert_eq!(resp.usage.completion_tokens, 3);
@@ -589,7 +589,7 @@ mod tests {
             "my-claude",
             vec![ChatMessage {
                 role: Role::Tool,
-                content: "tool output".into(),
+                content: Some("tool output".into()),
                 content_blocks: None,
                 name: None,
                 tool_call_id: None,

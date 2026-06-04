@@ -910,8 +910,9 @@ fn build_converse_inputs(
     for msg in &req.messages {
         match msg.role {
             Role::System => {
-                if !msg.content.is_empty() {
-                    systems.push(SystemContentBlock::Text(msg.content.clone()));
+                let content = msg.content_str();
+                if !content.is_empty() {
+                    systems.push(SystemContentBlock::Text(content.to_string()));
                 }
             }
             Role::User | Role::Assistant => {
@@ -922,7 +923,7 @@ fn build_converse_inputs(
                 };
                 let m = BedrockMessage::builder()
                     .role(role)
-                    .content(ContentBlock::Text(msg.content.clone()))
+                    .content(ContentBlock::Text(msg.content_str().to_string()))
                     .build()
                     .map_err(|e| {
                         BridgeError::Config(format!("bedrock converse: build message: {e}"))
@@ -1749,7 +1750,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "hello from bedrock");
+        assert_eq!(chat.message.content_str(), "hello from bedrock");
         assert_eq!(chat.usage.total_tokens, 9);
     }
 
@@ -1883,7 +1884,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "calling tool");
+        assert_eq!(chat.message.content_str(), "calling tool");
         // Tool calls translated into OpenAI shape via the reused
         // anthropic crate's converter.
         let tool_calls = chat
@@ -2070,7 +2071,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "cross-region ok");
+        assert_eq!(chat.message.content_str(), "cross-region ok");
     }
 
     /// Audit M6: cross-region dispatch coverage was only `us.`; the
@@ -2104,7 +2105,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "us-gov ok");
+        assert_eq!(chat.message.content_str(), "us-gov ok");
     }
 
     #[tokio::test]
@@ -2132,7 +2133,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-claude", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "global ok");
+        assert_eq!(chat.message.content_str(), "global ok");
     }
 
     // Removed `chat_publisher_not_implemented_error_includes_model_id_and_publisher_name`
@@ -2274,7 +2275,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-llama", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "hello from converse");
+        assert_eq!(chat.message.content_str(), "hello from converse");
         assert_eq!(chat.usage.prompt_tokens, 7);
         assert_eq!(chat.usage.completion_tokens, 3);
         assert_eq!(chat.usage.total_tokens, 10);
@@ -2306,7 +2307,7 @@ mod tests {
         );
         let req = ChatFormat::new("my-nova", vec![ChatMessage::user("hi")]);
         let chat = bridge.chat(&req, &ctx).await.unwrap();
-        assert_eq!(chat.message.content, "hello from converse");
+        assert_eq!(chat.message.content_str(), "hello from converse");
     }
 
     #[tokio::test]
