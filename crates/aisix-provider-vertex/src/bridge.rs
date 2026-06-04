@@ -371,7 +371,7 @@ impl VertexSecret {
     /// "invalid character X at position N").
     fn parse(secret: &str) -> Result<Self, BridgeError> {
         if secret.trim().is_empty() {
-            return Err(BridgeError::Config(
+            return Err(BridgeError::InvalidUpstreamCredentials(
                 "vertex provider_key.secret is empty — \
                  expected JSON with project, region, and either access_token \
                  or service_account_json"
@@ -379,7 +379,7 @@ impl VertexSecret {
             ));
         }
         let parsed: VertexSecret = serde_json::from_str(secret).map_err(|_e| {
-            BridgeError::Config(
+            BridgeError::InvalidUpstreamCredentials(
                 "vertex provider_key.secret must be valid JSON: \
                  {project, region, and either access_token or service_account_json}"
                     .into(),
@@ -390,7 +390,7 @@ impl VertexSecret {
         // distinct error so the operator gets a clearer message than
         // generic "neither set".
         if parsed.access_token.as_deref().is_some_and(str::is_empty) {
-            return Err(BridgeError::Config(
+            return Err(BridgeError::InvalidUpstreamCredentials(
                 "vertex provider_key.secret.access_token is empty".into(),
             ));
         }
@@ -400,14 +400,14 @@ impl VertexSecret {
             .is_some_and(|t| !t.is_empty());
         let has_sa = parsed.service_account_json.is_some();
         if has_token && has_sa {
-            return Err(BridgeError::Config(
+            return Err(BridgeError::InvalidUpstreamCredentials(
                 "vertex provider_key.secret must set exactly one of access_token \
                  or service_account_json (both were provided)"
                     .into(),
             ));
         }
         if !has_token && !has_sa {
-            return Err(BridgeError::Config(
+            return Err(BridgeError::InvalidUpstreamCredentials(
                 "vertex provider_key.secret must set either access_token or \
                  service_account_json (neither was provided)"
                     .into(),
@@ -2213,10 +2213,10 @@ mod tests {
     fn vertex_secret_rejects_empty() {
         let err = VertexSecret::parse("").unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamCredentials(msg) => {
                 assert!(msg.contains("secret is empty"));
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamCredentials, got {other:?}"),
         }
     }
 
@@ -2224,10 +2224,10 @@ mod tests {
     fn vertex_secret_rejects_non_json() {
         let err = VertexSecret::parse("ya29.justatoken").unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamCredentials(msg) => {
                 assert!(msg.contains("must be valid JSON"));
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamCredentials, got {other:?}"),
         }
     }
 
@@ -2238,13 +2238,13 @@ mod tests {
         let leaky = "X-DISTINCTIVE-LEAK-MARKER-Y";
         let err = VertexSecret::parse(leaky).unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamCredentials(msg) => {
                 assert!(
                     !msg.contains("DISTINCTIVE") && !msg.contains("LEAK-MARKER"),
                     "must NOT leak raw secret bytes; got {msg}"
                 );
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamCredentials, got {other:?}"),
         }
     }
 
@@ -2282,14 +2282,14 @@ mod tests {
         });
         let err = VertexSecret::parse(&json.to_string()).unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamCredentials(msg) => {
                 assert!(
                     msg.contains("exactly one of access_token or service_account_json"),
                     "got: {msg}"
                 );
                 assert!(msg.contains("both were provided"));
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamCredentials, got {other:?}"),
         }
     }
 
@@ -2298,14 +2298,14 @@ mod tests {
         let json = r#"{"project":"my-proj","region":"us-central1"}"#;
         let err = VertexSecret::parse(json).unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamCredentials(msg) => {
                 assert!(
                     msg.contains("either access_token or service_account_json"),
                     "got: {msg}"
                 );
                 assert!(msg.contains("neither was provided"));
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamCredentials, got {other:?}"),
         }
     }
 
@@ -2318,10 +2318,10 @@ mod tests {
         let json = r#"{"access_token":"","project":"my-proj","region":"us-central1"}"#;
         let err = VertexSecret::parse(json).unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamCredentials(msg) => {
                 assert!(msg.contains("access_token is empty"), "got: {msg}");
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamCredentials, got {other:?}"),
         }
     }
 
@@ -2598,10 +2598,10 @@ mod tests {
         let req = ChatFormat::new("customer-facing", vec![ChatMessage::user("hi")]);
         let err = bridge.chat(&req, &ctx).await.unwrap_err();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamCredentials(msg) => {
                 assert!(msg.contains("must be valid JSON"));
             }
-            other => panic!("expected Config error, got {other:?}"),
+            other => panic!("expected InvalidUpstreamCredentials, got {other:?}"),
         }
     }
 

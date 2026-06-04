@@ -102,7 +102,7 @@ impl AadCredentials {
             ("client_secret", &self.client_secret),
         ] {
             if value.is_empty() {
-                return Err(BridgeError::Config(format!(
+                return Err(BridgeError::InvalidUpstreamCredentials(format!(
                     "azure aad credentials.{name} is empty"
                 )));
             }
@@ -119,7 +119,7 @@ impl AadCredentials {
                 || value.contains('\n')
                 || value.contains("..")
             {
-                return Err(BridgeError::Config(format!(
+                return Err(BridgeError::InvalidUpstreamCredentials(format!(
                     "azure aad credentials.{name} {value:?} contains URL-control \
                      characters — reject `/`, `?`, `#`, whitespace, `..`"
                 )));
@@ -138,14 +138,14 @@ impl AadCredentials {
             .filter(|s| !s.is_empty())
         {
             if host.contains('@') || host.contains('?') || host.contains('#') {
-                return Err(BridgeError::Config(
+                return Err(BridgeError::InvalidUpstreamConfig(
                     "azure aad credentials.authority_host must be a bare origin — \
                      reject userinfo (@), query (?), fragment (#)"
                         .into(),
                 ));
             }
             if !(host.starts_with("https://") || host.starts_with("http://")) {
-                return Err(BridgeError::Config(format!(
+                return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "azure aad credentials.authority_host must use http:// or https:// \
                      scheme, got {host:?}"
                 )));
@@ -165,7 +165,7 @@ impl AadCredentials {
                 .unwrap_or(host)
                 .trim_end_matches('/');
             if after_scheme.contains('/') || after_scheme.contains('\\') {
-                return Err(BridgeError::Config(format!(
+                return Err(BridgeError::InvalidUpstreamConfig(format!(
                     "azure aad credentials.authority_host must be a bare origin \
                      (scheme://host[:port]) with no path, got {host:?}"
                 )));
@@ -502,10 +502,10 @@ mod tests {
         };
         let err = minter.get_token(&creds).await.err().unwrap();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamCredentials(msg) => {
                 assert!(msg.contains("tenant_id is empty"));
             }
-            other => panic!("expected Config, got {other:?}"),
+            other => panic!("expected InvalidUpstreamCredentials, got {other:?}"),
         }
     }
 
@@ -529,10 +529,10 @@ mod tests {
         };
         let err = minter.get_token(&creds).await.err().unwrap();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamCredentials(msg) => {
                 assert!(msg.contains("URL-control"));
             }
-            other => panic!("expected Config, got {other:?}"),
+            other => panic!("expected InvalidUpstreamCredentials, got {other:?}"),
         }
     }
 
@@ -632,8 +632,8 @@ mod tests {
         };
         let err = creds.validate().err().unwrap();
         match err {
-            BridgeError::Config(msg) => assert!(msg.contains("http:// or https://")),
-            other => panic!("expected Config, got {other:?}"),
+            BridgeError::InvalidUpstreamConfig(msg) => assert!(msg.contains("http:// or https://")),
+            other => panic!("expected InvalidUpstreamConfig, got {other:?}"),
         }
     }
 
@@ -649,11 +649,11 @@ mod tests {
         };
         let err = creds.validate().err().unwrap();
         match err {
-            BridgeError::Config(msg) => assert!(
+            BridgeError::InvalidUpstreamConfig(msg) => assert!(
                 msg.contains("bare origin") && msg.contains("no path"),
                 "expected a bare-origin/no-path rejection; got {msg}"
             ),
-            other => panic!("expected Config, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig, got {other:?}"),
         }
     }
 
@@ -689,11 +689,11 @@ mod tests {
         };
         let err = creds.validate().err().unwrap();
         match err {
-            BridgeError::Config(msg) => assert!(
+            BridgeError::InvalidUpstreamConfig(msg) => assert!(
                 msg.contains("bare origin") && msg.contains("no path"),
                 "expected a bare-origin/no-path rejection; got {msg}"
             ),
-            other => panic!("expected Config, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig, got {other:?}"),
         }
     }
 
@@ -707,7 +707,7 @@ mod tests {
         };
         let err = creds.validate().err().unwrap();
         match err {
-            BridgeError::Config(msg) => {
+            BridgeError::InvalidUpstreamConfig(msg) => {
                 assert!(msg.contains("bare origin"));
                 // The pasted userinfo must NOT surface in the error.
                 assert!(!msg.contains("pass"), "error leaked userinfo: {msg}");
@@ -716,7 +716,7 @@ mod tests {
                     "error leaked host: {msg}"
                 );
             }
-            other => panic!("expected Config, got {other:?}"),
+            other => panic!("expected InvalidUpstreamConfig, got {other:?}"),
         }
     }
 }
