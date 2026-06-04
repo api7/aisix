@@ -76,13 +76,17 @@ pub fn resolve_client_ip(
 }
 
 /// Parse the configured forwarded header into a left-to-right IP list.
-/// Splits on `,`, trims whitespace, strips an optional `:port` (or
-/// `[v6]:port`) suffix, and skips tokens that don't parse as an IP.
+/// Concatenates every header field instance (a client may send several)
+/// in received order, splits each on `,`, trims whitespace, strips an
+/// optional `:port` (or `[v6]:port`) suffix, and skips tokens that don't
+/// parse as an IP. Using `get_all` (not `get`) so a spoofed extra
+/// `x-forwarded-for` field can't hide entries from the trusted-proxy walk.
 fn parse_forwarded(headers: &axum::http::HeaderMap, header: &str) -> Vec<IpAddr> {
-    let Some(raw) = headers.get(header).and_then(|v| v.to_str().ok()) else {
-        return Vec::new();
-    };
-    raw.split(',')
+    headers
+        .get_all(header)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|raw| raw.split(','))
         .filter_map(|tok| parse_forwarded_token(tok.trim()))
         .collect()
 }
@@ -249,5 +253,20 @@ mod tests {
     fn header_parser_absent_header_is_empty() {
         let h = axum::http::HeaderMap::new();
         assert!(parse_forwarded(&h, "x-forwarded-for").is_empty());
+    }
+
+    #[test]
+    fn header_parser_concatenates_multiple_header_fields_in_order() {
+        // A client may send several x-forwarded-for fields; all must be
+        // parsed in received order so a spoofed extra field can't hide
+        // entries from the trusted-proxy walk.
+        let mut h = axum::http::HeaderMap::new();
+        h.append("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
+        h.append("x-forwarded-for", "10.0.0.2".parse().unwrap());
+        let parsed = parse_forwarded(&h, "x-forwarded-for");
+        assert_eq!(
+            parsed,
+            vec![ip("203.0.113.7"), ip("10.0.0.1"), ip("10.0.0.2")]
+        );
     }
 }
