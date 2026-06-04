@@ -418,19 +418,25 @@ pub struct AnthropicUsage {
 }
 
 pub fn response_into_chat_response(raw: AnthropicResponse) -> ChatResponse {
+    let mut saw_text_block = false;
     let text = raw
         .content
         .iter()
         .filter_map(|b| match b {
-            AnthropicResponseBlock::Text { text } => Some(text.as_str()),
+            AnthropicResponseBlock::Text { text } => {
+                saw_text_block = true;
+                Some(text.as_str())
+            }
             _ => None,
         })
         .collect::<Vec<_>>()
         .join("");
     // #395: when an Anthropic upstream returns only `tool_use` blocks
-    // (no text), surface `content: null` on the OpenAI shape rather than
-    // `""` — same wire-shape parity fix as the OpenAI passthrough.
-    let content = if text.is_empty() { None } else { Some(text) };
+    // (no text block at all), surface `content: null` on the OpenAI
+    // shape rather than `""` — same wire-shape parity fix as the OpenAI
+    // passthrough. An explicit empty text block (`text: ""`) is distinct
+    // and preserved as `Some("")`.
+    let content = saw_text_block.then_some(text);
 
     // Translate Anthropic `tool_use` content blocks into OpenAI's
     // `message.tool_calls` shape so OpenAI-SDK callers see a
@@ -1404,6 +1410,26 @@ mod tests {
         let out = response_into_chat_response(raw);
         assert_eq!(out.message.content_str(), "Let me check the weather.");
         assert!(out.message.extra.get("tool_calls").is_some());
+    }
+
+    #[test]
+    fn explicit_empty_text_block_stays_empty_string_not_null() {
+        // #395 refinement: distinguish "no text block at all" (→ null)
+        // from an explicit empty text block (→ ""). A response carrying
+        // a `{"type":"text","text":""}` block must surface `Some("")`,
+        // not `None`.
+        let body = r#"{
+            "id": "msg_empty_text_01",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-3-5-sonnet-20241022",
+            "content": [{"type": "text", "text": ""}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 3, "output_tokens": 0}
+        }"#;
+        let raw: AnthropicResponse = serde_json::from_str(body).unwrap();
+        let out = response_into_chat_response(raw);
+        assert_eq!(out.message.content, Some(String::new()));
     }
 
     #[test]
