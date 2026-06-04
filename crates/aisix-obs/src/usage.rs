@@ -29,20 +29,6 @@
 
 use serde::Serialize;
 
-/// One upstream attempt made while serving a routing-model request.
-/// This intentionally carries only low-sensitivity operational fields:
-/// target name, per-target attempt index, status/error class, and outcome.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct RoutingAttemptEvent {
-    pub model: String,
-    pub attempt: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<u16>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub error: String,
-    pub success: bool,
-}
-
 /// One usage event. Emitted at end-of-request (success / upstream error /
 /// guardrail block) per chat completion. Field shape pinned to the
 /// cp-api wire (snake_case via serde).
@@ -202,25 +188,46 @@ pub struct UsageEvent {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub inbound_protocol: String,
 
-    /// Display name of the routing target that ultimately served the
-    /// request. Empty for direct-model requests, cache hits, and routing
-    /// requests where every candidate failed.
+    // ─── Per-attempt telemetry (#655) ───
+    //
+    // Each UsageEvent now represents ONE upstream attempt. A request
+    // that fails over emits multiple events sharing `request_id` (the
+    // grouping/trace key); they are ordered by `attempt_index`. This
+    // mirrors LiteLLM's per-call logging model — `status_code`,
+    // `latency_ms`, and `ttft_ms` are scoped to THIS attempt, so the
+    // user-perceived total is reconstructed by summing the attempts of
+    // one `request_id`. Direct (non-routing) requests emit a single
+    // event with attempt_index=0, attempt_kind="initial".
+    /// 0-based index of this attempt within the request. Together with
+    /// `request_id` it uniquely identifies one attempt.
+    #[serde(default)]
+    pub attempt_index: u32,
+
+    /// What kind of attempt this is: `"initial"` (first try of the
+    /// first target), `"retry"` (same target, after a retryable
+    /// failure), or `"fallback"` (a different target than the previous
+    /// attempt). Defaults to `"initial"`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub served_by_model: String,
+    pub attempt_kind: String,
 
-    /// Number of upstream attempts made for a routing-model request.
-    /// Zero means routing did not run or no upstream attempt was made.
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub routing_attempt_count: u32,
+    /// Display name of the routing target this attempt actually used —
+    /// the target that served (success) or failed (failure). Empty for
+    /// direct-model requests and cache hits, where `model_id` already
+    /// identifies the single model. Replaces the old `served_by_model`,
+    /// which only carried the winning target.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub attempt_model: String,
 
-    /// Number of times routing moved from one target model to another.
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub routing_fallback_count: u32,
+    /// Error class for a FAILED attempt — a bounded, low-sensitivity
+    /// label (e.g. `"upstream_status"`, `"timeout"`, `"transport"`).
+    /// Empty on the successful attempt.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error_class: String,
 
-    /// Per-attempt routing trace for debugging failover. Omitted for
-    /// direct-model requests and cache hits.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub routing_attempts: Vec<RoutingAttemptEvent>,
+    /// Short human-readable error message for a FAILED attempt
+    /// (length-capped). Empty on the successful attempt.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error_message: String,
 
     // ─── ProviderKey telemetry attribution (#302 M17 / AISIX-Cloud#436) ───
     //
@@ -823,43 +830,48 @@ mod tests {
     }
 
     #[test]
-    fn routing_fields_serialise_only_when_present() {
-        let ev = UsageEvent {
+    fn per_attempt_fields_serialise_only_when_present() {
+        // A failed fallback attempt: zero tokens, error info, target name.
+        let failed = UsageEvent {
             request_id: "req-routing".into(),
-            served_by_model: "secondary".into(),
-            routing_attempt_count: 3,
-            routing_fallback_count: 1,
-            routing_attempts: vec![
-                RoutingAttemptEvent {
-                    model: "primary".into(),
-                    attempt: 1,
-                    status: Some(502),
-                    error: "upstream_status".into(),
-                    success: false,
-                },
-                RoutingAttemptEvent {
-                    model: "secondary".into(),
-                    attempt: 1,
-                    status: Some(200),
-                    error: String::new(),
-                    success: true,
-                },
-            ],
+            attempt_index: 0,
+            attempt_kind: "initial".into(),
+            attempt_model: "primary".into(),
+            status_code: 502,
+            error_class: "upstream_status".into(),
+            error_message: "upstream returned 502".into(),
+            latency_ms: 2000,
             ..Default::default()
         };
-        let json = serde_json::to_string(&ev).unwrap();
-        assert!(json.contains(r#""served_by_model":"secondary""#));
-        assert!(json.contains(r#""routing_attempt_count":3"#));
-        assert!(json.contains(r#""routing_fallback_count":1"#));
-        assert!(json.contains(r#""routing_attempts""#));
-        assert!(json.contains(r#""model":"primary""#));
-        assert!(json.contains(r#""error":"upstream_status""#));
+        let json = serde_json::to_string(&failed).unwrap();
+        assert!(json.contains(r#""attempt_index":0"#));
+        assert!(json.contains(r#""attempt_kind":"initial""#));
+        assert!(json.contains(r#""attempt_model":"primary""#));
+        assert!(json.contains(r#""error_class":"upstream_status""#));
+        assert!(json.contains(r#""error_message":"upstream returned 502""#));
 
+        // A winning fallback attempt of the same request shares request_id.
+        let won = UsageEvent {
+            request_id: "req-routing".into(),
+            attempt_index: 1,
+            attempt_kind: "fallback".into(),
+            attempt_model: "secondary".into(),
+            status_code: 200,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&won).unwrap();
+        assert!(json.contains(r#""attempt_kind":"fallback""#));
+        assert!(json.contains(r#""attempt_model":"secondary""#));
+        // No error fields on the winner.
+        assert!(!json.contains("error_class"));
+        assert!(!json.contains("error_message"));
+
+        // A direct (non-routing) request omits the routing-only fields.
         let empty = serde_json::to_string(&UsageEvent::default()).unwrap();
-        assert!(!empty.contains("served_by_model"));
-        assert!(!empty.contains("routing_attempt_count"));
-        assert!(!empty.contains("routing_fallback_count"));
-        assert!(!empty.contains("routing_attempts"));
+        assert!(!empty.contains("attempt_kind"));
+        assert!(!empty.contains("attempt_model"));
+        assert!(!empty.contains("error_class"));
+        assert!(!empty.contains("error_message"));
     }
 
     fn sample_event(id: &str) -> UsageEvent {

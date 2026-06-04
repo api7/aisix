@@ -3321,24 +3321,48 @@ data: [DONE]\n\n";
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["choices"][0]["message"]["content"], "after retries");
 
-        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
-            .await
-            .expect("usage event was never emitted")
-            .expect("sender dropped");
-        assert_eq!(event.served_by_model, "secondary");
-        assert_eq!(event.routing_attempt_count, 3);
-        assert_eq!(event.routing_fallback_count, 1);
-        assert_eq!(event.routing_attempts.len(), 3);
-        assert_eq!(event.routing_attempts[0].model, "primary");
-        assert_eq!(event.routing_attempts[0].attempt, 1);
-        assert_eq!(event.routing_attempts[0].status, Some(502));
-        assert!(!event.routing_attempts[0].success);
-        assert_eq!(event.routing_attempts[1].model, "primary");
-        assert_eq!(event.routing_attempts[1].attempt, 2);
-        assert_eq!(event.routing_attempts[2].model, "secondary");
-        assert_eq!(event.routing_attempts[2].attempt, 1);
-        assert_eq!(event.routing_attempts[2].status, Some(200));
-        assert!(event.routing_attempts[2].success);
+        // Per #655 each upstream attempt emits its own UsageEvent, all
+        // sharing `request_id`. Here: primary fails (initial), primary
+        // fails again (retry), secondary succeeds (fallback) — 3 events.
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .expect("usage event was never emitted")
+                .expect("sender dropped");
+            events.push(ev);
+        }
+        events.sort_by_key(|e| e.attempt_index);
+        let rid = events[0].request_id.clone();
+        assert!(
+            !rid.is_empty() && events.iter().all(|e| e.request_id == rid),
+            "all attempts share the request_id (trace key)"
+        );
+
+        // initial attempt on `primary` failed with the upstream's 502
+        assert_eq!(events[0].attempt_index, 0);
+        assert_eq!(events[0].attempt_kind, "initial");
+        assert_eq!(events[0].attempt_model, "primary");
+        assert_eq!(events[0].status_code, 502);
+        assert_eq!(events[0].error_class, "upstream_status");
+        assert_eq!(events[0].prompt_tokens, 0);
+        assert_eq!(events[0].completion_tokens, 0);
+
+        // retry on the SAME target, also failed
+        assert_eq!(events[1].attempt_index, 1);
+        assert_eq!(events[1].attempt_kind, "retry");
+        assert_eq!(events[1].attempt_model, "primary");
+        assert_eq!(events[1].status_code, 502);
+        assert!(!events[1].error_class.is_empty());
+
+        // fallback to `secondary` succeeded and carries the real tokens
+        assert_eq!(events[2].attempt_index, 2);
+        assert_eq!(events[2].attempt_kind, "fallback");
+        assert_eq!(events[2].attempt_model, "secondary");
+        assert_eq!(events[2].status_code, 200);
+        assert_eq!(events[2].error_class, "");
+        assert_eq!(events[2].prompt_tokens, 1);
+        assert_eq!(events[2].completion_tokens, 1);
     }
 
     #[tokio::test]
@@ -3389,19 +3413,31 @@ data: [DONE]\n\n";
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 
+        // Streaming attempts only the first target (#655): the single
+        // failed initial attempt is emitted as one per-attempt event.
         let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
             .await
             .expect("usage event was never emitted")
             .expect("sender dropped");
-        assert_eq!(event.served_by_model, "");
-        assert_eq!(event.routing_attempt_count, 1);
-        assert_eq!(event.routing_fallback_count, 0);
-        assert_eq!(event.routing_attempts.len(), 1);
-        assert_eq!(event.routing_attempts[0].model, "primary");
-        assert_eq!(event.routing_attempts[0].attempt, 1);
-        assert_eq!(event.routing_attempts[0].status, Some(502));
-        assert_eq!(event.routing_attempts[0].error, "upstream_status");
-        assert!(!event.routing_attempts[0].success);
+        assert_eq!(event.attempt_index, 0);
+        assert_eq!(event.attempt_kind, "initial");
+        assert_eq!(event.attempt_model, "primary");
+        assert_eq!(event.status_code, 502);
+        assert_eq!(event.error_class, "upstream_status");
+        assert_eq!(event.prompt_tokens, 0);
+        // No further events for this single-attempt request.
+        if let Ok(Some(extra)) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await
+        {
+            panic!(
+                "unexpected 2nd event: idx={} kind={} model={} status={} err={}",
+                extra.attempt_index,
+                extra.attempt_kind,
+                extra.attempt_model,
+                extra.status_code,
+                extra.error_class
+            );
+        }
     }
 
     #[tokio::test]

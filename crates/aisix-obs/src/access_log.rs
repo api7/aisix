@@ -20,10 +20,15 @@ pub struct AccessLog<'a> {
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
     pub request_id: &'a str,
+    /// Routing target that ultimately served the request (the winning
+    /// attempt's display name). `None` for direct models / cache hits.
     pub served_by_model: Option<&'a str>,
+    /// Total upstream attempts made (initial + retries + fallbacks).
     pub routing_attempt_count: Option<u32>,
+    /// How many attempts moved to a different target. Per #655 the
+    /// per-attempt detail lives in telemetry (per-attempt UsageEvents),
+    /// not in this one-line-per-request access log.
     pub routing_fallback_count: Option<u32>,
-    pub routing_attempts: Option<&'a str>,
 }
 
 impl AccessLog<'_> {
@@ -47,7 +52,6 @@ impl AccessLog<'_> {
             served_by_model = self.served_by_model,
             routing_attempt_count = self.routing_attempt_count,
             routing_fallback_count = self.routing_fallback_count,
-            routing_attempts = self.routing_attempts,
             "proxy request completed",
         );
     }
@@ -112,7 +116,6 @@ mod tests {
                 served_by_model: Some("fallback-target"),
                 routing_attempt_count: Some(2),
                 routing_fallback_count: Some(1),
-                routing_attempts: Some(r#"[{"model":"primary","success":false},{"model":"fallback-target","success":true}]"#),
             }
             .emit();
         });
@@ -131,7 +134,6 @@ mod tests {
         );
         assert!(out.contains("routing_attempt_count=2"));
         assert!(out.contains("routing_fallback_count=1"));
-        assert!(out.contains("routing_attempts="));
     }
 
     #[test]
@@ -160,7 +162,6 @@ mod tests {
                 served_by_model: None,
                 routing_attempt_count: None,
                 routing_fallback_count: None,
-                routing_attempts: None,
             }
             .emit();
         });

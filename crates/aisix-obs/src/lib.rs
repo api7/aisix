@@ -28,7 +28,7 @@ pub use metrics::{
 };
 pub use otlp::{install_otlp_tracer, shutdown_otlp, OtlpError, OtlpHandle};
 pub use otlp_http_sink::OtlpHttpFanOut;
-pub use usage::{RoutingAttemptEvent, UsageEvent, UsageSink};
+pub use usage::{UsageEvent, UsageSink};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ObsError {

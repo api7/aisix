@@ -20,8 +20,7 @@ use aisix_cache::CacheKey;
 use aisix_gateway::{BridgeContext, BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
 use aisix_obs::{
-    AccessLog, LlmUsage, Metrics, RequestLabels, RequestOutcome, RoutingAttemptEvent, UsageEvent,
-    UsageLabels,
+    AccessLog, LlmUsage, Metrics, RequestLabels, RequestOutcome, UsageEvent, UsageLabels,
 };
 use axum::extract::State;
 use axum::http::HeaderValue;
@@ -46,21 +45,62 @@ use crate::state::ProxyState;
 /// response came from the cache (`hit`) or the upstream (`miss`).
 pub const CACHE_HEADER: &str = "x-aisix-cache";
 
+/// One recorded upstream attempt (#655). Each attempt becomes its own
+/// per-attempt `UsageEvent`: failed attempts carry zero tokens + error
+/// info, the winning attempt carries the real tokens/cost. All attempts
+/// of one request share `request_id` and are ordered by `index`.
+#[derive(Clone)]
+struct AttemptRecord {
+    /// 0-based attempt index within the request.
+    index: u32,
+    /// `"initial"` (first try of the first target), `"retry"` (same
+    /// target after a retryable failure), or `"fallback"` (a different
+    /// target than the previous attempt).
+    kind: &'static str,
+    /// Routing target display name. Empty for direct (non-routing)
+    /// models, where `model_id` already identifies the single model.
+    target_model: String,
+    /// Resolved ProviderKey UUID for this attempt's target — feeds the
+    /// per-PK attribution tags on the emitted event. Empty when unknown.
+    provider_key_id: String,
+    /// This attempt's status (502/timeout-mapped/… on failure, 200 on
+    /// success).
+    status: u16,
+    success: bool,
+    /// Bounded error class (`routing_error_class`); empty on success.
+    error_class: String,
+    /// Short error message (length-capped); empty on success.
+    error_message: String,
+    /// This attempt's own wall-clock duration in ms.
+    latency_ms: u32,
+}
+
+/// Per-attempt telemetry accumulated while serving one request. Direct
+/// (non-routing) models record a single attempt with `target_model`
+/// empty; routing groups record one entry per try.
 #[derive(Clone, Default)]
 struct RoutingTelemetry {
-    served_by_model: String,
-    attempt_count: u32,
-    fallback_count: u32,
-    attempts: Vec<RoutingAttemptEvent>,
+    attempts: Vec<AttemptRecord>,
 }
 
 impl RoutingTelemetry {
-    fn attempts_json(&self) -> Option<String> {
-        if self.attempts.is_empty() {
-            None
-        } else {
-            serde_json::to_string(&self.attempts).ok()
-        }
+    fn attempt_count(&self) -> u32 {
+        self.attempts.len() as u32
+    }
+
+    /// Number of attempts that moved to a different target than the
+    /// previous one. Drives the access log's `routing_fallback_count`.
+    fn fallback_count(&self) -> u32 {
+        self.attempts
+            .iter()
+            .filter(|a| a.kind == "fallback")
+            .count() as u32
+    }
+
+    /// The winning (successful) attempt, if any. None for all-failed and
+    /// pre-dispatch-error requests.
+    fn winner(&self) -> Option<&AttemptRecord> {
+        self.attempts.iter().rfind(|a| a.success)
     }
 }
 
@@ -100,11 +140,14 @@ fn routing_error_class(err: &BridgeError) -> &'static str {
     }
 }
 
-fn routing_error_status(err: &BridgeError) -> Option<u16> {
-    match err {
-        BridgeError::UpstreamStatus { status, .. } => Some(*status),
-        _ => None,
-    }
+/// Short, control-char-stripped error string for the per-attempt
+/// `error_message` telemetry field (#655). Capped like `sanitize_tag`.
+fn attempt_error_message(err: &BridgeError) -> String {
+    err.to_string()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(256)
+        .collect()
 }
 
 // Per-attempt cooldown decision lives in `crate::cooldown` so every
@@ -178,7 +221,6 @@ pub async fn chat_completions(
                 &success,
                 elapsed,
             );
-            let routing_attempts_json = success.routing.attempts_json();
             emit_access_log(
                 method,
                 path,
@@ -192,22 +234,42 @@ pub async fn chat_completions(
                 success.total_tokens,
                 &request_id,
                 &success.routing,
-                routing_attempts_json.as_deref(),
             );
-            // The streaming path wires telemetry into the SSE stream's
-            // on_complete callback (it has to wait for the terminal
-            // chunk to read the upstream's `usage` block). Calling
-            // `emit_usage_event` here for streaming would double-emit
-            // — once with all-zero tokens at handler return, then
-            // again with the real values at stream end.
+            // Per #655: emit a zero-token event for each failed attempt
+            // that preceded the winner (non-streaming fallover). No-op for
+            // direct-model success, cache hits, and the single-attempt
+            // streaming path.
+            emit_failed_attempts(
+                &state,
+                &request_id,
+                &success.model_id,
+                &api_key_id,
+                &client,
+                &success.routing,
+            );
+            // The streaming path wires the WINNER's telemetry into the SSE
+            // stream's on_complete callback (it has to wait for the
+            // terminal chunk to read the upstream's `usage` block). Calling
+            // `emit_usage_event` here for streaming would double-emit — once
+            // with all-zero tokens at handler return, then again with the
+            // real values at stream end.
             if !success.telemetry_handled_by_stream {
+                // Winning-attempt metadata (#655). Direct models / cache
+                // hits have no recorded attempt → defaults (index 0,
+                // "initial", empty target). `latency_ms` is scoped to the
+                // winning attempt itself; the access log above carries the
+                // user-perceived total.
+                let winner = success.routing.winner();
+                let winner_latency = winner
+                    .map(|w| Duration::from_millis(u64::from(w.latency_ms)))
+                    .unwrap_or(elapsed);
                 emit_usage_event(
                     &state,
                     &request_id,
                     &success.model_id,
                     &api_key_id,
                     status,
-                    elapsed,
+                    winner_latency,
                     success.prompt_tokens.unwrap_or(0) as u32,
                     success.completion_tokens.unwrap_or(0) as u32,
                     UsageExtras {
@@ -223,7 +285,11 @@ pub async fn chat_completions(
                         cache_hit_saved_input_tokens: success.cache_hit_saved_input_tokens,
                         cache_hit_saved_output_tokens: success.cache_hit_saved_output_tokens,
                         ttft_ms: 0,
-                        routing: success.routing.clone(),
+                        attempt_index: winner.map(|w| w.index).unwrap_or(0),
+                        attempt_kind: winner.map(|w| w.kind).unwrap_or("initial").to_string(),
+                        attempt_model: winner.map(|w| w.target_model.clone()).unwrap_or_default(),
+                        error_class: String::new(),
+                        error_message: String::new(),
                         provider_key_id: success.provider_key_id.clone(),
                     },
                     success.cost_usd,
@@ -304,7 +370,14 @@ pub async fn chat_completions(
                 ),
                 None => (None, None, None),
             };
-            let routing_attempts_json = routing.attempts_json();
+            // Routing telemetry lives on the charge for an output-blocked
+            // request (the upstream succeeded, then the output guardrail
+            // blocked it); otherwise on the failure itself.
+            let routing = charge
+                .as_ref()
+                .map(|c| c.routing.clone())
+                .filter(|r| !r.attempts.is_empty())
+                .unwrap_or(routing);
             emit_access_log(
                 method,
                 path,
@@ -318,68 +391,96 @@ pub async fn chat_completions(
                 al_total,
                 &request_id,
                 &routing,
-                routing_attempts_json.as_deref(),
             );
-            // Telemetry for the failure path. `resolved_model_id` is
-            // populated by `dispatch` once the request's `req.model`
-            // has been resolved against the snapshot — so a guardrail
-            // / budget / rate-limit / bridge error after that point
-            // still records which model the request targeted. Errors
-            // before resolution (empty messages, ModelNotFound) keep
-            // an empty string. ContentFiltered (guardrail) is recorded
-            // with the dedicated `guardrail_blocked` flag so the
-            // dashboard can surface it on the Blocked tab.
+            // `resolved_model_id` is populated by `dispatch` once
+            // `req.model` resolves against the snapshot, so a guardrail /
+            // budget / rate-limit / bridge error after that point still
+            // records which model the request targeted. ContentFiltered
+            // (guardrail) sets `guardrail_blocked` for the Blocked tab.
             let guardrail_blocked = matches!(err, ProxyError::ContentFiltered(_));
-            // For output-content-filter blocks the upstream WAS called
-            // and the provider already billed for `prompt_tokens` +
-            // `completion_tokens`. The captured `charge` carries those
-            // counts forward so the customer's `usage_events` row
-            // reflects the bill. For all other error paths charge is
-            // None and tokens stay at 0 — those errors never reached
-            // the upstream.
-            let (prompt_tokens, completion_tokens, extras) = match charge {
-                Some(c) => (
-                    c.prompt_tokens,
-                    c.completion_tokens,
-                    UsageExtras {
-                        cached_prompt_tokens: c.cached_prompt_tokens,
-                        reasoning_tokens: c.reasoning_tokens,
-                        cache_creation_tokens: c.cache_creation_tokens,
-                        cache_read_tokens: c.cache_read_tokens,
-                        provider_request_id: c.provider_request_id,
-                        provider_model_version: c.provider_model_version,
-                        finish_reason: c.finish_reason,
-                        bypass_reason: c.bypass_reason,
-                        cache_status: c.cache_status.as_str().to_string(),
-                        cache_hit_saved_input_tokens: 0,
-                        cache_hit_saved_output_tokens: 0,
-                        ttft_ms: 0,
-                        routing: c.routing,
-                        provider_key_id: c.provider_key_id,
-                    },
-                ),
-                None => {
-                    let extras = UsageExtras {
-                        routing,
-                        ..UsageExtras::default()
-                    };
-                    (0, 0, extras)
-                }
-            };
-            emit_usage_event(
+            let model_id_str = resolved_model_id.as_deref().unwrap_or("");
+            // Per #655: emit one zero-token event for each FAILED attempt.
+            emit_failed_attempts(
                 &state,
                 &request_id,
-                resolved_model_id.as_deref().unwrap_or(""),
+                model_id_str,
                 &api_key_id,
-                status,
-                elapsed,
-                prompt_tokens,
-                completion_tokens,
-                extras,
-                /* cost_usd */ 0.0,
-                guardrail_blocked,
                 &client,
+                &routing,
             );
+            // Terminal event:
+            //  - output-blocked (charge present): the WINNING attempt was
+            //    billed by the upstream then blocked — emit it with the
+            //    charge tokens + guardrail_blocked + winner metadata.
+            //  - all-targets-failed (charge None, attempts present): every
+            //    attempt was already emitted above — nothing more.
+            //  - pre-dispatch error (charge None, no attempts): emit a
+            //    single terminal event (attempt 0, "initial").
+            match charge {
+                Some(c) => {
+                    let winner = routing.winner();
+                    emit_usage_event(
+                        &state,
+                        &request_id,
+                        model_id_str,
+                        &api_key_id,
+                        status,
+                        elapsed,
+                        c.prompt_tokens,
+                        c.completion_tokens,
+                        UsageExtras {
+                            cached_prompt_tokens: c.cached_prompt_tokens,
+                            reasoning_tokens: c.reasoning_tokens,
+                            cache_creation_tokens: c.cache_creation_tokens,
+                            cache_read_tokens: c.cache_read_tokens,
+                            provider_request_id: c.provider_request_id,
+                            provider_model_version: c.provider_model_version,
+                            finish_reason: c.finish_reason,
+                            bypass_reason: c.bypass_reason,
+                            cache_status: c.cache_status.as_str().to_string(),
+                            cache_hit_saved_input_tokens: 0,
+                            cache_hit_saved_output_tokens: 0,
+                            ttft_ms: 0,
+                            attempt_index: winner.map(|w| w.index).unwrap_or(0),
+                            attempt_kind: winner.map(|w| w.kind).unwrap_or("initial").to_string(),
+                            attempt_model: winner
+                                .map(|w| w.target_model.clone())
+                                .unwrap_or_default(),
+                            error_class: String::new(),
+                            error_message: String::new(),
+                            provider_key_id: c.provider_key_id,
+                        },
+                        /* cost_usd */ 0.0,
+                        guardrail_blocked,
+                        &client,
+                    );
+                }
+                None if routing.attempts.is_empty() => {
+                    emit_usage_event(
+                        &state,
+                        &request_id,
+                        model_id_str,
+                        &api_key_id,
+                        status,
+                        elapsed,
+                        /* prompt_tokens */ 0,
+                        /* completion_tokens */ 0,
+                        UsageExtras {
+                            attempt_kind: "initial".to_string(),
+                            // Bounded ProxyError class so the dashboard can
+                            // show why the request never reached an upstream.
+                            error_class: err.kind().to_string(),
+                            ..UsageExtras::default()
+                        },
+                        /* cost_usd */ 0.0,
+                        guardrail_blocked,
+                        &client,
+                    );
+                }
+                None => {
+                    // All attempts failed; each was emitted above.
+                }
+            }
             err.into_response()
         }
     }
@@ -765,20 +866,28 @@ async fn dispatch(
         let model_arc = Arc::new(model.clone());
         let pk_arc = Arc::new(pk_entry.value.clone());
         let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
+        let stream_attempt_started = Instant::now();
         let upstream = match bridge.chat_stream(req, &ctx).await {
             Ok(upstream) => upstream,
             Err(err) => {
+                let attempt_latency_ms = stream_attempt_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u32::MAX as u128) as u32;
+                // Streaming attempts only the first target (#655): a single
+                // failed AttemptRecord, emitted by the Err-arm fan-out.
                 let routing = if virtual_entry.value.routing.is_some() {
                     RoutingTelemetry {
-                        served_by_model: String::new(),
-                        attempt_count: 1,
-                        fallback_count: 0,
-                        attempts: vec![RoutingAttemptEvent {
-                            model: model.display_name.clone(),
-                            attempt: 1,
-                            status: routing_error_status(&err),
-                            error: routing_error_class(&err).to_string(),
+                        attempts: vec![AttemptRecord {
+                            index: 0,
+                            kind: "initial",
+                            target_model: model.display_name.clone(),
+                            provider_key_id: pk_entry.id.clone(),
+                            status: err.http_status(),
                             success: false,
+                            error_class: routing_error_class(&err).to_string(),
+                            error_message: attempt_error_message(&err),
+                            latency_ms: attempt_latency_ms,
                         }],
                     }
                 } else {
@@ -828,23 +937,31 @@ async fn dispatch(
         // Downstream client attribution (#492) moved into the on_complete
         // closure so streamed responses log the same IP/UA as non-streaming.
         let client_for_telem = client.clone();
+        // Streaming attempts only the first target (#655): a single
+        // winning AttemptRecord drives the access log served-by + counts.
         let stream_routing = if virtual_entry.value.routing.is_some() {
             RoutingTelemetry {
-                served_by_model: model.display_name.clone(),
-                attempt_count: 1,
-                fallback_count: 0,
-                attempts: vec![RoutingAttemptEvent {
-                    model: model.display_name.clone(),
-                    attempt: 1,
-                    status: Some(200),
-                    error: String::new(),
+                attempts: vec![AttemptRecord {
+                    index: 0,
+                    kind: "initial",
+                    target_model: model.display_name.clone(),
+                    provider_key_id: pk_entry.id.clone(),
+                    status: 200,
                     success: true,
+                    error_class: String::new(),
+                    error_message: String::new(),
+                    latency_ms: 0,
                 }],
             }
         } else {
             RoutingTelemetry::default()
         };
-        let stream_routing_for_telem = stream_routing.clone();
+        // Per-attempt target name for the on_complete winner event.
+        let attempt_model_for_telem = if virtual_entry.value.routing.is_some() {
+            model.display_name.clone()
+        } else {
+            String::new()
+        };
         // Per #204: pass the resolved guardrail chain so the streaming
         // path can run output guardrails at end-of-stream
         // (buffer-then-check). Mirrors the non-streaming
@@ -915,7 +1032,13 @@ async fn dispatch(
                         cache_hit_saved_input_tokens: 0,
                         cache_hit_saved_output_tokens: 0,
                         ttft_ms: comp.ttft_ms,
-                        routing: stream_routing_for_telem.clone(),
+                        // Streaming is single-attempt (#655): the winner is
+                        // always the initial attempt of the first target.
+                        attempt_index: 0,
+                        attempt_kind: "initial".to_string(),
+                        attempt_model: attempt_model_for_telem.clone(),
+                        error_class: String::new(),
+                        error_message: String::new(),
                         provider_key_id: provider_key_id_for_telem.clone(),
                     },
                     /* cost_usd */ 0.0,
@@ -1228,16 +1351,31 @@ async fn dispatch(
         let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
 
         for attempt_idx in 0..=retries {
-            if is_routing_request {
-                if let Some(prev) = last_attempted_target.as_deref() {
-                    if prev != model.display_name {
-                        routing.fallback_count += 1;
-                    }
-                }
-                last_attempted_target = Some(model.display_name.clone());
-                routing.attempt_count += 1;
-            }
-            match bridge.chat(req, &ctx).await {
+            // Per-attempt telemetry kind (#655): the first attempt overall
+            // is "initial"; a different target than the previous attempt is
+            // a "fallback"; the same target again is a "retry".
+            let attempt_index = routing.attempts.len() as u32;
+            let kind = if routing.attempts.is_empty() {
+                "initial"
+            } else if last_attempted_target.as_deref() != Some(model.display_name.as_str()) {
+                "fallback"
+            } else {
+                "retry"
+            };
+            last_attempted_target = Some(model.display_name.clone());
+            // Routing target name only for routing groups; a direct model
+            // leaves it empty since `model_id` already identifies it.
+            let target_model = if is_routing_request {
+                model.display_name.clone()
+            } else {
+                String::new()
+            };
+
+            let attempt_started = Instant::now();
+            let result = bridge.chat(req, &ctx).await;
+            let attempt_latency_ms =
+                attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            match result {
                 Ok(resp) => {
                     state.health.record_success(&model.display_name);
                     state.runtime_status.mark_healthy(&attempt.id);
@@ -1246,29 +1384,32 @@ async fn dispatch(
                     chosen_upstream_model =
                         Some(model.upstream_model().unwrap_or("unknown").to_string());
                     chosen_target_display_name = Some(model.display_name.clone());
-                    if is_routing_request {
-                        routing.served_by_model = model.display_name.clone();
-                        routing.attempts.push(RoutingAttemptEvent {
-                            model: model.display_name.clone(),
-                            attempt: (attempt_idx + 1) as u32,
-                            status: Some(200),
-                            error: String::new(),
-                            success: true,
-                        });
-                    }
+                    routing.attempts.push(AttemptRecord {
+                        index: attempt_index,
+                        kind,
+                        target_model,
+                        provider_key_id: pk_entry.id.clone(),
+                        status: 200,
+                        success: true,
+                        error_class: String::new(),
+                        error_message: String::new(),
+                        latency_ms: attempt_latency_ms,
+                    });
                     upstream = Some(resp);
                     break;
                 }
                 Err(err) => {
-                    if is_routing_request {
-                        routing.attempts.push(RoutingAttemptEvent {
-                            model: model.display_name.clone(),
-                            attempt: (attempt_idx + 1) as u32,
-                            status: routing_error_status(&err),
-                            error: routing_error_class(&err).to_string(),
-                            success: false,
-                        });
-                    }
+                    routing.attempts.push(AttemptRecord {
+                        index: attempt_index,
+                        kind,
+                        target_model,
+                        provider_key_id: pk_entry.id.clone(),
+                        status: err.http_status(),
+                        success: false,
+                        error_class: routing_error_class(&err).to_string(),
+                        error_message: attempt_error_message(&err),
+                        latency_ms: attempt_latency_ms,
+                    });
                     let retryable = is_retryable(&err, retry_on_429);
                     tracing::warn!(
                         target_model = %model.display_name,
@@ -1631,10 +1772,11 @@ fn emit_usage_event(
         // /v1/rerank don't emit UsageEvents today; when they do they
         // also pass `"openai"` here.
         inbound_protocol: "openai".to_string(),
-        served_by_model: extras.routing.served_by_model,
-        routing_attempt_count: extras.routing.attempt_count,
-        routing_fallback_count: extras.routing.fallback_count,
-        routing_attempts: extras.routing.attempts,
+        attempt_index: extras.attempt_index,
+        attempt_kind: extras.attempt_kind,
+        attempt_model: extras.attempt_model,
+        error_class: extras.error_class,
+        error_message: extras.error_message,
         // Per-PK telemetry attribution (#302 M17 / AISIX-Cloud#436).
         // Source struct is `aisix_core::TelemetryTags`; the wire
         // shape is flat strings + a bool, with skip_serializing_if
@@ -1728,7 +1870,18 @@ struct UsageExtras {
     cache_hit_saved_input_tokens: u32,
     cache_hit_saved_output_tokens: u32,
     ttft_ms: u32,
-    routing: RoutingTelemetry,
+    // ─── Per-attempt telemetry (#655) ───
+    /// 0-based attempt index within the request.
+    attempt_index: u32,
+    /// `"initial"` / `"retry"` / `"fallback"`. Empty defaults to
+    /// `"initial"` on the wire.
+    attempt_kind: String,
+    /// Routing target display name for this attempt; empty for direct.
+    attempt_model: String,
+    /// Bounded error class for a failed attempt; empty on success.
+    error_class: String,
+    /// Short error message for a failed attempt; empty on success.
+    error_message: String,
     /// UUID of the resolved ProviderKey. Used at emit time to look up
     /// `telemetry_tags` from the snapshot and populate UsageEvent's
     /// per-PK attribution fields (`provider_kind` / `provider_featured`
@@ -1738,6 +1891,46 @@ struct UsageExtras {
     /// emit events land in cp-api with the tag columns NULL.
     /// See AISIX-Cloud#436 / #302 M17.
     provider_key_id: String,
+}
+
+/// Emit one zero-token `UsageEvent` per FAILED attempt of a request
+/// (#655). The winning attempt (and pre-dispatch errors) are emitted
+/// separately by the caller. No-op when there are no failed attempts
+/// (direct-model success / pre-dispatch error). Each event shares the
+/// request's `request_id` (the trace key) and carries this attempt's
+/// status / error / latency.
+fn emit_failed_attempts(
+    state: &ProxyState,
+    request_id: &str,
+    model_id: &str,
+    api_key_id: &str,
+    client: &ClientContext,
+    routing: &RoutingTelemetry,
+) {
+    for rec in routing.attempts.iter().filter(|a| !a.success) {
+        emit_usage_event(
+            state,
+            request_id,
+            model_id,
+            api_key_id,
+            rec.status,
+            Duration::from_millis(u64::from(rec.latency_ms)),
+            /* prompt_tokens */ 0,
+            /* completion_tokens */ 0,
+            UsageExtras {
+                attempt_index: rec.index,
+                attempt_kind: rec.kind.to_string(),
+                attempt_model: rec.target_model.clone(),
+                error_class: rec.error_class.clone(),
+                error_message: rec.error_message.clone(),
+                provider_key_id: rec.provider_key_id.clone(),
+                ..UsageExtras::default()
+            },
+            /* cost_usd */ 0.0,
+            /* guardrail_blocked */ false,
+            client,
+        );
+    }
 }
 
 fn record_error(metrics: &Metrics, err: &ProxyError, model: &str, status: u16, elapsed: Duration) {
@@ -1763,8 +1956,11 @@ fn emit_access_log(
     total_tokens: Option<u64>,
     request_id: &str,
     routing: &RoutingTelemetry,
-    routing_attempts: Option<&str>,
 ) {
+    // Per #655 the access log stays ONE line per request (the transport
+    // plane), carrying user-perceived `latency` + the final status plus a
+    // routing summary. The per-attempt detail lives in telemetry only.
+    let served_by = routing.winner().map(|w| w.target_model.as_str());
     AccessLog {
         method,
         path,
@@ -1777,22 +1973,15 @@ fn emit_access_log(
         completion_tokens,
         total_tokens,
         request_id,
-        served_by_model: if routing.served_by_model.is_empty() {
-            None
-        } else {
-            Some(routing.served_by_model.as_str())
+        served_by_model: served_by.filter(|s| !s.is_empty()),
+        routing_attempt_count: match routing.attempt_count() {
+            0 => None,
+            n => Some(n),
         },
-        routing_attempt_count: if routing.attempt_count == 0 {
-            None
-        } else {
-            Some(routing.attempt_count)
+        routing_fallback_count: match routing.fallback_count() {
+            0 => None,
+            n => Some(n),
         },
-        routing_fallback_count: if routing.fallback_count == 0 {
-            None
-        } else {
-            Some(routing.fallback_count)
-        },
-        routing_attempts,
     }
     .emit();
 }

@@ -458,7 +458,6 @@ fn emit_access_log(
         served_by_model: None,
         routing_attempt_count: None,
         routing_fallback_count: None,
-        routing_attempts: None,
     }
     .emit();
 }
