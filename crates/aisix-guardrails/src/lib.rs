@@ -277,6 +277,17 @@ pub trait Guardrail: Send + Sync + 'static {
             on_exceeded_fail_open: false,
         }
     }
+
+    /// Whether this guardrail actually inspects the OUTPUT hook. Drives
+    /// whether its `stream_output_policy` participates in the streamed-output
+    /// hold-back fold (#466): an input-only guardrail must NOT force output
+    /// buffering — it never looks at the response, so holding the stream back
+    /// for it is pure latency with no security benefit. Default: `true`
+    /// (assume output-relevant, secure-leaning); input-only impls override
+    /// to gate on their hook.
+    fn runs_on_output(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

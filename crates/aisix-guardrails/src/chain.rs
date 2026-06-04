@@ -56,17 +56,25 @@ impl Guardrail for GuardrailChain {
         self.guardrails.is_empty()
     }
 
-    /// The strictest streamed-output policy across the chain's members.
-    /// If any member wants hold-back, the whole stream holds back and
-    /// the full chain's `check_output` runs on the held content.
+    /// The strictest streamed-output policy across the chain's
+    /// **output-hook** members. Only guardrails that actually inspect the
+    /// output influence hold-back; an input-only member must not force the
+    /// response to buffer (#466). If any output member wants hold-back, the
+    /// whole stream holds back and the full chain's `check_output` runs on
+    /// the held content.
     fn stream_output_policy(&self) -> StreamOutputPolicy {
         self.guardrails
             .iter()
+            .filter(|g| g.runs_on_output())
             .map(|g| g.stream_output_policy())
             .fold(
                 StreamOutputPolicy::EndOfStreamCheck,
                 StreamOutputPolicy::stricter,
             )
+    }
+
+    fn runs_on_output(&self) -> bool {
+        self.guardrails.iter().any(|g| g.runs_on_output())
     }
 
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
@@ -271,5 +279,44 @@ mod tests {
         } else {
             panic!("expected Block");
         }
+    }
+
+    #[test]
+    fn input_only_member_does_not_force_streamed_output_holdback() {
+        // #466 regression: the trait default stream policy is now BufferFull
+        // (secure-by-default), but a chain whose only member is input-only must
+        // NOT buffer the response stream — it never inspects output.
+        let input_only = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::input_only(
+            vec![KeywordRule::literal("x")],
+        ))]);
+        assert!(!input_only.runs_on_output());
+        assert!(
+            !input_only.stream_output_policy().holds_back(),
+            "input-only chain must fold to a non-holding policy"
+        );
+
+        // An output guardrail folds to the default hold-back policy.
+        let output = GuardrailChain::new(vec![Arc::new(KeywordBlocklist::output_only(vec![
+            KeywordRule::literal("x"),
+        ]))]);
+        assert!(output.runs_on_output());
+        assert!(
+            output.stream_output_policy().holds_back(),
+            "output chain must fold to a holding policy"
+        );
+
+        // A mixed chain (input-only + output) still holds back because of the
+        // output member; the input-only member is skipped, not the driver.
+        let mixed = GuardrailChain::new(vec![
+            Arc::new(KeywordBlocklist::input_only(vec![KeywordRule::literal("x")])),
+            Arc::new(KeywordBlocklist::output_only(vec![KeywordRule::literal("y")])),
+        ]);
+        assert!(mixed.runs_on_output());
+        assert!(mixed.stream_output_policy().holds_back());
+
+        // Empty chain → nothing runs on output, no hold-back.
+        let empty = GuardrailChain::new(vec![]);
+        assert!(!empty.runs_on_output());
+        assert!(!empty.stream_output_policy().holds_back());
     }
 }

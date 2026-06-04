@@ -295,6 +295,15 @@ impl BedrockFailure {
 
 #[async_trait]
 impl Guardrail for BedrockGuardrail {
+    /// Its streamed-output hold-back policy applies only when it inspects
+    /// output (#466); an input-only attachment must not buffer the response.
+    fn runs_on_output(&self) -> bool {
+        matches!(
+            self.hook_point,
+            GuardrailHookPoint::Output | GuardrailHookPoint::Both
+        )
+    }
+
     fn name(&self) -> &'static str {
         // Static name keeps metric cardinality bounded; the row's
         // own name is logged via tracing fields when we hit a
