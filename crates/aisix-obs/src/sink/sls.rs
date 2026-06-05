@@ -34,12 +34,6 @@ const X_LOG_BODYRAWSIZE: HeaderName = HeaderName::from_static("x-log-bodyrawsize
 /// compresses, so the value is constant.
 const X_LOG_COMPRESSTYPE: HeaderName = HeaderName::from_static("x-log-compresstype");
 
-/// Conservative ceiling on a single PutLogs body, comfortably under SLS's
-/// documented per-request limit. The shared pipeline never hands the sink a
-/// batch larger than this; an oversize body would otherwise come back as a
-/// permanent 400.
-const SLS_MAX_REQUEST_BYTES: u64 = 3 * 1024 * 1024;
-
 /// Cap on a masked error-detail string surfaced to logs / health.
 const DETAIL_MAX_CHARS: usize = 200;
 
@@ -118,8 +112,16 @@ impl ObservabilitySink for AliyunSlsSink {
             idempotency: IdempotencyScheme::None,
             // Independent posts; SLS does not require cross-record ordering.
             ordering: OrderingScope::None,
-            batch_unit: BatchUnit::Both,
-            max_batch_bytes: Some(SLS_MAX_REQUEST_BYTES),
+            // Count-bounded today (parity with OtlpSink). SLS does cap the
+            // PutLogs body (low single-digit MB), but byte-aware chunking is
+            // only needed once full prompt/response content rides these
+            // records; on the metadata-only path the pipeline's per-batch
+            // record cap keeps bodies far under the limit. Declaring a byte
+            // ceiling the sink does not yet self-enforce would be a false
+            // promise (and a silent-drop bug under content) — so it stays
+            // `None` until the chunking lands. Tracked in #529.
+            batch_unit: BatchUnit::Records,
+            max_batch_bytes: None,
             // PutLogs accepts or rejects the whole LogGroup.
             supports_partial_batch: false,
             supports_streaming_ingest: false,
