@@ -180,6 +180,7 @@ version = "0.1.0"
 dependencies = [
  "aisix-core",
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "metrics",
  "metrics-exporter-prometheus",
