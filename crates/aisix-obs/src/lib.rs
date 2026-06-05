@@ -31,7 +31,7 @@ pub use metrics::{
     RequestLabels, RequestOutcome, UsageLabels,
 };
 pub use otlp::{install_otlp_tracer, shutdown_otlp, OtlpError, OtlpHandle};
-pub use otlp_http_sink::OtlpHttpFanOut;
+pub use otlp_http_sink::{OtlpHttpFanOut, OtlpSink};
 pub use sink::{
     BatchUnit, ChannelKey, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink,
     OrderingScope, PipelineConfig, SinkAck, SinkCapabilities, SinkContent, SinkError, SinkHandle,

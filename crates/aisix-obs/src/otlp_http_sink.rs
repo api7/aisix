@@ -40,10 +40,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_core::models::{ExporterKind, ObservabilityExporter};
+use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
+use crate::sink::{
+    BatchUnit, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope,
+    SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkResult,
+};
 use crate::usage::UsageEvent;
 
 /// Wall-clock duration of an OTLP/HTTP POST before we abandon it.
@@ -209,6 +214,119 @@ impl Default for OtlpHttpFanOut {
     }
 }
 
+/// An [`ObservabilitySink`] over the OTLP/HTTP-JSON traces protocol — the
+/// same wire shape as [`OtlpHttpFanOut`], but driven by the shared
+/// [`crate::sink::SinkPipeline`] (batched, retried, backpressured) rather
+/// than a per-event fire-and-forget spawn. One instance per configured
+/// `otlp_http` exporter.
+pub struct OtlpSink {
+    name: String,
+    endpoint: String,
+    headers: BTreeMap<String, String>,
+    client: reqwest::Client,
+}
+
+impl OtlpSink {
+    /// Build a sink for one exporter. The `client` is shared across sinks so
+    /// connection pools and TLS sessions are reused.
+    pub fn new(
+        name: impl Into<String>,
+        endpoint: impl Into<String>,
+        headers: BTreeMap<String, String>,
+        client: reqwest::Client,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            endpoint: endpoint.into(),
+            headers,
+            client,
+        }
+    }
+}
+
+#[async_trait]
+impl ObservabilitySink for OtlpSink {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn capabilities(&self) -> SinkCapabilities {
+        SinkCapabilities {
+            idempotency: IdempotencyScheme::None,
+            ordering: OrderingScope::None,
+            batch_unit: BatchUnit::Records,
+            // OTLP spans are small and receivers accept large payloads; the
+            // sink does not split by bytes, so no pipeline-enforced ceiling.
+            max_batch_bytes: None,
+            supports_partial_batch: false,
+            supports_streaming_ingest: false,
+        }
+    }
+
+    async fn append_batch(&self, batch: &EventBatch, _marker: &IdempotencyMarker) -> SinkResult {
+        if batch.is_empty() {
+            return Ok(SinkAck::default());
+        }
+        // One export request carrying every record's span — one POST, one
+        // atomic retry unit (vs. the per-event fan-out's N spawns).
+        let spans: Vec<Value> = batch
+            .records
+            .iter()
+            .map(|record| build_otlp_span(&record.usage, &self.name))
+            .collect();
+        let body = otlp_export_request(spans);
+        let bytes = serde_json::to_vec(&body)
+            .map_err(|e| SinkError::Permanent(format!("otlp encode: {e}")))?;
+
+        let mut req = self
+            .client
+            .post(&self.endpoint)
+            .header("Content-Type", "application/json")
+            .body(bytes);
+        for (key, value) in &self.headers {
+            req = req.header(key, value);
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return Ok(SinkAck {
+                        accepted: batch.len(),
+                        ..SinkAck::default()
+                    });
+                }
+                let text = resp.text().await.unwrap_or_default();
+                let detail = format!(
+                    "HTTP {}: {}",
+                    status,
+                    text.chars().take(200).collect::<String>()
+                );
+                // 5xx / 408 / 429 are worth retrying; other 4xx are
+                // config/auth/payload errors that will fail identically.
+                if status.is_server_error()
+                    || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                {
+                    Err(SinkError::Transient(detail))
+                } else {
+                    Err(SinkError::Permanent(detail))
+                }
+            }
+            // Connect / DNS / timeout — transient by nature.
+            Err(e) => Err(SinkError::Transient(format!("POST {}: {e}", self.endpoint))),
+        }
+    }
+
+    async fn healthcheck(&self) -> SinkHealth {
+        // A real connectivity probe (and the control-plane "test connection"
+        // affordance) lands with the health/metrics surface; until then a
+        // sink reports healthy and its delivery errors surface via
+        // `SinkStats::last_error`.
+        SinkHealth::healthy()
+    }
+}
+
 async fn post_one(
     client: reqwest::Client,
     endpoint: String,
@@ -236,9 +354,8 @@ async fn post_one(
     Ok(())
 }
 
-/// Build an OTLP/HTTP-JSON `ExportTraceServiceRequest` payload with
-/// one span representing this chat completion. Attribute names match
-/// the OpenTelemetry GenAI semantic conventions:
+/// Build the single OTLP span object for one usage event. Attribute names
+/// match the OpenTelemetry GenAI semantic conventions:
 /// <https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md>.
 ///
 /// Per-attribute encoding:
@@ -246,7 +363,7 @@ async fn post_one(
 ///   `{"intValue": "..."}` (string-encoded int per OTLP/JSON spec).
 /// - Trace ID + span ID are random 16-byte / 8-byte hex values.
 /// - Timestamps are nanos-since-epoch, OTLP's required unit.
-fn build_otlp_traces_payload(event: &UsageEvent, exporter_name: &str) -> Value {
+fn build_otlp_span(event: &UsageEvent, exporter_name: &str) -> Value {
     let trace_id = random_trace_id();
     let span_id = random_span_id();
 
@@ -258,8 +375,6 @@ fn build_otlp_traces_payload(event: &UsageEvent, exporter_name: &str) -> Value {
     // Latency landed in milliseconds; widen + multiply.
     let latency_nanos = (event.latency_ms as u128).saturating_mul(1_000_000);
     let start_unix_nano = end_unix_nano.saturating_sub(latency_nanos);
-
-    let span_name = "chat.completions";
 
     // Status: OK (1) for 2xx, ERROR (2) otherwise.
     let status_code = if (200..300).contains(&event.status_code) {
@@ -332,6 +447,20 @@ fn build_otlp_traces_payload(event: &UsageEvent, exporter_name: &str) -> Value {
     }
 
     json!({
+        "traceId": trace_id,
+        "spanId":  span_id,
+        "name":    "chat.completions",
+        "kind":    3, // SPAN_KIND_CLIENT (DP → upstream LLM)
+        "startTimeUnixNano": start_unix_nano.to_string(),
+        "endTimeUnixNano":   end_unix_nano.to_string(),
+        "attributes": attributes,
+        "status": { "code": status_code },
+    })
+}
+
+/// Wrap one or more spans into an OTLP/HTTP-JSON `ExportTraceServiceRequest`.
+fn otlp_export_request(spans: Vec<Value>) -> Value {
+    json!({
         "resourceSpans": [{
             "resource": {
                 "attributes": [
@@ -340,19 +469,15 @@ fn build_otlp_traces_payload(event: &UsageEvent, exporter_name: &str) -> Value {
             },
             "scopeSpans": [{
                 "scope": { "name": "aisix-obs.otlp_http_sink" },
-                "spans": [{
-                    "traceId": trace_id,
-                    "spanId":  span_id,
-                    "name":    span_name,
-                    "kind":    3, // SPAN_KIND_CLIENT (DP → upstream LLM)
-                    "startTimeUnixNano": start_unix_nano.to_string(),
-                    "endTimeUnixNano":   end_unix_nano.to_string(),
-                    "attributes": attributes,
-                    "status": { "code": status_code },
-                }],
+                "spans": spans,
             }],
         }],
     })
+}
+
+/// One event -> one-span export request (used by the per-event fan-out).
+fn build_otlp_traces_payload(event: &UsageEvent, exporter_name: &str) -> Value {
+    otlp_export_request(vec![build_otlp_span(event, exporter_name)])
 }
 
 fn attr_string(key: &str, value: &str) -> Value {
@@ -591,6 +716,80 @@ mod tests {
             body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["status"]["code"],
             2
         );
+    }
+
+    fn otlp_test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+    }
+
+    fn batch_of(n: usize) -> EventBatch {
+        let records = (0..n)
+            .map(|_| Arc::new(crate::sink::SinkRecord::metadata_only(sample_event())))
+            .collect();
+        EventBatch::new(records)
+    }
+
+    #[tokio::test]
+    async fn otlp_sink_posts_one_request_with_all_spans() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/traces"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let sink = OtlpSink::new(
+            "test-exp",
+            format!("{}/v1/traces", server.uri()),
+            BTreeMap::new(),
+            otlp_test_client(),
+        );
+
+        let ack = sink
+            .append_batch(&batch_of(3), &IdempotencyMarker::None)
+            .await
+            .expect("2xx delivers the batch");
+        assert_eq!(ack.accepted, 3);
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "one batched request, not three spawns");
+        let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        let spans = body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .unwrap();
+        assert_eq!(spans.len(), 3, "all three spans in one export request");
+    }
+
+    #[tokio::test]
+    async fn otlp_sink_classifies_5xx_as_transient() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let sink = OtlpSink::new("e", server.uri(), BTreeMap::new(), otlp_test_client());
+        let err = sink
+            .append_batch(&batch_of(1), &IdempotencyMarker::None)
+            .await
+            .unwrap_err();
+        assert!(err.is_transient(), "5xx must be retryable: {err}");
+    }
+
+    #[tokio::test]
+    async fn otlp_sink_classifies_4xx_as_permanent() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(400))
+            .mount(&server)
+            .await;
+        let sink = OtlpSink::new("e", server.uri(), BTreeMap::new(), otlp_test_client());
+        let err = sink
+            .append_batch(&batch_of(1), &IdempotencyMarker::None)
+            .await
+            .unwrap_err();
+        assert!(!err.is_transient(), "4xx must be permanent: {err}");
     }
 
     #[test]
