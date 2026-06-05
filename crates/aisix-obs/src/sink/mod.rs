@@ -13,12 +13,14 @@
 //! and the concrete sinks (SLS, …) build on it.
 
 mod capabilities;
+mod manager;
 mod pipeline;
 mod record;
 
 pub use capabilities::{
     BatchUnit, ChannelKey, IdempotencyMarker, IdempotencyScheme, OrderingScope, SinkCapabilities,
 };
+pub use manager::ExporterPipelines;
 pub use pipeline::{PipelineConfig, SinkHandle, SinkPipeline, SinkStatsSnapshot};
 pub use record::{EventBatch, SinkContent, SinkRecord, SCHEMA_VERSION};
 
