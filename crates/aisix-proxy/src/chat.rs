@@ -1657,6 +1657,12 @@ fn emit_usage_event(
     // `aisix_usage_events_emitted_total` (#408). Keep `&'static str`
     // so prometheus cardinality stays bounded.
     state.usage_sink.try_emit("chat", event.clone());
+    // Guardrail outcome counters (#379). Recorded here — the one place every
+    // chat path (success / error / streaming / cache-hit) funnels through —
+    // from the same guardrail fields the UsageEvent carries.
+    state
+        .metrics
+        .record_guardrail_outcome(guardrail_blocked, &event.guardrail_bypassed_reason);
     // Per-env OTLP/HTTP fan-out. The snapshot's exporter table is
     // empty for envs that haven't configured any, so this is a cheap
     // no-op on the common path. Spawned tasks own the POST work and
