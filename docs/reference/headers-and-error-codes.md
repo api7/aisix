@@ -5,12 +5,9 @@ sidebar_position: 63
 toc_max_heading_level: 2
 ---
 
-Gateway responses should be interpreted by response format before status code
-alone. The response format determines which headers, error envelope, and status
-codes apply in logs, clients, and automation.
+Gateway responses should be interpreted by response format before status code alone. The response format determines which headers, error envelope, and status codes apply in logs, clients, and automation.
 
-AISIX has more than one response format. Identify the API that returned the
-response, then use the matching header and error guidance.
+AISIX has more than one response format. Identify the API that returned the response, then use the matching header and error guidance.
 
 ## Choose the Response Format
 
@@ -25,8 +22,7 @@ Use the request path to decide which response format applies.
 
 ## Proxy Response Headers
 
-Operational headers vary by endpoint. Do not treat every header as universal
-across every `/v1/*` route.
+Operational headers vary by endpoint. Do not treat every header as universal across every `/v1/*` route.
 
 | Header | When to use it |
 | --- | --- |
@@ -50,8 +46,7 @@ AISIX OpenAI-compatible proxy errors use this envelope:
 }
 ```
 
-The `param` and `code` fields are omitted when AISIX has no value for them.
-Budget denials can include additional budget fields inside the `error` object.
+The `param` and `code` fields are omitted when AISIX has no value for them. Budget denials can include additional budget fields inside the `error` object.
 
 Common AISIX `error.type` values are:
 
@@ -71,22 +66,15 @@ Common AISIX `error.type` values are:
 
 ### How Upstream Errors Are Rendered
 
-For upstream provider errors on OpenAI-style routes, AISIX separates
-client-safe information from operational detail.
+For upstream provider errors on OpenAI-style routes, AISIX separates client-safe information from operational detail.
 
-Upstream `4xx` responses keep the client-visible HTTP class and are rendered
-through the proxy error format. Where AISIX can parse the upstream provider
-error, it preserves or translates provider error semantics into the
-OpenAI-style envelope.
+Upstream `4xx` responses keep the client-visible HTTP class and are rendered through the proxy error format. Where AISIX can parse the upstream provider error, it preserves or translates provider error semantics into the OpenAI-style envelope.
 
-Upstream `5xx` responses generally collapse into `502` through the provider
-adapter. AISIX does not expose upstream `5xx` response bodies because they can
-contain provider-only detail.
+Upstream `5xx` responses generally collapse into `502` through the provider adapter. AISIX does not expose upstream `5xx` response bodies because they can contain provider-only detail.
 
 ## Anthropic-Style Proxy Errors
 
-`POST /v1/messages` and `POST /v1/messages/count_tokens` use the
-Anthropic-style error envelope:
+`POST /v1/messages` and `POST /v1/messages/count_tokens` use the Anthropic-style error envelope:
 
 ```json
 {
@@ -115,15 +103,11 @@ See [Anthropic Messages](../integration/anthropic-messages.md#error-format) for 
 
 ## Passthrough Errors
 
-`ANY /passthrough/:provider/*rest` forwards the upstream provider's status code
-and body unchanged after proxy authentication and provider resolution. See
-[Provider passthrough](../integration/passthrough.md).
+`ANY /passthrough/:provider/*rest` forwards the upstream provider's status code and body unchanged after proxy authentication and provider resolution. See [Provider passthrough](../integration/passthrough.md).
 
 ## Proxy Status Codes
 
-Use the error type first when the envelope includes one. The status code gives
-the broad category, but the error type usually identifies the more precise
-gateway condition.
+Use the error type first when the envelope includes one. The status code gives the broad category, but the error type usually identifies the more precise gateway condition.
 
 | Status | Meaning |
 | --- | --- |
@@ -160,8 +144,4 @@ Admin status codes are:
 
 ## Related Reading
 
-For proxy route behavior, see [Proxy API reference](proxy-api-reference.md).
-For standalone admin routes, requests, and responses, see
-[Admin API reference](/ai-gateway/reference/admin-api). For caller-facing
-OpenAI-compatible request and response behavior, see
-[OpenAI-compatible API](../integration/openai-compatible-api.md).
+For proxy route behavior, see [Proxy API reference](proxy-api-reference.md). For standalone admin routes, requests, and responses, see [Admin API reference](/ai-gateway/reference/admin-api). For caller-facing OpenAI-compatible request and response behavior, see [OpenAI-compatible API](../integration/openai-compatible-api.md).

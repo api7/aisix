@@ -4,36 +4,21 @@ description: Review which AISIX AI Gateway and AISIX Cloud capabilities are avai
 sidebar_position: 4
 ---
 
-Review feature availability before planning production rollout. The tables
-summarize AISIX AI Gateway and AISIX Cloud capabilities and call out limits
-that affect deployment, provider choice, or traffic policy.
+Review feature availability before planning production rollout. The tables summarize AISIX AI Gateway and AISIX Cloud capabilities and call out limits that affect deployment, provider choice, or traffic policy.
 
 ## Planning Summary
 
-For self-hosted gateway evaluation, start with OpenAI-compatible proxying,
-caller API keys, provider keys, model aliases, routing models, rate limits, and
-observability exporters.
+For self-hosted gateway evaluation, start with OpenAI-compatible proxying, caller API keys, provider keys, model aliases, routing models, rate limits, and observability exporters.
 
-Before depending on policy-heavy paths in production, read the limits for
-budgets, guardrails, and response caching. These features work in narrower
-runtime scopes or depend on Cloud connectivity, provider credentials, build
-features, or endpoint family.
+Before depending on policy-heavy paths in production, read the limits for budgets, guardrails, and response caching. These features work in narrower runtime scopes or depend on Cloud connectivity, provider credentials, build features, or endpoint family.
 
-For managed deployments, treat AISIX Cloud as the control plane for
-environments, certificates, configuration projection, usage events, and billing
-workflows. The Cloud playground is useful for control-plane feedback, but it is
-not the same as sending live traffic through a managed data plane.
+For managed deployments, treat AISIX Cloud as the control plane for environments, certificates, configuration projection, usage events, and billing workflows. The Cloud playground is useful for control-plane feedback, but it is not the same as sending live traffic through a managed data plane.
 
 ## Status Labels
 
-**Available** means the capability is ready for normal use in the supported
-deployment modes. **Limited** means the capability is available with important
-runtime or scope limitations. **Preview** means the capability is available for
-evaluation, but is not production-equivalent or not broad enough to describe as
-generally available.
+**Available** means the capability is ready for normal use in the supported deployment modes. **Limited** means the capability is available with important runtime or scope limitations. **Preview** means the capability is available for evaluation, but is not production-equivalent or not broad enough to describe as generally available.
 
-If a capability is marked **Limited** or **Preview**, review its limits before
-depending on it in production.
+If a capability is marked **Limited** or **Preview**, review its limits before depending on it in production.
 
 ## AISIX AI Gateway
 
@@ -54,9 +39,7 @@ depending on it in production.
 | Response caching | Limited | Cache lookup and write are policy-gated. Enforcement applies to chat completions, with per-policy TTL applied to matching requests. Streaming responses are not cached at this layer. See [Caching](../configuration/caching.md). |
 | Redis cache backend | Limited | The process-level cache backend can be switched from memory to Redis when `cache.backend` is `redis` and `cache.redis.url` is configured. A `CachePolicy.backend` field alone does not switch the runtime backend. See [Caching](../configuration/caching.md). |
 
-The [Proxy API reference](../reference/proxy-api-reference.md) covers the
-gateway API, and [Provider compatibility](../reference/provider-compatibility.md)
-covers provider-specific support.
+The [Proxy API reference](../reference/proxy-api-reference.md) covers the gateway API, and [Provider compatibility](../reference/provider-compatibility.md) covers provider-specific support.
 
 ## AISIX Cloud
 
@@ -71,10 +54,4 @@ covers provider-specific support.
 
 ## Related Reading
 
-For provider-specific behavior, see
-[Provider compatibility](../reference/provider-compatibility.md). Configure
-upstream access and aliases with
-[Provider keys](../configuration/provider-keys.md) and
-[Models](../configuration/models.md). For traffic controls and routing models,
-see [Rate limits](../configuration/rate-limits.md) and
-[Routing and failover](../configuration/routing-and-failover.md).
+For provider-specific behavior, see [Provider compatibility](../reference/provider-compatibility.md). Configure upstream access and aliases with [Provider keys](../configuration/provider-keys.md) and [Models](../configuration/models.md). For traffic controls and routing models, see [Rate limits](../configuration/rate-limits.md) and [Routing and failover](../configuration/routing-and-failover.md).

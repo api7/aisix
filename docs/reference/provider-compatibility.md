@@ -5,8 +5,7 @@ toc_max_heading_level: 2
 sidebar_position: 64
 ---
 
-This reference shows which proxy endpoints can be used with a
-provider-backed model.
+This reference shows which proxy endpoints can be used with a provider-backed model.
 
 AISIX has two compatibility layers:
 
@@ -15,8 +14,7 @@ AISIX has two compatibility layers:
 | Adapter families | Decide how chat-style requests are encoded for upstream providers. See [Adapter protocol families](adapters.md). |
 | Endpoint gates | Decide whether a specific proxy route accepts the resolved model at all. |
 
-That distinction matters. A model can work on `/v1/chat/completions` and still
-be rejected on `/v1/responses`, `/v1/images/generations`, or `/v1/rerank`.
+That distinction matters. A model can work on `/v1/chat/completions` and still be rejected on `/v1/responses`, `/v1/images/generations`, or `/v1/rerank`.
 
 ## Choose an Endpoint
 
@@ -36,59 +34,39 @@ Use the caller's API format and provider support requirements to choose a route.
 
 ## Broad Chat Routes
 
-`POST /v1/chat/completions` is the broadest proxy route. It accepts
-OpenAI-compatible caller requests, resolves the model alias, uses the configured
-provider key, and returns an OpenAI-compatible chat-completions response.
+`POST /v1/chat/completions` is the broadest proxy route. It accepts OpenAI-compatible caller requests, resolves the model alias, uses the configured provider key, and returns an OpenAI-compatible chat-completions response.
 
-For non-OpenAI upstreams, the provider-facing request is not necessarily
-OpenAI-compatible. Bedrock, Vertex, Azure OpenAI, and Anthropic-backed models use
-provider-specific adapter behavior behind the gateway.
+For non-OpenAI upstreams, the provider-facing request is not necessarily OpenAI-compatible. Bedrock, Vertex, Azure OpenAI, and Anthropic-backed models use provider-specific adapter behavior behind the gateway.
 
-Streaming chat uses server-sent events. It follows the same model resolution
-rules as non-streaming chat, but streaming requests use the first selected
-target and do not fail over mid-stream.
+Streaming chat uses server-sent events. It follows the same model resolution rules as non-streaming chat, but streaming requests use the first selected target and do not fail over mid-stream.
 
 ## Provider-Specific Routes
 
-Some proxy routes intentionally stay narrow because their upstream API format is
-provider-specific.
+Some proxy routes intentionally stay narrow because their upstream API format is provider-specific.
 
 ### OpenAI-Only Routes
 
-`POST /v1/responses` and `POST /v1/images/generations` require the resolved
-model to have `provider: "openai"`.
+`POST /v1/responses` and `POST /v1/images/generations` require the resolved model to have `provider: "openai"`.
 
-This is stricter than using the `openai` adapter. For example, an
-OpenAI-compatible vendor can work on `/v1/chat/completions` with
-`adapter: "openai"` and still be rejected on `/v1/responses` or
-`/v1/images/generations` if its provider label is not `openai`.
+This is stricter than using the `openai` adapter. For example, an OpenAI-compatible vendor can work on `/v1/chat/completions` with `adapter: "openai"` and still be rejected on `/v1/responses` or `/v1/images/generations` if its provider label is not `openai`.
 
 ### OpenAI-Style Forwarding Routes
 
-`POST /v1/embeddings` uses adapter-specific embeddings behavior. The OpenAI
-adapter supports embeddings; adapters that keep the default behavior return
-`501 not_implemented`.
+`POST /v1/embeddings` uses adapter-specific embeddings behavior. The OpenAI adapter supports embeddings; adapters that keep the default behavior return `501 not_implemented`.
 
-The audio endpoints forward OpenAI-style audio requests to the resolved
-provider base URL and return the upstream response format. Use them with
-upstreams that expose matching OpenAI-style audio routes.
+The audio endpoints forward OpenAI-style audio requests to the resolved provider base URL and return the upstream response format. Use them with upstreams that expose matching OpenAI-style audio routes.
 
 ### Rerank
 
-`POST /v1/rerank` uses a route-specific provider allowlist keyed on the model's
-`provider` label. Accepted provider labels are `openai`, `cohere`, and `jina`.
+`POST /v1/rerank` uses a route-specific provider allowlist keyed on the model's `provider` label. Accepted provider labels are `openai`, `cohere`, and `jina`.
 
 ### Anthropic Messages
 
-`POST /v1/messages` accepts Anthropic models natively and accepts non-Anthropic
-models through translation. Use this route when the caller is already built
-around the Anthropic Messages API. For OpenAI-style clients, prefer
-`/v1/chat/completions`.
+`POST /v1/messages` accepts Anthropic models natively and accepts non-Anthropic models through translation. Use this route when the caller is already built around the Anthropic Messages API. For OpenAI-style clients, prefer `/v1/chat/completions`.
 
 ## Compatibility Checks
 
-Provider compatibility is not a single yes-or-no question. Check these
-details before depending on a path.
+Provider compatibility is not a single yes-or-no question. Check these details before depending on a path.
 
 | Check | Why it matters |
 | --- | --- |
@@ -98,25 +76,14 @@ details before depending on a path.
 | Provider-specific response extensions | Vendor-specific response extensions beyond the OpenAI envelope are not normalized. Reasoning-style fields can be lifted per key through the `response.reasoning_field` override. |
 | Usage accounting | Usage events vary by endpoint and upstream response. |
 
-For response override details, see
-[Provider key schema](provider-key-schema.md#runtime-overrides). For usage
-behavior on `/v1/responses`, see
-[Responses](../integration/responses.md).
+For response override details, see [Provider key schema](provider-key-schema.md#runtime-overrides). For usage behavior on `/v1/responses`, see [Responses](../integration/responses.md).
 
 ## Featured and Community Catalog Providers
 
-In AISIX Cloud, the catalog distinguishes **featured** providers from community
-providers. Featured status affects discovery and AISIX Cloud web console
-presentation only.
+In AISIX Cloud, the catalog distinguishes **featured** providers from community providers. Featured status affects discovery and AISIX Cloud web console presentation only.
 
-Both featured and community providers resolve to one of the adapter families.
-The self-hosted gateway has no provider catalog and no featured concept;
-configure `provider`, `adapter`, and `api_base` on each provider key yourself.
-See [Adapter protocol families](adapters.md#cloud-catalog-and-self-hosted-providers).
+Both featured and community providers resolve to one of the adapter families. The self-hosted gateway has no provider catalog and no featured concept; configure `provider`, `adapter`, and `api_base` on each provider key yourself. See [Adapter protocol families](adapters.md#cloud-catalog-and-self-hosted-providers).
 
 ## Related Reading
 
-For adapter-family behavior, see
-[Adapter protocol families](adapters.md). For proxy routes and
-client-facing API behavior, see [Proxy API reference](proxy-api-reference.md)
-and [OpenAI-compatible API](../integration/openai-compatible-api.md).
+For adapter-family behavior, see [Adapter protocol families](adapters.md). For proxy routes and client-facing API behavior, see [Proxy API reference](proxy-api-reference.md) and [OpenAI-compatible API](../integration/openai-compatible-api.md).
