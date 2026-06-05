@@ -30,9 +30,10 @@ pub mod snapshot;
 pub use apikey::ApiKey;
 pub use cache_policy::{AppliesTo, CacheBackend, CachePolicy};
 pub use guardrail::{
-    AliyunTextModerationConfig, AzureContentSafetyConfig, AzureContentSafetyTextModerationConfig,
-    BedrockAWSCredentials, BedrockConfig, BedrockLatencyMode, Guardrail, GuardrailAttachment,
-    GuardrailHookPoint, GuardrailKind, GuardrailScopeType, KeywordConfig, KeywordPattern,
+    AliyunTextModerationConfig, AppliedGuardrail, AzureContentSafetyConfig,
+    AzureContentSafetyTextModerationConfig, BedrockAWSCredentials, BedrockConfig,
+    BedrockLatencyMode, Guardrail, GuardrailAttachment, GuardrailHookPoint, GuardrailKind,
+    GuardrailScopeType, KeywordConfig, KeywordPattern,
 };
 pub use model::{
     Adapter, BackgroundModelCheck, CooldownConfig, Model, DEFAULT_COOLDOWN_TRIGGER_STATUSES,

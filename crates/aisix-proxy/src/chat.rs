@@ -17,6 +17,7 @@
 //!    status, error type, and (for rate-limits) Retry-After.
 
 use aisix_cache::CacheKey;
+use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeContext, BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
 use aisix_obs::{
@@ -161,7 +162,20 @@ pub async fn chat_completions(
     let api_key_id = auth.entry.id.clone();
     let model_name = req.model.clone();
 
-    let outcome = dispatch(&state, &auth, &req, &request_id, started, &client).await;
+    // Filled by `dispatch` once the per-request guardrail chain resolves;
+    // read below to attach `applied_guardrails` to the telemetry event on
+    // both the success and failure (guardrail-block) paths (#379).
+    let mut applied_guardrails: Vec<AppliedGuardrail> = Vec::new();
+    let outcome = dispatch(
+        &state,
+        &auth,
+        &req,
+        &request_id,
+        started,
+        &client,
+        &mut applied_guardrails,
+    )
+    .await;
 
     match outcome {
         Ok(mut success) => {
@@ -224,6 +238,7 @@ pub async fn chat_completions(
                         cache_hit_saved_output_tokens: success.cache_hit_saved_output_tokens,
                         ttft_ms: 0,
                         routing: success.routing.clone(),
+                        applied_guardrails: applied_guardrails.clone(),
                         provider_key_id: success.provider_key_id.clone(),
                     },
                     success.cost_usd,
@@ -355,12 +370,21 @@ pub async fn chat_completions(
                         cache_hit_saved_output_tokens: 0,
                         ttft_ms: 0,
                         routing: c.routing,
+                        // Same applied set on the output-block path — the chain
+                        // governed the request even though it ultimately blocked.
+                        applied_guardrails: applied_guardrails.clone(),
                         provider_key_id: c.provider_key_id,
                     },
                 ),
                 None => {
+                    // Pre-upstream failures, incl. the input guardrail block:
+                    // `applied_guardrails` is populated by `dispatch` once the
+                    // chain resolved, so an input-blocked request still records
+                    // which guardrails governed it (empty for errors that fire
+                    // before resolution).
                     let extras = UsageExtras {
                         routing,
+                        applied_guardrails: applied_guardrails.clone(),
                         ..UsageExtras::default()
                     };
                     (0, 0, extras)
@@ -613,6 +637,12 @@ async fn dispatch(
     request_id: &str,
     started: Instant,
     client: &ClientContext,
+    // Out-param: filled with the resolved chain's `{kind, hook}` set as soon
+    // as the guardrail chain is resolved, so the caller can attach it to the
+    // telemetry event on BOTH the success and error (guardrail-block) paths
+    // without threading a field through every `Success`/`DispatchFailure`
+    // construction site. Stays empty for requests rejected before resolution.
+    applied_out: &mut Vec<AppliedGuardrail>,
 ) -> Result<Success, DispatchFailure> {
     if req.messages.is_empty() {
         return Err(DispatchFailure::new(
@@ -650,8 +680,15 @@ async fn dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
+    let resolved = state.guardrail_index.resolve(&guardrail_ctx);
+    // Capture the applied `{kind, hook}` set before the concrete chain is
+    // erased to `Arc<dyn Guardrail>` (the trait has no `applied()`). Fill the
+    // caller's out-param so the failure path can surface it too, and keep a
+    // local copy for the streaming on_complete closure below.
+    let applied_guardrails = resolved.applied().to_vec();
+    *applied_out = applied_guardrails.clone();
     let resolved_chain: std::sync::Arc<dyn aisix_guardrails::Guardrail> =
-        std::sync::Arc::new(state.guardrail_index.resolve(&guardrail_ctx));
+        std::sync::Arc::new(resolved);
 
     // Input guardrails. Run before reservation so a blocked prompt
     // doesn't burn an RPM slot — content-policy refusals shouldn't
@@ -825,6 +862,9 @@ async fn dispatch(
         let provider_key_id_for_telem = pk_entry.id.clone();
         let upstream_model_for_metrics = model.upstream_model().unwrap_or("unknown").to_string();
         let bypass_reason_for_telem = bypass_reason.clone().unwrap_or_default();
+        // Applied guardrail set (#379), owned for the move into on_complete so
+        // the streamed-response telemetry event records which guardrails ran.
+        let applied_guardrails_for_telem = applied_guardrails.clone();
         // Downstream client attribution (#492) moved into the on_complete
         // closure so streamed responses log the same IP/UA as non-streaming.
         let client_for_telem = client.clone();
@@ -916,6 +956,7 @@ async fn dispatch(
                         cache_hit_saved_output_tokens: 0,
                         ttft_ms: comp.ttft_ms,
                         routing: stream_routing_for_telem.clone(),
+                        applied_guardrails: applied_guardrails_for_telem.clone(),
                         provider_key_id: provider_key_id_for_telem.clone(),
                     },
                     /* cost_usd */ 0.0,
@@ -1622,6 +1663,7 @@ fn emit_usage_event(
         cost_usd,
         guardrail_blocked,
         guardrail_bypassed_reason: extras.bypass_reason,
+        applied_guardrails: extras.applied_guardrails,
         cache_status: extras.cache_status,
         cache_hit_saved_input_tokens: extras.cache_hit_saved_input_tokens,
         cache_hit_saved_output_tokens: extras.cache_hit_saved_output_tokens,
@@ -1735,6 +1777,12 @@ struct UsageExtras {
     cache_hit_saved_output_tokens: u32,
     ttft_ms: u32,
     routing: RoutingTelemetry,
+    /// The `{kind, hook}` set of guardrails that governed this request,
+    /// captured at chain-resolve time. Lands on
+    /// `dpmgr_usage_events.applied_guardrails` so the dashboard can show
+    /// which guardrails ran (#379). Empty for the guardrail-free path and
+    /// for requests rejected before resolution.
+    applied_guardrails: Vec<AppliedGuardrail>,
     /// UUID of the resolved ProviderKey. Used at emit time to look up
     /// `telemetry_tags` from the snapshot and populate UsageEvent's
     /// per-PK attribution fields (`provider_kind` / `provider_featured`

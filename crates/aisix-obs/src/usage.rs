@@ -27,6 +27,7 @@
 //! batch contract (5s interval / 100-event ceiling) lives in the worker
 //! (aisix-server), not here.
 
+use aisix_core::AppliedGuardrail;
 use serde::Serialize;
 
 /// One upstream attempt made while serving a routing-model request.
@@ -151,6 +152,21 @@ pub struct UsageEvent {
     /// wire empty maps to NULL via `skip_serializing_if`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub guardrail_bypassed_reason: String,
+
+    /// The guardrails that governed this request, captured at chain-build
+    /// time: each entry is the guardrail `kind` (e.g. `keyword`,
+    /// `aliyun_text_moderation`) plus the `hook` it's configured for
+    /// (`input` / `output` / `both`). Lets the dashboard show *which*
+    /// guardrails ran — not just the boolean `guardrail_blocked`. v1 records
+    /// the attached set, not per-guardrail verdicts (#379).
+    ///
+    /// Empty (the dominant guardrail-free deployment, or a request rejected
+    /// before guardrail resolution) is omitted from the wire via
+    /// `skip_serializing_if`; cp-api stores absent as an empty set. cp-api's
+    /// `/dp/telemetry` binds JSON leniently, so older CP images that don't
+    /// know this field ignore it — the DP can ship it ahead of the CP.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_guardrails: Vec<AppliedGuardrail>,
 
     /// Cache outcome on this request. One of:
     ///
@@ -737,6 +753,41 @@ mod tests {
         // resolve a peer / the client sent no User-Agent.
         assert!(!json.contains("client_source_ip"));
         assert!(!json.contains("client_user_agent"));
+        // Applied guardrails (#379): absent when no guardrail governed the
+        // request (the dominant guardrail-free deployment). Empty must not
+        // appear on the wire — cp-api treats absent as the empty set.
+        assert!(!json.contains("applied_guardrails"));
+    }
+
+    #[test]
+    fn applied_guardrails_serialise_when_set() {
+        // #379: a request governed by guardrails carries the attached set
+        // (kind + hook) so the dashboard can show which guardrails ran.
+        let ev = UsageEvent {
+            request_id: "req-guarded".into(),
+            guardrail_blocked: true,
+            applied_guardrails: vec![
+                AppliedGuardrail {
+                    kind: "keyword".into(),
+                    hook: "input".into(),
+                },
+                AppliedGuardrail {
+                    kind: "aliyun_text_moderation".into(),
+                    hook: "both".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""applied_guardrails""#));
+        assert!(json.contains(r#""kind":"keyword""#));
+        assert!(json.contains(r#""hook":"input""#));
+        assert!(json.contains(r#""kind":"aliyun_text_moderation""#));
+        assert!(json.contains(r#""hook":"both""#));
+
+        // Empty set stays off the wire entirely.
+        let empty = serde_json::to_string(&UsageEvent::default()).unwrap();
+        assert!(!empty.contains("applied_guardrails"));
     }
 
     #[test]

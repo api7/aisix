@@ -28,6 +28,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use aisix_core::AppliedGuardrail;
+
 use crate::{Guardrail, GuardrailChain};
 
 /// Which scope dimension an attachment covers.
@@ -50,6 +52,11 @@ pub(crate) struct IndexEntry {
     /// Higher = higher precedence. Entries are pre-sorted descending.
     priority: i32,
     guardrail: Arc<dyn Guardrail>,
+    /// The `{kind, hook}` of this entry's guardrail, captured at index-build
+    /// time (the only place the domain row's `kind` + `hook_point` are in
+    /// scope). `resolve` collects these from the entries it keeps so the
+    /// returned chain can report which guardrails governed the request (#379).
+    applied: AppliedGuardrail,
 }
 
 impl std::fmt::Debug for IndexEntry {
@@ -145,6 +152,10 @@ impl GuardrailIndex {
     pub fn resolve(&self, ctx: &RequestContext<'_>) -> GuardrailChain {
         let mut seen: HashSet<&str> = HashSet::new();
         let mut chain: Vec<Arc<dyn Guardrail>> = Vec::new();
+        // `applied` mirrors `chain` 1:1 — the `{kind, hook}` of each member
+        // we keep, for applied-guardrail telemetry (#379). Pushed on the same
+        // (matched + not-deduplicated) path so it never drifts from `chain`.
+        let mut applied: Vec<AppliedGuardrail> = Vec::new();
 
         for entry in &self.entries {
             if !entry.applies_to(ctx) {
@@ -155,9 +166,10 @@ impl GuardrailIndex {
             }
             seen.insert(entry.guardrail_id.as_str());
             chain.push(Arc::clone(&entry.guardrail));
+            applied.push(entry.applied.clone());
         }
 
-        GuardrailChain::new(chain)
+        GuardrailChain::new_with_applied(chain, applied)
     }
 }
 
@@ -172,6 +184,7 @@ impl GuardrailIndex {
         scope_id: Option<String>,
         priority: i32,
         guardrail: Arc<dyn Guardrail>,
+        applied: AppliedGuardrail,
     ) -> IndexEntry {
         IndexEntry {
             guardrail_id: guardrail_id.into(),
@@ -179,6 +192,7 @@ impl GuardrailIndex {
             scope_id,
             priority,
             guardrail,
+            applied,
         }
     }
 
@@ -223,7 +237,20 @@ mod tests {
         priority: i32,
         g: Arc<dyn Guardrail>,
     ) -> IndexEntry {
-        GuardrailIndex::push_entry(gid, scope, sid.map(str::to_owned), priority, g)
+        // These resolution tests build keyword guardrails via `kw`; the
+        // applied descriptor is documentary here (the dedicated applied
+        // tests live in build.rs against the real snapshot build path).
+        GuardrailIndex::push_entry(
+            gid,
+            scope,
+            sid.map(str::to_owned),
+            priority,
+            g,
+            AppliedGuardrail {
+                kind: "keyword".to_owned(),
+                hook: "both".to_owned(),
+            },
+        )
     }
 
     // 1. Empty index allows everything.

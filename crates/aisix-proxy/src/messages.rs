@@ -33,6 +33,7 @@
 //! status-to-type mapping. (`/v1/chat/completions` continues to emit
 //! the OpenAI-shape envelope with its DP-stable taxonomy.)
 
+use aisix_core::AppliedGuardrail;
 use aisix_obs::{AccessLog, LlmUsage, RequestLabels, RequestOutcome, UsageEvent, UsageLabels};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
@@ -108,7 +109,21 @@ pub async fn messages(
         .unwrap_or_default();
     drop(snapshot);
 
-    match dispatch(&state, &auth, &mut body, &request_id, started, &client).await {
+    // Filled by `dispatch` once the per-request guardrail chain resolves;
+    // read below to attach `applied_guardrails` to the telemetry event on both
+    // the success and failure (input-block) paths (#379).
+    let mut applied_guardrails: Vec<AppliedGuardrail> = Vec::new();
+    match dispatch(
+        &state,
+        &auth,
+        &mut body,
+        &request_id,
+        started,
+        &client,
+        &mut applied_guardrails,
+    )
+    .await
+    {
         Ok(DispatchOutcome {
             response,
             provider_label,
@@ -166,6 +181,7 @@ pub async fn messages(
                     elapsed,
                     metrics,
                     &client,
+                    applied_guardrails.clone(),
                 );
             }
             response
@@ -207,6 +223,7 @@ pub async fn messages(
                 elapsed,
                 AnthropicUsageMetrics::default(),
                 &client,
+                applied_guardrails.clone(),
             );
             // /v1/messages must return Anthropic-shape error envelope
             // `{type:"error", error:{type, message}}` so Claude SDKs
@@ -225,6 +242,12 @@ async fn dispatch(
     request_id: &str,
     started: Instant,
     client: &ClientContext,
+    // Out-param: filled with the resolved chain's `{kind, hook}` set as soon as
+    // the guardrail chain resolves, so `messages()` can attach it to telemetry
+    // on both the success and error (input-block) paths. Empty for requests
+    // rejected before resolution. The streaming paths capture the same set
+    // directly from `resolved_chain` for their end-of-stream emit.
+    applied_out: &mut Vec<AppliedGuardrail>,
 ) -> Result<DispatchOutcome, ProxyError> {
     let snapshot = state.snapshot.load();
 
@@ -263,6 +286,10 @@ async fn dispatch(
     // Arc so the chain can be cloned into the streaming-response body
     // (which outlives this handler) for end-of-stream output guardrails.
     let resolved_chain = std::sync::Arc::new(state.guardrail_index.resolve(&guardrail_ctx));
+    // Surface the applied `{kind, hook}` set to the caller so the telemetry
+    // event records which guardrails governed the request even when the input
+    // check below blocks it (#379 / closes the anthropic gap in #519).
+    *applied_out = resolved_chain.applied().to_vec();
     if !resolved_chain.is_empty() {
         if let Ok(chat) = aisix_provider_anthropic::parse_inbound_request(body) {
             if let aisix_guardrails::GuardrailVerdict::Block { reason } =
@@ -612,6 +639,9 @@ async fn anthropic_passthrough_dispatch(
         // #492: log the same client IP/UA on streamed responses.
         let client_ctx_c = client_ctx.clone();
 
+        // Applied guardrail set (#379), owned for the move into the
+        // end-of-stream telemetry closure.
+        let applied_guardrails_c = resolved_chain.applied().to_vec();
         let stream_guardrail = if resolved_chain.is_empty() {
             None
         } else {
@@ -651,6 +681,7 @@ async fn anthropic_passthrough_dispatch(
                     started.elapsed(),
                     metrics,
                     &client_ctx_c,
+                    applied_guardrails_c.clone(),
                 );
             },
         );
@@ -921,6 +952,9 @@ async fn cross_provider_dispatch(
         let started_for_telem = started;
         // #492: log the same client IP/UA on streamed responses.
         let client_for_telem = client.clone();
+        // Applied guardrail set (#379), owned for the move into the
+        // end-of-stream telemetry closure.
+        let applied_guardrails_for_telem = resolved_chain.applied().to_vec();
         let stream_guardrail = if resolved_chain.is_empty() {
             None
         } else {
@@ -958,6 +992,7 @@ async fn cross_provider_dispatch(
                     started_for_telem.elapsed(),
                     metrics,
                     &client_for_telem,
+                    applied_guardrails_for_telem.clone(),
                 );
             },
         );
@@ -1265,6 +1300,9 @@ fn emit_anthropic_usage_event(
     elapsed: Duration,
     metrics: AnthropicUsageMetrics,
     client: &ClientContext,
+    // The `{kind, hook}` set of guardrails that governed this request (#379).
+    // Empty for the guardrail-free path and pre-resolution failures.
+    applied_guardrails: Vec<AppliedGuardrail>,
 ) {
     // Per-PK telemetry attribution (#302 M17 / AISIX-Cloud#436).
     // Same shape as chat.rs's emit_usage_event — look up the
@@ -1303,6 +1341,7 @@ fn emit_anthropic_usage_event(
         byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        applied_guardrails,
         ..Default::default()
     };
     // Handler label "messages" — Anthropic /v1/messages inbound

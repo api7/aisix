@@ -14,8 +14,8 @@
 use std::sync::{Arc, Mutex};
 
 use aisix_core::models::{
-    AisixSnapshot, Guardrail as DomainGuardrail, GuardrailAttachment, GuardrailHookPoint,
-    GuardrailKind, GuardrailScopeType, KeywordPattern,
+    AisixSnapshot, AppliedGuardrail, Guardrail as DomainGuardrail, GuardrailAttachment,
+    GuardrailHookPoint, GuardrailKind, GuardrailScopeType, KeywordPattern,
 };
 use aisix_core::snapshot::ResourceTable;
 use aisix_core::SnapshotHandle;
@@ -43,6 +43,11 @@ pub fn build_chain_from_snapshot(
     bedrock_endpoint_url: Option<&str>,
 ) -> GuardrailChain {
     let mut chain: Vec<Arc<dyn Guardrail>> = Vec::new();
+    // `applied` mirrors `chain` 1:1 — the `{kind, hook}` of each member that
+    // actually materialised, for applied-guardrail telemetry (#379). Pushed
+    // only on the `Ok(Some)` path so inert/invalid rows (which never join the
+    // chain) never show up as "governed this request".
+    let mut applied: Vec<AppliedGuardrail> = Vec::new();
 
     let entries = table.entries();
     for entry in entries.iter() {
@@ -51,7 +56,10 @@ pub fn build_chain_from_snapshot(
             continue;
         }
         match build_one(row, bedrock_endpoint_url) {
-            Ok(Some(g)) => chain.push(g),
+            Ok(Some(g)) => {
+                chain.push(g);
+                applied.push(applied_for(row));
+            }
             Ok(None) => {
                 // Rule was technically valid but inert (e.g. empty
                 // keyword list). Skip silently — operators see this
@@ -68,7 +76,19 @@ pub fn build_chain_from_snapshot(
         }
     }
 
-    GuardrailChain::new(chain)
+    GuardrailChain::new_with_applied(chain, applied)
+}
+
+/// The `{kind, hook}` telemetry descriptor for a guardrail row that
+/// materialised into a chain (#379). Captured here — the build points are the
+/// only place the domain row's `kind` + `hook_point` are in scope alongside
+/// the runtime guardrail. `hook` is the configured hook_point, not a
+/// per-request verdict (v1 records the attached set, not which side fired).
+fn applied_for(row: &DomainGuardrail) -> AppliedGuardrail {
+    AppliedGuardrail {
+        kind: row.config.kind_str().to_owned(),
+        hook: row.hook_point.as_str().to_owned(),
+    }
 }
 
 fn build_one(
@@ -397,6 +417,7 @@ pub fn build_index_from_snapshot(
             attachment.scope_id.clone(),
             attachment.priority,
             runtime_guardrail,
+            applied_for(row),
         ));
     }
 
@@ -432,6 +453,7 @@ pub fn build_index_from_snapshot(
                     None,
                     0,
                     g,
+                    applied_for(row),
                 ));
             }
             Ok(None) => {}
@@ -1064,5 +1086,197 @@ mod tests {
             usage: UsageStats::new(0, 0),
         };
         assert!(!chain.check_output(&resp).await.is_block());
+    }
+
+    // -----------------------------------------------------------------------
+    // applied-guardrails capture (#379 A1)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn build_chain_reports_applied_kind_and_hook() {
+        // build_chain_from_snapshot is one of the two capture points: the
+        // resulting chain must report each materialised row's kind + hook,
+        // in the table's id-sorted iteration order.
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "kw-input",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "kw-input",
+                    "kind": "keyword",
+                    "hook_point": "input",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        table.insert(entry(
+            "kw-output",
+            "g-2",
+            parse(
+                r#"{
+                    "name": "kw-output",
+                    "kind": "keyword",
+                    "hook_point": "output",
+                    "patterns": [{ "kind": "literal", "value": "secret" }]
+                }"#,
+            ),
+        ));
+
+        let chain = build_chain_from_snapshot(&table, None);
+        // `applied` mirrors the chain 1:1 (pushed in lockstep); the absolute
+        // member order is a `ResourceTable::entries()` concern tested
+        // elsewhere, so sort by hook before comparing to pin only that BOTH
+        // rows are captured with the right kind + hook.
+        let mut applied = chain.applied().to_vec();
+        applied.sort_by(|a, b| a.hook.cmp(&b.hook));
+        assert_eq!(
+            applied,
+            vec![
+                AppliedGuardrail {
+                    kind: "keyword".to_owned(),
+                    hook: "input".to_owned(),
+                },
+                AppliedGuardrail {
+                    kind: "keyword".to_owned(),
+                    hook: "output".to_owned(),
+                },
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn applied_excludes_inert_and_disabled_rows() {
+        // `applied` is pushed only on Ok(Some) — it records what actually
+        // governs the request. An empty keyword list (inert / Ok(None)) and a
+        // disabled row (dropped) must not appear, so `applied` never claims a
+        // guardrail ran that didn't.
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "inert",
+            "g-1",
+            parse(r#"{ "name": "inert", "kind": "keyword", "patterns": [] }"#),
+        ));
+        table.insert(entry(
+            "off",
+            "g-2",
+            parse(
+                r#"{
+                    "name": "off",
+                    "enabled": false,
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "x" }]
+                }"#,
+            ),
+        ));
+        table.insert(entry(
+            "live",
+            "g-3",
+            parse(
+                r#"{
+                    "name": "live",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+
+        let chain = build_chain_from_snapshot(&table, None);
+        assert_eq!(chain.len(), 1, "only the live row materialises");
+        assert_eq!(
+            chain.applied(),
+            &[AppliedGuardrail {
+                kind: "keyword".to_owned(),
+                hook: "both".to_owned(),
+            }],
+            "applied reports only the row that actually governs the request",
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_chain_reports_applied_and_mirrors_dedup() {
+        // The per-request path (index.resolve, the capture point the proxy
+        // actually uses): the resolved chain reports each member's kind + hook,
+        // and `applied` mirrors the deduplicated chain 1:1 — a guardrail
+        // attached via two scopes still appears exactly once.
+        let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        guardrails.insert(entry(
+            "kw",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "kw",
+                    "kind": "keyword",
+                    "hook_point": "input",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        attachments.insert(attachment_entry(
+            "a-env",
+            parse_attachment(r#"{ "guardrail_id": "g-1", "scope_type": "env", "priority": 50 }"#),
+        ));
+        attachments.insert(attachment_entry(
+            "a-model",
+            parse_attachment(
+                r#"{ "guardrail_id": "g-1", "scope_type": "model", "scope_id": "m-A", "priority": 100 }"#,
+            ),
+        ));
+
+        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        let chain = index.resolve(&RequestContext {
+            model_id: "m-A",
+            api_key_id: "k",
+            team_id: None,
+        });
+        assert_eq!(chain.len(), 1, "dedup keeps a single runtime guardrail");
+        assert_eq!(
+            chain.applied(),
+            &[AppliedGuardrail {
+                kind: "keyword".to_owned(),
+                hook: "input".to_owned(),
+            }],
+            "applied mirrors the deduplicated chain, not the raw entry count",
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_chain_applied_empty_when_no_attachment_matches() {
+        // A model-scoped attachment that doesn't match the request resolves to
+        // an empty chain — and `applied` must be empty too, so the telemetry
+        // event never claims a guardrail governed a request it didn't.
+        let guardrails: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        guardrails.insert(entry(
+            "kw",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "kw",
+                    "kind": "keyword",
+                    "hook_point": "output",
+                    "patterns": [{ "kind": "literal", "value": "x" }]
+                }"#,
+            ),
+        ));
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        attachments.insert(attachment_entry(
+            "a-model",
+            parse_attachment(
+                r#"{ "guardrail_id": "g-1", "scope_type": "model", "scope_id": "m-A", "priority": 10 }"#,
+            ),
+        ));
+
+        let index = build_index_from_snapshot(&guardrails, &attachments, None);
+        let chain = index.resolve(&RequestContext {
+            model_id: "m-OTHER",
+            api_key_id: "k",
+            team_id: None,
+        });
+        assert!(chain.is_empty());
+        assert!(
+            chain.applied().is_empty(),
+            "no matching attachment → empty applied set",
+        );
     }
 }

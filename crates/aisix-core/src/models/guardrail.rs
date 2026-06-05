@@ -381,6 +381,44 @@ pub enum GuardrailKind {
     AliyunTextModeration(AliyunTextModerationConfig),
 }
 
+impl GuardrailKind {
+    /// The wire `kind` discriminator string — matches the cp-api kind enum
+    /// and the dashboard. Used for applied-guardrail telemetry.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            GuardrailKind::Keyword(_) => "keyword",
+            GuardrailKind::Bedrock(_) => "bedrock",
+            GuardrailKind::AzureContentSafety(_) => "azure_content_safety",
+            GuardrailKind::AzureContentSafetyTextModeration(_) => {
+                "azure_content_safety_text_moderation"
+            }
+            GuardrailKind::AliyunTextModeration(_) => "aliyun_text_moderation",
+        }
+    }
+}
+
+impl GuardrailHookPoint {
+    /// Lowercase wire string: "input" / "output" / "both".
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GuardrailHookPoint::Input => "input",
+            GuardrailHookPoint::Output => "output",
+            GuardrailHookPoint::Both => "both",
+        }
+    }
+}
+
+/// One guardrail that applied to a request, captured at chain-build time:
+/// the guardrail `kind` and the `hook` it's configured for. Carried on the
+/// telemetry UsageEvent so the dashboard can show which guardrails governed a
+/// request (#379 observability). v1 records the attached set (kind + hook),
+/// not per-guardrail verdicts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedGuardrail {
+    pub kind: String,
+    pub hook: String,
+}
+
 /// Top-level `Guardrail` resource shape. Mirrors what cp-api writes
 /// to kine at `/aisix/<env>/guardrails/<uuid>`.
 ///

@@ -9,6 +9,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use aisix_core::AppliedGuardrail;
 use aisix_gateway::{ChatFormat, ChatResponse};
 use async_trait::async_trait;
 
@@ -17,6 +18,13 @@ use crate::{Guardrail, GuardrailVerdict, StreamOutputPolicy};
 #[derive(Clone)]
 pub struct GuardrailChain {
     guardrails: Vec<Arc<dyn Guardrail>>,
+    /// The `{kind, hook}` of each guardrail that materialised into this
+    /// chain, captured at build time. Carried onto the telemetry
+    /// `UsageEvent` so the dashboard can show which guardrails governed a
+    /// request (#379). Empty for chains built via [`GuardrailChain::new`]
+    /// (the in-memory test path); populated by the snapshot build points
+    /// (`build_chain_from_snapshot` and `GuardrailIndex::resolve`).
+    applied: Vec<AppliedGuardrail>,
 }
 
 impl std::fmt::Debug for GuardrailChain {
@@ -30,7 +38,32 @@ impl std::fmt::Debug for GuardrailChain {
 
 impl GuardrailChain {
     pub fn new(guardrails: Vec<Arc<dyn Guardrail>>) -> Self {
-        Self { guardrails }
+        Self {
+            guardrails,
+            applied: Vec::new(),
+        }
+    }
+
+    /// Build a chain that also carries the `{kind, hook}` of each member
+    /// for applied-guardrail telemetry (#379). Used by the snapshot build
+    /// points; `applied` is expected to line up 1:1 with the materialised
+    /// `guardrails`, but the chain's runtime behaviour does not depend on
+    /// that — `applied` is telemetry-only.
+    pub fn new_with_applied(
+        guardrails: Vec<Arc<dyn Guardrail>>,
+        applied: Vec<AppliedGuardrail>,
+    ) -> Self {
+        Self {
+            guardrails,
+            applied,
+        }
+    }
+
+    /// The `{kind, hook}` set of guardrails that governed this request,
+    /// in chain order. Empty when the chain was built without applied
+    /// metadata (e.g. [`GuardrailChain::new`]).
+    pub fn applied(&self) -> &[AppliedGuardrail] {
+        &self.applied
     }
 
     pub fn empty() -> Self {
@@ -322,5 +355,25 @@ mod tests {
         let empty = GuardrailChain::new(vec![]);
         assert!(!empty.runs_on_output());
         assert!(!empty.stream_output_policy().holds_back());
+    }
+
+    #[test]
+    fn new_has_empty_applied_and_new_with_applied_reports_it() {
+        // `new` (the in-memory/test constructor) carries no applied metadata;
+        // `new_with_applied` (the snapshot build points) reports it verbatim.
+        assert!(GuardrailChain::new(vec![]).applied().is_empty());
+
+        let applied = vec![
+            AppliedGuardrail {
+                kind: "keyword".to_owned(),
+                hook: "input".to_owned(),
+            },
+            AppliedGuardrail {
+                kind: "aliyun_text_moderation".to_owned(),
+                hook: "both".to_owned(),
+            },
+        ];
+        let chain = GuardrailChain::new_with_applied(vec![], applied.clone());
+        assert_eq!(chain.applied(), applied.as_slice());
     }
 }
