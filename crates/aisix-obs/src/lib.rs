@@ -34,8 +34,8 @@ pub use otlp::{install_otlp_tracer, shutdown_otlp, OtlpError, OtlpHandle};
 pub use otlp_http_sink::OtlpHttpFanOut;
 pub use sink::{
     BatchUnit, ChannelKey, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink,
-    OrderingScope, SinkAck, SinkCapabilities, SinkContent, SinkError, SinkHealth, SinkRecord,
-    SinkResult, SCHEMA_VERSION,
+    OrderingScope, PipelineConfig, SinkAck, SinkCapabilities, SinkContent, SinkError, SinkHandle,
+    SinkHealth, SinkPipeline, SinkRecord, SinkResult, SinkStatsSnapshot, SCHEMA_VERSION,
 };
 pub use usage::{RoutingAttemptEvent, UsageEvent, UsageSink};
 
