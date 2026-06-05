@@ -8,7 +8,7 @@ AI Gateway public docs are maintained in the `api7/docs` repository under `docs/
 
 When asked to update AI Gateway docs:
 
-- Make content changes in the `api7/docs` repository under `docs/ai-gateway`.
+- Make content changes in the `api7/docs` repository under the `docs/ai-gateway/*` path.
 - Validate with the docs-site build or preview from the `api7/docs` repository.
 - Use this repository only to verify product behavior, generated schema/OpenAPI sources, or implementation details that the docs describe.
 
