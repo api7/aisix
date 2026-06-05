@@ -33,10 +33,10 @@ pub use metrics::{
 pub use otlp::{install_otlp_tracer, shutdown_otlp, OtlpError, OtlpHandle};
 pub use otlp_http_sink::{OtlpHttpFanOut, OtlpSink};
 pub use sink::{
-    BatchUnit, ChannelKey, EventBatch, ExporterPipelines, IdempotencyMarker, IdempotencyScheme,
-    ObservabilitySink, OrderingScope, PipelineConfig, SinkAck, SinkCapabilities, SinkContent,
-    SinkError, SinkHandle, SinkHealth, SinkPipeline, SinkRecord, SinkResult, SinkStatsSnapshot,
-    SCHEMA_VERSION,
+    AliyunSlsSink, BatchUnit, ChannelKey, EventBatch, ExporterPipelines, IdempotencyMarker,
+    IdempotencyScheme, ObservabilitySink, OrderingScope, PipelineConfig, SinkAck, SinkCapabilities,
+    SinkContent, SinkError, SinkHandle, SinkHealth, SinkPipeline, SinkRecord, SinkResult,
+    SinkStatsSnapshot, SCHEMA_VERSION,
 };
 pub use usage::{RoutingAttemptEvent, UsageEvent, UsageSink};
 

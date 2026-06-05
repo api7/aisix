@@ -29,6 +29,41 @@
           ]
         }
       }
+    },
+    {
+      "description": "Aliyun SLS (Simple Log Service) PutLogs target. Unlike `otlp_http`, the AccessKey is **never** part of this config: it would otherwise sit in plaintext on the kine path, and SLS keys grant broad account access. Instead the config carries a [`credential_ref`] pointer that the customer-side DP resolves to the real key locally (env / mounted secret); API7's control plane stores only the reference. This is what lets the DP run in the customer's environment without API7 ever holding the plaintext key.\n\n[`credential_ref`]: AliyunSlsConfig::credential_ref",
+      "type": "object",
+      "required": [
+        "credential_ref",
+        "endpoint",
+        "kind",
+        "logstore",
+        "project"
+      ],
+      "properties": {
+        "credential_ref": {
+          "description": "Opaque pointer to the AccessKey credential, resolved locally by the DP at delivery time. The plaintext AccessKey MUST NOT live in etcd/kine — the control plane stores only this reference, never the key itself. BYOK variants (customer KMS / uploaded key) resolve the same reference through a different unwrap path in a later phase.",
+          "type": "string"
+        },
+        "endpoint": {
+          "description": "SLS region endpoint host with no scheme, e.g. `ap-southeast-3.log.aliyuncs.com`. The request host the DP signs and posts to is `<project>.<endpoint>`.",
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "aliyun_sls"
+          ]
+        },
+        "logstore": {
+          "description": "SLS logstore that receives the request-event logs.",
+          "type": "string"
+        },
+        "project": {
+          "description": "SLS project name (the `<project>` in the request host).",
+          "type": "string"
+        }
+      }
     }
   ],
   "required": [

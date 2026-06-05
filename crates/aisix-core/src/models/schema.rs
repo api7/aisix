@@ -585,11 +585,14 @@ fn cache_policy_schema() -> Value {
 }
 
 fn observability_exporter_schema() -> Value {
-    // MVP: single discriminator value `otlp_http` whose fields land
-    // flat at the top level (matches the Guardrail wire shape — see
-    // `models/observability_exporter.rs` doc comment). Phase 2 adds
-    // `helicone` / `datadog_logs` / `s3_ndjson` as additional
-    // discriminator values with their own `if`/`then` branches below.
+    // Discriminated by `kind`; each branch's fields land flat at the top
+    // level (matches the Guardrail wire shape — see
+    // `models/observability_exporter.rs`). `additionalProperties` only
+    // considers THIS object's `properties` (not those inside `allOf`/`then`),
+    // so every kind's fields are listed at the top level as the union;
+    // per-kind required-fields and the endpoint pattern live in the
+    // `if`/`then` branches. Phase 2 adds `datadog_logs` / `s3_ndjson` the
+    // same way.
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -598,25 +601,52 @@ fn observability_exporter_schema() -> Value {
         "properties": {
             "name":    { "type": "string", "minLength": 1, "maxLength": 120 },
             "enabled": { "type": "boolean" },
-            "kind":    { "type": "string", "enum": ["otlp_http"] },
-            // otlp_http branch — flat fields.
-            "endpoint": {
-                "type": "string",
-                // Reject http:// and any non-URL by anchoring on https://.
-                // Loopback bypass for e2e: allow http://mock-otlp:* /
-                // http://127.0.0.1 / http://localhost so the compose
-                // test can wire a fake receiver without TLS.
-                "pattern": "^https://.+|^http://(mock-otlp|otel-collector|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$"
-            },
+            "kind":    { "type": "string", "enum": ["otlp_http", "aliyun_sls"] },
+            // Shared field; the per-kind pattern is enforced in the branches.
+            "endpoint": { "type": "string" },
+            // otlp_http field.
             "headers": {
                 "type": "object",
                 "additionalProperties": { "type": "string" }
-            }
+            },
+            // aliyun_sls fields. The AccessKey is NEVER here — only a
+            // `credential_ref` the DP resolves locally (no plaintext key on
+            // the kine path).
+            "project":        { "type": "string", "minLength": 1 },
+            "logstore":       { "type": "string", "minLength": 1 },
+            "credential_ref": { "type": "string", "minLength": 1 }
         },
         "allOf": [
             {
                 "if":   { "properties": { "kind": { "const": "otlp_http" } } },
-                "then": { "required": ["endpoint"] }
+                "then": {
+                    "required": ["endpoint"],
+                    "properties": {
+                        // Reject http:// and any non-URL by anchoring on
+                        // https://. Loopback bypass for e2e: allow
+                        // http://mock-otlp:* / otel-collector / 127.0.0.1 /
+                        // localhost so the compose test can wire a fake
+                        // receiver without TLS.
+                        "endpoint": {
+                            "pattern": "^https://.+|^http://(mock-otlp|otel-collector|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$"
+                        }
+                    }
+                }
+            },
+            {
+                "if":   { "properties": { "kind": { "const": "aliyun_sls" } } },
+                "then": {
+                    "required": ["endpoint", "project", "logstore", "credential_ref"],
+                    "properties": {
+                        // A bare SLS region host (the sink prepends
+                        // https://<project>.). Loopback bypass for e2e: a
+                        // scheme-qualified mock-sls / 127.0.0.1 / localhost
+                        // the sink posts to directly.
+                        "endpoint": {
+                            "pattern": "^[a-z0-9][a-z0-9.-]*\\.aliyuncs\\.com$|^http://(mock-sls|127\\.0\\.0\\.1|localhost)(:[0-9]+)?$"
+                        }
+                    }
+                }
             }
         ]
     })
@@ -1291,6 +1321,97 @@ mod tests {
             "risk_level_threshold": "none"
         });
         assert!(validate_guardrail(&v).is_err());
+    }
+
+    // ---- observability_exporter schema tests ----
+
+    #[test]
+    fn exporter_otlp_http_happy_path() {
+        let v = json!({
+            "name": "honeycomb",
+            "kind": "otlp_http",
+            "endpoint": "https://api.honeycomb.io/v1/traces",
+            "headers": { "x-honeycomb-team": "abc" }
+        });
+        validate_observability_exporter(&v).unwrap();
+    }
+
+    #[test]
+    fn exporter_otlp_http_rejects_plain_http_endpoint() {
+        let v = json!({
+            "name": "x",
+            "kind": "otlp_http",
+            "endpoint": "http://api.honeycomb.io/v1/traces"
+        });
+        assert!(validate_observability_exporter(&v).is_err());
+    }
+
+    #[test]
+    fn exporter_aliyun_sls_happy_path() {
+        let v = json!({
+            "name": "sls-prod",
+            "kind": "aliyun_sls",
+            "endpoint": "ap-southeast-3.log.aliyuncs.com",
+            "project": "aisix-obs",
+            "logstore": "request-events",
+            "credential_ref": "sls-prod"
+        });
+        validate_observability_exporter(&v).unwrap();
+    }
+
+    #[test]
+    fn exporter_aliyun_sls_allows_loopback_mock_endpoint() {
+        // The L2 e2e points the DP at a local mock SLS over http://.
+        let v = json!({
+            "name": "sls-e2e",
+            "kind": "aliyun_sls",
+            "endpoint": "http://mock-sls:9000",
+            "project": "p",
+            "logstore": "l",
+            "credential_ref": "mock"
+        });
+        validate_observability_exporter(&v).unwrap();
+    }
+
+    #[test]
+    fn exporter_aliyun_sls_requires_project_logstore_credential() {
+        for missing in ["project", "logstore", "credential_ref"] {
+            let mut v = json!({
+                "name": "x",
+                "kind": "aliyun_sls",
+                "endpoint": "ap-southeast-3.log.aliyuncs.com",
+                "project": "p",
+                "logstore": "l",
+                "credential_ref": "r"
+            });
+            v.as_object_mut().unwrap().remove(missing);
+            assert!(
+                validate_observability_exporter(&v).is_err(),
+                "missing `{missing}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn exporter_aliyun_sls_rejects_plaintext_credentials() {
+        // No AccessKey field is allowed at the schema layer either —
+        // `additionalProperties: false` rejects it before serde runs.
+        let v = json!({
+            "name": "x",
+            "kind": "aliyun_sls",
+            "endpoint": "ap-southeast-3.log.aliyuncs.com",
+            "project": "p",
+            "logstore": "l",
+            "credential_ref": "r",
+            "access_key_secret": "AKIASECRET"
+        });
+        assert!(validate_observability_exporter(&v).is_err());
+    }
+
+    #[test]
+    fn exporter_rejects_unknown_kind() {
+        let v = json!({ "name": "x", "kind": "splunk_hec", "endpoint": "https://x" });
+        assert!(validate_observability_exporter(&v).is_err());
     }
 
     // ---- rate_limit_policy schema tests ----

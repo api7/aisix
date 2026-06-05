@@ -48,6 +48,14 @@ mime = "0.3"
 # Trusted-proxy CIDR matching for real-ip resolution (#492)
 ipnet = "2"
 
+# Aliyun SLS sink (aisix-obs): the official protobuf + signature sub-crates
+# ONLY — not the full `aliyun-log-rust-sdk`, which forces reqwest native-tls
+# (OpenSSL) + ~13 C/TLS crates. Transport is our own rustls reqwest, so these
+# stay pure-Rust with no OpenSSL.
+aliyun-log-sdk-protobuf = "0.1"
+aliyun-log-sdk-sign = "0.2"
+lz4_flex = "0.11"
+
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "multipart"] }
 eventsource-stream = "0.2"

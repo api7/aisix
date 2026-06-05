@@ -32,14 +32,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aisix_core::models::{ExporterKind, ObservabilityExporter};
+use aisix_core::models::{AliyunSlsConfig, ExporterKind, ObservabilityExporter, OtlpHttpConfig};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::sink::{
-    BatchUnit, EventBatch, ExporterPipelines, IdempotencyMarker, IdempotencyScheme,
-    ObservabilitySink, OrderingScope, PipelineConfig, SinkAck, SinkCapabilities, SinkError,
-    SinkHealth, SinkRecord, SinkResult,
+    resolve_sls_credential, AliyunSlsSink, BatchUnit, EventBatch, ExporterPipelines,
+    IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope, PipelineConfig,
+    SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkRecord, SinkResult,
 };
 use crate::usage::UsageEvent;
 
@@ -52,12 +52,19 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// to AISIX in their own analytics. Not a contract; informational.
 const USER_AGENT: &str = concat!("aisix-dp/", env!("CARGO_PKG_VERSION"));
 
-/// Fans usage events out to every configured `otlp_http` exporter, each via
-/// its own [`crate::sink::SinkPipeline`] (batched, retried, backpressured).
-/// Cheap clonable handle; the per-exporter pipelines and the shared
-/// `reqwest::Client` live behind an `Arc`. Pipelines start lazily on first
-/// sighting of an exporter (immediately consistent with the snapshot) and are
-/// GC'd by [`OtlpHttpFanOut::gc`] when an exporter leaves it.
+/// Fans usage events out to every configured observability exporter — any
+/// [`ExporterKind`], dispatched per kind to the matching
+/// [`crate::sink::ObservabilitySink`] — each via its own
+/// [`crate::sink::SinkPipeline`] (batched, retried, backpressured). Cheap
+/// clonable handle; the per-exporter pipelines and the shared `reqwest::Client`
+/// live behind an `Arc`. Pipelines start lazily on first sighting of an
+/// exporter (immediately consistent with the snapshot) and are GC'd by
+/// [`OtlpHttpFanOut::gc`] when an exporter leaves it.
+///
+/// NOTE: the type name is historical — it drove only `otlp_http` originally
+/// and now fans out all kinds. A rename to `ExporterFanOut` (plus the
+/// `ProxyState::otlp_fan_out` field) is a mechanical, behaviour-preserving
+/// follow-up kept out of this change to avoid churning every call site.
 #[derive(Clone)]
 pub struct OtlpHttpFanOut {
     inner: Arc<FanOutInner>,
@@ -66,7 +73,7 @@ pub struct OtlpHttpFanOut {
 struct FanOutInner {
     /// Per-exporter delivery pipelines (one batched worker each).
     exporters: ExporterPipelines,
-    /// Shared HTTP client handed to every `OtlpSink` (connection-pool reuse).
+    /// Shared HTTP client handed to every sink (connection-pool reuse).
     client: reqwest::Client,
 }
 
@@ -97,10 +104,11 @@ impl OtlpHttpFanOut {
         }
     }
 
-    /// Fan one event out to every enabled `otlp_http` exporter, enqueuing it
-    /// into that exporter's pipeline (lazily started on first sighting). The
-    /// pipeline owns batching / retry / backpressure; enqueue is non-blocking,
-    /// so this never blocks the request hot path. Empty list = cheap no-op.
+    /// Fan one event out to every enabled exporter, dispatched per kind and
+    /// enqueued into that exporter's pipeline (lazily started on first
+    /// sighting). The pipeline owns batching / retry / backpressure; enqueue is
+    /// non-blocking, so this never blocks the request hot path. Empty list =
+    /// cheap no-op.
     pub fn fan_out<'a, I>(&self, event: &UsageEvent, exporters: I)
     where
         I: IntoIterator<Item = &'a ObservabilityExporter>,
@@ -111,32 +119,52 @@ impl OtlpHttpFanOut {
             if !exp.enabled {
                 continue;
             }
-            // Single-variant enum today; the spelled-out pattern forces a
-            // compile error here when a new ExporterKind variant is added.
-            let ExporterKind::OtlpHttp(cfg) = &exp.kind;
 
-            // Fingerprint the delivery-relevant config so a dashboard edit
-            // (endpoint / headers) rebuilds the exporter's pipeline.
-            let fingerprint = {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                cfg.endpoint.hash(&mut hasher);
-                cfg.headers.hash(&mut hasher);
-                hasher.finish()
-            };
-
+            // Dispatch on kind: each arm fingerprints its delivery-relevant
+            // config (so a dashboard edit rebuilds the pipeline) and lazily
+            // builds the matching sink. All kinds share one `ExporterPipelines`
+            // manager and the pooled client. A new `ExporterKind` variant
+            // makes this `match` non-exhaustive — a compile-time prompt to wire
+            // its sink here.
             let client = self.inner.client.clone();
-            let handle = self
-                .inner
-                .exporters
-                .get_or_create(&exp.name, fingerprint, move || {
-                    Arc::new(OtlpSink::new(
-                        exp.name.clone(),
-                        cfg.endpoint.clone(),
-                        cfg.headers.clone(),
-                        client,
-                    )) as Arc<dyn ObservabilitySink>
-                });
+            let handle = match &exp.kind {
+                ExporterKind::OtlpHttp(cfg) => {
+                    let fingerprint = fingerprint_otlp(cfg);
+                    let name = exp.name.clone();
+                    let endpoint = cfg.endpoint.clone();
+                    let headers = cfg.headers.clone();
+                    self.inner
+                        .exporters
+                        .get_or_create(&exp.name, fingerprint, move || {
+                            Arc::new(OtlpSink::new(name, endpoint, headers, client))
+                                as Arc<dyn ObservabilitySink>
+                        })
+                }
+                ExporterKind::AliyunSls(cfg) => {
+                    let fingerprint = fingerprint_sls(cfg);
+                    let name = exp.name.clone();
+                    let cfg = cfg.clone();
+                    self.inner
+                        .exporters
+                        .get_or_create(&exp.name, fingerprint, move || {
+                            // Resolve the AccessKey from the DP's local env at
+                            // build time (the key never rode the kine path).
+                            // Missing creds → empty key → SLS 401 surfaces as a
+                            // delivery-health auth error, not a silent drop.
+                            let (ak_id, ak_secret) =
+                                resolve_sls_credential(&cfg.credential_ref).unwrap_or_default();
+                            Arc::new(AliyunSlsSink::new(
+                                name,
+                                &cfg.endpoint,
+                                &cfg.project,
+                                &cfg.logstore,
+                                ak_id,
+                                ak_secret,
+                                client,
+                            )) as Arc<dyn ObservabilitySink>
+                        })
+                }
+            };
 
             let rec =
                 record.get_or_insert_with(|| Arc::new(SinkRecord::metadata_only(event.clone())));
@@ -145,8 +173,9 @@ impl OtlpHttpFanOut {
     }
 
     /// Stop pipelines for exporters no longer present in `live` (the current
-    /// snapshot's enabled `otlp_http` exporter names). Called periodically by
-    /// the server to GC pipelines for deleted / disabled exporters.
+    /// snapshot's enabled exporter names, across all kinds). Called
+    /// periodically by the server to GC pipelines for deleted / disabled
+    /// exporters.
     pub fn gc(&self, live: &std::collections::HashSet<String>) {
         self.inner.exporters.retain(live);
     }
@@ -161,6 +190,32 @@ impl Default for OtlpHttpFanOut {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Hash an `otlp_http` exporter's delivery-relevant config. A change to
+/// endpoint or headers yields a new fingerprint, so the manager rebuilds the
+/// exporter's pipeline against the edited target.
+fn fingerprint_otlp(cfg: &OtlpHttpConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cfg.endpoint.hash(&mut hasher);
+    cfg.headers.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Hash an `aliyun_sls` exporter's delivery-relevant config. The fingerprint
+/// covers only kine-visible fields (endpoint / project / logstore /
+/// credential_ref), never the resolved AccessKey — rotating the secret under
+/// the *same* reference therefore takes effect on the next DP restart, not
+/// live. A ref change does rebuild the pipeline.
+fn fingerprint_sls(cfg: &AliyunSlsConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cfg.endpoint.hash(&mut hasher);
+    cfg.project.hash(&mut hasher);
+    cfg.logstore.hash(&mut hasher);
+    cfg.credential_ref.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// An [`ObservabilitySink`] over the OTLP/HTTP-JSON traces protocol — the

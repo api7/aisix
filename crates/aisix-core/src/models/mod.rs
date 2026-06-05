@@ -37,7 +37,9 @@ pub use guardrail::{
 pub use model::{
     Adapter, BackgroundModelCheck, CooldownConfig, Model, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
-pub use observability_exporter::{ExporterKind, ObservabilityExporter, OtlpHttpConfig};
+pub use observability_exporter::{
+    AliyunSlsConfig, ExporterKind, ObservabilityExporter, OtlpHttpConfig,
+};
 pub use provider_key::{
     ParamConstraints, ProviderKey, RequestOverrides, ResponseOverrides, StreamDoneMarker,
     TelemetryTags,

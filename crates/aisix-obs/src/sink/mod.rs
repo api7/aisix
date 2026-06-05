@@ -16,6 +16,7 @@ mod capabilities;
 mod manager;
 mod pipeline;
 mod record;
+mod sls;
 
 pub use capabilities::{
     BatchUnit, ChannelKey, IdempotencyMarker, IdempotencyScheme, OrderingScope, SinkCapabilities,
@@ -23,6 +24,7 @@ pub use capabilities::{
 pub use manager::ExporterPipelines;
 pub use pipeline::{PipelineConfig, SinkHandle, SinkPipeline, SinkStatsSnapshot};
 pub use record::{EventBatch, SinkContent, SinkRecord, SCHEMA_VERSION};
+pub use sls::{resolve_sls_credential, AliyunSlsSink};
 
 use async_trait::async_trait;
 

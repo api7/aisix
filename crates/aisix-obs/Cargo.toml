@@ -29,6 +29,13 @@ reqwest.workspace = true
 uuid.workspace = true
 base64.workspace = true
 parking_lot.workspace = true
+# Aliyun SLS sink — official protobuf + signature sub-crates (pure-Rust),
+# lz4 block compression, and `http` types for sign_v1. Transport is reqwest
+# (rustls), so no native-tls / OpenSSL is pulled in.
+http.workspace = true
+aliyun-log-sdk-protobuf.workspace = true
+aliyun-log-sdk-sign.workspace = true
+lz4_flex.workspace = true
 
 [dev-dependencies]
 wiremock.workspace = true

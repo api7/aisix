@@ -10,9 +10,10 @@
 //! endpoint, which is the whole reason for DP-direct egress (sensitive
 //! prompt / response content stays on the data plane).
 //!
-//! MVP scope: `kind = "otlp_http"` only — covers Tempo / Loki / Jaeger
-//! / Honeycomb / Grafana Cloud / Langfuse-via-OTLP because all of them
-//! accept the OTLP/HTTP wire format.
+//! Kinds: `otlp_http` (Tempo / Loki / Jaeger / Honeycomb / Grafana Cloud /
+//! Langfuse-via-OTLP — anything speaking OTLP/HTTP) and `aliyun_sls`
+//! (Aliyun SLS PutLogs). Further targets (Datadog / S3 / …) land as
+//! additional kinds.
 //!
 //! Wire shape on kine — flat object with the kind-tagged config fields
 //! at top level, matching the `Guardrail` pattern in this crate:
@@ -33,10 +34,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::resource::Resource;
 
-/// Discriminated union of exporter back-ends. MVP ships only
-/// `otlp_http`; Helicone / Datadog / S3 land in follow-ups, each as a
-/// new variant whose serde tag matches the wire-side `kind`
-/// discriminator.
+/// Discriminated union of exporter back-ends. Ships `otlp_http` and
+/// `aliyun_sls`; Datadog / S3 / … land in follow-ups, each as a new
+/// variant whose serde tag matches the wire-side `kind` discriminator.
 ///
 /// `tag = "kind"` puts the variant tag inline with the inner struct's
 /// fields — same shape as `GuardrailKind` so the kine wire stays
@@ -45,6 +45,7 @@ use crate::resource::Resource;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExporterKind {
     OtlpHttp(OtlpHttpConfig),
+    AliyunSls(AliyunSlsConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
@@ -62,6 +63,38 @@ pub struct OtlpHttpConfig {
     /// `provider_keys`. Field-level encryption arrives in Phase 2.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+}
+
+/// Aliyun SLS (Simple Log Service) PutLogs target. Unlike `otlp_http`,
+/// the AccessKey is **never** part of this config: it would otherwise
+/// sit in plaintext on the kine path, and SLS keys grant broad account
+/// access. Instead the config carries a [`credential_ref`] pointer that
+/// the customer-side DP resolves to the real key locally (env / mounted
+/// secret); API7's control plane stores only the reference. This is what
+/// lets the DP run in the customer's environment without API7 ever
+/// holding the plaintext key.
+///
+/// [`credential_ref`]: AliyunSlsConfig::credential_ref
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AliyunSlsConfig {
+    /// SLS region endpoint host with no scheme, e.g.
+    /// `ap-southeast-3.log.aliyuncs.com`. The request host the DP signs
+    /// and posts to is `<project>.<endpoint>`.
+    pub endpoint: String,
+
+    /// SLS project name (the `<project>` in the request host).
+    pub project: String,
+
+    /// SLS logstore that receives the request-event logs.
+    pub logstore: String,
+
+    /// Opaque pointer to the AccessKey credential, resolved locally by
+    /// the DP at delivery time. The plaintext AccessKey MUST NOT live in
+    /// etcd/kine — the control plane stores only this reference, never the
+    /// key itself. BYOK variants (customer KMS / uploaded key) resolve the
+    /// same reference through a different unwrap path in a later phase.
+    pub credential_ref: String,
 }
 
 /// Top-level `ObservabilityExporter` resource. `deny_unknown_fields`
@@ -140,6 +173,7 @@ mod tests {
                     Some("abc123"),
                 );
             }
+            other => panic!("expected otlp_http, got {other:?}"),
         }
     }
 
@@ -158,6 +192,7 @@ mod tests {
                 .unwrap();
         match &e.kind {
             ExporterKind::OtlpHttp(c) => assert!(c.headers.is_empty()),
+            other => panic!("expected otlp_http, got {other:?}"),
         }
     }
 
@@ -198,5 +233,58 @@ mod tests {
         assert_eq!(v["kind"], "otlp_http");
         assert_eq!(v["endpoint"], "https://api.honeycomb.io/v1/traces");
         assert!(v.get("otlp_http").is_none(), "kind block must not nest");
+    }
+
+    const VALID_SLS: &str = r#"{
+        "name": "sls-prod",
+        "enabled": true,
+        "kind": "aliyun_sls",
+        "endpoint": "ap-southeast-3.log.aliyuncs.com",
+        "project": "aisix-obs",
+        "logstore": "request-events",
+        "credential_ref": "sls-prod"
+    }"#;
+
+    #[test]
+    fn deserialises_aliyun_sls() {
+        let e: ObservabilityExporter = serde_json::from_str(VALID_SLS).unwrap();
+        assert_eq!(e.name, "sls-prod");
+        assert!(e.enabled);
+        match &e.kind {
+            ExporterKind::AliyunSls(c) => {
+                assert_eq!(c.endpoint, "ap-southeast-3.log.aliyuncs.com");
+                assert_eq!(c.project, "aisix-obs");
+                assert_eq!(c.logstore, "request-events");
+                assert_eq!(c.credential_ref, "sls-prod");
+            }
+            other => panic!("expected aliyun_sls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aliyun_sls_round_trips_flat() {
+        let e: ObservabilityExporter = serde_json::from_str(VALID_SLS).unwrap();
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], "aliyun_sls");
+        assert_eq!(v["project"], "aisix-obs");
+        assert_eq!(v["credential_ref"], "sls-prod");
+        assert!(v.get("aliyun_sls").is_none(), "kind block must not nest");
+    }
+
+    #[test]
+    fn rejects_plaintext_credentials_in_config() {
+        // The AccessKey must NEVER be a config field — only a
+        // `credential_ref`. `deny_unknown_fields` on the inner config
+        // rejects any attempt to smuggle a plaintext key onto the kine path.
+        for key in ["access_key_secret", "access_key_id", "ak", "sk"] {
+            let json = format!(
+                r#"{{"name":"x","kind":"aliyun_sls","endpoint":"ap-southeast-3.log.aliyuncs.com","project":"p","logstore":"l","credential_ref":"r","{key}":"AKIASECRET"}}"#
+            );
+            let r: Result<ObservabilityExporter, _> = serde_json::from_str(&json);
+            assert!(
+                r.is_err(),
+                "plaintext credential field `{key}` must be rejected"
+            );
+        }
     }
 }
