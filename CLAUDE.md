@@ -2,6 +2,17 @@
 
 Behavioral guidelines to reduce common LLM coding mistakes. Bias toward caution over speed; for trivial tasks, use judgment. Merge with project-specific instructions as needed.
 
+## AI Gateway Docs Ownership
+
+AI Gateway public docs are maintained in the `api7/docs` repository under `docs/ai-gateway`. Do not edit `docs/**` in this repository for public documentation updates unless the docs migration strategy changes explicitly.
+
+When asked to update AI Gateway docs:
+
+- Make content changes in `/Users/test/Desktop/api7/docs/docs/ai-gateway`.
+- Validate with the docs-site build or preview from `/Users/test/Desktop/api7/docs`.
+- Use this repository only to verify product behavior, generated schema/OpenAPI sources, or implementation details that the docs describe.
+- Do not delete the existing `docs/` content in this repository until the docs-site PR is polished, approved, and ready for the intentional cleanup step.
+
 ## 1. Think Before Coding
 
 **Don't assume. Don't hide confusion. Surface tradeoffs.**
