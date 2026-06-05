@@ -66,6 +66,9 @@ pub const M_USAGE_EVENT_DROPS_TOTAL: &str = "aisix_usage_event_drops_total";
 /// events — a remote-API guardrail's upstream was unreachable but `fail_open`
 /// let the request through — sliced by the bounded DP-internal `reason`
 /// (e.g. `bedrock_5xx` / `bedrock_timeout` / `bedrock_throttled`).
+///
+/// Scope: recorded for `/v1/chat/completions` only until #519 brings the
+/// `/v1/messages` path in — read these as chat-path, not gateway-wide.
 pub const M_GUARDRAIL_BLOCKS_TOTAL: &str = "aisix_guardrail_blocks_total";
 pub const M_GUARDRAIL_BYPASSES_TOTAL: &str = "aisix_guardrail_bypasses_total";
 /// Issue #408: counter for UsageEvents successfully enqueued onto the
@@ -811,9 +814,14 @@ mod tests {
             rendered.contains(&format!("{M_GUARDRAIL_BLOCKS_TOTAL} 1")),
             "want one block, got:\n{rendered}"
         );
-        // One bypass, sliced by the bounded reason.
-        assert!(rendered.contains(M_GUARDRAIL_BYPASSES_TOTAL));
-        assert!(rendered.contains("reason=\"bedrock_5xx\""));
+        // Exactly one bypass, sliced by the bounded reason — pinning the count
+        // proves the blocked + clean calls didn't touch the bypass counter.
+        assert!(
+            rendered.contains(&format!(
+                "{M_GUARDRAIL_BYPASSES_TOTAL}{{reason=\"bedrock_5xx\"}} 1"
+            )),
+            "want exactly one bedrock_5xx bypass, got:\n{rendered}"
+        );
     }
 
     #[test]
