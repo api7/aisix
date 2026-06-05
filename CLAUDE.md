@@ -2,7 +2,7 @@
 
 Behavioral guidelines to reduce common LLM coding mistakes. Bias toward caution over speed; for trivial tasks, use judgment. Merge with project-specific instructions as needed.
 
-## AI Gateway Docs Ownership
+## AI Gateway Docs Update Strategy
 
 AI Gateway public docs are maintained in the `api7/docs` repository under `docs/ai-gateway`.
 
