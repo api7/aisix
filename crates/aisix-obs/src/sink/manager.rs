@@ -1,14 +1,20 @@
 //! Per-exporter pipeline manager.
 //!
-//! Owns one [`SinkPipeline`] per configured exporter and keeps the running
-//! set reconciled against the desired set (the etcd snapshot's exporters).
-//! The request hot path enqueues a record into every running pipeline; a
-//! reconcile loop (driven by snapshot version changes) starts pipelines for
-//! new exporters, stops removed ones, and rebuilds reconfigured ones.
+//! Owns one [`SinkPipeline`] per configured exporter. The request hot path
+//! resolves an exporter's pipeline with [`ExporterPipelines::get_or_create`]
+//! — lazily starting it on first sighting, and rebuilding it when the
+//! exporter's config changes — then enqueues into the returned handle. A
+//! periodic [`ExporterPipelines::retain`] stops pipelines for exporters that
+//! left the snapshot.
 //!
-//! Shared by every pipeline-backed sink family (`otlp`, `http_batch`, …) —
-//! the manager is sink-agnostic: the caller supplies a `build` closure that
-//! turns one desired spec into an [`ObservabilitySink`].
+//! Lazy-on-first-sighting mirrors the previous `OtlpHttpFanOut` permit map:
+//! it is immediately consistent with the snapshot (a just-added exporter
+//! receives the very next request), avoiding the reconcile-loop race where a
+//! newly-added exporter would miss requests until the next poll.
+//!
+//! Sink-agnostic — the caller supplies a `build` closure mapping an exporter
+//! to an [`ObservabilitySink`], so the manager is shared by every
+//! pipeline-backed sink family (`otlp`, `http_batch`, …).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -17,17 +23,16 @@ use parking_lot::Mutex;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use super::{
-    ObservabilitySink, PipelineConfig, SinkHandle, SinkPipeline, SinkRecord, SinkStatsSnapshot,
-};
+use super::{ObservabilitySink, PipelineConfig, SinkHandle, SinkPipeline, SinkStatsSnapshot};
 
 /// One running pipeline plus the bookkeeping needed to stop/rebuild it.
 struct Running {
-    /// Hash of the exporter's delivery-relevant config. A change rebuilds
-    /// the pipeline (old stops, new starts).
+    /// Hash of the exporter's delivery-relevant config. A change rebuilds the
+    /// pipeline (old stops, new starts).
     fingerprint: u64,
     handle: SinkHandle,
     cancel: watch::Sender<bool>,
+    /// Detached worker; awaited only on graceful [`ExporterPipelines::shutdown`].
     worker: JoinHandle<()>,
 }
 
@@ -38,9 +43,8 @@ pub struct ExporterPipelines {
 }
 
 impl ExporterPipelines {
-    /// Build an empty manager. Pipelines appear on the first [`reconcile`].
-    ///
-    /// [`reconcile`]: ExporterPipelines::reconcile
+    /// Build an empty manager. Pipelines start on first
+    /// [`get_or_create`](Self::get_or_create).
     pub fn new(cfg: PipelineConfig) -> Self {
         Self {
             running: Mutex::new(HashMap::new()),
@@ -53,79 +57,63 @@ impl ExporterPipelines {
         self.running.lock().len()
     }
 
-    /// True when no pipeline is running (no exporters configured).
+    /// True when no pipeline is running.
     pub fn is_empty(&self) -> bool {
         self.running.lock().is_empty()
     }
 
-    /// Enqueue `record` into every running pipeline (fan-out). Non-blocking:
-    /// a full queue drops the record on that pipeline (counted there). Cheap
-    /// — the record is `Arc`-shared, so each pipeline gets a pointer clone.
-    pub fn enqueue_to_all(&self, record: &Arc<SinkRecord>) {
-        let running = self.running.lock();
-        for pipeline in running.values() {
-            pipeline.handle.try_enqueue(Arc::clone(record));
+    /// Resolve the pipeline handle for exporter `key`, lazily starting it via
+    /// `build` on first sighting — or rebuilding it (stop old, start new) when
+    /// `fingerprint` changed (the exporter's config was updated). `build` runs
+    /// only when a (re)start is needed; an unchanged exporter just returns its
+    /// existing handle. The returned handle is cheap to clone and enqueue into.
+    pub fn get_or_create(
+        &self,
+        key: &str,
+        fingerprint: u64,
+        build: impl FnOnce() -> Arc<dyn ObservabilitySink>,
+    ) -> SinkHandle {
+        let mut running = self.running.lock();
+        if let Some(existing) = running.get(key) {
+            if existing.fingerprint == fingerprint {
+                return existing.handle.clone();
+            }
+            // Config changed — stop the stale pipeline, then rebuild below.
+            if let Some(old) = running.remove(key) {
+                let _ = old.cancel.send(true);
+                tracing::info!(exporter = %key, "rebuilding reconfigured exporter pipeline");
+            }
         }
+        let sink = build();
+        let (handle, pipeline) = SinkPipeline::new(sink, self.cfg.clone());
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let worker = tokio::spawn(pipeline.run(cancel_rx));
+        running.insert(
+            key.to_string(),
+            Running {
+                fingerprint,
+                handle: handle.clone(),
+                cancel: cancel_tx,
+                worker,
+            },
+        );
+        handle
     }
 
-    /// Reconcile the running pipelines against `desired`:
-    /// - start a pipeline for every desired key that isn't running;
-    /// - stop pipelines whose key is no longer desired;
-    /// - rebuild a pipeline whose `fingerprint` changed (stop old, start new).
-    ///
-    /// `build` is invoked only for new or changed exporters, so unchanged
-    /// pipelines keep running untouched. Stopped pipelines drain their queue
-    /// and exit on their own (cancel signal); they are not aborted.
-    pub fn reconcile<T>(
-        &self,
-        desired: &[T],
-        key: impl Fn(&T) -> String,
-        fingerprint: impl Fn(&T) -> u64,
-        build: impl Fn(&T) -> Arc<dyn ObservabilitySink>,
-    ) {
+    /// Stop pipelines whose exporter key is not in `live`. Stopped pipelines
+    /// drain their queue and exit on their own (cancel signal); they are not
+    /// aborted. Called periodically to GC exporters that left the snapshot.
+    pub fn retain(&self, live: &HashSet<String>) {
         let mut running = self.running.lock();
-
-        // Stop pipelines whose exporter disappeared.
-        let desired_keys: HashSet<String> = desired.iter().map(&key).collect();
-        running.retain(|name, pipeline| {
-            if desired_keys.contains(name) {
+        running.retain(|key, pipeline| {
+            if live.contains(key) {
                 true
             } else {
                 let _ = pipeline.cancel.send(true);
-                tracing::info!(exporter = %name, "stopping removed exporter pipeline");
+                tracing::info!(exporter = %key, "stopping removed exporter pipeline");
                 false
             }
         });
-
-        // Start new / rebuild changed.
-        for spec in desired {
-            let name = key(spec);
-            let fp = fingerprint(spec);
-            match running.get(&name) {
-                Some(existing) if existing.fingerprint == fp => continue,
-                Some(_) => {
-                    if let Some(old) = running.remove(&name) {
-                        let _ = old.cancel.send(true);
-                        tracing::info!(exporter = %name, "rebuilding reconfigured exporter pipeline");
-                    }
-                }
-                None => {}
-            }
-
-            let sink = build(spec);
-            let (handle, pipeline) = SinkPipeline::new(sink, self.cfg.clone());
-            let (cancel_tx, cancel_rx) = watch::channel(false);
-            let worker = tokio::spawn(pipeline.run(cancel_rx));
-            running.insert(
-                name,
-                Running {
-                    fingerprint: fp,
-                    handle,
-                    cancel: cancel_tx,
-                    worker,
-                },
-            );
-        }
     }
 
     /// Per-exporter delivery stats, keyed by exporter name (health/dashboard).
@@ -133,7 +121,7 @@ impl ExporterPipelines {
         self.running
             .lock()
             .iter()
-            .map(|(name, pipeline)| (name.clone(), pipeline.handle.stats()))
+            .map(|(key, pipeline)| (key.clone(), pipeline.handle.stats()))
             .collect()
     }
 
@@ -160,8 +148,7 @@ mod tests {
     use crate::usage::UsageEvent;
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-    /// A sink that adds each delivered batch's size to a shared counter, so
-    /// tests can assert total fan-out delivery without tracking each sink.
+    /// A sink that adds each delivered batch's size to a shared counter.
     struct CountingSink {
         delivered: Arc<AtomicUsize>,
     }
@@ -197,12 +184,6 @@ mod tests {
         }
     }
 
-    /// A desired exporter spec for the test reconcile calls.
-    struct Spec {
-        name: &'static str,
-        fp: u64,
-    }
-
     fn rec() -> Arc<SinkRecord> {
         Arc::new(SinkRecord::metadata_only(UsageEvent::default()))
     }
@@ -217,142 +198,66 @@ mod tests {
         ExporterPipelines::new(cfg)
     }
 
-    #[tokio::test]
-    async fn reconcile_starts_a_pipeline_per_exporter() {
-        let mgr = manager();
-        let delivered = Arc::new(AtomicUsize::new(0));
-        let d = Arc::clone(&delivered);
-        mgr.reconcile(
-            &[Spec { name: "a", fp: 1 }, Spec { name: "b", fp: 1 }],
-            |s| s.name.to_string(),
-            |s| s.fp,
-            move |_| {
-                Arc::new(CountingSink {
-                    delivered: Arc::clone(&d),
-                }) as Arc<dyn ObservabilitySink>
-            },
-        );
-        assert_eq!(mgr.len(), 2);
-        assert!(!mgr.is_empty());
+    /// A `build` closure that counts invocations and shares a delivery counter.
+    fn counting(
+        builds: &Arc<AtomicU32>,
+        delivered: &Arc<AtomicUsize>,
+    ) -> impl FnOnce() -> Arc<dyn ObservabilitySink> {
+        let builds = Arc::clone(builds);
+        let delivered = Arc::clone(delivered);
+        move || {
+            builds.fetch_add(1, Ordering::Relaxed);
+            Arc::new(CountingSink { delivered }) as Arc<dyn ObservabilitySink>
+        }
     }
 
     #[tokio::test]
-    async fn enqueue_fans_out_to_every_pipeline() {
-        let mgr = manager();
-        let delivered = Arc::new(AtomicUsize::new(0));
-        let d = Arc::clone(&delivered);
-        mgr.reconcile(
-            &[Spec { name: "a", fp: 1 }, Spec { name: "b", fp: 1 }],
-            |s| s.name.to_string(),
-            |s| s.fp,
-            move |_| {
-                Arc::new(CountingSink {
-                    delivered: Arc::clone(&d),
-                }) as Arc<dyn ObservabilitySink>
-            },
-        );
-        mgr.enqueue_to_all(&rec());
-        mgr.shutdown().await; // drains both pipelines
-
-        assert_eq!(
-            delivered.load(Ordering::Relaxed),
-            2,
-            "one record to each of two sinks"
-        );
-    }
-
-    #[tokio::test]
-    async fn reconcile_stops_removed_exporters() {
-        let mgr = manager();
-        let d = Arc::new(AtomicUsize::new(0));
-        let build = |d: Arc<AtomicUsize>| {
-            move |_: &Spec| {
-                Arc::new(CountingSink {
-                    delivered: Arc::clone(&d),
-                }) as Arc<dyn ObservabilitySink>
-            }
-        };
-        mgr.reconcile(
-            &[Spec { name: "a", fp: 1 }, Spec { name: "b", fp: 1 }],
-            |s| s.name.to_string(),
-            |s| s.fp,
-            build(Arc::clone(&d)),
-        );
-        assert_eq!(mgr.len(), 2);
-
-        mgr.reconcile(
-            &[Spec { name: "a", fp: 1 }],
-            |s| s.name.to_string(),
-            |s| s.fp,
-            build(Arc::clone(&d)),
-        );
-        assert_eq!(mgr.len(), 1, "exporter b's pipeline was stopped");
-    }
-
-    #[tokio::test]
-    async fn reconcile_is_idempotent_for_unchanged_exporters() {
+    async fn get_or_create_starts_once_and_reuses() {
         let mgr = manager();
         let builds = Arc::new(AtomicU32::new(0));
-        let d = Arc::new(AtomicUsize::new(0));
-        let make = |builds: Arc<AtomicU32>, d: Arc<AtomicUsize>| {
-            move |_: &Spec| {
-                builds.fetch_add(1, Ordering::Relaxed);
-                Arc::new(CountingSink {
-                    delivered: Arc::clone(&d),
-                }) as Arc<dyn ObservabilitySink>
-            }
-        };
-        let specs = [Spec { name: "a", fp: 1 }];
-        mgr.reconcile(
-            &specs,
-            |s| s.name.to_string(),
-            |s| s.fp,
-            make(Arc::clone(&builds), Arc::clone(&d)),
-        );
-        mgr.reconcile(
-            &specs,
-            |s| s.name.to_string(),
-            |s| s.fp,
-            make(Arc::clone(&builds), Arc::clone(&d)),
-        );
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let h1 = mgr.get_or_create("a", 1, counting(&builds, &delivered));
+        let h2 = mgr.get_or_create("a", 1, counting(&builds, &delivered));
         assert_eq!(
             builds.load(Ordering::Relaxed),
             1,
-            "unchanged exporter is not rebuilt"
+            "second call reuses the pipeline"
         );
         assert_eq!(mgr.len(), 1);
+
+        // Both handles point at the same pipeline.
+        h1.try_enqueue(rec());
+        h2.try_enqueue(rec());
+        mgr.shutdown().await;
+        assert_eq!(delivered.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
-    async fn reconcile_rebuilds_on_fingerprint_change() {
+    async fn get_or_create_rebuilds_on_fingerprint_change() {
         let mgr = manager();
         let builds = Arc::new(AtomicU32::new(0));
-        let d = Arc::new(AtomicUsize::new(0));
-        let make = |builds: Arc<AtomicU32>, d: Arc<AtomicUsize>| {
-            move |_: &Spec| {
-                builds.fetch_add(1, Ordering::Relaxed);
-                Arc::new(CountingSink {
-                    delivered: Arc::clone(&d),
-                }) as Arc<dyn ObservabilitySink>
-            }
-        };
-        mgr.reconcile(
-            &[Spec { name: "a", fp: 1 }],
-            |s| s.name.to_string(),
-            |s| s.fp,
-            make(Arc::clone(&builds), Arc::clone(&d)),
-        );
-        mgr.reconcile(
-            &[Spec { name: "a", fp: 2 }],
-            |s| s.name.to_string(),
-            |s| s.fp,
-            make(Arc::clone(&builds), Arc::clone(&d)),
-        );
+        let delivered = Arc::new(AtomicUsize::new(0));
+        mgr.get_or_create("a", 1, counting(&builds, &delivered));
+        mgr.get_or_create("a", 2, counting(&builds, &delivered));
         assert_eq!(
             builds.load(Ordering::Relaxed),
             2,
             "config change rebuilds the pipeline"
         );
         assert_eq!(mgr.len(), 1, "still exactly one pipeline for exporter a");
+    }
+
+    #[tokio::test]
+    async fn retain_stops_absent_exporters() {
+        let mgr = manager();
+        let builds = Arc::new(AtomicU32::new(0));
+        let delivered = Arc::new(AtomicUsize::new(0));
+        mgr.get_or_create("a", 1, counting(&builds, &delivered));
+        mgr.get_or_create("b", 1, counting(&builds, &delivered));
+        assert_eq!(mgr.len(), 2);
+
+        let live: HashSet<String> = ["a".to_string()].into_iter().collect();
+        mgr.retain(&live);
+        assert_eq!(mgr.len(), 1, "exporter b's pipeline was stopped");
     }
 }

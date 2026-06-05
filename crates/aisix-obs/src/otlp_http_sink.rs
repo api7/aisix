@@ -1,53 +1,45 @@
-//! Per-env OTLP/HTTP exporter — emits one OTLP-shaped POST per chat
-//! request to each configured `ObservabilityExporter` (kind=otlp_http).
+//! Per-env OTLP/HTTP exporter — emits one OTLP-shaped span per chat request
+//! to each configured `ObservabilityExporter` (kind=otlp_http).
 //!
 //! ## Design
 //!
 //! cp-api projects every configured exporter onto kine at
-//! `/aisix/<env>/observability_exporters/<uuid>`. The DP loads them
-//! via the existing etcd watch into
-//! `AisixSnapshot::observability_exporters`. After every chat
-//! completion the proxy hot path hands the resulting `UsageEvent` plus
-//! the live snapshot's exporter list to [`fan_out`], which:
+//! `/aisix/<env>/observability_exporters/<uuid>`. The DP loads them via the
+//! existing etcd watch into `AisixSnapshot::observability_exporters`. After
+//! every chat completion the proxy hot path hands the resulting `UsageEvent`
+//! plus the live snapshot's exporter list to [`OtlpHttpFanOut::fan_out`],
+//! which:
 //!
 //! 1. Filters to enabled exporters with `kind = OtlpHttp`.
-//! 2. Builds one OTLP/HTTP-JSON span per exporter, encoded per
+//! 2. Resolves each exporter's [`crate::sink::SinkPipeline`] (lazily started
+//!    on first sighting, immediately consistent with the snapshot) and
+//!    enqueues one OTLP span record into it. The pipeline batches, retries
+//!    transient failures with backoff, and drops-with-metric under
+//!    backpressure — all off the request hot path. Spans are encoded per
 //!    OpenTelemetry's GenAI semantic conventions
 //!    (<https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md>).
-//! 3. Spawns a fire-and-forget tokio task per (event, exporter) pair
-//!    that POSTs the span. Failures get a `tracing::warn!` and are
-//!    dropped — observability MUST NOT block the request hot path.
 //!
-//! ## What's intentionally NOT in MVP
+//! ## What's intentionally NOT here yet
 //!
-//! - **No batching** — one HTTP POST per request per exporter. Phase 2
-//!   will move to a worker-task model with a bounded mpsc + 1s flush
-//!   interval once the patterns are exercised by real load.
-//! - **No retry / backoff** — best-effort fire-and-forget. If the
-//!   user's OTLP receiver is unreachable the span is lost. Phase 2
-//!   adds a tiny exponential-backoff wrapper.
-//! - **No gRPC** — `otlp_grpc` is a separate kind we'll add when a
-//!   user actually asks for it; the JSON-over-HTTP form works against
-//!   every receiver in the wild and avoids pulling in tonic on the
-//!   hot path.
-//! - **No content_mode redaction** — defaults to `metadata_only`
-//!   (no prompt/response bodies in the span). The MVP cannot leak
-//!   user content because it never accepts content fields in the
-//!   first place.
+//! - **No gRPC** — `otlp_grpc` is a separate kind we'll add when a user
+//!   actually asks for it; the JSON-over-HTTP form works against every
+//!   receiver in the wild and avoids pulling in tonic on the hot path.
+//! - **No content_mode redaction** — defaults to `metadata_only` (no
+//!   prompt/response bodies in the span). The record never carries content
+//!   fields, so it cannot leak.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_core::models::{ExporterKind, ObservabilityExporter};
 use async_trait::async_trait;
-use parking_lot::Mutex;
 use serde_json::{json, Value};
-use tokio::sync::Semaphore;
 
 use crate::sink::{
-    BatchUnit, EventBatch, IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope,
-    SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkResult,
+    BatchUnit, EventBatch, ExporterPipelines, IdempotencyMarker, IdempotencyScheme,
+    ObservabilitySink, OrderingScope, PipelineConfig, SinkAck, SinkCapabilities, SinkError,
+    SinkHealth, SinkRecord, SinkResult,
 };
 use crate::usage::UsageEvent;
 
@@ -56,46 +48,36 @@ use crate::usage::UsageEvent;
 /// tasks for a wedged user receiver.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Maximum concurrent in-flight POSTs per exporter. Past this point we
-/// drop further events on the request hot path rather than queueing
-/// them — the queue would just grow unbounded behind a slow receiver,
-/// hold the per-event JSON body in memory, and eventually OOM the DP.
-/// 64 is generous enough that a healthy receiver never trips the cap
-/// (even at a sustained 100 RPS, a 200 ms p50 keeps in-flight under
-/// 20) but still bounds the worst case to ~64 × payload-size bytes.
-/// See issue #113.
-const MAX_INFLIGHT_PER_EXPORTER: usize = 64;
-
 /// `User-Agent` header so vendor receivers can attribute traces back
 /// to AISIX in their own analytics. Not a contract; informational.
 const USER_AGENT: &str = concat!("aisix-dp/", env!("CARGO_PKG_VERSION"));
 
-/// Cheap clonable handle the proxy hands to request handlers. Holds a
-/// reusable `reqwest::Client` so connection pools survive across
-/// requests — even with per-event POSTs the kept-alive socket
-/// amortises TLS for the common case where one DP exports to one
-/// vendor.
-///
-/// Per-exporter concurrency is bounded: a [`Semaphore`] with
-/// [`MAX_INFLIGHT_PER_EXPORTER`] permits is created lazily on first
-/// sighting of each exporter name. When the cap is hit, further events
-/// for that exporter are *dropped* on the hot path (logged at debug)
-/// rather than queued. This is intentional — the alternative is letting
-/// task count + memory grow unbounded behind a slow receiver, which
-/// caused real OOMs in production. See issue #113.
-#[derive(Debug, Clone)]
+/// Fans usage events out to every configured `otlp_http` exporter, each via
+/// its own [`crate::sink::SinkPipeline`] (batched, retried, backpressured).
+/// Cheap clonable handle; the per-exporter pipelines and the shared
+/// `reqwest::Client` live behind an `Arc`. Pipelines start lazily on first
+/// sighting of an exporter (immediately consistent with the snapshot) and are
+/// GC'd by [`OtlpHttpFanOut::gc`] when an exporter leaves it.
+#[derive(Clone)]
 pub struct OtlpHttpFanOut {
     inner: Arc<FanOutInner>,
 }
 
-#[derive(Debug)]
 struct FanOutInner {
+    /// Per-exporter delivery pipelines (one batched worker each).
+    exporters: ExporterPipelines,
+    /// Shared HTTP client handed to every `OtlpSink` (connection-pool reuse).
     client: reqwest::Client,
-    /// Per-exporter semaphores keyed by name. Created lazily; never
-    /// pruned (a Semaphore is small and the operator's exporter set
-    /// is bounded by configuration). The Mutex is parking_lot so
-    /// uncontended lookups are basically a single atomic load.
-    permits: Mutex<HashMap<String, Arc<Semaphore>>>,
+}
+
+/// Delivery tuning for otlp exporter pipelines. A short flush keeps a
+/// single-request span visible quickly (the old fan-out posted each event
+/// immediately); batching + retry + drop accounting come from the pipeline.
+fn exporter_pipeline_config() -> PipelineConfig {
+    PipelineConfig {
+        flush_interval: Duration::from_secs(1),
+        ..PipelineConfig::default()
+    }
 }
 
 impl OtlpHttpFanOut {
@@ -109,102 +91,69 @@ impl OtlpHttpFanOut {
             .expect("reqwest::Client default config is valid");
         Self {
             inner: Arc::new(FanOutInner {
+                exporters: ExporterPipelines::new(exporter_pipeline_config()),
                 client,
-                permits: Mutex::new(HashMap::new()),
             }),
         }
     }
 
-    /// Look up (or lazily insert) the per-exporter permit semaphore.
-    /// Returning `Arc<Semaphore>` lets the spawned task hold the permit
-    /// past `fan_out`'s lifetime — the permit drops with the task.
-    fn permits_for(&self, exporter_name: &str) -> Arc<Semaphore> {
-        let mut guard = self.inner.permits.lock();
-        if let Some(sem) = guard.get(exporter_name) {
-            return Arc::clone(sem);
-        }
-        let sem = Arc::new(Semaphore::new(MAX_INFLIGHT_PER_EXPORTER));
-        guard.insert(exporter_name.to_string(), Arc::clone(&sem));
-        sem
-    }
-
-    /// Test-only: how many in-flight slots are currently held for
-    /// `exporter_name`. Used by tests to assert the bounded-fan-out
-    /// invariant. Returns 0 if the exporter has never been seen.
-    #[doc(hidden)]
-    pub fn in_flight_for(&self, exporter_name: &str) -> usize {
-        let guard = self.inner.permits.lock();
-        match guard.get(exporter_name) {
-            Some(sem) => MAX_INFLIGHT_PER_EXPORTER.saturating_sub(sem.available_permits()),
-            None => 0,
-        }
-    }
-
-    /// Fan out one event to every enabled `otlp_http` exporter in the
-    /// supplied list. Returns immediately — the actual POSTs run on
-    /// detached tokio tasks and never block the caller.
-    ///
-    /// Per-exporter concurrency is capped at
-    /// [`MAX_INFLIGHT_PER_EXPORTER`]. Past the cap, further events for
-    /// that exporter are dropped (logged at `debug`) — the alternative
-    /// is unbounded queueing behind a slow / down receiver, which OOMs
-    /// the DP. See issue #113.
-    ///
-    /// The `exporters` slice is what the proxy's snapshot lookup
-    /// returns. Empty slice = no-op (the common case for envs that
-    /// haven't configured any exporters yet, so this is the cheap
-    /// path).
+    /// Fan one event out to every enabled `otlp_http` exporter, enqueuing it
+    /// into that exporter's pipeline (lazily started on first sighting). The
+    /// pipeline owns batching / retry / backpressure; enqueue is non-blocking,
+    /// so this never blocks the request hot path. Empty list = cheap no-op.
     pub fn fan_out<'a, I>(&self, event: &UsageEvent, exporters: I)
     where
         I: IntoIterator<Item = &'a ObservabilityExporter>,
     {
+        // Build the record once, and only if there is at least one exporter.
+        let mut record: Option<Arc<SinkRecord>> = None;
         for exp in exporters {
             if !exp.enabled {
                 continue;
             }
-            // Single-variant enum today; the `let ExporterKind::OtlpHttp`
-            // pattern is exhaustive but deliberately written with the
-            // type tag spelled out so adding a new variant in Phase 2
-            // forces a compile error here.
+            // Single-variant enum today; the spelled-out pattern forces a
+            // compile error here when a new ExporterKind variant is added.
             let ExporterKind::OtlpHttp(cfg) = &exp.kind;
 
-            // Try to claim a permit BEFORE building the payload — if
-            // we're at the cap, drop early so we don't even pay the
-            // JSON-serialisation cost.
-            let sem = self.permits_for(&exp.name);
-            let permit = match sem.try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    tracing::debug!(
-                        exporter = %exp.name,
-                        cap = MAX_INFLIGHT_PER_EXPORTER,
-                        "otlp_http fan-out: exporter at concurrency cap; dropping span",
-                    );
-                    continue;
-                }
+            // Fingerprint the delivery-relevant config so a dashboard edit
+            // (endpoint / headers) rebuilds the exporter's pipeline.
+            let fingerprint = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                cfg.endpoint.hash(&mut hasher);
+                cfg.headers.hash(&mut hasher);
+                hasher.finish()
             };
 
-            // Build the wire body once per exporter (cheap — small
-            // JSON) so the spawned task only owns the bytes.
-            let body = build_otlp_traces_payload(event, &exp.name);
-            let endpoint = cfg.endpoint.clone();
-            let headers = cfg.headers.clone();
             let client = self.inner.client.clone();
-            let exporter_name = exp.name.clone();
+            let handle = self
+                .inner
+                .exporters
+                .get_or_create(&exp.name, fingerprint, move || {
+                    Arc::new(OtlpSink::new(
+                        exp.name.clone(),
+                        cfg.endpoint.clone(),
+                        cfg.headers.clone(),
+                        client,
+                    )) as Arc<dyn ObservabilitySink>
+                });
 
-            tokio::spawn(async move {
-                // Permit released when the task ends. `_permit` keeps
-                // it alive across the await point.
-                let _permit = permit;
-                if let Err(err) = post_one(client, endpoint, headers, body).await {
-                    tracing::warn!(
-                        exporter = %exporter_name,
-                        error = %err,
-                        "otlp_http exporter POST failed; span dropped",
-                    );
-                }
-            });
+            let rec =
+                record.get_or_insert_with(|| Arc::new(SinkRecord::metadata_only(event.clone())));
+            handle.try_enqueue(Arc::clone(rec));
         }
+    }
+
+    /// Stop pipelines for exporters no longer present in `live` (the current
+    /// snapshot's enabled `otlp_http` exporter names). Called periodically by
+    /// the server to GC pipelines for deleted / disabled exporters.
+    pub fn gc(&self, live: &std::collections::HashSet<String>) {
+        self.inner.exporters.retain(live);
+    }
+
+    /// Drain every exporter pipeline at graceful shutdown.
+    pub async fn shutdown(&self) {
+        self.inner.exporters.shutdown().await;
     }
 }
 
@@ -325,33 +274,6 @@ impl ObservabilitySink for OtlpSink {
         // `SinkStats::last_error`.
         SinkHealth::healthy()
     }
-}
-
-async fn post_one(
-    client: reqwest::Client,
-    endpoint: String,
-    headers: BTreeMap<String, String>,
-    body: Value,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut req = client
-        .post(&endpoint)
-        .header("Content-Type", "application/json")
-        .body(serde_json::to_vec(&body)?);
-    for (k, v) in headers {
-        req = req.header(k, v);
-    }
-    let resp = req.send().await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "HTTP {}: {}",
-            status,
-            body.chars().take(200).collect::<String>()
-        )
-        .into());
-    }
-    Ok(())
 }
 
 /// Build the single OTLP span object for one usage event. Attribute names
@@ -475,7 +397,10 @@ fn otlp_export_request(spans: Vec<Value>) -> Value {
     })
 }
 
-/// One event -> one-span export request (used by the per-event fan-out).
+/// One event -> one-span export request. Test-only helper for the payload
+/// assertions; production paths build spans via [`build_otlp_span`] and batch
+/// them through [`otlp_export_request`] inside [`OtlpSink`].
+#[cfg(test)]
 fn build_otlp_traces_payload(event: &UsageEvent, exporter_name: &str) -> Value {
     otlp_export_request(vec![build_otlp_span(event, exporter_name)])
 }
@@ -861,104 +786,40 @@ mod tests {
         f.fan_out(&sample_event(), std::iter::once(&exp));
     }
 
-    // ---- regression coverage for issue #113 -------------------------
-    // Pre-fix, fan_out spawned one detached tokio::spawn per (event,
-    // exporter) with no concurrency cap. A slow / down OTLP receiver
-    // would let task count + per-task payload memory grow unbounded
-    // until OOM. The fix bounds in-flight POSTs per exporter to
-    // MAX_INFLIGHT_PER_EXPORTER via a Semaphore; past the cap, events
-    // are dropped on the request hot path rather than queued.
-
-    /// A receiver that hangs forever — simulates a wedged OTLP backend.
-    /// We point exporters at it to wedge the spawned tasks past the
-    /// cap so we can observe the bound.
-    fn wedged_endpoint(server: &wiremock::MockServer) -> ObservabilityExporter {
-        // wiremock without registering any Mock returns 404 — that's
-        // fast (not the wedged behaviour we want). Instead point at a
-        // path that has a long delay registered.
-        let exp_json = serde_json::json!({
-            "name": "wedged-exporter",
+    #[tokio::test]
+    async fn fan_out_delivers_a_span_to_a_real_receiver() {
+        // The new fan-out enqueues into a per-exporter pipeline (1s flush);
+        // a single request's span lands at the receiver after the flush.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/traces"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let exp: ObservabilityExporter = serde_json::from_value(serde_json::json!({
+            "name": "real-otlp",
             "enabled": true,
             "kind": "otlp_http",
             "endpoint": format!("{}/v1/traces", server.uri()),
             "headers": {}
-        });
-        serde_json::from_value(exp_json).unwrap()
-    }
+        }))
+        .unwrap();
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fan_out_caps_in_flight_when_exporter_is_slow() {
-        use std::time::Duration;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        // Each POST hangs for 5 minutes; production REQUEST_TIMEOUT
-        // is 5s so in steady state these all time out, but for the
-        // test window we drive the cap deterministically.
-        Mock::given(method("POST"))
-            .and(path("/v1/traces"))
-            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(300)))
-            .mount(&server)
-            .await;
-
-        let exp = wedged_endpoint(&server);
         let f = OtlpHttpFanOut::new();
-        // Push more events than the cap; tasks block on the wedged
-        // receiver, so in_flight must saturate at MAX_INFLIGHT_PER_EXPORTER
-        // and further calls must be dropped at the hot path.
-        let pushes = MAX_INFLIGHT_PER_EXPORTER + 50;
-        for _ in 0..pushes {
-            f.fan_out(&sample_event(), std::iter::once(&exp));
-        }
-        // Yield so spawned tasks get a chance to acquire their
-        // permits before we sample. Multi-thread runtime + a couple
-        // of yields is plenty for try_acquire to settle.
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        let inflight = f.in_flight_for(&exp.name);
-        assert_eq!(
-            inflight, MAX_INFLIGHT_PER_EXPORTER,
-            "in-flight should saturate exactly at the cap; got {inflight}",
-        );
-        // Pre-fix (no cap), inflight would equal `pushes` here —
-        // i.e. ~114, growing unboundedly. The assertion above pins
-        // the bound.
-    }
+        f.fan_out(&sample_event(), std::iter::once(&exp));
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fan_out_recovers_after_permits_release() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        // Fast 200 — every permit released quickly.
-        Mock::given(method("POST"))
-            .and(path("/v1/traces"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
-
-        let exp = wedged_endpoint(&server);
-        let f = OtlpHttpFanOut::new();
-        // Drive a burst that exceeds the cap; under fast-receiver
-        // conditions the permits cycle through quickly.
-        for _ in 0..(MAX_INFLIGHT_PER_EXPORTER * 2) {
-            f.fan_out(&sample_event(), std::iter::once(&exp));
+        // Poll for the batched POST (flush_interval is 1s).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !server.received_requests().await.unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no OTLP POST within 5s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        // Generous wait — wiremock + reqwest + tokio handshake is
-        // hundreds of ms in CI. The point: in-flight should drop back
-        // to (close to) zero after the burst clears.
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        let inflight = f.in_flight_for(&exp.name);
-        assert!(
-            inflight < MAX_INFLIGHT_PER_EXPORTER,
-            "permits should release as POSTs complete; in_flight stuck at {inflight}",
-        );
+        f.shutdown().await;
     }
 }
