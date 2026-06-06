@@ -95,6 +95,45 @@ pub struct AliyunSlsConfig {
     /// key itself. BYOK variants (customer KMS / uploaded key) resolve the
     /// same reference through a different unwrap path in a later phase.
     pub credential_ref: String,
+
+    /// Whether captured request/response content is delivered to this
+    /// logstore. `metadata_only` (default) ships only operational metadata
+    /// — never a prompt or response. `full` additionally captures the
+    /// request prompt and the assembled response, each truncated to
+    /// [`content_max_bytes`]. Enabling `full` writes end-user prompt /
+    /// response text into the customer's SLS, so the dashboard must surface
+    /// the privacy implication when an operator turns it on.
+    ///
+    /// [`content_max_bytes`]: AliyunSlsConfig::content_max_bytes
+    #[serde(default)]
+    pub content_mode: SlsContentMode,
+
+    /// Per-field byte cap for captured content under `content_mode = full`.
+    /// The prompt and the response are each truncated to this many bytes
+    /// (UTF-8-boundary safe), and the log carries a `content_truncated`
+    /// marker when either was cut. Ignored under `metadata_only`. Defaults
+    /// to 128 KiB.
+    #[serde(default = "default_content_max_bytes")]
+    pub content_max_bytes: u32,
+}
+
+/// Content-capture mode for an SLS exporter. Defaults to the
+/// privacy-preserving `metadata_only`.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SlsContentMode {
+    /// Operational metadata only — never the prompt or response.
+    #[default]
+    MetadataOnly,
+    /// Metadata plus the captured request prompt and assembled response.
+    Full,
+}
+
+/// Default per-field content cap: 128 KiB.
+const fn default_content_max_bytes() -> u32 {
+    128 * 1024
 }
 
 /// Top-level `ObservabilityExporter` resource. `deny_unknown_fields`
@@ -256,6 +295,31 @@ mod tests {
                 assert_eq!(c.project, "aisix-obs");
                 assert_eq!(c.logstore, "request-events");
                 assert_eq!(c.credential_ref, "sls-prod");
+                // Content capture is off by default (privacy-preserving).
+                assert_eq!(c.content_mode, SlsContentMode::MetadataOnly);
+                assert_eq!(c.content_max_bytes, 128 * 1024);
+            }
+            other => panic!("expected aliyun_sls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aliyun_sls_opts_into_full_content_capture() {
+        let json = r#"{
+            "name": "sls-content",
+            "kind": "aliyun_sls",
+            "endpoint": "ap-southeast-3.log.aliyuncs.com",
+            "project": "p",
+            "logstore": "l",
+            "credential_ref": "r",
+            "content_mode": "full",
+            "content_max_bytes": 4096
+        }"#;
+        let e: ObservabilityExporter = serde_json::from_str(json).unwrap();
+        match &e.kind {
+            ExporterKind::AliyunSls(c) => {
+                assert_eq!(c.content_mode, SlsContentMode::Full);
+                assert_eq!(c.content_max_bytes, 4096);
             }
             other => panic!("expected aliyun_sls, got {other:?}"),
         }

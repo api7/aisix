@@ -32,14 +32,17 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aisix_core::models::{AliyunSlsConfig, ExporterKind, ObservabilityExporter, OtlpHttpConfig};
+use aisix_core::models::{
+    AliyunSlsConfig, ExporterKind, ObservabilityExporter, OtlpHttpConfig, SlsContentMode,
+};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::sink::{
-    resolve_sls_credential, AliyunSlsSink, BatchUnit, EventBatch, ExporterPipelines,
-    IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope, PipelineConfig,
-    SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkRecord, SinkResult,
+    resolve_sls_credential, AliyunSlsSink, BatchUnit, CapturedContent, EventBatch,
+    ExporterPipelines, IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope,
+    PipelineConfig, SinkAck, SinkCapabilities, SinkContent, SinkError, SinkHealth, SinkRecord,
+    SinkResult,
 };
 use crate::usage::UsageEvent;
 
@@ -109,12 +112,23 @@ impl OtlpHttpFanOut {
     /// sighting). The pipeline owns batching / retry / backpressure; enqueue is
     /// non-blocking, so this never blocks the request hot path. Empty list =
     /// cheap no-op.
-    pub fn fan_out<'a, I>(&self, event: &UsageEvent, exporters: I)
-    where
+    ///
+    /// `content` is the request's captured prompt/response, or `None` when the
+    /// handler captured none (the default). It is attached ONLY to an
+    /// `aliyun_sls` exporter whose `content_mode = full`; every other exporter
+    /// — and the CP telemetry path, which is not in this loop — receives the
+    /// shared metadata-only record, so prompt/response can never leak there.
+    pub fn fan_out<'a, I>(
+        &self,
+        event: &UsageEvent,
+        content: Option<&CapturedContent>,
+        exporters: I,
+    ) where
         I: IntoIterator<Item = &'a ObservabilityExporter>,
     {
-        // Build the record once, and only if there is at least one exporter.
-        let mut record: Option<Arc<SinkRecord>> = None;
+        // The shared metadata-only record, built once on first sighting and
+        // reused by every exporter that does not capture content.
+        let mut metadata_record: Option<Arc<SinkRecord>> = None;
         for exp in exporters {
             if !exp.enabled {
                 continue;
@@ -166,9 +180,16 @@ impl OtlpHttpFanOut {
                 }
             };
 
-            let rec =
-                record.get_or_insert_with(|| Arc::new(SinkRecord::metadata_only(event.clone())));
-            handle.try_enqueue(Arc::clone(rec));
+            // A content-bearing record for an SLS exporter that opted into
+            // full capture (and only when the handler captured content); the
+            // shared metadata-only record for everyone else.
+            let record = content_record(&exp.kind, event, content).unwrap_or_else(|| {
+                Arc::clone(
+                    metadata_record
+                        .get_or_insert_with(|| Arc::new(SinkRecord::metadata_only(event.clone()))),
+                )
+            });
+            handle.try_enqueue(record);
         }
     }
 
@@ -216,6 +237,61 @@ fn fingerprint_sls(cfg: &AliyunSlsConfig) -> u64 {
     cfg.logstore.hash(&mut hasher);
     cfg.credential_ref.hash(&mut hasher);
     hasher.finish()
+}
+
+/// The content-bearing [`SinkRecord`] for one exporter, or `None` to fall back
+/// to the shared metadata-only record.
+///
+/// Content is attached ONLY to an `aliyun_sls` exporter whose
+/// `content_mode = full`, and ONLY when the handler captured content — every
+/// other exporter (and the CP telemetry path, which never enters the fan-out)
+/// gets metadata only. The captured prompt/response are truncated to the
+/// exporter's `content_max_bytes`, ORing in any truncation the handler already
+/// applied at capture time.
+fn content_record(
+    kind: &ExporterKind,
+    event: &UsageEvent,
+    content: Option<&CapturedContent>,
+) -> Option<Arc<SinkRecord>> {
+    let ExporterKind::AliyunSls(cfg) = kind else {
+        return None;
+    };
+    if cfg.content_mode != SlsContentMode::Full {
+        return None;
+    }
+    let captured = content?;
+    let mut sc = SinkContent::capture(
+        &captured.prompt,
+        &captured.response,
+        cfg.content_max_bytes as usize,
+    );
+    sc.truncated = sc.truncated || captured.truncated;
+    Some(Arc::new(
+        SinkRecord::metadata_only(event.clone()).with_content(sc),
+    ))
+}
+
+/// The largest `content_max_bytes` among the env's enabled exporters that
+/// capture full content, or `None` if none do.
+///
+/// A request handler calls this BEFORE doing any capture work: `None` means no
+/// exporter wants prompt/response, so the handler skips capture entirely (no
+/// body clone, no stream accumulation — zero hot-path cost). `Some(cap)` is the
+/// bound the handler caps its capture at; each exporter then re-truncates to
+/// its own (≤ cap) limit at delivery.
+pub fn content_capture_cap<'a>(
+    exporters: impl IntoIterator<Item = &'a ObservabilityExporter>,
+) -> Option<u32> {
+    exporters
+        .into_iter()
+        .filter(|e| e.enabled)
+        .filter_map(|e| match &e.kind {
+            ExporterKind::AliyunSls(cfg) if cfg.content_mode == SlsContentMode::Full => {
+                Some(cfg.content_max_bytes)
+            }
+            _ => None,
+        })
+        .max()
 }
 
 /// An [`ObservabilitySink`] over the OTLP/HTTP-JSON traces protocol — the
@@ -631,6 +707,111 @@ mod tests {
         .unwrap()
     }
 
+    fn sls_kind(content_mode: SlsContentMode, max_bytes: u32) -> ExporterKind {
+        ExporterKind::AliyunSls(AliyunSlsConfig {
+            endpoint: "ap-southeast-3.log.aliyuncs.com".into(),
+            project: "p".into(),
+            logstore: "l".into(),
+            credential_ref: "r".into(),
+            content_mode,
+            content_max_bytes: max_bytes,
+        })
+    }
+
+    #[test]
+    fn content_record_targets_only_full_capture_sls() {
+        let event = sample_event();
+        let captured = CapturedContent {
+            prompt: "the prompt".into(),
+            response: "the response".into(),
+            truncated: false,
+        };
+
+        // otlp never carries content, even when content was captured.
+        let otlp = ExporterKind::OtlpHttp(OtlpHttpConfig {
+            endpoint: "https://x/v1/traces".into(),
+            headers: Default::default(),
+        });
+        assert!(content_record(&otlp, &event, Some(&captured)).is_none());
+
+        // sls metadata_only → no content.
+        let meta = sls_kind(SlsContentMode::MetadataOnly, 1024);
+        assert!(content_record(&meta, &event, Some(&captured)).is_none());
+
+        // sls full but nothing captured → falls back to metadata.
+        let full = sls_kind(SlsContentMode::Full, 1024);
+        assert!(content_record(&full, &event, None).is_none());
+
+        // sls full + captured content → a content-bearing record that still
+        // carries the metadata.
+        let rec = content_record(&full, &event, Some(&captured))
+            .expect("full-capture sls with content yields a content record");
+        let c = rec.content.as_ref().expect("content attached");
+        assert_eq!(c.prompt, "the prompt");
+        assert_eq!(c.response, "the response");
+        assert!(!c.truncated);
+        assert_eq!(rec.usage.request_id, "req-test-123");
+
+        // Per-exporter cap truncates + flags.
+        let big = CapturedContent {
+            prompt: "a".repeat(500),
+            response: "ok".into(),
+            truncated: false,
+        };
+        let rec = content_record(&sls_kind(SlsContentMode::Full, 16), &event, Some(&big)).unwrap();
+        let c = rec.content.as_ref().unwrap();
+        assert_eq!(c.prompt.len(), 16);
+        assert!(c.truncated, "oversize content must flag truncated");
+
+        // Handler-side truncation propagates even when the per-exporter cap
+        // did not cut.
+        let pre = CapturedContent {
+            prompt: "short".into(),
+            response: "short".into(),
+            truncated: true,
+        };
+        let rec = content_record(&full, &event, Some(&pre)).unwrap();
+        assert!(
+            rec.content.as_ref().unwrap().truncated,
+            "source truncation must propagate"
+        );
+    }
+
+    #[test]
+    fn content_capture_cap_picks_max_enabled_full_sls() {
+        fn sls(name: &str, enabled: bool, mode: &str, max: u32) -> ObservabilityExporter {
+            serde_json::from_value(serde_json::json!({
+                "name": name,
+                "enabled": enabled,
+                "kind": "aliyun_sls",
+                "endpoint": "ap-southeast-3.log.aliyuncs.com",
+                "project": "p",
+                "logstore": "l",
+                "credential_ref": "r",
+                "content_mode": mode,
+                "content_max_bytes": max,
+            }))
+            .unwrap()
+        }
+
+        // No exporter wants content → None (handler skips capture).
+        let otlp = sample_exporter();
+        let meta = sls("a", true, "metadata_only", 1024);
+        assert_eq!(content_capture_cap([&otlp, &meta]), None);
+
+        // One full-capture sls → its cap.
+        let full = sls("a", true, "full", 4096);
+        assert_eq!(content_capture_cap([&full]), Some(4096));
+
+        // Max across several full-capture exporters.
+        let full_b = sls("b", true, "full", 8192);
+        assert_eq!(content_capture_cap([&full, &full_b]), Some(8192));
+
+        // A disabled full-capture exporter is ignored.
+        let disabled = sls("a", false, "full", 4096);
+        assert_eq!(content_capture_cap([&disabled]), None);
+    }
+
     #[test]
     fn payload_carries_genai_semconv_attributes() {
         let body = build_otlp_traces_payload(&sample_event(), "test-exp");
@@ -824,7 +1005,7 @@ mod tests {
         // can't easily count spawned tasks, but if the call returned
         // and the test process didn't hang, we're good.
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), std::iter::empty());
+        f.fan_out(&sample_event(), None, std::iter::empty());
     }
 
     #[test]
@@ -838,7 +1019,7 @@ mod tests {
         let mut exp = sample_exporter();
         exp.enabled = false;
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), std::iter::once(&exp));
+        f.fan_out(&sample_event(), None, std::iter::once(&exp));
     }
 
     #[tokio::test]
@@ -861,7 +1042,7 @@ mod tests {
         .unwrap();
 
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), std::iter::once(&exp));
+        f.fan_out(&sample_event(), None, std::iter::once(&exp));
 
         // Poll for the batched POST (flush_interval is 1s).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

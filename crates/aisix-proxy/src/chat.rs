@@ -21,8 +21,8 @@ use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeContext, BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
 use aisix_obs::{
-    AccessLog, LlmUsage, Metrics, RequestLabels, RequestOutcome, RoutingAttemptEvent, UsageEvent,
-    UsageLabels,
+    content_capture_cap, AccessLog, CapturedContent, LlmUsage, Metrics, RequestLabels,
+    RequestOutcome, RoutingAttemptEvent, UsageEvent, UsageLabels,
 };
 use axum::extract::State;
 use axum::http::HeaderValue;
@@ -244,6 +244,7 @@ pub async fn chat_completions(
                     success.cost_usd,
                     /* guardrail_blocked */ false,
                     &client,
+                    success.captured_content.take(),
                 );
             }
             // Inject x-ratelimit-* headers so OpenAI SDK clients see the
@@ -403,6 +404,7 @@ pub async fn chat_completions(
                 /* cost_usd */ 0.0,
                 guardrail_blocked,
                 &client,
+                /* content */ None,
             );
             err.into_response()
         }
@@ -488,6 +490,12 @@ struct Success {
     /// the routing group's display name.
     served_by_target: Option<String>,
     routing: RoutingTelemetry,
+    /// Captured request/response content for the observability fan-out, built
+    /// (gated on the snapshot's content-capturing exporters) where the request
+    /// and upstream response are both in scope. `None` when no exporter
+    /// captures content, and on the streaming path (filled at stream end). It
+    /// is forwarded only to `fan_out`, never to the CP telemetry sink.
+    captured_content: Option<CapturedContent>,
 }
 
 /// Cache decision attached to every successful request. Wire shape
@@ -653,6 +661,16 @@ async fn dispatch(
     }
 
     let snapshot = state.snapshot.load();
+    // Largest content cap any enabled content-capturing exporter wants, or
+    // `None` when none do — computed once so each response path (cache hit /
+    // upstream) only captures when an exporter actually consumes it.
+    let content_cap = content_capture_cap(
+        snapshot
+            .observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &e.value),
+    );
     let virtual_entry = snapshot.models.get_by_name(&req.model).ok_or_else(|| {
         DispatchFailure::new(None, None, ProxyError::ModelNotFound(req.model.clone()))
     })?;
@@ -962,6 +980,9 @@ async fn dispatch(
                     /* cost_usd */ 0.0,
                     comp.guardrail_blocked,
                     &client_for_telem,
+                    // Streaming content capture lands in C3b; metadata only here.
+                    /* content */
+                    None,
                 );
                 metrics_for_stream.record_llm_usage(
                     UsageLabels {
@@ -1044,6 +1065,8 @@ async fn dispatch(
                 Some(model.display_name.clone()),
             ),
             routing: stream_routing,
+            // Streaming content capture lands in C3b.
+            captured_content: None,
         });
     }
 
@@ -1156,6 +1179,16 @@ async fn dispatch(
                     .upstream_model()
                     .unwrap_or("unknown")
                     .to_string();
+                // Capture the prompt + cached response for content-capturing
+                // exporters (gated). A cache hit still served content to the
+                // caller, so it's logged like a fresh response.
+                let captured_content = content_cap.map(|cap| {
+                    CapturedContent::new(
+                        &serde_json::to_string(req).unwrap_or_default(),
+                        cached.message.content.as_deref().unwrap_or(""),
+                        cap as usize,
+                    )
+                });
                 let mut response = Json(render_response(now, cached, &req.model)).into_response();
                 response
                     .headers_mut()
@@ -1200,6 +1233,7 @@ async fn dispatch(
                     // `served_by_target` field docs on `Success`.
                     served_by_target: None,
                     routing: RoutingTelemetry::default(),
+                    captured_content,
                 });
             }
             Ok(None) => {}
@@ -1468,6 +1502,18 @@ async fn dispatch(
         }
     }
 
+    // Capture request/response content for the observability fan-out (gated:
+    // `content_cap` is `None` when no exporter wants it). Built here, where both
+    // the request and the upstream response text are in scope; threaded to
+    // `fan_out` via `Success`, never to the CP sink.
+    let captured_content = content_cap.map(|cap| {
+        CapturedContent::new(
+            &serde_json::to_string(req).unwrap_or_default(),
+            upstream.message.content.as_deref().unwrap_or(""),
+            cap as usize,
+        )
+    });
+
     let mut response = Json(render_response(now, upstream, &req.model)).into_response();
     if matches!(cache_status, CacheStatus::Miss) {
         // Miss header only when the cache was actually consulted —
@@ -1513,6 +1559,7 @@ async fn dispatch(
         telemetry_handled_by_stream: false,
         served_by_target,
         routing,
+        captured_content,
     })
 }
 
@@ -1628,6 +1675,7 @@ fn emit_usage_event(
     cost_usd: f64,
     guardrail_blocked: bool,
     client: &ClientContext,
+    content: Option<CapturedContent>,
 ) {
     // Look up per-PK telemetry attribution tags from the live snapshot.
     // Empty `provider_key_id` (pre-dispatch error paths) → default
@@ -1712,7 +1760,7 @@ fn emit_usage_event(
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
-        .fan_out(&event, exporters.iter().map(|e| &e.value));
+        .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));
 }
 
 /// Defence-in-depth sanitiser for operator-defined `ProviderKey

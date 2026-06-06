@@ -624,7 +624,7 @@ fn emit_usage_event(
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
-        .fan_out(&event, exporters.iter().map(|e| &e.value));
+        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
 }
 
 fn copy_response_header(src: &HeaderMap, dst: &mut Response, name: header::HeaderName) {

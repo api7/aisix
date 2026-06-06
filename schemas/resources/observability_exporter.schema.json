@@ -41,6 +41,22 @@
         "project"
       ],
       "properties": {
+        "content_max_bytes": {
+          "description": "Per-field byte cap for captured content under `content_mode = full`. The prompt and the response are each truncated to this many bytes (UTF-8-boundary safe), and the log carries a `content_truncated` marker when either was cut. Ignored under `metadata_only`. Defaults to 128 KiB.",
+          "default": 131072,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "content_mode": {
+          "description": "Whether captured request/response content is delivered to this logstore. `metadata_only` (default) ships only operational metadata — never a prompt or response. `full` additionally captures the request prompt and the assembled response, each truncated to [`content_max_bytes`]. Enabling `full` writes end-user prompt / response text into the customer's SLS, so the dashboard must surface the privacy implication when an operator turns it on.\n\n[`content_max_bytes`]: AliyunSlsConfig::content_max_bytes",
+          "default": "metadata_only",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SlsContentMode"
+            }
+          ]
+        },
         "credential_ref": {
           "description": "Opaque pointer to the AccessKey credential, resolved locally by the DP at delivery time. The plaintext AccessKey MUST NOT live in etcd/kine — the control plane stores only this reference, never the key itself. BYOK variants (customer KMS / uploaded key) resolve the same reference through a different unwrap path in a later phase.",
           "type": "string"
@@ -78,6 +94,27 @@
     "name": {
       "description": "Operator-facing label, surfaced in /logs and the dashboard list. Not used for routing — the etcd-key uuid is the identity.",
       "type": "string"
+    }
+  },
+  "definitions": {
+    "SlsContentMode": {
+      "description": "Content-capture mode for an SLS exporter. Defaults to the privacy-preserving `metadata_only`.",
+      "oneOf": [
+        {
+          "description": "Operational metadata only — never the prompt or response.",
+          "type": "string",
+          "enum": [
+            "metadata_only"
+          ]
+        },
+        {
+          "description": "Metadata plus the captured request prompt and assembled response.",
+          "type": "string",
+          "enum": [
+            "full"
+          ]
+        }
+      ]
     }
   }
 }

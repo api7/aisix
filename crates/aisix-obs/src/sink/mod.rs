@@ -23,7 +23,7 @@ pub use capabilities::{
 };
 pub use manager::ExporterPipelines;
 pub use pipeline::{PipelineConfig, SinkHandle, SinkPipeline, SinkStatsSnapshot};
-pub use record::{EventBatch, SinkContent, SinkRecord, SCHEMA_VERSION};
+pub use record::{CapturedContent, EventBatch, SinkContent, SinkRecord, SCHEMA_VERSION};
 pub use sls::{resolve_sls_credential, AliyunSlsSink};
 
 use async_trait::async_trait;

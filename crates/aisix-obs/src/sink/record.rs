@@ -31,6 +31,67 @@ pub struct SinkContent {
     pub truncated: bool,
 }
 
+impl SinkContent {
+    /// Build captured content, truncating `prompt` and `response` to at most
+    /// `max_bytes` each (on a UTF-8 char boundary so the result stays valid).
+    /// `truncated` is set when either field was cut.
+    pub fn capture(prompt: &str, response: &str, max_bytes: usize) -> Self {
+        let (prompt, p_cut) = truncate_on_char_boundary(prompt, max_bytes);
+        let (response, r_cut) = truncate_on_char_boundary(response, max_bytes);
+        Self {
+            prompt: prompt.to_owned(),
+            response: response.to_owned(),
+            truncated: p_cut || r_cut,
+        }
+    }
+}
+
+/// Truncate `s` to at most `max_bytes`, backing up to the previous UTF-8 char
+/// boundary so the slice stays valid. Returns the slice and whether it was cut.
+fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> (&str, bool) {
+    if s.len() <= max_bytes {
+        return (s, false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&s[..end], true)
+}
+
+/// Raw captured request/response content, handed from a request handler to the
+/// exporter fan-out. The handler captures up to the largest `content_max_bytes`
+/// among the env's content-capturing exporters (bounding the hot-path buffer);
+/// each exporter then re-truncates to its own cap at delivery. `truncated`
+/// records whether the *source* already exceeded the handler's capture cap, so
+/// a per-exporter [`SinkContent`] reflects truncation from either stage.
+///
+/// This type exists ONLY on the exporter path — it never touches the
+/// `UsageEvent` that feeds CP telemetry, so prompt/response content cannot
+/// reach the control plane.
+#[derive(Debug, Clone)]
+pub struct CapturedContent {
+    pub prompt: String,
+    pub response: String,
+    pub truncated: bool,
+}
+
+impl CapturedContent {
+    /// Capture `prompt` and `response`, truncating each to `max_bytes` (on a
+    /// UTF-8 char boundary) to bound the held buffer at the largest cap any
+    /// content-capturing exporter requested. `truncated` is set if either was
+    /// cut here; a per-exporter `SinkContent` ORs in its own (smaller) cap.
+    pub fn new(prompt: &str, response: &str, max_bytes: usize) -> Self {
+        let (prompt, p_cut) = truncate_on_char_boundary(prompt, max_bytes);
+        let (response, r_cut) = truncate_on_char_boundary(response, max_bytes);
+        Self {
+            prompt: prompt.to_owned(),
+            response: response.to_owned(),
+            truncated: p_cut || r_cut,
+        }
+    }
+}
+
 /// One canonical observability event handed to sinks.
 ///
 /// Sink body-encoders read fields off `usage` (and optionally `content`) to
@@ -114,6 +175,46 @@ mod tests {
         let json = serde_json::to_value(&rec).unwrap();
         assert_eq!(json["content"]["prompt"], "hi");
         assert_eq!(json["content"]["response"], "hello");
+    }
+
+    #[test]
+    fn capture_keeps_short_content_untruncated() {
+        let c = SinkContent::capture("hello", "world", 128);
+        assert_eq!(c.prompt, "hello");
+        assert_eq!(c.response, "world");
+        assert!(!c.truncated);
+    }
+
+    #[test]
+    fn capture_truncates_and_flags_oversize_content() {
+        let big = "a".repeat(1000);
+        let c = SinkContent::capture(&big, "ok", 100);
+        assert_eq!(c.prompt.len(), 100);
+        assert_eq!(c.response, "ok");
+        assert!(c.truncated, "oversize prompt must set the truncated flag");
+    }
+
+    #[test]
+    fn captured_content_new_bounds_each_field() {
+        let cc = CapturedContent::new("hello", "world", 128);
+        assert_eq!(cc.prompt, "hello");
+        assert_eq!(cc.response, "world");
+        assert!(!cc.truncated);
+
+        let cc = CapturedContent::new(&"x".repeat(50), "ok", 10);
+        assert_eq!(cc.prompt.len(), 10);
+        assert!(cc.truncated);
+    }
+
+    #[test]
+    fn capture_truncates_on_a_utf8_char_boundary() {
+        // "你好" is 6 bytes (3 each); a 4-byte cap must back up to the 3-byte
+        // boundary rather than split the second char, keeping valid UTF-8.
+        let c = SinkContent::capture("你好", "", 4);
+        assert_eq!(c.prompt, "你");
+        assert!(c.truncated);
+        // The result is shorter than the cap because it backed up to a boundary.
+        assert_eq!(c.prompt.len(), 3);
     }
 
     #[test]
