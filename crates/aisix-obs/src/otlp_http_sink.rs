@@ -32,14 +32,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aisix_core::models::{AliyunSlsConfig, ExporterKind, ObservabilityExporter, OtlpHttpConfig};
+use aisix_core::models::{
+    AliyunSlsConfig, ExporterKind, ObjectStoreConfig, ObservabilityExporter, OtlpHttpConfig,
+};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::sink::{
-    resolve_sls_credential, AliyunSlsSink, BatchUnit, EventBatch, ExporterPipelines,
-    IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope, PipelineConfig,
-    SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkRecord, SinkResult,
+    build_object_store_sink, resolve_sls_credential, AliyunSlsSink, BatchUnit, EventBatch,
+    ExporterPipelines, IdempotencyMarker, IdempotencyScheme, ObservabilitySink, OrderingScope,
+    PipelineConfig, SinkAck, SinkCapabilities, SinkError, SinkHealth, SinkRecord, SinkResult,
 };
 use crate::usage::UsageEvent;
 
@@ -164,6 +166,21 @@ impl OtlpHttpFanOut {
                             )) as Arc<dyn ObservabilitySink>
                         })
                 }
+                ExporterKind::ObjectStore(cfg) => {
+                    let fingerprint = fingerprint_object_store(cfg);
+                    let name = exp.name.clone();
+                    let cfg = cfg.clone();
+                    self.inner
+                        .exporters
+                        .get_or_create(&exp.name, fingerprint, move || {
+                            // Resolve cloud creds from the DP's local env and
+                            // build the backend at build time. Missing creds or
+                            // an un-buildable backend yield a sink that reports
+                            // the reason via delivery health (never a silent
+                            // drop) — mirroring the SLS path.
+                            build_object_store_sink(name, &cfg)
+                        })
+                }
             };
 
             let rec =
@@ -214,6 +231,24 @@ fn fingerprint_sls(cfg: &AliyunSlsConfig) -> u64 {
     cfg.endpoint.hash(&mut hasher);
     cfg.project.hash(&mut hasher);
     cfg.logstore.hash(&mut hasher);
+    cfg.credential_ref.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Hash an `object_store` exporter's delivery-relevant config. Covers only
+/// kine-visible fields (provider / bucket / prefix / region / endpoint /
+/// compression / credential_ref), never the resolved cloud key — rotating the
+/// secret under the *same* reference therefore takes effect on the next DP
+/// restart, not live. Any field change rebuilds the pipeline.
+fn fingerprint_object_store(cfg: &ObjectStoreConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cfg.provider.hash(&mut hasher);
+    cfg.bucket.hash(&mut hasher);
+    cfg.prefix.hash(&mut hasher);
+    cfg.region.hash(&mut hasher);
+    cfg.endpoint.hash(&mut hasher);
+    cfg.compression.hash(&mut hasher);
     cfg.credential_ref.hash(&mut hasher);
     hasher.finish()
 }
