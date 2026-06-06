@@ -920,12 +920,18 @@ async fn dispatch(
                 model_name: req.model.clone(),
             })
         };
+        // Capture the prompt for content-capturing exporters; the response is
+        // assembled inside the stream into `comp.response_text`. Both gated on
+        // `content_cap` (None on the common content-free path).
+        let captured_prompt_for_telem =
+            content_cap.map(|_| serde_json::to_string(req).unwrap_or_default());
         let sse_stream = build_sse_stream(
             upstream,
             now,
             stream_guardrail,
             started,
             req.model.clone(),
+            content_cap,
             move |comp: StreamCompletion| {
                 // Rate-limit accounting (TPM cap) for all layers.
                 for key in &post_stream_keys {
@@ -980,9 +986,16 @@ async fn dispatch(
                     /* cost_usd */ 0.0,
                     comp.guardrail_blocked,
                     &client_for_telem,
-                    // Streaming content capture lands in C3b; metadata only here.
-                    /* content */
-                    None,
+                    // Prompt captured up front, response assembled across the
+                    // stream into `comp.response_text`; both gated on the cap.
+                    match (&captured_prompt_for_telem, content_cap) {
+                        (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+                            prompt,
+                            &comp.response_text,
+                            cap as usize,
+                        )),
+                        _ => None,
+                    },
                 );
                 metrics_for_stream.record_llm_usage(
                     UsageLabels {
@@ -1978,6 +1991,11 @@ struct StreamCompletion {
     /// irrelevant — the customer must not be billed for tokens that
     /// never crossed the wire. Issue #419.
     chunks_delivered: u32,
+    /// Assembled assistant text for content-capturing exporters, accumulated
+    /// across chunks ONLY when an exporter wants full content (bounded to the
+    /// capture cap). Empty otherwise. Read by the on_complete telemetry
+    /// closure; never reaches the CP sink.
+    response_text: String,
 }
 
 /// Parameters needed to run output-guardrail evaluation at
@@ -2075,6 +2093,9 @@ fn build_sse_stream<F>(
     // onto every SSE chunk's `model` field per AISIX-Cloud#410. Owned
     // so it can move into the `async_stream::stream!` closure.
     client_facing_model: String,
+    // Largest content cap any content-capturing exporter wants, or `None` to
+    // skip response accumulation entirely (the common, content-free path).
+    content_cap: Option<u32>,
     on_complete: F,
 ) -> impl Stream<Item = Result<Event, Infallible>>
 where
@@ -2179,6 +2200,15 @@ where
                             window_buf.push_str(text);
                         } else if let Some(buf) = content_buffer.as_mut() {
                             buf.push_str(text);
+                        }
+                        // Content capture: assemble the response for the
+                        // observability fan-out, bounded to the cap so a long
+                        // stream can't grow the buffer without limit. Only when
+                        // an exporter wants full content.
+                        if let Some(cap) = content_cap {
+                            if comp.response_text.len() < cap as usize {
+                                comp.response_text.push_str(text);
+                            }
                         }
                     }
                     if let Some(u) = chunk.usage.as_ref() {
