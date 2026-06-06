@@ -80,6 +80,68 @@
           "type": "string"
         }
       }
+    },
+    {
+      "description": "Object-storage sink — ONE config covering S3 / GCS / Azure Blob (and S3-compatible MinIO / Cloudflare R2 via `endpoint`) behind a single backend, so the sink is written once rather than per provider. Batched NDJSON files land under a date-partitioned, deterministic key layout that Snowpipe / Databricks Auto Loader ingest from. Like `aliyun_sls`, cloud credentials are **never** in this config: a [`credential_ref`] points at keys the DP resolves locally, so the control plane never holds the secret on the kine path.\n\n[`credential_ref`]: ObjectStoreConfig::credential_ref",
+      "type": "object",
+      "required": [
+        "bucket",
+        "credential_ref",
+        "kind",
+        "prefix",
+        "provider"
+      ],
+      "properties": {
+        "bucket": {
+          "description": "Bucket (S3 / GCS) or container (Azure Blob) that receives the files.",
+          "type": "string"
+        },
+        "compression": {
+          "description": "Compression applied to each NDJSON file before upload. Default gzip.",
+          "default": "gzip",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ObjectStoreCompression"
+            }
+          ]
+        },
+        "credential_ref": {
+          "description": "Opaque pointer to the cloud credentials, resolved locally by the DP at delivery time. The plaintext key MUST NOT live in etcd/kine — the control plane stores only this reference, never the secret itself.",
+          "type": "string"
+        },
+        "endpoint": {
+          "description": "Override the backend host for S3-compatible stores (MinIO, Aliyun OSS, Cloudflare R2). Unset = the provider's native endpoint.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "object_store"
+          ]
+        },
+        "prefix": {
+          "description": "Key prefix the partition path is appended to, e.g. `ai-gateway`. The full key is `<prefix>/org=…/env=…/table=…/dt=…/hh=…/<file>`.",
+          "type": "string"
+        },
+        "provider": {
+          "description": "Which object-storage backend the bucket lives in.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ObjectStoreProvider"
+            }
+          ]
+        },
+        "region": {
+          "description": "AWS region for S3 (SigV4 signature scope) — recommended; `object_store` defaults to `us-east-1` when unset, so a non-default-region bucket should set it. Ignored for GCS / Azure Blob.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
     }
   ],
   "required": [
@@ -97,6 +159,34 @@
     }
   },
   "definitions": {
+    "ObjectStoreCompression": {
+      "description": "File compression for object-storage uploads.",
+      "oneOf": [
+        {
+          "description": "gzip (RFC 1952) — the default; smaller egress, accepted by Snowpipe and Auto Loader.",
+          "type": "string",
+          "enum": [
+            "gzip"
+          ]
+        },
+        {
+          "description": "No compression — raw NDJSON.",
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        }
+      ]
+    },
+    "ObjectStoreProvider": {
+      "description": "Object-storage backend selector. The sink builds one backend client per variant; everything downstream (batching, key layout, retry) is shared.",
+      "type": "string",
+      "enum": [
+        "s3",
+        "gcs",
+        "azure_blob"
+      ]
+    },
     "SlsContentMode": {
       "description": "Content-capture mode for an SLS exporter. Defaults to the privacy-preserving `metadata_only`.",
       "oneOf": [

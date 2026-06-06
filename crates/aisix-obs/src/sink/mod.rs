@@ -14,6 +14,7 @@
 
 mod capabilities;
 mod manager;
+mod object_store;
 mod pipeline;
 mod record;
 mod sls;
@@ -22,6 +23,7 @@ pub use capabilities::{
     BatchUnit, ChannelKey, IdempotencyMarker, IdempotencyScheme, OrderingScope, SinkCapabilities,
 };
 pub use manager::ExporterPipelines;
+pub use object_store::{build_object_store_sink, ObjectStoreSink};
 pub use pipeline::{PipelineConfig, SinkHandle, SinkPipeline, SinkStatsSnapshot};
 pub use record::{CapturedContent, EventBatch, SinkContent, SinkRecord, SCHEMA_VERSION};
 pub use sls::{resolve_sls_credential, AliyunSlsSink};

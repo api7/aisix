@@ -34,9 +34,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::resource::Resource;
 
-/// Discriminated union of exporter back-ends. Ships `otlp_http` and
-/// `aliyun_sls`; Datadog / S3 / … land in follow-ups, each as a new
-/// variant whose serde tag matches the wire-side `kind` discriminator.
+/// Discriminated union of exporter back-ends. Ships `otlp_http`,
+/// `aliyun_sls`, and `object_store` (S3 / GCS / Azure Blob, one variant);
+/// Datadog / … land in follow-ups, each as a new variant whose serde tag
+/// matches the wire-side `kind` discriminator.
 ///
 /// `tag = "kind"` puts the variant tag inline with the inner struct's
 /// fields — same shape as `GuardrailKind` so the kine wire stays
@@ -46,6 +47,7 @@ use crate::resource::Resource;
 pub enum ExporterKind {
     OtlpHttp(OtlpHttpConfig),
     AliyunSls(AliyunSlsConfig),
+    ObjectStore(ObjectStoreConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
@@ -139,6 +141,74 @@ pub enum SlsContentMode {
 /// Default per-field content cap: 128 KiB.
 const fn default_content_max_bytes() -> u32 {
     128 * 1024
+}
+
+/// Object-storage sink — ONE config covering S3 / GCS / Azure Blob (and
+/// S3-compatible MinIO / Cloudflare R2 via `endpoint`) behind a single
+/// backend, so the sink is written once rather than per provider. Batched
+/// NDJSON files land under a date-partitioned, deterministic key layout that
+/// Snowpipe / Databricks Auto Loader ingest from. Like `aliyun_sls`, cloud
+/// credentials are **never** in this config: a [`credential_ref`] points at
+/// keys the DP resolves locally, so the control plane never holds the secret
+/// on the kine path.
+///
+/// [`credential_ref`]: ObjectStoreConfig::credential_ref
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectStoreConfig {
+    /// Which object-storage backend the bucket lives in.
+    pub provider: ObjectStoreProvider,
+
+    /// Bucket (S3 / GCS) or container (Azure Blob) that receives the files.
+    pub bucket: String,
+
+    /// Key prefix the partition path is appended to, e.g. `ai-gateway`.
+    /// The full key is `<prefix>/org=…/env=…/table=…/dt=…/hh=…/<file>`.
+    pub prefix: String,
+
+    /// AWS region for S3 (SigV4 signature scope) — recommended; `object_store`
+    /// defaults to `us-east-1` when unset, so a non-default-region bucket
+    /// should set it. Ignored for GCS / Azure Blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+
+    /// Override the backend host for S3-compatible stores (MinIO, Aliyun
+    /// OSS, Cloudflare R2). Unset = the provider's native endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+
+    /// Compression applied to each NDJSON file before upload. Default gzip.
+    #[serde(default)]
+    pub compression: ObjectStoreCompression,
+
+    /// Opaque pointer to the cloud credentials, resolved locally by the DP
+    /// at delivery time. The plaintext key MUST NOT live in etcd/kine — the
+    /// control plane stores only this reference, never the secret itself.
+    pub credential_ref: String,
+}
+
+/// Object-storage backend selector. The sink builds one backend client per
+/// variant; everything downstream (batching, key layout, retry) is shared.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectStoreProvider {
+    S3,
+    Gcs,
+    AzureBlob,
+}
+
+/// File compression for object-storage uploads.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectStoreCompression {
+    /// gzip (RFC 1952) — the default; smaller egress, accepted by Snowpipe
+    /// and Auto Loader.
+    #[default]
+    Gzip,
+    /// No compression — raw NDJSON.
+    None,
 }
 
 /// Top-level `ObservabilityExporter` resource. `deny_unknown_fields`
@@ -348,6 +418,87 @@ mod tests {
         for key in ["access_key_secret", "access_key_id", "ak", "sk"] {
             let json = format!(
                 r#"{{"name":"x","kind":"aliyun_sls","endpoint":"ap-southeast-3.log.aliyuncs.com","project":"p","logstore":"l","credential_ref":"r","{key}":"AKIASECRET"}}"#
+            );
+            let r: Result<ObservabilityExporter, _> = serde_json::from_str(&json);
+            assert!(
+                r.is_err(),
+                "plaintext credential field `{key}` must be rejected"
+            );
+        }
+    }
+
+    const VALID_OBJECT_STORE: &str = r#"{
+        "name": "acme-s3-events",
+        "enabled": true,
+        "kind": "object_store",
+        "provider": "s3",
+        "bucket": "acme-aisix-events",
+        "prefix": "ai-gateway",
+        "region": "us-east-1",
+        "compression": "gzip",
+        "credential_ref": "acme-s3"
+    }"#;
+
+    #[test]
+    fn deserialises_object_store() {
+        let e: ObservabilityExporter = serde_json::from_str(VALID_OBJECT_STORE).unwrap();
+        assert_eq!(e.name, "acme-s3-events");
+        assert!(e.enabled);
+        match &e.kind {
+            ExporterKind::ObjectStore(c) => {
+                assert_eq!(c.provider, ObjectStoreProvider::S3);
+                assert_eq!(c.bucket, "acme-aisix-events");
+                assert_eq!(c.prefix, "ai-gateway");
+                assert_eq!(c.region.as_deref(), Some("us-east-1"));
+                assert_eq!(c.compression, ObjectStoreCompression::Gzip);
+                assert_eq!(c.credential_ref, "acme-s3");
+            }
+            other => panic!("expected object_store, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_store_defaults_compression_to_gzip_and_omits_optionals() {
+        // gcs with no region/endpoint/compression — defaults + Options apply.
+        let e: ObservabilityExporter = serde_json::from_str(
+            r#"{"name":"x","kind":"object_store","provider":"gcs","bucket":"b","prefix":"p","credential_ref":"r"}"#,
+        )
+        .unwrap();
+        match &e.kind {
+            ExporterKind::ObjectStore(c) => {
+                assert_eq!(c.provider, ObjectStoreProvider::Gcs);
+                assert_eq!(c.compression, ObjectStoreCompression::Gzip);
+                assert!(c.region.is_none());
+                assert!(c.endpoint.is_none());
+            }
+            other => panic!("expected object_store, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_store_round_trips_flat() {
+        let e: ObservabilityExporter = serde_json::from_str(VALID_OBJECT_STORE).unwrap();
+        let v = serde_json::to_value(&e).unwrap();
+        // Flat wire — kind tag + fields at the top level, never nested.
+        assert_eq!(v["kind"], "object_store");
+        assert_eq!(v["provider"], "s3");
+        assert_eq!(v["bucket"], "acme-aisix-events");
+        assert_eq!(v["credential_ref"], "acme-s3");
+        assert!(v.get("object_store").is_none(), "kind block must not nest");
+    }
+
+    #[test]
+    fn rejects_plaintext_credentials_in_object_store_config() {
+        // Cloud keys must NEVER be config fields — only `credential_ref`.
+        // `deny_unknown_fields` rejects any smuggled plaintext secret.
+        for key in [
+            "access_key_id",
+            "secret_access_key",
+            "sas_token",
+            "service_account_json",
+        ] {
+            let json = format!(
+                r#"{{"name":"x","kind":"object_store","provider":"s3","bucket":"b","prefix":"p","credential_ref":"r","{key}":"PLAINTEXT"}}"#
             );
             let r: Result<ObservabilityExporter, _> = serde_json::from_str(&json);
             assert!(

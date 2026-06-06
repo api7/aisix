@@ -601,7 +601,7 @@ fn observability_exporter_schema() -> Value {
         "properties": {
             "name":    { "type": "string", "minLength": 1, "maxLength": 120 },
             "enabled": { "type": "boolean" },
-            "kind":    { "type": "string", "enum": ["otlp_http", "aliyun_sls"] },
+            "kind":    { "type": "string", "enum": ["otlp_http", "aliyun_sls", "object_store"] },
             // Shared field; the per-kind pattern is enforced in the branches.
             "endpoint": { "type": "string" },
             // otlp_http field.
@@ -618,7 +618,14 @@ fn observability_exporter_schema() -> Value {
             // Content capture (opt-in). `full` writes captured prompt /
             // response into the logstore; `content_max_bytes` truncates each.
             "content_mode":      { "type": "string", "enum": ["metadata_only", "full"] },
-            "content_max_bytes": { "type": "integer", "minimum": 1 }
+            "content_max_bytes": { "type": "integer", "minimum": 1 },
+            // object_store fields (S3 / GCS / Azure Blob, one variant). Cloud
+            // credentials are NEVER here — only the shared `credential_ref`.
+            "provider":    { "type": "string", "enum": ["s3", "gcs", "azure_blob"] },
+            "bucket":      { "type": "string", "minLength": 1 },
+            "prefix":      { "type": "string", "minLength": 1 },
+            "region":      { "type": "string", "minLength": 1 },
+            "compression": { "type": "string", "enum": ["gzip", "none"] }
         },
         "allOf": [
             {
@@ -648,6 +655,22 @@ fn observability_exporter_schema() -> Value {
                         // the sink posts to directly.
                         "endpoint": {
                             "pattern": "^[a-z0-9][a-z0-9.-]*\\.aliyuncs\\.com$|^http://(mock-sls|127\\.0\\.0\\.1|localhost)(:[0-9]+)?$"
+                        }
+                    }
+                }
+            },
+            {
+                "if":   { "properties": { "kind": { "const": "object_store" } } },
+                "then": {
+                    "required": ["provider", "bucket", "prefix", "credential_ref"],
+                    "properties": {
+                        // `endpoint` is optional — set only for S3-compatible
+                        // stores (MinIO / OSS / R2). When present: https, or a
+                        // loopback emulator host (MinIO / Azurite /
+                        // fake-gcs-server) for the compose e2e — never a way to
+                        // redirect real traffic to an arbitrary plaintext host.
+                        "endpoint": {
+                            "pattern": "^https://.+|^http://(minio|azurite|fake-gcs-server|fake-gcs|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$"
                         }
                     }
                 }
@@ -1375,6 +1398,69 @@ mod tests {
             "credential_ref": "mock"
         });
         validate_observability_exporter(&v).unwrap();
+    }
+
+    #[test]
+    fn exporter_object_store_happy_path() {
+        let v = json!({
+            "name": "acme-s3",
+            "kind": "object_store",
+            "provider": "s3",
+            "bucket": "acme-aisix-events",
+            "prefix": "ai-gateway",
+            "region": "us-east-1",
+            "credential_ref": "acme-s3"
+        });
+        validate_observability_exporter(&v).unwrap();
+    }
+
+    #[test]
+    fn exporter_object_store_requires_core_fields() {
+        // Each config missing one required object_store field is rejected.
+        let cases = [
+            json!({"name":"x","kind":"object_store","bucket":"b","prefix":"p","credential_ref":"r"}),
+            json!({"name":"x","kind":"object_store","provider":"s3","prefix":"p","credential_ref":"r"}),
+            json!({"name":"x","kind":"object_store","provider":"s3","bucket":"b","credential_ref":"r"}),
+            json!({"name":"x","kind":"object_store","provider":"s3","bucket":"b","prefix":"p"}),
+        ];
+        for v in cases {
+            assert!(
+                validate_observability_exporter(&v).is_err(),
+                "incomplete object_store config must be rejected: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn exporter_object_store_rejects_bad_provider() {
+        let v = json!({
+            "name": "x", "kind": "object_store",
+            "provider": "wasabi", "bucket": "b", "prefix": "p", "credential_ref": "r"
+        });
+        assert!(validate_observability_exporter(&v).is_err());
+    }
+
+    #[test]
+    fn exporter_object_store_allows_loopback_minio_endpoint() {
+        // The e2e points the S3 sink at a local MinIO over http://.
+        let v = json!({
+            "name": "s3-e2e", "kind": "object_store",
+            "provider": "s3", "bucket": "b", "prefix": "p",
+            "endpoint": "http://minio:9000", "credential_ref": "mock"
+        });
+        validate_observability_exporter(&v).unwrap();
+    }
+
+    #[test]
+    fn exporter_object_store_rejects_plaintext_non_loopback_endpoint() {
+        // A non-loopback plaintext endpoint must be rejected — no exfil to an
+        // arbitrary http host.
+        let v = json!({
+            "name": "x", "kind": "object_store",
+            "provider": "s3", "bucket": "b", "prefix": "p",
+            "endpoint": "http://evil.example.com", "credential_ref": "r"
+        });
+        assert!(validate_observability_exporter(&v).is_err());
     }
 
     #[test]

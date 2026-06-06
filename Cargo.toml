@@ -119,6 +119,16 @@ hex = "0.4"
 moka = { version = "0.12", features = ["future"] }
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "cluster-async"] }
 
+# Object-storage observability sink (aisix-obs): ONE crate covering S3 / GCS /
+# Azure Blob (+ S3-compatible MinIO/R2) behind a single `ObjectStore` trait, so
+# the sink is written once, not per-provider. The cloud features pull reqwest
+# default-features=false + rustls, so this stays rustls-only — no OpenSSL /
+# native-tls (same posture as the SLS sub-crates above).
+object_store = { version = "0.13", default-features = false, features = ["aws", "gcp", "azure", "tls-webpki-roots"] }
+# NDJSON gzip for the object-storage sink. flate2's default miniz_oxide backend
+# is pure Rust — no zlib/C, consistent with the no-OpenSSL posture.
+flate2 = "1"
+
 # Tokenization / counting (optional hard-mode TPM)
 tiktoken-rs = "0.5"
 
