@@ -653,11 +653,26 @@ async fn anthropic_passthrough_dispatch(
         } else {
             Some(resolved_chain.clone())
         };
+        // Content capture: prompt up front; the response is already assembled
+        // into `usage.response_text` by the frame parser and preserved (not
+        // taken) when `content_cap` is set. Both gated.
+        let content_cap = content_capture_cap(
+            state
+                .snapshot
+                .load()
+                .observability_exporters
+                .entries()
+                .iter()
+                .map(|e| &e.value),
+        );
+        let captured_prompt_c =
+            content_cap.map(|_| serde_json::to_string(&body).unwrap_or_default());
         let parsed_stream = build_anthropic_passthrough_stream(
             body_stream,
             started,
             stream_guardrail,
             model_name.to_string(),
+            content_cap,
             move |usage| {
                 // Streaming responses that got this far are 200 — the
                 // !status.is_success() guard above returned early on
@@ -688,9 +703,16 @@ async fn anthropic_passthrough_dispatch(
                     metrics,
                     &client_ctx_c,
                     applied_guardrails_c.clone(),
-                    // Streaming content capture lands in C3b; metadata only here.
-                    /* content */
-                    None,
+                    // Prompt captured up front; response assembled by the frame
+                    // parser into `usage.response_text`. Both gated on the cap.
+                    match (&captured_prompt_c, content_cap) {
+                        (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+                            prompt,
+                            &usage.response_text,
+                            cap as usize,
+                        )),
+                        _ => None,
+                    },
                 );
             },
         );
@@ -1008,12 +1030,26 @@ async fn cross_provider_dispatch(
         } else {
             Some(resolved_chain.clone())
         };
+        // Content capture: prompt up front, response assembled in the stream
+        // into `comp.response_text`. Both gated on `content_cap`.
+        let content_cap = content_capture_cap(
+            state
+                .snapshot
+                .load()
+                .observability_exporters
+                .entries()
+                .iter()
+                .map(|e| &e.value),
+        );
+        let captured_prompt_for_telem =
+            content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
         let sse_body = build_anthropic_sse_stream(
             upstream,
             encoder,
             started,
             stream_guardrail,
             model_name.to_string(),
+            content_cap,
             move |comp| {
                 let metrics = AnthropicUsageMetrics {
                     prompt_tokens: comp.prompt_tokens,
@@ -1041,9 +1077,16 @@ async fn cross_provider_dispatch(
                     metrics,
                     &client_for_telem,
                     applied_guardrails_for_telem.clone(),
-                    // Streaming content capture lands in C3b; metadata only here.
-                    /* content */
-                    None,
+                    // Prompt captured up front, response assembled across the
+                    // stream into `comp.response_text`; both gated on the cap.
+                    match (&captured_prompt_for_telem, content_cap) {
+                        (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+                            prompt,
+                            &comp.response_text,
+                            cap as usize,
+                        )),
+                        _ => None,
+                    },
                 );
             },
         );
@@ -1156,6 +1199,9 @@ fn build_anthropic_sse_stream(
     started: Instant,
     output_guardrail: Option<std::sync::Arc<aisix_guardrails::GuardrailChain>>,
     model_label: String,
+    // Largest content cap any content-capturing exporter wants, or `None` to
+    // skip response accumulation (the common, content-free path).
+    content_cap: Option<u32>,
     on_complete: impl FnOnce(AnthropicStreamCompletion) + Send + 'static,
 ) -> axum::body::Body {
     use futures::StreamExt;
@@ -1210,6 +1256,15 @@ fn build_anthropic_sse_stream(
                         }
                         if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
                             tool_call_fragments.extend(tcs.iter().cloned());
+                        }
+                    }
+                    // Content capture: assemble the response (bounded to the
+                    // cap), only when an exporter wants full content.
+                    if let Some(cap) = content_cap {
+                        if let Some(t) = chunk.delta.content.as_deref() {
+                            if comp.response_text.len() < cap as usize {
+                                comp.response_text.push_str(t);
+                            }
                         }
                     }
                     for ev in encoder.next_events(&chunk) {
@@ -1297,6 +1352,11 @@ struct AnthropicStreamCompletion {
     provider_model_version: String,
     finish_reason: String,
     ttft_ms: u32,
+    /// Assembled assistant text for content-capturing exporters, accumulated
+    /// across chunks ONLY when an exporter wants full content (bounded to the
+    /// capture cap). Empty otherwise. Read by the on_complete closure; never
+    /// reaches the CP sink.
+    response_text: String,
 }
 
 struct CompleteAnthropicStreamOnDrop<F: FnOnce(AnthropicStreamCompletion)> {
@@ -1742,6 +1802,9 @@ fn build_anthropic_passthrough_stream<S, F>(
     started: Instant,
     output_guardrail: Option<std::sync::Arc<aisix_guardrails::GuardrailChain>>,
     model_label: String,
+    // When `Some`, the assembled `response_text` is preserved (not taken by the
+    // guardrail scan) so the on_complete content capture can read it.
+    content_cap: Option<u32>,
     on_complete: F,
 ) -> AnthropicDeliveryCounter<reqwest::Result<Bytes>>
 where
@@ -1803,7 +1866,14 @@ where
         // event (bytes were already forwarded verbatim, mirroring the
         // cross-provider path and the common streaming-guardrail pattern).
         if let Some(chain) = output_guardrail.as_ref() {
-            let text = std::mem::take(&mut guard.usage().response_text);
+            // Clone (not take) when content capture is on, so the assembled
+            // response survives for the on_complete content capture below;
+            // otherwise take it (nothing downstream reads it).
+            let text = if content_cap.is_some() {
+                guard.usage().response_text.clone()
+            } else {
+                std::mem::take(&mut guard.usage().response_text)
+            };
             if !text.is_empty() {
                 let synth = aisix_gateway::ChatResponse {
                     id: String::new(),
