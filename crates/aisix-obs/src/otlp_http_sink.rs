@@ -768,6 +768,22 @@ mod tests {
         });
         assert!(content_record(&otlp, &event, Some(&captured)).is_none());
 
+        // object_store never carries content either — content_record gates on
+        // the AliyunSls variant, so any other kind gets metadata-only even when
+        // content was captured (no prompt/response leak into S3 / GCS / Azure).
+        let objstore = serde_json::from_value::<ObservabilityExporter>(serde_json::json!({
+            "name": "o",
+            "enabled": true,
+            "kind": "object_store",
+            "provider": "s3",
+            "bucket": "b",
+            "prefix": "p",
+            "credential_ref": "r"
+        }))
+        .unwrap()
+        .kind;
+        assert!(content_record(&objstore, &event, Some(&captured)).is_none());
+
         // sls metadata_only → no content.
         let meta = sls_kind(SlsContentMode::MetadataOnly, 1024);
         assert!(content_record(&meta, &event, Some(&captured)).is_none());
