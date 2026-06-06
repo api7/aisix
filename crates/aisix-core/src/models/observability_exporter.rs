@@ -113,7 +113,12 @@ pub struct AliyunSlsConfig {
     /// (UTF-8-boundary safe), and the log carries a `content_truncated`
     /// marker when either was cut. Ignored under `metadata_only`. Defaults
     /// to 128 KiB.
+    ///
+    /// `0` is rejected — `full` with a zero cap captures nothing, which is a
+    /// misconfiguration. The `range(min = 1)` keeps the generated JSON schema
+    /// in step with the runtime validator so the CP and DP agree on the floor.
     #[serde(default = "default_content_max_bytes")]
+    #[schemars(range(min = 1))]
     pub content_max_bytes: u32,
 }
 
