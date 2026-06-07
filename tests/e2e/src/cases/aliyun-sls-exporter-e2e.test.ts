@@ -25,7 +25,8 @@ import {
 // credential_ref → env path, not a key on the kine config). The body's field
 // mapping is covered by the Rust round-trip unit test (`sink::sls::tests`),
 // and that a real Aliyun endpoint actually accepts the signed request is
-// covered by the one-off real-SLS smoke (`sls_smoke`, env-gated).
+// validated by the control-plane full-chain e2e (api7/AISIX-Cloud), not in
+// this repo.
 
 const CALLER_PLAINTEXT = "sk-sls-exporter-caller-PLAINTEXT";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
