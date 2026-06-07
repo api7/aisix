@@ -48,6 +48,9 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+use crate::attempt::{
+    attempt_error_message, routing_error_class, AttemptInfo, AttemptRecord, RoutingTelemetry,
+};
 use crate::auth::AuthenticatedKey;
 use crate::chat::sanitize_tag;
 use crate::client_ip::ClientContext;
@@ -116,6 +119,7 @@ pub async fn messages(
             upstream_model,
             metrics,
             usage_handled_by_stream,
+            routing,
         }) => {
             let elapsed = started.elapsed();
             let status = response.status().as_u16();
@@ -126,6 +130,7 @@ pub async fn messages(
                 status,
                 elapsed,
                 &request_id,
+                &routing,
             );
             state.metrics.record_request(
                 &provider_label,
@@ -150,7 +155,31 @@ pub async fn messages(
             };
             state.metrics.record_proxy_request(labels, elapsed);
             state.metrics.record_llm_request(labels, elapsed);
+            // Per #655: one zero-token UsageEvent per failed attempt that
+            // preceded the winner (non-streaming failover). No-op for a
+            // first-try success and for the single-attempt streaming path.
+            emit_failed_attempts_anthropic(
+                &state,
+                &request_id,
+                &model_id,
+                &api_key_id,
+                &provider_label,
+                &model_name,
+                &upstream_model,
+                auth.key().team_id.as_deref(),
+                auth.key().user_id.as_deref(),
+                &client,
+                &routing,
+            );
             if !usage_handled_by_stream {
+                // Winning-attempt classification (#655). Direct models have
+                // no recorded attempt → AttemptInfo defaults (index 0,
+                // "initial", empty target). The streaming path emits the
+                // winner from its Drop guard, so it is skipped here.
+                let attempt = routing
+                    .winner()
+                    .map(AttemptInfo::from_record)
+                    .unwrap_or_default();
                 emit_anthropic_usage_event(
                     &state,
                     &request_id,
@@ -166,11 +195,12 @@ pub async fn messages(
                     elapsed,
                     metrics,
                     &client,
+                    attempt,
                 );
             }
             response
         }
-        Err(err) => {
+        Err(MessagesDispatchError { err, routing }) => {
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
             emit_access_log(
@@ -180,6 +210,7 @@ pub async fn messages(
                 status,
                 elapsed,
                 &request_id,
+                &routing,
             );
             state.metrics.record_request(
                 "unknown",
@@ -188,11 +219,9 @@ pub async fn messages(
                 RequestOutcome::from_status(status),
                 elapsed,
             );
-            // Emit a token-less UsageEvent so the dashboard's Logs tab
-            // surfaces the failed Anthropic-SDK request alongside its
-            // openai-shape siblings. status_code carries the failure
-            // class; tokens stay zero.
-            emit_anthropic_usage_event(
+            // Per #655: emit one zero-token UsageEvent per FAILED attempt so
+            // the dashboard's Logs tab surfaces each failed upstream try.
+            emit_failed_attempts_anthropic(
                 &state,
                 &request_id,
                 &model_id,
@@ -200,14 +229,38 @@ pub async fn messages(
                 "unknown",
                 &model_name,
                 "unknown",
-                "unknown",
                 auth.key().team_id.as_deref(),
                 auth.key().user_id.as_deref(),
-                status,
-                elapsed,
-                AnthropicUsageMetrics::default(),
                 &client,
+                &routing,
             );
+            // Pre-dispatch failure (model-not-found, auth, budget, guardrail
+            // block before any upstream attempt) records no attempts — emit a
+            // single terminal event carrying the failure class. When attempts
+            // were recorded, each was already emitted above.
+            if routing.attempts.is_empty() {
+                emit_anthropic_usage_event(
+                    &state,
+                    &request_id,
+                    &model_id,
+                    &api_key_id,
+                    "unknown",
+                    &model_name,
+                    "unknown",
+                    "unknown",
+                    auth.key().team_id.as_deref(),
+                    auth.key().user_id.as_deref(),
+                    status,
+                    elapsed,
+                    AnthropicUsageMetrics::default(),
+                    &client,
+                    AttemptInfo {
+                        kind: "initial".to_string(),
+                        error_class: err.kind().to_string(),
+                        ..Default::default()
+                    },
+                );
+            }
             // /v1/messages must return Anthropic-shape error envelope
             // `{type:"error", error:{type, message}}` so Claude SDKs
             // can parse it — closes #336. The DP-stable taxonomy
@@ -218,6 +271,44 @@ pub async fn messages(
     }
 }
 
+/// Emit one zero-token `UsageEvent` per FAILED attempt of a `/v1/messages`
+/// request (#655). The winner / pre-dispatch event is emitted separately.
+/// No-op when there are no failed attempts. Each event shares `request_id`.
+#[allow(clippy::too_many_arguments)]
+fn emit_failed_attempts_anthropic(
+    state: &ProxyState,
+    request_id: &str,
+    model_id: &str,
+    api_key_id: &str,
+    provider: &str,
+    model: &str,
+    upstream_model: &str,
+    team_id: Option<&str>,
+    user_id: Option<&str>,
+    client: &ClientContext,
+    routing: &RoutingTelemetry,
+) {
+    for rec in routing.attempts.iter().filter(|a| !a.success) {
+        emit_anthropic_usage_event(
+            state,
+            request_id,
+            model_id,
+            api_key_id,
+            provider,
+            model,
+            &rec.provider_key_id,
+            upstream_model,
+            team_id,
+            user_id,
+            rec.status,
+            Duration::from_millis(u64::from(rec.latency_ms)),
+            AnthropicUsageMetrics::default(),
+            client,
+            AttemptInfo::from_record(rec),
+        );
+    }
+}
+
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -225,7 +316,7 @@ async fn dispatch(
     request_id: &str,
     started: Instant,
     client: &ClientContext,
-) -> Result<DispatchOutcome, ProxyError> {
+) -> Result<DispatchOutcome, MessagesDispatchError> {
     let snapshot = state.snapshot.load();
 
     // Extract and resolve model.
@@ -241,7 +332,7 @@ async fn dispatch(
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
     if !auth.key().can_access(&model_name) {
-        return Err(ProxyError::ModelForbidden(model_name.clone()));
+        return Err(ProxyError::ModelForbidden(model_name.clone()).into());
     }
 
     let model_rl =
@@ -276,7 +367,8 @@ async fn dispatch(
                 );
                 return Err(ProxyError::ContentFiltered(
                     "request blocked by content policy".into(),
-                ));
+                )
+                .into());
             }
         }
     }
@@ -284,11 +376,12 @@ async fn dispatch(
     // Budget pre-check via cp-api (mirrors /v1/chat/completions).
     let budget_decision = state.budgets.check(&auth.entry.id).await;
     if !budget_decision.allowed {
-        return Err(ProxyError::BudgetExceeded(Box::new(
-            budget_decision.reason.unwrap_or_else(|| {
+        return Err(
+            ProxyError::BudgetExceeded(Box::new(budget_decision.reason.unwrap_or_else(|| {
                 crate::budget::BudgetReason::message_only(auth.entry.id.clone())
-            }),
-        )));
+            })))
+            .into(),
+        );
     }
 
     // Resolve the attempt list. For a Model Group (routing model) this
@@ -314,15 +407,33 @@ async fn dispatch(
         .as_ref()
         .map(|r| r.retry_on_429_or_default())
         .unwrap_or(false);
+    // Routing target names only matter on the telemetry for a real Model
+    // Group; a direct model leaves `attempt_model` empty (its `model_id`
+    // already identifies it), matching chat.rs.
+    let is_routing_request = model_entry.value.routing.is_some();
+    let mut routing = RoutingTelemetry::default();
 
     // Streaming attempts only the first target (no mid-stream fallback),
-    // matching /v1/chat/completions.
+    // matching /v1/chat/completions. The winning UsageEvent is emitted by
+    // the stream's Drop guard; a connect failure records a single failed
+    // attempt the handler emits.
     if is_stream {
-        return dispatch_to_target(
+        let target = &attempt_models[0];
+        let (idx, kind) = routing.begin_attempt(&target.model.display_name);
+        let target_model = if is_routing_request {
+            target.model.display_name.clone()
+        } else {
+            String::new()
+        };
+        let pk_id = crate::dispatch::resolve_provider_key(&snapshot, &target.model)
+            .map(|e| e.id.clone())
+            .unwrap_or_default();
+        let attempt_started = Instant::now();
+        return match dispatch_to_target(
             state,
             &snapshot,
             body,
-            &attempt_models[0],
+            target,
             &model_name,
             request_id,
             started,
@@ -331,16 +442,65 @@ async fn dispatch(
             auth.key().user_id.clone(),
             resolved_chain.clone(),
             client,
+            AttemptInfo {
+                index: idx,
+                kind: kind.to_string(),
+                model: target_model.clone(),
+                ..Default::default()
+            },
         )
-        .await;
+        .await
+        {
+            Ok(mut outcome) => {
+                routing.attempts.push(AttemptRecord {
+                    index: idx,
+                    kind,
+                    target_model,
+                    provider_key_id: outcome.provider_key_id.clone(),
+                    status: 200,
+                    success: true,
+                    error_class: String::new(),
+                    error_message: String::new(),
+                    latency_ms: ms_since(attempt_started),
+                });
+                outcome.routing = routing;
+                Ok(outcome)
+            }
+            Err(e) => {
+                let (error_class, error_message) = attempt_error_from_proxy(&e);
+                routing.attempts.push(AttemptRecord {
+                    index: idx,
+                    kind,
+                    target_model,
+                    provider_key_id: pk_id,
+                    status: e.status().as_u16(),
+                    success: false,
+                    error_class,
+                    error_message,
+                    latency_ms: ms_since(attempt_started),
+                });
+                Err(MessagesDispatchError { err: e, routing })
+            }
+        };
     }
 
     // Non-streaming: walk targets, failing over to the next only on a
     // retryable upstream failure. A 4xx / config error is returned
-    // as-is — retrying other targets won't help.
+    // as-is — retrying other targets won't help. Each target attempt
+    // becomes its own per-attempt record (#655).
     let n = attempt_models.len();
     let mut last_err: Option<ProxyError> = None;
     for (i, target) in attempt_models.iter().enumerate() {
+        let (idx, kind) = routing.begin_attempt(&target.model.display_name);
+        let target_model = if is_routing_request {
+            target.model.display_name.clone()
+        } else {
+            String::new()
+        };
+        let pk_id = crate::dispatch::resolve_provider_key(&snapshot, &target.model)
+            .map(|e| e.id.clone())
+            .unwrap_or_default();
+        let attempt_started = Instant::now();
         match dispatch_to_target(
             state,
             &snapshot,
@@ -354,15 +514,47 @@ async fn dispatch(
             auth.key().user_id.clone(),
             resolved_chain.clone(),
             client,
+            AttemptInfo {
+                index: idx,
+                kind: kind.to_string(),
+                model: target_model.clone(),
+                ..Default::default()
+            },
         )
         .await
         {
-            Ok(outcome) => return Ok(outcome),
+            Ok(mut outcome) => {
+                routing.attempts.push(AttemptRecord {
+                    index: idx,
+                    kind,
+                    target_model,
+                    provider_key_id: outcome.provider_key_id.clone(),
+                    status: 200,
+                    success: true,
+                    error_class: String::new(),
+                    error_message: String::new(),
+                    latency_ms: ms_since(attempt_started),
+                });
+                outcome.routing = routing;
+                return Ok(outcome);
+            }
             Err(e) => {
                 let retryable = matches!(
                     &e,
                     ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429)
                 );
+                let (error_class, error_message) = attempt_error_from_proxy(&e);
+                routing.attempts.push(AttemptRecord {
+                    index: idx,
+                    kind,
+                    target_model,
+                    provider_key_id: pk_id,
+                    status: e.status().as_u16(),
+                    success: false,
+                    error_class,
+                    error_message,
+                    latency_ms: ms_since(attempt_started),
+                });
                 last_err = Some(e);
                 if !(retryable && i + 1 < n) {
                     break;
@@ -370,7 +562,15 @@ async fn dispatch(
             }
         }
     }
-    Err(last_err.unwrap_or(ProxyError::ProviderUnavailable))
+    Err(MessagesDispatchError {
+        err: last_err.unwrap_or(ProxyError::ProviderUnavailable),
+        routing,
+    })
+}
+
+/// Milliseconds elapsed since `started`, saturating at `u32::MAX`.
+fn ms_since(started: Instant) -> u32 {
+    started.elapsed().as_millis().min(u32::MAX as u128) as u32
 }
 
 /// Dispatch one concrete (non-routing) target Model. Branches on the
@@ -390,6 +590,10 @@ async fn dispatch_to_target(
     user_id: Option<String>,
     resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
     client: &ClientContext,
+    // Winning-attempt classification (#655) — used by the streaming paths
+    // whose Drop guard owns the UsageEvent emit. Non-streaming paths emit
+    // from the handler and ignore it.
+    attempt: AttemptInfo,
 ) -> Result<DispatchOutcome, ProxyError> {
     let model = &target.model;
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -409,6 +613,7 @@ async fn dispatch_to_target(
             user_id,
             resolved_chain,
             client,
+            attempt,
         )
         .await;
     }
@@ -428,6 +633,7 @@ async fn dispatch_to_target(
         user_id,
         resolved_chain,
         client,
+        attempt,
     )
     .await
 }
@@ -452,6 +658,7 @@ async fn anthropic_passthrough_dispatch(
     user_id: Option<String>,
     resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
     client_ctx: &ClientContext,
+    attempt: AttemptInfo,
 ) -> Result<DispatchOutcome, ProxyError> {
     let mut body = body.clone();
     let api_key = crate::dispatch::require_secret(pk_value, model)?;
@@ -611,6 +818,8 @@ async fn anthropic_passthrough_dispatch(
         let user_id_c = user_id.clone();
         // #492: log the same client IP/UA on streamed responses.
         let client_ctx_c = client_ctx.clone();
+        // Winning-attempt classification (#655) for the stream-end emit.
+        let attempt_c = attempt.clone();
 
         let stream_guardrail = if resolved_chain.is_empty() {
             None
@@ -651,6 +860,7 @@ async fn anthropic_passthrough_dispatch(
                     started.elapsed(),
                     metrics,
                     &client_ctx_c,
+                    attempt_c.clone(),
                 );
             },
         );
@@ -690,6 +900,7 @@ async fn anthropic_passthrough_dispatch(
             upstream_model: upstream_model.clone(),
             metrics: AnthropicUsageMetrics::default(),
             usage_handled_by_stream: true,
+            routing: RoutingTelemetry::default(),
         })
     } else {
         // Non-streaming: deserialise and re-serialise as JSON. Decode
@@ -770,6 +981,7 @@ async fn anthropic_passthrough_dispatch(
             upstream_model,
             metrics,
             usage_handled_by_stream: false,
+            routing: RoutingTelemetry::default(),
         })
     }
 }
@@ -843,6 +1055,7 @@ async fn cross_provider_dispatch(
     user_id: Option<String>,
     resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
     client: &ClientContext,
+    attempt: AttemptInfo,
 ) -> Result<DispatchOutcome, ProxyError> {
     use aisix_gateway::{Bridge, BridgeContext};
     use aisix_provider_anthropic::{
@@ -921,6 +1134,8 @@ async fn cross_provider_dispatch(
         let started_for_telem = started;
         // #492: log the same client IP/UA on streamed responses.
         let client_for_telem = client.clone();
+        // Winning-attempt classification (#655) for the stream-end emit.
+        let attempt_for_telem = attempt.clone();
         let stream_guardrail = if resolved_chain.is_empty() {
             None
         } else {
@@ -958,6 +1173,7 @@ async fn cross_provider_dispatch(
                     started_for_telem.elapsed(),
                     metrics,
                     &client_for_telem,
+                    attempt_for_telem.clone(),
                 );
             },
         );
@@ -983,6 +1199,7 @@ async fn cross_provider_dispatch(
             upstream_model,
             metrics: AnthropicUsageMetrics::default(),
             usage_handled_by_stream: true,
+            routing: RoutingTelemetry::default(),
         });
     }
 
@@ -1034,6 +1251,7 @@ async fn cross_provider_dispatch(
         upstream_model,
         metrics,
         usage_handled_by_stream: false,
+        routing: RoutingTelemetry::default(),
     })
 }
 
@@ -1223,6 +1441,49 @@ struct DispatchOutcome {
     upstream_model: String,
     metrics: AnthropicUsageMetrics,
     usage_handled_by_stream: bool,
+    /// Per-attempt routing telemetry (#655). Carries every attempt that
+    /// preceded the winner plus the winning attempt itself, so the
+    /// handler can emit one `UsageEvent` per attempt sharing `request_id`.
+    routing: RoutingTelemetry,
+}
+
+/// Dispatch error carrying the per-attempt telemetry accumulated before
+/// the request ultimately failed (#655). Mirrors `chat::DispatchFailure`.
+struct MessagesDispatchError {
+    err: ProxyError,
+    routing: RoutingTelemetry,
+}
+
+impl MessagesDispatchError {
+    /// Pre-dispatch failure (model-not-found, auth, budget, guardrail
+    /// block before any upstream attempt): no recorded attempts.
+    fn pre_dispatch(err: ProxyError) -> Self {
+        Self {
+            err,
+            routing: RoutingTelemetry::default(),
+        }
+    }
+}
+
+impl From<ProxyError> for MessagesDispatchError {
+    /// Every `?` in `dispatch`'s pre-attempt prelude converts here — those
+    /// errors fire before any upstream attempt, so they carry no routing.
+    fn from(err: ProxyError) -> Self {
+        Self::pre_dispatch(err)
+    }
+}
+
+/// Bounded error class + short message for a per-attempt record, derived
+/// from a `ProxyError`. Bridge errors carry the upstream-mapped class +
+/// message; everything else uses the DP-stable `ProxyError::kind`.
+fn attempt_error_from_proxy(err: &ProxyError) -> (String, String) {
+    match err {
+        ProxyError::Bridge(be) => (
+            routing_error_class(be).to_string(),
+            attempt_error_message(be),
+        ),
+        other => (other.kind().to_string(), String::new()),
+    }
 }
 
 /// Bundle of optional fields a UsageEvent emit-call wants when the
@@ -1265,6 +1526,7 @@ fn emit_anthropic_usage_event(
     elapsed: Duration,
     metrics: AnthropicUsageMetrics,
     client: &ClientContext,
+    attempt: AttemptInfo,
 ) {
     // Per-PK telemetry attribution (#302 M17 / AISIX-Cloud#436).
     // Same shape as chat.rs's emit_usage_event — look up the
@@ -1296,6 +1558,11 @@ fn emit_anthropic_usage_event(
         finish_reason: metrics.finish_reason,
         ttft_ms: metrics.ttft_ms,
         inbound_protocol: "anthropic".to_string(),
+        attempt_index: attempt.index,
+        attempt_kind: attempt.kind,
+        attempt_model: attempt.model,
+        error_class: attempt.error_class,
+        error_message: attempt.error_message,
         provider_kind: sanitize_tag(tags.kind.unwrap_or_default()),
         provider_featured: tags.featured,
         branded_provider: sanitize_tag(tags.branded_provider.unwrap_or_default()),
@@ -1723,7 +1990,15 @@ fn emit_access_log(
     status: u16,
     latency: Duration,
     request_id: &str,
+    routing: &RoutingTelemetry,
 ) {
+    // Per #655 the access log stays ONE line per request, carrying the
+    // user-perceived `latency` + final status plus a routing summary; the
+    // per-attempt detail lives in telemetry.
+    let served_by = routing
+        .winner()
+        .map(|w| w.target_model.as_str())
+        .filter(|s| !s.is_empty());
     AccessLog {
         method: "POST",
         path: "/v1/messages",
@@ -1736,9 +2011,15 @@ fn emit_access_log(
         completion_tokens: None,
         total_tokens: None,
         request_id,
-        served_by_model: None,
-        routing_attempt_count: None,
-        routing_fallback_count: None,
+        served_by_model: served_by,
+        routing_attempt_count: match routing.attempt_count() {
+            0 => None,
+            n => Some(n),
+        },
+        routing_fallback_count: match routing.fallback_count() {
+            0 => None,
+            n => Some(n),
+        },
     }
     .emit();
 }

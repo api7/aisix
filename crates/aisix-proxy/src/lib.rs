@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+mod attempt;
 mod audio;
 mod auth;
 pub mod background;
@@ -3438,6 +3439,235 @@ data: [DONE]\n\n";
                 extra.error_class
             );
         }
+    }
+
+    #[tokio::test]
+    async fn messages_routing_emits_per_attempt_events() {
+        // Per #655 the /v1/messages family must emit one UsageEvent per
+        // upstream attempt, just like /v1/chat/completions. A Model Group
+        // whose primary 502s and secondary succeeds emits 2 events sharing
+        // request_id, tagged inbound_protocol="anthropic".
+        use aisix_obs::UsageSink;
+
+        let bad_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
+            .expect(1)
+            .mount(&bad_upstream)
+            .await;
+
+        let good_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-good",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "fallback worked"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&good_upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-bad", &bad_upstream.uri()));
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-good", &good_upstream.uri()));
+        snap.models
+            .insert(model_entry_with_id("m-bad", "primary", "pk-bad"));
+        snap.models
+            .insert(model_entry_with_id("m-good", "secondary", "pk-good"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary", "secondary"],
+            None,
+            None,
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+        let body = serde_json::json!({
+            "model": "smart",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .expect("usage event was never emitted")
+                .expect("sender dropped");
+            events.push(ev);
+        }
+        events.sort_by_key(|e| e.attempt_index);
+        let rid = events[0].request_id.clone();
+        assert!(
+            !rid.is_empty() && events.iter().all(|e| e.request_id == rid),
+            "all attempts share the request_id (trace key)"
+        );
+        assert!(
+            events.iter().all(|e| e.inbound_protocol == "anthropic"),
+            "/v1/messages tags inbound_protocol=anthropic on every attempt"
+        );
+
+        // initial attempt on `primary` failed with the upstream's 502
+        assert_eq!(events[0].attempt_index, 0);
+        assert_eq!(events[0].attempt_kind, "initial");
+        assert_eq!(events[0].attempt_model, "primary");
+        assert_eq!(events[0].status_code, 502);
+        assert_eq!(events[0].error_class, "upstream_status");
+        assert_eq!(events[0].prompt_tokens, 0);
+        assert_eq!(events[0].completion_tokens, 0);
+
+        // fallback to `secondary` succeeded with real tokens
+        assert_eq!(events[1].attempt_index, 1);
+        assert_eq!(events[1].attempt_kind, "fallback");
+        assert_eq!(events[1].attempt_model, "secondary");
+        assert_eq!(events[1].status_code, 200);
+        assert_eq!(events[1].error_class, "");
+        assert_eq!(events[1].prompt_tokens, 1);
+        assert_eq!(events[1].completion_tokens, 1);
+    }
+
+    #[tokio::test]
+    async fn responses_routing_emits_per_attempt_events() {
+        // Per #655 the /v1/responses family must emit one UsageEvent per
+        // upstream attempt. A Model Group whose primary 502s and secondary
+        // succeeds emits 2 events sharing request_id, inbound_protocol="openai".
+        use aisix_obs::UsageSink;
+
+        let bad_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
+            .expect(1)
+            .mount(&bad_upstream)
+            .await;
+
+        let good_upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp-good",
+                "object": "response",
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&good_upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-bad", &bad_upstream.uri()));
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-good", &good_upstream.uri()));
+        snap.models
+            .insert(model_entry_with_id("m-bad", "primary", "pk-bad"));
+        snap.models
+            .insert(model_entry_with_id("m-good", "secondary", "pk-good"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary", "secondary"],
+            None,
+            None,
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+        let body = serde_json::json!({
+            "model": "smart",
+            "input": "hi"
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .expect("usage event was never emitted")
+                .expect("sender dropped");
+            events.push(ev);
+        }
+        events.sort_by_key(|e| e.attempt_index);
+        let rid = events[0].request_id.clone();
+        assert!(
+            !rid.is_empty() && events.iter().all(|e| e.request_id == rid),
+            "all attempts share the request_id (trace key)"
+        );
+        assert!(
+            events.iter().all(|e| e.inbound_protocol == "openai"),
+            "/v1/responses tags inbound_protocol=openai on every attempt"
+        );
+
+        // initial attempt on `primary` failed with the upstream's 502
+        assert_eq!(events[0].attempt_index, 0);
+        assert_eq!(events[0].attempt_kind, "initial");
+        assert_eq!(events[0].attempt_model, "primary");
+        assert_eq!(events[0].status_code, 502);
+        assert_eq!(events[0].error_class, "upstream_status");
+        assert_eq!(events[0].prompt_tokens, 0);
+
+        // fallback to `secondary` succeeded with real tokens
+        assert_eq!(events[1].attempt_index, 1);
+        assert_eq!(events[1].attempt_kind, "fallback");
+        assert_eq!(events[1].attempt_model, "secondary");
+        assert_eq!(events[1].status_code, 200);
+        assert_eq!(events[1].error_class, "");
+        assert_eq!(events[1].prompt_tokens, 1);
+        assert_eq!(events[1].completion_tokens, 1);
     }
 
     #[tokio::test]

@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::attempt::{attempt_error_message, routing_error_class, AttemptRecord, RoutingTelemetry};
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
@@ -44,65 +45,6 @@ use crate::state::ProxyState;
 /// Header set on every non-streaming response indicating whether the
 /// response came from the cache (`hit`) or the upstream (`miss`).
 pub const CACHE_HEADER: &str = "x-aisix-cache";
-
-/// One recorded upstream attempt (#655). Each attempt becomes its own
-/// per-attempt `UsageEvent`: failed attempts carry zero tokens + error
-/// info, the winning attempt carries the real tokens/cost. All attempts
-/// of one request share `request_id` and are ordered by `index`.
-#[derive(Clone)]
-struct AttemptRecord {
-    /// 0-based attempt index within the request.
-    index: u32,
-    /// `"initial"` (first try of the first target), `"retry"` (same
-    /// target after a retryable failure), or `"fallback"` (a different
-    /// target than the previous attempt).
-    kind: &'static str,
-    /// Routing target display name. Empty for direct (non-routing)
-    /// models, where `model_id` already identifies the single model.
-    target_model: String,
-    /// Resolved ProviderKey UUID for this attempt's target — feeds the
-    /// per-PK attribution tags on the emitted event. Empty when unknown.
-    provider_key_id: String,
-    /// This attempt's status (502/timeout-mapped/… on failure, 200 on
-    /// success).
-    status: u16,
-    success: bool,
-    /// Bounded error class (`routing_error_class`); empty on success.
-    error_class: String,
-    /// Short error message (length-capped); empty on success.
-    error_message: String,
-    /// This attempt's own wall-clock duration in ms.
-    latency_ms: u32,
-}
-
-/// Per-attempt telemetry accumulated while serving one request. Direct
-/// (non-routing) models record a single attempt with `target_model`
-/// empty; routing groups record one entry per try.
-#[derive(Clone, Default)]
-struct RoutingTelemetry {
-    attempts: Vec<AttemptRecord>,
-}
-
-impl RoutingTelemetry {
-    fn attempt_count(&self) -> u32 {
-        self.attempts.len() as u32
-    }
-
-    /// Number of attempts that moved to a different target than the
-    /// previous one. Drives the access log's `routing_fallback_count`.
-    fn fallback_count(&self) -> u32 {
-        self.attempts
-            .iter()
-            .filter(|a| a.kind == "fallback")
-            .count() as u32
-    }
-
-    /// The winning (successful) attempt, if any. None for all-failed and
-    /// pre-dispatch-error requests.
-    fn winner(&self) -> Option<&AttemptRecord> {
-        self.attempts.iter().rfind(|a| a.success)
-    }
-}
 
 struct DispatchFailure {
     model_id: Option<String>,
@@ -125,29 +67,6 @@ impl DispatchFailure {
         self.routing = routing;
         self
     }
-}
-
-fn routing_error_class(err: &BridgeError) -> &'static str {
-    match err {
-        BridgeError::Timeout { .. } => "timeout",
-        BridgeError::UpstreamStatus { .. } => "upstream_status",
-        BridgeError::UpstreamDecode(_) => "upstream_decode",
-        BridgeError::Config(_) => "config",
-        BridgeError::InvalidUpstreamConfig(_) => "invalid_config",
-        BridgeError::InvalidUpstreamCredentials(_) => "invalid_credentials",
-        BridgeError::Transport(_) => "transport",
-        BridgeError::StreamAborted => "stream_aborted",
-    }
-}
-
-/// Short, control-char-stripped error string for the per-attempt
-/// `error_message` telemetry field (#655). Capped like `sanitize_tag`.
-fn attempt_error_message(err: &BridgeError) -> String {
-    err.to_string()
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(256)
-        .collect()
 }
 
 // Per-attempt cooldown decision lives in `crate::cooldown` so every
@@ -877,19 +796,17 @@ async fn dispatch(
                 // Streaming attempts only the first target (#655): a single
                 // failed AttemptRecord, emitted by the Err-arm fan-out.
                 let routing = if virtual_entry.value.routing.is_some() {
-                    RoutingTelemetry {
-                        attempts: vec![AttemptRecord {
-                            index: 0,
-                            kind: "initial",
-                            target_model: model.display_name.clone(),
-                            provider_key_id: pk_entry.id.clone(),
-                            status: err.http_status(),
-                            success: false,
-                            error_class: routing_error_class(&err).to_string(),
-                            error_message: attempt_error_message(&err),
-                            latency_ms: attempt_latency_ms,
-                        }],
-                    }
+                    RoutingTelemetry::single(AttemptRecord {
+                        index: 0,
+                        kind: "initial",
+                        target_model: model.display_name.clone(),
+                        provider_key_id: pk_entry.id.clone(),
+                        status: err.http_status(),
+                        success: false,
+                        error_class: routing_error_class(&err).to_string(),
+                        error_message: attempt_error_message(&err),
+                        latency_ms: attempt_latency_ms,
+                    })
                 } else {
                     RoutingTelemetry::default()
                 };
@@ -940,19 +857,17 @@ async fn dispatch(
         // Streaming attempts only the first target (#655): a single
         // winning AttemptRecord drives the access log served-by + counts.
         let stream_routing = if virtual_entry.value.routing.is_some() {
-            RoutingTelemetry {
-                attempts: vec![AttemptRecord {
-                    index: 0,
-                    kind: "initial",
-                    target_model: model.display_name.clone(),
-                    provider_key_id: pk_entry.id.clone(),
-                    status: 200,
-                    success: true,
-                    error_class: String::new(),
-                    error_message: String::new(),
-                    latency_ms: 0,
-                }],
-            }
+            RoutingTelemetry::single(AttemptRecord {
+                index: 0,
+                kind: "initial",
+                target_model: model.display_name.clone(),
+                provider_key_id: pk_entry.id.clone(),
+                status: 200,
+                success: true,
+                error_class: String::new(),
+                error_message: String::new(),
+                latency_ms: 0,
+            })
         } else {
             RoutingTelemetry::default()
         };
@@ -1317,7 +1232,6 @@ async fn dispatch(
         .unwrap_or(false);
     let is_routing_request = virtual_entry.value.routing.is_some();
     let mut routing = RoutingTelemetry::default();
-    let mut last_attempted_target: Option<String> = None;
 
     for attempt in &attempt_models {
         let model = &attempt.model;
@@ -1354,15 +1268,7 @@ async fn dispatch(
             // Per-attempt telemetry kind (#655): the first attempt overall
             // is "initial"; a different target than the previous attempt is
             // a "fallback"; the same target again is a "retry".
-            let attempt_index = routing.attempts.len() as u32;
-            let kind = if routing.attempts.is_empty() {
-                "initial"
-            } else if last_attempted_target.as_deref() != Some(model.display_name.as_str()) {
-                "fallback"
-            } else {
-                "retry"
-            };
-            last_attempted_target = Some(model.display_name.clone());
+            let (attempt_index, kind) = routing.begin_attempt(&model.display_name);
             // Routing target name only for routing groups; a direct model
             // leaves it empty since `model_id` already identifies it.
             let target_model = if is_routing_request {

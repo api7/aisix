@@ -20,6 +20,9 @@ use axum::Json;
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
+use crate::attempt::{
+    attempt_error_message, routing_error_class, AttemptInfo, AttemptRecord, RoutingTelemetry,
+};
 use crate::auth::AuthenticatedKey;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
@@ -41,6 +44,45 @@ struct ResponseDispatchSuccess {
     /// UUID of the resolved Model row — needed for UsageEvent
     /// `model_id` field. Always present on success.
     model_id: String,
+    /// Per-attempt routing telemetry (#655): the failed attempts that
+    /// preceded the winner plus the winning attempt itself.
+    routing: RoutingTelemetry,
+}
+
+/// Dispatch error carrying the per-attempt telemetry accumulated before
+/// the request ultimately failed (#655). Mirrors `chat::DispatchFailure`.
+struct ResponsesDispatchError {
+    err: ProxyError,
+    routing: RoutingTelemetry,
+}
+
+impl From<ProxyError> for ResponsesDispatchError {
+    /// Pre-attempt `?` failures (model-not-found, auth, budget) carry no
+    /// recorded attempts.
+    fn from(err: ProxyError) -> Self {
+        Self {
+            err,
+            routing: RoutingTelemetry::default(),
+        }
+    }
+}
+
+/// Bounded error class + short message for a per-attempt record, derived
+/// from a `ProxyError`. Bridge errors carry the upstream-mapped class +
+/// message; everything else uses the DP-stable `ProxyError::kind`.
+fn attempt_error_from_proxy(err: &ProxyError) -> (String, String) {
+    match err {
+        ProxyError::Bridge(be) => (
+            routing_error_class(be).to_string(),
+            attempt_error_message(be),
+        ),
+        other => (other.kind().to_string(), String::new()),
+    }
+}
+
+/// Milliseconds elapsed since `started`, saturating at `u32::MAX`.
+fn ms_since(started: Instant) -> u32 {
+    started.elapsed().as_millis().min(u32::MAX as u128) as u32
 }
 
 /// Subset of the OpenAI Responses-API `usage` block the gateway
@@ -88,6 +130,7 @@ pub async fn responses(
                 status,
                 elapsed,
                 &request_id,
+                &success.routing,
             );
             state.metrics.record_request(
                 &success.provider,
@@ -95,6 +138,16 @@ pub async fn responses(
                 status,
                 RequestOutcome::from_status(status),
                 elapsed,
+            );
+            // Per #655: one zero-token UsageEvent per failed attempt that
+            // preceded the winner (non-streaming failover).
+            emit_failed_attempts(
+                &state,
+                &request_id,
+                &success.model_id,
+                &api_key_id,
+                &client,
+                &success.routing,
             );
             // Issue #404: emit UsageEvent so cp-api's budget ledger
             // and customer-facing /logs analytics see /v1/responses
@@ -105,6 +158,13 @@ pub async fn responses(
             // emission requires SSE byte-stream interception and is
             // tracked as a follow-up.
             if let Some(usage) = success.usage {
+                // Winning-attempt classification (#655). Direct models
+                // have no recorded attempt → AttemptInfo defaults.
+                let attempt = success
+                    .routing
+                    .winner()
+                    .map(AttemptInfo::from_record)
+                    .unwrap_or_default();
                 emit_usage_event(
                     &state,
                     &request_id,
@@ -114,11 +174,12 @@ pub async fn responses(
                     elapsed,
                     &usage,
                     &client,
+                    attempt,
                 );
             }
             success.response
         }
-        Err(err) => {
+        Err(ResponsesDispatchError { err, routing }) => {
             let status = err.status().as_u16();
             let elapsed = started.elapsed();
             emit_access_log(
@@ -128,6 +189,7 @@ pub async fn responses(
                 status,
                 elapsed,
                 &request_id,
+                &routing,
             );
             state.metrics.record_request(
                 "unknown",
@@ -136,6 +198,30 @@ pub async fn responses(
                 RequestOutcome::from_status(status),
                 elapsed,
             );
+            // Per #655: emit one zero-token UsageEvent per FAILED attempt so
+            // the dashboard's Logs tab surfaces each failed upstream try.
+            // `model_id` is empty on pre-dispatch failures (model never
+            // resolved); the request_id still groups the rows.
+            emit_failed_attempts(&state, &request_id, "", &api_key_id, &client, &routing);
+            // Pre-dispatch failure (model-not-found, auth, budget) records no
+            // attempts — emit a single terminal event carrying the failure
+            // class. When attempts were recorded, each was already emitted.
+            if routing.attempts.is_empty() {
+                emit_zero_token_event(
+                    &state,
+                    &request_id,
+                    "",
+                    &api_key_id,
+                    status,
+                    elapsed,
+                    &client,
+                    AttemptInfo {
+                        kind: "initial".to_string(),
+                        error_class: err.kind().to_string(),
+                        ..Default::default()
+                    },
+                );
+            }
             err.into_response()
         }
     }
@@ -146,7 +232,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     body: &Value,
     request_id: &str,
-) -> Result<ResponseDispatchSuccess, ProxyError> {
+) -> Result<ResponseDispatchSuccess, ResponsesDispatchError> {
     let snapshot = state.snapshot.load();
 
     let model_name = body
@@ -161,7 +247,7 @@ async fn dispatch(
         .ok_or_else(|| ProxyError::ModelNotFound(model_name.clone()))?;
 
     if !auth.key().can_access(&model_name) {
-        return Err(ProxyError::ModelForbidden(model_name.clone()));
+        return Err(ProxyError::ModelForbidden(model_name.clone()).into());
     }
 
     let model_rl =
@@ -185,6 +271,8 @@ async fn dispatch(
         .as_ref()
         .map(|r| r.retry_on_429_or_default())
         .unwrap_or(false);
+    let is_routing_request = model_entry.value.routing.is_some();
+    let mut routing = RoutingTelemetry::default();
 
     let is_stream = body
         .get("stream")
@@ -204,7 +292,14 @@ async fn dispatch(
             .iter()
             .find(|t| t.model.provider.as_deref() == Some("openai"))
             .ok_or_else(not_openai)?;
-        return responses_to_target(
+        let (idx, kind) = routing.begin_attempt(&target.model.display_name);
+        let target_model = if is_routing_request {
+            target.model.display_name.clone()
+        } else {
+            String::new()
+        };
+        let attempt_started = Instant::now();
+        return match responses_to_target(
             state,
             &snapshot,
             body,
@@ -212,7 +307,39 @@ async fn dispatch(
             &target.id,
             request_id,
         )
-        .await;
+        .await
+        {
+            Ok(mut success) => {
+                routing.attempts.push(AttemptRecord {
+                    index: idx,
+                    kind,
+                    target_model,
+                    provider_key_id: String::new(),
+                    status: success.response.status().as_u16(),
+                    success: true,
+                    error_class: String::new(),
+                    error_message: String::new(),
+                    latency_ms: ms_since(attempt_started),
+                });
+                success.routing = routing;
+                Ok(success)
+            }
+            Err(e) => {
+                let (error_class, error_message) = attempt_error_from_proxy(&e);
+                routing.attempts.push(AttemptRecord {
+                    index: idx,
+                    kind,
+                    target_model,
+                    provider_key_id: String::new(),
+                    status: e.status().as_u16(),
+                    success: false,
+                    error_class,
+                    error_message,
+                    latency_ms: ms_since(attempt_started),
+                });
+                Err(ResponsesDispatchError { err: e, routing })
+            }
+        };
     }
 
     let mut last_err: Option<ProxyError> = None;
@@ -222,6 +349,13 @@ async fn dispatch(
             continue;
         }
         any_openai = true;
+        let (idx, kind) = routing.begin_attempt(&target.model.display_name);
+        let target_model = if is_routing_request {
+            target.model.display_name.clone()
+        } else {
+            String::new()
+        };
+        let attempt_started = Instant::now();
         match responses_to_target(
             state,
             &snapshot,
@@ -232,12 +366,38 @@ async fn dispatch(
         )
         .await
         {
-            Ok(success) => return Ok(success),
+            Ok(mut success) => {
+                routing.attempts.push(AttemptRecord {
+                    index: idx,
+                    kind,
+                    target_model,
+                    provider_key_id: String::new(),
+                    status: success.response.status().as_u16(),
+                    success: true,
+                    error_class: String::new(),
+                    error_message: String::new(),
+                    latency_ms: ms_since(attempt_started),
+                });
+                success.routing = routing;
+                return Ok(success);
+            }
             Err(e) => {
                 let retryable = matches!(
                     &e,
                     ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429)
                 );
+                let (error_class, error_message) = attempt_error_from_proxy(&e);
+                routing.attempts.push(AttemptRecord {
+                    index: idx,
+                    kind,
+                    target_model,
+                    provider_key_id: String::new(),
+                    status: e.status().as_u16(),
+                    success: false,
+                    error_class,
+                    error_message,
+                    latency_ms: ms_since(attempt_started),
+                });
                 last_err = Some(e);
                 if !retryable {
                     break;
@@ -247,9 +407,12 @@ async fn dispatch(
     }
 
     if !any_openai {
-        return Err(not_openai());
+        return Err(not_openai().into());
     }
-    Err(last_err.unwrap_or(ProxyError::ProviderUnavailable))
+    Err(ResponsesDispatchError {
+        err: last_err.unwrap_or(ProxyError::ProviderUnavailable),
+        routing,
+    })
 }
 
 /// Dispatch one concrete OpenAI target's Responses-API passthrough to
@@ -359,6 +522,7 @@ async fn responses_to_target(
             provider: provider_label,
             usage: None,
             model_id: model_id.to_string(),
+            routing: RoutingTelemetry::default(),
         })
     } else {
         let json_body: Value = upstream_resp
@@ -385,6 +549,7 @@ async fn responses_to_target(
             provider: provider_label,
             usage,
             model_id: model_id.to_string(),
+            routing: RoutingTelemetry::default(),
         })
     }
 }
@@ -458,6 +623,7 @@ fn emit_usage_event(
     elapsed: Duration,
     usage: &ResponseUsage,
     client: &ClientContext,
+    attempt: AttemptInfo,
 ) {
     let event = UsageEvent {
         request_id: request_id.to_string(),
@@ -471,6 +637,11 @@ fn emit_usage_event(
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
+        attempt_index: attempt.index,
+        attempt_kind: attempt.kind,
+        attempt_model: attempt.model,
+        error_class: attempt.error_class,
+        error_message: attempt.error_message,
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
@@ -483,6 +654,68 @@ fn emit_usage_event(
         .fan_out(&event, exporters.iter().map(|e| &e.value));
 }
 
+/// Emit a zero-token `UsageEvent` for a failed / pre-dispatch attempt
+/// (#655). Tokens stay 0; `status_code` + `error_*` carry the failure.
+#[allow(clippy::too_many_arguments)]
+fn emit_zero_token_event(
+    state: &ProxyState,
+    request_id: &str,
+    model_id: &str,
+    api_key_id: &str,
+    status_code: u16,
+    elapsed: Duration,
+    client: &ClientContext,
+    attempt: AttemptInfo,
+) {
+    let event = UsageEvent {
+        request_id: request_id.to_string(),
+        occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        model_id: model_id.to_string(),
+        api_key_id: api_key_id.to_string(),
+        latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+        status_code,
+        inbound_protocol: "openai".to_string(),
+        attempt_index: attempt.index,
+        attempt_kind: attempt.kind,
+        attempt_model: attempt.model,
+        error_class: attempt.error_class,
+        error_message: attempt.error_message,
+        client_source_ip: client.source_ip.clone(),
+        client_user_agent: client.user_agent.clone(),
+        ..Default::default()
+    };
+    state.usage_sink.try_emit("responses", event.clone());
+    let snap = state.snapshot.load();
+    let exporters = snap.observability_exporters.entries();
+    state
+        .otlp_fan_out
+        .fan_out(&event, exporters.iter().map(|e| &e.value));
+}
+
+/// Emit one zero-token `UsageEvent` per FAILED attempt of a `/v1/responses`
+/// request (#655). The winner / terminal event is emitted separately.
+fn emit_failed_attempts(
+    state: &ProxyState,
+    request_id: &str,
+    model_id: &str,
+    api_key_id: &str,
+    client: &ClientContext,
+    routing: &RoutingTelemetry,
+) {
+    for rec in routing.attempts.iter().filter(|a| !a.success) {
+        emit_zero_token_event(
+            state,
+            request_id,
+            model_id,
+            api_key_id,
+            rec.status,
+            Duration::from_millis(u64::from(rec.latency_ms)),
+            client,
+            AttemptInfo::from_record(rec),
+        );
+    }
+}
+
 fn emit_access_log(
     model: &str,
     provider: &str,
@@ -490,7 +723,14 @@ fn emit_access_log(
     status: u16,
     elapsed: Duration,
     request_id: &str,
+    routing: &RoutingTelemetry,
 ) {
+    // Per #655 the access log stays ONE line per request, carrying the
+    // user-perceived `latency` + final status plus a routing summary.
+    let served_by = routing
+        .winner()
+        .map(|w| w.target_model.as_str())
+        .filter(|s| !s.is_empty());
     AccessLog {
         method: "POST",
         path: "/v1/responses",
@@ -503,9 +743,15 @@ fn emit_access_log(
         completion_tokens: None,
         total_tokens: None,
         request_id,
-        served_by_model: None,
-        routing_attempt_count: None,
-        routing_fallback_count: None,
+        served_by_model: served_by,
+        routing_attempt_count: match routing.attempt_count() {
+            0 => None,
+            n => Some(n),
+        },
+        routing_fallback_count: match routing.fallback_count() {
+            0 => None,
+            n => Some(n),
+        },
     }
     .emit();
 }
@@ -943,12 +1189,14 @@ mod tests {
         }
     }
 
-    /// Issue #404 negative pinning: 5xx responses must NOT emit
-    /// a UsageEvent. Audit MEDIUM-2 on this PR — without negative
-    /// pinning, a future regression that moved `emit_usage_event`
-    /// into the error branch would silently ship.
+    /// Per #655: a 5xx upstream now emits ONE zero-token UsageEvent for the
+    /// failed attempt, so the dashboard's Logs tab surfaces the failure
+    /// alongside its siblings. (Pre-#655 the responses handler dropped the
+    /// event on the error path — the failed request was invisible.) The
+    /// event carries the mapped status (502), zero tokens, an error class,
+    /// and the initial-attempt classification.
     #[tokio::test]
-    async fn upstream_5xx_does_not_emit_usage_event() {
+    async fn upstream_5xx_emits_zero_token_failed_attempt_event() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -981,10 +1229,26 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 
         let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
+        let ev = recv
+            .expect("a failed-attempt UsageEvent must be emitted within the timeout")
+            .expect("the usage sink channel must not be closed");
+        assert_eq!(ev.status_code, 502, "failed attempt records the mapped 502");
+        assert_eq!(ev.prompt_tokens, 0, "failed attempt has zero tokens");
+        assert_eq!(ev.completion_tokens, 0, "failed attempt has zero tokens");
+        assert_eq!(ev.attempt_index, 0, "single direct-model attempt");
+        assert_eq!(ev.attempt_kind, "initial");
+        assert_eq!(
+            ev.error_class, "upstream_status",
+            "500 upstream maps to an upstream_status error class",
+        );
+        // Exactly one event — a direct model has no further attempts and no
+        // separate terminal event (the attempt itself is terminal).
+        let extra = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        if let Ok(Some(ev)) = extra {
             panic!(
-                "5xx must not emit UsageEvent, got status_code={}",
-                ev.status_code,
+                "expected exactly one event for a single failed attempt, got a second: \
+                 attempt_index={} status_code={}",
+                ev.attempt_index, ev.status_code,
             );
         }
     }
