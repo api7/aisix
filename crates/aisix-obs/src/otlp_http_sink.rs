@@ -315,6 +315,23 @@ fn build_otlp_traces_payload(event: &UsageEvent, exporter_name: &str) -> Value {
     if event.ttft_ms > 0 {
         attributes.push(attr_int("aisix.ttft_ms", event.ttft_ms as i64));
     }
+    // Per-attempt telemetry (#655). `request_id` is the trace/group key; a
+    // failover request emits one span per attempt sharing it, ordered by
+    // `aisix.attempt_index`. The OTLP encoder is an explicit allowlist, so
+    // these are added here alongside the wire fields.
+    attributes.push(attr_int("aisix.attempt_index", event.attempt_index as i64));
+    if !event.attempt_kind.is_empty() {
+        attributes.push(attr_string("aisix.attempt_kind", &event.attempt_kind));
+    }
+    if !event.attempt_model.is_empty() {
+        attributes.push(attr_string("aisix.attempt_model", &event.attempt_model));
+    }
+    if !event.error_class.is_empty() {
+        attributes.push(attr_string("aisix.error_class", &event.error_class));
+    }
+    if !event.error_message.is_empty() {
+        attributes.push(attr_string("aisix.error_message", &event.error_message));
+    }
     // Downstream client attribution (#492). Custom attrs so exporters
     // can slice by source IP / client type; the OTLP encoder is an
     // explicit allowlist, so new UsageEvent fields must be added here.
@@ -548,6 +565,54 @@ mod tests {
         assert!(keys.contains(&"aisix.model_id"));
         assert!(keys.contains(&"aisix.exporter_name"));
         assert!(keys.contains(&"aisix.request_id"));
+    }
+
+    #[test]
+    fn payload_carries_per_attempt_attributes() {
+        // A failed fallback attempt (#655): zero tokens, error info, target.
+        let mut ev = sample_event();
+        ev.attempt_index = 1;
+        ev.attempt_kind = "fallback".into();
+        ev.attempt_model = "secondary".into();
+        ev.error_class = "upstream_status".into();
+        ev.error_message = "upstream returned 502".into();
+        let body = build_otlp_traces_payload(&ev, "test-exp");
+        let attrs = body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap();
+        let find = |k: &str| attrs.iter().find(|a| a["key"] == k);
+        assert_eq!(find("aisix.attempt_index").unwrap()["value"]["intValue"], "1");
+        assert_eq!(
+            find("aisix.attempt_kind").unwrap()["value"]["stringValue"],
+            "fallback"
+        );
+        assert_eq!(
+            find("aisix.attempt_model").unwrap()["value"]["stringValue"],
+            "secondary"
+        );
+        assert_eq!(
+            find("aisix.error_class").unwrap()["value"]["stringValue"],
+            "upstream_status"
+        );
+        assert_eq!(
+            find("aisix.error_message").unwrap()["value"]["stringValue"],
+            "upstream returned 502"
+        );
+
+        // A direct (non-routing) success omits the routing-only attrs but
+        // still carries attempt_index=0.
+        let plain = build_otlp_traces_payload(&sample_event(), "test-exp");
+        let plain_attrs = plain["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+            .as_array()
+            .unwrap();
+        let keys: Vec<&str> = plain_attrs
+            .iter()
+            .map(|a| a["key"].as_str().unwrap())
+            .collect();
+        assert!(keys.contains(&"aisix.attempt_index"));
+        assert!(!keys.contains(&"aisix.attempt_kind"));
+        assert!(!keys.contains(&"aisix.attempt_model"));
+        assert!(!keys.contains(&"aisix.error_class"));
     }
 
     #[test]
