@@ -283,7 +283,20 @@ fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
         .user_agent(format!("aisix-dp/{}", env!("CARGO_PKG_VERSION")))
         .identity(identity)
         .add_root_certificate(ca)
-        .use_rustls_tls();
+        .use_rustls_tls()
+        // Pin HTTP/1.1 for the dp-manager REST surface. dp-manager
+        // multiplexes kine/etcd gRPC and the /dp/* REST API on one TLS
+        // port via cmux: HTTP/2 streams carrying
+        // `content-type: application/grpc` go to kine, everything else to
+        // an HTTP/1.1-only gin server. If this client negotiates ALPN h2
+        // — which it does whenever reqwest's `http2` feature is enabled,
+        // and an observability-sink dependency (object_store) unifies that
+        // feature onto the shared workspace reqwest — every budget_check /
+        // heartbeat / telemetry request lands on the gin listener, which
+        // can't parse the h2 preface, and fails at the transport layer.
+        // This line is load-bearing; do not remove without making the CP
+        // REST listener h2-capable. See issue #535.
+        .http1_only();
     // Operator-supplied extra root (e2e / on-prem). Covers the dp-
     // manager server cert when it's signed by a CA distinct from the
     // cert-manager-issued client-cert CA.
@@ -552,5 +565,66 @@ mod tests {
             extra_ca_pem: None,
         };
         build_client(&mtls).expect("build_client must tolerate PEM without trailing newline");
+    }
+
+    /// Regression for #535: the dp-manager REST client must advertise
+    /// **only** `http/1.1` in its TLS ALPN — never `h2`. dp-manager
+    /// multiplexes kine/etcd gRPC and the `/dp/*` REST API on a single
+    /// TLS port via cmux; an h2 REST connection is misrouted to the
+    /// HTTP/1.1-only gin listener and every budget_check / heartbeat /
+    /// telemetry request then fails at the transport layer. The
+    /// `.http1_only()` in `build_client` pins this. We inspect the raw
+    /// ClientHello (sent in the clear before the handshake) instead of
+    /// completing a TLS session, so the test needs no server cert and
+    /// can't flake on handshake details.
+    #[tokio::test]
+    async fn cp_rest_client_advertises_only_http1_alpn() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let capture = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            buf.truncate(n);
+            buf
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let client = build_client(&mtls).expect("build mTLS client");
+
+        // One request makes the client emit a ClientHello; we never
+        // reply, so it errors out — only the ClientHello matters.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            client
+                .get(format!("https://127.0.0.1:{}/dp/budget_check", addr.port()))
+                .send(),
+        )
+        .await;
+
+        let hello = tokio::time::timeout(Duration::from_secs(2), capture)
+            .await
+            .expect("ClientHello capture timed out")
+            .expect("capture task panicked");
+
+        // ALPN entries are length-prefixed: 0x08 "http/1.1", 0x02 "h2".
+        // Find the http/1.1 entry (9 bytes — no realistic random
+        // collision), then assert the 3 bytes right before it are NOT
+        // the h2 entry, which is exactly where an [h2, http/1.1] list
+        // would place it.
+        let http11 = b"\x08http/1.1";
+        let pos = hello
+            .windows(http11.len())
+            .position(|w| w == http11)
+            .expect("ClientHello must advertise http/1.1 ALPN");
+        let preceded_by_h2 = pos >= 3 && &hello[pos - 3..pos] == b"\x02h2";
+        assert!(
+            !preceded_by_h2,
+            "CP-REST ClientHello must NOT advertise h2 ALPN — dp-manager's \
+             cmux would misroute the h2 REST connection (#535)",
+        );
     }
 }
