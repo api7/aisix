@@ -53,7 +53,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::attempt::{
-    attempt_error_message, routing_error_class, AttemptInfo, AttemptRecord, RoutingTelemetry,
+    attempt_error_from_proxy, ms_since, AttemptInfo, AttemptRecord, RoutingTelemetry,
 };
 use crate::auth::AuthenticatedKey;
 use crate::chat::sanitize_tag;
@@ -604,11 +604,6 @@ async fn dispatch(
         err: last_err.unwrap_or(ProxyError::ProviderUnavailable),
         routing,
     })
-}
-
-/// Milliseconds elapsed since `started`, saturating at `u32::MAX`.
-fn ms_since(started: Instant) -> u32 {
-    started.elapsed().as_millis().min(u32::MAX as u128) as u32
 }
 
 /// Dispatch one concrete (non-routing) target Model. Branches on the
@@ -1648,19 +1643,6 @@ impl From<ProxyError> for MessagesDispatchError {
     /// errors fire before any upstream attempt, so they carry no routing.
     fn from(err: ProxyError) -> Self {
         Self::pre_dispatch(err)
-    }
-}
-
-/// Bounded error class + short message for a per-attempt record, derived
-/// from a `ProxyError`. Bridge errors carry the upstream-mapped class +
-/// message; everything else uses the DP-stable `ProxyError::kind`.
-fn attempt_error_from_proxy(err: &ProxyError) -> (String, String) {
-    match err {
-        ProxyError::Bridge(be) => (
-            routing_error_class(be).to_string(),
-            attempt_error_message(be),
-        ),
-        other => (other.kind().to_string(), String::new()),
     }
 }
 

@@ -12,7 +12,11 @@
 //! `/v1/messages`, and `/v1/responses` cannot drift apart on how they
 //! classify and emit attempts.
 
+use std::time::Instant;
+
 use aisix_gateway::BridgeError;
+
+use crate::error::ProxyError;
 
 /// One recorded upstream attempt. See module docs.
 #[derive(Clone)]
@@ -153,4 +157,23 @@ pub(crate) fn attempt_error_message(err: &BridgeError) -> String {
         .filter(|c| !c.is_control())
         .take(256)
         .collect()
+}
+
+/// Bounded error class + short message for a per-attempt record, derived
+/// from a `ProxyError`. Bridge errors carry the upstream-mapped class +
+/// message; everything else uses the DP-stable `ProxyError::kind`. Shared
+/// by the `/v1/messages` and `/v1/responses` dispatch loops.
+pub(crate) fn attempt_error_from_proxy(err: &ProxyError) -> (String, String) {
+    match err {
+        ProxyError::Bridge(be) => (
+            routing_error_class(be).to_string(),
+            attempt_error_message(be),
+        ),
+        other => (other.kind().to_string(), String::new()),
+    }
+}
+
+/// Milliseconds elapsed since `started`, saturating at `u32::MAX`.
+pub(crate) fn ms_since(started: Instant) -> u32 {
+    started.elapsed().as_millis().min(u32::MAX as u128) as u32
 }
