@@ -60,6 +60,17 @@ pub const M_BUDGET_RESET_SECONDS: &str = "aisix_budget_reset_seconds";
 pub const M_BUDGET_DETAILS_PRESENT: &str = "aisix_budget_details_present";
 pub const M_REDIS_FAILURES_TOTAL: &str = "aisix_redis_failures_total";
 pub const M_USAGE_EVENT_DROPS_TOTAL: &str = "aisix_usage_event_drops_total";
+/// Guardrail outcomes (#379 observability). `aisix_guardrail_blocks_total`
+/// counts requests a guardrail rejected (input or output hook; policy or
+/// fail-closed combined). `aisix_guardrail_bypasses_total` counts fail-open
+/// events — a remote-API guardrail's upstream was unreachable but `fail_open`
+/// let the request through — sliced by the bounded DP-internal `reason`
+/// (e.g. `bedrock_5xx` / `bedrock_timeout` / `bedrock_throttled`).
+///
+/// Scope: recorded for `/v1/chat/completions` only until #519 brings the
+/// `/v1/messages` path in — read these as chat-path, not gateway-wide.
+pub const M_GUARDRAIL_BLOCKS_TOTAL: &str = "aisix_guardrail_blocks_total";
+pub const M_GUARDRAIL_BYPASSES_TOTAL: &str = "aisix_guardrail_bypasses_total";
 /// Issue #408: counter for UsageEvents successfully enqueued onto the
 /// `UsageSink` (i.e. handed off to the telemetry worker for delivery
 /// to cp-api + per-env OTLP exporters). Operators slice this by:
@@ -144,6 +155,25 @@ impl Metrics {
                 "status" => status.to_string(),
             )
             .record(duration.as_secs_f64());
+        });
+    }
+
+    /// Record one request's guardrail outcome. Called once per request from
+    /// the centralised telemetry emit, using the same data as the UsageEvent's
+    /// `guardrail_blocked` / `guardrail_bypassed_reason` fields. An empty
+    /// `bypass_reason` means no bypass occurred.
+    pub fn record_guardrail_outcome(&self, blocked: bool, bypass_reason: &str) {
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            if blocked {
+                metrics::counter!(M_GUARDRAIL_BLOCKS_TOTAL).increment(1);
+            }
+            if !bypass_reason.is_empty() {
+                metrics::counter!(
+                    M_GUARDRAIL_BYPASSES_TOTAL,
+                    "reason" => bypass_reason.to_string(),
+                )
+                .increment(1);
+            }
         });
     }
 
@@ -770,6 +800,28 @@ mod tests {
         let rendered = m.render();
         assert!(rendered.contains(M_RATELIMIT_REJECTIONS));
         assert!(rendered.contains("scope=\"requests\""));
+    }
+
+    #[test]
+    fn guardrail_outcome_counters_increment() {
+        let m = Metrics::new(false);
+        m.record_guardrail_outcome(true, ""); // blocked, no bypass
+        m.record_guardrail_outcome(false, "bedrock_5xx"); // fail-open bypass
+        m.record_guardrail_outcome(false, ""); // clean request → records nothing
+        let rendered = m.render();
+        // Exactly one block (the clean call must not increment it).
+        assert!(
+            rendered.contains(&format!("{M_GUARDRAIL_BLOCKS_TOTAL} 1")),
+            "want one block, got:\n{rendered}"
+        );
+        // Exactly one bypass, sliced by the bounded reason — pinning the count
+        // proves the blocked + clean calls didn't touch the bypass counter.
+        assert!(
+            rendered.contains(&format!(
+                "{M_GUARDRAIL_BYPASSES_TOTAL}{{reason=\"bedrock_5xx\"}} 1"
+            )),
+            "want exactly one bedrock_5xx bypass, got:\n{rendered}"
+        );
     }
 
     #[test]

@@ -585,11 +585,14 @@ fn cache_policy_schema() -> Value {
 }
 
 fn observability_exporter_schema() -> Value {
-    // MVP: single discriminator value `otlp_http` whose fields land
-    // flat at the top level (matches the Guardrail wire shape — see
-    // `models/observability_exporter.rs` doc comment). Phase 2 adds
-    // `helicone` / `datadog_logs` / `s3_ndjson` as additional
-    // discriminator values with their own `if`/`then` branches below.
+    // Discriminated by `kind`; each branch's fields land flat at the top
+    // level (matches the Guardrail wire shape — see
+    // `models/observability_exporter.rs`). `additionalProperties` only
+    // considers THIS object's `properties` (not those inside `allOf`/`then`),
+    // so every kind's fields are listed at the top level as the union;
+    // per-kind required-fields and the endpoint pattern live in the
+    // `if`/`then` branches. Phase 2 adds `datadog_logs` / `s3_ndjson` the
+    // same way.
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -598,25 +601,79 @@ fn observability_exporter_schema() -> Value {
         "properties": {
             "name":    { "type": "string", "minLength": 1, "maxLength": 120 },
             "enabled": { "type": "boolean" },
-            "kind":    { "type": "string", "enum": ["otlp_http"] },
-            // otlp_http branch — flat fields.
-            "endpoint": {
-                "type": "string",
-                // Reject http:// and any non-URL by anchoring on https://.
-                // Loopback bypass for e2e: allow http://mock-otlp:* /
-                // http://127.0.0.1 / http://localhost so the compose
-                // test can wire a fake receiver without TLS.
-                "pattern": "^https://.+|^http://(mock-otlp|otel-collector|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$"
-            },
+            "kind":    { "type": "string", "enum": ["otlp_http", "aliyun_sls", "object_store"] },
+            // Shared field; the per-kind pattern is enforced in the branches.
+            "endpoint": { "type": "string" },
+            // otlp_http field.
             "headers": {
                 "type": "object",
                 "additionalProperties": { "type": "string" }
-            }
+            },
+            // aliyun_sls fields. The AccessKey is NEVER here — only a
+            // `credential_ref` the DP resolves locally (no plaintext key on
+            // the kine path).
+            "project":        { "type": "string", "minLength": 1 },
+            "logstore":       { "type": "string", "minLength": 1 },
+            "credential_ref": { "type": "string", "minLength": 1 },
+            // Content capture (opt-in). `full` writes captured prompt /
+            // response into the logstore; `content_max_bytes` truncates each.
+            "content_mode":      { "type": "string", "enum": ["metadata_only", "full"] },
+            "content_max_bytes": { "type": "integer", "minimum": 1 },
+            // object_store fields (S3 / GCS / Azure Blob, one variant). Cloud
+            // credentials are NEVER here — only the shared `credential_ref`.
+            "provider":    { "type": "string", "enum": ["s3", "gcs", "azure_blob"] },
+            "bucket":      { "type": "string", "minLength": 1 },
+            "prefix":      { "type": "string", "minLength": 1 },
+            "region":      { "type": "string", "minLength": 1 },
+            "compression": { "type": "string", "enum": ["gzip", "none"] }
         },
         "allOf": [
             {
                 "if":   { "properties": { "kind": { "const": "otlp_http" } } },
-                "then": { "required": ["endpoint"] }
+                "then": {
+                    "required": ["endpoint"],
+                    "properties": {
+                        // Reject http:// and any non-URL by anchoring on
+                        // https://. Loopback bypass for e2e: allow
+                        // http://mock-otlp:* / otel-collector / 127.0.0.1 /
+                        // localhost so the compose test can wire a fake
+                        // receiver without TLS.
+                        "endpoint": {
+                            "pattern": "^https://.+|^http://(mock-otlp|otel-collector|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$"
+                        }
+                    }
+                }
+            },
+            {
+                "if":   { "properties": { "kind": { "const": "aliyun_sls" } } },
+                "then": {
+                    "required": ["endpoint", "project", "logstore", "credential_ref"],
+                    "properties": {
+                        // A bare SLS region host (the sink prepends
+                        // https://<project>.). Loopback bypass for e2e: a
+                        // scheme-qualified mock-sls / 127.0.0.1 / localhost
+                        // the sink posts to directly.
+                        "endpoint": {
+                            "pattern": "^[a-z0-9][a-z0-9.-]*\\.aliyuncs\\.com$|^http://(mock-sls|127\\.0\\.0\\.1|localhost)(:[0-9]+)?$"
+                        }
+                    }
+                }
+            },
+            {
+                "if":   { "properties": { "kind": { "const": "object_store" } } },
+                "then": {
+                    "required": ["provider", "bucket", "prefix", "credential_ref"],
+                    "properties": {
+                        // `endpoint` is optional — set only for S3-compatible
+                        // stores (MinIO / OSS / R2). When present: https, or a
+                        // loopback emulator host (MinIO / Azurite /
+                        // fake-gcs-server) for the compose e2e — never a way to
+                        // redirect real traffic to an arbitrary plaintext host.
+                        "endpoint": {
+                            "pattern": "^https://.+|^http://(minio|azurite|fake-gcs-server|fake-gcs|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$"
+                        }
+                    }
+                }
             }
         ]
     })
@@ -1291,6 +1348,190 @@ mod tests {
             "risk_level_threshold": "none"
         });
         assert!(validate_guardrail(&v).is_err());
+    }
+
+    // ---- observability_exporter schema tests ----
+
+    #[test]
+    fn exporter_otlp_http_happy_path() {
+        let v = json!({
+            "name": "honeycomb",
+            "kind": "otlp_http",
+            "endpoint": "https://api.honeycomb.io/v1/traces",
+            "headers": { "x-honeycomb-team": "abc" }
+        });
+        validate_observability_exporter(&v).unwrap();
+    }
+
+    #[test]
+    fn exporter_otlp_http_rejects_plain_http_endpoint() {
+        let v = json!({
+            "name": "x",
+            "kind": "otlp_http",
+            "endpoint": "http://api.honeycomb.io/v1/traces"
+        });
+        assert!(validate_observability_exporter(&v).is_err());
+    }
+
+    #[test]
+    fn exporter_aliyun_sls_happy_path() {
+        let v = json!({
+            "name": "sls-prod",
+            "kind": "aliyun_sls",
+            "endpoint": "ap-southeast-3.log.aliyuncs.com",
+            "project": "aisix-obs",
+            "logstore": "request-events",
+            "credential_ref": "sls-prod"
+        });
+        validate_observability_exporter(&v).unwrap();
+    }
+
+    #[test]
+    fn exporter_aliyun_sls_allows_loopback_mock_endpoint() {
+        // The L2 e2e points the DP at a local mock SLS over http://.
+        let v = json!({
+            "name": "sls-e2e",
+            "kind": "aliyun_sls",
+            "endpoint": "http://mock-sls:9000",
+            "project": "p",
+            "logstore": "l",
+            "credential_ref": "mock"
+        });
+        validate_observability_exporter(&v).unwrap();
+    }
+
+    #[test]
+    fn exporter_object_store_happy_path() {
+        let v = json!({
+            "name": "acme-s3",
+            "kind": "object_store",
+            "provider": "s3",
+            "bucket": "acme-aisix-events",
+            "prefix": "ai-gateway",
+            "region": "us-east-1",
+            "credential_ref": "acme-s3"
+        });
+        validate_observability_exporter(&v).unwrap();
+    }
+
+    #[test]
+    fn exporter_object_store_requires_core_fields() {
+        // Each config missing one required object_store field is rejected.
+        let cases = [
+            json!({"name":"x","kind":"object_store","bucket":"b","prefix":"p","credential_ref":"r"}),
+            json!({"name":"x","kind":"object_store","provider":"s3","prefix":"p","credential_ref":"r"}),
+            json!({"name":"x","kind":"object_store","provider":"s3","bucket":"b","credential_ref":"r"}),
+            json!({"name":"x","kind":"object_store","provider":"s3","bucket":"b","prefix":"p"}),
+        ];
+        for v in cases {
+            assert!(
+                validate_observability_exporter(&v).is_err(),
+                "incomplete object_store config must be rejected: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn exporter_object_store_rejects_bad_provider() {
+        let v = json!({
+            "name": "x", "kind": "object_store",
+            "provider": "wasabi", "bucket": "b", "prefix": "p", "credential_ref": "r"
+        });
+        assert!(validate_observability_exporter(&v).is_err());
+    }
+
+    #[test]
+    fn exporter_object_store_allows_loopback_minio_endpoint() {
+        // The e2e points the S3 sink at a local MinIO over http://.
+        let v = json!({
+            "name": "s3-e2e", "kind": "object_store",
+            "provider": "s3", "bucket": "b", "prefix": "p",
+            "endpoint": "http://minio:9000", "credential_ref": "mock"
+        });
+        validate_observability_exporter(&v).unwrap();
+    }
+
+    #[test]
+    fn exporter_object_store_rejects_plaintext_non_loopback_endpoint() {
+        // A non-loopback plaintext endpoint must be rejected — no exfil to an
+        // arbitrary http host.
+        let v = json!({
+            "name": "x", "kind": "object_store",
+            "provider": "s3", "bucket": "b", "prefix": "p",
+            "endpoint": "http://evil.example.com", "credential_ref": "r"
+        });
+        assert!(validate_observability_exporter(&v).is_err());
+    }
+
+    #[test]
+    fn exporter_aliyun_sls_requires_project_logstore_credential() {
+        for missing in ["project", "logstore", "credential_ref"] {
+            let mut v = json!({
+                "name": "x",
+                "kind": "aliyun_sls",
+                "endpoint": "ap-southeast-3.log.aliyuncs.com",
+                "project": "p",
+                "logstore": "l",
+                "credential_ref": "r"
+            });
+            v.as_object_mut().unwrap().remove(missing);
+            assert!(
+                validate_observability_exporter(&v).is_err(),
+                "missing `{missing}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn exporter_aliyun_sls_rejects_plaintext_credentials() {
+        // No AccessKey field is allowed at the schema layer either —
+        // `additionalProperties: false` rejects it before serde runs.
+        let v = json!({
+            "name": "x",
+            "kind": "aliyun_sls",
+            "endpoint": "ap-southeast-3.log.aliyuncs.com",
+            "project": "p",
+            "logstore": "l",
+            "credential_ref": "r",
+            "access_key_secret": "AKIASECRET"
+        });
+        assert!(validate_observability_exporter(&v).is_err());
+    }
+
+    #[test]
+    fn exporter_aliyun_sls_content_capture_fields() {
+        let base = |extra: serde_json::Value| {
+            let mut v = json!({
+                "name": "x",
+                "kind": "aliyun_sls",
+                "endpoint": "ap-southeast-3.log.aliyuncs.com",
+                "project": "p",
+                "logstore": "l",
+                "credential_ref": "r"
+            });
+            let obj = v.as_object_mut().unwrap();
+            for (k, val) in extra.as_object().unwrap() {
+                obj.insert(k.clone(), val.clone());
+            }
+            v
+        };
+        // Opt-in content capture validates.
+        validate_observability_exporter(&base(
+            json!({ "content_mode": "full", "content_max_bytes": 4096 }),
+        ))
+        .unwrap();
+        // Unknown content_mode is rejected.
+        assert!(
+            validate_observability_exporter(&base(json!({ "content_mode": "verbose" }))).is_err()
+        );
+        // content_max_bytes must be a positive integer.
+        assert!(validate_observability_exporter(&base(json!({ "content_max_bytes": 0 }))).is_err());
+    }
+
+    #[test]
+    fn exporter_rejects_unknown_kind() {
+        let v = json!({ "name": "x", "kind": "splunk_hec", "endpoint": "https://x" });
+        assert!(validate_observability_exporter(&v).is_err());
     }
 
     // ---- rate_limit_policy schema tests ----

@@ -30,14 +30,18 @@ pub mod snapshot;
 pub use apikey::ApiKey;
 pub use cache_policy::{AppliesTo, CacheBackend, CachePolicy};
 pub use guardrail::{
-    AliyunTextModerationConfig, AzureContentSafetyConfig, AzureContentSafetyTextModerationConfig,
-    BedrockAWSCredentials, BedrockConfig, BedrockLatencyMode, Guardrail, GuardrailAttachment,
-    GuardrailHookPoint, GuardrailKind, GuardrailScopeType, KeywordConfig, KeywordPattern,
+    AliyunTextModerationConfig, AppliedGuardrail, AzureContentSafetyConfig,
+    AzureContentSafetyTextModerationConfig, BedrockAWSCredentials, BedrockConfig,
+    BedrockLatencyMode, Guardrail, GuardrailAttachment, GuardrailHookPoint, GuardrailKind,
+    GuardrailScopeType, KeywordConfig, KeywordPattern,
 };
 pub use model::{
     Adapter, BackgroundModelCheck, CooldownConfig, Model, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
-pub use observability_exporter::{ExporterKind, ObservabilityExporter, OtlpHttpConfig};
+pub use observability_exporter::{
+    AliyunSlsConfig, ExporterKind, ObjectStoreCompression, ObjectStoreConfig, ObjectStoreProvider,
+    ObservabilityExporter, OtlpHttpConfig, SlsContentMode,
+};
 pub use provider_key::{
     ParamConstraints, ProviderKey, RequestOverrides, ResponseOverrides, StreamDoneMarker,
     TelemetryTags,

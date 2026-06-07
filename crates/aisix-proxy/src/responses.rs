@@ -651,7 +651,7 @@ fn emit_usage_event(
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
-        .fan_out(&event, exporters.iter().map(|e| &e.value));
+        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
 }
 
 /// Emit a zero-token `UsageEvent` for a failed / pre-dispatch attempt
@@ -687,9 +687,11 @@ fn emit_zero_token_event(
     state.usage_sink.try_emit("responses", event.clone());
     let snap = state.snapshot.load();
     let exporters = snap.observability_exporters.entries();
-    state
-        .otlp_fan_out
-        .fan_out(&event, exporters.iter().map(|e| &e.value));
+    state.otlp_fan_out.fan_out(
+        &event,
+        /* content */ None,
+        exporters.iter().map(|e| &e.value),
+    );
 }
 
 /// Emit one zero-token `UsageEvent` per FAILED attempt of a `/v1/responses`

@@ -32,7 +32,7 @@ pub use error::{
 pub use models::{
     validate_apikey, validate_cache_policy, validate_guardrail, validate_model,
     validate_observability_exporter, validate_provider_key, validate_rate_limit_policy, Adapter,
-    AisixSnapshot, ApiKey, CachePolicy, CooldownConfig, ExporterKind, Guardrail,
+    AisixSnapshot, ApiKey, AppliedGuardrail, CachePolicy, CooldownConfig, ExporterKind, Guardrail,
     GuardrailHookPoint, GuardrailKind, KeywordConfig, KeywordPattern, Model, ObservabilityExporter,
     OnAllFilteredPolicy, ParamConstraints, ProviderKey, RateLimit, RateLimitPolicy,
     RequestOverrides, ResponseOverrides, Routing, RoutingStrategy, RoutingTarget, SchemaError,

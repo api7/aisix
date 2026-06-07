@@ -33,7 +33,11 @@
 //! status-to-type mapping. (`/v1/chat/completions` continues to emit
 //! the OpenAI-shape envelope with its DP-stable taxonomy.)
 
-use aisix_obs::{AccessLog, LlmUsage, RequestLabels, RequestOutcome, UsageEvent, UsageLabels};
+use aisix_core::AppliedGuardrail;
+use aisix_obs::{
+    content_capture_cap, AccessLog, CapturedContent, LlmUsage, RequestLabels, RequestOutcome,
+    UsageEvent, UsageLabels,
+};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -111,7 +115,21 @@ pub async fn messages(
         .unwrap_or_default();
     drop(snapshot);
 
-    match dispatch(&state, &auth, &mut body, &request_id, started, &client).await {
+    // Filled by `dispatch` once the per-request guardrail chain resolves;
+    // read below to attach `applied_guardrails` to the telemetry event on both
+    // the success and failure (input-block) paths (#379).
+    let mut applied_guardrails: Vec<AppliedGuardrail> = Vec::new();
+    match dispatch(
+        &state,
+        &auth,
+        &mut body,
+        &request_id,
+        started,
+        &client,
+        &mut applied_guardrails,
+    )
+    .await
+    {
         Ok(DispatchOutcome {
             response,
             provider_label,
@@ -120,6 +138,7 @@ pub async fn messages(
             metrics,
             usage_handled_by_stream,
             routing,
+            captured_content,
         }) => {
             let elapsed = started.elapsed();
             let status = response.status().as_u16();
@@ -169,6 +188,7 @@ pub async fn messages(
                 auth.key().team_id.as_deref(),
                 auth.key().user_id.as_deref(),
                 &client,
+                &applied_guardrails,
                 &routing,
             );
             if !usage_handled_by_stream {
@@ -196,6 +216,8 @@ pub async fn messages(
                     metrics,
                     &client,
                     attempt,
+                    applied_guardrails.clone(),
+                    captured_content,
                 );
             }
             response
@@ -232,6 +254,7 @@ pub async fn messages(
                 auth.key().team_id.as_deref(),
                 auth.key().user_id.as_deref(),
                 &client,
+                &applied_guardrails,
                 &routing,
             );
             // Pre-dispatch failure (model-not-found, auth, budget, guardrail
@@ -259,6 +282,8 @@ pub async fn messages(
                         error_class: err.kind().to_string(),
                         ..Default::default()
                     },
+                    applied_guardrails.clone(),
+                    /* content */ None,
                 );
             }
             // /v1/messages must return Anthropic-shape error envelope
@@ -286,6 +311,7 @@ fn emit_failed_attempts_anthropic(
     team_id: Option<&str>,
     user_id: Option<&str>,
     client: &ClientContext,
+    applied_guardrails: &[AppliedGuardrail],
     routing: &RoutingTelemetry,
 ) {
     for rec in routing.attempts.iter().filter(|a| !a.success) {
@@ -305,6 +331,8 @@ fn emit_failed_attempts_anthropic(
             AnthropicUsageMetrics::default(),
             client,
             AttemptInfo::from_record(rec),
+            applied_guardrails.to_vec(),
+            /* content */ None,
         );
     }
 }
@@ -316,6 +344,12 @@ async fn dispatch(
     request_id: &str,
     started: Instant,
     client: &ClientContext,
+    // Out-param: filled with the resolved chain's `{kind, hook}` set as soon as
+    // the guardrail chain resolves, so `messages()` can attach it to telemetry
+    // on both the success and error (input-block) paths. Empty for requests
+    // rejected before resolution. The streaming paths capture the same set
+    // directly from `resolved_chain` for their end-of-stream emit.
+    applied_out: &mut Vec<AppliedGuardrail>,
 ) -> Result<DispatchOutcome, MessagesDispatchError> {
     let snapshot = state.snapshot.load();
 
@@ -354,6 +388,10 @@ async fn dispatch(
     // Arc so the chain can be cloned into the streaming-response body
     // (which outlives this handler) for end-of-stream output guardrails.
     let resolved_chain = std::sync::Arc::new(state.guardrail_index.resolve(&guardrail_ctx));
+    // Surface the applied `{kind, hook}` set to the caller so the telemetry
+    // event records which guardrails governed the request even when the input
+    // check below blocks it (#379 / closes the anthropic gap in #519).
+    *applied_out = resolved_chain.applied().to_vec();
     if !resolved_chain.is_empty() {
         if let Ok(chat) = aisix_provider_anthropic::parse_inbound_request(body) {
             if let aisix_guardrails::GuardrailVerdict::Block { reason } =
@@ -821,16 +859,34 @@ async fn anthropic_passthrough_dispatch(
         // Winning-attempt classification (#655) for the stream-end emit.
         let attempt_c = attempt.clone();
 
+        // Applied guardrail set (#379), owned for the move into the
+        // end-of-stream telemetry closure.
+        let applied_guardrails_c = resolved_chain.applied().to_vec();
         let stream_guardrail = if resolved_chain.is_empty() {
             None
         } else {
             Some(resolved_chain.clone())
         };
+        // Content capture: prompt up front; the response is already assembled
+        // into `usage.response_text` by the frame parser and preserved (not
+        // taken) when `content_cap` is set. Both gated.
+        let content_cap = content_capture_cap(
+            state
+                .snapshot
+                .load()
+                .observability_exporters
+                .entries()
+                .iter()
+                .map(|e| &e.value),
+        );
+        let captured_prompt_c =
+            content_cap.map(|_| serde_json::to_string(&body).unwrap_or_default());
         let parsed_stream = build_anthropic_passthrough_stream(
             body_stream,
             started,
             stream_guardrail,
             model_name.to_string(),
+            content_cap,
             move |usage| {
                 // Streaming responses that got this far are 200 — the
                 // !status.is_success() guard above returned early on
@@ -861,6 +917,17 @@ async fn anthropic_passthrough_dispatch(
                     metrics,
                     &client_ctx_c,
                     attempt_c.clone(),
+                    applied_guardrails_c.clone(),
+                    // Prompt captured up front; response assembled by the frame
+                    // parser into `usage.response_text`. Both gated on the cap.
+                    match (&captured_prompt_c, content_cap) {
+                        (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+                            prompt,
+                            &usage.response_text,
+                            cap as usize,
+                        )),
+                        _ => None,
+                    },
                 );
             },
         );
@@ -901,6 +968,8 @@ async fn anthropic_passthrough_dispatch(
             metrics: AnthropicUsageMetrics::default(),
             usage_handled_by_stream: true,
             routing: RoutingTelemetry::default(),
+            // Streaming content capture lands in C3b.
+            captured_content: None,
         })
     } else {
         // Non-streaming: deserialise and re-serialise as JSON. Decode
@@ -974,6 +1043,27 @@ async fn anthropic_passthrough_dispatch(
             }
         }
 
+        // Capture the prompt (the outbound request body) + assembled assistant
+        // text for content-capturing exporters (gated). Built here, before
+        // `json_body` is rendered into the response; threaded to `fan_out` via
+        // `DispatchOutcome`, never to the CP sink.
+        let captured_content = content_capture_cap(
+            state
+                .snapshot
+                .load()
+                .observability_exporters
+                .entries()
+                .iter()
+                .map(|e| &e.value),
+        )
+        .map(|cap| {
+            CapturedContent::new(
+                &serde_json::to_string(&body).unwrap_or_default(),
+                &anthropic_response_text(&json_body),
+                cap as usize,
+            )
+        });
+
         Ok(DispatchOutcome {
             response: Json(json_body).into_response(),
             provider_label,
@@ -982,8 +1072,24 @@ async fn anthropic_passthrough_dispatch(
             metrics,
             usage_handled_by_stream: false,
             routing: RoutingTelemetry::default(),
+            captured_content,
         })
     }
+}
+
+/// Concatenate the text from an Anthropic response's `content` blocks — the
+/// assistant's assembled output text, for content-capturing exporters.
+fn anthropic_response_text(body: &Value) -> String {
+    body.get("content")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
 }
 
 /// Pull `usage.input_tokens` / `output_tokens` / `cache_creation_input_tokens`
@@ -1136,17 +1242,34 @@ async fn cross_provider_dispatch(
         let client_for_telem = client.clone();
         // Winning-attempt classification (#655) for the stream-end emit.
         let attempt_for_telem = attempt.clone();
+        // Applied guardrail set (#379), owned for the move into the
+        // end-of-stream telemetry closure.
+        let applied_guardrails_for_telem = resolved_chain.applied().to_vec();
         let stream_guardrail = if resolved_chain.is_empty() {
             None
         } else {
             Some(resolved_chain.clone())
         };
+        // Content capture: prompt up front, response assembled in the stream
+        // into `comp.response_text`. Both gated on `content_cap`.
+        let content_cap = content_capture_cap(
+            state
+                .snapshot
+                .load()
+                .observability_exporters
+                .entries()
+                .iter()
+                .map(|e| &e.value),
+        );
+        let captured_prompt_for_telem =
+            content_cap.map(|_| serde_json::to_string(body).unwrap_or_default());
         let sse_body = build_anthropic_sse_stream(
             upstream,
             encoder,
             started,
             stream_guardrail,
             model_name.to_string(),
+            content_cap,
             move |comp| {
                 let metrics = AnthropicUsageMetrics {
                     prompt_tokens: comp.prompt_tokens,
@@ -1174,6 +1297,17 @@ async fn cross_provider_dispatch(
                     metrics,
                     &client_for_telem,
                     attempt_for_telem.clone(),
+                    applied_guardrails_for_telem.clone(),
+                    // Prompt captured up front, response assembled across the
+                    // stream into `comp.response_text`; both gated on the cap.
+                    match (&captured_prompt_for_telem, content_cap) {
+                        (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+                            prompt,
+                            &comp.response_text,
+                            cap as usize,
+                        )),
+                        _ => None,
+                    },
                 );
             },
         );
@@ -1200,6 +1334,8 @@ async fn cross_provider_dispatch(
             metrics: AnthropicUsageMetrics::default(),
             usage_handled_by_stream: true,
             routing: RoutingTelemetry::default(),
+            // Streaming content capture lands in C3b.
+            captured_content: None,
         });
     }
 
@@ -1243,6 +1379,25 @@ async fn cross_provider_dispatch(
         finish_reason: finish_reason_label(&resp.finish_reason),
         ttft_ms: 0,
     };
+    // Capture the prompt (the Anthropic request body) + assembled assistant
+    // text for content-capturing exporters (gated); threaded to `fan_out` via
+    // `DispatchOutcome`, never to the CP sink.
+    let captured_content = content_capture_cap(
+        state
+            .snapshot
+            .load()
+            .observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &e.value),
+    )
+    .map(|cap| {
+        CapturedContent::new(
+            &serde_json::to_string(body).unwrap_or_default(),
+            resp.message.content.as_deref().unwrap_or(""),
+            cap as usize,
+        )
+    });
     let json = chat_response_into_anthropic_json(&resp, model_name);
     Ok(DispatchOutcome {
         response: Json(json).into_response(),
@@ -1252,6 +1407,7 @@ async fn cross_provider_dispatch(
         metrics,
         usage_handled_by_stream: false,
         routing: RoutingTelemetry::default(),
+        captured_content,
     })
 }
 
@@ -1266,6 +1422,9 @@ fn build_anthropic_sse_stream(
     started: Instant,
     output_guardrail: Option<std::sync::Arc<aisix_guardrails::GuardrailChain>>,
     model_label: String,
+    // Largest content cap any content-capturing exporter wants, or `None` to
+    // skip response accumulation (the common, content-free path).
+    content_cap: Option<u32>,
     on_complete: impl FnOnce(AnthropicStreamCompletion) + Send + 'static,
 ) -> axum::body::Body {
     use futures::StreamExt;
@@ -1320,6 +1479,15 @@ fn build_anthropic_sse_stream(
                         }
                         if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
                             tool_call_fragments.extend(tcs.iter().cloned());
+                        }
+                    }
+                    // Content capture: assemble the response (bounded to the
+                    // cap), only when an exporter wants full content.
+                    if let Some(cap) = content_cap {
+                        if let Some(t) = chunk.delta.content.as_deref() {
+                            if comp.response_text.len() < cap as usize {
+                                comp.response_text.push_str(t);
+                            }
                         }
                     }
                     for ev in encoder.next_events(&chunk) {
@@ -1407,6 +1575,11 @@ struct AnthropicStreamCompletion {
     provider_model_version: String,
     finish_reason: String,
     ttft_ms: u32,
+    /// Assembled assistant text for content-capturing exporters, accumulated
+    /// across chunks ONLY when an exporter wants full content (bounded to the
+    /// capture cap). Empty otherwise. Read by the on_complete closure; never
+    /// reaches the CP sink.
+    response_text: String,
 }
 
 struct CompleteAnthropicStreamOnDrop<F: FnOnce(AnthropicStreamCompletion)> {
@@ -1445,6 +1618,11 @@ struct DispatchOutcome {
     /// preceded the winner plus the winning attempt itself, so the
     /// handler can emit one `UsageEvent` per attempt sharing `request_id`.
     routing: RoutingTelemetry,
+    /// Captured request/response content for the observability fan-out, gated
+    /// on the snapshot's content-capturing exporters. `None` when none want it
+    /// or on the streaming path (filled at stream end). Forwarded only to
+    /// `fan_out`, never to the CP telemetry sink.
+    captured_content: Option<CapturedContent>,
 }
 
 /// Dispatch error carrying the per-attempt telemetry accumulated before
@@ -1527,6 +1705,10 @@ fn emit_anthropic_usage_event(
     metrics: AnthropicUsageMetrics,
     client: &ClientContext,
     attempt: AttemptInfo,
+    // The `{kind, hook}` set of guardrails that governed this request (#379).
+    // Empty for the guardrail-free path and pre-resolution failures.
+    applied_guardrails: Vec<AppliedGuardrail>,
+    content: Option<CapturedContent>,
 ) {
     // Per-PK telemetry attribution (#302 M17 / AISIX-Cloud#436).
     // Same shape as chat.rs's emit_usage_event — look up the
@@ -1570,6 +1752,7 @@ fn emit_anthropic_usage_event(
         byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        applied_guardrails,
         ..Default::default()
     };
     // Handler label "messages" — Anthropic /v1/messages inbound
@@ -1578,7 +1761,7 @@ fn emit_anthropic_usage_event(
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
-        .fan_out(&event, exporters.iter().map(|e| &e.value));
+        .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));
     state.metrics.record_llm_usage(
         UsageLabels {
             endpoint: "/v1/messages",
@@ -1891,6 +2074,9 @@ fn build_anthropic_passthrough_stream<S, F>(
     started: Instant,
     output_guardrail: Option<std::sync::Arc<aisix_guardrails::GuardrailChain>>,
     model_label: String,
+    // When `Some`, the assembled `response_text` is preserved (not taken by the
+    // guardrail scan) so the on_complete content capture can read it.
+    content_cap: Option<u32>,
     on_complete: F,
 ) -> AnthropicDeliveryCounter<reqwest::Result<Bytes>>
 where
@@ -1952,7 +2138,14 @@ where
         // event (bytes were already forwarded verbatim, mirroring the
         // cross-provider path and the common streaming-guardrail pattern).
         if let Some(chain) = output_guardrail.as_ref() {
-            let text = std::mem::take(&mut guard.usage().response_text);
+            // Clone (not take) when content capture is on, so the assembled
+            // response survives for the on_complete content capture below;
+            // otherwise take it (nothing downstream reads it).
+            let text = if content_cap.is_some() {
+                guard.usage().response_text.clone()
+            } else {
+                std::mem::take(&mut guard.usage().response_text)
+            };
             if !text.is_empty() {
                 let synth = aisix_gateway::ChatResponse {
                     id: String::new(),

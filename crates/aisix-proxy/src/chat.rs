@@ -17,10 +17,12 @@
 //!    status, error type, and (for rate-limits) Retry-After.
 
 use aisix_cache::CacheKey;
+use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeContext, BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
 use aisix_obs::{
-    AccessLog, LlmUsage, Metrics, RequestLabels, RequestOutcome, UsageEvent, UsageLabels,
+    content_capture_cap, AccessLog, CapturedContent, LlmUsage, Metrics, RequestLabels,
+    RequestOutcome, UsageEvent, UsageLabels,
 };
 use axum::extract::State;
 use axum::http::HeaderValue;
@@ -123,7 +125,20 @@ pub async fn chat_completions(
     let api_key_id = auth.entry.id.clone();
     let model_name = req.model.clone();
 
-    let outcome = dispatch(&state, &auth, &req, &request_id, started, &client).await;
+    // Filled by `dispatch` once the per-request guardrail chain resolves;
+    // read below to attach `applied_guardrails` to the telemetry event on
+    // both the success and failure (guardrail-block) paths (#379).
+    let mut applied_guardrails: Vec<AppliedGuardrail> = Vec::new();
+    let outcome = dispatch(
+        &state,
+        &auth,
+        &req,
+        &request_id,
+        started,
+        &client,
+        &mut applied_guardrails,
+    )
+    .await;
 
     match outcome {
         Ok(mut success) => {
@@ -164,6 +179,7 @@ pub async fn chat_completions(
                 &success.model_id,
                 &api_key_id,
                 &client,
+                &applied_guardrails,
                 &success.routing,
             );
             // The streaming path wires the WINNER's telemetry into the SSE
@@ -209,11 +225,13 @@ pub async fn chat_completions(
                         attempt_model: winner.map(|w| w.target_model.clone()).unwrap_or_default(),
                         error_class: String::new(),
                         error_message: String::new(),
+                        applied_guardrails: applied_guardrails.clone(),
                         provider_key_id: success.provider_key_id.clone(),
                     },
                     success.cost_usd,
                     /* guardrail_blocked */ false,
                     &client,
+                    success.captured_content.take(),
                 );
             }
             // Inject x-ratelimit-* headers so OpenAI SDK clients see the
@@ -319,12 +337,16 @@ pub async fn chat_completions(
             let guardrail_blocked = matches!(err, ProxyError::ContentFiltered(_));
             let model_id_str = resolved_model_id.as_deref().unwrap_or("");
             // Per #655: emit one zero-token event for each FAILED attempt.
+            // `applied_guardrails` (resolved by `dispatch`) is recorded on
+            // every attempt so an input-blocked / failed request still
+            // reports which guardrails governed it.
             emit_failed_attempts(
                 &state,
                 &request_id,
                 model_id_str,
                 &api_key_id,
                 &client,
+                &applied_guardrails,
                 &routing,
             );
             // Terminal event:
@@ -367,11 +389,15 @@ pub async fn chat_completions(
                                 .unwrap_or_default(),
                             error_class: String::new(),
                             error_message: String::new(),
+                            // The chain governed the request even though it
+                            // ultimately blocked on the output filter.
+                            applied_guardrails: applied_guardrails.clone(),
                             provider_key_id: c.provider_key_id,
                         },
                         /* cost_usd */ 0.0,
                         guardrail_blocked,
                         &client,
+                        /* content */ None,
                     );
                 }
                 None if routing.attempts.is_empty() => {
@@ -389,11 +415,16 @@ pub async fn chat_completions(
                             // Bounded ProxyError class so the dashboard can
                             // show why the request never reached an upstream.
                             error_class: err.kind().to_string(),
+                            // Input-blocked / pre-upstream errors still record
+                            // the resolved guardrail chain (empty if it failed
+                            // before resolution).
+                            applied_guardrails: applied_guardrails.clone(),
                             ..UsageExtras::default()
                         },
                         /* cost_usd */ 0.0,
                         guardrail_blocked,
                         &client,
+                        /* content */ None,
                     );
                 }
                 None => {
@@ -484,6 +515,12 @@ struct Success {
     /// the routing group's display name.
     served_by_target: Option<String>,
     routing: RoutingTelemetry,
+    /// Captured request/response content for the observability fan-out, built
+    /// (gated on the snapshot's content-capturing exporters) where the request
+    /// and upstream response are both in scope. `None` when no exporter
+    /// captures content, and on the streaming path (filled at stream end). It
+    /// is forwarded only to `fan_out`, never to the CP telemetry sink.
+    captured_content: Option<CapturedContent>,
 }
 
 /// Cache decision attached to every successful request. Wire shape
@@ -633,6 +670,12 @@ async fn dispatch(
     request_id: &str,
     started: Instant,
     client: &ClientContext,
+    // Out-param: filled with the resolved chain's `{kind, hook}` set as soon
+    // as the guardrail chain is resolved, so the caller can attach it to the
+    // telemetry event on BOTH the success and error (guardrail-block) paths
+    // without threading a field through every `Success`/`DispatchFailure`
+    // construction site. Stays empty for requests rejected before resolution.
+    applied_out: &mut Vec<AppliedGuardrail>,
 ) -> Result<Success, DispatchFailure> {
     if req.messages.is_empty() {
         return Err(DispatchFailure::new(
@@ -643,6 +686,16 @@ async fn dispatch(
     }
 
     let snapshot = state.snapshot.load();
+    // Largest content cap any enabled content-capturing exporter wants, or
+    // `None` when none do — computed once so each response path (cache hit /
+    // upstream) only captures when an exporter actually consumes it.
+    let content_cap = content_capture_cap(
+        snapshot
+            .observability_exporters
+            .entries()
+            .iter()
+            .map(|e| &e.value),
+    );
     let virtual_entry = snapshot.models.get_by_name(&req.model).ok_or_else(|| {
         DispatchFailure::new(None, None, ProxyError::ModelNotFound(req.model.clone()))
     })?;
@@ -670,8 +723,15 @@ async fn dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
+    let resolved = state.guardrail_index.resolve(&guardrail_ctx);
+    // Capture the applied `{kind, hook}` set before the concrete chain is
+    // erased to `Arc<dyn Guardrail>` (the trait has no `applied()`). Fill the
+    // caller's out-param so the failure path can surface it too, and keep a
+    // local copy for the streaming on_complete closure below.
+    let applied_guardrails = resolved.applied().to_vec();
+    *applied_out = applied_guardrails.clone();
     let resolved_chain: std::sync::Arc<dyn aisix_guardrails::Guardrail> =
-        std::sync::Arc::new(state.guardrail_index.resolve(&guardrail_ctx));
+        std::sync::Arc::new(resolved);
 
     // Input guardrails. Run before reservation so a blocked prompt
     // doesn't burn an RPM slot — content-policy refusals shouldn't
@@ -851,6 +911,9 @@ async fn dispatch(
         let provider_key_id_for_telem = pk_entry.id.clone();
         let upstream_model_for_metrics = model.upstream_model().unwrap_or("unknown").to_string();
         let bypass_reason_for_telem = bypass_reason.clone().unwrap_or_default();
+        // Applied guardrail set (#379), owned for the move into on_complete so
+        // the streamed-response telemetry event records which guardrails ran.
+        let applied_guardrails_for_telem = applied_guardrails.clone();
         // Downstream client attribution (#492) moved into the on_complete
         // closure so streamed responses log the same IP/UA as non-streaming.
         let client_for_telem = client.clone();
@@ -894,12 +957,18 @@ async fn dispatch(
                 model_name: req.model.clone(),
             })
         };
+        // Capture the prompt for content-capturing exporters; the response is
+        // assembled inside the stream into `comp.response_text`. Both gated on
+        // `content_cap` (None on the common content-free path).
+        let captured_prompt_for_telem =
+            content_cap.map(|_| serde_json::to_string(req).unwrap_or_default());
         let sse_stream = build_sse_stream(
             upstream,
             now,
             stream_guardrail,
             started,
             req.model.clone(),
+            content_cap,
             move |comp: StreamCompletion| {
                 // Rate-limit accounting (TPM cap) for all layers.
                 for key in &post_stream_keys {
@@ -954,11 +1023,22 @@ async fn dispatch(
                         attempt_model: attempt_model_for_telem.clone(),
                         error_class: String::new(),
                         error_message: String::new(),
+                        applied_guardrails: applied_guardrails_for_telem.clone(),
                         provider_key_id: provider_key_id_for_telem.clone(),
                     },
                     /* cost_usd */ 0.0,
                     comp.guardrail_blocked,
                     &client_for_telem,
+                    // Prompt captured up front, response assembled across the
+                    // stream into `comp.response_text`; both gated on the cap.
+                    match (&captured_prompt_for_telem, content_cap) {
+                        (Some(prompt), Some(cap)) => Some(CapturedContent::new(
+                            prompt,
+                            &comp.response_text,
+                            cap as usize,
+                        )),
+                        _ => None,
+                    },
                 );
                 metrics_for_stream.record_llm_usage(
                     UsageLabels {
@@ -1041,6 +1121,8 @@ async fn dispatch(
                 Some(model.display_name.clone()),
             ),
             routing: stream_routing,
+            // Streaming content capture lands in C3b.
+            captured_content: None,
         });
     }
 
@@ -1153,6 +1235,16 @@ async fn dispatch(
                     .upstream_model()
                     .unwrap_or("unknown")
                     .to_string();
+                // Capture the prompt + cached response for content-capturing
+                // exporters (gated). A cache hit still served content to the
+                // caller, so it's logged like a fresh response.
+                let captured_content = content_cap.map(|cap| {
+                    CapturedContent::new(
+                        &serde_json::to_string(req).unwrap_or_default(),
+                        cached.message.content.as_deref().unwrap_or(""),
+                        cap as usize,
+                    )
+                });
                 let mut response = Json(render_response(now, cached, &req.model)).into_response();
                 response
                     .headers_mut()
@@ -1197,6 +1289,7 @@ async fn dispatch(
                     // `served_by_target` field docs on `Success`.
                     served_by_target: None,
                     routing: RoutingTelemetry::default(),
+                    captured_content,
                 });
             }
             Ok(None) => {}
@@ -1474,6 +1567,18 @@ async fn dispatch(
         }
     }
 
+    // Capture request/response content for the observability fan-out (gated:
+    // `content_cap` is `None` when no exporter wants it). Built here, where both
+    // the request and the upstream response text are in scope; threaded to
+    // `fan_out` via `Success`, never to the CP sink.
+    let captured_content = content_cap.map(|cap| {
+        CapturedContent::new(
+            &serde_json::to_string(req).unwrap_or_default(),
+            upstream.message.content.as_deref().unwrap_or(""),
+            cap as usize,
+        )
+    });
+
     let mut response = Json(render_response(now, upstream, &req.model)).into_response();
     if matches!(cache_status, CacheStatus::Miss) {
         // Miss header only when the cache was actually consulted —
@@ -1519,6 +1624,7 @@ async fn dispatch(
         telemetry_handled_by_stream: false,
         served_by_target,
         routing,
+        captured_content,
     })
 }
 
@@ -1634,6 +1740,7 @@ fn emit_usage_event(
     cost_usd: f64,
     guardrail_blocked: bool,
     client: &ClientContext,
+    content: Option<CapturedContent>,
 ) {
     // Look up per-PK telemetry attribution tags from the live snapshot.
     // Empty `provider_key_id` (pre-dispatch error paths) → default
@@ -1669,6 +1776,7 @@ fn emit_usage_event(
         cost_usd,
         guardrail_blocked,
         guardrail_bypassed_reason: extras.bypass_reason,
+        applied_guardrails: extras.applied_guardrails,
         cache_status: extras.cache_status,
         cache_hit_saved_input_tokens: extras.cache_hit_saved_input_tokens,
         cache_hit_saved_output_tokens: extras.cache_hit_saved_output_tokens,
@@ -1705,6 +1813,12 @@ fn emit_usage_event(
     // `aisix_usage_events_emitted_total` (#408). Keep `&'static str`
     // so prometheus cardinality stays bounded.
     state.usage_sink.try_emit("chat", event.clone());
+    // Guardrail outcome counters (#379). Recorded here — the one place every
+    // chat path (success / error / streaming / cache-hit) funnels through —
+    // from the same guardrail fields the UsageEvent carries.
+    state
+        .metrics
+        .record_guardrail_outcome(guardrail_blocked, &event.guardrail_bypassed_reason);
     // Per-env OTLP/HTTP fan-out. The snapshot's exporter table is
     // empty for envs that haven't configured any, so this is a cheap
     // no-op on the common path. Spawned tasks own the POST work and
@@ -1712,7 +1826,7 @@ fn emit_usage_event(
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
-        .fan_out(&event, exporters.iter().map(|e| &e.value));
+        .fan_out(&event, content.as_ref(), exporters.iter().map(|e| &e.value));
 }
 
 /// Defence-in-depth sanitiser for operator-defined `ProviderKey
@@ -1788,6 +1902,12 @@ struct UsageExtras {
     error_class: String,
     /// Short error message for a failed attempt; empty on success.
     error_message: String,
+    /// The `{kind, hook}` set of guardrails that governed this request,
+    /// captured at chain-resolve time. Lands on
+    /// `dpmgr_usage_events.applied_guardrails` so the dashboard can show
+    /// which guardrails ran (#379). Empty for the guardrail-free path and
+    /// for requests rejected before resolution.
+    applied_guardrails: Vec<AppliedGuardrail>,
     /// UUID of the resolved ProviderKey. Used at emit time to look up
     /// `telemetry_tags` from the snapshot and populate UsageEvent's
     /// per-PK attribution fields (`provider_kind` / `provider_featured`
@@ -1811,6 +1931,7 @@ fn emit_failed_attempts(
     model_id: &str,
     api_key_id: &str,
     client: &ClientContext,
+    applied_guardrails: &[AppliedGuardrail],
     routing: &RoutingTelemetry,
 ) {
     for rec in routing.attempts.iter().filter(|a| !a.success) {
@@ -1829,12 +1950,14 @@ fn emit_failed_attempts(
                 attempt_model: rec.target_model.clone(),
                 error_class: rec.error_class.clone(),
                 error_message: rec.error_message.clone(),
+                applied_guardrails: applied_guardrails.to_vec(),
                 provider_key_id: rec.provider_key_id.clone(),
                 ..UsageExtras::default()
             },
             /* cost_usd */ 0.0,
             /* guardrail_blocked */ false,
             client,
+            /* content */ None,
         );
     }
 }
@@ -1971,6 +2094,11 @@ struct StreamCompletion {
     /// irrelevant — the customer must not be billed for tokens that
     /// never crossed the wire. Issue #419.
     chunks_delivered: u32,
+    /// Assembled assistant text for content-capturing exporters, accumulated
+    /// across chunks ONLY when an exporter wants full content (bounded to the
+    /// capture cap). Empty otherwise. Read by the on_complete telemetry
+    /// closure; never reaches the CP sink.
+    response_text: String,
 }
 
 /// Parameters needed to run output-guardrail evaluation at
@@ -2068,6 +2196,9 @@ fn build_sse_stream<F>(
     // onto every SSE chunk's `model` field per AISIX-Cloud#410. Owned
     // so it can move into the `async_stream::stream!` closure.
     client_facing_model: String,
+    // Largest content cap any content-capturing exporter wants, or `None` to
+    // skip response accumulation entirely (the common, content-free path).
+    content_cap: Option<u32>,
     on_complete: F,
 ) -> impl Stream<Item = Result<Event, Infallible>>
 where
@@ -2172,6 +2303,15 @@ where
                             window_buf.push_str(text);
                         } else if let Some(buf) = content_buffer.as_mut() {
                             buf.push_str(text);
+                        }
+                        // Content capture: assemble the response for the
+                        // observability fan-out, bounded to the cap so a long
+                        // stream can't grow the buffer without limit. Only when
+                        // an exporter wants full content.
+                        if let Some(cap) = content_cap {
+                            if comp.response_text.len() < cap as usize {
+                                comp.response_text.push_str(text);
+                            }
                         }
                     }
                     if let Some(u) = chunk.usage.as_ref() {

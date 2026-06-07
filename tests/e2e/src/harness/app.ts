@@ -28,6 +28,14 @@ export interface AppOverrides {
     recursive?: boolean;
     header?: string;
   };
+  /**
+   * Extra environment variables for the spawned binary, applied AFTER the
+   * `AISIX_*` strip. Use for non-config secrets the DP reads from its own
+   * environment rather than from the kine config — e.g.
+   * `SLS_CRED_<REF>_AK_ID` / `_AK_SECRET` for an `aliyun_sls` exporter, whose
+   * AccessKey deliberately never travels on the config path.
+   */
+  extraEnv?: Record<string, string>;
 }
 
 export interface SpawnedApp {
@@ -113,6 +121,12 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
   childEnv.all_proxy = "";
   childEnv.NO_PROXY = "127.0.0.1,localhost";
   childEnv.no_proxy = "127.0.0.1,localhost";
+
+  // Non-config secrets the DP reads straight from its environment (e.g.
+  // SLS AccessKeys). Applied last so they survive the AISIX_* strip above.
+  for (const [k, v] of Object.entries(overrides.extraEnv ?? {})) {
+    childEnv[k] = v;
+  }
 
   const child = spawn(BIN_PATH, ["--config", cfgPath], {
     stdio: ["ignore", "pipe", "pipe"],

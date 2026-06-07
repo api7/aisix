@@ -22,7 +22,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.93"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/moonming/ai-gateway"
 authors = ["moonming"]
 
@@ -47,6 +47,14 @@ http-body-util = "0.1"
 mime = "0.3"
 # Trusted-proxy CIDR matching for real-ip resolution (#492)
 ipnet = "2"
+
+# Aliyun SLS sink (aisix-obs): the official protobuf + signature sub-crates
+# ONLY — not the full `aliyun-log-rust-sdk`, which forces reqwest native-tls
+# (OpenSSL) + ~13 C/TLS crates. Transport is our own rustls reqwest, so these
+# stay pure-Rust with no OpenSSL.
+aliyun-log-sdk-protobuf = "0.1"
+aliyun-log-sdk-sign = "0.2"
+lz4_flex = "0.11"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "multipart"] }
@@ -110,6 +118,16 @@ hex = "0.4"
 # Caching / storage backends
 moka = { version = "0.12", features = ["future"] }
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "cluster-async"] }
+
+# Object-storage observability sink (aisix-obs): ONE crate covering S3 / GCS /
+# Azure Blob (+ S3-compatible MinIO/R2) behind a single `ObjectStore` trait, so
+# the sink is written once, not per-provider. The cloud features pull reqwest
+# default-features=false + rustls, so this stays rustls-only — no OpenSSL /
+# native-tls (same posture as the SLS sub-crates above).
+object_store = { version = "0.13", default-features = false, features = ["aws", "gcp", "azure", "tls-webpki-roots"] }
+# NDJSON gzip for the object-storage sink. flate2's default miniz_oxide backend
+# is pure Rust — no zlib/C, consistent with the no-OpenSSL posture.
+flate2 = "1"
 
 # Tokenization / counting (optional hard-mode TPM)
 tiktoken-rs = "0.5"

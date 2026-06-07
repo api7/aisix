@@ -404,7 +404,7 @@ fn emit_usage_event(
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
-        .fan_out(&event, exporters.iter().map(|e| &e.value));
+        .fan_out(&event, None, exporters.iter().map(|e| &e.value));
 }
 
 /// Default upstream host for the rerank-supporting providers,

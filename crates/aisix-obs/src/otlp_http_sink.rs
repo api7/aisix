@@ -1,49 +1,50 @@
-//! Per-env OTLP/HTTP exporter — emits one OTLP-shaped POST per chat
-//! request to each configured `ObservabilityExporter` (kind=otlp_http).
+//! Per-env OTLP/HTTP exporter — emits one OTLP-shaped span per chat request
+//! to each configured `ObservabilityExporter` (kind=otlp_http).
 //!
 //! ## Design
 //!
 //! cp-api projects every configured exporter onto kine at
-//! `/aisix/<env>/observability_exporters/<uuid>`. The DP loads them
-//! via the existing etcd watch into
-//! `AisixSnapshot::observability_exporters`. After every chat
-//! completion the proxy hot path hands the resulting `UsageEvent` plus
-//! the live snapshot's exporter list to [`fan_out`], which:
+//! `/aisix/<env>/observability_exporters/<uuid>`. The DP loads them via the
+//! existing etcd watch into `AisixSnapshot::observability_exporters`. After
+//! every chat completion the proxy hot path hands the resulting `UsageEvent`
+//! plus the live snapshot's exporter list to [`OtlpHttpFanOut::fan_out`],
+//! which:
 //!
 //! 1. Filters to enabled exporters with `kind = OtlpHttp`.
-//! 2. Builds one OTLP/HTTP-JSON span per exporter, encoded per
+//! 2. Resolves each exporter's [`crate::sink::SinkPipeline`] (lazily started
+//!    on first sighting, immediately consistent with the snapshot) and
+//!    enqueues one OTLP span record into it. The pipeline batches, retries
+//!    transient failures with backoff, and drops-with-metric under
+//!    backpressure — all off the request hot path. Spans are encoded per
 //!    OpenTelemetry's GenAI semantic conventions
 //!    (<https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md>).
-//! 3. Spawns a fire-and-forget tokio task per (event, exporter) pair
-//!    that POSTs the span. Failures get a `tracing::warn!` and are
-//!    dropped — observability MUST NOT block the request hot path.
 //!
-//! ## What's intentionally NOT in MVP
+//! ## What's intentionally NOT here yet
 //!
-//! - **No batching** — one HTTP POST per request per exporter. Phase 2
-//!   will move to a worker-task model with a bounded mpsc + 1s flush
-//!   interval once the patterns are exercised by real load.
-//! - **No retry / backoff** — best-effort fire-and-forget. If the
-//!   user's OTLP receiver is unreachable the span is lost. Phase 2
-//!   adds a tiny exponential-backoff wrapper.
-//! - **No gRPC** — `otlp_grpc` is a separate kind we'll add when a
-//!   user actually asks for it; the JSON-over-HTTP form works against
-//!   every receiver in the wild and avoids pulling in tonic on the
-//!   hot path.
-//! - **No content_mode redaction** — defaults to `metadata_only`
-//!   (no prompt/response bodies in the span). The MVP cannot leak
-//!   user content because it never accepts content fields in the
-//!   first place.
+//! - **No gRPC** — `otlp_grpc` is a separate kind we'll add when a user
+//!   actually asks for it; the JSON-over-HTTP form works against every
+//!   receiver in the wild and avoids pulling in tonic on the hot path.
+//! - **No content_mode redaction** — defaults to `metadata_only` (no
+//!   prompt/response bodies in the span). The record never carries content
+//!   fields, so it cannot leak.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aisix_core::models::{ExporterKind, ObservabilityExporter};
-use parking_lot::Mutex;
+use aisix_core::models::{
+    AliyunSlsConfig, ExporterKind, ObjectStoreConfig, ObservabilityExporter, OtlpHttpConfig,
+    SlsContentMode,
+};
+use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::sync::Semaphore;
 
+use crate::sink::{
+    build_object_store_sink, resolve_sls_credential, AliyunSlsSink, BatchUnit, CapturedContent,
+    EventBatch, ExporterPipelines, IdempotencyMarker, IdempotencyScheme, ObservabilitySink,
+    OrderingScope, PipelineConfig, SinkAck, SinkCapabilities, SinkContent, SinkError, SinkHealth,
+    SinkRecord, SinkResult,
+};
 use crate::usage::UsageEvent;
 
 /// Wall-clock duration of an OTLP/HTTP POST before we abandon it.
@@ -51,46 +52,43 @@ use crate::usage::UsageEvent;
 /// tasks for a wedged user receiver.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Maximum concurrent in-flight POSTs per exporter. Past this point we
-/// drop further events on the request hot path rather than queueing
-/// them — the queue would just grow unbounded behind a slow receiver,
-/// hold the per-event JSON body in memory, and eventually OOM the DP.
-/// 64 is generous enough that a healthy receiver never trips the cap
-/// (even at a sustained 100 RPS, a 200 ms p50 keeps in-flight under
-/// 20) but still bounds the worst case to ~64 × payload-size bytes.
-/// See issue #113.
-const MAX_INFLIGHT_PER_EXPORTER: usize = 64;
-
 /// `User-Agent` header so vendor receivers can attribute traces back
 /// to AISIX in their own analytics. Not a contract; informational.
 const USER_AGENT: &str = concat!("aisix-dp/", env!("CARGO_PKG_VERSION"));
 
-/// Cheap clonable handle the proxy hands to request handlers. Holds a
-/// reusable `reqwest::Client` so connection pools survive across
-/// requests — even with per-event POSTs the kept-alive socket
-/// amortises TLS for the common case where one DP exports to one
-/// vendor.
+/// Fans usage events out to every configured observability exporter — any
+/// [`ExporterKind`], dispatched per kind to the matching
+/// [`crate::sink::ObservabilitySink`] — each via its own
+/// [`crate::sink::SinkPipeline`] (batched, retried, backpressured). Cheap
+/// clonable handle; the per-exporter pipelines and the shared `reqwest::Client`
+/// live behind an `Arc`. Pipelines start lazily on first sighting of an
+/// exporter (immediately consistent with the snapshot) and are GC'd by
+/// [`OtlpHttpFanOut::gc`] when an exporter leaves it.
 ///
-/// Per-exporter concurrency is bounded: a [`Semaphore`] with
-/// [`MAX_INFLIGHT_PER_EXPORTER`] permits is created lazily on first
-/// sighting of each exporter name. When the cap is hit, further events
-/// for that exporter are *dropped* on the hot path (logged at debug)
-/// rather than queued. This is intentional — the alternative is letting
-/// task count + memory grow unbounded behind a slow receiver, which
-/// caused real OOMs in production. See issue #113.
-#[derive(Debug, Clone)]
+/// NOTE: the type name is historical — it drove only `otlp_http` originally
+/// and now fans out all kinds. A rename to `ExporterFanOut` (plus the
+/// `ProxyState::otlp_fan_out` field) is a mechanical, behaviour-preserving
+/// follow-up kept out of this change to avoid churning every call site.
+#[derive(Clone)]
 pub struct OtlpHttpFanOut {
     inner: Arc<FanOutInner>,
 }
 
-#[derive(Debug)]
 struct FanOutInner {
+    /// Per-exporter delivery pipelines (one batched worker each).
+    exporters: ExporterPipelines,
+    /// Shared HTTP client handed to every sink (connection-pool reuse).
     client: reqwest::Client,
-    /// Per-exporter semaphores keyed by name. Created lazily; never
-    /// pruned (a Semaphore is small and the operator's exporter set
-    /// is bounded by configuration). The Mutex is parking_lot so
-    /// uncontended lookups are basically a single atomic load.
-    permits: Mutex<HashMap<String, Arc<Semaphore>>>,
+}
+
+/// Delivery tuning for otlp exporter pipelines. A short flush keeps a
+/// single-request span visible quickly (the old fan-out posted each event
+/// immediately); batching + retry + drop accounting come from the pipeline.
+fn exporter_pipeline_config() -> PipelineConfig {
+    PipelineConfig {
+        flush_interval: Duration::from_secs(1),
+        ..PipelineConfig::default()
+    }
 }
 
 impl OtlpHttpFanOut {
@@ -104,102 +102,124 @@ impl OtlpHttpFanOut {
             .expect("reqwest::Client default config is valid");
         Self {
             inner: Arc::new(FanOutInner {
+                exporters: ExporterPipelines::new(exporter_pipeline_config()),
                 client,
-                permits: Mutex::new(HashMap::new()),
             }),
         }
     }
 
-    /// Look up (or lazily insert) the per-exporter permit semaphore.
-    /// Returning `Arc<Semaphore>` lets the spawned task hold the permit
-    /// past `fan_out`'s lifetime — the permit drops with the task.
-    fn permits_for(&self, exporter_name: &str) -> Arc<Semaphore> {
-        let mut guard = self.inner.permits.lock();
-        if let Some(sem) = guard.get(exporter_name) {
-            return Arc::clone(sem);
-        }
-        let sem = Arc::new(Semaphore::new(MAX_INFLIGHT_PER_EXPORTER));
-        guard.insert(exporter_name.to_string(), Arc::clone(&sem));
-        sem
-    }
-
-    /// Test-only: how many in-flight slots are currently held for
-    /// `exporter_name`. Used by tests to assert the bounded-fan-out
-    /// invariant. Returns 0 if the exporter has never been seen.
-    #[doc(hidden)]
-    pub fn in_flight_for(&self, exporter_name: &str) -> usize {
-        let guard = self.inner.permits.lock();
-        match guard.get(exporter_name) {
-            Some(sem) => MAX_INFLIGHT_PER_EXPORTER.saturating_sub(sem.available_permits()),
-            None => 0,
-        }
-    }
-
-    /// Fan out one event to every enabled `otlp_http` exporter in the
-    /// supplied list. Returns immediately — the actual POSTs run on
-    /// detached tokio tasks and never block the caller.
+    /// Fan one event out to every enabled exporter, dispatched per kind and
+    /// enqueued into that exporter's pipeline (lazily started on first
+    /// sighting). The pipeline owns batching / retry / backpressure; enqueue is
+    /// non-blocking, so this never blocks the request hot path. Empty list =
+    /// cheap no-op.
     ///
-    /// Per-exporter concurrency is capped at
-    /// [`MAX_INFLIGHT_PER_EXPORTER`]. Past the cap, further events for
-    /// that exporter are dropped (logged at `debug`) — the alternative
-    /// is unbounded queueing behind a slow / down receiver, which OOMs
-    /// the DP. See issue #113.
-    ///
-    /// The `exporters` slice is what the proxy's snapshot lookup
-    /// returns. Empty slice = no-op (the common case for envs that
-    /// haven't configured any exporters yet, so this is the cheap
-    /// path).
-    pub fn fan_out<'a, I>(&self, event: &UsageEvent, exporters: I)
-    where
+    /// `content` is the request's captured prompt/response, or `None` when the
+    /// handler captured none (the default). It is attached ONLY to an
+    /// `aliyun_sls` exporter whose `content_mode = full`; every other exporter
+    /// — and the CP telemetry path, which is not in this loop — receives the
+    /// shared metadata-only record, so prompt/response can never leak there.
+    pub fn fan_out<'a, I>(
+        &self,
+        event: &UsageEvent,
+        content: Option<&CapturedContent>,
+        exporters: I,
+    ) where
         I: IntoIterator<Item = &'a ObservabilityExporter>,
     {
+        // The shared metadata-only record, built once on first sighting and
+        // reused by every exporter that does not capture content.
+        let mut metadata_record: Option<Arc<SinkRecord>> = None;
         for exp in exporters {
             if !exp.enabled {
                 continue;
             }
-            // Single-variant enum today; the `let ExporterKind::OtlpHttp`
-            // pattern is exhaustive but deliberately written with the
-            // type tag spelled out so adding a new variant in Phase 2
-            // forces a compile error here.
-            let ExporterKind::OtlpHttp(cfg) = &exp.kind;
 
-            // Try to claim a permit BEFORE building the payload — if
-            // we're at the cap, drop early so we don't even pay the
-            // JSON-serialisation cost.
-            let sem = self.permits_for(&exp.name);
-            let permit = match sem.try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    tracing::debug!(
-                        exporter = %exp.name,
-                        cap = MAX_INFLIGHT_PER_EXPORTER,
-                        "otlp_http fan-out: exporter at concurrency cap; dropping span",
-                    );
-                    continue;
+            // Dispatch on kind: each arm fingerprints its delivery-relevant
+            // config (so a dashboard edit rebuilds the pipeline) and lazily
+            // builds the matching sink. All kinds share one `ExporterPipelines`
+            // manager and the pooled client. A new `ExporterKind` variant
+            // makes this `match` non-exhaustive — a compile-time prompt to wire
+            // its sink here.
+            let client = self.inner.client.clone();
+            let handle = match &exp.kind {
+                ExporterKind::OtlpHttp(cfg) => {
+                    let fingerprint = fingerprint_otlp(cfg);
+                    let name = exp.name.clone();
+                    let endpoint = cfg.endpoint.clone();
+                    let headers = cfg.headers.clone();
+                    self.inner
+                        .exporters
+                        .get_or_create(&exp.name, fingerprint, move || {
+                            Arc::new(OtlpSink::new(name, endpoint, headers, client))
+                                as Arc<dyn ObservabilitySink>
+                        })
+                }
+                ExporterKind::AliyunSls(cfg) => {
+                    let fingerprint = fingerprint_sls(cfg);
+                    let name = exp.name.clone();
+                    let cfg = cfg.clone();
+                    self.inner
+                        .exporters
+                        .get_or_create(&exp.name, fingerprint, move || {
+                            // Resolve the AccessKey from the DP's local env at
+                            // build time (the key never rode the kine path).
+                            // Missing creds → empty key → SLS 401 surfaces as a
+                            // delivery-health auth error, not a silent drop.
+                            let (ak_id, ak_secret) =
+                                resolve_sls_credential(&cfg.credential_ref).unwrap_or_default();
+                            Arc::new(AliyunSlsSink::new(
+                                name,
+                                &cfg.endpoint,
+                                &cfg.project,
+                                &cfg.logstore,
+                                ak_id,
+                                ak_secret,
+                                client,
+                            )) as Arc<dyn ObservabilitySink>
+                        })
+                }
+                ExporterKind::ObjectStore(cfg) => {
+                    let fingerprint = fingerprint_object_store(cfg);
+                    let name = exp.name.clone();
+                    let cfg = cfg.clone();
+                    self.inner
+                        .exporters
+                        .get_or_create(&exp.name, fingerprint, move || {
+                            // Resolve cloud creds from the DP's local env and
+                            // build the backend at build time. Missing creds or
+                            // an un-buildable backend yield a sink that reports
+                            // the reason via delivery health (never a silent
+                            // drop) — mirroring the SLS path.
+                            build_object_store_sink(name, &cfg)
+                        })
                 }
             };
 
-            // Build the wire body once per exporter (cheap — small
-            // JSON) so the spawned task only owns the bytes.
-            let body = build_otlp_traces_payload(event, &exp.name);
-            let endpoint = cfg.endpoint.clone();
-            let headers = cfg.headers.clone();
-            let client = self.inner.client.clone();
-            let exporter_name = exp.name.clone();
-
-            tokio::spawn(async move {
-                // Permit released when the task ends. `_permit` keeps
-                // it alive across the await point.
-                let _permit = permit;
-                if let Err(err) = post_one(client, endpoint, headers, body).await {
-                    tracing::warn!(
-                        exporter = %exporter_name,
-                        error = %err,
-                        "otlp_http exporter POST failed; span dropped",
-                    );
-                }
+            // A content-bearing record for an SLS exporter that opted into
+            // full capture (and only when the handler captured content); the
+            // shared metadata-only record for everyone else.
+            let record = content_record(&exp.kind, event, content).unwrap_or_else(|| {
+                Arc::clone(
+                    metadata_record
+                        .get_or_insert_with(|| Arc::new(SinkRecord::metadata_only(event.clone()))),
+                )
             });
+            handle.try_enqueue(record);
         }
+    }
+
+    /// Stop pipelines for exporters no longer present in `live` (the current
+    /// snapshot's enabled exporter names, across all kinds). Called
+    /// periodically by the server to GC pipelines for deleted / disabled
+    /// exporters.
+    pub fn gc(&self, live: &std::collections::HashSet<String>) {
+        self.inner.exporters.retain(live);
+    }
+
+    /// Drain every exporter pipeline at graceful shutdown.
+    pub async fn shutdown(&self) {
+        self.inner.exporters.shutdown().await;
     }
 }
 
@@ -209,36 +229,220 @@ impl Default for OtlpHttpFanOut {
     }
 }
 
-async fn post_one(
-    client: reqwest::Client,
-    endpoint: String,
-    headers: BTreeMap<String, String>,
-    body: Value,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut req = client
-        .post(&endpoint)
-        .header("Content-Type", "application/json")
-        .body(serde_json::to_vec(&body)?);
-    for (k, v) in headers {
-        req = req.header(k, v);
-    }
-    let resp = req.send().await?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "HTTP {}: {}",
-            status,
-            body.chars().take(200).collect::<String>()
-        )
-        .into());
-    }
-    Ok(())
+/// Hash an `otlp_http` exporter's delivery-relevant config. A change to
+/// endpoint or headers yields a new fingerprint, so the manager rebuilds the
+/// exporter's pipeline against the edited target.
+fn fingerprint_otlp(cfg: &OtlpHttpConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cfg.endpoint.hash(&mut hasher);
+    cfg.headers.hash(&mut hasher);
+    hasher.finish()
 }
 
-/// Build an OTLP/HTTP-JSON `ExportTraceServiceRequest` payload with
-/// one span representing this chat completion. Attribute names match
-/// the OpenTelemetry GenAI semantic conventions:
+/// Hash an `aliyun_sls` exporter's delivery-relevant config. The fingerprint
+/// covers only kine-visible fields (endpoint / project / logstore /
+/// credential_ref), never the resolved AccessKey — rotating the secret under
+/// the *same* reference therefore takes effect on the next DP restart, not
+/// live. A ref change does rebuild the pipeline.
+fn fingerprint_sls(cfg: &AliyunSlsConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cfg.endpoint.hash(&mut hasher);
+    cfg.project.hash(&mut hasher);
+    cfg.logstore.hash(&mut hasher);
+    cfg.credential_ref.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The content-bearing [`SinkRecord`] for one exporter, or `None` to fall back
+/// to the shared metadata-only record.
+///
+/// Content is attached ONLY to an `aliyun_sls` exporter whose
+/// `content_mode = full`, and ONLY when the handler captured content — every
+/// other exporter (and the CP telemetry path, which never enters the fan-out)
+/// gets metadata only. The captured prompt/response are truncated to the
+/// exporter's `content_max_bytes`, ORing in any truncation the handler already
+/// applied at capture time.
+fn content_record(
+    kind: &ExporterKind,
+    event: &UsageEvent,
+    content: Option<&CapturedContent>,
+) -> Option<Arc<SinkRecord>> {
+    let ExporterKind::AliyunSls(cfg) = kind else {
+        return None;
+    };
+    if cfg.content_mode != SlsContentMode::Full {
+        return None;
+    }
+    let captured = content?;
+    let mut sc = SinkContent::capture(
+        &captured.prompt,
+        &captured.response,
+        cfg.content_max_bytes as usize,
+    );
+    sc.truncated = sc.truncated || captured.truncated;
+    Some(Arc::new(
+        SinkRecord::metadata_only(event.clone()).with_content(sc),
+    ))
+}
+
+/// The largest `content_max_bytes` among the env's enabled exporters that
+/// capture full content, or `None` if none do.
+///
+/// A request handler calls this BEFORE doing any capture work: `None` means no
+/// exporter wants prompt/response, so the handler skips capture entirely (no
+/// body clone, no stream accumulation — zero hot-path cost). `Some(cap)` is the
+/// bound the handler caps its capture at; each exporter then re-truncates to
+/// its own (≤ cap) limit at delivery.
+pub fn content_capture_cap<'a>(
+    exporters: impl IntoIterator<Item = &'a ObservabilityExporter>,
+) -> Option<u32> {
+    exporters
+        .into_iter()
+        .filter(|e| e.enabled)
+        .filter_map(|e| match &e.kind {
+            ExporterKind::AliyunSls(cfg) if cfg.content_mode == SlsContentMode::Full => {
+                Some(cfg.content_max_bytes)
+            }
+            _ => None,
+        })
+        .max()
+}
+
+/// Hash an `object_store` exporter's delivery-relevant config. Covers only
+/// kine-visible fields (provider / bucket / prefix / region / endpoint /
+/// compression / credential_ref), never the resolved cloud key — rotating the
+/// secret under the *same* reference therefore takes effect on the next DP
+/// restart, not live. Any field change rebuilds the pipeline.
+fn fingerprint_object_store(cfg: &ObjectStoreConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cfg.provider.hash(&mut hasher);
+    cfg.bucket.hash(&mut hasher);
+    cfg.prefix.hash(&mut hasher);
+    cfg.region.hash(&mut hasher);
+    cfg.endpoint.hash(&mut hasher);
+    cfg.compression.hash(&mut hasher);
+    cfg.credential_ref.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// An [`ObservabilitySink`] over the OTLP/HTTP-JSON traces protocol — the
+/// same wire shape as [`OtlpHttpFanOut`], but driven by the shared
+/// [`crate::sink::SinkPipeline`] (batched, retried, backpressured) rather
+/// than a per-event fire-and-forget spawn. One instance per configured
+/// `otlp_http` exporter.
+pub struct OtlpSink {
+    name: String,
+    endpoint: String,
+    headers: BTreeMap<String, String>,
+    client: reqwest::Client,
+}
+
+impl OtlpSink {
+    /// Build a sink for one exporter. The `client` is shared across sinks so
+    /// connection pools and TLS sessions are reused.
+    pub fn new(
+        name: impl Into<String>,
+        endpoint: impl Into<String>,
+        headers: BTreeMap<String, String>,
+        client: reqwest::Client,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            endpoint: endpoint.into(),
+            headers,
+            client,
+        }
+    }
+}
+
+#[async_trait]
+impl ObservabilitySink for OtlpSink {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn capabilities(&self) -> SinkCapabilities {
+        SinkCapabilities {
+            idempotency: IdempotencyScheme::None,
+            ordering: OrderingScope::None,
+            batch_unit: BatchUnit::Records,
+            // OTLP spans are small and receivers accept large payloads; the
+            // sink does not split by bytes, so no pipeline-enforced ceiling.
+            max_batch_bytes: None,
+            supports_partial_batch: false,
+            supports_streaming_ingest: false,
+        }
+    }
+
+    async fn append_batch(&self, batch: &EventBatch, _marker: &IdempotencyMarker) -> SinkResult {
+        if batch.is_empty() {
+            return Ok(SinkAck::default());
+        }
+        // One export request carrying every record's span — one POST, one
+        // atomic retry unit (vs. the per-event fan-out's N spawns).
+        let spans: Vec<Value> = batch
+            .records
+            .iter()
+            .map(|record| build_otlp_span(&record.usage, &self.name))
+            .collect();
+        let body = otlp_export_request(spans);
+        let bytes = serde_json::to_vec(&body)
+            .map_err(|e| SinkError::Permanent(format!("otlp encode: {e}")))?;
+
+        let mut req = self
+            .client
+            .post(&self.endpoint)
+            .header("Content-Type", "application/json")
+            .body(bytes);
+        for (key, value) in &self.headers {
+            req = req.header(key, value);
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return Ok(SinkAck {
+                        accepted: batch.len(),
+                        ..SinkAck::default()
+                    });
+                }
+                let text = resp.text().await.unwrap_or_default();
+                let detail = format!(
+                    "HTTP {}: {}",
+                    status,
+                    text.chars().take(200).collect::<String>()
+                );
+                // 5xx / 408 / 429 are worth retrying; other 4xx are
+                // config/auth/payload errors that will fail identically.
+                if status.is_server_error()
+                    || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                {
+                    Err(SinkError::Transient(detail))
+                } else {
+                    Err(SinkError::Permanent(detail))
+                }
+            }
+            // Connect / DNS / timeout — transient by nature.
+            Err(e) => Err(SinkError::Transient(format!("POST {}: {e}", self.endpoint))),
+        }
+    }
+
+    async fn healthcheck(&self) -> SinkHealth {
+        // A real connectivity probe (and the control-plane "test connection"
+        // affordance) lands with the health/metrics surface; until then a
+        // sink reports healthy and its delivery errors surface via
+        // `SinkStats::last_error`.
+        SinkHealth::healthy()
+    }
+}
+
+/// Build the single OTLP span object for one usage event. Attribute names
+/// match the OpenTelemetry GenAI semantic conventions:
 /// <https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md>.
 ///
 /// Per-attribute encoding:
@@ -246,7 +450,7 @@ async fn post_one(
 ///   `{"intValue": "..."}` (string-encoded int per OTLP/JSON spec).
 /// - Trace ID + span ID are random 16-byte / 8-byte hex values.
 /// - Timestamps are nanos-since-epoch, OTLP's required unit.
-fn build_otlp_traces_payload(event: &UsageEvent, exporter_name: &str) -> Value {
+fn build_otlp_span(event: &UsageEvent, exporter_name: &str) -> Value {
     let trace_id = random_trace_id();
     let span_id = random_span_id();
 
@@ -258,8 +462,6 @@ fn build_otlp_traces_payload(event: &UsageEvent, exporter_name: &str) -> Value {
     // Latency landed in milliseconds; widen + multiply.
     let latency_nanos = (event.latency_ms as u128).saturating_mul(1_000_000);
     let start_unix_nano = end_unix_nano.saturating_sub(latency_nanos);
-
-    let span_name = "chat.completions";
 
     // Status: OK (1) for 2xx, ERROR (2) otherwise.
     let status_code = if (200..300).contains(&event.status_code) {
@@ -349,6 +551,20 @@ fn build_otlp_traces_payload(event: &UsageEvent, exporter_name: &str) -> Value {
     }
 
     json!({
+        "traceId": trace_id,
+        "spanId":  span_id,
+        "name":    "chat.completions",
+        "kind":    3, // SPAN_KIND_CLIENT (DP → upstream LLM)
+        "startTimeUnixNano": start_unix_nano.to_string(),
+        "endTimeUnixNano":   end_unix_nano.to_string(),
+        "attributes": attributes,
+        "status": { "code": status_code },
+    })
+}
+
+/// Wrap one or more spans into an OTLP/HTTP-JSON `ExportTraceServiceRequest`.
+fn otlp_export_request(spans: Vec<Value>) -> Value {
+    json!({
         "resourceSpans": [{
             "resource": {
                 "attributes": [
@@ -357,19 +573,18 @@ fn build_otlp_traces_payload(event: &UsageEvent, exporter_name: &str) -> Value {
             },
             "scopeSpans": [{
                 "scope": { "name": "aisix-obs.otlp_http_sink" },
-                "spans": [{
-                    "traceId": trace_id,
-                    "spanId":  span_id,
-                    "name":    span_name,
-                    "kind":    3, // SPAN_KIND_CLIENT (DP → upstream LLM)
-                    "startTimeUnixNano": start_unix_nano.to_string(),
-                    "endTimeUnixNano":   end_unix_nano.to_string(),
-                    "attributes": attributes,
-                    "status": { "code": status_code },
-                }],
+                "spans": spans,
             }],
         }],
     })
+}
+
+/// One event -> one-span export request. Test-only helper for the payload
+/// assertions; production paths build spans via [`build_otlp_span`] and batch
+/// them through [`otlp_export_request`] inside [`OtlpSink`].
+#[cfg(test)]
+fn build_otlp_traces_payload(event: &UsageEvent, exporter_name: &str) -> Value {
+    otlp_export_request(vec![build_otlp_span(event, exporter_name)])
 }
 
 fn attr_string(key: &str, value: &str) -> Value {
@@ -543,6 +758,127 @@ mod tests {
         .unwrap()
     }
 
+    fn sls_kind(content_mode: SlsContentMode, max_bytes: u32) -> ExporterKind {
+        ExporterKind::AliyunSls(AliyunSlsConfig {
+            endpoint: "ap-southeast-3.log.aliyuncs.com".into(),
+            project: "p".into(),
+            logstore: "l".into(),
+            credential_ref: "r".into(),
+            content_mode,
+            content_max_bytes: max_bytes,
+        })
+    }
+
+    #[test]
+    fn content_record_targets_only_full_capture_sls() {
+        let event = sample_event();
+        let captured = CapturedContent {
+            prompt: "the prompt".into(),
+            response: "the response".into(),
+            truncated: false,
+        };
+
+        // otlp never carries content, even when content was captured.
+        let otlp = ExporterKind::OtlpHttp(OtlpHttpConfig {
+            endpoint: "https://x/v1/traces".into(),
+            headers: Default::default(),
+        });
+        assert!(content_record(&otlp, &event, Some(&captured)).is_none());
+
+        // object_store never carries content either — content_record gates on
+        // the AliyunSls variant, so any other kind gets metadata-only even when
+        // content was captured (no prompt/response leak into S3 / GCS / Azure).
+        let objstore = serde_json::from_value::<ObservabilityExporter>(serde_json::json!({
+            "name": "o",
+            "enabled": true,
+            "kind": "object_store",
+            "provider": "s3",
+            "bucket": "b",
+            "prefix": "p",
+            "credential_ref": "r"
+        }))
+        .unwrap()
+        .kind;
+        assert!(content_record(&objstore, &event, Some(&captured)).is_none());
+
+        // sls metadata_only → no content.
+        let meta = sls_kind(SlsContentMode::MetadataOnly, 1024);
+        assert!(content_record(&meta, &event, Some(&captured)).is_none());
+
+        // sls full but nothing captured → falls back to metadata.
+        let full = sls_kind(SlsContentMode::Full, 1024);
+        assert!(content_record(&full, &event, None).is_none());
+
+        // sls full + captured content → a content-bearing record that still
+        // carries the metadata.
+        let rec = content_record(&full, &event, Some(&captured))
+            .expect("full-capture sls with content yields a content record");
+        let c = rec.content.as_ref().expect("content attached");
+        assert_eq!(c.prompt, "the prompt");
+        assert_eq!(c.response, "the response");
+        assert!(!c.truncated);
+        assert_eq!(rec.usage.request_id, "req-test-123");
+
+        // Per-exporter cap truncates + flags.
+        let big = CapturedContent {
+            prompt: "a".repeat(500),
+            response: "ok".into(),
+            truncated: false,
+        };
+        let rec = content_record(&sls_kind(SlsContentMode::Full, 16), &event, Some(&big)).unwrap();
+        let c = rec.content.as_ref().unwrap();
+        assert_eq!(c.prompt.len(), 16);
+        assert!(c.truncated, "oversize content must flag truncated");
+
+        // Handler-side truncation propagates even when the per-exporter cap
+        // did not cut.
+        let pre = CapturedContent {
+            prompt: "short".into(),
+            response: "short".into(),
+            truncated: true,
+        };
+        let rec = content_record(&full, &event, Some(&pre)).unwrap();
+        assert!(
+            rec.content.as_ref().unwrap().truncated,
+            "source truncation must propagate"
+        );
+    }
+
+    #[test]
+    fn content_capture_cap_picks_max_enabled_full_sls() {
+        fn sls(name: &str, enabled: bool, mode: &str, max: u32) -> ObservabilityExporter {
+            serde_json::from_value(serde_json::json!({
+                "name": name,
+                "enabled": enabled,
+                "kind": "aliyun_sls",
+                "endpoint": "ap-southeast-3.log.aliyuncs.com",
+                "project": "p",
+                "logstore": "l",
+                "credential_ref": "r",
+                "content_mode": mode,
+                "content_max_bytes": max,
+            }))
+            .unwrap()
+        }
+
+        // No exporter wants content → None (handler skips capture).
+        let otlp = sample_exporter();
+        let meta = sls("a", true, "metadata_only", 1024);
+        assert_eq!(content_capture_cap([&otlp, &meta]), None);
+
+        // One full-capture sls → its cap.
+        let full = sls("a", true, "full", 4096);
+        assert_eq!(content_capture_cap([&full]), Some(4096));
+
+        // Max across several full-capture exporters.
+        let full_b = sls("b", true, "full", 8192);
+        assert_eq!(content_capture_cap([&full, &full_b]), Some(8192));
+
+        // A disabled full-capture exporter is ignored.
+        let disabled = sls("a", false, "full", 4096);
+        assert_eq!(content_capture_cap([&disabled]), None);
+    }
+
     #[test]
     fn payload_carries_genai_semconv_attributes() {
         let body = build_otlp_traces_payload(&sample_event(), "test-exp");
@@ -581,7 +917,10 @@ mod tests {
             .as_array()
             .unwrap();
         let find = |k: &str| attrs.iter().find(|a| a["key"] == k);
-        assert_eq!(find("aisix.attempt_index").unwrap()["value"]["intValue"], "1");
+        assert_eq!(
+            find("aisix.attempt_index").unwrap()["value"]["intValue"],
+            "1"
+        );
         assert_eq!(
             find("aisix.attempt_kind").unwrap()["value"]["stringValue"],
             "fallback"
@@ -658,6 +997,80 @@ mod tests {
         );
     }
 
+    fn otlp_test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+    }
+
+    fn batch_of(n: usize) -> EventBatch {
+        let records = (0..n)
+            .map(|_| Arc::new(crate::sink::SinkRecord::metadata_only(sample_event())))
+            .collect();
+        EventBatch::new(records)
+    }
+
+    #[tokio::test]
+    async fn otlp_sink_posts_one_request_with_all_spans() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/traces"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let sink = OtlpSink::new(
+            "test-exp",
+            format!("{}/v1/traces", server.uri()),
+            BTreeMap::new(),
+            otlp_test_client(),
+        );
+
+        let ack = sink
+            .append_batch(&batch_of(3), &IdempotencyMarker::None)
+            .await
+            .expect("2xx delivers the batch");
+        assert_eq!(ack.accepted, 3);
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1, "one batched request, not three spawns");
+        let body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        let spans = body["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .unwrap();
+        assert_eq!(spans.len(), 3, "all three spans in one export request");
+    }
+
+    #[tokio::test]
+    async fn otlp_sink_classifies_5xx_as_transient() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let sink = OtlpSink::new("e", server.uri(), BTreeMap::new(), otlp_test_client());
+        let err = sink
+            .append_batch(&batch_of(1), &IdempotencyMarker::None)
+            .await
+            .unwrap_err();
+        assert!(err.is_transient(), "5xx must be retryable: {err}");
+    }
+
+    #[tokio::test]
+    async fn otlp_sink_classifies_4xx_as_permanent() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(400))
+            .mount(&server)
+            .await;
+        let sink = OtlpSink::new("e", server.uri(), BTreeMap::new(), otlp_test_client());
+        let err = sink
+            .append_batch(&batch_of(1), &IdempotencyMarker::None)
+            .await
+            .unwrap_err();
+        assert!(!err.is_transient(), "4xx must be permanent: {err}");
+    }
+
     #[test]
     fn payload_omits_empty_optional_fields() {
         let mut ev = sample_event();
@@ -710,7 +1123,7 @@ mod tests {
         // can't easily count spawned tasks, but if the call returned
         // and the test process didn't hang, we're good.
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), std::iter::empty());
+        f.fan_out(&sample_event(), None, std::iter::empty());
     }
 
     #[test]
@@ -724,107 +1137,43 @@ mod tests {
         let mut exp = sample_exporter();
         exp.enabled = false;
         let f = OtlpHttpFanOut::new();
-        f.fan_out(&sample_event(), std::iter::once(&exp));
+        f.fan_out(&sample_event(), None, std::iter::once(&exp));
     }
 
-    // ---- regression coverage for issue #113 -------------------------
-    // Pre-fix, fan_out spawned one detached tokio::spawn per (event,
-    // exporter) with no concurrency cap. A slow / down OTLP receiver
-    // would let task count + per-task payload memory grow unbounded
-    // until OOM. The fix bounds in-flight POSTs per exporter to
-    // MAX_INFLIGHT_PER_EXPORTER via a Semaphore; past the cap, events
-    // are dropped on the request hot path rather than queued.
-
-    /// A receiver that hangs forever — simulates a wedged OTLP backend.
-    /// We point exporters at it to wedge the spawned tasks past the
-    /// cap so we can observe the bound.
-    fn wedged_endpoint(server: &wiremock::MockServer) -> ObservabilityExporter {
-        // wiremock without registering any Mock returns 404 — that's
-        // fast (not the wedged behaviour we want). Instead point at a
-        // path that has a long delay registered.
-        let exp_json = serde_json::json!({
-            "name": "wedged-exporter",
+    #[tokio::test]
+    async fn fan_out_delivers_a_span_to_a_real_receiver() {
+        // The new fan-out enqueues into a per-exporter pipeline (1s flush);
+        // a single request's span lands at the receiver after the flush.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/traces"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let exp: ObservabilityExporter = serde_json::from_value(serde_json::json!({
+            "name": "real-otlp",
             "enabled": true,
             "kind": "otlp_http",
             "endpoint": format!("{}/v1/traces", server.uri()),
             "headers": {}
-        });
-        serde_json::from_value(exp_json).unwrap()
-    }
+        }))
+        .unwrap();
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fan_out_caps_in_flight_when_exporter_is_slow() {
-        use std::time::Duration;
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        // Each POST hangs for 5 minutes; production REQUEST_TIMEOUT
-        // is 5s so in steady state these all time out, but for the
-        // test window we drive the cap deterministically.
-        Mock::given(method("POST"))
-            .and(path("/v1/traces"))
-            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(300)))
-            .mount(&server)
-            .await;
-
-        let exp = wedged_endpoint(&server);
         let f = OtlpHttpFanOut::new();
-        // Push more events than the cap; tasks block on the wedged
-        // receiver, so in_flight must saturate at MAX_INFLIGHT_PER_EXPORTER
-        // and further calls must be dropped at the hot path.
-        let pushes = MAX_INFLIGHT_PER_EXPORTER + 50;
-        for _ in 0..pushes {
-            f.fan_out(&sample_event(), std::iter::once(&exp));
-        }
-        // Yield so spawned tasks get a chance to acquire their
-        // permits before we sample. Multi-thread runtime + a couple
-        // of yields is plenty for try_acquire to settle.
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
-        let inflight = f.in_flight_for(&exp.name);
-        assert_eq!(
-            inflight, MAX_INFLIGHT_PER_EXPORTER,
-            "in-flight should saturate exactly at the cap; got {inflight}",
-        );
-        // Pre-fix (no cap), inflight would equal `pushes` here —
-        // i.e. ~114, growing unboundedly. The assertion above pins
-        // the bound.
-    }
+        f.fan_out(&sample_event(), None, std::iter::once(&exp));
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fan_out_recovers_after_permits_release() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        // Fast 200 — every permit released quickly.
-        Mock::given(method("POST"))
-            .and(path("/v1/traces"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
-
-        let exp = wedged_endpoint(&server);
-        let f = OtlpHttpFanOut::new();
-        // Drive a burst that exceeds the cap; under fast-receiver
-        // conditions the permits cycle through quickly.
-        for _ in 0..(MAX_INFLIGHT_PER_EXPORTER * 2) {
-            f.fan_out(&sample_event(), std::iter::once(&exp));
+        // Poll for the batched POST (flush_interval is 1s).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !server.received_requests().await.unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no OTLP POST within 5s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        // Generous wait — wiremock + reqwest + tokio handshake is
-        // hundreds of ms in CI. The point: in-flight should drop back
-        // to (close to) zero after the burst clears.
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        let inflight = f.in_flight_for(&exp.name);
-        assert!(
-            inflight < MAX_INFLIGHT_PER_EXPORTER,
-            "permits should release as POSTs complete; in_flight stuck at {inflight}",
-        );
+        f.shutdown().await;
     }
 }
