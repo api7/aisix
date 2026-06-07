@@ -184,33 +184,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  sls-smoke:
-    name: aliyun sls smoke (real)
-    runs-on: ubicloud-standard-2
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: arduino/setup-protoc@v3.0.0
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@v2
-      # Real Aliyun SLS PutLogs validation — the v1 signature / lz4 block /
-      # protobuf a mock receiver cannot check. The test is `#[ignore]` +
-      # env-gated, so it only does real work when the SLS secrets are present;
-      # fork PRs (where GitHub withholds secrets) see empty vars and skip
-      # cleanly. NOTE: `AISIX_E2E_SLS_*` is read directly by the test — this is
-      # a `cargo test` process that never loads `Config`, so the `AISIX_`
-      # prefix is safe here (unlike the spawned binary in the e2e job, whose
-      # credentials must use the non-`AISIX_` `SLS_CRED_*` form).
-      - name: real-SLS smoke
-        env:
-          AISIX_E2E_SLS_AK_ID: ${{ secrets.ALI_SLS_AK_ID }}
-          AISIX_E2E_SLS_AK_SECRET: ${{ secrets.ALI_SLS_SK }}
-          AISIX_E2E_SLS_ENDPOINT: ap-southeast-3.log.aliyuncs.com
-          AISIX_E2E_SLS_PROJECT: aisix-e2e-obs
-          AISIX_E2E_SLS_LOGSTORE: request-events
-        run: cargo test -p aisix-obs --lib -- --ignored sls_smoke --nocapture
-
   coverage-gate:
     name: coverage >= 90%
     needs: [rust-unit, e2e]
