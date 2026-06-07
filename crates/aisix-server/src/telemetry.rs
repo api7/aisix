@@ -244,6 +244,12 @@ fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
         .user_agent(format!("aisix-dp/{}", env!("CARGO_PKG_VERSION")))
         .identity(identity)
         .add_root_certificate(ca)
+        // Pin HTTP/1.1 — see heartbeat::build_client. dp-manager cmux
+        // routes one TLS port to gRPC (h2) vs REST (http1) by ALPN; once
+        // the cloud-sink crates pulled reqwest's `http2` feature into the
+        // workspace, this telemetry client advertised `h2` and cmux
+        // misrouted the /dp/telemetry POSTs to the gRPC handler.
+        .http1_only()
         .use_rustls_tls();
     // Mirror heartbeat::build_client — pick up the operator-supplied
     // extra trust root (managed.cp_ca_cert_file) when set.

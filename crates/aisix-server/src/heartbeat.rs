@@ -283,6 +283,18 @@ fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
         .user_agent(format!("aisix-dp/{}", env!("CARGO_PKG_VERSION")))
         .identity(identity)
         .add_root_certificate(ca)
+        // Pin HTTP/1.1 for the dp-manager REST calls. dp-manager
+        // multiplexes gRPC (kine/etcd, HTTP/2) and the REST surface
+        // (/dp/*) on one TLS port via cmux, which routes by the
+        // negotiated ALPN protocol. When the observability cloud-sink
+        // crates pulled reqwest's `http2` feature into the workspace
+        // (Cargo feature unification), this client began advertising `h2`
+        // in ALPN, so cmux handed these REST requests to the gRPC handler
+        // and every POST failed with "error sending request". Forcing
+        // http/1.1 keeps ALPN at `http/1.1` so cmux routes to the REST
+        // mux. The etcd/gRPC client is a separate tonic h2 connection and
+        // is unaffected.
+        .http1_only()
         .use_rustls_tls();
     // Operator-supplied extra root (e2e / on-prem). Covers the dp-
     // manager server cert when it's signed by a CA distinct from the
