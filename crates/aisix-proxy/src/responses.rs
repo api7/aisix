@@ -601,6 +601,7 @@ async fn responses_to_target(
             futures::pin_mut!(stream);
             let read_to = model.stream_read_timeout();
             let mut buf: Vec<u8> = Vec::new();
+            let mut saw_chunk = false;
             loop {
                 // #554: bound each read so a stalled upstream fails over —
                 // the buffer path hasn't sent anything to the client yet, so
@@ -622,8 +623,23 @@ async fn responses_to_target(
                     None => stream.next().await,
                 };
                 let Some(chunk) = next else {
+                    // #554: an upstream that returns 200 then closes with zero
+                    // bytes is a first-chunk failure — fail over rather than
+                    // serving an empty 200, matching the verbatim branch. Only
+                    // when a stream timeout is configured, so a model without
+                    // one keeps the pre-#554 behavior.
+                    if !saw_chunk && read_to.is_some() {
+                        let err = crate::cooldown::note_failure(
+                            &state.runtime_status,
+                            model_id,
+                            model.cooldown.as_ref(),
+                            aisix_gateway::BridgeError::StreamAborted,
+                        );
+                        return Err(ProxyError::Bridge(err));
+                    }
                     break;
                 };
+                saw_chunk = true;
                 let chunk = chunk
                     .map_err(|e| {
                         crate::cooldown::note_failure(

@@ -1242,9 +1242,13 @@ async fn cross_provider_dispatch(
                     return Err(ProxyError::Bridge(err));
                 }
                 None => {
-                    return Err(ProxyError::Bridge(
-                        aisix_gateway::BridgeError::StreamAborted,
-                    ))
+                    let err = aisix_gateway::BridgeError::StreamAborted;
+                    if let Some((ttl, reason)) =
+                        crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                    {
+                        state.runtime_status.mark_cooldown(model_id, ttl, reason);
+                    }
+                    return Err(ProxyError::Bridge(err));
                 }
             };
             // Re-prepend the peeked chunk so the SSE encoder sees the whole

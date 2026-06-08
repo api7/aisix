@@ -86,7 +86,7 @@ A failed probe transitions the model to `unhealthy` in the runtime status tracke
 
 ### Timeouts
 
-Two optional per-model knobs bound how long the gateway waits on the upstream. Both are in **milliseconds**; `0` or absent means no timeout. They mirror LiteLLM's `timeout` and `stream_timeout`.
+Two optional per-model knobs bound how long the gateway waits on the upstream. Both are in **milliseconds**. Setting a knob to `0` disables that timeout; omitting `timeout` disables it too, while omitting `stream_timeout` makes streaming fall back to `timeout` (see below) rather than disabling the streaming timeout. They mirror LiteLLM's `timeout` and `stream_timeout`.
 
 ```json title="Direct model timeouts"
 {

@@ -245,20 +245,23 @@ pub struct Model {
     pub provider_key_id: Option<String>,
 
     /// Non-streaming request timeout in ms — the end-to-end budget for a
-    /// `stream:false` upstream call. 0 or absent = no timeout. On a
+    /// `stream:false` upstream call. `0` or absent = no timeout. On a
     /// routing model's target, an elapsed timeout fails over to the next
-    /// target (the timeout error is retryable). Mirrors LiteLLM's
+    /// target (the timeout error is retryable). For `stream:true` requests
+    /// it is also the fallback streaming budget when `stream_timeout` is
+    /// unset (see [`Model::stream_timeout_effective`]). Mirrors LiteLLM's
     /// `timeout`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
 
     /// Streaming read timeout in ms — the maximum gap the gateway waits
     /// for the next upstream chunk on a `stream:true` call, applied to the
-    /// first chunk and to every inter-chunk gap. 0 or absent = no timeout.
-    /// A *first-chunk* timeout fails over to the next target (before any
-    /// bytes reach the client); a *mid-stream* timeout terminates the
-    /// stream like any other upstream error. Mirrors LiteLLM's
-    /// `stream_timeout`.
+    /// first chunk and to every inter-chunk gap. `0` = no timeout; when
+    /// absent, streaming falls back to `timeout` (see
+    /// [`Model::stream_timeout_effective`]). A *first-chunk* timeout fails
+    /// over to the next target (before any bytes reach the client); a
+    /// *mid-stream* timeout terminates the stream like any other upstream
+    /// error. Mirrors LiteLLM's `stream_timeout`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_timeout: Option<u64>,
 
@@ -417,6 +420,24 @@ mod tests {
         .unwrap();
         assert_eq!(zero.request_timeout(), None);
         assert_eq!(zero.stream_read_timeout(), None);
+
+        // stream_timeout_effective cascade: prefer stream_timeout when set.
+        assert_eq!(
+            m.stream_timeout_effective(),
+            Some(std::time::Duration::from_millis(2_500))
+        );
+        // Falls back to `timeout` when stream_timeout is absent.
+        let timeout_only: Model = serde_json::from_str(
+            r#"{"display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1","timeout":5000}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            timeout_only.stream_timeout_effective(),
+            Some(std::time::Duration::from_millis(5_000))
+        );
+        // None when neither is set, and when both are the 0 sentinel.
+        assert_eq!(none.stream_timeout_effective(), None);
+        assert_eq!(zero.stream_timeout_effective(), None);
     }
 
     #[test]
