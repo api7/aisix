@@ -13,6 +13,13 @@
 //! (`/messages/count_tokens`), the absence of streaming, and the tiny
 //! `{"input_tokens": <int>}` response, which is forwarded verbatim.
 //!
+//! Guardrails: this surface is intentionally **exempt** from the input
+//! guardrail chain (#545). It is a pre-flight sizing call — no content
+//! reaches a model and the response is only an integer token count, never
+//! generated content — so there is nothing to moderate on either hook. The
+//! same `messages` payload is scanned when the caller issues the actual
+//! `/v1/messages` request, which runs input + output guardrails.
+//!
 //! Scope: Anthropic-backed models only. `count_tokens` has no upstream
 //! equivalent for OpenAI/Gemini/DeepSeek, so a non-Anthropic Model is
 //! rejected with a 400 at the gateway boundary (parallel to `/v1/rerank`

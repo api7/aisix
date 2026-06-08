@@ -131,6 +131,31 @@ pub async fn rerank(
     }
 }
 
+/// Build a [`ChatFormat`](aisix_gateway::ChatFormat) of user messages from
+/// the rerank `query` + `documents` so the input guardrail chain can scan
+/// them (#545). Documents may be plain strings or `{ "text": ... }`
+/// objects; both are collected. Never sent upstream.
+fn rerank_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat {
+    let mut messages = Vec::new();
+    if let Some(q) = body.get("query").and_then(|v| v.as_str()) {
+        if !q.is_empty() {
+            messages.push(aisix_gateway::ChatMessage::user(q.to_string()));
+        }
+    }
+    if let Some(docs) = body.get("documents").and_then(|v| v.as_array()) {
+        for d in docs {
+            let text = d
+                .as_str()
+                .or_else(|| d.get("text").and_then(|t| t.as_str()))
+                .unwrap_or("");
+            if !text.is_empty() {
+                messages.push(aisix_gateway::ChatMessage::user(text.to_string()));
+            }
+        }
+    }
+    aisix_gateway::ChatFormat::new(model, messages)
+}
+
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -152,6 +177,36 @@ async fn dispatch(
 
     if !auth.key().can_access(&model_name) {
         return Err(ProxyError::ModelForbidden(model_name.clone()));
+    }
+
+    // #545: /v1/rerank must run input guardrails. Before this it forwarded
+    // the user `query` + `documents` with no configured content/DLP check,
+    // so a block enforced on /v1/chat/completions was bypassable by
+    // switching surface. Run before the rate-limit reservation so a
+    // content-policy refusal doesn't burn an RPM slot. (Output is reranked
+    // indices/scores, not generated text, so there is no output hook.)
+    let guardrail_ctx = aisix_guardrails::RequestContext {
+        model_id: &model_entry.id,
+        api_key_id: &auth.entry.id,
+        team_id: auth.key().team_id.as_deref(),
+    };
+    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    if !resolved_chain.is_empty() {
+        let chat = rerank_input_to_chat(&model_name, &*body);
+        if let aisix_guardrails::GuardrailVerdict::Block { reason } =
+            aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+        {
+            // Per #153 the matched-pattern detail stays in ops logs only.
+            tracing::warn!(
+                guardrail_hook = "input",
+                model = %model_name,
+                reason = %reason,
+                "guardrail blocked /v1/rerank request",
+            );
+            return Err(ProxyError::ContentFiltered(
+                "request blocked by content policy".into(),
+            ));
+        }
     }
 
     let model_rl =
@@ -469,6 +524,7 @@ mod tests {
     use aisix_core::{AisixSnapshot, ApiKey, Model, ProxyConfig};
     use aisix_gateway::Hub;
     use aisix_provider_openai::OpenAiBridge;
+    use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -555,6 +611,79 @@ mod tests {
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body.to_string()))
             .unwrap()
+    }
+
+    fn keyword_input_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
+        let json = format!(
+            r#"{{"name":"t","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{{"kind":"literal","value":"{literal}"}}]}}"#
+        );
+        let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("g-1", g, 1)
+    }
+
+    /// #545: a configured input guardrail must fire on /v1/rerank — a blocked
+    /// `query` returns 422 content_filter and the upstream is never contacted.
+    #[tokio::test]
+    async fn input_guardrail_blocks_query_returns_422() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"results": []})),
+            )
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(cohere_model("rr"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+        let app = build_app(snap);
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "rr", "query": "find BLOCKME", "documents": ["x", "y"]
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+    }
+
+    /// #545: a blocked literal in `documents` (not the query) is also scanned.
+    #[tokio::test]
+    async fn input_guardrail_blocks_document_returns_422() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"results": []})),
+            )
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(cohere_model("rr"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+        let app = build_app(snap);
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "rr", "query": "fine query", "documents": ["clean", "has BLOCKME inside"]
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
     }
 
     #[tokio::test]
