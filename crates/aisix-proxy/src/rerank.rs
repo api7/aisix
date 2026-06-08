@@ -652,6 +652,10 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "content_filter");
+        assert!(!v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("BLOCKME"));
     }
 
     /// #545: a blocked literal in `documents` (not the query) is also scanned.
@@ -684,6 +688,48 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "content_filter");
+        assert!(!v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("BLOCKME"));
+    }
+
+    /// #545 companion: a benign query/documents with a guardrail configured
+    /// still dispatches to the upstream (`expect(1)`) and returns 200 — the
+    /// guardrail must not block clean rerank traffic.
+    #[tokio::test]
+    async fn input_guardrail_allows_benign_rerank_forwards_200() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "rr-ok",
+                "results": [{"index": 0, "relevance_score": 0.9}],
+                "meta": {"billed_units": {"search_units": 1}}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        let pk_json = format!(
+            r#"{{"display_name":"cohere-up","secret":"sk-cohere-mock","api_base":"{}","provider":"cohere","adapter":"openai"}}"#,
+            upstream.uri()
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&pk_json).unwrap();
+        snap.provider_keys.insert(ResourceEntry::new(PK_ID, pk, 1));
+        snap.models.insert(cohere_model("rr"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "rr", "query": "a fine query", "documents": ["clean a", "clean b"]
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

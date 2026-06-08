@@ -13,12 +13,16 @@
 //! (`/messages/count_tokens`), the absence of streaming, and the tiny
 //! `{"input_tokens": <int>}` response, which is forwarded verbatim.
 //!
-//! Guardrails: this surface is intentionally **exempt** from the input
-//! guardrail chain (#545). It is a pre-flight sizing call — no content
-//! reaches a model and the response is only an integer token count, never
-//! generated content — so there is nothing to moderate on either hook. The
-//! same `messages` payload is scanned when the caller issues the actual
-//! `/v1/messages` request, which runs input + output guardrails.
+//! Guardrails: this surface is intentionally **exempt** from the
+//! content-moderation guardrail chain (#545). It is a pre-flight sizing
+//! call — no content reaches a model and the response is only an integer
+//! token count, never generated content — so there is nothing for a
+//! content-moderation hook to moderate on either side, and the same
+//! `messages` payload is scanned when the caller issues the actual
+//! `/v1/messages` request. (A DLP/egress policy is a separate concern: the
+//! `messages` are forwarded to the provider's count endpoint here before the
+//! real call, so a DLP guardrail attached at env-scope would not see them —
+//! tracked in #555, out of scope for #545.)
 //!
 //! Scope: Anthropic-backed models only. `count_tokens` has no upstream
 //! equivalent for OpenAI/Gemini/DeepSeek, so a non-Anthropic Model is
