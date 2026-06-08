@@ -142,6 +142,66 @@
           ]
         }
       }
+    },
+    {
+      "description": "Datadog native **Logs HTTP intake** target. Each request event becomes one Datadog log object, gzip-compressed and POSTed to `https://http-intake.logs.<site>/api/v2/logs`. Like `aliyun_sls` (and unlike `otlp_http`), the Datadog API key is **never** part of this config: it would otherwise sit in plaintext on the kine path, and a Datadog API key grants broad org access. Instead the config carries a [`credential_ref`] pointer that the customer-side DP resolves to the real key locally (env / mounted secret); API7's control plane stores only the reference. This deliberately diverges from issue #688's `api_key: SecretRef` draft to stay consistent with SLS / object_store and avoid the #692 credential-encryption dependency.\n\n[`credential_ref`]: DatadogConfig::credential_ref",
+      "type": "object",
+      "required": [
+        "credential_ref",
+        "kind",
+        "service",
+        "site"
+      ],
+      "properties": {
+        "content_max_bytes": {
+          "description": "Per-field byte cap for captured content under `content_mode = full`. The prompt and the response are each truncated to this many bytes (UTF-8-boundary safe), and the log carries a `content_truncated` marker when either was cut. Ignored under `metadata_only`. Defaults to 128 KiB and is capped at 1 MiB — a single Datadog log may not exceed 1 MB, so a larger per-field cap could push a log past the intake limit.\n\n`0` is rejected — `full` with a zero cap captures nothing, which is a misconfiguration. The `range(min = 1, max = …)` keeps the generated JSON schema in step with the runtime validator so the CP and DP agree on the bounds.",
+          "default": 131072,
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 1048576.0,
+          "minimum": 1.0
+        },
+        "content_mode": {
+          "description": "Whether captured request/response content is delivered to Datadog. `metadata_only` (default) ships only operational metadata — never a prompt or response. `full` additionally captures the request prompt and the assembled response, each truncated to [`content_max_bytes`]. Enabling `full` writes end-user prompt / response text into the customer's Datadog org, so the dashboard must surface the privacy implication when an operator turns it on. Reuses [`SlsContentMode`] — the codebase's existing `metadata_only | full` model — so the shared content-capture plumbing (`content_record` / `content_capture_cap`) stays single-sourced.\n\n[`content_max_bytes`]: DatadogConfig::content_max_bytes",
+          "default": "metadata_only",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SlsContentMode"
+            }
+          ]
+        },
+        "credential_ref": {
+          "description": "Opaque pointer to the Datadog API key, resolved locally by the DP at delivery time. The plaintext key MUST NOT live in etcd/kine — the control plane stores only this reference, never the key itself. The DP reads `DD_CRED_<SLUG>_API_KEY` from its own environment, where `<SLUG>` upper-cases the reference with non-alphanumerics folded to `_`.",
+          "type": "string"
+        },
+        "ddsource": {
+          "description": "Datadog `ddsource` reserved attribute — the integration/source name. Defaults to `aisix-ai-gateway`.",
+          "default": "aisix-ai-gateway",
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "datadog"
+          ]
+        },
+        "service": {
+          "description": "Datadog `service` reserved attribute — the service name every log from this exporter is tagged with in Datadog's Log Explorer.",
+          "type": "string"
+        },
+        "site": {
+          "description": "Datadog site, validated against the allow-list in the loader schema (`datadoghq.com`, `us3`/`us5`/`ap1`/`ap2` regions, `datadoghq.eu`, `ddog-gov.com`). The intake host is `http-intake.logs.<site>`. A scheme-qualified loopback host (the e2e's `http://mock-datadog:*`) is admitted only for vetted local mocks, never to redirect real traffic.",
+          "type": "string"
+        },
+        "tags": {
+          "description": "Operator-defined tags rendered into Datadog's comma-joined `ddtags` reserved attribute (e.g. `[\"team:platform\", \"tier:prod\"]` → `team:platform,tier:prod`). Empty by default.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
     }
   ],
   "required": [
@@ -188,7 +248,7 @@
       ]
     },
     "SlsContentMode": {
-      "description": "Content-capture mode for an SLS exporter. Defaults to the privacy-preserving `metadata_only`.",
+      "description": "Content-capture mode for an SLS / Datadog exporter. Defaults to the privacy-preserving `metadata_only`. (`Hash` so a Datadog exporter's fingerprint can cover its content config; see `fingerprint_datadog`.)",
       "oneOf": [
         {
           "description": "Operational metadata only — never the prompt or response.",

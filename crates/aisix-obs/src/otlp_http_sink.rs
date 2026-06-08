@@ -33,17 +33,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aisix_core::models::{
-    AliyunSlsConfig, ExporterKind, ObjectStoreConfig, ObservabilityExporter, OtlpHttpConfig,
-    SlsContentMode,
+    AliyunSlsConfig, DatadogConfig, ExporterKind, ObjectStoreConfig, ObservabilityExporter,
+    OtlpHttpConfig, SlsContentMode,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::sink::{
-    build_object_store_sink, resolve_sls_credential, AliyunSlsSink, BatchUnit, CapturedContent,
-    EventBatch, ExporterPipelines, IdempotencyMarker, IdempotencyScheme, ObservabilitySink,
-    OrderingScope, PipelineConfig, SinkAck, SinkCapabilities, SinkContent, SinkError, SinkHealth,
-    SinkRecord, SinkResult,
+    build_object_store_sink, resolve_datadog_credential, resolve_sls_credential, AliyunSlsSink,
+    BatchUnit, CapturedContent, DatadogSink, EventBatch, ExporterPipelines, IdempotencyMarker,
+    IdempotencyScheme, ObservabilitySink, OrderingScope, PipelineConfig, SinkAck, SinkCapabilities,
+    SinkContent, SinkError, SinkHealth, SinkRecord, SinkResult,
 };
 use crate::usage::UsageEvent;
 
@@ -116,9 +116,10 @@ impl OtlpHttpFanOut {
     ///
     /// `content` is the request's captured prompt/response, or `None` when the
     /// handler captured none (the default). It is attached ONLY to an
-    /// `aliyun_sls` exporter whose `content_mode = full`; every other exporter
-    /// — and the CP telemetry path, which is not in this loop — receives the
-    /// shared metadata-only record, so prompt/response can never leak there.
+    /// `aliyun_sls` or `datadog` exporter whose `content_mode = full`; every
+    /// other exporter — and the CP telemetry path, which is not in this loop —
+    /// receives the shared metadata-only record, so prompt/response can never
+    /// leak there.
     pub fn fan_out<'a, I>(
         &self,
         event: &UsageEvent,
@@ -194,6 +195,31 @@ impl OtlpHttpFanOut {
                             build_object_store_sink(name, &cfg)
                         })
                 }
+                ExporterKind::Datadog(cfg) => {
+                    let fingerprint = fingerprint_datadog(cfg);
+                    let name = exp.name.clone();
+                    let cfg = cfg.clone();
+                    self.inner
+                        .exporters
+                        .get_or_create(&exp.name, fingerprint, move || {
+                            // Resolve the Datadog API key from the DP's local
+                            // env at build time (the key never rode the kine
+                            // path). Missing key → empty → Datadog 403 surfaces
+                            // as a delivery-health auth error, not a silent drop
+                            // — mirroring the SLS path.
+                            let api_key =
+                                resolve_datadog_credential(&cfg.credential_ref).unwrap_or_default();
+                            Arc::new(DatadogSink::new(
+                                name,
+                                &cfg.site,
+                                api_key,
+                                &cfg.ddsource,
+                                &cfg.tags,
+                                &cfg.service,
+                                client,
+                            )) as Arc<dyn ObservabilitySink>
+                        })
+                }
             };
 
             // A content-bearing record for an SLS exporter that opted into
@@ -258,7 +284,7 @@ fn fingerprint_sls(cfg: &AliyunSlsConfig) -> u64 {
 /// The content-bearing [`SinkRecord`] for one exporter, or `None` to fall back
 /// to the shared metadata-only record.
 ///
-/// Content is attached ONLY to an `aliyun_sls` exporter whose
+/// Content is attached ONLY to an `aliyun_sls` OR `datadog` exporter whose
 /// `content_mode = full`, and ONLY when the handler captured content — every
 /// other exporter (and the CP telemetry path, which never enters the fan-out)
 /// gets metadata only. The captured prompt/response are truncated to the
@@ -269,18 +295,19 @@ fn content_record(
     event: &UsageEvent,
     content: Option<&CapturedContent>,
 ) -> Option<Arc<SinkRecord>> {
-    let ExporterKind::AliyunSls(cfg) = kind else {
-        return None;
+    // The exporters that opt into full content capture share the
+    // `SlsContentMode` model; pull each one's (mode, cap). Any other kind
+    // never carries content, so prompt/response can't leak into it.
+    let (mode, max_bytes) = match kind {
+        ExporterKind::AliyunSls(cfg) => (cfg.content_mode, cfg.content_max_bytes),
+        ExporterKind::Datadog(cfg) => (cfg.content_mode, cfg.content_max_bytes),
+        _ => return None,
     };
-    if cfg.content_mode != SlsContentMode::Full {
+    if mode != SlsContentMode::Full {
         return None;
     }
     let captured = content?;
-    let mut sc = SinkContent::capture(
-        &captured.prompt,
-        &captured.response,
-        cfg.content_max_bytes as usize,
-    );
+    let mut sc = SinkContent::capture(&captured.prompt, &captured.response, max_bytes as usize);
     sc.truncated = sc.truncated || captured.truncated;
     Some(Arc::new(
         SinkRecord::metadata_only(event.clone()).with_content(sc),
@@ -305,6 +332,9 @@ pub fn content_capture_cap<'a>(
             ExporterKind::AliyunSls(cfg) if cfg.content_mode == SlsContentMode::Full => {
                 Some(cfg.content_max_bytes)
             }
+            ExporterKind::Datadog(cfg) if cfg.content_mode == SlsContentMode::Full => {
+                Some(cfg.content_max_bytes)
+            }
             _ => None,
         })
         .max()
@@ -325,6 +355,24 @@ fn fingerprint_object_store(cfg: &ObjectStoreConfig) -> u64 {
     cfg.endpoint.hash(&mut hasher);
     cfg.compression.hash(&mut hasher);
     cfg.credential_ref.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Hash a `datadog` exporter's delivery-relevant config. Covers only
+/// kine-visible fields (site / credential_ref / service / ddsource / tags /
+/// content config), never the resolved API key — rotating the secret under the
+/// *same* reference therefore takes effect on the next DP restart, not live. A
+/// ref change (or any other field change) rebuilds the pipeline.
+fn fingerprint_datadog(cfg: &DatadogConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cfg.site.hash(&mut hasher);
+    cfg.credential_ref.hash(&mut hasher);
+    cfg.service.hash(&mut hasher);
+    cfg.ddsource.hash(&mut hasher);
+    cfg.tags.hash(&mut hasher);
+    cfg.content_mode.hash(&mut hasher);
+    cfg.content_max_bytes.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -769,6 +817,18 @@ mod tests {
         })
     }
 
+    fn datadog_kind(content_mode: SlsContentMode, max_bytes: u32) -> ExporterKind {
+        ExporterKind::Datadog(DatadogConfig {
+            site: "datadoghq.com".into(),
+            credential_ref: "r".into(),
+            service: "ai-gateway".into(),
+            ddsource: "aisix-ai-gateway".into(),
+            tags: vec![],
+            content_mode,
+            content_max_bytes: max_bytes,
+        })
+    }
+
     #[test]
     fn content_record_targets_only_full_capture_sls() {
         let event = sample_event();
@@ -842,6 +902,24 @@ mod tests {
             rec.content.as_ref().unwrap().truncated,
             "source truncation must propagate"
         );
+
+        // datadog behaves identically to sls: metadata_only → no content,
+        // full + captured content → a content-bearing record (same shared
+        // `SlsContentMode` plumbing).
+        let dd_meta = datadog_kind(SlsContentMode::MetadataOnly, 1024);
+        assert!(content_record(&dd_meta, &event, Some(&captured)).is_none());
+        let dd_full = datadog_kind(SlsContentMode::Full, 1024);
+        assert!(content_record(&dd_full, &event, None).is_none());
+        let rec = content_record(&dd_full, &event, Some(&captured))
+            .expect("full-capture datadog with content yields a content record");
+        let c = rec.content.as_ref().expect("content attached");
+        assert_eq!(c.prompt, "the prompt");
+        assert_eq!(c.response, "the response");
+        // Per-exporter cap truncates a datadog record too.
+        let rec =
+            content_record(&datadog_kind(SlsContentMode::Full, 16), &event, Some(&big)).unwrap();
+        assert_eq!(rec.content.as_ref().unwrap().prompt.len(), 16);
+        assert!(rec.content.as_ref().unwrap().truncated);
     }
 
     #[test]
@@ -877,6 +955,27 @@ mod tests {
         // A disabled full-capture exporter is ignored.
         let disabled = sls("a", false, "full", 4096);
         assert_eq!(content_capture_cap([&disabled]), None);
+
+        // A full-capture datadog exporter counts toward the cap too, and the
+        // max is taken across both kinds.
+        fn datadog(name: &str, enabled: bool, mode: &str, max: u32) -> ObservabilityExporter {
+            serde_json::from_value(serde_json::json!({
+                "name": name,
+                "enabled": enabled,
+                "kind": "datadog",
+                "site": "datadoghq.com",
+                "credential_ref": "r",
+                "service": "ai-gateway",
+                "content_mode": mode,
+                "content_max_bytes": max,
+            }))
+            .unwrap()
+        }
+        let dd_full = datadog("dd", true, "full", 16384);
+        assert_eq!(content_capture_cap([&dd_full]), Some(16384));
+        assert_eq!(content_capture_cap([&full, &dd_full]), Some(16384));
+        let dd_meta = datadog("dd", true, "metadata_only", 4096);
+        assert_eq!(content_capture_cap([&dd_meta]), None);
     }
 
     #[test]

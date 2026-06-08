@@ -13,6 +13,7 @@
 //! and the concrete sinks (SLS, …) build on it.
 
 mod capabilities;
+mod datadog;
 mod manager;
 mod object_store;
 mod pipeline;
@@ -22,6 +23,7 @@ mod sls;
 pub use capabilities::{
     BatchUnit, ChannelKey, IdempotencyMarker, IdempotencyScheme, OrderingScope, SinkCapabilities,
 };
+pub use datadog::{resolve_datadog_credential, DatadogSink};
 pub use manager::ExporterPipelines;
 pub use object_store::{build_object_store_sink, ObjectStoreSink};
 pub use pipeline::{PipelineConfig, SinkHandle, SinkPipeline, SinkStatsSnapshot};

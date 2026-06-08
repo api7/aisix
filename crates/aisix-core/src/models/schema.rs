@@ -591,8 +591,7 @@ fn observability_exporter_schema() -> Value {
     // considers THIS object's `properties` (not those inside `allOf`/`then`),
     // so every kind's fields are listed at the top level as the union;
     // per-kind required-fields and the endpoint pattern live in the
-    // `if`/`then` branches. Phase 2 adds `datadog_logs` / `s3_ndjson` the
-    // same way.
+    // `if`/`then` branches. Further kinds (`s3_ndjson`, …) land the same way.
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -601,7 +600,7 @@ fn observability_exporter_schema() -> Value {
         "properties": {
             "name":    { "type": "string", "minLength": 1, "maxLength": 120 },
             "enabled": { "type": "boolean" },
-            "kind":    { "type": "string", "enum": ["otlp_http", "aliyun_sls", "object_store"] },
+            "kind":    { "type": "string", "enum": ["otlp_http", "aliyun_sls", "object_store", "datadog"] },
             // Shared field; the per-kind pattern is enforced in the branches.
             "endpoint": { "type": "string" },
             // otlp_http field.
@@ -615,17 +614,28 @@ fn observability_exporter_schema() -> Value {
             "project":        { "type": "string", "minLength": 1 },
             "logstore":       { "type": "string", "minLength": 1 },
             "credential_ref": { "type": "string", "minLength": 1 },
-            // Content capture (opt-in). `full` writes captured prompt /
-            // response into the logstore; `content_max_bytes` truncates each.
+            // Content capture (opt-in), shared by aliyun_sls + datadog. `full`
+            // writes captured prompt / response to the sink; `content_max_bytes`
+            // truncates each. The 1 MiB ceiling matches Datadog's per-log limit.
             "content_mode":      { "type": "string", "enum": ["metadata_only", "full"] },
-            "content_max_bytes": { "type": "integer", "minimum": 1 },
+            "content_max_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
             // object_store fields (S3 / GCS / Azure Blob, one variant). Cloud
             // credentials are NEVER here — only the shared `credential_ref`.
             "provider":    { "type": "string", "enum": ["s3", "gcs", "azure_blob"] },
             "bucket":      { "type": "string", "minLength": 1 },
             "prefix":      { "type": "string", "minLength": 1 },
             "region":      { "type": "string", "minLength": 1 },
-            "compression": { "type": "string", "enum": ["gzip", "none"] }
+            "compression": { "type": "string", "enum": ["gzip", "none"] },
+            // datadog fields. The Datadog API key is NEVER here — only the
+            // shared `credential_ref` the DP resolves locally. `site` is
+            // constrained to the allow-list in the per-kind branch below.
+            "site":    { "type": "string", "minLength": 1 },
+            "service": { "type": "string", "minLength": 1 },
+            "ddsource": { "type": "string", "minLength": 1 },
+            "tags": {
+                "type": "array",
+                "items": { "type": "string" }
+            }
         },
         "allOf": [
             {
@@ -671,6 +681,34 @@ fn observability_exporter_schema() -> Value {
                         // redirect real traffic to an arbitrary plaintext host.
                         "endpoint": {
                             "pattern": "^https://.+|^http://(minio|azurite|fake-gcs-server|fake-gcs|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$"
+                        }
+                    }
+                }
+            },
+            {
+                "if":   { "properties": { "kind": { "const": "datadog" } } },
+                "then": {
+                    "required": ["site", "credential_ref", "service"],
+                    "properties": {
+                        // The Datadog site, constrained to the supported intake
+                        // sites; the sink posts to `http-intake.logs.<site>`.
+                        // Loopback bypass for e2e: a scheme-qualified
+                        // mock-datadog / 127.0.0.1 / localhost the sink posts to
+                        // directly (so a local mock intake needs no TLS) — never
+                        // a way to redirect real traffic to an arbitrary host.
+                        "site": {
+                            "enum": [
+                                "datadoghq.com",
+                                "us3.datadoghq.com",
+                                "us5.datadoghq.com",
+                                "datadoghq.eu",
+                                "ap1.datadoghq.com",
+                                "ap2.datadoghq.com",
+                                "ddog-gov.com",
+                                "mock-datadog",
+                                "127.0.0.1",
+                                "localhost"
+                            ]
                         }
                     }
                 }
@@ -1532,6 +1570,148 @@ mod tests {
     fn exporter_rejects_unknown_kind() {
         let v = json!({ "name": "x", "kind": "splunk_hec", "endpoint": "https://x" });
         assert!(validate_observability_exporter(&v).is_err());
+    }
+
+    #[test]
+    fn exporter_datadog_happy_path() {
+        let v = json!({
+            "name": "datadog-prod",
+            "kind": "datadog",
+            "site": "datadoghq.com",
+            "credential_ref": "datadog-prod",
+            "service": "ai-gateway",
+            "ddsource": "aisix-ai-gateway",
+            "tags": ["team:platform", "tier:prod"]
+        });
+        validate_observability_exporter(&v).unwrap();
+    }
+
+    #[test]
+    fn exporter_datadog_accepts_every_allow_list_site() {
+        for site in [
+            "datadoghq.com",
+            "us3.datadoghq.com",
+            "us5.datadoghq.com",
+            "datadoghq.eu",
+            "ap1.datadoghq.com",
+            "ap2.datadoghq.com",
+            "ddog-gov.com",
+        ] {
+            let v = json!({
+                "name": "x",
+                "kind": "datadog",
+                "site": site,
+                "credential_ref": "r",
+                "service": "s"
+            });
+            validate_observability_exporter(&v)
+                .unwrap_or_else(|e| panic!("site {site:?} must validate: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn exporter_datadog_rejects_non_allow_list_site() {
+        // A plausible-looking but unsupported / spoofed site must be rejected —
+        // no exfil to an arbitrary `http-intake.logs.<host>`.
+        for bad in [
+            "evil.datadoghq.com.attacker.test",
+            "datadoghq.org",
+            "us9.datadoghq.com",
+            "datadog.com",
+            "",
+        ] {
+            let v = json!({
+                "name": "x",
+                "kind": "datadog",
+                "site": bad,
+                "credential_ref": "r",
+                "service": "s"
+            });
+            assert!(
+                validate_observability_exporter(&v).is_err(),
+                "site {bad:?} must be rejected by the allow-list"
+            );
+        }
+    }
+
+    #[test]
+    fn exporter_datadog_allows_loopback_mock_site() {
+        // The e2e points the DP at a local mock Datadog intake.
+        let v = json!({
+            "name": "datadog-e2e",
+            "kind": "datadog",
+            "site": "mock-datadog",
+            "credential_ref": "mock",
+            "service": "ai-gateway"
+        });
+        validate_observability_exporter(&v).unwrap();
+    }
+
+    #[test]
+    fn exporter_datadog_requires_site_credential_service() {
+        for missing in ["site", "credential_ref", "service"] {
+            let mut v = json!({
+                "name": "x",
+                "kind": "datadog",
+                "site": "datadoghq.com",
+                "credential_ref": "r",
+                "service": "s"
+            });
+            v.as_object_mut().unwrap().remove(missing);
+            assert!(
+                validate_observability_exporter(&v).is_err(),
+                "missing `{missing}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn exporter_datadog_rejects_plaintext_api_key() {
+        // No API-key field is allowed at the schema layer either —
+        // `additionalProperties: false` rejects it before serde runs.
+        let v = json!({
+            "name": "x",
+            "kind": "datadog",
+            "site": "datadoghq.com",
+            "credential_ref": "r",
+            "service": "s",
+            "api_key": "DDSECRET"
+        });
+        assert!(validate_observability_exporter(&v).is_err());
+    }
+
+    #[test]
+    fn exporter_datadog_content_capture_fields() {
+        let base = |extra: serde_json::Value| {
+            let mut v = json!({
+                "name": "x",
+                "kind": "datadog",
+                "site": "datadoghq.com",
+                "credential_ref": "r",
+                "service": "s"
+            });
+            let obj = v.as_object_mut().unwrap();
+            for (k, val) in extra.as_object().unwrap() {
+                obj.insert(k.clone(), val.clone());
+            }
+            v
+        };
+        // Opt-in content capture validates.
+        validate_observability_exporter(&base(
+            json!({ "content_mode": "full", "content_max_bytes": 4096 }),
+        ))
+        .unwrap();
+        // Unknown content_mode is rejected.
+        assert!(
+            validate_observability_exporter(&base(json!({ "content_mode": "verbose" }))).is_err()
+        );
+        // content_max_bytes must be a positive integer (min 1).
+        assert!(validate_observability_exporter(&base(json!({ "content_max_bytes": 0 }))).is_err());
+        // content_max_bytes is capped at 1 MiB (Datadog per-log limit).
+        assert!(
+            validate_observability_exporter(&base(json!({ "content_max_bytes": 1_048_577 })))
+                .is_err()
+        );
     }
 
     // ---- rate_limit_policy schema tests ----

@@ -35,9 +35,10 @@ use serde::{Deserialize, Serialize};
 use crate::resource::Resource;
 
 /// Discriminated union of exporter back-ends. Ships `otlp_http`,
-/// `aliyun_sls`, and `object_store` (S3 / GCS / Azure Blob, one variant);
-/// Datadog / … land in follow-ups, each as a new variant whose serde tag
-/// matches the wire-side `kind` discriminator.
+/// `aliyun_sls`, `object_store` (S3 / GCS / Azure Blob, one variant), and
+/// `datadog` (Datadog native Logs intake); further targets land in
+/// follow-ups, each as a new variant whose serde tag matches the wire-side
+/// `kind` discriminator.
 ///
 /// `tag = "kind"` puts the variant tag inline with the inner struct's
 /// fields — same shape as `GuardrailKind` so the kine wire stays
@@ -48,6 +49,7 @@ pub enum ExporterKind {
     OtlpHttp(OtlpHttpConfig),
     AliyunSls(AliyunSlsConfig),
     ObjectStore(ObjectStoreConfig),
+    Datadog(DatadogConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
@@ -124,10 +126,11 @@ pub struct AliyunSlsConfig {
     pub content_max_bytes: u32,
 }
 
-/// Content-capture mode for an SLS exporter. Defaults to the
-/// privacy-preserving `metadata_only`.
+/// Content-capture mode for an SLS / Datadog exporter. Defaults to the
+/// privacy-preserving `metadata_only`. (`Hash` so a Datadog exporter's
+/// fingerprint can cover its content config; see `fingerprint_datadog`.)
 #[derive(
-    Debug, Clone, Copy, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq,
+    Debug, Clone, Copy, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Hash,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum SlsContentMode {
@@ -140,6 +143,92 @@ pub enum SlsContentMode {
 
 /// Default per-field content cap: 128 KiB.
 const fn default_content_max_bytes() -> u32 {
+    128 * 1024
+}
+
+/// Datadog native **Logs HTTP intake** target. Each request event becomes one
+/// Datadog log object, gzip-compressed and POSTed to
+/// `https://http-intake.logs.<site>/api/v2/logs`. Like `aliyun_sls` (and
+/// unlike `otlp_http`), the Datadog API key is **never** part of this config:
+/// it would otherwise sit in plaintext on the kine path, and a Datadog API key
+/// grants broad org access. Instead the config carries a [`credential_ref`]
+/// pointer that the customer-side DP resolves to the real key locally (env /
+/// mounted secret); API7's control plane stores only the reference. This
+/// deliberately diverges from issue #688's `api_key: SecretRef` draft to stay
+/// consistent with SLS / object_store and avoid the #692 credential-encryption
+/// dependency.
+///
+/// [`credential_ref`]: DatadogConfig::credential_ref
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DatadogConfig {
+    /// Datadog site, validated against the allow-list in the loader schema
+    /// (`datadoghq.com`, `us3`/`us5`/`ap1`/`ap2` regions, `datadoghq.eu`,
+    /// `ddog-gov.com`). The intake host is `http-intake.logs.<site>`. A
+    /// scheme-qualified loopback host (the e2e's `http://mock-datadog:*`) is
+    /// admitted only for vetted local mocks, never to redirect real traffic.
+    pub site: String,
+
+    /// Opaque pointer to the Datadog API key, resolved locally by the DP at
+    /// delivery time. The plaintext key MUST NOT live in etcd/kine — the
+    /// control plane stores only this reference, never the key itself. The DP
+    /// reads `DD_CRED_<SLUG>_API_KEY` from its own environment, where `<SLUG>`
+    /// upper-cases the reference with non-alphanumerics folded to `_`.
+    pub credential_ref: String,
+
+    /// Datadog `service` reserved attribute — the service name every log from
+    /// this exporter is tagged with in Datadog's Log Explorer.
+    pub service: String,
+
+    /// Datadog `ddsource` reserved attribute — the integration/source name.
+    /// Defaults to `aisix-ai-gateway`.
+    #[serde(default = "default_ddsource")]
+    pub ddsource: String,
+
+    /// Operator-defined tags rendered into Datadog's comma-joined `ddtags`
+    /// reserved attribute (e.g. `["team:platform", "tier:prod"]` →
+    /// `team:platform,tier:prod`). Empty by default.
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    /// Whether captured request/response content is delivered to Datadog.
+    /// `metadata_only` (default) ships only operational metadata — never a
+    /// prompt or response. `full` additionally captures the request prompt and
+    /// the assembled response, each truncated to [`content_max_bytes`].
+    /// Enabling `full` writes end-user prompt / response text into the
+    /// customer's Datadog org, so the dashboard must surface the privacy
+    /// implication when an operator turns it on. Reuses [`SlsContentMode`] —
+    /// the codebase's existing `metadata_only | full` model — so the shared
+    /// content-capture plumbing (`content_record` / `content_capture_cap`)
+    /// stays single-sourced.
+    ///
+    /// [`content_max_bytes`]: DatadogConfig::content_max_bytes
+    #[serde(default)]
+    pub content_mode: SlsContentMode,
+
+    /// Per-field byte cap for captured content under `content_mode = full`.
+    /// The prompt and the response are each truncated to this many bytes
+    /// (UTF-8-boundary safe), and the log carries a `content_truncated` marker
+    /// when either was cut. Ignored under `metadata_only`. Defaults to 128 KiB
+    /// and is capped at 1 MiB — a single Datadog log may not exceed 1 MB, so a
+    /// larger per-field cap could push a log past the intake limit.
+    ///
+    /// `0` is rejected — `full` with a zero cap captures nothing, which is a
+    /// misconfiguration. The `range(min = 1, max = …)` keeps the generated JSON
+    /// schema in step with the runtime validator so the CP and DP agree on the
+    /// bounds.
+    #[serde(default = "default_dd_content_max_bytes")]
+    #[schemars(range(min = 1, max = 1_048_576))]
+    pub content_max_bytes: u32,
+}
+
+/// Default Datadog `ddsource` reserved attribute.
+fn default_ddsource() -> String {
+    "aisix-ai-gateway".to_string()
+}
+
+/// Default per-field content cap for a Datadog exporter: 128 KiB.
+const fn default_dd_content_max_bytes() -> u32 {
     128 * 1024
 }
 
@@ -499,6 +588,91 @@ mod tests {
         ] {
             let json = format!(
                 r#"{{"name":"x","kind":"object_store","provider":"s3","bucket":"b","prefix":"p","credential_ref":"r","{key}":"PLAINTEXT"}}"#
+            );
+            let r: Result<ObservabilityExporter, _> = serde_json::from_str(&json);
+            assert!(
+                r.is_err(),
+                "plaintext credential field `{key}` must be rejected"
+            );
+        }
+    }
+
+    const VALID_DATADOG: &str = r#"{
+        "name": "datadog-prod",
+        "enabled": true,
+        "kind": "datadog",
+        "site": "datadoghq.com",
+        "credential_ref": "datadog-prod",
+        "service": "ai-gateway"
+    }"#;
+
+    #[test]
+    fn deserialises_datadog() {
+        let e: ObservabilityExporter = serde_json::from_str(VALID_DATADOG).unwrap();
+        assert_eq!(e.name, "datadog-prod");
+        assert!(e.enabled);
+        match &e.kind {
+            ExporterKind::Datadog(c) => {
+                assert_eq!(c.site, "datadoghq.com");
+                assert_eq!(c.credential_ref, "datadog-prod");
+                assert_eq!(c.service, "ai-gateway");
+                // ddsource defaults; tags empty.
+                assert_eq!(c.ddsource, "aisix-ai-gateway");
+                assert!(c.tags.is_empty());
+                // Content capture is off by default (privacy-preserving).
+                assert_eq!(c.content_mode, SlsContentMode::MetadataOnly);
+                assert_eq!(c.content_max_bytes, 128 * 1024);
+            }
+            other => panic!("expected datadog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn datadog_opts_into_full_content_capture_and_tags() {
+        let json = r#"{
+            "name": "datadog-content",
+            "kind": "datadog",
+            "site": "datadoghq.eu",
+            "credential_ref": "r",
+            "service": "ai-gateway",
+            "ddsource": "custom-source",
+            "tags": ["team:platform", "tier:prod"],
+            "content_mode": "full",
+            "content_max_bytes": 4096
+        }"#;
+        let e: ObservabilityExporter = serde_json::from_str(json).unwrap();
+        match &e.kind {
+            ExporterKind::Datadog(c) => {
+                assert_eq!(c.site, "datadoghq.eu");
+                assert_eq!(c.ddsource, "custom-source");
+                assert_eq!(c.tags, vec!["team:platform", "tier:prod"]);
+                assert_eq!(c.content_mode, SlsContentMode::Full);
+                assert_eq!(c.content_max_bytes, 4096);
+            }
+            other => panic!("expected datadog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn datadog_round_trips_flat() {
+        let e: ObservabilityExporter = serde_json::from_str(VALID_DATADOG).unwrap();
+        let v = serde_json::to_value(&e).unwrap();
+        // Flat wire — kind tag + fields at the top level, never nested.
+        assert_eq!(v["kind"], "datadog");
+        assert_eq!(v["site"], "datadoghq.com");
+        assert_eq!(v["credential_ref"], "datadog-prod");
+        assert_eq!(v["service"], "ai-gateway");
+        assert!(v.get("datadog").is_none(), "kind block must not nest");
+    }
+
+    #[test]
+    fn rejects_plaintext_api_key_in_datadog_config() {
+        // The Datadog API key must NEVER be a config field — only a
+        // `credential_ref`. `deny_unknown_fields` on the inner config rejects
+        // any attempt to smuggle a plaintext key onto the kine path.
+        for key in ["api_key", "apikey", "dd_api_key", "key"] {
+            let json = format!(
+                r#"{{"name":"x","kind":"datadog","site":"datadoghq.com","credential_ref":"r","service":"s","{key}":"DDSECRET"}}"#
             );
             let r: Result<ObservabilityExporter, _> = serde_json::from_str(&json);
             assert!(

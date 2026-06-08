@@ -39,8 +39,8 @@ pub use model::{
     Adapter, BackgroundModelCheck, CooldownConfig, Model, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use observability_exporter::{
-    AliyunSlsConfig, ExporterKind, ObjectStoreCompression, ObjectStoreConfig, ObjectStoreProvider,
-    ObservabilityExporter, OtlpHttpConfig, SlsContentMode,
+    AliyunSlsConfig, DatadogConfig, ExporterKind, ObjectStoreCompression, ObjectStoreConfig,
+    ObjectStoreProvider, ObservabilityExporter, OtlpHttpConfig, SlsContentMode,
 };
 pub use provider_key::{
     ParamConstraints, ProviderKey, RequestOverrides, ResponseOverrides, StreamDoneMarker,
