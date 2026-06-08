@@ -1,0 +1,43 @@
+name: setup-protoc
+description: >-
+  Install a pinned protoc, resilient to the GitHub release-asset 504s that flake
+  arduino/setup-protoc. The intermittent timeout is on the release-CDN *download*
+  (objects.githubusercontent.com), not the GitHub API lookup, so repo-token does
+  not help. Drop-in replacement that keeps the same pinned version and retries
+  the download hard before failing the job.
+inputs:
+  version:
+    description: protoc version to install (without the leading "v").
+    default: "23.4"
+runs:
+  using: composite
+  steps:
+    - name: install protoc ${{ inputs.version }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        url="https://github.com/protocolbuffers/protobuf/releases/download/v${{ inputs.version }}/protoc-${{ inputs.version }}-linux-x86_64.zip"
+        # curl's own --retry plus an outer loop: the release CDN 504s are
+        # intermittent, so retry hard (up to 5 outer x 5 inner) before failing.
+        for attempt in 1 2 3 4 5; do
+          echo "::group::protoc download attempt ${attempt}/5"
+          if curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 30 -o /tmp/protoc.zip "${url}"; then
+            echo "::endgroup::"
+            break
+          fi
+          echo "::endgroup::"
+          if [ "${attempt}" = 5 ]; then
+            echo "::error::protoc ${{ inputs.version }} download failed after 5 attempts (GitHub release CDN)"
+            exit 1
+          fi
+          sleep 15
+        done
+        # Install under $HOME (no sudo) and expose it to later steps via
+        # $GITHUB_PATH; pin $PROTOC for prost/tonic build scripts.
+        dest="${HOME}/.local/protoc-${{ inputs.version }}"
+        mkdir -p "${dest}"
+        unzip -o -q /tmp/protoc.zip -d "${dest}" 'bin/protoc' 'include/*'
+        echo "${dest}/bin" >> "${GITHUB_PATH}"
+        echo "PROTOC=${dest}/bin/protoc" >> "${GITHUB_ENV}"
+        # $GITHUB_PATH only affects *subsequent* steps, so verify by full path.
+        "${dest}/bin/protoc" --version
