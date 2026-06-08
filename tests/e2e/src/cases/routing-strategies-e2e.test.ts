@@ -42,6 +42,7 @@ describe("routing strategies and retry behavior e2e", () => {
   async function createOpenAiModel(
     displayName: string,
     upstream: OpenAiUpstream,
+    extra: Record<string, unknown> = {},
   ): Promise<void> {
     if (!admin) throw new Error("admin client not initialized");
     const providerKey = await admin.createProviderKey({
@@ -54,6 +55,7 @@ describe("routing strategies and retry behavior e2e", () => {
       provider: "openai",
       model_name: "gpt-4o-mini",
       provider_key_id: providerKey.id,
+      ...extra,
     });
   }
 
@@ -107,7 +109,12 @@ describe("routing strategies and retry behavior e2e", () => {
     });
     upstreams.push(primary, secondary);
 
-    await createOpenAiModel("routing-retry-primary", primary);
+    // Disable cooldown on the failing primary so the readiness probe below
+    // (which exercises the bad→good failover) doesn't take the primary out
+    // of rotation and zero out its per-target hit count in the assertion.
+    await createOpenAiModel("routing-retry-primary", primary, {
+      cooldown: { enabled: false },
+    });
     await createOpenAiModel("routing-retry-secondary", secondary);
     await waitUntilModelResponds("routing-retry-secondary", "after retries");
     await admin.createModel({
@@ -129,16 +136,21 @@ describe("routing strategies and retry behavior e2e", () => {
       maxRetries: 0,
     });
 
-    // Probing the virtual would warm the primary's cooldown
-    // (post-PR #268: every retryable upstream failure cools down the
-    // failing direct target) and zero out the per-target hit counts
-    // below. Instead, gate on the admin snapshot containing the
-    // virtual record — that proves the routing config has propagated
-    // to the DP without sending any traffic through the dispatcher.
+    // Gate on the routing model being live in the DISPATCHER's snapshot.
+    // The admin snapshot (`listModels`) reads etcd directly and can show
+    // the virtual before the DP's watch loop has applied it to the proxy
+    // snapshot — gating on it raced the test request to a 404
+    // model-not-found. The proxy's `/v1/models` excludes routing aliases,
+    // so probe the virtual through the dispatcher instead; cooldown is
+    // disabled on the primary above, so the probe's failover doesn't skew
+    // the per-target counts (baselines are snapshotted after this gate).
     await waitConfigPropagation(async () => {
       try {
-        const models = await admin!.listModels();
-        return models.some((m) => m.display_name === "routing-retry-virtual");
+        const probe = await client.chat.completions.create({
+          model: "routing-retry-virtual",
+          messages: [{ role: "user", content: "ready-probe" }],
+        });
+        return probe.choices[0]?.message.content === "after retries";
       } catch {
         return false;
       }
