@@ -10,7 +10,7 @@ This is the gateway's current virtual-model mechanism.
 
 Use it when you want to separate the caller contract from the individual upstream target that serves a given request.
 
-A routing alias works across the proxy's passthrough endpoints: `/v1/chat/completions` (OpenAI shape), `/v1/messages` (Anthropic shape), `/v1/responses`, and `/v1/messages/count_tokens`. Targets in one group may mix providers — e.g. an OpenAI target and an Anthropic target — and the gateway dispatches each target through the right path regardless of which endpoint the caller used. Streaming requests attempt only the first target (no mid-stream fallback); non-streaming requests fail over across targets.
+A routing alias works across the proxy's passthrough endpoints: `/v1/chat/completions` (OpenAI shape), `/v1/messages` (Anthropic shape), `/v1/responses`, and `/v1/messages/count_tokens`. Targets in one group may mix providers — e.g. an OpenAI target and an Anthropic target — and the gateway dispatches each target through the right path regardless of which endpoint the caller used. Both non-streaming and streaming requests fail over across targets. For streaming, failover can fire up to and including the first chunk — a connect failure or a slow first token (see [Timeout-Triggered Failover](#timeout-triggered-failover)) moves to the next target before any bytes reach the caller; once the first chunk is forwarded the response is committed to that target and a later mid-stream failure ends the stream rather than failing over.
 
 `/v1/responses` and `/v1/messages/count_tokens` are provider-restricted (OpenAI-only and Anthropic-only respectively). When a group is used on one of these endpoints, only the targets whose provider matches the endpoint are attempted, in order; if the group has no matching target the request is rejected with a 400.
 
@@ -85,6 +85,15 @@ Current rules:
 The proxy retries only on retryable upstream or transport failures. Upstream `4xx` responses are treated as caller-side problems and do not trigger retry or failover, except optional `429` handling when `retry_on_429` is enabled.
 
 This is an important operational boundary. Routing is not a way to mask bad caller requests or invalid model usage.
+
+## Timeout-Triggered Failover
+
+A target that is *too slow* fails over the same way a target that *errors* does. Slowness is defined per direct target by [`timeout`](models.md#timeouts) (non-streaming) and [`stream_timeout`](models.md#timeouts) (streaming), both in milliseconds.
+
+- **Non-streaming.** If a target doesn't return a complete response within its `timeout`, the gateway abandons it (a `504`-class timeout) and moves to the next target — identical to the retryable-failure path above.
+- **Streaming.** `stream_timeout` is a per-chunk read timeout (it resets after each chunk). A timeout on the **first** chunk fires before any bytes reach the caller, so the gateway fails over cleanly to the next target. Once the first chunk has been forwarded the response is committed to that target; a later inter-chunk stall **ends the stream** with an error rather than failing over (the gateway can't un-send bytes already on the wire). When `stream_timeout` is unset, the streaming budget falls back to `timeout`.
+
+Because a timed-out attempt is just another retryable failure, it composes with `retries`, `max_fallbacks`, and the runtime [cooldown](models.md#cooldown) (`trigger_on_timeout`) exactly like a `5xx`. These knobs mirror LiteLLM's `timeout` / `stream_timeout`.
 
 ## Runtime Filtering
 

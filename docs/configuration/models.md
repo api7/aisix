@@ -29,6 +29,7 @@ Current required fields are:
 Optional fields include:
 
 - `timeout`
+- `stream_timeout`
 - `rate_limit`
 - `cost`
 - `cooldown`
@@ -82,6 +83,26 @@ Current semantics:
 - `interval_seconds` has a minimum of `5`; `timeout_seconds`, `max_tokens`, and `stale_after_seconds` have a minimum of `1`
 
 A failed probe transitions the model to `unhealthy` in the runtime status tracker. A subsequent successful probe clears that state. The routing filter excludes `unhealthy` candidates ahead of `cooldown` candidates.
+
+### Timeouts
+
+Two optional per-model knobs bound how long the gateway waits on the upstream. Both are in **milliseconds**; `0` or absent means no timeout. They mirror LiteLLM's `timeout` and `stream_timeout`.
+
+```json title="Direct model timeouts"
+{
+  "timeout": 15000,
+  "stream_timeout": 2500
+}
+```
+
+- `timeout` — end-to-end budget for a **non-streaming** (`stream:false`) upstream call. If the call doesn't finish in time, the gateway abandons it.
+- `stream_timeout` — read timeout for a **streaming** (`stream:true`) call, applied to the **first** chunk and to **every inter-chunk gap** (it resets after each chunk). When `stream_timeout` is absent, a streaming request falls back to `timeout` for this budget.
+
+An elapsed timeout surfaces as a retryable upstream failure (HTTP `504`), so on a [routing model](routing-and-failover.md) it triggers failover to the next target — see [Routing § Timeout-Triggered Failover](routing-and-failover.md#timeout-triggered-failover). On a direct model with no fallback target it simply returns `504` to the caller.
+
+A timeout also feeds [Cooldown](#cooldown) (`trigger_on_timeout`), so a repeatedly-slow target is taken out of rotation for subsequent requests.
+
+> A small `timeout` set for non-streaming traffic also becomes the streaming read budget when `stream_timeout` is unset (LiteLLM parity). Set `stream_timeout` explicitly if streaming needs a different budget.
 
 ### Cooldown
 
