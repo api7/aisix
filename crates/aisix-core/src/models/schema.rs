@@ -691,24 +691,19 @@ fn observability_exporter_schema() -> Value {
                     "required": ["site", "credential_ref", "service"],
                     "properties": {
                         // The Datadog site, constrained to the supported intake
-                        // sites; the sink posts to `http-intake.logs.<site>`.
-                        // Loopback bypass for e2e: a scheme-qualified
-                        // mock-datadog / 127.0.0.1 / localhost the sink posts to
-                        // directly (so a local mock intake needs no TLS) — never
-                        // a way to redirect real traffic to an arbitrary host.
+                        // sites; the sink posts to `https://http-intake.logs.<site>`.
+                        // Loopback bypass for e2e: a bare mock-datadog / 127.0.0.1
+                        // / localhost host, OPTIONALLY with a `:port`, which the
+                        // sink posts to over http:// directly (a local mock intake
+                        // needs no TLS) — never a way to redirect real traffic to
+                        // an arbitrary host. The `:port` is allowed ONLY on the
+                        // loopback hosts (the e2e harness binds a free port); the
+                        // real sites match exactly, no port. Mirrors the
+                        // aliyun_sls / object_store loopback patterns — the prior
+                        // exact-enum rejected the harness's free-port host while
+                        // the sink's `is_loopback_site` accepted it (#548).
                         "site": {
-                            "enum": [
-                                "datadoghq.com",
-                                "us3.datadoghq.com",
-                                "us5.datadoghq.com",
-                                "datadoghq.eu",
-                                "ap1.datadoghq.com",
-                                "ap2.datadoghq.com",
-                                "ddog-gov.com",
-                                "mock-datadog",
-                                "127.0.0.1",
-                                "localhost"
-                            ]
+                            "pattern": "^(datadoghq\\.com|us3\\.datadoghq\\.com|us5\\.datadoghq\\.com|datadoghq\\.eu|ap1\\.datadoghq\\.com|ap2\\.datadoghq\\.com|ddog-gov\\.com)$|^(mock-datadog|127\\.0\\.0\\.1|localhost)(:[0-9]+)?$"
                         }
                     }
                 }
@@ -1618,6 +1613,7 @@ mod tests {
             "datadoghq.org",
             "us9.datadoghq.com",
             "datadog.com",
+            "datadoghq.com:443", // a port is NOT allowed on a real site
             "",
         ] {
             let v = json!({
@@ -1636,15 +1632,20 @@ mod tests {
 
     #[test]
     fn exporter_datadog_allows_loopback_mock_site() {
-        // The e2e points the DP at a local mock Datadog intake.
-        let v = json!({
-            "name": "datadog-e2e",
-            "kind": "datadog",
-            "site": "mock-datadog",
-            "credential_ref": "mock",
-            "service": "ai-gateway"
-        });
-        validate_observability_exporter(&v).unwrap();
+        // The e2e points the DP at a local mock Datadog intake — bare host OR
+        // host:port. The harness binds a FREE port, so `:port` must validate
+        // (the prior exact-enum rejected it while the sink accepted it — #548).
+        for site in ["mock-datadog", "127.0.0.1:54321", "localhost:8080"] {
+            let v = json!({
+                "name": "datadog-e2e",
+                "kind": "datadog",
+                "site": site,
+                "credential_ref": "mock",
+                "service": "ai-gateway"
+            });
+            validate_observability_exporter(&v)
+                .unwrap_or_else(|e| panic!("loopback site {site:?} must validate: {e:?}"));
+        }
     }
 
     #[test]
