@@ -808,26 +808,46 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
     })
 }
 
-/// Collect the assistant's visible output text from a Responses-API
-/// response object for output-guardrail scanning (#719): the `text` of
-/// every `output_text` content part across all message items in
-/// `output[]`. Reasoning items and tool-call arguments are not included
-/// (reasoning is out of output-guardrail scope, matching the chat surface).
+/// Collect the assistant's output text from a Responses-API response object
+/// for output-guardrail scanning (#719/#546):
+/// - the `text` of every `output_text` content part of message items, and
+/// - the `name` + `arguments` (function calls) / `input` (custom tool calls)
+///   of tool-call items — these are **top-level** item fields, not under
+///   `content[]`, so without scanning them a blocked literal placed in a
+///   tool-call's arguments would bypass the output guardrail. The chat
+///   surface scans tool-call output too (`ChatResponse::guardrail_output_text`,
+///   the #448 fix); this keeps the surfaces symmetric.
+///
+/// Reasoning items are intentionally excluded (out of output-guardrail
+/// scope, matching the chat surface) — they carry `summary`, not `content`
+/// / `arguments`, so they're naturally skipped.
 /// <https://platform.openai.com/docs/api-reference/responses/object>
 fn responses_output_text(resp: &Value) -> String {
-    resp.get("output")
-        .and_then(|v| v.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|it| it.get("content").and_then(|c| c.as_array()))
-                .flatten()
-                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default()
+    let Some(items) = resp.get("output").and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for it in items {
+        if let Some(content) = it.get("content").and_then(|c| c.as_array()) {
+            parts.extend(
+                content
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str())),
+            );
+        }
+        // Tool-call items carry caller-visible model output under top-level
+        // `name`/`arguments` (function_call) or `name`/`input` (custom tool).
+        for key in ["name", "arguments", "input"] {
+            if let Some(s) = it.get(key).and_then(|v| v.as_str()) {
+                parts.push(s);
+            }
+        }
+    }
+    parts
+        .into_iter()
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Collect the assistant's streamed output text from a buffered
@@ -1633,6 +1653,95 @@ mod tests {
             "oversized streamed response must fail closed, not be released unscanned",
         );
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+    }
+
+    /// #546: output tool-call arguments must be scanned. A blocked literal in
+    /// a `function_call` item's `arguments` (a top-level item field, not under
+    /// `content[]`) must block the non-streaming response — else tool-call
+    /// output is an output-guardrail bypass.
+    #[tokio::test]
+    async fn output_guardrail_blocks_tool_call_arguments_non_streaming() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_tc",
+                "object": "response",
+                "output": [{
+                    "type": "function_call",
+                    "name": "lookup",
+                    "arguments": "{\"q\":\"BLOCKME\"}"
+                }],
+                "usage": {"input_tokens": 5, "output_tokens": 4}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+    }
+
+    /// #546: tool-call arguments are scanned on the streaming path too (via
+    /// the `response.completed` event), and held back — the args never reach
+    /// the client.
+    #[tokio::test]
+    async fn output_guardrail_blocks_tool_call_arguments_streaming() {
+        let upstream = MockServer::start().await;
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "response": {"output": [{
+                "type": "function_call",
+                "name": "lookup",
+                "arguments": "{\"q\":\"BLOCKME\"}"
+            }]}
+        });
+        let sse = format!("event: response.completed\ndata: {completed}\n\ndata: [DONE]\n\n");
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("BLOCKME"),
+            "tool-call arguments leaked despite output block",
+        );
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "content_filter");
     }
