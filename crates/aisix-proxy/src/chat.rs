@@ -2233,6 +2233,18 @@ where
         } else {
             None
         };
+        // #448 parity for streaming: accumulate tool-call text (function name +
+        // arguments) so the end-of-stream output check scans tool calls too.
+        // The chat non-streaming path (`guardrail_output_text`) and /v1/messages
+        // streaming already scan tool calls, but chat streaming buffered only
+        // `delta.content` — a blocked literal in tool-call `arguments` leaked.
+        // Bounded to the same cap as the hold-back buffer so a huge tool-call
+        // stream can't grow it without limit. Allocated only with a guardrail.
+        let mut tool_calls_buf = if output_guardrail.is_some() {
+            Some(String::new())
+        } else {
+            None
+        };
         // P2 (#379) / #466: streamed-output policy folded over the output-hook
         // guardrails. EndOfStreamCheck (reached only when no output-hook
         // guardrail is present) leaves the live-forward path below byte-for-byte
@@ -2311,6 +2323,27 @@ where
                         if let Some(cap) = content_cap {
                             if comp.response_text.len() < cap as usize {
                                 comp.response_text.push_str(text);
+                            }
+                        }
+                    }
+                    // #448 streaming parity: collect tool-call name + arguments
+                    // for the output guardrail. `delta.tool_calls` streams as
+                    // partial JSON objects; concatenate their text WITHOUT a
+                    // separator so a literal split across deltas reassembles.
+                    if let (Some(tcs), Some(buf)) =
+                        (chunk.delta.tool_calls.as_ref(), tool_calls_buf.as_mut())
+                    {
+                        for tc in tcs {
+                            if buf.len() >= aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES {
+                                break;
+                            }
+                            if let Some(f) = tc.get("function") {
+                                if let Some(n) = f.get("name").and_then(|v| v.as_str()) {
+                                    buf.push_str(n);
+                                }
+                                if let Some(a) = f.get("arguments").and_then(|v| v.as_str()) {
+                                    buf.push_str(a);
+                                }
                             }
                         }
                     }
@@ -2507,9 +2540,20 @@ where
                 // or — for BufferFull — the whole response), then release
                 // the held events if it scans clean.
                 if let Some(ctx) = output_guardrail.as_ref() {
-                    let final_text = match &stream_policy {
+                    let content_part = match &stream_policy {
                         aisix_guardrails::StreamOutputPolicy::Window { .. } => window_buf.clone(),
                         _ => content_buffer.clone().unwrap_or_default(),
+                    };
+                    // Scan content + tool-call text together (#448 streaming
+                    // parity) so blocked content in tool-call arguments can't
+                    // leak. Joined with a newline; either part may be empty.
+                    let tc_part = tool_calls_buf.as_deref().unwrap_or("");
+                    let final_text = if tc_part.is_empty() {
+                        content_part
+                    } else if content_part.is_empty() {
+                        tc_part.to_string()
+                    } else {
+                        format!("{content_part}\n{tc_part}")
                     };
                     let blocked = if final_text.is_empty() {
                         false
@@ -2564,10 +2608,19 @@ where
             } else if let (Some(content), Some(ctx)) =
                 (content_buffer.as_ref(), output_guardrail.as_ref())
             {
+                // EndOfStreamCheck: scan content + tool-call text (#448 parity).
+                let tc_part = tool_calls_buf.as_deref().unwrap_or("");
+                let scan_text = if tc_part.is_empty() {
+                    content.clone()
+                } else if content.is_empty() {
+                    tc_part.to_string()
+                } else {
+                    format!("{content}\n{tc_part}")
+                };
                 let synthesized = aisix_gateway::ChatResponse {
                     id: guard.comp().provider_request_id.clone(),
                     model: guard.comp().provider_model_version.clone(),
-                    message: aisix_gateway::ChatMessage::assistant(content.clone()),
+                    message: aisix_gateway::ChatMessage::assistant(scan_text),
                     finish_reason: aisix_gateway::FinishReason::Stop,
                     usage: aisix_gateway::UsageStats::new(
                         guard.comp().prompt_tokens,
