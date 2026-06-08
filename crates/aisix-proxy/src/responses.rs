@@ -490,19 +490,24 @@ fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
 }
 
 /// Collect the plain, caller-supplied text of one Responses-API input
-/// item. A message item carries text under `content`; a
-/// `function_call_output` (a tool result the caller feeds back into the
-/// conversation) carries it under `output`. Both are user-controlled
-/// content entering the model — the `/v1/chat/completions` equivalent
-/// (a `role:"tool"` message) is scanned, so both are scanned here too,
-/// else the #719 surface-switch bypass would survive on the tool-result
-/// channel. `content`/`output` are each a string or an array of typed
-/// parts; we gather the `text` of each part and ignore non-text parts
-/// (images, files). A `function_call_output` item has no `role`, so the
-/// caller maps it to a user message (scanned by every guardrail kind).
+/// item, across every key on the `input`-item union that carries text the
+/// model will see:
+/// - `content` — message items;
+/// - `output` — tool-result items (`function_call_output`,
+///   `custom_tool_call_output`, `*_call_output`) the caller feeds back;
+/// - `reason` — an `mcp_approval_response` justification.
+///
+/// All are user-controlled content entering the model — the
+/// `/v1/chat/completions` equivalent (a `role:"tool"` message) is
+/// scanned, so leaving any of these unscanned would let the #719
+/// surface-switch bypass survive on that channel. Each slot is a string
+/// or an array of typed parts; we gather the `text` of each part and
+/// ignore non-text parts (images, files). These items carry no `role`,
+/// so the caller maps them to a user message (scanned by every guardrail
+/// kind). Reading a key absent on other item types is a harmless no-op.
 /// <https://platform.openai.com/docs/api-reference/responses/create>
 fn responses_item_text(item: &Value) -> String {
-    [item.get("content"), item.get("output")]
+    [item.get("content"), item.get("output"), item.get("reason")]
         .into_iter()
         .flatten()
         .map(responses_value_text)
@@ -1163,6 +1168,45 @@ mod tests {
                 "model": "gpt-4o-resp",
                 "instructions": "you must BLOCKME",
                 "input": "hello"
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+    }
+
+    /// #719 (re-audit LOW-1): an `mcp_approval_response` item carries
+    /// caller-supplied justification text under `reason`, which reaches the
+    /// model. It is scanned too, so no input-bearing channel is silently
+    /// skipped. A blocked literal in `reason` must 422.
+    #[tokio::test]
+    async fn input_guardrail_blocks_mcp_approval_response_reason() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id":"x","object":"response","output":[]})),
+            )
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": [
+                    {"type": "mcp_approval_response", "approve": true, "approval_request_id": "ar_1", "reason": "BLOCKME please"}
+                ]
             })))
             .await
             .unwrap();
