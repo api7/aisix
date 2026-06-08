@@ -651,6 +651,12 @@ async fn responses_to_target(
                     })
                     .map_err(ProxyError::Bridge)?;
                 if buf.len() + chunk.len() > max_buffer_bytes {
+                    // Unlike chat's BufferFull, we always fail closed on
+                    // overflow regardless of `on_exceeded_fail_open`: an
+                    // output-hook guardrail must not release a response it
+                    // couldn't fully buffer to scan. No shipped guardrail
+                    // configures `BufferFull { on_exceeded_fail_open: true }`
+                    // on this surface today.
                     tracing::warn!(
                         guardrail_hook = "output",
                         model = %model.display_name,
