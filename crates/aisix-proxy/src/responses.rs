@@ -12,6 +12,7 @@
 //! Only OpenAI models support this endpoint. Non-OpenAI models receive a
 //! 400 with an explanatory message.
 
+use aisix_gateway::{ChatFormat, ChatMessage};
 use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
@@ -236,6 +237,41 @@ async fn dispatch(
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
     let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
+    // #719: /v1/responses must run input guardrails like /v1/chat/completions
+    // and /v1/messages. Before this, user input reached the upstream without
+    // any configured content/DLP check, so a content block enforced on the
+    // chat surface was bypassable simply by calling /v1/responses (the same
+    // violent input that 422s on chat returned 200 with the content echoed
+    // here). Translate the Responses-API body into the internal ChatFormat
+    // and run the resolved input guardrail chain; a Block short-circuits
+    // before dispatch. (Input Rewrite/Bypass is not applied to the outgoing
+    // Responses body — only Block is enforced, matching /v1/messages.)
+    let guardrail_ctx = aisix_guardrails::RequestContext {
+        model_id: &model_entry.id,
+        api_key_id: &auth.entry.id,
+        team_id: auth.key().team_id.as_deref(),
+    };
+    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    if !resolved_chain.is_empty() {
+        let chat = responses_input_to_chat(&model_name, body);
+        if let aisix_guardrails::GuardrailVerdict::Block { reason } =
+            aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+        {
+            // Per #153 the matched-pattern detail stays in ops logs only; the
+            // wire envelope stays generic so callers can't enumerate the
+            // blocklist by probing error responses.
+            tracing::warn!(
+                guardrail_hook = "input",
+                model = %model_name,
+                reason = %reason,
+                "guardrail blocked /v1/responses request",
+            );
+            return Err(
+                ProxyError::ContentFiltered("request blocked by content policy".into()).into(),
+            );
+        }
+    }
+
     // Resolve the attempt list (routing-aware). /v1/responses is
     // OpenAI-only, so we attempt the group's OpenAI targets in order; a
     // direct model resolves to itself (#471).
@@ -395,6 +431,78 @@ async fn dispatch(
         err: last_err.unwrap_or(ProxyError::ProviderUnavailable),
         routing,
     })
+}
+
+/// Translate a `/v1/responses` request body into the internal
+/// [`ChatFormat`] so the input guardrail chain can scan the
+/// user-supplied content (#719). Only scannable text matters here — this
+/// is **not** a faithful Responses→Chat transform and is never sent
+/// upstream; the original `body` is forwarded verbatim.
+///
+/// The Responses-API `input` field is either a bare string or an array of
+/// input items; a message item is `{role, content}` whose `content` is a
+/// string or an array of typed parts (`input_text` / `output_text` /
+/// `text`). The optional top-level `instructions` maps to a system
+/// message. Roles are preserved so the guardrail's user-vs-all message
+/// selection behaves the same as on /v1/chat/completions.
+/// <https://platform.openai.com/docs/api-reference/responses/create>
+fn responses_input_to_chat(model: &str, body: &Value) -> ChatFormat {
+    let mut messages = Vec::new();
+
+    if let Some(instructions) = body.get("instructions").and_then(|v| v.as_str()) {
+        if !instructions.is_empty() {
+            messages.push(ChatMessage::system(instructions.to_string()));
+        }
+    }
+
+    match body.get("input") {
+        Some(Value::String(text)) => {
+            if !text.is_empty() {
+                messages.push(ChatMessage::user(text.clone()));
+            }
+        }
+        Some(Value::Array(items)) => {
+            for item in items {
+                // A bare-string array element is treated as user text; an
+                // object element is a message whose role we preserve.
+                if let Some(text) = item.as_str() {
+                    if !text.is_empty() {
+                        messages.push(ChatMessage::user(text.to_string()));
+                    }
+                    continue;
+                }
+                let text = responses_item_text(item);
+                if text.is_empty() {
+                    continue;
+                }
+                let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+                messages.push(match role {
+                    "assistant" => ChatMessage::assistant(text),
+                    "system" | "developer" => ChatMessage::system(text),
+                    _ => ChatMessage::user(text),
+                });
+            }
+        }
+        _ => {}
+    }
+
+    ChatFormat::new(model, messages)
+}
+
+/// Collect the plain text of one Responses-API input item. `content` is
+/// either a string or an array of typed parts; we gather the `text` of
+/// each part and ignore non-text parts (images, files, tool calls).
+fn responses_item_text(item: &Value) -> String {
+    match item.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
 }
 
 /// Dispatch one concrete OpenAI target's Responses-API passthrough to
@@ -834,6 +942,134 @@ mod tests {
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body.to_string()))
             .unwrap()
+    }
+
+    /// An env-scoped keyword input guardrail (no attachment row → applies to
+    /// every request via the backward-compat fallback) that blocks on a
+    /// literal substring. Keyword is local (no remote call), so it's the
+    /// deterministic stand-in for any input-hook guardrail kind.
+    fn keyword_input_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
+        let json = format!(
+            r#"{{"name":"test-block","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{{"kind":"literal","value":"{literal}"}}]}}"#
+        );
+        let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("g-1", g, 1)
+    }
+
+    /// #719 (the core fix): a configured INPUT guardrail that blocks on
+    /// /v1/chat/completions must also fire on /v1/responses. The same blocked
+    /// input must return 422 content_filter here — not 200 with the input
+    /// echoed back — and the upstream must never be contacted (`expect(0)`).
+    #[tokio::test]
+    async fn input_guardrail_blocks_string_input_returns_422_content_filter() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_should_not_happen",
+                "object": "response",
+                "output": [{"type":"message","content":[{"type":"output_text","text":"echo: BLOCKME"}]}]
+            })))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "please BLOCKME now"
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+        // Per #153 the matched literal must not leak into the wire message.
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(!msg.contains("BLOCKME"), "blocklist literal leaked: {msg}");
+    }
+
+    /// #719: the Responses `input` array form (message items with typed
+    /// content parts) must be scanned too — a blocked literal inside an
+    /// `input_text` part blocks the call.
+    #[tokio::test]
+    async fn input_guardrail_blocks_array_message_items() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id":"x","object":"response","output":[]})),
+            )
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": [
+                    {"role": "user", "content": [{"type": "input_text", "text": "hi BLOCKME"}]}
+                ]
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+    }
+
+    /// #719 companion: a benign input with a configured input guardrail must
+    /// still forward to the upstream (`expect(1)`) and return 200 — the
+    /// guardrail must not block clean traffic.
+    #[tokio::test]
+    async fn input_guardrail_allows_benign_input_forwards_200() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_ok",
+                "object": "response",
+                "output": [{"type":"message","content":[{"type":"output_text","text":"hi"}]}]
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "a perfectly fine request"
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["object"], "response");
     }
 
     #[tokio::test]

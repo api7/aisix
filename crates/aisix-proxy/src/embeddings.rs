@@ -14,7 +14,7 @@
 //! Providers that don't implement embeddings return a 501 with
 //! `"type": "not_implemented"`.
 
-use aisix_gateway::{BridgeContext, BridgeError, EmbeddingRequest};
+use aisix_gateway::{BridgeContext, BridgeError, ChatFormat, ChatMessage, EmbeddingRequest};
 use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -60,6 +60,23 @@ impl InputField {
             InputField::Multi(v) => v,
         }
     }
+}
+
+/// Build a [`ChatFormat`] of user messages from the embeddings `input` so
+/// the input guardrail chain can scan it (#719). Each non-empty string
+/// becomes one user message; the synthesized request is never sent
+/// upstream (the original `input` shape is forwarded verbatim).
+fn embeddings_input_to_chat(model: &str, input: &InputField) -> ChatFormat {
+    let messages = match input {
+        InputField::Single(s) if !s.is_empty() => vec![ChatMessage::user(s.clone())],
+        InputField::Single(_) => Vec::new(),
+        InputField::Multi(v) => v
+            .iter()
+            .filter(|s| !s.is_empty())
+            .map(|s| ChatMessage::user(s.clone()))
+            .collect(),
+    };
+    ChatFormat::new(model, messages)
 }
 
 pub async fn embeddings(
@@ -229,6 +246,39 @@ async fn dispatch(
         crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
     let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
+    // #719: /v1/embeddings must run input guardrails. Before this the
+    // handler explicitly bypassed all guardrails, so a content block
+    // enforced on /v1/chat/completions was bypassable by sending the same
+    // text to /v1/embeddings. The embeddings `input` (a string or array of
+    // strings) carries scannable user content; translate it into the
+    // internal ChatFormat and run the resolved input guardrail chain. A
+    // Block short-circuits before the upstream call. (Embeddings responses
+    // are vectors, not text, so there is no output hook to run.)
+    let guardrail_ctx = aisix_guardrails::RequestContext {
+        model_id: &model_entry.id,
+        api_key_id: &auth.entry.id,
+        team_id: auth.key().team_id.as_deref(),
+    };
+    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    if !resolved_chain.is_empty() {
+        let chat = embeddings_input_to_chat(&body.model, &body.input);
+        if let aisix_guardrails::GuardrailVerdict::Block { reason } =
+            aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+        {
+            // Per #153 keep the matched-pattern detail in ops logs only; the
+            // wire envelope stays generic.
+            tracing::warn!(
+                guardrail_hook = "input",
+                model = %body.model,
+                reason = %reason,
+                "guardrail blocked /v1/embeddings request",
+            );
+            return Err(ProxyError::ContentFiltered(
+                "request blocked by content policy".into(),
+            ));
+        }
+    }
+
     let upstream_model_id = crate::dispatch::require_upstream_model(model)?.to_string();
 
     // Preserve the caller's original `input` shape per #162 /
@@ -373,8 +423,11 @@ fn emit_usage_event(
     //   - provider_request_id / provider_model_version / finish_reason
     //     — not exposed by the OpenAI embeddings response shape
     //   - cost_usd — cp-api computes server-side from pricing catalog
-    //   - guardrail_blocked / guardrail_bypassed_reason — embeddings
-    //     bypass guardrails today
+    //   - guardrail_blocked — a blocked input short-circuits before this
+    //     emit (success-only path), so it is never set here
+    //   - guardrail_bypassed_reason — embeddings now run input guardrails
+    //     (#719); fail-open bypass telemetry is not yet plumbed for the
+    //     non-chat handlers (follow-up, same as the per-PK fields below)
     //   - cache_status / cache_hit_saved_* — no caching on embeddings
     //   - ttft_ms — embeddings are not streamed
     //   - served_by_model / routing_* — embeddings don't run routing
@@ -498,6 +551,113 @@ mod tests {
             "model": "text-embedding-3-small",
             "usage": {"prompt_tokens": 4, "total_tokens": 4}
         })
+    }
+
+    /// An env-scoped keyword input guardrail (no attachment row → applies
+    /// to every request via the backward-compat fallback) that blocks on a
+    /// literal. `fail_open:false` is irrelevant for keyword (local, never
+    /// errors) but keeps the row explicit.
+    fn keyword_input_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
+        let json = format!(
+            r#"{{"name":"test-block","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{{"kind":"literal","value":"{literal}"}}]}}"#
+        );
+        let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("g-1", g, 1)
+    }
+
+    /// #719: /v1/embeddings explicitly bypassed all guardrails, so a content
+    /// block configured on /v1/chat/completions was evadable by sending the
+    /// same text to /v1/embeddings. A configured input guardrail must now
+    /// fire here: a blocked literal returns 422 content_filter and the
+    /// upstream is never contacted (`expect(0)`).
+    #[tokio::test]
+    async fn input_guardrail_blocks_string_input_returns_422_content_filter() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({"model": "my-embed", "input": "please BLOCKME now"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+        // Per #153 the matched literal must not leak into the wire message.
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(!msg.contains("BLOCKME"), "blocklist literal leaked: {msg}");
+    }
+
+    /// #719: the array `input` form must be scanned too — a blocked literal
+    /// in any element blocks the call.
+    #[tokio::test]
+    async fn input_guardrail_blocks_array_input() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+        let app = build_app(snap);
+        let body =
+            serde_json::json!({"model": "my-embed", "input": ["totally fine", "now BLOCKME"]});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+    }
+
+    /// #719 companion: a benign input with a configured input guardrail must
+    /// still reach the upstream (`expect(1)`) and return 200 — the guardrail
+    /// must not block clean traffic.
+    #[tokio::test]
+    async fn input_guardrail_allows_benign_input_forwards_200() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({"model": "my-embed", "input": "a perfectly fine request"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["object"], "list");
     }
 
     #[tokio::test]
