@@ -242,10 +242,6 @@ async fn dispatch(
     let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
         .ok_or(ProxyError::ProviderUnavailable)?;
 
-    let model_rl =
-        crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
-    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
-
     // #719: /v1/embeddings must run input guardrails. Before this the
     // handler explicitly bypassed all guardrails, so a content block
     // enforced on /v1/chat/completions was bypassable by sending the same
@@ -254,6 +250,9 @@ async fn dispatch(
     // internal ChatFormat and run the resolved input guardrail chain. A
     // Block short-circuits before the upstream call. (Embeddings responses
     // are vectors, not text, so there is no output hook to run.)
+    //
+    // #542: run this BEFORE the rate-limit reservation so a content-policy
+    // block doesn't burn an RPM slot (matching /v1/chat/completions).
     let guardrail_ctx = aisix_guardrails::RequestContext {
         model_id: &model_entry.id,
         api_key_id: &auth.entry.id,
@@ -278,6 +277,10 @@ async fn dispatch(
             ));
         }
     }
+
+    let model_rl =
+        crate::quota::ModelRateLimit::from_model(&body.model, &model_entry.id, &model_entry.value);
+    let reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
     let upstream_model_id = crate::dispatch::require_upstream_model(model)?.to_string();
 
