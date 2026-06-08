@@ -49,6 +49,13 @@ struct ResponseDispatchSuccess {
     /// Per-attempt routing telemetry (#655): the failed attempts that
     /// preceded the winner plus the winning attempt itself.
     routing: RoutingTelemetry,
+    /// #543: set when an OUTPUT guardrail blocked this response. The
+    /// upstream already billed, so this is returned as a "success" carrying
+    /// the billed `usage` + a 422 body, and the emitted UsageEvent is marked
+    /// `guardrail_blocked` so the dashboard's Blocked tab + budget ledger see
+    /// it (silently zeroing the tokens would underreport spend the operator
+    /// paid the provider for).
+    guardrail_blocked: bool,
 }
 
 /// Dispatch error carrying the per-attempt telemetry accumulated before
@@ -159,6 +166,7 @@ pub async fn responses(
                     &usage,
                     &client,
                     attempt,
+                    success.guardrail_blocked,
                 );
             }
             success.response
@@ -693,6 +701,7 @@ async fn responses_to_target(
                 usage: None,
                 model_id: model_id.to_string(),
                 routing: RoutingTelemetry::default(),
+                guardrail_blocked: false,
             });
         }
 
@@ -710,6 +719,7 @@ async fn responses_to_target(
             usage: None,
             model_id: model_id.to_string(),
             routing: RoutingTelemetry::default(),
+            guardrail_blocked: false,
         })
     } else {
         let json_body: Value = upstream_resp
@@ -735,10 +745,6 @@ async fn responses_to_target(
         // configured output block isn't bypassable by calling /v1/responses
         // (the input half is enforced in `dispatch`). Only when an
         // output-hook guardrail is attached; otherwise this is a no-op.
-        // NOTE: the provider has already billed for this response — an
-        // output block returns 422 and currently records a zero-token event
-        // rather than the billed tokens (telemetry refinement tracked as a
-        // follow-up, like the input-side #543).
         if aisix_guardrails::Guardrail::runs_on_output(chain) {
             let synth = synth_chat_response(&upstream_model, responses_output_text(&json_body));
             if let aisix_guardrails::GuardrailVerdict::Block { reason } =
@@ -751,9 +757,22 @@ async fn responses_to_target(
                     reason = %reason,
                     "guardrail blocked /v1/responses response",
                 );
-                return Err(ProxyError::ContentFiltered(
-                    "response blocked by content policy".into(),
-                ));
+                // #543: the provider already billed for this response, so
+                // return a 422 body BUT carry the billed `usage` (marked
+                // guardrail_blocked) — recording zero tokens would let the
+                // customer's ledger underreport spend they were charged for.
+                // This is the output analog of chat.rs's UpstreamCharge.
+                return Ok(ResponseDispatchSuccess {
+                    response: ProxyError::ContentFiltered(
+                        "response blocked by content policy".into(),
+                    )
+                    .into_response(),
+                    provider: provider_label,
+                    usage,
+                    model_id: model_id.to_string(),
+                    routing: RoutingTelemetry::default(),
+                    guardrail_blocked: true,
+                });
             }
         }
 
@@ -763,6 +782,7 @@ async fn responses_to_target(
             usage,
             model_id: model_id.to_string(),
             routing: RoutingTelemetry::default(),
+            guardrail_blocked: false,
         })
     }
 }
@@ -980,6 +1000,7 @@ fn emit_usage_event(
     usage: &ResponseUsage,
     client: &ClientContext,
     attempt: AttemptInfo,
+    guardrail_blocked: bool,
 ) {
     let event = UsageEvent {
         request_id: request_id.to_string(),
@@ -1000,6 +1021,7 @@ fn emit_usage_event(
         error_message: attempt.error_message,
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
+        guardrail_blocked,
         ..Default::default()
     };
     state.usage_sink.try_emit("responses", event.clone());
@@ -2103,6 +2125,70 @@ mod tests {
         assert_eq!(event.inbound_protocol, "openai");
         assert!(!event.request_id.is_empty());
         assert!(!event.occurred_at.is_empty());
+    }
+
+    /// #543: an OUTPUT-blocked /v1/responses still records the billed
+    /// upstream tokens (the provider already charged), marked
+    /// `guardrail_blocked`, with status 422 — NOT a zero-token event. Zeroing
+    /// would let the customer's budget ledger underreport spend they paid the
+    /// provider for (the output analog of chat.rs's UpstreamCharge).
+    #[tokio::test]
+    async fn output_block_records_billed_tokens_issue_543() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let upstream_body = serde_json::json!({
+            "id": "resp-blk",
+            "object": "response",
+            "output": [{"type":"message","role":"assistant","content":[{"type":"output_text","text":"sure: BLOCKME"}]}],
+            "usage": {"input_tokens": 11, "output_tokens": 7}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a UsageEvent must be emitted for an output-blocked response (#543)")
+            .expect("usage_sink sender dropped");
+        assert_eq!(
+            event.prompt_tokens, 11,
+            "billed input tokens must be recorded despite the block",
+        );
+        assert_eq!(
+            event.completion_tokens, 7,
+            "billed output tokens must be recorded despite the block",
+        );
+        assert_eq!(event.status_code, 422);
+        assert!(
+            event.guardrail_blocked,
+            "the output-block event must be marked guardrail_blocked",
+        );
     }
 
     /// Companion: an upstream response missing the `usage` block
