@@ -209,9 +209,16 @@ pub struct DatadogConfig {
     /// Per-field byte cap for captured content under `content_mode = full`.
     /// The prompt and the response are each truncated to this many bytes
     /// (UTF-8-boundary safe), and the log carries a `content_truncated` marker
-    /// when either was cut. Ignored under `metadata_only`. Defaults to 128 KiB
-    /// and is capped at 1 MiB — a single Datadog log may not exceed 1 MB, so a
-    /// larger per-field cap could push a log past the intake limit.
+    /// when either was cut. Ignored under `metadata_only`. Defaults to 128 KiB.
+    ///
+    /// This bounds each field *independently*: a single log carries BOTH the
+    /// prompt and the response plus metadata, so the encoded log can reach
+    /// ~2× this cap. Datadog rejects any single log over 1 MB and any request
+    /// over 5 MB / 1000 logs; byte-aware per-log/per-request splitting to those
+    /// limits is not yet enforced (tracked in api7/ai-gateway#556) — until it
+    /// lands, a large cap on a busy `full` exporter risks Datadog rejecting an
+    /// oversized batch (a `Permanent` delivery error surfaced via `last_error`).
+    /// The 128 KiB default keeps a log well under the per-log limit.
     ///
     /// `0` is rejected — `full` with a zero cap captures nothing, which is a
     /// misconfiguration. The `range(min = 1, max = …)` keeps the generated JSON

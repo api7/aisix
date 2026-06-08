@@ -107,7 +107,8 @@ impl ObservabilitySink for DatadogSink {
             // bodies far under the limit. Declaring a byte ceiling the sink
             // does not yet self-enforce would be a false promise (and a
             // silent-drop bug under content) — so it stays `None` until the
-            // chunking lands, matching the SLS sink's resolved shape.
+            // chunking lands (api7/ai-gateway#556), matching the SLS sink's
+            // resolved shape.
             batch_unit: BatchUnit::Records,
             max_batch_bytes: None,
             // The intake accepts or rejects the whole request.

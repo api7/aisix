@@ -30,14 +30,12 @@ import {
 // tests (`sink::datadog::tests`); that a real Datadog site accepts the request
 // is validated by the control-plane full-chain e2e (api7/AISIX-Cloud), not here.
 //
-// NOTE (gated on api7/ai-gateway#548): the harness binds the in-test mock to a
-// free loopback port and points `site` at `127.0.0.1:<port>`, exactly as the
-// SLS / OTLP mock-edge tests point their endpoint at `http://127.0.0.1:<port>`.
-// The SLS and OTLP loopback bypasses admit a port via a regex `(:[0-9]+)?`
-// group, but the `datadog` `site` bypass is currently an exact-match `enum` of
-// bare hosts, so the Admin API rejects a loopback `site` with a port until #548
-// lands. This spec is written to the intended contract (the sink already
-// accepts `host:port`); it is held back from merge until #548 is fixed.
+// The harness binds the in-test mock to a free loopback port and points `site`
+// at `127.0.0.1:<port>`, exactly as the SLS / OTLP mock-edge tests point their
+// endpoint at `http://127.0.0.1:<port>`. The `datadog` `site` validator admits
+// a loopback host with an optional `:port` via the same `(:[0-9]+)?` regex
+// group as the SLS / OTLP bypasses (api7/ai-gateway#548, fixed in this PR), so
+// the Admin API accepts it.
 
 const CALLER_PLAINTEXT = "sk-datadog-exporter-caller-PLAINTEXT";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");

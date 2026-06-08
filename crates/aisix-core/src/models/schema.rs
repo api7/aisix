@@ -616,7 +616,10 @@ fn observability_exporter_schema() -> Value {
             "credential_ref": { "type": "string", "minLength": 1 },
             // Content capture (opt-in), shared by aliyun_sls + datadog. `full`
             // writes captured prompt / response to the sink; `content_max_bytes`
-            // truncates each. The 1 MiB ceiling matches Datadog's per-log limit.
+            // truncates each FIELD. It is not a per-log bound — a datadog log
+            // carries both prompt and response, so byte-aware splitting to
+            // Datadog's 1 MB-per-log / 5 MB-per-request intake limits is tracked
+            // separately (api7/ai-gateway#556), not enforced by this cap.
             "content_mode":      { "type": "string", "enum": ["metadata_only", "full"] },
             "content_max_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
             // object_store fields (S3 / GCS / Azure Blob, one variant). Cloud
