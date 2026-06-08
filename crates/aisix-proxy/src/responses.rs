@@ -18,6 +18,7 @@ use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures::StreamExt;
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
@@ -622,19 +623,47 @@ async fn responses_to_target(
         // verbatim or block with 422. Requests with no output-hook
         // guardrail keep the zero-copy verbatim passthrough below.
         if aisix_guardrails::Guardrail::runs_on_output(chain) {
-            let bytes = upstream_resp
-                .bytes()
-                .await
-                .map_err(|e| {
-                    crate::cooldown::note_failure(
-                        &state.runtime_status,
-                        model_id,
-                        model.cooldown.as_ref(),
-                        aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
-                    )
-                })
-                .map_err(ProxyError::Bridge)?;
-            let out_text = responses_sse_output_text(&bytes);
+            // Hold the whole SSE response back to scan it, but cap the
+            // buffer so a huge (or malicious) upstream response can't OOM the
+            // gateway. Mirror the chat surface's secure BufferFull default
+            // (#466): read with a running byte count and fail closed if the
+            // response exceeds the cap — an output-hook guardrail must never
+            // release content it couldn't fully buffer to scan. The cap is
+            // taken from the chain's resolved streaming policy.
+            let max_buffer_bytes = match aisix_guardrails::Guardrail::stream_output_policy(chain) {
+                aisix_guardrails::StreamOutputPolicy::BufferFull {
+                    max_buffer_bytes, ..
+                } => max_buffer_bytes,
+                _ => aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+            };
+            let stream = upstream_resp.bytes_stream();
+            futures::pin_mut!(stream);
+            let mut buf: Vec<u8> = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk
+                    .map_err(|e| {
+                        crate::cooldown::note_failure(
+                            &state.runtime_status,
+                            model_id,
+                            model.cooldown.as_ref(),
+                            aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+                        )
+                    })
+                    .map_err(ProxyError::Bridge)?;
+                if buf.len() + chunk.len() > max_buffer_bytes {
+                    tracing::warn!(
+                        guardrail_hook = "output",
+                        model = %model.display_name,
+                        max_buffer_bytes,
+                        "streaming /v1/responses output exceeded buffer cap; failing closed",
+                    );
+                    return Err(ProxyError::ContentFiltered(
+                        "response blocked by content policy".into(),
+                    ));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            let out_text = responses_sse_output_text(&buf);
             let synth = synth_chat_response(&upstream_model, out_text);
             if let aisix_guardrails::GuardrailVerdict::Block { reason } =
                 aisix_guardrails::Guardrail::check_output(chain, &synth).await
@@ -650,7 +679,7 @@ async fn responses_to_target(
                     "response blocked by content policy".into(),
                 ));
             }
-            let mut response = axum::response::Response::new(axum::body::Body::from(bytes));
+            let mut response = axum::response::Response::new(axum::body::Body::from(buf));
             apply_passthrough_headers(&mut response, &headers, request_id);
             return Ok(ResponseDispatchSuccess {
                 response,
@@ -1556,6 +1585,50 @@ mod tests {
             body.starts_with("event: ") || body.starts_with("data: "),
             "SSE shape preserved on release",
         );
+    }
+
+    /// #719 (audit HIGH-1): the streaming hold-back buffer is capped so a
+    /// huge (or malicious) upstream response can't OOM the gateway. A
+    /// response exceeding the BufferFull cap fails closed (422) rather than
+    /// being released unscanned — even when its content is otherwise clean.
+    #[tokio::test]
+    async fn output_guardrail_streaming_oversized_response_fails_closed() {
+        let upstream = MockServer::start().await;
+        // One delta larger than the 256 KiB default BufferFull cap.
+        let big = "x".repeat(300_000);
+        let sse =
+            format!("data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{big}\"}}\n\ndata: [DONE]\n\n");
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "oversized streamed response must fail closed, not be released unscanned",
+        );
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
     }
 
     #[tokio::test]
