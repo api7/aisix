@@ -851,10 +851,16 @@ fn responses_output_text(resp: &Value) -> String {
 }
 
 /// Collect the assistant's streamed output text from a buffered
-/// Responses-API SSE response (#719). Prefers the authoritative full output
-/// carried on the terminal `response.completed` event; falls back to
-/// concatenating `response.output_text.delta` chunks when no completed
-/// event is present (e.g. a truncated stream). The `type` field on each
+/// Responses-API SSE response (#719/#546). Prefers the authoritative full
+/// output carried on a terminal `response` event — `response.completed`,
+/// **and also `response.incomplete` / `response.failed`**, which carry the
+/// same full `output[]` (incl. tool-call items) and fire routinely (e.g.
+/// `max_output_tokens` truncation). Falls back to concatenating the streamed
+/// deltas when no terminal `response` object is present (truncated/aborted):
+/// both `response.output_text.delta` (assistant text) and
+/// `response.function_call_arguments.delta` (tool-call args stream via their
+/// own event, NOT output_text) — otherwise blocked tool-call args would leak
+/// on a stream that never reaches a terminal object. The `type` field on each
 /// `data:` JSON line drives the dispatch.
 /// <https://platform.openai.com/docs/api-reference/responses-streaming>
 fn responses_sse_output_text(bytes: &[u8]) -> String {
@@ -873,7 +879,7 @@ fn responses_sse_output_text(bytes: &[u8]) -> String {
             Err(_) => continue,
         };
         match json.get("type").and_then(|t| t.as_str()) {
-            Some("response.completed") => {
+            Some("response.completed" | "response.incomplete" | "response.failed") => {
                 if let Some(resp) = json.get("response") {
                     let full = responses_output_text(resp);
                     if !full.is_empty() {
@@ -882,6 +888,15 @@ fn responses_sse_output_text(bytes: &[u8]) -> String {
                 }
             }
             Some("response.output_text.delta") => {
+                if let Some(d) = json.get("delta").and_then(|d| d.as_str()) {
+                    deltas.push_str(d);
+                }
+            }
+            Some("response.function_call_arguments.delta") => {
+                // Concatenate WITHOUT a separator — these are pieces of one
+                // call's `arguments` string; a separator would split a literal
+                // that streamed across two deltas (e.g. "BLOCK"+"ME") and miss
+                // the match.
                 if let Some(d) = json.get("delta").and_then(|d| d.as_str()) {
                     deltas.push_str(d);
                 }
@@ -1741,6 +1756,103 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&bytes).contains("BLOCKME"),
             "tool-call arguments leaked despite output block",
+        );
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+    }
+
+    /// #546 (audit HIGH): tool-call args on a `response.incomplete` terminal
+    /// (fires routinely on `max_output_tokens` truncation — it carries the
+    /// full `output[]`) must also be scanned and held back, not only
+    /// `response.completed`. Same for `response.failed`.
+    #[tokio::test]
+    async fn output_guardrail_blocks_tool_call_on_incomplete_terminal() {
+        let upstream = MockServer::start().await;
+        let incomplete = serde_json::json!({
+            "type": "response.incomplete",
+            "response": {"output": [{
+                "type": "function_call",
+                "name": "lookup",
+                "arguments": "{\"q\":\"BLOCKME\"}"
+            }]}
+        });
+        let sse = format!("event: response.incomplete\ndata: {incomplete}\n\ndata: [DONE]\n\n");
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("BLOCKME"),
+            "tool-call args leaked on response.incomplete terminal",
+        );
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+    }
+
+    /// #546 (audit HIGH): a stream that ends WITHOUT a terminal `response`
+    /// object but streamed tool-call argument deltas must still be scanned —
+    /// args arrive via `response.function_call_arguments.delta`, not
+    /// `output_text.delta`. The literal is split across two deltas to pin
+    /// that they reassemble without a separator.
+    #[tokio::test]
+    async fn output_guardrail_blocks_tool_call_delta_without_terminal() {
+        let upstream = MockServer::start().await;
+        let d1 = serde_json::json!({"type":"response.function_call_arguments.delta","delta":"{\"q\":\"BLOCK"});
+        let d2 =
+            serde_json::json!({"type":"response.function_call_arguments.delta","delta":"ME\"}"});
+        let sse = format!(
+            "event: response.function_call_arguments.delta\ndata: {d1}\n\n\
+             event: response.function_call_arguments.delta\ndata: {d2}\n\ndata: [DONE]\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("BLOCK"),
+            "streamed tool-call args leaked with no terminal event",
         );
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "content_filter");
