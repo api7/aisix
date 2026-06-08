@@ -19,9 +19,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: arduino/setup-protoc@v3.0.0
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -34,9 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: arduino/setup-protoc@v3.0.0
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
       - name: regenerate schemas
         run: cargo run -p aisix-core --bin dump-schema
@@ -93,9 +89,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
-      - uses: arduino/setup-protoc@v3.0.0
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -118,9 +112,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
-      - uses: arduino/setup-protoc@v3.0.0
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
       - name: build
         run: cargo build -p aisix-server --bin aisix

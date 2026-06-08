@@ -444,6 +444,16 @@ async fn multipart_dispatch(
 /// JSON passthrough for `/v1/audio/speech` — returns binary audio bytes.
 /// Returns `(response, provider_label, model_id)`; `model_id` lets the
 /// handler attribute a (zero-token) UsageEvent (#406).
+/// Build a [`ChatFormat`](aisix_gateway::ChatFormat) from the speech `input`
+/// text so the input guardrail chain can scan it (#545). Never sent upstream.
+fn speech_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat {
+    let messages = match body.get("input").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => vec![aisix_gateway::ChatMessage::user(s.to_string())],
+        _ => Vec::new(),
+    };
+    aisix_gateway::ChatFormat::new(model, messages)
+}
+
 async fn speech_dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -464,6 +474,36 @@ async fn speech_dispatch(
 
     if !auth.key().can_access(&model_name) {
         return Err(ProxyError::ModelForbidden(model_name.clone()));
+    }
+
+    // #545: /v1/audio/speech must run input guardrails. Before this it
+    // forwarded the user `input` text (synthesized to audio) with no
+    // configured content/DLP check, so a block enforced on
+    // /v1/chat/completions was bypassable by switching surface. Run before
+    // the rate-limit reservation so a content-policy refusal doesn't burn an
+    // RPM slot. (Output is binary audio, not scannable text — no output hook.)
+    let guardrail_ctx = aisix_guardrails::RequestContext {
+        model_id: &model_entry.id,
+        api_key_id: &auth.entry.id,
+        team_id: auth.key().team_id.as_deref(),
+    };
+    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    if !resolved_chain.is_empty() {
+        let chat = speech_input_to_chat(&model_name, &body);
+        if let aisix_guardrails::GuardrailVerdict::Block { reason } =
+            aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+        {
+            // Per #153 the matched-pattern detail stays in ops logs only.
+            tracing::warn!(
+                guardrail_hook = "input",
+                model = %model_name,
+                reason = %reason,
+                "guardrail blocked /v1/audio/speech request",
+            );
+            return Err(ProxyError::ContentFiltered(
+                "request blocked by content policy".into(),
+            ));
+        }
     }
 
     let model_rl =
@@ -744,6 +784,95 @@ mod tests {
         hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
         let handle = SnapshotHandle::new(snap);
         crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache())
+    }
+
+    fn keyword_input_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
+        let json = format!(
+            r#"{{"name":"t","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{{"kind":"literal","value":"{literal}"}}]}}"#
+        );
+        let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("g-1", g, 1)
+    }
+
+    fn speech_req(body: &str) -> Request<axum::body::Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// #545: a configured input guardrail must fire on /v1/audio/speech — a
+    /// blocked `input` returns 422 content_filter, upstream never contacted.
+    #[tokio::test]
+    async fn input_guardrail_blocks_speech_input_returns_422() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(b"ID3".to_vec()),
+            )
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(tts_model("my-tts"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            speech_req(r#"{"model":"my-tts","input":"say BLOCKME aloud","voice":"alloy"}"#),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+        assert!(!v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("BLOCKME"));
+    }
+
+    /// #545 companion: benign input with a guardrail configured still forwards
+    /// (`expect(1)`) and returns the audio bytes.
+    #[tokio::test]
+    async fn input_guardrail_allows_benign_speech_input() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "audio/mpeg")
+                    .set_body_bytes(b"ID3\x03\x00".to_vec()),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(tts_model("my-tts"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+        let app = build_app(snap);
+        let resp = tower::ServiceExt::oneshot(
+            app,
+            speech_req(r#"{"model":"my-tts","input":"Hello there","voice":"alloy"}"#),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

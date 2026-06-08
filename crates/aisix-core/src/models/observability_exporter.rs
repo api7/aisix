@@ -277,9 +277,16 @@ pub struct ObjectStoreConfig {
     #[serde(default)]
     pub compression: ObjectStoreCompression,
 
+    /// How the DP authenticates to the bucket. Default `credential_ref`.
+    #[serde(default)]
+    pub auth_mode: ObjectStoreAuthMode,
+
     /// Opaque pointer to the cloud credentials, resolved locally by the DP
     /// at delivery time. The plaintext key MUST NOT live in etcd/kine — the
     /// control plane stores only this reference, never the secret itself.
+    /// Required when `auth_mode = credential_ref`; unused (and may be empty)
+    /// when `auth_mode = cloud_identity`.
+    #[serde(default)]
     pub credential_ref: String,
 }
 
@@ -305,6 +312,23 @@ pub enum ObjectStoreCompression {
     Gzip,
     /// No compression — raw NDJSON.
     None,
+}
+
+/// How the DP obtains credentials for the object-storage bucket.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectStoreAuthMode {
+    /// Resolve `credential_ref` to static keys from the DP's local env
+    /// (`OBJSTORE_CRED_<SLUG>_<FIELD>`). The default.
+    #[default]
+    CredentialRef,
+    /// Use the DP host's own attached cloud identity — EC2 instance role /
+    /// EKS IRSA / ECS task role (S3), or GKE Workload Identity / GCE metadata
+    /// (GCS) — via the cloud SDK's default credential chain, with no static
+    /// keys anywhere. Supported for S3 and GCS only.
+    CloudIdentity,
 }
 
 /// Top-level `ObservabilityExporter` resource. `deny_unknown_fields`
@@ -581,6 +605,30 @@ mod tests {
         assert_eq!(v["bucket"], "acme-aisix-events");
         assert_eq!(v["credential_ref"], "acme-s3");
         assert!(v.get("object_store").is_none(), "kind block must not nest");
+    }
+
+    #[test]
+    fn object_store_auth_mode_defaults_and_cloud_identity() {
+        // Absent auth_mode → credential_ref (back-compat default).
+        let e: ObservabilityExporter = serde_json::from_str(VALID_OBJECT_STORE).unwrap();
+        match &e.kind {
+            ExporterKind::ObjectStore(c) => {
+                assert_eq!(c.auth_mode, ObjectStoreAuthMode::CredentialRef);
+            }
+            other => panic!("expected object_store, got {other:?}"),
+        }
+        // cloud_identity deserializes and credential_ref may be omitted.
+        let e: ObservabilityExporter = serde_json::from_str(
+            r#"{"name":"x","kind":"object_store","provider":"s3","bucket":"b","prefix":"p","auth_mode":"cloud_identity"}"#,
+        )
+        .unwrap();
+        match &e.kind {
+            ExporterKind::ObjectStore(c) => {
+                assert_eq!(c.auth_mode, ObjectStoreAuthMode::CloudIdentity);
+                assert_eq!(c.credential_ref, "");
+            }
+            other => panic!("expected object_store, got {other:?}"),
+        }
     }
 
     #[test]

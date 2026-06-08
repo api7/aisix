@@ -629,6 +629,8 @@ fn observability_exporter_schema() -> Value {
             "prefix":      { "type": "string", "minLength": 1 },
             "region":      { "type": "string", "minLength": 1 },
             "compression": { "type": "string", "enum": ["gzip", "none"] },
+            // object_store auth mode: how the DP reaches the bucket.
+            "auth_mode":   { "type": "string", "enum": ["credential_ref", "cloud_identity"] },
             // datadog fields. The Datadog API key is NEVER here — only the
             // shared `credential_ref` the DP resolves locally. `site` is
             // constrained to the allow-list in the per-kind branch below.
@@ -675,7 +677,7 @@ fn observability_exporter_schema() -> Value {
             {
                 "if":   { "properties": { "kind": { "const": "object_store" } } },
                 "then": {
-                    "required": ["provider", "bucket", "prefix", "credential_ref"],
+                    "required": ["provider", "bucket", "prefix"],
                     "properties": {
                         // `endpoint` is optional — set only for S3-compatible
                         // stores (MinIO / OSS / R2). When present: https, or a
@@ -685,7 +687,27 @@ fn observability_exporter_schema() -> Value {
                         "endpoint": {
                             "pattern": "^https://.+|^http://(minio|azurite|fake-gcs-server|fake-gcs|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$"
                         }
-                    }
+                    },
+                    "allOf": [
+                        {
+                            // cloud_identity: the DP authenticates with its own
+                            // attached cloud identity — S3 / GCS only (Azure
+                            // managed identity needs a non-secret account name
+                            // the keyless config does not carry), and no
+                            // credential_ref. Otherwise (the default
+                            // credential_ref mode) credential_ref is required.
+                            "if": {
+                                "required": ["auth_mode"],
+                                "properties": { "auth_mode": { "const": "cloud_identity" } }
+                            },
+                            "then": {
+                                "properties": { "provider": { "enum": ["s3", "gcs"] } }
+                            },
+                            "else": {
+                                "required": ["credential_ref"]
+                            }
+                        }
+                    ]
                 }
             },
             {
@@ -1474,6 +1496,48 @@ mod tests {
             "provider": "wasabi", "bucket": "b", "prefix": "p", "credential_ref": "r"
         });
         assert!(validate_observability_exporter(&v).is_err());
+    }
+
+    #[test]
+    fn exporter_object_store_cloud_identity_omits_credential_ref() {
+        // cloud_identity (S3 / GCS): the DP uses its own attached identity, so
+        // credential_ref is NOT required.
+        for provider in ["s3", "gcs"] {
+            let v = json!({
+                "name": "x", "kind": "object_store",
+                "provider": provider, "bucket": "b", "prefix": "p",
+                "auth_mode": "cloud_identity"
+            });
+            validate_observability_exporter(&v)
+                .unwrap_or_else(|e| panic!("cloud_identity {provider} should validate: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn exporter_object_store_cloud_identity_rejects_azure() {
+        // Azure cloud_identity is unsupported (managed identity needs a
+        // non-secret account name the keyless config does not carry).
+        let v = json!({
+            "name": "x", "kind": "object_store",
+            "provider": "azure_blob", "bucket": "c", "prefix": "p",
+            "auth_mode": "cloud_identity"
+        });
+        assert!(validate_observability_exporter(&v).is_err());
+    }
+
+    #[test]
+    fn exporter_object_store_credential_ref_mode_still_requires_ref() {
+        // Default (no auth_mode) and explicit credential_ref both require the
+        // ref — only cloud_identity drops it.
+        for v in [
+            json!({"name":"x","kind":"object_store","provider":"s3","bucket":"b","prefix":"p"}),
+            json!({"name":"x","kind":"object_store","provider":"s3","bucket":"b","prefix":"p","auth_mode":"credential_ref"}),
+        ] {
+            assert!(
+                validate_observability_exporter(&v).is_err(),
+                "credential_ref must be required outside cloud_identity: {v}"
+            );
+        }
     }
 
     #[test]

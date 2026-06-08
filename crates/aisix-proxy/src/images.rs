@@ -127,6 +127,17 @@ pub async fn image_generations(
     }
 }
 
+/// Build a [`ChatFormat`](aisix_gateway::ChatFormat) from the image
+/// generation `prompt` so the input guardrail chain can scan it (#545).
+/// Never sent upstream.
+fn images_input_to_chat(model: &str, body: &Value) -> aisix_gateway::ChatFormat {
+    let messages = match body.get("prompt").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => vec![aisix_gateway::ChatMessage::user(s.to_string())],
+        _ => Vec::new(),
+    };
+    aisix_gateway::ChatFormat::new(model, messages)
+}
+
 async fn dispatch(
     state: &ProxyState,
     auth: &AuthenticatedKey,
@@ -147,6 +158,36 @@ async fn dispatch(
 
     if !auth.key().can_access(model_name) {
         return Err(ProxyError::ModelForbidden(model_name.to_string()));
+    }
+
+    // #545: /v1/images/generations must run input guardrails. Before this it
+    // forwarded the user `prompt` with no configured content/DLP check, so a
+    // block enforced on /v1/chat/completions was bypassable by switching
+    // surface. Run before the rate-limit reservation so a content-policy
+    // refusal doesn't burn an RPM slot. (Output is an image, not scannable
+    // text, so there is no output hook.)
+    let guardrail_ctx = aisix_guardrails::RequestContext {
+        model_id: &model_entry.id,
+        api_key_id: &auth.entry.id,
+        team_id: auth.key().team_id.as_deref(),
+    };
+    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    if !resolved_chain.is_empty() {
+        let chat = images_input_to_chat(model_name, &body);
+        if let aisix_guardrails::GuardrailVerdict::Block { reason } =
+            aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+        {
+            // Per #153 the matched-pattern detail stays in ops logs only.
+            tracing::warn!(
+                guardrail_hook = "input",
+                model = %model_name,
+                reason = %reason,
+                "guardrail blocked /v1/images/generations request",
+            );
+            return Err(ProxyError::ContentFiltered(
+                "request blocked by content policy".into(),
+            ));
+        }
     }
 
     let model_rl =
@@ -395,6 +436,76 @@ mod tests {
             "created": 1_700_000_000i64,
             "data": [{"url": "https://example.com/image.png"}]
         })
+    }
+
+    fn keyword_input_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
+        let json = format!(
+            r#"{{"name":"t","enabled":true,"hook_point":"input","fail_open":false,"kind":"keyword","patterns":[{{"kind":"literal","value":"{literal}"}}]}}"#
+        );
+        let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("g-1", g, 1)
+    }
+
+    /// #545: a configured input guardrail must fire on /v1/images/generations
+    /// — a blocked `prompt` returns 422 content_filter, upstream never hit.
+    #[tokio::test]
+    async fn input_guardrail_blocks_prompt_returns_422() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images/generations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("dalle"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({"model": "dalle", "prompt": "draw BLOCKME please"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+        assert!(!v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("BLOCKME"));
+    }
+
+    /// #545 companion: a benign prompt with a guardrail configured forwards
+    /// (`expect(1)`) and returns 200.
+    #[tokio::test]
+    async fn input_guardrail_allows_benign_prompt_forwards_200() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images/generations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("dalle"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+        let app = build_app(snap);
+        let body = serde_json::json!({"model": "dalle", "prompt": "a serene landscape"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["data"][0]["url"].is_string());
     }
 
     /// Issue #168 regression: only OpenAI's API has the documented

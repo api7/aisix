@@ -86,12 +86,20 @@
       "type": "object",
       "required": [
         "bucket",
-        "credential_ref",
         "kind",
         "prefix",
         "provider"
       ],
       "properties": {
+        "auth_mode": {
+          "description": "How the DP authenticates to the bucket. Default `credential_ref`.",
+          "default": "credential_ref",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ObjectStoreAuthMode"
+            }
+          ]
+        },
         "bucket": {
           "description": "Bucket (S3 / GCS) or container (Azure Blob) that receives the files.",
           "type": "string"
@@ -106,7 +114,8 @@
           ]
         },
         "credential_ref": {
-          "description": "Opaque pointer to the cloud credentials, resolved locally by the DP at delivery time. The plaintext key MUST NOT live in etcd/kine — the control plane stores only this reference, never the secret itself.",
+          "description": "Opaque pointer to the cloud credentials, resolved locally by the DP at delivery time. The plaintext key MUST NOT live in etcd/kine — the control plane stores only this reference, never the secret itself. Required when `auth_mode = credential_ref`; unused (and may be empty) when `auth_mode = cloud_identity`.",
+          "default": "",
           "type": "string"
         },
         "endpoint": {
@@ -219,6 +228,25 @@
     }
   },
   "definitions": {
+    "ObjectStoreAuthMode": {
+      "description": "How the DP obtains credentials for the object-storage bucket.",
+      "oneOf": [
+        {
+          "description": "Resolve `credential_ref` to static keys from the DP's local env (`OBJSTORE_CRED_<SLUG>_<FIELD>`). The default.",
+          "type": "string",
+          "enum": [
+            "credential_ref"
+          ]
+        },
+        {
+          "description": "Use the DP host's own attached cloud identity — EC2 instance role / EKS IRSA / ECS task role (S3), or GKE Workload Identity / GCE metadata (GCS) — via the cloud SDK's default credential chain, with no static keys anywhere. Supported for S3 and GCS only.",
+          "type": "string",
+          "enum": [
+            "cloud_identity"
+          ]
+        }
+      ]
+    },
     "ObjectStoreCompression": {
       "description": "File compression for object-storage uploads.",
       "oneOf": [

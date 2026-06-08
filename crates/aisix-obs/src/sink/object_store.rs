@@ -27,7 +27,7 @@ use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use sha2::{Digest, Sha256};
 
 use aisix_core::models::observability_exporter::{
-    ObjectStoreCompression, ObjectStoreConfig, ObjectStoreProvider,
+    ObjectStoreAuthMode, ObjectStoreCompression, ObjectStoreConfig, ObjectStoreProvider,
 };
 
 use super::{
@@ -277,6 +277,58 @@ pub fn build_object_store(
     }
 }
 
+/// Build the backend using the DP host's OWN attached cloud identity, with no
+/// static keys ("cloud identity" auth). **S3** uses the AWS default credential
+/// chain via [`object_store::aws::AmazonS3Builder::from_env`] (env / EKS IRSA
+/// web-identity / ECS task role / EC2 instance profile). **GCS** uses
+/// Application Default Credentials (GKE Workload Identity / GCE metadata) by
+/// constructing the builder with no service-account key. **Azure** is not
+/// supported here — its managed identity still needs a non-secret account name
+/// the keyless config does not carry; cp-api rejects that combination at create
+/// time, and this arm returns a clear permanent error as a backstop.
+pub fn build_object_store_ambient(
+    provider: ObjectStoreProvider,
+    bucket: &str,
+    region: Option<&str>,
+    endpoint: Option<&str>,
+) -> Result<Arc<dyn ObjectStore>, SinkError> {
+    match provider {
+        ObjectStoreProvider::S3 => {
+            let mut b = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
+            if let Some(r) = region {
+                b = b.with_region(r);
+            }
+            if let Some(ep) = endpoint {
+                b = b.with_endpoint(ep).with_virtual_hosted_style_request(false);
+                if ep.starts_with("http://") {
+                    b = b.with_allow_http(true);
+                }
+            }
+            let store = b.build().map_err(|e| {
+                SinkError::Permanent(format!("object_store: build s3 (cloud identity): {e}"))
+            })?;
+            Ok(Arc::new(store))
+        }
+        ObjectStoreProvider::Gcs => {
+            // No service-account key set → `object_store` sources Application
+            // Default Credentials (GKE Workload Identity / GCE metadata).
+            let store = object_store::gcp::GoogleCloudStorageBuilder::new()
+                .with_bucket_name(bucket)
+                .build()
+                .map_err(|e| {
+                    SinkError::Permanent(format!("object_store: build gcs (cloud identity): {e}"))
+                })?;
+            Ok(Arc::new(store))
+        }
+        ObjectStoreProvider::AzureBlob => Err(SinkError::Permanent(
+            "object_store: cloud_identity auth is not supported for azure_blob \
+             (managed identity needs a non-secret account name the keyless config \
+             does not carry); use credential_ref"
+                .to_string(),
+        )),
+    }
+}
+
 /// Build the ready-to-run sink for a configured `object_store` exporter:
 /// resolve credentials from the DP's local env, construct the backend, and
 /// wrap it in an [`ObjectStoreSink`]. If credentials are missing or the
@@ -288,22 +340,34 @@ pub fn build_object_store_sink(
     name: String,
     cfg: &ObjectStoreConfig,
 ) -> Arc<dyn ObservabilitySink> {
-    let Some(creds) = resolve_object_store_credential(cfg.provider, &cfg.credential_ref) else {
-        return Arc::new(BrokenSink::new(
-            name,
-            format!(
-                "object_store: no credentials resolved for credential_ref {:?}",
-                cfg.credential_ref
-            ),
-        ));
+    let store = match cfg.auth_mode {
+        ObjectStoreAuthMode::CredentialRef => {
+            let Some(creds) = resolve_object_store_credential(cfg.provider, &cfg.credential_ref)
+            else {
+                return Arc::new(BrokenSink::new(
+                    name,
+                    format!(
+                        "object_store: no credentials resolved for credential_ref {:?}",
+                        cfg.credential_ref
+                    ),
+                ));
+            };
+            build_object_store(
+                cfg.provider,
+                &cfg.bucket,
+                cfg.region.as_deref(),
+                cfg.endpoint.as_deref(),
+                creds,
+            )
+        }
+        ObjectStoreAuthMode::CloudIdentity => build_object_store_ambient(
+            cfg.provider,
+            &cfg.bucket,
+            cfg.region.as_deref(),
+            cfg.endpoint.as_deref(),
+        ),
     };
-    match build_object_store(
-        cfg.provider,
-        &cfg.bucket,
-        cfg.region.as_deref(),
-        cfg.endpoint.as_deref(),
-        creds,
-    ) {
+    match store {
         Ok(store) => Arc::new(ObjectStoreSink::new(
             name,
             store,
@@ -681,6 +745,39 @@ mod tests {
             },
         );
         assert!(matches!(r, Err(SinkError::Permanent(_))));
+    }
+
+    #[test]
+    fn build_object_store_ambient_dispatches_s3() {
+        // Cloud-identity S3 builds offline via the AWS default credential chain
+        // (from_env → IMDS / IRSA / ECS); creds are fetched lazily at request
+        // time, so build() succeeds with no static keys.
+        let store =
+            build_object_store_ambient(ObjectStoreProvider::S3, "bucket", Some("us-east-1"), None);
+        assert!(store.is_ok(), "s3 ambient build: {store:?}");
+    }
+
+    #[test]
+    fn build_object_store_ambient_dispatches_gcs() {
+        // Cloud-identity GCS builds with no service-account key → Application
+        // Default Credentials at request time; build() succeeds offline.
+        let store = build_object_store_ambient(ObjectStoreProvider::Gcs, "bucket", None, None);
+        assert!(store.is_ok(), "gcs ambient build: {store:?}");
+    }
+
+    #[test]
+    fn build_object_store_ambient_rejects_azure() {
+        // Azure cloud_identity is not supported (managed identity needs a
+        // non-secret account name the keyless config does not carry) — a clear
+        // permanent error pointing the operator back to credential_ref.
+        let r = build_object_store_ambient(ObjectStoreProvider::AzureBlob, "container", None, None);
+        match r {
+            Err(SinkError::Permanent(msg)) => {
+                assert!(msg.contains("azure_blob"), "msg: {msg}");
+                assert!(msg.contains("credential_ref"), "msg: {msg}");
+            }
+            other => panic!("expected Permanent error, got {other:?}"),
+        }
     }
 
     #[test]
