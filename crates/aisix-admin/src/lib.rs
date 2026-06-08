@@ -267,7 +267,11 @@ mod tests {
     }
 
     async fn body_json(resp: axum::http::Response<Body>) -> Value {
-        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        // 1 MiB cap: the merged `/admin/openapi.json` embeds every resource
+        // schema and is ~60 KB and growing, so the old 64 KB cap raced the
+        // spec size (#554 pushed it over on CI). Generous headroom for a
+        // self-generated, in-memory body.
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
 
@@ -294,7 +298,7 @@ mod tests {
             .unwrap();
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("/admin/openapi.json"));
     }
@@ -336,7 +340,7 @@ mod tests {
             "unexpected content-type: {ct}"
         );
 
-        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(body.contains("aisix_requests_total"));
         assert!(body.contains("provider=\"openai\""));
@@ -441,7 +445,7 @@ mod tests {
             .unwrap();
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         assert_eq!(std::str::from_utf8(&bytes).unwrap(), "ok");
     }
 
@@ -468,7 +472,7 @@ mod tests {
             .unwrap();
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(text.contains("livez check failed"));
     }
@@ -1051,7 +1055,7 @@ mod tests {
     #[tokio::test]
     async fn openapi_apikey_schema_excludes_max_budget_usd() {
         let resp = openapi::openapi_json().await;
-        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let parsed: serde_json::Value =
             serde_json::from_slice(&bytes).expect("OPENAPI_JSON must parse");
         let props = &parsed["components"]["schemas"]["ApiKey"]["properties"];
