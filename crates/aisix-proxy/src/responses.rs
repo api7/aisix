@@ -12,7 +12,7 @@
 //! Only OpenAI models support this endpoint. Non-OpenAI models receive a
 //! 400 with an explanatory message.
 
-use aisix_gateway::{ChatFormat, ChatMessage};
+use aisix_gateway::{ChatFormat, ChatMessage, ChatResponse, FinishReason, UsageStats};
 use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
@@ -324,6 +324,7 @@ async fn dispatch(
             &target.model,
             &target.id,
             request_id,
+            &resolved_chain,
         )
         .await
         {
@@ -381,6 +382,7 @@ async fn dispatch(
             &target.model,
             &target.id,
             request_id,
+            &resolved_chain,
         )
         .await
         {
@@ -541,6 +543,7 @@ async fn responses_to_target(
     model: &aisix_core::Model,
     model_id: &str,
     request_id: &str,
+    chain: &aisix_guardrails::GuardrailChain,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
     let mut body = body.clone();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -609,30 +612,63 @@ async fn responses_to_target(
 
     if is_stream {
         let headers = upstream_resp.headers().clone();
-        let body_stream = upstream_resp.bytes_stream();
 
+        // #719: when an output-hook guardrail is attached, the streaming
+        // response can't be forwarded token-by-token — a blocked phrase
+        // would already be on the wire before it scans clean, the same
+        // surface-switch bypass via `stream:true`. Mirror the chat
+        // surface's secure default (BufferFull): hold the whole SSE
+        // response, scan the assistant output text, then release the bytes
+        // verbatim or block with 422. Requests with no output-hook
+        // guardrail keep the zero-copy verbatim passthrough below.
+        if aisix_guardrails::Guardrail::runs_on_output(chain) {
+            let bytes = upstream_resp
+                .bytes()
+                .await
+                .map_err(|e| {
+                    crate::cooldown::note_failure(
+                        &state.runtime_status,
+                        model_id,
+                        model.cooldown.as_ref(),
+                        aisix_gateway::BridgeError::UpstreamDecode(e.to_string()),
+                    )
+                })
+                .map_err(ProxyError::Bridge)?;
+            let out_text = responses_sse_output_text(&bytes);
+            let synth = synth_chat_response(&upstream_model, out_text);
+            if let aisix_guardrails::GuardrailVerdict::Block { reason } =
+                aisix_guardrails::Guardrail::check_output(chain, &synth).await
+            {
+                // Per #153 the matched-pattern detail stays in ops logs only.
+                tracing::warn!(
+                    guardrail_hook = "output",
+                    model = %model.display_name,
+                    reason = %reason,
+                    "guardrail blocked streaming /v1/responses response",
+                );
+                return Err(ProxyError::ContentFiltered(
+                    "response blocked by content policy".into(),
+                ));
+            }
+            let mut response = axum::response::Response::new(axum::body::Body::from(bytes));
+            apply_passthrough_headers(&mut response, &headers, request_id);
+            return Ok(ResponseDispatchSuccess {
+                response,
+                provider: provider_label,
+                usage: None,
+                model_id: model_id.to_string(),
+                routing: RoutingTelemetry::default(),
+            });
+        }
+
+        let body_stream = upstream_resp.bytes_stream();
         let mut response =
             axum::response::Response::new(axum::body::Body::from_stream(body_stream));
+        apply_passthrough_headers(&mut response, &headers, request_id);
 
-        if let Some(ct) = headers.get("content-type") {
-            if let Ok(hv) = HeaderValue::from_bytes(ct.as_bytes()) {
-                response
-                    .headers_mut()
-                    .insert(axum::http::header::CONTENT_TYPE, hv);
-            }
-        }
-
-        if let Ok(hv) = HeaderValue::from_str(request_id) {
-            response
-                .headers_mut()
-                .insert(HeaderName::from_static("x-aisix-request-id"), hv);
-        }
-
-        // Streaming path passes the upstream byte stream verbatim;
-        // the gateway doesn't parse SSE chunks here today, so we
-        // can't extract the usage block from `response.completed`
-        // without a stream wrapper. Emission for the streaming
-        // path is tracked as a #404 follow-up (see PR body).
+        // Verbatim passthrough (no output guardrail). The gateway doesn't
+        // parse SSE chunks here, so usage stays None — streaming usage
+        // emission is tracked as a #404 follow-up (see PR body).
         Ok(ResponseDispatchSuccess {
             response,
             provider: provider_label,
@@ -659,6 +695,32 @@ async fn responses_to_target(
         // `Json::into_response`) so the success struct can carry
         // typed counters rather than re-parsing JSON downstream.
         let usage = extract_response_usage(&json_body);
+
+        // #719: run the output guardrail chain on the assistant's text so a
+        // configured output block isn't bypassable by calling /v1/responses
+        // (the input half is enforced in `dispatch`). Only when an
+        // output-hook guardrail is attached; otherwise this is a no-op.
+        // NOTE: the provider has already billed for this response — an
+        // output block returns 422 and currently records a zero-token event
+        // rather than the billed tokens (telemetry refinement tracked as a
+        // follow-up, like the input-side #543).
+        if aisix_guardrails::Guardrail::runs_on_output(chain) {
+            let synth = synth_chat_response(&upstream_model, responses_output_text(&json_body));
+            if let aisix_guardrails::GuardrailVerdict::Block { reason } =
+                aisix_guardrails::Guardrail::check_output(chain, &synth).await
+            {
+                // Per #153 the matched-pattern detail stays in ops logs only.
+                tracing::warn!(
+                    guardrail_hook = "output",
+                    model = %model.display_name,
+                    reason = %reason,
+                    "guardrail blocked /v1/responses response",
+                );
+                return Err(ProxyError::ContentFiltered(
+                    "response blocked by content policy".into(),
+                ));
+            }
+        }
 
         Ok(ResponseDispatchSuccess {
             response: Json(json_body).into_response(),
@@ -709,6 +771,106 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         reasoning_tokens,
         cached_prompt_tokens,
     })
+}
+
+/// Collect the assistant's visible output text from a Responses-API
+/// response object for output-guardrail scanning (#719): the `text` of
+/// every `output_text` content part across all message items in
+/// `output[]`. Reasoning items and tool-call arguments are not included
+/// (reasoning is out of output-guardrail scope, matching the chat surface).
+/// <https://platform.openai.com/docs/api-reference/responses/object>
+fn responses_output_text(resp: &Value) -> String {
+    resp.get("output")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|it| it.get("content").and_then(|c| c.as_array()))
+                .flatten()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// Collect the assistant's streamed output text from a buffered
+/// Responses-API SSE response (#719). Prefers the authoritative full output
+/// carried on the terminal `response.completed` event; falls back to
+/// concatenating `response.output_text.delta` chunks when no completed
+/// event is present (e.g. a truncated stream). The `type` field on each
+/// `data:` JSON line drives the dispatch.
+/// <https://platform.openai.com/docs/api-reference/responses-streaming>
+fn responses_sse_output_text(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut deltas = String::new();
+    for line in text.lines() {
+        let data = match line.strip_prefix("data:") {
+            Some(d) => d.trim(),
+            None => continue,
+        };
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let json: Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match json.get("type").and_then(|t| t.as_str()) {
+            Some("response.completed") => {
+                if let Some(resp) = json.get("response") {
+                    let full = responses_output_text(resp);
+                    if !full.is_empty() {
+                        return full;
+                    }
+                }
+            }
+            Some("response.output_text.delta") => {
+                if let Some(d) = json.get("delta").and_then(|d| d.as_str()) {
+                    deltas.push_str(d);
+                }
+            }
+            _ => {}
+        }
+    }
+    deltas
+}
+
+/// Build the minimal internal `ChatResponse` an output guardrail needs to
+/// scan: the assistant text in `message.content`. Only the text is read by
+/// `check_output` (via `guardrail_output_text`); the other fields are
+/// placeholders and never reach the client.
+fn synth_chat_response(model: &str, text: String) -> ChatResponse {
+    ChatResponse {
+        id: String::new(),
+        model: model.to_string(),
+        message: ChatMessage::assistant(text),
+        finish_reason: FinishReason::Stop,
+        usage: UsageStats::default(),
+    }
+}
+
+/// Copy the upstream `content-type` onto the client response and stamp the
+/// `x-aisix-request-id` header. Shared by the streaming verbatim-passthrough
+/// and buffered hold-back paths.
+fn apply_passthrough_headers(
+    response: &mut Response,
+    upstream_headers: &axum::http::HeaderMap,
+    request_id: &str,
+) {
+    if let Some(ct) = upstream_headers.get("content-type") {
+        if let Ok(hv) = HeaderValue::from_bytes(ct.as_bytes()) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::CONTENT_TYPE, hv);
+        }
+    }
+    if let Ok(hv) = HeaderValue::from_str(request_id) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-aisix-request-id"), hv);
+    }
 }
 
 /// Issue #404: push one `UsageEvent` onto cp-api's telemetry sink
@@ -1215,6 +1377,185 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "content_filter");
+    }
+
+    /// An env-scoped keyword guardrail on the OUTPUT hook (no attachment →
+    /// applies to every request). `runs_on_output()` is true, so the
+    /// handler scans the assistant output.
+    fn keyword_output_guardrail(literal: &str) -> ResourceEntry<aisix_core::Guardrail> {
+        let json = format!(
+            r#"{{"name":"test-out-block","enabled":true,"hook_point":"output","fail_open":false,"kind":"keyword","patterns":[{{"kind":"literal","value":"{literal}"}}]}}"#
+        );
+        let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new("g-out-1", g, 1)
+    }
+
+    /// #719: output guardrails must run on /v1/responses non-streaming
+    /// responses — a configured output block must not be bypassable by
+    /// switching surface. A blocked literal in the assistant output → 422.
+    /// The upstream IS contacted (`expect(1)`): output checks run on the
+    /// returned response, unlike the input check which short-circuits first.
+    #[tokio::test]
+    async fn output_guardrail_blocks_non_streaming_response() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_x",
+                "object": "response",
+                "output": [{"type":"message","role":"assistant","content":[{"type":"output_text","text":"sure: BLOCKME here"}]}],
+                "usage": {"input_tokens": 5, "output_tokens": 4}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+        // The blocked model output must not be echoed back to the caller.
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            !msg.contains("BLOCKME"),
+            "model output leaked in error: {msg}"
+        );
+    }
+
+    /// #719 companion: a clean non-streaming response with an output
+    /// guardrail configured passes through unchanged → 200 with body.
+    #[tokio::test]
+    async fn output_guardrail_allows_clean_non_streaming_response() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_ok",
+                "object": "response",
+                "output": [{"type":"message","role":"assistant","content":[{"type":"output_text","text":"a clean answer"}]}],
+                "usage": {"input_tokens": 5, "output_tokens": 3}
+            })))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["output"][0]["content"][0]["text"], "a clean answer");
+    }
+
+    /// #719: streaming /v1/responses must also enforce output guardrails —
+    /// else `stream:true` bypasses the output block. The blocked content is
+    /// held back (BufferFull): the client gets 422 and never the tokens.
+    #[tokio::test]
+    async fn output_guardrail_blocks_streaming_response_holds_back() {
+        let upstream = MockServer::start().await;
+        let sse = "event: response.output_text.delta\n\
+                   data: {\"type\":\"response.output_text.delta\",\"delta\":\"sure: BLOCKME\"}\n\n\
+                   event: response.completed\n\
+                   data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"sure: BLOCKME\"}]}]}}\n\n\
+                   data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        // The held-back content must never reach the client.
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("BLOCKME"),
+            "streamed content leaked despite output block",
+        );
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+    }
+
+    /// #719 companion: a clean streaming response with an output guardrail
+    /// is scanned then released in full → 200 + the SSE body.
+    #[tokio::test]
+    async fn output_guardrail_allows_clean_streaming_response() {
+        let upstream = MockServer::start().await;
+        let sse = "event: response.output_text.delta\n\
+                   data: {\"type\":\"response.output_text.delta\",\"delta\":\"a clean answer\"}\n\n\
+                   data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("a clean answer"),
+            "clean SSE body must be released in full",
+        );
+        assert!(
+            body.starts_with("event: ") || body.starts_with("data: "),
+            "SSE shape preserved on release",
+        );
     }
 
     #[tokio::test]
