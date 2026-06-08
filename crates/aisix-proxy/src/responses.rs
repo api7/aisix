@@ -892,11 +892,19 @@ fn responses_sse_output_text(bytes: &[u8]) -> String {
                     deltas.push_str(d);
                 }
             }
-            Some("response.function_call_arguments.delta") => {
-                // Concatenate WITHOUT a separator — these are pieces of one
-                // call's `arguments` string; a separator would split a literal
-                // that streamed across two deltas (e.g. "BLOCK"+"ME") and miss
-                // the match.
+            // Tool-call argument deltas across all tool kinds — function calls,
+            // MCP tool calls, and custom tools each stream their args/input via
+            // their own event, not output_text.delta. On a terminal `response`
+            // object these are already covered by responses_output_text; this
+            // matters only when the stream aborts before any terminal object.
+            // Concatenate WITHOUT a separator — these are pieces of one call's
+            // string; a separator would split a literal that streamed across
+            // two deltas (e.g. "BLOCK"+"ME") and miss the match.
+            Some(
+                "response.function_call_arguments.delta"
+                | "response.mcp_call_arguments.delta"
+                | "response.custom_tool_call_input.delta",
+            ) => {
                 if let Some(d) = json.get("delta").and_then(|d| d.as_str()) {
                     deltas.push_str(d);
                 }
@@ -1854,6 +1862,45 @@ mod tests {
             !String::from_utf8_lossy(&bytes).contains("BLOCK"),
             "streamed tool-call args leaked with no terminal event",
         );
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+    }
+
+    /// #546 (re-audit): MCP tool-call argument deltas stream via their own
+    /// event too; a no-terminal stream of `response.mcp_call_arguments.delta`
+    /// carrying a blocked literal must still be scanned and held back.
+    #[tokio::test]
+    async fn output_guardrail_blocks_mcp_tool_call_delta_without_terminal() {
+        let upstream = MockServer::start().await;
+        let d = serde_json::json!({"type":"response.mcp_call_arguments.delta","delta":"{\"q\":\"BLOCKME\"}"});
+        let sse =
+            format!("event: response.mcp_call_arguments.delta\ndata: {d}\n\ndata: [DONE]\n\n");
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("BLOCKME"));
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "content_filter");
     }
