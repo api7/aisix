@@ -57,16 +57,6 @@ pub(crate) struct RoutingTelemetry {
 }
 
 impl RoutingTelemetry {
-    /// Build a telemetry log holding a single already-classified attempt
-    /// (the streaming path, which only ever tries the first target).
-    pub fn single(rec: AttemptRecord) -> Self {
-        let last_target = Some(rec.target_model.clone());
-        Self {
-            attempts: vec![rec],
-            last_target,
-        }
-    }
-
     /// Classify the next attempt against `display_name` and advance the
     /// last-target tracker. Returns `(index, kind)` to stamp onto the
     /// `AttemptRecord` the caller pushes once the attempt resolves. Call

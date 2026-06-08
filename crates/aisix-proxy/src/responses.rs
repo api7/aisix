@@ -293,75 +293,17 @@ async fn dispatch(
     let is_routing_request = model_entry.value.routing.is_some();
     let mut routing = RoutingTelemetry::default();
 
-    let is_stream = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
     let not_openai = || {
         ProxyError::InvalidRequest(format!(
             "model `{model_name}` is not an OpenAI provider; /v1/responses requires OpenAI"
         ))
     };
 
-    // Streaming attempts the first eligible target only (no mid-stream
-    // fallback), matching /v1/chat/completions and /v1/messages.
-    if is_stream {
-        let target = attempt_models
-            .iter()
-            .find(|t| t.model.provider.as_deref() == Some("openai"))
-            .ok_or_else(not_openai)?;
-        let (idx, kind) = routing.begin_attempt(&target.model.display_name);
-        let target_model = if is_routing_request {
-            target.model.display_name.clone()
-        } else {
-            String::new()
-        };
-        let attempt_started = Instant::now();
-        return match responses_to_target(
-            state,
-            &snapshot,
-            body,
-            &target.model,
-            &target.id,
-            request_id,
-            &resolved_chain,
-        )
-        .await
-        {
-            Ok(mut success) => {
-                routing.attempts.push(AttemptRecord {
-                    index: idx,
-                    kind,
-                    target_model,
-                    provider_key_id: String::new(),
-                    status: success.response.status().as_u16(),
-                    success: true,
-                    error_class: String::new(),
-                    error_message: String::new(),
-                    latency_ms: ms_since(attempt_started),
-                });
-                success.routing = routing;
-                Ok(success)
-            }
-            Err(e) => {
-                let (error_class, error_message) = attempt_error_from_proxy(&e);
-                routing.attempts.push(AttemptRecord {
-                    index: idx,
-                    kind,
-                    target_model,
-                    provider_key_id: String::new(),
-                    status: e.status().as_u16(),
-                    success: false,
-                    error_class,
-                    error_message,
-                    latency_ms: ms_since(attempt_started),
-                });
-                Err(ResponsesDispatchError { err: e, routing })
-            }
-        };
-    }
-
+    // Walk the OpenAI targets, failing over on a retryable failure.
+    // Streaming and non-streaming share this loop: `responses_to_target`
+    // branches internally and, for streaming, only returns Ok once the
+    // first chunk has arrived under `stream_timeout` (#554) — so the 200 is
+    // committed to exactly one target and a slow first chunk fails over.
     let mut last_err: Option<ProxyError> = None;
     let mut any_openai = false;
     for target in &attempt_models {
@@ -570,23 +512,42 @@ async fn responses_to_target(
         .unwrap_or(false);
 
     let client = crate::http_client::client();
-    let upstream_resp = client
+    let mut req = client
         .post(&url)
         .header("authorization", format!("Bearer {api_key}"))
         .header("content-type", "application/json")
         .header("x-aisix-request-id", request_id)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            crate::cooldown::note_failure(
-                &state.runtime_status,
-                model_id,
-                model.cooldown.as_ref(),
-                aisix_gateway::BridgeError::Transport(e.to_string()),
-            )
-        })
-        .map_err(ProxyError::Bridge)?;
+        .json(&body);
+    // #554: non-streaming gets the E2E request timeout via reqwest's
+    // request-level timeout. Streaming must NOT use it (it would cap the
+    // whole stream); the streaming branch below enforces the per-chunk
+    // read timeout instead.
+    if !is_stream {
+        if let Some(d) = model.request_timeout() {
+            req = req.timeout(d);
+        }
+    }
+    let send_started = Instant::now();
+    // Streaming bounds the connect by the stream deadline (reqwest's
+    // request-level timeout can't be used — it would cap the whole stream);
+    // non-streaming relies on the request-level timeout set above.
+    let connect_deadline = if is_stream {
+        model.stream_timeout_effective()
+    } else {
+        None
+    };
+    let upstream_resp =
+        crate::stream_timeout::send_with_deadline(req, connect_deadline, send_started)
+            .await
+            .map_err(|be| {
+                crate::cooldown::note_failure(
+                    &state.runtime_status,
+                    model_id,
+                    model.cooldown.as_ref(),
+                    be,
+                )
+            })
+            .map_err(ProxyError::Bridge)?;
 
     let status = upstream_resp.status();
 
@@ -638,8 +599,31 @@ async fn responses_to_target(
             };
             let stream = upstream_resp.bytes_stream();
             futures::pin_mut!(stream);
+            let read_to = model.stream_read_timeout();
             let mut buf: Vec<u8> = Vec::new();
-            while let Some(chunk) = stream.next().await {
+            loop {
+                // #554: bound each read so a stalled upstream fails over —
+                // the buffer path hasn't sent anything to the client yet, so
+                // a read timeout is a retryable failure, not a truncation.
+                let next = match read_to {
+                    Some(d) => tokio::time::timeout(d, stream.next())
+                        .await
+                        .map_err(|_| {
+                            crate::cooldown::note_failure(
+                                &state.runtime_status,
+                                model_id,
+                                model.cooldown.as_ref(),
+                                aisix_gateway::BridgeError::Timeout {
+                                    elapsed_ms: d.as_millis() as u64,
+                                },
+                            )
+                        })
+                        .map_err(ProxyError::Bridge)?,
+                    None => stream.next().await,
+                };
+                let Some(chunk) = next else {
+                    break;
+                };
                 let chunk = chunk
                     .map_err(|e| {
                         crate::cooldown::note_failure(
@@ -696,7 +680,42 @@ async fn responses_to_target(
             });
         }
 
-        let body_stream = upstream_resp.bytes_stream();
+        // #554: enforce the per-chunk read timeout and peek the first byte
+        // so a slow first token fails over before the 200 is committed; a
+        // mid-stream stall truncates the forwarded stream (no in-band error
+        // frame for an opaque byte passthrough).
+        let mut body_stream: std::pin::Pin<
+            Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
+        > = Box::pin(crate::stream_timeout::with_read_timeout_bytes(
+            upstream_resp.bytes_stream(),
+            model.stream_read_timeout(),
+        ));
+        let first_bytes = match body_stream.next().await {
+            Some(Ok(b)) => b,
+            Some(Err(e)) => {
+                let err = crate::dispatch::reqwest_error_to_bridge(&e, send_started);
+                if let Some((ttl, reason)) =
+                    crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                {
+                    state.runtime_status.mark_cooldown(model_id, ttl, reason);
+                }
+                return Err(ProxyError::Bridge(err));
+            }
+            None => {
+                let err = aisix_gateway::BridgeError::StreamAborted;
+                if let Some((ttl, reason)) =
+                    crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                {
+                    state.runtime_status.mark_cooldown(model_id, ttl, reason);
+                }
+                return Err(ProxyError::Bridge(err));
+            }
+        };
+        let body_stream = futures::stream::once(std::future::ready(Ok::<
+            bytes::Bytes,
+            reqwest::Error,
+        >(first_bytes)))
+        .chain(body_stream);
         let mut response =
             axum::response::Response::new(axum::body::Body::from_stream(body_stream));
         apply_passthrough_headers(&mut response, &headers, request_id);

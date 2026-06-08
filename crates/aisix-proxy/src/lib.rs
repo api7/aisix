@@ -51,6 +51,7 @@ mod rerank;
 mod responses;
 mod routing;
 mod state;
+mod stream_timeout;
 mod util;
 
 pub use auth::AuthenticatedKey;
