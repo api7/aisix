@@ -778,13 +778,14 @@ async fn anthropic_passthrough_dispatch(
         // target) before the 200 is committed; without one, forward directly
         // (pre-#554 behavior). A mid-stream stall truncates the forwarded
         // stream — there is no in-band error frame for an opaque passthrough.
+        let stream_budget = model.stream_timeout_effective();
         let wrapped: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
             Box::pin(crate::stream_timeout::with_read_timeout_bytes(
                 upstream_resp.bytes_stream(),
-                model.stream_read_timeout(),
+                stream_budget,
             ));
         let body_stream: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
-            if model.stream_read_timeout().is_some() {
+            if stream_budget.is_some() {
                 let mut wrapped = wrapped;
                 let first_bytes = match wrapped.next().await {
                     Some(Ok(b)) => b,
@@ -1221,15 +1222,16 @@ async fn cross_provider_dispatch(
             }
             ProxyError::Bridge(err)
         })?;
-        // #554: when a `stream_timeout` is configured, peek the first chunk
-        // so a slow/erroring first token fails over (the caller loops to the
-        // next target) before the 200 is committed. Without one, commit the
-        // stream directly (pre-#554 behavior; a first-chunk error then
-        // surfaces in-band). The wrapper keeps enforcing the read timeout on
-        // the remaining chunks either way (no-op when unset).
-        let upstream =
-            crate::stream_timeout::with_read_timeout(upstream, model.stream_read_timeout());
-        let upstream: aisix_gateway::ChatChunkStream = if model.stream_read_timeout().is_some() {
+        // #554: when a streaming budget is configured (`stream_timeout`,
+        // falling back to `timeout`), peek the first chunk so a slow/erroring
+        // first token fails over (the caller loops to the next target) before
+        // the 200 is committed. Without one, commit the stream directly
+        // (pre-#554 behavior; a first-chunk error then surfaces in-band). The
+        // wrapper keeps enforcing the read timeout on the remaining chunks
+        // either way (no-op when unset).
+        let stream_budget = model.stream_timeout_effective();
+        let upstream = crate::stream_timeout::with_read_timeout(upstream, stream_budget);
+        let upstream: aisix_gateway::ChatChunkStream = if stream_budget.is_some() {
             let mut upstream = upstream;
             let first_chunk = match upstream.next().await {
                 Some(Ok(chunk)) => chunk,

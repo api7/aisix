@@ -86,7 +86,7 @@ A failed probe transitions the model to `unhealthy` in the runtime status tracke
 
 ### Timeouts
 
-Two optional per-model knobs bound how long the gateway waits on the upstream. Both are in **milliseconds**. Setting a knob to `0` disables that timeout; omitting `timeout` disables it too, while omitting `stream_timeout` makes streaming fall back to `timeout` (see below) rather than disabling the streaming timeout. They mirror LiteLLM's `timeout` and `stream_timeout`.
+Two optional per-model knobs bound how long the gateway waits on the upstream. Both are in **milliseconds**. `timeout` of `0` or absent means no non-streaming timeout. `stream_timeout` of a positive value bounds streaming; `0` or absent makes streaming fall back to `timeout` instead (so to disable streaming timeouts entirely, set `timeout` to `0` as well). They mirror LiteLLM's `timeout` and `stream_timeout`.
 
 ```json title="Direct model timeouts"
 {
@@ -96,7 +96,7 @@ Two optional per-model knobs bound how long the gateway waits on the upstream. B
 ```
 
 - `timeout` — end-to-end budget for a **non-streaming** (`stream:false`) upstream call. If the call doesn't finish in time, the gateway abandons it.
-- `stream_timeout` — read timeout for a **streaming** (`stream:true`) call, applied to the **first** chunk and to **every inter-chunk gap** (it resets after each chunk). When `stream_timeout` is absent, a streaming request falls back to `timeout` for this budget.
+- `stream_timeout` — read timeout for a **streaming** (`stream:true`) call, applied to the **first** chunk and to **every inter-chunk gap** (it resets after each chunk). When `stream_timeout` is `0` or absent, the streaming budget falls back to `timeout`.
 
 An elapsed timeout surfaces as a retryable upstream failure (HTTP `504`), so on a [routing model](routing-and-failover.md) it triggers failover to the next target — see [Routing § Timeout-Triggered Failover](routing-and-failover.md#timeout-triggered-failover). On a direct model with no fallback target it simply returns `504` to the caller.
 

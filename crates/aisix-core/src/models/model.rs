@@ -256,10 +256,12 @@ pub struct Model {
 
     /// Streaming read timeout in ms — the maximum gap the gateway waits
     /// for the next upstream chunk on a `stream:true` call, applied to the
-    /// first chunk and to every inter-chunk gap. `0` = no timeout; when
-    /// absent, streaming falls back to `timeout` (see
-    /// [`Model::stream_timeout_effective`]). A *first-chunk* timeout fails
-    /// over to the next target (before any bytes reach the client); a
+    /// first chunk and to every inter-chunk gap. A positive value bounds
+    /// each chunk wait; `0` or absent means "no streaming-specific
+    /// override", so the effective streaming budget falls back to `timeout`
+    /// (see [`Model::stream_timeout_effective`]) — set `timeout` to `0` too
+    /// to disable streaming timeouts entirely. A *first-chunk* timeout
+    /// fails over to the next target (before any bytes reach the client); a
     /// *mid-stream* timeout terminates the stream like any other upstream
     /// error. Mirrors LiteLLM's `stream_timeout`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -326,13 +328,17 @@ impl Model {
             .map(std::time::Duration::from_millis)
     }
 
-    /// Effective deadline for a streaming request: `stream_timeout` when
-    /// set, otherwise the non-streaming `timeout`. Mirrors LiteLLM's
-    /// `Router._get_timeout`, which uses `stream_timeout` for stream calls
-    /// and falls back to the general `timeout`. Applied both to the connect
-    /// phase and as the per-chunk read timeout. `None` = no streaming
-    /// timeout. Note: a model that sets only a small `timeout` therefore
-    /// also gets that value as its streaming read timeout.
+    /// Effective deadline for a streaming request: a positive
+    /// `stream_timeout`, otherwise the non-streaming `timeout`. Mirrors
+    /// LiteLLM's `Router._get_timeout`, which uses `stream_timeout` for
+    /// stream calls and falls back to the general `timeout`. Applied to the
+    /// connect phase, the per-chunk read timeout, and the first-chunk
+    /// failover gate. Because `stream_read_timeout()` folds `0` to `None`,
+    /// `stream_timeout: 0` is treated the same as absent — it falls back to
+    /// `timeout` rather than disabling the streaming timeout. `None` (both
+    /// unset or `0`) = no streaming timeout. Note: a model that sets only a
+    /// small `timeout` therefore also gets that value as its streaming
+    /// budget.
     pub fn stream_timeout_effective(&self) -> Option<std::time::Duration> {
         self.stream_read_timeout()
             .or_else(|| self.request_timeout())
@@ -438,6 +444,18 @@ mod tests {
         // None when neither is set, and when both are the 0 sentinel.
         assert_eq!(none.stream_timeout_effective(), None);
         assert_eq!(zero.stream_timeout_effective(), None);
+
+        // Explicit `stream_timeout: 0` folds to absent → falls back to
+        // `timeout` (matches LiteLLM's falsy 0), not "disable streaming".
+        let stream_zero_timeout_set: Model = serde_json::from_str(
+            r#"{"display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1","timeout":5000,"stream_timeout":0}"#,
+        )
+        .unwrap();
+        assert_eq!(stream_zero_timeout_set.stream_read_timeout(), None);
+        assert_eq!(
+            stream_zero_timeout_set.stream_timeout_effective(),
+            Some(std::time::Duration::from_millis(5_000))
+        );
     }
 
     #[test]

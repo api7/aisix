@@ -86,7 +86,7 @@
       ]
     },
     "stream_timeout": {
-      "description": "Streaming read timeout in ms — the maximum gap the gateway waits for the next upstream chunk on a `stream:true` call, applied to the first chunk and to every inter-chunk gap. `0` = no timeout; when absent, streaming falls back to `timeout` (see [`Model::stream_timeout_effective`]). A *first-chunk* timeout fails over to the next target (before any bytes reach the client); a *mid-stream* timeout terminates the stream like any other upstream error. Mirrors LiteLLM's `stream_timeout`.",
+      "description": "Streaming read timeout in ms — the maximum gap the gateway waits for the next upstream chunk on a `stream:true` call, applied to the first chunk and to every inter-chunk gap. A positive value bounds each chunk wait; `0` or absent means \"no streaming-specific override\", so the effective streaming budget falls back to `timeout` (see [`Model::stream_timeout_effective`]) — set `timeout` to `0` too to disable streaming timeouts entirely. A *first-chunk* timeout fails over to the next target (before any bytes reach the client); a *mid-stream* timeout terminates the stream like any other upstream error. Mirrors LiteLLM's `stream_timeout`.",
       "type": [
         "integer",
         "null"

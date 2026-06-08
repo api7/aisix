@@ -897,43 +897,45 @@ async fn dispatch(
                 ctx = ctx.with_deadline(d);
             }
             let attempt_started = Instant::now();
-            // Connect, then — only when a `stream_timeout` is configured —
+            // Effective streaming budget: `stream_timeout`, falling back to
+            // `timeout`. Used for the connect deadline (above) AND the
+            // per-chunk read timeout + first-chunk peek here, so the budget
+            // is applied consistently.
+            let stream_budget = model.stream_timeout_effective();
+            // Connect, then — only when a streaming budget is configured —
             // peek the first chunk so a slow or erroring first token fails
-            // over before the 200 is committed. Without a stream timeout
-            // there is nothing to gate on, so the stream is committed
-            // directly (a first-chunk error then surfaces in-band, exactly
-            // like the pre-#554 behavior). The read-timeout wrapper is a
-            // no-op when `stream_read_timeout()` is None.
-            let attempt_stream: Result<aisix_gateway::ChatChunkStream, BridgeError> = match bridge
-                .chat_stream(req, &ctx)
-                .await
-            {
-                Err(e) => Err(e),
-                Ok(up) => {
-                    let up =
-                        crate::stream_timeout::with_read_timeout(up, model.stream_read_timeout());
-                    if model.stream_read_timeout().is_some() {
-                        let mut up = up;
-                        match up.next().await {
-                            // Re-prepend the peeked chunk so the SSE pump
-                            // sees the whole stream (and records TTFT on
-                            // the first content chunk); the wrapper keeps
-                            // enforcing the read timeout on the rest.
-                            Some(Ok(chunk)) => Ok(Box::pin(
-                                futures::stream::once(std::future::ready(Ok::<_, BridgeError>(
-                                    chunk,
-                                )))
-                                .chain(up),
-                            )
-                                as aisix_gateway::ChatChunkStream),
-                            Some(Err(e)) => Err(e),
-                            None => Err(BridgeError::StreamAborted),
+            // over before the 200 is committed. Without a budget there is
+            // nothing to gate on, so the stream is committed directly (a
+            // first-chunk error then surfaces in-band, exactly like the
+            // pre-#554 behavior). The read-timeout wrapper is a no-op when
+            // the budget is None.
+            let attempt_stream: Result<aisix_gateway::ChatChunkStream, BridgeError> =
+                match bridge.chat_stream(req, &ctx).await {
+                    Err(e) => Err(e),
+                    Ok(up) => {
+                        let up = crate::stream_timeout::with_read_timeout(up, stream_budget);
+                        if stream_budget.is_some() {
+                            let mut up = up;
+                            match up.next().await {
+                                // Re-prepend the peeked chunk so the SSE pump
+                                // sees the whole stream (and records TTFT on
+                                // the first content chunk); the wrapper keeps
+                                // enforcing the read timeout on the rest.
+                                Some(Ok(chunk)) => Ok(Box::pin(
+                                    futures::stream::once(std::future::ready(
+                                        Ok::<_, BridgeError>(chunk),
+                                    ))
+                                    .chain(up),
+                                )
+                                    as aisix_gateway::ChatChunkStream),
+                                Some(Err(e)) => Err(e),
+                                None => Err(BridgeError::StreamAborted),
+                            }
+                        } else {
+                            Ok(up)
                         }
-                    } else {
-                        Ok(up)
                     }
-                }
-            };
+                };
             let latency_ms = attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
             match attempt_stream {
                 Ok(upstream) => {

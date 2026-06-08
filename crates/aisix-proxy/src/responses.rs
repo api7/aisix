@@ -599,7 +599,10 @@ async fn responses_to_target(
             };
             let stream = upstream_resp.bytes_stream();
             futures::pin_mut!(stream);
-            let read_to = model.stream_read_timeout();
+            // Effective streaming budget: `stream_timeout`, falling back to
+            // `timeout` — applied to every buffered read, consistent with the
+            // verbatim branch and the connect deadline.
+            let read_to = model.stream_timeout_effective();
             let mut buf: Vec<u8> = Vec::new();
             let mut saw_chunk = false;
             loop {
@@ -702,15 +705,16 @@ async fn responses_to_target(
         // without one, forward directly (pre-#554 behavior). A mid-stream
         // stall truncates the forwarded stream (no in-band error frame for
         // an opaque byte passthrough).
+        let stream_budget = model.stream_timeout_effective();
         let wrapped: std::pin::Pin<
             Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
         > = Box::pin(crate::stream_timeout::with_read_timeout_bytes(
             upstream_resp.bytes_stream(),
-            model.stream_read_timeout(),
+            stream_budget,
         ));
         let body_stream: std::pin::Pin<
             Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
-        > = if model.stream_read_timeout().is_some() {
+        > = if stream_budget.is_some() {
             let mut wrapped = wrapped;
             let first_bytes = match wrapped.next().await {
                 Some(Ok(b)) => b,
