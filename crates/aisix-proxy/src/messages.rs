@@ -772,42 +772,53 @@ async fn anthropic_passthrough_dispatch(
         // For SSE streaming: pass through the response body as a streaming
         // `text/event-stream` response.
         let headers = upstream_resp.headers().clone();
-        // #554: enforce the per-chunk read timeout on the forwarded bytes,
-        // then peek the first byte so a slow first token fails over (the
-        // caller loops to the next target) before the 200 is committed. A
-        // mid-stream stall truncates the forwarded stream — there is no
-        // in-band error frame to inject into an opaque byte passthrough.
-        let mut body_stream: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
+        // #554: enforce the per-chunk read timeout on the forwarded bytes.
+        // When a `stream_timeout` is configured, peek the first byte so a
+        // slow/erroring first token fails over (the caller loops to the next
+        // target) before the 200 is committed; without one, forward directly
+        // (pre-#554 behavior). A mid-stream stall truncates the forwarded
+        // stream — there is no in-band error frame for an opaque passthrough.
+        let wrapped: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
             Box::pin(crate::stream_timeout::with_read_timeout_bytes(
                 upstream_resp.bytes_stream(),
                 model.stream_read_timeout(),
             ));
-        let first_bytes = match body_stream.next().await {
-            Some(Ok(b)) => b,
-            Some(Err(e)) => {
-                let err = crate::dispatch::reqwest_error_to_bridge(&e, send_started);
-                if let Some((ttl, reason)) =
-                    crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
-                {
-                    state.runtime_status.mark_cooldown(model_id, ttl, reason);
-                }
-                return Err(ProxyError::Bridge(err));
-            }
-            // Read timeout before the first byte (or an upstream that closed
-            // immediately): retryable stream-abort so the caller fails over.
-            None => {
-                let err = aisix_gateway::BridgeError::StreamAborted;
-                if let Some((ttl, reason)) =
-                    crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
-                {
-                    state.runtime_status.mark_cooldown(model_id, ttl, reason);
-                }
-                return Err(ProxyError::Bridge(err));
-            }
-        };
-        let body_stream =
-            futures::stream::once(std::future::ready(Ok::<Bytes, reqwest::Error>(first_bytes)))
-                .chain(body_stream);
+        let body_stream: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
+            if model.stream_read_timeout().is_some() {
+                let mut wrapped = wrapped;
+                let first_bytes = match wrapped.next().await {
+                    Some(Ok(b)) => b,
+                    Some(Err(e)) => {
+                        let err = crate::dispatch::reqwest_error_to_bridge(&e, send_started);
+                        if let Some((ttl, reason)) =
+                            crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                        {
+                            state.runtime_status.mark_cooldown(model_id, ttl, reason);
+                        }
+                        return Err(ProxyError::Bridge(err));
+                    }
+                    // Read timeout before the first byte (or an upstream that
+                    // closed immediately): retryable stream-abort so the
+                    // caller fails over.
+                    None => {
+                        let err = aisix_gateway::BridgeError::StreamAborted;
+                        if let Some((ttl, reason)) =
+                            crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                        {
+                            state.runtime_status.mark_cooldown(model_id, ttl, reason);
+                        }
+                        return Err(ProxyError::Bridge(err));
+                    }
+                };
+                Box::pin(
+                    futures::stream::once(std::future::ready(Ok::<Bytes, reqwest::Error>(
+                        first_bytes,
+                    )))
+                    .chain(wrapped),
+                )
+            } else {
+                wrapped
+            };
 
         // Issue #245: parity with the OpenAI streaming fix (#225 /
         // #196). Pre-fix this path forwarded raw bytes and emitted a
@@ -1210,39 +1221,45 @@ async fn cross_provider_dispatch(
             }
             ProxyError::Bridge(err)
         })?;
-        // #554: peek the first chunk under the per-chunk read timeout so a
-        // slow first token fails over (the caller loops to the next target)
-        // before the 200 is committed. The wrapped stream keeps enforcing
-        // the read timeout on the remaining chunks; a mid-stream stall
-        // surfaces as an error frame via `build_anthropic_sse_stream`.
-        let mut upstream =
+        // #554: when a `stream_timeout` is configured, peek the first chunk
+        // so a slow/erroring first token fails over (the caller loops to the
+        // next target) before the 200 is committed. Without one, commit the
+        // stream directly (pre-#554 behavior; a first-chunk error then
+        // surfaces in-band). The wrapper keeps enforcing the read timeout on
+        // the remaining chunks either way (no-op when unset).
+        let upstream =
             crate::stream_timeout::with_read_timeout(upstream, model.stream_read_timeout());
-        let first_chunk = match upstream.next().await {
-            Some(Ok(chunk)) => chunk,
-            Some(Err(err)) => {
-                if let Some((ttl, reason)) =
-                    crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
-                {
-                    state.runtime_status.mark_cooldown(model_id, ttl, reason);
+        let upstream: aisix_gateway::ChatChunkStream = if model.stream_read_timeout().is_some() {
+            let mut upstream = upstream;
+            let first_chunk = match upstream.next().await {
+                Some(Ok(chunk)) => chunk,
+                Some(Err(err)) => {
+                    if let Some((ttl, reason)) =
+                        crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                    {
+                        state.runtime_status.mark_cooldown(model_id, ttl, reason);
+                    }
+                    return Err(ProxyError::Bridge(err));
                 }
-                return Err(ProxyError::Bridge(err));
-            }
-            None => {
-                return Err(ProxyError::Bridge(
-                    aisix_gateway::BridgeError::StreamAborted,
-                ))
-            }
+                None => {
+                    return Err(ProxyError::Bridge(
+                        aisix_gateway::BridgeError::StreamAborted,
+                    ))
+                }
+            };
+            // Re-prepend the peeked chunk so the SSE encoder sees the whole
+            // stream (and records TTFT on the first content chunk).
+            Box::pin(
+                futures::stream::once(std::future::ready(Ok::<_, aisix_gateway::BridgeError>(
+                    first_chunk,
+                )))
+                .chain(upstream),
+            )
+        } else {
+            upstream
         };
         state.health.record_success(model_name);
         state.runtime_status.mark_healthy(model_id);
-        // Re-prepend the peeked chunk so the SSE encoder sees the whole
-        // stream (and records TTFT on the first content chunk).
-        let upstream: aisix_gateway::ChatChunkStream = Box::pin(
-            futures::stream::once(std::future::ready(Ok::<_, aisix_gateway::BridgeError>(
-                first_chunk,
-            )))
-            .chain(upstream),
-        );
 
         let message_id = format!("msg_{}", Uuid::new_v4().simple());
         let encoder = AnthropicSseEncoder::new(message_id, model_name, 0);

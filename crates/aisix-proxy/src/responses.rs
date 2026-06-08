@@ -680,42 +680,52 @@ async fn responses_to_target(
             });
         }
 
-        // #554: enforce the per-chunk read timeout and peek the first byte
-        // so a slow first token fails over before the 200 is committed; a
-        // mid-stream stall truncates the forwarded stream (no in-band error
-        // frame for an opaque byte passthrough).
-        let mut body_stream: std::pin::Pin<
+        // #554: enforce the per-chunk read timeout on the forwarded bytes.
+        // When a `stream_timeout` is configured, peek the first byte so a
+        // slow/erroring first token fails over before the 200 is committed;
+        // without one, forward directly (pre-#554 behavior). A mid-stream
+        // stall truncates the forwarded stream (no in-band error frame for
+        // an opaque byte passthrough).
+        let wrapped: std::pin::Pin<
             Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
         > = Box::pin(crate::stream_timeout::with_read_timeout_bytes(
             upstream_resp.bytes_stream(),
             model.stream_read_timeout(),
         ));
-        let first_bytes = match body_stream.next().await {
-            Some(Ok(b)) => b,
-            Some(Err(e)) => {
-                let err = crate::dispatch::reqwest_error_to_bridge(&e, send_started);
-                if let Some((ttl, reason)) =
-                    crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
-                {
-                    state.runtime_status.mark_cooldown(model_id, ttl, reason);
+        let body_stream: std::pin::Pin<
+            Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>,
+        > = if model.stream_read_timeout().is_some() {
+            let mut wrapped = wrapped;
+            let first_bytes = match wrapped.next().await {
+                Some(Ok(b)) => b,
+                Some(Err(e)) => {
+                    let err = crate::dispatch::reqwest_error_to_bridge(&e, send_started);
+                    if let Some((ttl, reason)) =
+                        crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                    {
+                        state.runtime_status.mark_cooldown(model_id, ttl, reason);
+                    }
+                    return Err(ProxyError::Bridge(err));
                 }
-                return Err(ProxyError::Bridge(err));
-            }
-            None => {
-                let err = aisix_gateway::BridgeError::StreamAborted;
-                if let Some((ttl, reason)) =
-                    crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
-                {
-                    state.runtime_status.mark_cooldown(model_id, ttl, reason);
+                None => {
+                    let err = aisix_gateway::BridgeError::StreamAborted;
+                    if let Some((ttl, reason)) =
+                        crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                    {
+                        state.runtime_status.mark_cooldown(model_id, ttl, reason);
+                    }
+                    return Err(ProxyError::Bridge(err));
                 }
-                return Err(ProxyError::Bridge(err));
-            }
+            };
+            Box::pin(
+                futures::stream::once(std::future::ready(Ok::<bytes::Bytes, reqwest::Error>(
+                    first_bytes,
+                )))
+                .chain(wrapped),
+            )
+        } else {
+            wrapped
         };
-        let body_stream = futures::stream::once(std::future::ready(Ok::<
-            bytes::Bytes,
-            reqwest::Error,
-        >(first_bytes)))
-        .chain(body_stream);
         let mut response =
             axum::response::Response::new(axum::body::Body::from_stream(body_stream));
         apply_passthrough_headers(&mut response, &headers, request_id);
