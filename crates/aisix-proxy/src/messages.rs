@@ -369,17 +369,16 @@ async fn dispatch(
         return Err(ProxyError::ModelForbidden(model_name.clone()).into());
     }
 
-    let model_rl =
-        crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
-
-    // #448 (#22): /v1/messages must run input guardrails + the budget
-    // pre-check like /v1/chat/completions — previously prompts reached the
-    // upstream without any content/DLP check. Translate the Anthropic-
-    // shaped body into the internal ChatFormat and run the resolved input
-    // guardrail chain; a Block short-circuits before dispatch. (Input
-    // Rewrite/Bypass on this endpoint is not yet applied to the outgoing
-    // Anthropic body — only Block is enforced here.)
+    // #448 (#22): /v1/messages must run input guardrails like
+    // /v1/chat/completions — previously prompts reached the upstream without
+    // any content/DLP check. Translate the Anthropic-shaped body into the
+    // internal ChatFormat and run the resolved input guardrail chain; a Block
+    // short-circuits before dispatch. (Input Rewrite/Bypass on this endpoint
+    // is not yet applied to the outgoing Anthropic body — only Block is
+    // enforced here.)
+    //
+    // #542: run this BEFORE the rate-limit reservation so a content-policy
+    // block doesn't burn an RPM slot (matching /v1/chat/completions).
     let guardrail_ctx = aisix_guardrails::RequestContext {
         model_id: &model_entry.id,
         api_key_id: &auth.entry.id,
@@ -410,6 +409,10 @@ async fn dispatch(
             }
         }
     }
+
+    let model_rl =
+        crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
+    let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
     // Budget pre-check via cp-api (mirrors /v1/chat/completions).
     let budget_decision = state.budgets.check(&auth.entry.id).await;

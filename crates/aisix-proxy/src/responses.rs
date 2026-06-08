@@ -234,10 +234,6 @@ async fn dispatch(
         return Err(ProxyError::ModelForbidden(model_name.clone()).into());
     }
 
-    let model_rl =
-        crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
-    let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
-
     // #719: /v1/responses must run input guardrails like /v1/chat/completions
     // and /v1/messages. Before this, user input reached the upstream without
     // any configured content/DLP check, so a content block enforced on the
@@ -247,6 +243,9 @@ async fn dispatch(
     // and run the resolved input guardrail chain; a Block short-circuits
     // before dispatch. (Input Rewrite/Bypass is not applied to the outgoing
     // Responses body — only Block is enforced, matching /v1/messages.)
+    //
+    // #542: run this BEFORE the rate-limit reservation so a content-policy
+    // block doesn't burn an RPM slot (matching /v1/chat/completions).
     let guardrail_ctx = aisix_guardrails::RequestContext {
         model_id: &model_entry.id,
         api_key_id: &auth.entry.id,
@@ -272,6 +271,10 @@ async fn dispatch(
             );
         }
     }
+
+    let model_rl =
+        crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
+    let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
     // Resolve the attempt list (routing-aware). /v1/responses is
     // OpenAI-only, so we attempt the group's OpenAI targets in order; a
@@ -1903,6 +1906,59 @@ mod tests {
         assert!(!String::from_utf8_lossy(&bytes).contains("BLOCKME"));
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["type"], "content_filter");
+    }
+
+    /// #542: a guardrail-blocked request must NOT consume a rate-limit slot.
+    /// With RPM=1 and a blocking guardrail, a blocked request followed by a
+    /// benign one — the benign request must still succeed (the block didn't
+    /// burn the only slot). Pre-fix (guardrail ran after `quota::enforce`) the
+    /// block reserved+burned the slot, so the benign request got 429.
+    #[tokio::test]
+    async fn blocked_request_does_not_consume_rate_limit_slot() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id":"resp_ok","object":"response",
+                "output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}],
+                "usage":{"input_tokens":1,"output_tokens":1}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        // API key capped at RPM=1.
+        let apikey: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"8b6712790a2089c67aa97a2d80022df18cc65c7814350e33baebe79aab508891","allowed_models":["*"],"rate_limit":{"rpm":1}}"#,
+        )
+        .unwrap();
+        snap.apikeys.insert(ResourceEntry::new("k-1", apikey, 1));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        // Blocked by the guardrail — must NOT reserve the single RPM slot.
+        let blocked = app
+            .clone()
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"BLOCKME"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Benign request — the slot must still be available.
+        let ok = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"gpt-4o-resp","input":"hello"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            ok.status(),
+            StatusCode::OK,
+            "a guardrail block must not burn the RPM slot (#542)",
+        );
     }
 
     #[tokio::test]
