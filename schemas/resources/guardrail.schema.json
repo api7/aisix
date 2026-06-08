@@ -28,7 +28,7 @@
       }
     },
     {
-      "description": "AWS Bedrock managed guardrail. Phase 1 parses + persists; the chain builder skips it with a warn log. Phase 2 wires real `ApplyGuardrail` dispatch.",
+      "description": "AWS Bedrock managed guardrail. The chain builder constructs a `BedrockGuardrail` that calls AWS `ApplyGuardrail` (real SigV4 dispatch) on input and/or output per the row's hook point.",
       "type": "object",
       "required": [
         "aws_credentials",

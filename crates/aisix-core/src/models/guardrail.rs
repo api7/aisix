@@ -25,10 +25,9 @@
 //!   * `keyword` — literal/regex blocklist; runs entirely in DP
 //!     process. Configured via `keyword.patterns` (list of
 //!     `{ kind: "literal" | "regex", value: "..." }`).
-//!   * `bedrock` — calls AWS Bedrock's `ApplyGuardrail`. Phase 1
-//!     parses + accepts the kind but the chain builder logs
-//!     "bedrock not yet implemented" and skips the row; Phase 2
-//!     wires the actual dispatch (PRD-09c §6.7).
+//!   * `bedrock` — calls AWS Bedrock's `ApplyGuardrail` on input
+//!     and/or output. The DP signs the call with SigV4 and maps
+//!     `GUARDRAIL_INTERVENED` to a block (PRD-09c §6.7).
 //!   * `azure_content_safety` — calls Azure AI Content Safety Prompt
 //!     Shield (`/contentsafety/text:shieldPrompt`). Detects jailbreak
 //!     and indirect injection attacks. P1 (PRD-09c §6 P1).
@@ -337,9 +336,9 @@ fn default_aliyun_window_overlap_size() -> u32 {
     128
 }
 
-/// Config block for `kind: "bedrock"`. Phase 1 stores the shape +
-/// passes it through `aisix-guardrails::build` which logs
-/// `bedrock not yet implemented` and skips the row.
+/// Config block for `kind: "bedrock"`. The DP builds an
+/// `aisix-guardrails::BedrockGuardrail` from this and dispatches
+/// `ApplyGuardrail` on every governed request.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BedrockConfig {
@@ -362,9 +361,9 @@ pub struct BedrockConfig {
 pub enum GuardrailKind {
     /// In-process literal/regex blocklist. Always available.
     Keyword(KeywordConfig),
-    /// AWS Bedrock managed guardrail. Phase 1 parses + persists;
-    /// the chain builder skips it with a warn log. Phase 2 wires
-    /// real `ApplyGuardrail` dispatch.
+    /// AWS Bedrock managed guardrail. The chain builder constructs a
+    /// `BedrockGuardrail` that calls AWS `ApplyGuardrail` (real SigV4
+    /// dispatch) on input and/or output per the row's hook point.
     Bedrock(BedrockConfig),
     /// Azure AI Content Safety Prompt Shield. Detects jailbreak and
     /// indirect injection attacks via the `/contentsafety/text:shieldPrompt`
