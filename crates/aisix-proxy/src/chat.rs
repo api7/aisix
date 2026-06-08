@@ -832,47 +832,186 @@ async fn dispatch(
 
     let now = created_ts();
 
-    // Streaming path: only attempt the first target. Streaming fallback
-    // is genuinely hard (we'd have to buffer the stream to detect
-    // failure mid-flight) and not worth the complexity for V1.
+    // Streaming path (#554): walk the target list with first-chunk
+    // fallback. For each target we connect, then peek the first stream
+    // chunk under the per-chunk read timeout (`stream_timeout`, falling
+    // back to `timeout`). A first-chunk failure — connect error, an error
+    // chunk, an empty stream, or a read timeout — fails over to the next
+    // target before any bytes reach the client, exactly like the
+    // non-streaming loop. The peeked chunk is re-prepended so the SSE pump
+    // sees the full stream; the wrapper keeps enforcing the read timeout on
+    // the remaining chunks, so a mid-stream stall terminates the response
+    // (no fallback once the 200 is committed).
     if req.is_streaming() {
-        let model = &attempt_models[0].model;
-        let provider = crate::dispatch::require_provider(model).map_err(with_model)?;
-        let pk_entry =
-            crate::dispatch::resolve_provider_key(&snapshot, model).map_err(with_model)?;
-        let bridge = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
-            .ok_or_else(|| with_model(ProxyError::ProviderUnavailable))?;
-        let model_arc = Arc::new(model.clone());
-        let pk_arc = Arc::new(pk_entry.value.clone());
-        let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
-        let stream_attempt_started = Instant::now();
-        let upstream = match bridge.chat_stream(req, &ctx).await {
-            Ok(upstream) => upstream,
-            Err(err) => {
-                let attempt_latency_ms = stream_attempt_started
-                    .elapsed()
-                    .as_millis()
-                    .min(u32::MAX as u128) as u32;
-                // Streaming attempts only the first target (#655): a single
-                // failed AttemptRecord, emitted by the Err-arm fan-out.
-                let routing = if virtual_entry.value.routing.is_some() {
-                    RoutingTelemetry::single(AttemptRecord {
-                        index: 0,
-                        kind: "initial",
-                        target_model: model.display_name.clone(),
+        let retry_on_429 = virtual_entry
+            .value
+            .routing
+            .as_ref()
+            .map(|r| r.retry_on_429_or_default())
+            .unwrap_or(false);
+        let is_routing_request = virtual_entry.value.routing.is_some();
+        let mut stream_routing = RoutingTelemetry::default();
+        let mut last_err: Option<BridgeError> = None;
+
+        struct StreamWin {
+            model: aisix_core::Model,
+            provider_lc: String,
+            pk_id: String,
+            upstream: aisix_gateway::ChatChunkStream,
+            idx: u32,
+            kind: &'static str,
+        }
+        let mut won: Option<StreamWin> = None;
+
+        'targets: for attempt in &attempt_models {
+            let model = &attempt.model;
+            let Ok(provider) = crate::dispatch::require_provider(model) else {
+                last_err = Some(BridgeError::Config("model has no provider".into()));
+                continue 'targets;
+            };
+            let Ok(pk_entry) = crate::dispatch::resolve_provider_key(&snapshot, model) else {
+                last_err = Some(BridgeError::Config(
+                    "model references unknown provider_key_id".into(),
+                ));
+                continue 'targets;
+            };
+            let Some(bridge) = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value) else {
+                last_err = Some(BridgeError::Config(
+                    "no bridge registered for provider_key".into(),
+                ));
+                continue 'targets;
+            };
+            let (idx, kind) = stream_routing.begin_attempt(&model.display_name);
+            let target_model = if is_routing_request {
+                model.display_name.clone()
+            } else {
+                String::new()
+            };
+            let model_arc = Arc::new(model.clone());
+            let pk_arc = Arc::new(pk_entry.value.clone());
+            // Streaming deadline (#554): bound the connect by the effective
+            // stream timeout; the read-timeout wrapper below enforces the
+            // same budget on the first and subsequent chunks.
+            let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc);
+            if let Some(d) = model.stream_timeout_effective() {
+                ctx = ctx.with_deadline(d);
+            }
+            let attempt_started = Instant::now();
+            // Effective streaming budget: `stream_timeout`, falling back to
+            // `timeout`. Used for the connect deadline (above) AND the
+            // per-chunk read timeout + first-chunk peek here, so the budget
+            // is applied consistently.
+            let stream_budget = model.stream_timeout_effective();
+            // Connect, then — only when a streaming budget is configured —
+            // peek the first chunk so a slow or erroring first token fails
+            // over before the 200 is committed. Without a budget there is
+            // nothing to gate on, so the stream is committed directly (a
+            // first-chunk error then surfaces in-band, exactly like the
+            // pre-#554 behavior). The read-timeout wrapper is a no-op when
+            // the budget is None.
+            let attempt_stream: Result<aisix_gateway::ChatChunkStream, BridgeError> =
+                match bridge.chat_stream(req, &ctx).await {
+                    Err(e) => Err(e),
+                    Ok(up) => {
+                        let up = crate::stream_timeout::with_read_timeout(up, stream_budget);
+                        if stream_budget.is_some() {
+                            let mut up = up;
+                            match up.next().await {
+                                // Re-prepend the peeked chunk so the SSE pump
+                                // sees the whole stream (and records TTFT on
+                                // the first content chunk); the wrapper keeps
+                                // enforcing the read timeout on the rest.
+                                Some(Ok(chunk)) => Ok(Box::pin(
+                                    futures::stream::once(std::future::ready(
+                                        Ok::<_, BridgeError>(chunk),
+                                    ))
+                                    .chain(up),
+                                )
+                                    as aisix_gateway::ChatChunkStream),
+                                Some(Err(e)) => Err(e),
+                                None => Err(BridgeError::StreamAborted),
+                            }
+                        } else {
+                            Ok(up)
+                        }
+                    }
+                };
+            let latency_ms = attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            match attempt_stream {
+                Ok(upstream) => {
+                    state.health.record_success(&model.display_name);
+                    state.runtime_status.mark_healthy(&attempt.id);
+                    stream_routing.attempts.push(AttemptRecord {
+                        index: idx,
+                        kind,
+                        target_model,
+                        provider_key_id: pk_entry.id.clone(),
+                        status: 200,
+                        success: true,
+                        error_class: String::new(),
+                        error_message: String::new(),
+                        latency_ms,
+                    });
+                    won = Some(StreamWin {
+                        model: model.clone(),
+                        provider_lc: provider.to_ascii_lowercase(),
+                        pk_id: pk_entry.id.clone(),
+                        upstream,
+                        idx,
+                        kind,
+                    });
+                    break 'targets;
+                }
+                Err(err) => {
+                    stream_routing.attempts.push(AttemptRecord {
+                        index: idx,
+                        kind,
+                        target_model,
                         provider_key_id: pk_entry.id.clone(),
                         status: err.http_status(),
                         success: false,
                         error_class: routing_error_class(&err).to_string(),
                         error_message: attempt_error_message(&err),
-                        latency_ms: attempt_latency_ms,
-                    })
-                } else {
-                    RoutingTelemetry::default()
-                };
-                return Err(with_model(ProxyError::Bridge(err)).with_routing(routing));
+                        latency_ms,
+                    });
+                    let retryable = is_retryable(&err, retry_on_429);
+                    tracing::warn!(
+                        target_model = %model.display_name,
+                        error = %err,
+                        retryable,
+                        "streaming routing target attempt failed",
+                    );
+                    if retryable {
+                        state.health.record_failure(&model.display_name);
+                    }
+                    if let Some((ttl, reason)) =
+                        decide_cooldown(&err, attempt.model.cooldown.as_ref())
+                    {
+                        state.runtime_status.mark_cooldown(&attempt.id, ttl, reason);
+                    }
+                    last_err = Some(err);
+                    if !retryable {
+                        break 'targets;
+                    }
+                }
             }
+        }
+
+        let Some(won) = won else {
+            let err = last_err.unwrap_or_else(|| {
+                BridgeError::Config("streaming routing exhausted with no targets".into())
+            });
+            return Err(with_model(ProxyError::Bridge(err)).with_routing(stream_routing));
         };
+        let StreamWin {
+            model,
+            provider_lc: provider,
+            pk_id,
+            upstream,
+            idx: winner_idx,
+            kind: winner_kind,
+        } = won;
+        let model = &model;
         // Hold concurrency for the stream's full lifetime instead of
         // releasing it at handler return. RPM was already counted by
         // pre_commit; TPM is updated retroactively on stream-end by
@@ -901,14 +1040,14 @@ async fn dispatch(
         let user_id_for_metrics = auth.key().user_id.clone();
         let provider_for_metrics = provider.to_ascii_lowercase();
         let model_for_metrics = req.model.clone();
-        let provider_key_id_for_metrics = pk_entry.id.clone();
+        let provider_key_id_for_metrics = pk_id.clone();
         // Captured for the stream-end telemetry closure so
         // emit_usage_event can look up `telemetry_tags` for per-PK
         // attribution (#302 M17 / AISIX-Cloud#436). The metrics
         // variant above is `&str`-scoped to inner scopes that consume
         // it as a borrow; the telem variant is owned for the move
         // into the on_complete closure.
-        let provider_key_id_for_telem = pk_entry.id.clone();
+        let provider_key_id_for_telem = pk_id.clone();
         let upstream_model_for_metrics = model.upstream_model().unwrap_or("unknown").to_string();
         let bypass_reason_for_telem = bypass_reason.clone().unwrap_or_default();
         // Applied guardrail set (#379), owned for the move into on_complete so
@@ -917,25 +1056,10 @@ async fn dispatch(
         // Downstream client attribution (#492) moved into the on_complete
         // closure so streamed responses log the same IP/UA as non-streaming.
         let client_for_telem = client.clone();
-        // Streaming attempts only the first target (#655): a single
-        // winning AttemptRecord drives the access log served-by + counts.
-        let stream_routing = if virtual_entry.value.routing.is_some() {
-            RoutingTelemetry::single(AttemptRecord {
-                index: 0,
-                kind: "initial",
-                target_model: model.display_name.clone(),
-                provider_key_id: pk_entry.id.clone(),
-                status: 200,
-                success: true,
-                error_class: String::new(),
-                error_message: String::new(),
-                latency_ms: 0,
-            })
-        } else {
-            RoutingTelemetry::default()
-        };
-        // Per-attempt target name for the on_complete winner event.
-        let attempt_model_for_telem = if virtual_entry.value.routing.is_some() {
+        // Per-attempt target name for the on_complete winner event. The
+        // real per-attempt RoutingTelemetry was accumulated by the
+        // fallback loop above (`stream_routing`).
+        let attempt_model_for_telem = if is_routing_request {
             model.display_name.clone()
         } else {
             String::new()
@@ -1016,10 +1140,10 @@ async fn dispatch(
                         cache_hit_saved_input_tokens: 0,
                         cache_hit_saved_output_tokens: 0,
                         ttft_ms: comp.ttft_ms,
-                        // Streaming is single-attempt (#655): the winner is
-                        // always the initial attempt of the first target.
-                        attempt_index: 0,
-                        attempt_kind: "initial".to_string(),
+                        // #554: the winning attempt may be a fallback target,
+                        // not the initial one — record the real index/kind.
+                        attempt_index: winner_idx,
+                        attempt_kind: winner_kind.to_string(),
                         attempt_model: attempt_model_for_telem.clone(),
                         error_class: String::new(),
                         error_message: String::new(),
@@ -1100,7 +1224,7 @@ async fn dispatch(
             cache_read_tokens: 0,
             provider_request_id: String::new(),
             provider_model_version: String::new(),
-            provider_key_id: pk_entry.id.clone(),
+            provider_key_id: pk_id.clone(),
             upstream_model: model.upstream_model().unwrap_or("unknown").to_string(),
             finish_reason: String::new(),
             bypass_reason: bypass_reason.clone(),
@@ -1111,13 +1235,12 @@ async fn dispatch(
             cache_hit_saved_input_tokens: 0,
             cache_hit_saved_output_tokens: 0,
             telemetry_handled_by_stream: true,
-            // Streaming attempts only `targets[0]` (no mid-stream
-            // fallback), so on the routing path the served target is
-            // unambiguously the first one. The helper enforces the
+            // #554: the served target is whichever one won the first-chunk
+            // race (may be a fallback). The helper enforces the
             // "direct model → None" rule consistently with the
             // non-streaming and cache paths.
             served_by_target: served_by_target_for_routing(
-                virtual_entry.value.routing.is_some(),
+                is_routing_request,
                 Some(model.display_name.clone()),
             ),
             routing: stream_routing,
@@ -1355,7 +1478,13 @@ async fn dispatch(
         };
         let model_arc = Arc::new(model.clone());
         let pk_arc = Arc::new(pk_entry.value.clone());
-        let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
+        // Per-attempt non-streaming deadline (#554): an elapsed `timeout`
+        // surfaces as a retryable `BridgeError::Timeout`, so a slow target
+        // fails over to the next one via the loop below.
+        let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc);
+        if let Some(d) = model.request_timeout() {
+            ctx = ctx.with_deadline(d);
+        }
 
         for attempt_idx in 0..=retries {
             // Per-attempt telemetry kind (#655): the first attempt overall

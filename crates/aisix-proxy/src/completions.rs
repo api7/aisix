@@ -229,7 +229,11 @@ async fn dispatch(
 
     let model_arc = Arc::new(model.clone());
     let pk_arc = Arc::new(pk_entry.value.clone());
-    let ctx = BridgeContext::new(request_id, model_arc, pk_arc);
+    // #554: apply the configured request `timeout` as the upstream deadline.
+    let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc);
+    if let Some(d) = model.request_timeout() {
+        ctx = ctx.with_deadline(d);
+    }
 
     let provider_label = provider.to_ascii_lowercase();
 

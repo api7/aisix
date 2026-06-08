@@ -18,10 +18,28 @@
 //! plumbing flows naturally.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use aisix_core::resource::ResourceEntry;
 use aisix_core::{AisixSnapshot, Model, ProviderKey};
-use aisix_gateway::{Bridge, Hub};
+use aisix_gateway::{Bridge, BridgeError, Hub};
+
+/// Map a `reqwest` transport error from a raw-passthrough dispatch
+/// (`/v1/responses`, `/v1/messages` Anthropic, `/v1/messages/count_tokens`)
+/// into the gateway's [`BridgeError`]. A timed-out request (the per-request
+/// `.timeout(model.request_timeout())` budget elapsed) becomes
+/// [`BridgeError::Timeout`] so it surfaces as 504, classifies as `"timeout"`
+/// in telemetry, and participates in routing failover exactly like the
+/// Bridge-trait path (#554). Everything else stays a transport error.
+pub(crate) fn reqwest_error_to_bridge(e: &reqwest::Error, started: Instant) -> BridgeError {
+    if e.is_timeout() {
+        BridgeError::Timeout {
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        }
+    } else {
+        BridgeError::Transport(e.to_string())
+    }
+}
 
 use crate::error::ProxyError;
 

@@ -307,10 +307,13 @@ async fn count_tokens_to_target(
     }
 
     let client = crate::http_client::client();
-    let upstream_resp = client
-        .post(&url)
-        .headers(headers)
-        .json(&body)
+    let mut req = client.post(&url).headers(headers).json(&body);
+    // #554: count_tokens is non-streaming; apply the E2E request timeout.
+    if let Some(d) = model.request_timeout() {
+        req = req.timeout(d);
+    }
+    let send_started = Instant::now();
+    let upstream_resp = req
         .send()
         .await
         .map_err(|e| {
@@ -318,7 +321,7 @@ async fn count_tokens_to_target(
                 &state.runtime_status,
                 model_id,
                 model.cooldown.as_ref(),
-                aisix_gateway::BridgeError::Transport(e.to_string()),
+                crate::dispatch::reqwest_error_to_bridge(&e, send_started),
             )
         })
         .map_err(ProxyError::Bridge)?;

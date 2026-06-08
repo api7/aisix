@@ -244,9 +244,28 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_key_id: Option<String>,
 
-    /// Request timeout in ms. 0 or absent = no timeout.
+    /// Non-streaming request timeout in ms — the end-to-end budget for a
+    /// `stream:false` upstream call. `0` or absent = no timeout. On a
+    /// routing model's target, an elapsed timeout fails over to the next
+    /// target (the timeout error is retryable). For `stream:true` requests
+    /// it is also the fallback streaming budget when `stream_timeout` is
+    /// unset (see [`Model::stream_timeout_effective`]). Mirrors LiteLLM's
+    /// `timeout`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
+
+    /// Streaming read timeout in ms — the maximum gap the gateway waits
+    /// for the next upstream chunk on a `stream:true` call, applied to the
+    /// first chunk and to every inter-chunk gap. A positive value bounds
+    /// each chunk wait; `0` or absent means "no streaming-specific
+    /// override", so the effective streaming budget falls back to `timeout`
+    /// (see [`Model::stream_timeout_effective`]) — set `timeout` to `0` too
+    /// to disable streaming timeouts entirely. A *first-chunk* timeout
+    /// fails over to the next target (before any bytes reach the client); a
+    /// *mid-stream* timeout terminates the stream like any other upstream
+    /// error. Mirrors LiteLLM's `stream_timeout`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_timeout: Option<u64>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
@@ -291,6 +310,39 @@ impl Model {
     pub fn upstream_model(&self) -> Option<&str> {
         self.model_name.as_deref()
     }
+
+    /// Non-streaming request deadline derived from `timeout`. Folds the
+    /// `0`/absent "no timeout" sentinel into `None` so callers can apply
+    /// it unconditionally with `if let Some(d) = ...`.
+    pub fn request_timeout(&self) -> Option<std::time::Duration> {
+        self.timeout
+            .filter(|&ms| ms > 0)
+            .map(std::time::Duration::from_millis)
+    }
+
+    /// Streaming per-chunk read deadline derived from `stream_timeout`.
+    /// Same `0`/absent → `None` folding as [`Model::request_timeout`].
+    pub fn stream_read_timeout(&self) -> Option<std::time::Duration> {
+        self.stream_timeout
+            .filter(|&ms| ms > 0)
+            .map(std::time::Duration::from_millis)
+    }
+
+    /// Effective deadline for a streaming request: a positive
+    /// `stream_timeout`, otherwise the non-streaming `timeout`. Mirrors
+    /// LiteLLM's `Router._get_timeout`, which uses `stream_timeout` for
+    /// stream calls and falls back to the general `timeout`. Applied to the
+    /// connect phase, the per-chunk read timeout, and the first-chunk
+    /// failover gate. Because `stream_read_timeout()` folds `0` to `None`,
+    /// `stream_timeout: 0` is treated the same as absent — it falls back to
+    /// `timeout` rather than disabling the streaming timeout. `None` (both
+    /// unset or `0`) = no streaming timeout. Note: a model that sets only a
+    /// small `timeout` therefore also gets that value as its streaming
+    /// budget.
+    pub fn stream_timeout_effective(&self) -> Option<std::time::Duration> {
+        self.stream_read_timeout()
+            .or_else(|| self.request_timeout())
+    }
 }
 
 impl Resource for Model {
@@ -334,6 +386,76 @@ mod tests {
         );
         assert_eq!(m.timeout, Some(30_000));
         assert_eq!(m.rate_limit.as_ref().unwrap().rpm, Some(100));
+    }
+
+    #[test]
+    fn deserialises_stream_timeout_and_helpers_fold_zero() {
+        let m: Model = serde_json::from_str(
+            r#"{
+              "display_name": "my-gpt4",
+              "provider": "openai",
+              "model_name": "gpt-4o",
+              "provider_key_id": "pk-1",
+              "timeout": 30000,
+              "stream_timeout": 2500
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(m.stream_timeout, Some(2_500));
+        assert_eq!(
+            m.request_timeout(),
+            Some(std::time::Duration::from_millis(30_000))
+        );
+        assert_eq!(
+            m.stream_read_timeout(),
+            Some(std::time::Duration::from_millis(2_500))
+        );
+
+        // Absent → None.
+        let none: Model = serde_json::from_str(
+            r#"{"display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1"}"#,
+        )
+        .unwrap();
+        assert_eq!(none.request_timeout(), None);
+        assert_eq!(none.stream_read_timeout(), None);
+
+        // Explicit 0 is the "no timeout" sentinel → None.
+        let zero: Model = serde_json::from_str(
+            r#"{"display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1","timeout":0,"stream_timeout":0}"#,
+        )
+        .unwrap();
+        assert_eq!(zero.request_timeout(), None);
+        assert_eq!(zero.stream_read_timeout(), None);
+
+        // stream_timeout_effective cascade: prefer stream_timeout when set.
+        assert_eq!(
+            m.stream_timeout_effective(),
+            Some(std::time::Duration::from_millis(2_500))
+        );
+        // Falls back to `timeout` when stream_timeout is absent.
+        let timeout_only: Model = serde_json::from_str(
+            r#"{"display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1","timeout":5000}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            timeout_only.stream_timeout_effective(),
+            Some(std::time::Duration::from_millis(5_000))
+        );
+        // None when neither is set, and when both are the 0 sentinel.
+        assert_eq!(none.stream_timeout_effective(), None);
+        assert_eq!(zero.stream_timeout_effective(), None);
+
+        // Explicit `stream_timeout: 0` folds to absent → falls back to
+        // `timeout` (matches LiteLLM's falsy 0), not "disable streaming".
+        let stream_zero_timeout_set: Model = serde_json::from_str(
+            r#"{"display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1","timeout":5000,"stream_timeout":0}"#,
+        )
+        .unwrap();
+        assert_eq!(stream_zero_timeout_set.stream_read_timeout(), None);
+        assert_eq!(
+            stream_zero_timeout_set.stream_timeout_effective(),
+            Some(std::time::Duration::from_millis(5_000))
+        );
     }
 
     #[test]

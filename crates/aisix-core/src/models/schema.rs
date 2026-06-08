@@ -134,6 +134,7 @@ fn model_schema() -> Value {
             "model_name":      { "type": "string", "minLength": 1 },
             "provider_key_id": { "type": "string", "minLength": 1 },
             "timeout":         { "type": "integer", "minimum": 0 },
+            "stream_timeout":  { "type": "integer", "minimum": 0 },
             "rate_limit":      { "$ref": "#/$defs/rate_limit" },
             "routing": {
                 "type": "object",

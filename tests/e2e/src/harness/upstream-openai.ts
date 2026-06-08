@@ -6,8 +6,15 @@ export interface OpenAiUpstreamOptions {
   nonStreamBody?: unknown;
   /** Sequence of SSE event payloads (already-stringified JSON or `[DONE]`). */
   streamEvents?: string[];
-  /** Inserted before the response is written. */
+  /** Inserted before the response is written (delays status + headers). */
   responseDelayMs?: number;
+  /**
+   * Inserted AFTER the SSE headers are flushed but BEFORE the first event.
+   * Models "connection + headers fast, first token slow", i.e. the TTFT
+   * timeout scenario (#554). Distinct from `responseDelayMs` (delays the
+   * headers too) and `eventDelayMs` (only applies between events).
+   */
+  firstEventDelayMs?: number;
   /** Inserted between SSE events. */
   eventDelayMs?: number;
   /** Status code to return (default 200). */
@@ -37,6 +44,8 @@ export interface OpenAiUpstreamStep {
   nonStreamBody?: unknown;
   streamEvents?: string[];
   responseDelayMs?: number;
+  /** See `OpenAiUpstreamOptions.firstEventDelayMs`. */
+  firstEventDelayMs?: number;
   eventDelayMs?: number;
   status?: number;
   errorBody?: unknown;
@@ -74,6 +83,12 @@ export async function startOpenAiUpstream(
   let requestIndex = 0;
 
   const server: Server = createServer((req, res) => {
+    // When the gateway abandons a slow upstream (e.g. a #554 request/stream
+    // timeout fires and the client connection is dropped), a later
+    // `res.write`/`res.end` here would emit an error on a closed socket.
+    // Swallow it so a deliberately-slow mock can't surface as an unhandled
+    // exception that fails the run.
+    res.on("error", () => {});
     let raw = "";
     req.on("data", (c: Buffer) => (raw += c.toString("utf8")));
     req.on("end", async () => {
@@ -110,8 +125,17 @@ export async function startOpenAiUpstream(
         res.statusCode = 200;
         res.setHeader("content-type", "text/event-stream");
         res.setHeader("cache-control", "no-cache");
+        // Flush the 200 + headers immediately so the gateway's connect
+        // phase completes fast; `firstEventDelayMs` then models a slow
+        // first token (TTFT timeout) independently of the headers (#554).
+        res.flushHeaders();
+        if (step.firstEventDelayMs) await sleep(step.firstEventDelayMs);
         const events = step.streamEvents ?? [];
         for (let i = 0; i < events.length; i++) {
+          // The gateway may have abandoned a stalled stream (#554 read
+          // timeout) and closed the connection; stop writing rather than
+          // throwing on a dead socket.
+          if (res.writableEnded || res.destroyed) return;
           if (
             step.disconnectAfterEvents !== undefined &&
             i >= step.disconnectAfterEvents
@@ -122,7 +146,7 @@ export async function startOpenAiUpstream(
           res.write(`data: ${events[i]}\n\n`);
           if (step.eventDelayMs) await sleep(step.eventDelayMs);
         }
-        res.end();
+        if (!res.writableEnded && !res.destroyed) res.end();
         return;
       }
 
