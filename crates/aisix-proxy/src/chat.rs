@@ -2419,9 +2419,24 @@ where
                                     aisix_gateway::ChatResponse {
                                         id: comp.provider_request_id.clone(),
                                         model: comp.provider_model_version.clone(),
-                                        message: aisix_gateway::ChatMessage::assistant(
-                                            window_buf.clone(),
-                                        ),
+                                        // Fold tool-call text into the window
+                                        // scan (#558) so a blocked tool-call
+                                        // arg is caught BEFORE this window's
+                                        // held events (which include the
+                                        // tool-call chunks) are released —
+                                        // otherwise Window mode would leak
+                                        // tool-call args ahead of the
+                                        // end-of-stream check.
+                                        message: aisix_gateway::ChatMessage::assistant({
+                                            let w = window_buf.clone();
+                                            match tool_calls_buf.as_deref() {
+                                                Some(tc) if !tc.is_empty() && !w.is_empty() => {
+                                                    format!("{w}\n{tc}")
+                                                }
+                                                Some(tc) if !tc.is_empty() => tc.to_string(),
+                                                _ => w,
+                                            }
+                                        }),
                                         finish_reason: aisix_gateway::FinishReason::Stop,
                                         usage: aisix_gateway::UsageStats::new(
                                             comp.prompt_tokens,

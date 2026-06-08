@@ -1976,6 +1976,84 @@ data: [DONE]\n\n";
         );
     }
 
+    /// #448 parity (streaming): the chat streaming output guardrail buffered
+    /// only `delta.content`, so a blocked literal in a tool-call's `arguments`
+    /// leaked (chat non-streaming + /v1/messages streaming already scan tool
+    /// calls). With the fix, tool-call name + arguments are scanned at
+    /// end-of-stream; a blocked literal blocks the stream (error frame) and is
+    /// held back (never on the wire) under the default BufferFull policy.
+    #[tokio::test]
+    async fn streaming_output_guardrail_blocks_tool_call_arguments() {
+        let upstream = MockServer::start().await;
+        let c1 = serde_json::json!({"id":"up-1","model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]});
+        // Tool-call delta carrying the forbidden literal in `arguments` — the
+        // pre-fix path never scanned this.
+        let c2 = serde_json::json!({"id":"up-1","model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"secret-string\"}"}}]},"finish_reason":null}]});
+        let c3 = serde_json::json!({"id":"up-1","model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]});
+        let sse = format!("data: {c1}\n\ndata: {c2}\n\ndata: {c3}\n\ndata: [DONE]\n\n");
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+        seed_guardrail(
+            &state.snapshot,
+            "g-stream-tc",
+            r#"{"name":"stream-tc-guard","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"secret-string"}]}"#,
+        );
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut wire = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            wire.extend_from_slice(chunk.unwrap().as_ref());
+        }
+        let wire_str = String::from_utf8(wire).expect("SSE bytes are utf8");
+
+        assert!(
+            !wire_str.contains("secret-string"),
+            "tool-call arguments leaked despite output block; got:\n{wire_str}"
+        );
+        assert!(
+            wire_str.contains("event: error"),
+            "blocked stream must emit `event: error`; got:\n{wire_str}"
+        );
+        let idx = wire_str
+            .find("event: error\n")
+            .expect("error event present");
+        let data_line = wire_str[idx..]
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .expect("error event followed by a data line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&data_line["data: ".len()..]).expect("valid error envelope");
+        assert_eq!(parsed["error"]["type"], "content_filter");
+    }
+
     /// P2 (#379): like the keyword guardrail above (which now holds back by
     /// default, #466), `azure_content_safety_text_moderation` keeps offending
     /// content off the wire — here via the configurable `Window` policy
