@@ -1573,12 +1573,15 @@ fn build_tool_config(req: &ChatFormat) -> Option<ToolConfiguration> {
         if let Some(description) = function.get("description").and_then(|v| v.as_str()) {
             spec = spec.description(description);
         }
-        // OpenAI `parameters` is a JSON Schema object; default to an empty
-        // object schema for a no-argument tool.
-        let parameters = function
-            .get("parameters")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+        // OpenAI `parameters` is a JSON Schema object. Default to an empty
+        // object schema when omitted; skip the tool if `parameters` is
+        // present but not an object — a non-object schema is malformed and
+        // Bedrock would reject the whole Converse request with a 400.
+        let parameters = match function.get("parameters") {
+            Some(p) if p.is_object() => p.clone(),
+            Some(_) => continue,
+            None => serde_json::json!({"type": "object", "properties": {}}),
+        };
         spec = spec.input_schema(ToolInputSchema::Json(json_to_document(&parameters)));
         if let Ok(spec) = spec.build() {
             tools.push(Tool::ToolSpec(spec));
@@ -3332,6 +3335,163 @@ mod tests {
                 .and_then(|f| f.get("arguments"))
                 .and_then(|v| v.as_str()),
             Some("{\"location\":\"Paris\"}")
+        );
+    }
+
+    #[test]
+    fn emit_converse_chunk_tool_call_index_is_dense_despite_leading_text() {
+        // The headline streaming claim: a leading text block (contentBlockIndex
+        // 0) must NOT shift the first tool call's OpenAI index, and parallel
+        // tool calls must get dense 0-based indices (0, 1) — not their raw
+        // Converse block indices (1, 2).
+        use aws_sdk_bedrockruntime::types::{
+            ContentBlockDeltaEvent, ContentBlockStartEvent, ToolUseBlockDelta, ToolUseBlockStart,
+        };
+        let mut emitted_role = false;
+        let mut tool_blocks: Vec<i32> = Vec::new();
+
+        // A text block streams first at contentBlockIndex 0.
+        let text = ConverseStreamOutput::ContentBlockDelta(
+            ContentBlockDeltaEvent::builder()
+                .content_block_index(0)
+                .delta(ContentBlockDelta::Text("Let me check. ".to_string()))
+                .build()
+                .unwrap(),
+        );
+        let chunks = emit_converse_chunk(text, "m", &mut emitted_role, &mut tool_blocks);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].delta.content.as_deref(), Some("Let me check. "));
+
+        // Two tool-use blocks open at contentBlockIndex 1 and 2.
+        let mut open_indices = Vec::new();
+        for (block_index, id) in [(1, "tu_a"), (2, "tu_b")] {
+            let start = ConverseStreamOutput::ContentBlockStart(
+                ContentBlockStartEvent::builder()
+                    .content_block_index(block_index)
+                    .start(ContentBlockStart::ToolUse(
+                        ToolUseBlockStart::builder()
+                            .tool_use_id(id)
+                            .name("get_weather")
+                            .build()
+                            .unwrap(),
+                    ))
+                    .build()
+                    .unwrap(),
+            );
+            let chunks = emit_converse_chunk(start, "m", &mut emitted_role, &mut tool_blocks);
+            open_indices.push(
+                chunks[0].delta.tool_calls.as_ref().unwrap()[0]["index"]
+                    .as_i64()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            open_indices,
+            vec![0, 1],
+            "tool calls must get dense 0-based indices despite the leading text block at index 0"
+        );
+
+        // An arguments fragment on block 2 must correlate to dense index 1.
+        let frag = ConverseStreamOutput::ContentBlockDelta(
+            ContentBlockDeltaEvent::builder()
+                .content_block_index(2)
+                .delta(ContentBlockDelta::ToolUse(
+                    ToolUseBlockDelta::builder().input("{}").build().unwrap(),
+                ))
+                .build()
+                .unwrap(),
+        );
+        let chunks = emit_converse_chunk(frag, "m", &mut emitted_role, &mut tool_blocks);
+        assert_eq!(
+            chunks[0].delta.tool_calls.as_ref().unwrap()[0]["index"].as_i64(),
+            Some(1),
+            "the second tool call's argument fragments must carry dense index 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_converse_preserves_prose_alongside_tool_calls() {
+        // When a Converse response carries BOTH a text block and a toolUse
+        // block, the assistant `content` must be preserved (non-null)
+        // alongside tool_calls — the OpenAI prose-plus-tool_calls shape.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": {"message": {"role": "assistant", "content": [
+                    {"text": "On it."},
+                    {"toolUse": {
+                        "toolUseId": "tu_1",
+                        "name": "get_weather",
+                        "input": {"location": "Paris"}
+                    }}
+                ]}},
+                "stopReason": "tool_use",
+                "usage": {"inputTokens": 9, "outputTokens": 4, "totalTokens": 13},
+                "metrics": {"latencyMs": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-llama", vec![ChatMessage::user("weather in Paris?")]);
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+
+        assert_eq!(
+            chat.message.content.as_deref(),
+            Some("On it."),
+            "prose must be preserved as content when tool_calls are also present"
+        );
+        let tool_calls = chat
+            .message
+            .extra
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .expect("tool_calls must be present");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(chat.finish_reason, FinishReason::ToolCalls);
+    }
+
+    #[tokio::test]
+    async fn chat_converse_skips_tool_with_non_object_parameters() {
+        // A malformed tool (non-object `parameters`) must be skipped rather
+        // than forwarded as an invalid inputSchema that Bedrock would 400 on;
+        // a valid sibling tool still goes through.
+        let req: ChatFormat = serde_json::from_value(serde_json::json!({
+            "model": "my-llama",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {"type": "function", "function": {"name": "bad", "parameters": 42}},
+                {"type": "function", "function": {
+                    "name": "good",
+                    "parameters": {"type": "object", "properties": {}}
+                }}
+            ],
+        }))
+        .expect("request deserializes");
+        let body = capture_converse_body(&req).await;
+        let tools = body
+            .get("toolConfig")
+            .and_then(|c| c.get("tools"))
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("toolConfig.tools must be present; body={body}"));
+        assert_eq!(
+            tools.len(),
+            1,
+            "the malformed tool must be skipped; body={body}"
+        );
+        assert_eq!(
+            tools[0]
+                .get("toolSpec")
+                .and_then(|s| s.get("name"))
+                .and_then(|v| v.as_str()),
+            Some("good"),
         );
     }
 
