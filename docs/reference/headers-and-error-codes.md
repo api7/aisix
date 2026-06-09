@@ -33,6 +33,8 @@ Current proxy error `type` values include:
 
 These values appear in the proxy's OpenAI-compatible error envelope.
 
+Some errors also set a machine-readable `code` alongside `type`. Notably, a request rejected by a model's [`allowed_cidrs`](../configuration/models.md#ip-access-control) IP allowlist returns `type: permission_denied` with `code: ip_restricted` and HTTP `403`.
+
 This list covers gateway-generated errors on the OpenAI-shape proxy endpoints. Two surfaces are exceptions:
 
 - `POST /v1/messages` — uses the Anthropic-shape envelope with its own type-string set. See [Anthropic Messages — Error Shape](../integration/anthropic-messages.md#error-shape).
@@ -42,7 +44,7 @@ This list covers gateway-generated errors on the OpenAI-shape proxy endpoints. T
 
 - `400` invalid request
 - `401` missing or invalid caller auth
-- `403` model not allowed for the key
+- `403` model not allowed for the key, or client IP outside the model's `allowed_cidrs` allowlist (`code: ip_restricted`)
 - `404` model alias not found
 - `422` content blocked by policy
 - `429` rate limit or budget rejection

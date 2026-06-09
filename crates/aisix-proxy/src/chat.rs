@@ -714,6 +714,11 @@ async fn dispatch(
         return Err(with_model(ProxyError::ModelForbidden(req.model.clone())));
     }
 
+    // Client-IP allowlist gate (#557): reject before any guardrail / upstream
+    // work when the resolved source IP is outside the model's allowed_cidrs.
+    crate::dispatch::check_ip_access(&virtual_entry.value, &client.source_ip)
+        .map_err(with_model)?;
+
     // Resolve the per-request guardrail chain from the index.
     // Done once here; `resolved_chain` is reused for both the input
     // check below, the output check later, and the streaming output

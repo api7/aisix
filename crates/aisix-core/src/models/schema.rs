@@ -135,6 +135,11 @@ fn model_schema() -> Value {
             "provider_key_id": { "type": "string", "minLength": 1 },
             "timeout":         { "type": "integer", "minimum": 0 },
             "stream_timeout":  { "type": "integer", "minimum": 0 },
+            // Client-IP allowlist (#557). Permitted on both direct and
+            // routing models — the gate binds to whichever model the client
+            // names, so a Model Group can be IP-restricted too. CIDR format
+            // is validated by cp-api on write; the DP skips malformed entries.
+            "allowed_cidrs":   { "type": "array", "items": { "type": "string", "minLength": 1 } },
             "rate_limit":      { "$ref": "#/$defs/rate_limit" },
             "routing": {
                 "type": "object",
@@ -809,6 +814,31 @@ mod tests {
             }
         });
         validate_model(&v).unwrap();
+    }
+
+    #[test]
+    fn model_allowed_cidrs_passes_on_direct_and_routing() {
+        // Direct model with an IP allowlist (#557).
+        let direct = json!({
+            "display_name": "ip-restricted",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111",
+            "allowed_cidrs": ["10.0.0.0/8", "2001:db8::/32"]
+        });
+        validate_model(&direct).unwrap();
+
+        // Routing (Model Group) model can also be IP-restricted — the gate
+        // binds to the requested model name regardless of its shape.
+        let routing = json!({
+            "display_name": "router-restricted",
+            "routing": {
+                "strategy": "failover",
+                "targets": [{"model": "my-gpt4"}]
+            },
+            "allowed_cidrs": ["10.0.0.0/8"]
+        });
+        validate_model(&routing).unwrap();
     }
 
     #[test]

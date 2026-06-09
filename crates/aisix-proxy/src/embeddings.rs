@@ -125,7 +125,7 @@ pub async fn embeddings(
     };
     let model_name = body.model.clone();
 
-    match dispatch(&state, &auth, body, &request_id).await {
+    match dispatch(&state, &auth, body, &request_id, &client.source_ip).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             let status = 200u16;
@@ -223,6 +223,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     body: EmbeddingRequestBody,
     request_id: &str,
+    source_ip: &str,
 ) -> Result<EmbedDispatchSuccess, ProxyError> {
     let snapshot = state.snapshot.load();
 
@@ -234,6 +235,9 @@ async fn dispatch(
     if !auth.key().can_access(&body.model) {
         return Err(ProxyError::ModelForbidden(body.model.clone()));
     }
+
+    // Client-IP allowlist gate (#557): reject before guardrails / upstream.
+    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
 
     let model = &model_entry.value;
     let provider = crate::dispatch::require_provider(model)?;

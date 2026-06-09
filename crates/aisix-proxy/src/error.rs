@@ -148,6 +148,13 @@ pub enum ProxyError {
     ModelNotFound(String),
     #[error("API key is not allowed to use model {0:?}")]
     ModelForbidden(String),
+    /// The resolved client IP is outside the model's `allowed_cidrs`
+    /// allowlist (#557). Caller-visible message is intentionally generic and
+    /// MUST NOT echo the configured CIDR ranges — handing back the allowlist
+    /// lets a probe enumerate it (mirrors the #153 guardrail-redaction rule).
+    /// The model name rides along for operator logs only.
+    #[error("Access denied: your client IP is not allowed to access this model")]
+    ModelIpRestricted(String),
     #[error("request payload is invalid: {0}")]
     InvalidRequest(String),
     #[error("no bridge registered for provider")]
@@ -202,6 +209,7 @@ impl ProxyError {
         match self {
             ProxyError::MissingAuth | ProxyError::InvalidApiKey => StatusCode::UNAUTHORIZED,
             ProxyError::ModelForbidden(_) => StatusCode::FORBIDDEN,
+            ProxyError::ModelIpRestricted(_) => StatusCode::FORBIDDEN,
             ProxyError::ModelNotFound(_) => StatusCode::NOT_FOUND,
             ProxyError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             ProxyError::ProviderUnavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -220,6 +228,7 @@ impl ProxyError {
         match self {
             ProxyError::MissingAuth | ProxyError::InvalidApiKey => "invalid_api_key",
             ProxyError::ModelForbidden(_) => "permission_denied",
+            ProxyError::ModelIpRestricted(_) => "permission_denied",
             ProxyError::ModelNotFound(_) => "model_not_found",
             ProxyError::InvalidRequest(_) => "invalid_request_error",
             ProxyError::RequestTooLarge { .. } => "invalid_request_error",
@@ -282,6 +291,10 @@ impl ProxyError {
         let env = ErrorEnvelope::new(self.to_string(), self.kind());
         match self {
             ProxyError::BudgetExceeded(r) => env.with_code("budget_exceeded").with_budget(r),
+            // Stable machine-readable code for SDKs to branch on, distinct
+            // from the generic `permission_denied` type shared with
+            // ModelForbidden (#557 AC-1).
+            ProxyError::ModelIpRestricted(_) => env.with_code("ip_restricted"),
             _ => env,
         }
     }
@@ -508,6 +521,20 @@ mod tests {
     }
 
     #[test]
+    fn model_ip_restricted_is_403_with_ip_restricted_code() {
+        let e = ProxyError::ModelIpRestricted("gpt-4o".into());
+        assert_eq!(e.status(), StatusCode::FORBIDDEN);
+        assert_eq!(e.kind(), "permission_denied");
+        let json = serde_json::to_value(e.envelope()).unwrap();
+        assert_eq!(json["error"]["type"], "permission_denied");
+        assert_eq!(json["error"]["code"], "ip_restricted");
+        // Message must stay generic — never echo the configured CIDR list.
+        let msg = json["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("not allowed to access this model"));
+        assert!(!msg.contains("gpt-4o"));
+    }
+
+    #[test]
     fn bridge_error_inherits_status_and_type() {
         let bridge_err = BridgeError::upstream_status(429, "rate limited");
         let wrapped = ProxyError::Bridge(bridge_err);
@@ -651,6 +678,13 @@ mod tests {
     #[tokio::test]
     async fn anthropic_envelope_403_maps_to_permission_error() {
         let err = ProxyError::ModelForbidden("gpt-4o".into());
+        let resp = err.into_anthropic_response();
+        assert_anthropic_envelope(resp, StatusCode::FORBIDDEN, "permission_error").await;
+    }
+
+    #[tokio::test]
+    async fn anthropic_envelope_403_ip_restricted_maps_to_permission_error() {
+        let err = ProxyError::ModelIpRestricted("claude-sonnet-4-5".into());
         let resp = err.into_anthropic_response();
         assert_anthropic_envelope(resp, StatusCode::FORBIDDEN, "permission_error").await;
     }

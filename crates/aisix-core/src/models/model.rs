@@ -269,6 +269,17 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
 
+    /// Client-IP allowlist in CIDR notation (IPv4/IPv6). Applies to both
+    /// direct and routing models — the gate binds to whichever model the
+    /// client names, so a Model Group can be IP-restricted too. Absent or
+    /// empty = no restriction (all clients allowed). When non-empty, a request
+    /// whose resolved client IP falls outside every range is rejected with 403
+    /// before the request is dispatched upstream (api7/AISIX-Cloud#557). The
+    /// resolved client IP honours the gateway's `proxy.real_ip` trusted-proxy
+    /// config (X-Forwarded-For), so the check works behind a load balancer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_cidrs: Option<Vec<String>>,
+
     /// Virtual-router config. When set, the proxy walks `routing.targets`
     /// to pick a downstream Model and dispatches against THAT model's
     /// `provider` / `model_name` / `provider_key_id`. The fields on
@@ -339,6 +350,29 @@ impl Model {
     pub fn stream_timeout_effective(&self) -> Option<std::time::Duration> {
         self.stream_read_timeout()
             .or_else(|| self.request_timeout())
+    }
+
+    /// Whether a client at `source_ip` may access this model (#557).
+    ///
+    /// Returns `true` when no `allowed_cidrs` restriction is configured (the
+    /// common case). When a restriction is set, returns `true` only if
+    /// `source_ip` parses as an IP address contained in at least one range.
+    /// Malformed CIDR entries are skipped; an empty or unparseable `source_ip`
+    /// against a configured restriction returns `false` (fail closed) so an
+    /// unattributable request can never slip past an allowlist.
+    pub fn ip_allowed(&self, source_ip: &str) -> bool {
+        let ranges = match self.allowed_cidrs.as_deref() {
+            Some(r) if !r.is_empty() => r,
+            _ => return true,
+        };
+        let ip: std::net::IpAddr = match source_ip.parse() {
+            Ok(ip) => ip,
+            Err(_) => return false,
+        };
+        ranges
+            .iter()
+            .filter_map(|cidr| cidr.parse::<ipnet::IpNet>().ok())
+            .any(|net| net.contains(&ip))
     }
 }
 
@@ -465,6 +499,64 @@ mod tests {
             }"#,
         );
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn ip_allowed_matrix() {
+        fn model_with(cidrs: Option<Vec<&str>>) -> Model {
+            let mut m: Model = serde_json::from_str(sample_json()).unwrap();
+            m.allowed_cidrs = cidrs.map(|c| c.into_iter().map(String::from).collect());
+            m
+        }
+
+        // No restriction → everything allowed.
+        let open = model_with(None);
+        assert!(open.ip_allowed("203.0.113.7"));
+        assert!(open.ip_allowed("")); // even an unresolved IP
+
+        // Empty list behaves like no restriction.
+        assert!(model_with(Some(vec![])).ip_allowed("203.0.113.7"));
+
+        // IPv4 allowlist: in-range allowed, out-of-range denied.
+        let v4 = model_with(Some(vec!["10.0.0.0/8", "192.168.1.0/24"]));
+        assert!(v4.ip_allowed("10.1.2.3"));
+        assert!(v4.ip_allowed("192.168.1.42"));
+        assert!(!v4.ip_allowed("114.114.114.114"));
+        assert!(!v4.ip_allowed("192.168.2.1"));
+
+        // Fail closed: a restriction set but the client IP is empty/garbage.
+        assert!(!v4.ip_allowed(""));
+        assert!(!v4.ip_allowed("not-an-ip"));
+
+        // IPv6 allowlist.
+        let v6 = model_with(Some(vec!["2001:db8::/32"]));
+        assert!(v6.ip_allowed("2001:db8::1"));
+        assert!(!v6.ip_allowed("2001:db9::1"));
+
+        // Malformed CIDR entries are skipped, valid ones still apply.
+        let mixed = model_with(Some(vec!["garbage", "10.0.0.0/8"]));
+        assert!(mixed.ip_allowed("10.0.0.1"));
+        assert!(!mixed.ip_allowed("203.0.113.1"));
+    }
+
+    #[test]
+    fn deserialises_allowed_cidrs() {
+        let m: Model = serde_json::from_str(
+            r#"{"display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1","allowed_cidrs":["10.0.0.0/8"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m.allowed_cidrs.as_deref(),
+            Some(&["10.0.0.0/8".to_string()][..])
+        );
+
+        // Absent field → None → no restriction.
+        let none: Model = serde_json::from_str(
+            r#"{"display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1"}"#,
+        )
+        .unwrap();
+        assert!(none.allowed_cidrs.is_none());
+        assert!(none.ip_allowed("203.0.113.7"));
     }
 
     #[test]

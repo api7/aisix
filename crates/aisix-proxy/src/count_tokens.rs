@@ -49,6 +49,7 @@ use serde_json::Value;
 use std::time::{Duration, Instant};
 
 use crate::auth::AuthenticatedKey;
+use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::messages::ANTHROPIC_VERSION;
 use crate::request_id::new_request_id;
@@ -57,6 +58,7 @@ use crate::state::ProxyState;
 pub async fn count_tokens(
     State(state): State<ProxyState>,
     auth: Result<AuthenticatedKey, ProxyError>,
+    client: ClientContext,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     // Auth / body-extractor rejections must render the Anthropic-shape
@@ -89,7 +91,7 @@ pub async fn count_tokens(
         .unwrap_or("")
         .to_string();
 
-    match dispatch(&state, &auth, &body, &request_id).await {
+    match dispatch(&state, &auth, &body, &request_id, &client.source_ip).await {
         Ok((resp, provider)) => {
             let elapsed = started.elapsed();
             let status = resp.status().as_u16();
@@ -140,6 +142,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     body: &Value,
     request_id: &str,
+    source_ip: &str,
 ) -> Result<(Response, String), ProxyError> {
     let snapshot = state.snapshot.load();
 
@@ -157,6 +160,9 @@ async fn dispatch(
     if !auth.key().can_access(&model_name) {
         return Err(ProxyError::ModelForbidden(model_name.clone()));
     }
+
+    // Client-IP allowlist gate (#557): reject before quota / upstream.
+    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);

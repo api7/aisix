@@ -69,7 +69,7 @@ pub async fn rerank(
         .unwrap_or("")
         .to_string();
 
-    match dispatch(&state, &auth, &mut body, &request_id).await {
+    match dispatch(&state, &auth, &mut body, &request_id, &client.source_ip).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
@@ -161,6 +161,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     body: &mut Value,
     request_id: &str,
+    source_ip: &str,
 ) -> Result<RerankDispatchSuccess, ProxyError> {
     let snapshot = state.snapshot.load();
 
@@ -178,6 +179,9 @@ async fn dispatch(
     if !auth.key().can_access(&model_name) {
         return Err(ProxyError::ModelForbidden(model_name.clone()));
     }
+
+    // Client-IP allowlist gate (#557): reject before guardrails / upstream.
+    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
 
     // #545: /v1/rerank must run input guardrails. Before this it forwarded
     // the user `query` + `documents` with no configured content/DLP check,

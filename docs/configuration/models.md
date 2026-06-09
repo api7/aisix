@@ -31,6 +31,7 @@ Optional fields include:
 - `timeout`
 - `stream_timeout`
 - `rate_limit`
+- `allowed_cidrs`
 - `cost`
 - `cooldown`
 - `background_model_check`
@@ -103,6 +104,32 @@ An elapsed timeout surfaces as a retryable upstream failure (HTTP `504`), so on 
 A timeout also feeds [Cooldown](#cooldown) (`trigger_on_timeout`), so a repeatedly-slow target is taken out of rotation for subsequent requests.
 
 > A small `timeout` set for non-streaming traffic also becomes the streaming read budget when `stream_timeout` is unset. Set `stream_timeout` explicitly if streaming needs a different budget.
+
+### IP Access Control
+
+`allowed_cidrs` restricts which client source IPs may use a model. It is an optional list of CIDR ranges (IPv4 or IPv6); when present and non-empty, a request whose resolved client IP is outside every range is rejected with HTTP `403` **before** the upstream is contacted. Absent or empty means no restriction (all clients allowed).
+
+```json title="Model with an IP allowlist"
+{
+  "allowed_cidrs": ["10.0.0.0/8", "192.168.0.0/16", "2001:db8::/32"]
+}
+```
+
+The rejection uses the OpenAI error shape with a stable `code`:
+
+```json
+{
+  "error": {
+    "message": "Access denied: your client IP is not allowed to access this model",
+    "type": "permission_denied",
+    "code": "ip_restricted"
+  }
+}
+```
+
+The check applies to every request-serving endpoint (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, images, audio, `…/count_tokens`) and to both direct and routing models — the gate binds to whichever model the client names, so a [routing model](routing-and-failover.md) can be IP-restricted too.
+
+The resolved client IP comes from the same trusted-proxy chain used for usage telemetry: configure [`proxy.real_ip`](../reference/runtime-config-schema.md) so the gateway reads the real client address from `X-Forwarded-For` when it sits behind a load balancer. Without trusted proxies configured, the immediate TCP peer is used.
 
 ### Cooldown
 

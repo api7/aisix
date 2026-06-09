@@ -71,6 +71,7 @@ pub async fn transcriptions(
         // (build_v1_url) owns the `/v1` prefix.
         "/audio/transcriptions",
         &request_id,
+        &client.source_ip,
     )
     .await
     {
@@ -143,6 +144,7 @@ pub async fn translations(
         // (build_v1_url) owns the `/v1` prefix.
         "/audio/translations",
         &request_id,
+        &client.source_ip,
     )
     .await
     {
@@ -212,7 +214,7 @@ pub async fn speech(
         .unwrap_or("unknown")
         .to_string();
 
-    match speech_dispatch(&state, &auth, body, &request_id).await {
+    match speech_dispatch(&state, &auth, body, &request_id, &client.source_ip).await {
         Ok((resp, provider, model_id)) => {
             let elapsed = started.elapsed();
             emit_access_log(
@@ -287,6 +289,7 @@ async fn multipart_dispatch(
     mut multipart: Multipart,
     upstream_path: &str,
     request_id: &str,
+    source_ip: &str,
 ) -> Result<AudioDispatchSuccess, ProxyError> {
     // Collect all fields first so we can find `model` before building the
     // outgoing reqwest multipart.
@@ -324,6 +327,9 @@ async fn multipart_dispatch(
     if !auth.key().can_access(&model_name) {
         return Err(ProxyError::ModelForbidden(model_name.clone()));
     }
+
+    // Client-IP allowlist gate (#557): reject before quota / upstream.
+    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
 
     let model_rl =
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
@@ -459,6 +465,7 @@ async fn speech_dispatch(
     auth: &AuthenticatedKey,
     mut body: Value,
     request_id: &str,
+    source_ip: &str,
 ) -> Result<(Response, String, String), ProxyError> {
     let model_name = body
         .get("model")
@@ -475,6 +482,9 @@ async fn speech_dispatch(
     if !auth.key().can_access(&model_name) {
         return Err(ProxyError::ModelForbidden(model_name.clone()));
     }
+
+    // Client-IP allowlist gate (#557): reject before guardrails / upstream.
+    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
 
     // #545: /v1/audio/speech must run input guardrails. Before this it
     // forwarded the user `input` text (synthesized to audio) with no

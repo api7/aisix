@@ -369,6 +369,9 @@ async fn dispatch(
         return Err(ProxyError::ModelForbidden(model_name.clone()).into());
     }
 
+    // Client-IP allowlist gate (#557): reject before guardrails / upstream.
+    crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
+
     // #448 (#22): /v1/messages must run input guardrails like
     // /v1/chat/completions — previously prompts reached the upstream without
     // any content/DLP check. Translate the Anthropic-shaped body into the
