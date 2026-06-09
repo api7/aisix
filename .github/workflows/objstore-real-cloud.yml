@@ -1,0 +1,92 @@
+# Real-cloud object_store smoke e2e — credential_ref (static-key) write path
+# against REAL Amazon S3 and Google Cloud Storage.
+#
+# Runs the `objstore_smoke_s3` / `objstore_smoke_gcs` round-trips (write a batch
+# → assert exactly one object under the prefix → re-deliver the same batch →
+# assert no duplicate key → clean up) against the actual cloud APIs. These
+# complement the emulator smoke in ci.yml's unit job, which cannot exercise real
+# S3 auth or (for GCS) the real PUT path that fake-gcs-server can't round-trip.
+#
+# Gated: never runs on a normal push. Triggered manually (workflow_dispatch),
+# nightly (schedule), or on a same-repo PR labeled `objstore real cloud`. Each
+# provider's test self-skips (logged) when its secrets are absent, so an
+# unconfigured run is a green no-op.
+#
+# ── Required repository secrets ──
+#   Settings → Secrets and variables → Actions → New repository secret
+#
+#   Amazon S3 (native AWS):
+#     AISIX_E2E_OBJSTORE_S3_BUCKET             test bucket name
+#     AISIX_E2E_OBJSTORE_S3_REGION             the bucket's region, e.g. us-east-1
+#     AISIX_E2E_OBJSTORE_S3_ACCESS_KEY_ID      IAM user access key id
+#     AISIX_E2E_OBJSTORE_S3_SECRET_ACCESS_KEY  IAM user secret access key
+#     (For an S3-compatible host — MinIO / Cloudflare R2 — also set
+#      AISIX_E2E_OBJSTORE_S3_ENDPOINT.)
+#   Google Cloud Storage:
+#     AISIX_E2E_OBJSTORE_GCS_BUCKET            test bucket name
+#     AISIX_E2E_OBJSTORE_GCS_SERVICE_ACCOUNT   the full service-account key JSON
+#                                              (paste the downloaded key as one secret)
+#
+# Least privilege — scope the identity to the test bucket only:
+#   AWS:  s3:PutObject, s3:GetObject, s3:DeleteObject on arn:aws:s3:::<bucket>/*
+#         + s3:ListBucket on arn:aws:s3:::<bucket>
+#   GCS:  roles/storage.objectAdmin on the bucket
+#
+# See crates/aisix-obs/tests/real-cloud.env.example for a local-run template.
+name: objstore-real-cloud
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 0 * * *" # 00:30 UTC (08:30 Asia/Shanghai)
+  pull_request:
+    types: [labeled, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: objstore-real-cloud-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: objstore real-cloud smoke (S3 + GCS)
+    # Same-repo + label gate on PRs; always run on manual dispatch / schedule.
+    # The explicit same-repo check is defense-in-depth: plain `pull_request`
+    # withholds secrets from fork PRs by GitHub default today, but this gate
+    # keeps the credentials off fork-controlled code even if that default is
+    # ever flipped (mirrors docker-image.yml's `!= 'pull_request'` guard).
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       contains(github.event.pull_request.labels.*.name, 'objstore real cloud'))
+    runs-on: ubicloud-standard-2
+    env:
+      AISIX_E2E_OBJSTORE_S3_BUCKET: ${{ secrets.AISIX_E2E_OBJSTORE_S3_BUCKET }}
+      AISIX_E2E_OBJSTORE_S3_REGION: ${{ secrets.AISIX_E2E_OBJSTORE_S3_REGION }}
+      AISIX_E2E_OBJSTORE_S3_ENDPOINT: ${{ secrets.AISIX_E2E_OBJSTORE_S3_ENDPOINT }}
+      AISIX_E2E_OBJSTORE_S3_ACCESS_KEY_ID: ${{ secrets.AISIX_E2E_OBJSTORE_S3_ACCESS_KEY_ID }}
+      AISIX_E2E_OBJSTORE_S3_SECRET_ACCESS_KEY: ${{ secrets.AISIX_E2E_OBJSTORE_S3_SECRET_ACCESS_KEY }}
+      AISIX_E2E_OBJSTORE_GCS_BUCKET: ${{ secrets.AISIX_E2E_OBJSTORE_GCS_BUCKET }}
+      AISIX_E2E_OBJSTORE_GCS_SERVICE_ACCOUNT: ${{ secrets.AISIX_E2E_OBJSTORE_GCS_SERVICE_ACCOUNT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@v2
+      - name: Report which providers are configured
+        run: |
+          s3=0; gcs=0
+          if [ -n "$AISIX_E2E_OBJSTORE_S3_BUCKET" ]; then echo "S3: configured"; s3=1; else echo "::warning::S3 secrets absent — objstore_smoke_s3 will self-skip"; fi
+          if [ -n "$AISIX_E2E_OBJSTORE_GCS_BUCKET" ]; then echo "GCS: configured"; gcs=1; else echo "::warning::GCS secrets absent — objstore_smoke_gcs will self-skip"; fi
+          # A manual dispatch or scheduled run is deliberate — secrets are
+          # expected. Fail rather than pass green while testing nothing. PR
+          # runs may legitimately have no secrets, so they still self-skip.
+          if [ "${{ github.event_name }}" != "pull_request" ] && [ "$s3" = 0 ] && [ "$gcs" = 0 ]; then
+            echo "::error::No object_store real-cloud secrets configured; this ${{ github.event_name }} run would test nothing."
+            exit 1
+          fi
+      - name: objstore real-cloud round-trips (S3 + GCS)
+        run: cargo test -p aisix-obs -- --ignored --nocapture objstore_smoke_s3 objstore_smoke_gcs

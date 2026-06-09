@@ -974,12 +974,11 @@ mod smoke {
     }
 
     #[tokio::test]
-    #[ignore = "hits a real S3-compatible server (MinIO/LocalStack). \
+    #[ignore = "hits a real S3 or S3-compatible server (native AWS / MinIO / LocalStack). \
                 Run: docker compose -f crates/aisix-obs/tests/object-store-emulators.compose.yml up -d \
                 then AISIX_E2E_OBJSTORE_S3_* set; cargo test -p aisix-obs -- --ignored objstore_smoke_s3"]
     async fn objstore_smoke_s3_roundtrip() {
-        let (Some(endpoint), Some(bucket), Some(key_id), Some(secret)) = (
-            env("AISIX_E2E_OBJSTORE_S3_ENDPOINT"),
+        let (Some(bucket), Some(key_id), Some(secret)) = (
             env("AISIX_E2E_OBJSTORE_S3_BUCKET"),
             env("AISIX_E2E_OBJSTORE_S3_ACCESS_KEY_ID"),
             env("AISIX_E2E_OBJSTORE_S3_SECRET_ACCESS_KEY"),
@@ -987,11 +986,16 @@ mod smoke {
             eprintln!("objstore_smoke_s3: AISIX_E2E_OBJSTORE_S3_* not set — skipping");
             return;
         };
+        // endpoint optional: set it for an S3-compatible host (MinIO /
+        // LocalStack / R2 — path-style); omit it for native AWS S3
+        // (virtual-hosted, region only). region defaults to us-east-1.
+        let endpoint = env("AISIX_E2E_OBJSTORE_S3_ENDPOINT");
+        let region = env("AISIX_E2E_OBJSTORE_S3_REGION").unwrap_or_else(|| "us-east-1".to_string());
         let store = build_object_store(
             ObjectStoreProvider::S3,
             &bucket,
-            Some("us-east-1"),
-            Some(&endpoint),
+            Some(&region),
+            endpoint.as_deref(),
             ObjectStoreCredentials::S3 {
                 access_key_id: key_id,
                 secret_access_key: secret,
@@ -1037,19 +1041,21 @@ mod smoke {
                 %2F), so build + auth verify there but the PUT only greens on real GCS. \
                 cargo test -p aisix-obs -- --ignored objstore_smoke_gcs"]
     async fn objstore_smoke_gcs_roundtrip() {
-        let (Some(endpoint), Some(bucket), Some(service_account_key)) = (
-            env("AISIX_E2E_OBJSTORE_GCS_ENDPOINT"),
+        let (Some(bucket), Some(service_account_key)) = (
             env("AISIX_E2E_OBJSTORE_GCS_BUCKET"),
             env("AISIX_E2E_OBJSTORE_GCS_SERVICE_ACCOUNT"),
         ) else {
             eprintln!("objstore_smoke_gcs: AISIX_E2E_OBJSTORE_GCS_* not set — skipping");
             return;
         };
+        // GCS ignores the `endpoint` arg (an emulator base URL rides the
+        // service-account JSON's `gcs_base_url` instead), so it is not read
+        // here — native GCS needs only the bucket + service-account key.
         let store = build_object_store(
             ObjectStoreProvider::Gcs,
             &bucket,
             None,
-            Some(&endpoint),
+            None,
             ObjectStoreCredentials::Gcs {
                 service_account_key,
             },
