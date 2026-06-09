@@ -9,7 +9,7 @@ This tutorial lands the AISIX AI Gateway's per-request telemetry in Snowflake fo
 You end with an `object_store` exporter writing telemetry to your bucket, a Snowflake pipe auto-loading those files into a `VARIANT` landing table, and a SQL view that turns each request into queryable columns — model, token counts, cost, latency, cache outcome, and guardrail outcome.
 
 :::note This is the object-storage staging path, not a first-party Snowflake sink
-The `object_store` exporter is the available, shipping way to get gateway telemetry into Snowflake: the gateway writes files to a bucket you own, and you run Snowpipe — the same pattern Snowflake recommends for warehouse ingestion. A first-party Snowflake sink, where AISIX manages the pipe, schema, and exactly-once streaming for you, is on the [roadmap](../roadmap.md) (tracked in `api7/AISIX-Cloud#690`). This tutorial does not depend on it.
+The `object_store` exporter is the available, shipping way to get gateway telemetry into Snowflake: the gateway writes files to a bucket you own, and you run Snowpipe — the same pattern Snowflake recommends for warehouse ingestion. A first-party Snowflake sink, where AISIX manages the pipe, schema, and exactly-once streaming for you, is on the [roadmap](../roadmap.md). This tutorial does not depend on it.
 
 The `object_store` exporter ships **metadata only** — model, token counts, cost, latency, status, and cache/guardrail outcomes. It never writes the prompt or the response text to your bucket, so no end-user content reaches Snowflake on this path.
 :::
@@ -95,7 +95,7 @@ Confirm objects landed under the partitioned prefix:
 aws s3 ls s3://acme-aisix-events/ai-gateway/ --recursive
 ```
 
-Expected — one or more gzipped NDJSON objects under a `dt=…/hh=…` partition, each named by the SHA-256 of its contents:
+Expected — one or more gzipped NDJSON objects under a `dt=…/hh=…` partition, each named by a SHA-256 content hash:
 
 ```text
 2026-06-09 14:03:11        742 ai-gateway/dt=2026-06-09/hh=14/9f86d081884c7d659a2feaa0c55ad015.ndjson.gz
@@ -365,7 +365,7 @@ The end-to-end path is real and tested: the `object_store` sink's NDJSON encodin
 ## What just happened
 
 1. The gateway recorded one `UsageEvent` of metadata per request and handed it to the `object_store` exporter's delivery pipeline — off the request hot path, so export never adds latency to a client call.
-2. The pipeline batched events and flushed them (every 5 seconds or 100 events) as one gzipped NDJSON object, named by the SHA-256 of its contents, under `<prefix>/dt=YYYY-MM-DD/hh=HH/`.
+2. The pipeline batched events and flushed them (every 5 seconds or 100 events) as one gzipped NDJSON object, named by a SHA-256 prefix of its contents (a content address), under `<prefix>/dt=YYYY-MM-DD/hh=HH/`.
 3. The bucket emitted a create-object event (to SQS for S3, to a storage queue via Event Grid for Azure), which Snowpipe consumed and used to `COPY` the new file into the `VARIANT` landing table.
 4. The view projected the raw records into typed columns you can aggregate for cost, usage, and audit reporting.
 
@@ -400,7 +400,7 @@ curl -sS -X DELETE http://127.0.0.1:3001/admin/v1/observability_exporters/EXPORT
 - **S3-compatible stores** — point `endpoint` at MinIO or Cloudflare R2 and keep `provider: "s3"`. Snowflake also stages from those via an S3-compatible external stage.
 - **Configure it in AISIX Cloud** — instead of the self-hosted admin API, create the same `object_store` exporter from the dashboard under your environment's **Observability** section. Credentials stay on the data plane and are referenced, not stored, by the control plane; the Snowflake half of this tutorial is identical.
 - **Curated tables** — schedule a task that `MERGE`s from `gateway_events` into a typed, deduplicated model and build cost/usage rollups on top.
-- **Other warehouses and sinks** — the same `object_store` exporter feeds Databricks Auto Loader (`api7/AISIX-Cloud#380`), and the gateway also ships `aliyun_sls` and `datadog` exporters for operational logging. See [Observability exporters](../configuration/observability-exporters.md).
+- **Other warehouses and sinks** — the same `object_store` exporter feeds Databricks Auto Loader, and the gateway also ships `aliyun_sls` and `datadog` exporters for operational logging. See [Observability exporters](../configuration/observability-exporters.md).
 
 ## Related pages
 
