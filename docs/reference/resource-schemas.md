@@ -1,10 +1,10 @@
 ---
-title: Resource Schemas
+title: Resource schemas
 description: Reference for the current dynamic resource shapes used by AISIX AI Gateway.
 sidebar_position: 62
 ---
 
-## Current Dynamic Resource Types
+## Current dynamic resource types
 
 - `Model`
 - `ApiKey`
@@ -18,7 +18,7 @@ sidebar_position: 62
 
 Use this page as the schema map. Use the configuration pages when you need operator guidance and examples.
 
-## Key Schema Notes
+## Key schema notes
 
 - `Model` is either direct upstream config or a routing model, never both.
 - `Model.background_model_check` is direct-model-only.
@@ -29,14 +29,14 @@ Use this page as the schema map. Use the configuration pages when you need opera
 - `ObservabilityExporter` is discriminated by `kind` with `otlp_http`, `aliyun_sls`, `object_store`, and `datadog` shapes. `object_store` adds an `auth_mode` of `credential_ref` (default; resolved to data-plane env vars) or `cloud_identity` (keyless host identity, S3/GCS only).
 - `RateLimitPolicy` requires `name`, `scope` (`api_key` / `model` / `team` / `member`), `scope_ref`, and `window` (`second` / `minute` / `hour`); at least one of `max_requests` or `max_tokens` must be set. The standalone admin API does not currently expose CRUD routes for it — rows are written directly under the etcd `rate_limit_policies/<id>` prefix.
 
-## How To Read These Schemas
+## How to read these schemas
 
 - `Model` defines the caller-visible target contract
 - `ApiKey` defines caller identity, authorization, and some policy
 - `ProviderKey` defines upstream credential and base-url wiring
 - `Guardrail`, `CachePolicy`, and `ObservabilityExporter` are dynamic policy or telemetry resources layered onto the serving path
 
-## Runtime Versus Schema Boundary
+## Runtime versus schema boundary
 
 Not every field or shape present in the schema should be interpreted as equally broad runtime support.
 
@@ -46,7 +46,7 @@ Examples:
 - `Model.background_model_check` exists in schema, but it only applies to direct models and its runtime effect is surfaced through `/admin/v1/models/status`
 - `Guardrail.kind = bedrock` exists in schema, but current generally reliable runtime behavior is strongest on `keyword`
 
-## Related Pages
+## Related pages
 
 - [Models](../configuration/models.md)
 - [API Keys](../configuration/api-keys.md)
