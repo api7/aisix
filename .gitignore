@@ -32,3 +32,6 @@ coverage/
 .env
 .env.*
 !.env.example
+
+# Filled-in real-cloud objstore credentials (template: real-cloud.env.example)
+/crates/aisix-obs/tests/real-cloud.env
