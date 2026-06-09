@@ -6,6 +6,16 @@
     "display_name"
   ],
   "properties": {
+    "allowed_cidrs": {
+      "description": "Client-IP allowlist in CIDR notation (IPv4/IPv6). Applies to both direct and routing models — the gate binds to whichever model the client names, so a Model Group can be IP-restricted too. Absent or empty = no restriction (all clients allowed). When non-empty, a request whose resolved client IP falls outside every range is rejected with 403 before the request is dispatched upstream (api7/AISIX-Cloud#557). The resolved client IP honours the gateway's `proxy.real_ip` trusted-proxy config (X-Forwarded-For), so the check works behind a load balancer.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
     "background_model_check": {
       "description": "Optional direct-model-only background health-check configuration.",
       "anyOf": [

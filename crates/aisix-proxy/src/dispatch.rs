@@ -97,6 +97,27 @@ pub(crate) fn require_provider(model: &Model) -> Result<&str, ProxyError> {
     })
 }
 
+/// Enforce a Model's client-IP allowlist (`allowed_cidrs`, #557).
+///
+/// Called by every request-serving endpoint right after the requested Model
+/// is resolved and before any upstream dispatch, so a disallowed source IP is
+/// rejected with 403 before the provider is ever contacted (issue AC-1). For
+/// routing models the check binds to the **requested** model — the access
+/// decision belongs to the name the client asked for, not the chosen target.
+///
+/// No-op when the Model has no `allowed_cidrs` configured (the common case).
+pub(crate) fn check_ip_access(model: &Model, source_ip: &str) -> Result<(), ProxyError> {
+    if model.ip_allowed(source_ip) {
+        return Ok(());
+    }
+    tracing::warn!(
+        model = %model.display_name,
+        source_ip = %source_ip,
+        "request rejected: client IP not in model allowed_cidrs"
+    );
+    Err(ProxyError::ModelIpRestricted(model.display_name.clone()))
+}
+
 /// Required upstream model id (`model_name`) for a non-routing Model.
 pub(crate) fn require_upstream_model(model: &Model) -> Result<&str, ProxyError> {
     model.model_name.as_deref().ok_or_else(|| {

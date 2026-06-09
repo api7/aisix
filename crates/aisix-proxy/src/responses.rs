@@ -110,7 +110,7 @@ pub async fn responses(
         .unwrap_or("")
         .to_string();
 
-    match dispatch(&state, &auth, &body, &request_id).await {
+    match dispatch(&state, &auth, &body, &request_id, &client.source_ip).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
@@ -224,6 +224,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     body: &Value,
     request_id: &str,
+    source_ip: &str,
 ) -> Result<ResponseDispatchSuccess, ResponsesDispatchError> {
     let snapshot = state.snapshot.load();
 
@@ -241,6 +242,9 @@ async fn dispatch(
     if !auth.key().can_access(&model_name) {
         return Err(ProxyError::ModelForbidden(model_name.clone()).into());
     }
+
+    // Client-IP allowlist gate (#557): reject before guardrails / upstream.
+    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
 
     // #719: /v1/responses must run input guardrails like /v1/chat/completions
     // and /v1/messages. Before this, user input reached the upstream without

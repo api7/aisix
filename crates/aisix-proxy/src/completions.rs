@@ -74,7 +74,7 @@ pub async fn completions(
         .unwrap_or("unknown")
         .to_string();
 
-    match dispatch(&state, &auth, body, &request_id).await {
+    match dispatch(&state, &auth, body, &request_id, &client.source_ip).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             // Audit MEDIUM-2 on PR #426: use the actual response
@@ -169,6 +169,7 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     body: Value,
     request_id: &str,
+    source_ip: &str,
 ) -> Result<CompletionDispatchSuccess, ProxyError> {
     let model_name = body
         .get("model")
@@ -185,6 +186,9 @@ async fn dispatch(
     if !auth.key().can_access(model_name) {
         return Err(ProxyError::ModelForbidden(model_name.to_string()));
     }
+
+    // Client-IP allowlist gate (#557): reject before guardrails / upstream.
+    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
 
     // #545: /v1/completions must run input guardrails. Before this it
     // forwarded the user `prompt` to the upstream with no configured
