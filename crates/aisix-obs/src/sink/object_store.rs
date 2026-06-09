@@ -1157,12 +1157,11 @@ mod smoke {
     }
 
     #[tokio::test]
-    #[ignore = "hits a real Azure Blob emulator (Azurite). \
+    #[ignore = "hits a real Azure Blob account (or the Azurite emulator). \
                 Run with AISIX_E2E_OBJSTORE_AZURE_* set; \
                 cargo test -p aisix-obs -- --ignored objstore_smoke_azure"]
     async fn objstore_smoke_azure_roundtrip() {
-        let (Some(endpoint), Some(container), Some(account), Some(access_key)) = (
-            env("AISIX_E2E_OBJSTORE_AZURE_ENDPOINT"),
+        let (Some(container), Some(account), Some(access_key)) = (
             env("AISIX_E2E_OBJSTORE_AZURE_CONTAINER"),
             env("AISIX_E2E_OBJSTORE_AZURE_ACCOUNT"),
             env("AISIX_E2E_OBJSTORE_AZURE_ACCESS_KEY"),
@@ -1170,11 +1169,15 @@ mod smoke {
             eprintln!("objstore_smoke_azure: AISIX_E2E_OBJSTORE_AZURE_* not set — skipping");
             return;
         };
+        // endpoint optional: set it for the Azurite emulator
+        // (http://127.0.0.1:10000/devstoreaccount1); omit it for a real Azure
+        // account, where the builder derives https://<account>.blob.core.windows.net.
+        let endpoint = env("AISIX_E2E_OBJSTORE_AZURE_ENDPOINT");
         let store = build_object_store(
             ObjectStoreProvider::AzureBlob,
             &container,
             None,
-            Some(&endpoint),
+            endpoint.as_deref(),
             ObjectStoreCredentials::Azure {
                 account,
                 access_key,
