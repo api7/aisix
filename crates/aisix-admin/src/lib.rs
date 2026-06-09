@@ -53,8 +53,11 @@ pub use etcd_store::EtcdConfigStore;
 pub use state::AdminState;
 pub use store::{ConfigStore, InMemoryStore, StoreError};
 
+use aisix_core::config::PrometheusConfig;
+use aisix_obs::Metrics;
 use axum::routing::{get, post};
 use axum::{http::StatusCode, response::Response, Router};
+use std::sync::Arc;
 
 pub fn build_router(state: AdminState) -> Router {
     // Eagerly build the merged OpenAPI doc so any panic in schema
@@ -159,6 +162,44 @@ pub fn build_router(state: AdminState) -> Router {
     }
 
     router.with_state(state)
+}
+
+/// Build a minimal router for a **dedicated** Prometheus metrics
+/// listener — only the scrape endpoint at `prometheus.path`, backed by
+/// the shared [`Metrics`] handle. No admin state, no auth-protected
+/// routes, no playground.
+///
+/// `aisix-server` binds this on `observability.metrics.prometheus.addr`
+/// when that address is set. It exists because managed-mode DPs never
+/// bind the admin listener that normally hosts `/metrics`, so a separate
+/// listener is the only way they can be scraped. When the address is
+/// unset the gateway keeps `/metrics` on the admin listener and this
+/// router is not built.
+pub fn metrics_router(metrics: Arc<Metrics>, prometheus: &PrometheusConfig) -> Router {
+    Router::new()
+        .route(
+            &normalized_prometheus_path(&prometheus.path),
+            get(dedicated_metrics_handler),
+        )
+        .with_state(metrics)
+}
+
+/// Prometheus scrape handler for the dedicated metrics listener. The
+/// recorder is always present here (the handle is a required argument,
+/// unlike the admin variant's optional one), so there is no 503 branch.
+/// Emits `text/plain; version=0.0.4`.
+async fn dedicated_metrics_handler(
+    axum::extract::State(metrics): axum::extract::State<Arc<Metrics>>,
+) -> Response {
+    use axum::http::header::CONTENT_TYPE;
+    use axum::response::IntoResponse;
+
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
+        metrics.render(),
+    )
+        .into_response()
 }
 
 fn normalized_prometheus_path(path: &str) -> String {
@@ -368,6 +409,7 @@ mod tests {
             .with_prometheus_config(PrometheusConfig {
                 enabled: true,
                 path: "/internal/prom".into(),
+                addr: None,
             });
         let app = build_router(state);
 
@@ -402,6 +444,7 @@ mod tests {
             .with_prometheus_config(PrometheusConfig {
                 enabled: true,
                 path: "internal/prom".into(),
+                addr: None,
             });
         let app = build_router(state);
 
@@ -426,6 +469,7 @@ mod tests {
             .with_prometheus_config(PrometheusConfig {
                 enabled: false,
                 path: "/metrics".into(),
+                addr: None,
             });
         let app = build_router(state);
         let req = Request::builder()
@@ -433,6 +477,102 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dedicated_metrics_router_serves_scrape_decoupled_from_admin() {
+        use aisix_obs::{Metrics, RequestOutcome};
+        use std::time::Duration;
+
+        let metrics = Arc::new(Metrics::new(false));
+        metrics.record_request(
+            "openai",
+            "my-gpt4",
+            200,
+            RequestOutcome::Success,
+            Duration::from_millis(10),
+        );
+
+        let app = metrics_router(
+            metrics,
+            &PrometheusConfig {
+                enabled: true,
+                path: "/metrics".into(),
+                addr: Some("0.0.0.0:9090".into()),
+            },
+        );
+
+        // The dedicated listener serves the prometheus scrape.
+        let resp = run(
+            app.clone(),
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("text/plain"),
+            "unexpected content-type: {ct}"
+        );
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("aisix_requests_total"));
+        assert!(body.contains("provider=\"openai\""));
+
+        // It carries ONLY metrics — admin routes are not mounted on this
+        // listener, proving the scrape surface is decoupled from admin.
+        let resp = run(
+            app,
+            Request::builder()
+                .uri("/admin/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dedicated_metrics_router_honors_custom_path() {
+        use aisix_obs::Metrics;
+
+        let app = metrics_router(
+            Arc::new(Metrics::new(false)),
+            &PrometheusConfig {
+                enabled: true,
+                path: "internal/prom".into(),
+                addr: Some("0.0.0.0:9090".into()),
+            },
+        );
+
+        // Path is normalized to a leading slash and served there.
+        let resp = run(
+            app.clone(),
+            Request::builder()
+                .uri("/internal/prom")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The default `/metrics` is not mounted when a custom path is set.
+        let resp = run(
+            app,
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 

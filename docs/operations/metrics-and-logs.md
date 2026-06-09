@@ -10,9 +10,9 @@ Use them together. No single signal tells the whole story.
 
 ## Metrics
 
-`GET /metrics` on the admin listener is the default Prometheus scrape endpoint. Operators can change it with `observability.metrics.prometheus.path`, or disable the endpoint with `observability.metrics.prometheus.enabled: false`.
+`GET /metrics` is the Prometheus scrape endpoint. By default it is served on the admin listener. You can change the path with `observability.metrics.prometheus.path`, disable it with `observability.metrics.prometheus.enabled: false`, or serve it on a **dedicated listener** with `observability.metrics.prometheus.addr` (for example `0.0.0.0:9090`). A dedicated listener is what lets you scrape a Cloud managed data plane — see [Managed data plane metrics](#managed-data-plane-metrics).
 
-This endpoint is unauthenticated by design on the private admin listener.
+This endpoint is unauthenticated by design. Keep it on a private listener and restrict access at the network layer (firewall, security group, or Kubernetes NetworkPolicy).
 
 Treat `/metrics` as infrastructure-facing, not as a public diagnostics surface.
 
@@ -22,9 +22,51 @@ Metric families are registered lazily on first observation — the gateway does 
 
 ### Managed Data Plane Metrics
 
-The `/metrics` endpoint lives on the **admin listener**, which a Cloud managed data plane does not bind. So a managed DP does **not** expose `/metrics` for local scraping.
+The `/metrics` endpoint is served on the **admin listener**, which a Cloud managed data plane does not bind. A managed DP therefore exposes metrics on a **dedicated metrics listener** instead, configured by `observability.metrics.prometheus.addr`. The managed image binds this on `0.0.0.0:9090` by default, so **no control-plane configuration is required** — you scrape it directly with your own Prometheus, from inside the data plane's network.
 
-To get metrics off a managed data plane into your own Prometheus/OTLP stack, configure an OTLP exporter through the AISIX Cloud control plane (the same `otlp_http` exporter resource described below). The data plane fans metrics/telemetry out to the configured collector rather than waiting to be scraped. Self-hosted standalone deployments keep using local `/metrics` scraping as usual.
+To scrape a managed data plane (or any deployment with a dedicated listener):
+
+1. **Expose the metrics port** in your data plane deployment. The proxy and admin ports are unaffected — only the metrics port needs to be reachable by your Prometheus.
+
+   Docker:
+
+   ```bash
+   docker run ... -p 9090:9090 <aisix-dp-image>
+   ```
+
+   Kubernetes — add the port to the container and a `Service`:
+
+   ```yaml
+   ports:
+     - { name: metrics, containerPort: 9090 }
+   ```
+
+2. **Point Prometheus at it.** A static scrape config:
+
+   ```yaml
+   scrape_configs:
+     - job_name: aisix-data-plane
+       metrics_path: /metrics
+       static_configs:
+         - targets: ["<data-plane-host>:9090"]
+   ```
+
+   Or, with the Prometheus Operator, a `ServiceMonitor`:
+
+   ```yaml
+   apiVersion: monitoring.coreos.com/v1
+   kind: ServiceMonitor
+   metadata:
+     name: aisix-data-plane
+   spec:
+     selector:
+       matchLabels: { app: aisix-dp }
+     endpoints:
+       - port: metrics
+         path: /metrics
+   ```
+
+Restrict access to the metrics port at the network layer — it is unauthenticated, like every Prometheus exporter. Self-hosted standalone deployments can keep scraping `/metrics` on the admin listener, or set `addr` to move it onto a dedicated listener too.
 
 AISIX exposes native metric names with the `aisix_` prefix. Existing compatibility series remain:
 

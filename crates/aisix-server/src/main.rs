@@ -8,8 +8,8 @@
 //!  5. Bootstrap initial snapshot
 //!  6. Spawn watch supervisor
 //!  7. Build proxy router
-//!  8. Build admin router
-//!  9. Bind + serve both ports (tokio::select! with shutdown signal)
+//!  8. Build admin router (+ dedicated metrics listener when configured)
+//!  9. Bind + serve the ports (tokio::select! with shutdown signal)
 //! 10. On SIGINT/SIGTERM: cancel supervisor, stop accepting, join
 
 use std::error::Error as StdError;
@@ -521,6 +521,31 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         None
     };
 
+    // Dedicated metrics listener. The admin listener that normally hosts
+    // `/metrics` is never bound in managed mode, so a managed DP can only
+    // be scraped through a separate listener. Bound whenever
+    // `observability.metrics.prometheus.addr` is set — `config.managed.yaml`
+    // sets it by default (no control-plane change needed); self-hosted
+    // deployments keep `/metrics` on the admin listener unless they opt in
+    // by setting the address. Shares the same `metrics` handle as the proxy
+    // and admin surfaces, so one scrape reflects all request paths.
+    let metrics_serve_handle = {
+        let prom = &cfg.observability.metrics.prometheus;
+        if let (true, Some(addr)) = (prom.enabled, prom.addr.as_deref()) {
+            let metrics_addr: std::net::SocketAddr = addr.parse()?;
+            let metrics_router = aisix_admin::metrics_router(metrics.clone(), prom);
+            Some(tokio::spawn(serve_http(
+                metrics_addr,
+                metrics_router,
+                None,
+                cancel_rx.clone(),
+                "metrics",
+            )))
+        } else {
+            None
+        }
+    };
+
     // Step 9: bind + serve the proxy (always). Admin is handled above.
     let proxy_addr: std::net::SocketAddr = cfg.proxy.addr.parse()?;
     let proxy_tls = cfg.proxy.tls.clone();
@@ -544,6 +569,13 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(anyhow::anyhow!("admin serve error: {e}")),
             Err(e) => return Err(anyhow::anyhow!("admin task join error: {e}")),
+        }
+    }
+    if let Some(handle) = metrics_serve_handle {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(anyhow::anyhow!("metrics serve error: {e}")),
+            Err(e) => return Err(anyhow::anyhow!("metrics task join error: {e}")),
         }
     }
 

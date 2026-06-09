@@ -16,6 +16,13 @@ export interface AppOverrides {
   prometheus?: boolean;
   /** Prometheus scrape path. Defaults to `/metrics`. */
   prometheusPath?: string;
+  /**
+   * Bind `/metrics` on a dedicated listener (its own free port) instead
+   * of only the admin listener. Mirrors how a managed DP is scraped —
+   * the admin listener is not the scrape surface. When set, `metricsUrl`
+   * on the returned handle points at that listener.
+   */
+  metricsListener?: boolean;
   /** Extra raw config keys merged into the YAML at the top level. */
   extra?: Record<string, unknown>;
   /**
@@ -43,6 +50,8 @@ export interface SpawnedApp {
   adminUrl: string;
   adminKey: string;
   etcdPrefix: string;
+  /** Dedicated metrics listener URL — set only when `metricsListener` was requested. */
+  metricsUrl?: string;
   signal(signal: NodeJS.Signals): void;
   exit(): Promise<void>;
 }
@@ -68,7 +77,10 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
     );
   }
 
-  const [proxyPort, adminPort] = await pickFreePorts(2);
+  const wantMetricsListener = overrides.metricsListener ?? false;
+  const [proxyPort, adminPort, metricsPort] = await pickFreePorts(
+    wantMetricsListener ? 3 : 2,
+  );
   const adminKey = overrides.adminKey ?? `admin-${randomUUID()}`;
   const etcdPrefix = `/aisix-e2e-${randomUUID()}`;
 
@@ -93,6 +105,7 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
         prometheus: {
           enabled: overrides.prometheus ?? true,
           path: overrides.prometheusPath ?? "/metrics",
+          ...(wantMetricsListener ? { addr: `127.0.0.1:${metricsPort}` } : {}),
         },
         otlp: { enabled: false, endpoint: "http://127.0.0.1:4317" },
       },
@@ -149,6 +162,9 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
 
   const proxyUrl = `http://127.0.0.1:${proxyPort}`;
   const adminUrl = `http://127.0.0.1:${adminPort}`;
+  const metricsUrl = wantMetricsListener
+    ? `http://127.0.0.1:${metricsPort}`
+    : undefined;
 
   try {
     await Promise.all([
@@ -170,6 +186,7 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
     adminUrl,
     adminKey,
     etcdPrefix,
+    metricsUrl,
     signal(signal: NodeJS.Signals) {
       if (child.exitCode === null) child.kill(signal);
     },

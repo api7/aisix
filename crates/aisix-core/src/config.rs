@@ -458,6 +458,22 @@ pub struct MetricsConfig {
 pub struct PrometheusConfig {
     pub enabled: bool,
     pub path: String,
+    /// Optional bind address for a **dedicated** metrics listener
+    /// (e.g. `0.0.0.0:9090`). When set, the gateway serves `path` on
+    /// its own listener — separate from the admin listener that
+    /// normally hosts `/metrics`.
+    ///
+    /// This is what lets a managed-mode DP be scraped at all: managed
+    /// mode never binds the admin listener (`ManagedConfig::is_managed`),
+    /// so without a dedicated address `/metrics` is configured but
+    /// stranded on a listener that never comes up. The baked-in
+    /// `config.managed.yaml` sets this so managed DPs expose metrics by
+    /// default with no control-plane change.
+    ///
+    /// Unset (the default) keeps `/metrics` on the admin listener only,
+    /// preserving the prior behavior for self-hosted deployments.
+    #[serde(default)]
+    pub addr: Option<String>,
 }
 
 impl Default for PrometheusConfig {
@@ -465,6 +481,7 @@ impl Default for PrometheusConfig {
         Self {
             enabled: true,
             path: "/metrics".into(),
+            addr: None,
         }
     }
 }
@@ -628,6 +645,16 @@ impl Config {
                 "proxy.real_ip.trusted_proxies invalid CIDR/IP: {bad}"
             )));
         }
+        // Dedicated metrics listener address, when configured, must be a
+        // bindable socket address. Unset keeps `/metrics` on the admin
+        // listener (no dedicated listener), so only validate when present.
+        if let Some(addr) = self.observability.metrics.prometheus.addr.as_deref() {
+            if addr.parse::<std::net::SocketAddr>().is_err() {
+                return Err(BootstrapError::Config(format!(
+                    "observability.metrics.prometheus.addr invalid socket address: {addr}"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -661,6 +688,9 @@ admin:
         assert_eq!(cfg.etcd.endpoints, vec!["http://127.0.0.1:2379"]);
         assert_eq!(cfg.proxy.request_body_limit_bytes, 10 * 1024 * 1024);
         assert!(cfg.observability.metrics.prometheus.enabled);
+        // No dedicated metrics listener unless an addr is set — `/metrics`
+        // stays on the admin listener for self-hosted deployments.
+        assert!(cfg.observability.metrics.prometheus.addr.is_none());
         assert_eq!(cfg.cache.backend, CacheBackend::Memory);
         // real_ip defaults: trust nothing, non-recursive, x-forwarded-for.
         assert!(cfg.proxy.real_ip.trusted_proxies.is_empty());
@@ -766,6 +796,61 @@ admin:
         );
         let err = Config::load_from_path(Some(f.path())).unwrap_err();
         assert!(err.to_string().contains("proxy.addr"));
+    }
+
+    #[test]
+    fn parses_prometheus_addr_for_dedicated_listener() {
+        // A dedicated metrics listener address parses and round-trips.
+        // This is the managed-mode shape: `/metrics` is served on its
+        // own bound listener because the admin listener is never bound.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+observability:
+  metrics:
+    prometheus:
+      enabled: true
+      path: "/metrics"
+      addr: "0.0.0.0:9090"
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(
+            cfg.observability.metrics.prometheus.addr.as_deref(),
+            Some("0.0.0.0:9090"),
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_prometheus_addr() {
+        // A malformed dedicated-listener address must fail validation at
+        // boot, not at bind time — operators get a clear config error.
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+observability:
+  metrics:
+    prometheus:
+      addr: "not-a-socket-addr"
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(
+            err.to_string().contains("prometheus.addr"),
+            "error should name the bad field: {err}"
+        );
     }
 
     #[test]
