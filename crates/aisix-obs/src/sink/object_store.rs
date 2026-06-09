@@ -1240,11 +1240,11 @@ mod smoke {
 
     #[tokio::test]
     #[ignore = "KEYLESS cloud_identity GCS round-trip — set \
-                AISIX_E2E_OBJSTORE_CLOUDID_GCS_BUCKET to a real bucket the runtime's \
-                AMBIENT identity can write (GKE Workload Identity / GCE metadata / \
-                GitHub-OIDC Workload Identity Federation). No service-account key: \
-                ADC is sourced with no key. cargo test -p aisix-obs -- --ignored \
-                objstore_smoke_gcs_cloud_identity"]
+                AISIX_E2E_OBJSTORE_CLOUDID_GCS_BUCKET on a real GKE pod with Workload \
+                Identity (or a GCE VM with an attached service account), where \
+                object_store's ADC reaches the GCE metadata server. A non-GCE runner \
+                (incl. GitHub Actions via WIF) cannot — see #573. No service-account \
+                key. cargo test -p aisix-obs -- --ignored objstore_smoke_gcs_cloud_identity"]
     async fn objstore_smoke_gcs_cloud_identity() {
         let Some(bucket) = env("AISIX_E2E_OBJSTORE_CLOUDID_GCS_BUCKET") else {
             eprintln!(
