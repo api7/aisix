@@ -1031,7 +1031,9 @@ mod tests {
 /// `cargo test -p aisix-obs -- --ignored objstore_smoke`.
 #[cfg(test)]
 mod smoke {
-    use super::{build_object_store, ObjectStoreCredentials, ObjectStoreSink};
+    use super::{
+        build_object_store, build_object_store_ambient, ObjectStoreCredentials, ObjectStoreSink,
+    };
     use crate::sink::{EventBatch, IdempotencyMarker, ObservabilitySink, SinkRecord};
     use crate::usage::UsageEvent;
     use aisix_core::models::observability_exporter::{ObjectStoreCompression, ObjectStoreProvider};
@@ -1209,6 +1211,51 @@ mod smoke {
             },
         )
         .expect("build GCS store");
+        smoke_roundtrip(store).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "KEYLESS cloud_identity S3 round-trip — set \
+                AISIX_E2E_OBJSTORE_CLOUDID_S3_BUCKET to a real bucket the runtime's \
+                AMBIENT identity can write (EC2 instance role / EKS IRSA / \
+                GitHub-OIDC-assumed role). No static keys: from_env sources the \
+                ambient chain. cargo test -p aisix-obs -- --ignored \
+                objstore_smoke_s3_cloud_identity"]
+    async fn objstore_smoke_s3_cloud_identity() {
+        let Some(bucket) = env("AISIX_E2E_OBJSTORE_CLOUDID_S3_BUCKET") else {
+            eprintln!(
+                "objstore_smoke_s3_cloud_identity: AISIX_E2E_OBJSTORE_CLOUDID_S3_BUCKET not set — skipping"
+            );
+            return;
+        };
+        let region =
+            env("AISIX_E2E_OBJSTORE_CLOUDID_S3_REGION").unwrap_or_else(|| "us-east-1".to_string());
+        // Keyless: no credential_ref, no static keys — the ambient AWS chain
+        // (instance role / IRSA / OIDC-assumed role) is sourced by from_env.
+        let store =
+            build_object_store_ambient(ObjectStoreProvider::S3, &bucket, Some(&region), None)
+                .expect("build keyless S3 store");
+        smoke_roundtrip(store).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "KEYLESS cloud_identity GCS round-trip — set \
+                AISIX_E2E_OBJSTORE_CLOUDID_GCS_BUCKET to a real bucket the runtime's \
+                AMBIENT identity can write (GKE Workload Identity / GCE metadata / \
+                GitHub-OIDC Workload Identity Federation). No service-account key: \
+                ADC is sourced with no key. cargo test -p aisix-obs -- --ignored \
+                objstore_smoke_gcs_cloud_identity"]
+    async fn objstore_smoke_gcs_cloud_identity() {
+        let Some(bucket) = env("AISIX_E2E_OBJSTORE_CLOUDID_GCS_BUCKET") else {
+            eprintln!(
+                "objstore_smoke_gcs_cloud_identity: AISIX_E2E_OBJSTORE_CLOUDID_GCS_BUCKET not set — skipping"
+            );
+            return;
+        };
+        // Keyless: no service-account key — Application Default Credentials
+        // (Workload Identity / WIF) are sourced at request time.
+        let store = build_object_store_ambient(ObjectStoreProvider::Gcs, &bucket, None, None)
+            .expect("build keyless GCS store");
         smoke_roundtrip(store).await;
     }
 }
