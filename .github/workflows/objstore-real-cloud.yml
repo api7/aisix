@@ -53,10 +53,15 @@ concurrency:
 jobs:
   smoke:
     name: objstore real-cloud smoke (S3 + GCS)
-    # Label-gate on PRs; always run on manual dispatch / schedule.
+    # Same-repo + label gate on PRs; always run on manual dispatch / schedule.
+    # The explicit same-repo check is defense-in-depth: plain `pull_request`
+    # withholds secrets from fork PRs by GitHub default today, but this gate
+    # keeps the credentials off fork-controlled code even if that default is
+    # ever flipped (mirrors docker-image.yml's `!= 'pull_request'` guard).
     if: >-
       github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'objstore real cloud')
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       contains(github.event.pull_request.labels.*.name, 'objstore real cloud'))
     runs-on: ubicloud-standard-2
     env:
       AISIX_E2E_OBJSTORE_S3_BUCKET: ${{ secrets.AISIX_E2E_OBJSTORE_S3_BUCKET }}
@@ -73,7 +78,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Report which providers are configured
         run: |
-          if [ -n "$AISIX_E2E_OBJSTORE_S3_BUCKET" ]; then echo "S3: configured"; else echo "::warning::S3 secrets absent — objstore_smoke_s3 will self-skip"; fi
-          if [ -n "$AISIX_E2E_OBJSTORE_GCS_BUCKET" ]; then echo "GCS: configured"; else echo "::warning::GCS secrets absent — objstore_smoke_gcs will self-skip"; fi
+          s3=0; gcs=0
+          if [ -n "$AISIX_E2E_OBJSTORE_S3_BUCKET" ]; then echo "S3: configured"; s3=1; else echo "::warning::S3 secrets absent — objstore_smoke_s3 will self-skip"; fi
+          if [ -n "$AISIX_E2E_OBJSTORE_GCS_BUCKET" ]; then echo "GCS: configured"; gcs=1; else echo "::warning::GCS secrets absent — objstore_smoke_gcs will self-skip"; fi
+          # A manual dispatch or scheduled run is deliberate — secrets are
+          # expected. Fail rather than pass green while testing nothing. PR
+          # runs may legitimately have no secrets, so they still self-skip.
+          if [ "${{ github.event_name }}" != "pull_request" ] && [ "$s3" = 0 ] && [ "$gcs" = 0 ]; then
+            echo "::error::No object_store real-cloud secrets configured; this ${{ github.event_name }} run would test nothing."
+            exit 1
+          fi
       - name: objstore real-cloud round-trips (S3 + GCS)
         run: cargo test -p aisix-obs -- --ignored --nocapture objstore_smoke_s3 objstore_smoke_gcs
