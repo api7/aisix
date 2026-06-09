@@ -872,6 +872,154 @@ mod tests {
         );
         assert_eq!(partition(""), ("unknown".to_string(), "00".to_string()));
     }
+
+    // ── Boundary + error cases ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn broken_sink_fails_every_delivery_and_reports_unhealthy() {
+        // A sink that could not be built must never drop events silently:
+        // every delivery fails permanently with the reason, and it reports
+        // unhealthy so the failure shows on the exporter-health panel.
+        let s = BrokenSink::new(
+            "obj-broken",
+            "object_store: no credentials resolved for credential_ref \"acme\"",
+        );
+        match s
+            .append_batch(
+                &batch_of(vec![SinkRecord::metadata_only(event("req-1"))]),
+                &IdempotencyMarker::None,
+            )
+            .await
+        {
+            Err(SinkError::Permanent(m)) => {
+                assert!(m.contains("credential_ref"), "reason surfaced: {m}")
+            }
+            other => panic!("broken sink must reject with Permanent, got {other:?}"),
+        }
+        let health = s.healthcheck().await;
+        assert!(!health.healthy, "broken sink is unhealthy");
+        assert!(
+            health
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("credential_ref"),
+            "unhealthy detail surfaces the reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_sink_with_missing_credentials_is_broken() {
+        // credential_ref mode with the env vars unset → a BrokenSink, not a
+        // half-credentialed client. The ref's slug is one no env will hold.
+        let cfg = ObjectStoreConfig {
+            provider: ObjectStoreProvider::S3,
+            bucket: "b".into(),
+            prefix: "p".into(),
+            region: None,
+            endpoint: None,
+            compression: ObjectStoreCompression::Gzip,
+            auth_mode: ObjectStoreAuthMode::CredentialRef,
+            credential_ref: "aisix_objstore_edge_unset_ref".into(),
+        };
+        let s = build_object_store_sink("missing-cred".into(), &cfg);
+        assert!(
+            s.append_batch(
+                &batch_of(vec![SinkRecord::metadata_only(event("x"))]),
+                &IdempotencyMarker::None,
+            )
+            .await
+            .is_err(),
+            "missing-credential sink fails delivery (no silent drop)"
+        );
+        assert!(
+            !s.healthcheck().await.healthy,
+            "missing-credential sink is unhealthy"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_sink_cloud_identity_builds_a_real_sink() {
+        // cloud_identity needs no credential_ref env: the ambient S3 builder
+        // constructs offline (creds fetched lazily at request time), so the
+        // dispatcher yields a real, healthy sink — not a BrokenSink.
+        let cfg = ObjectStoreConfig {
+            provider: ObjectStoreProvider::S3,
+            bucket: "b".into(),
+            prefix: "p".into(),
+            region: Some("us-east-1".into()),
+            endpoint: None,
+            compression: ObjectStoreCompression::Gzip,
+            auth_mode: ObjectStoreAuthMode::CloudIdentity,
+            credential_ref: String::new(),
+        };
+        let s = build_object_store_sink("ci".into(), &cfg);
+        assert!(
+            s.healthcheck().await.healthy,
+            "cloud_identity S3 builds a healthy sink offline"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_sink_cloud_identity_azure_is_broken() {
+        // cloud_identity is S3/GCS only; azure_blob ambient is rejected, and
+        // the dispatcher wraps that error in a BrokenSink (unhealthy).
+        let cfg = ObjectStoreConfig {
+            provider: ObjectStoreProvider::AzureBlob,
+            bucket: "c".into(),
+            prefix: "p".into(),
+            region: None,
+            endpoint: None,
+            compression: ObjectStoreCompression::Gzip,
+            auth_mode: ObjectStoreAuthMode::CloudIdentity,
+            credential_ref: String::new(),
+        };
+        let s = build_object_store_sink("ci-az".into(), &cfg);
+        assert!(
+            !s.healthcheck().await.healthy,
+            "azure_blob + cloud_identity → broken sink"
+        );
+    }
+
+    #[test]
+    fn object_key_handles_empty_and_slashed_prefix() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        // Empty prefix → the key begins at the partition, with no leading slash.
+        let empty = ObjectStoreSink::new("k", store.clone(), "", ObjectStoreCompression::None);
+        let key = empty.object_key(b"body", "2026-05-01T12:34:56Z");
+        assert!(
+            key.starts_with("dt=2026-05-01/hh=12/"),
+            "empty prefix → key starts at the partition: {key}"
+        );
+        assert!(!key.starts_with('/'), "no leading slash: {key}");
+        // Surrounding slashes are trimmed (not doubled) and the inner path kept.
+        let slashed =
+            ObjectStoreSink::new("k", store, "///deep/path///", ObjectStoreCompression::None);
+        let key2 = slashed.object_key(b"body", "2026-05-01T12:34:56Z");
+        assert!(key2.starts_with("deep/path/dt="), "trimmed prefix: {key2}");
+    }
+
+    #[test]
+    fn maps_more_object_store_errors_to_permanent() {
+        // Beyond PermissionDenied: a missing bucket/object and an
+        // unauthenticated request fail the same way on retry → permanent, so
+        // the pipeline does not retry-storm a request that can never succeed.
+        for e in [
+            object_store::Error::NotFound {
+                path: "p".into(),
+                source: "missing".into(),
+            },
+            object_store::Error::Unauthenticated {
+                path: "p".into(),
+                source: "bad token".into(),
+            },
+        ] {
+            assert!(
+                !map_object_store_err(e).is_transient(),
+                "auth/not-found errors are permanent"
+            );
+        }
+    }
 }
 
 /// Real-emulator smoke tests — the one-off validation that the sink's real
