@@ -1,5 +1,5 @@
 ---
-title: Add Keyword Guardrails
+title: Add keyword guardrails
 description: Block forbidden prompt content with a keyword guardrail in AISIX AI Gateway and verify the 422 content_filter rejection.
 sidebar_position: 82
 ---
@@ -14,7 +14,7 @@ You end with one enabled `Guardrail` and a reproducible pair of calls — one al
 - A direct model and caller API key from the [First Model, First Key, First Request](../quickstart/first-model-first-key-first-request.md) quickstart — this tutorial reuses `gpt-4o-prod` and `sk-demo-caller` as canonical names
 - The caller key must include the model in `allowed_models` (or be a wildcard `["*"]`)
 
-## How It Works
+## How it works
 
 Keyword guardrails run **in-process** in the data plane — no external call. With `hook_point: "input"` the chain runs on the request payload **before** bridge dispatch, so a match short-circuits the request with `422` and the upstream is never called.
 
@@ -23,11 +23,11 @@ Pattern kinds:
 - `literal` — case-insensitive substring match
 - `regex` — full `regex::Regex` syntax. Invalid regex is loader-rejected so a typo cannot silently disarm the policy.
 
-## Step 1: Pick A Forbidden Word
+## Step 1: Pick a forbidden word
 
 Use a unique, non-natural-language token so the assertion in Step 4 is unambiguous. This tutorial uses `supersecret-banned-token`. Replace with whatever your policy actually wants to block.
 
-## Step 2: Create The Guardrail
+## Step 2: Create the guardrail
 
 ```bash title="Create the keyword guardrail"
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/guardrails \
@@ -47,7 +47,7 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/guardrails \
 Field meanings (full reference in [Guardrails](../configuration/guardrails.md)):
 
 - `hook_point: "input"` — run on the request payload before dispatch. Use `output` to inspect upstream responses, or `both` to inspect both sides.
-- `kind: "keyword"` — the in-process pattern matcher. The other current kind, `bedrock`, parses but the DP-side dispatch is roadmap.
+- `kind: "keyword"` — the in-process pattern matcher. Other kinds call an external moderation service — see [Guardrails](../configuration/guardrails.md).
 - `patterns[].kind: "literal"` — case-insensitive substring match. Use `"regex"` for arbitrary patterns.
 
 Wait for the snapshot to propagate:
@@ -58,7 +58,7 @@ sleep 1
 
 If the verification step below returns the upstream response instead of `422` on slow runners, propagation is still in flight. See [Wait for configuration propagation](../quickstart/first-model-first-key-first-request.md#step-4-wait-for-configuration-propagation) for the polling alternative.
 
-## Step 3: Verify Benign Traffic Still Passes
+## Step 3: Verify benign traffic still passes
 
 Confirm the guardrail is not over-blocking. A clean prompt should reach the upstream as normal:
 
@@ -74,7 +74,7 @@ curl -sSi -X POST http://127.0.0.1:3000/v1/chat/completions \
 
 Expected: `HTTP/1.1 200 OK` followed by an OpenAI-shaped chat-completions body.
 
-## Step 4: Verify Forbidden Content Is Blocked
+## Step 4: Verify forbidden content is blocked
 
 Now send a request whose content includes the forbidden token:
 
@@ -105,7 +105,7 @@ The `message` field is intentionally generic — it does **not** include the mat
 
 The upstream is never called. This is the same contract `tests/e2e/src/cases/guardrail-keyword-e2e.test.ts` asserts — that test polls for guardrail readiness by waiting until a forbidden-word probe returns `422`, then confirms benign traffic still returns `200` and that the upstream `receivedRequests` count does not increase for the blocked request.
 
-## What Just Happened
+## What just happened
 
 1. The proxy authenticated the caller key and resolved `gpt-4o-prod` to a Model in the snapshot.
 2. The allowlist check passed (`gpt-4o-prod` is in `allowed_models`).
@@ -124,15 +124,15 @@ curl -sS -X DELETE http://127.0.0.1:3001/admin/v1/guardrails/YOUR_GUARDRAIL_ID \
 
 Use the `id` returned in Step 2.
 
-## Variations And Next Steps
+## Variations and next steps
 
 - **Output-side check** — set `hook_point: "output"` to inspect the upstream response. Useful for catching responses that contain forbidden content the prompt didn't expose. `hook_point: "both"` runs on both sides.
 - **Regex patterns** — replace the literal with `{"kind":"regex","value":"\\bsupersecret-\\w+\\b"}` for a bounded regex match. Invalid regex is rejected at admin-write time.
 - **Multiple patterns** — `patterns` is an array; add several entries in one guardrail or write multiple guardrails for different categories.
 - **Stage a rule** — write the guardrail with `"enabled": false` first, confirm the resource shape, then flip it on.
-- **AWS Bedrock guardrails** — `kind: "bedrock"` accepts the wire shape today, but DP-side dispatch is on the [Roadmap](../roadmap.md). Treat it as parsed-only until that lands.
+- **AWS Bedrock guardrails** — `kind: "bedrock"` screens content through AWS Bedrock's `ApplyGuardrail` API. See [Block content with AWS Bedrock guardrails](block-content-with-aws-bedrock-guardrails.md).
 
-## Related Pages
+## Related pages
 
 - [Guardrails](../configuration/guardrails.md) — full field reference, kinds, and hook-point semantics
 - [Errors And Retries](../integration/errors-and-retries.md) — the `content_filter` envelope and where `422` fits in the gateway error taxonomy

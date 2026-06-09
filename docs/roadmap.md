@@ -42,19 +42,6 @@ Applies to:
 
 ## Next
 
-### Bedrock Guardrails Runtime Completion
-
-Current status:
-- The guardrail schema supports `kind=bedrock`.
-- The current data-plane implementation accepts and stores the shape, but runtime behavior is not yet documented as generally available.
-
-Planned outcome:
-- Documentable customer-facing runtime support for Bedrock-backed guardrails.
-
-Applies to:
-- `AISIX AI Gateway`
-- `AISIX Cloud`
-
 ### Redis-Backed Cache Policy Completion
 
 Current status:

@@ -28,8 +28,7 @@ Use it as a navigation aid, not as a replacement for detailed feature pages.
 | Per-key budgets | Limited | Standalone deployments do not enforce per-key budgets; managed deployments enforce via the budget controller. |
 | Rate limits and concurrency limits | Available | Three layers are AND-combined per request: `ApiKey.rate_limit`, `Model.rate_limit`, and scope-matched `RateLimitPolicy` rows (`api_key` / `model` / `team` / `member`). |
 | Routing models and failover | Available | Current model schema supports routing strategies and retry budget behavior. |
-| Keyword guardrails | Available | Current runtime enforcement is on `POST /v1/chat/completions`; non-chat endpoints do not run the guardrail chain today. |
-| Bedrock guardrails | Limited | Current code includes feature-gated runtime wiring. Treat it as an advanced capability with deployment and support caveats rather than as a planned-only feature. |
+| Guardrails | Available | Content-policy enforcement on the input and output hooks across all guarded proxy surfaces. Kinds: `keyword` (in-process), AWS Bedrock (`ApplyGuardrail`), Azure AI Content Safety (Prompt Shield and Text Moderation), and Aliyun content moderation. A block returns `422 content_filter`. See [Guardrails](../configuration/guardrails.md). |
 | Memory-backed response caching | Available | Current cache policy behavior centers on memory-backed caching. |
 | Redis-backed cache policy | Limited | Current code includes Redis backend selection and connection logic. Treat it as implemented with support caveats until the full cache docs land. |
 | Observability exporters | Available | Current admin surface and resource model include observability exporters. |
