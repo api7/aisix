@@ -209,7 +209,7 @@ pub struct UsageEvent {
     // Each UsageEvent now represents ONE upstream attempt. A request
     // that fails over emits multiple events sharing `request_id` (the
     // grouping/trace key); they are ordered by `attempt_index`. This
-    // mirrors LiteLLM's per-call logging model — `status_code`,
+    // mirrors a per-call logging model — `status_code`,
     // `latency_ms`, and `ttft_ms` are scoped to THIS attempt, so the
     // user-perceived total is reconstructed by summing the attempts of
     // one `request_id`. Direct (non-routing) requests emit a single

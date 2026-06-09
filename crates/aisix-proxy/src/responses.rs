@@ -850,8 +850,8 @@ async fn responses_to_target(
 ///
 /// `output_tokens`, by contrast, defaults to 0 when absent: a 200 that
 /// reports an input side but omits the output side is still a real
-/// billable call and must be recorded. This matches LiteLLM, which
-/// coerces a missing completion/output side to 0 and still logs/bills
+/// billable call and must be recorded. This matches the de-facto gateway
+/// behavior, which coerces a missing completion/output side to 0 and still logs/bills
 /// the event (#429 follow-up; mirrors the tolerant wire-layer decode of
 /// #474). Spec:
 /// <https://platform.openai.com/docs/api-reference/responses/object>
@@ -2551,10 +2551,10 @@ mod tests {
         }
     }
 
-    /// #429 (LiteLLM-parity follow-up): a 200 whose `usage` carries
+    /// #429 (gateway-parity follow-up): a 200 whose `usage` carries
     /// `input_tokens` but omits `output_tokens` is still a real billable
     /// call. It MUST emit a UsageEvent with `completion_tokens = 0`
-    /// (matching LiteLLM's coerce-missing-to-0), NOT be dropped. Only a
+    /// (coercing the missing side to 0), NOT be dropped. Only a
     /// fully absent / input-less usage block skips.
     #[tokio::test]
     async fn emits_with_zero_output_when_output_tokens_missing() {

@@ -169,7 +169,7 @@ pub enum BridgeError {
     /// (empty secret, api key with invalid HTTP-header bytes, unparseable
     /// service-account / AAD / Bedrock credential JSON). Maps to 401
     /// `authentication_error`, not 400: this is an auth-material problem,
-    /// and 401 matches LiteLLM's canonical mapping for the same providers
+    /// and 401 matches the canonical provider mapping for the same providers
     /// (Anthropic/OpenAI/Azure raise `AuthenticationError`). Non-retryable
     /// (#367 follow-up). Distinct from [`InvalidUpstreamConfig`] (400),
     /// which is request/routing shape, not credentials.
@@ -582,7 +582,7 @@ mod tests {
         // #367 follow-up: auth-material problems (empty/invalid secret,
         // unparseable credential JSON) are a 401 authentication_error,
         // not a 400 — they're a distinct class from request/routing shape
-        // and match LiteLLM's AuthenticationError mapping.
+        // and match the canonical AuthenticationError mapping.
         let e = BridgeError::InvalidUpstreamCredentials("provider_key.secret is empty".into());
         assert_eq!(e.http_status(), 401);
         assert_eq!(e.error_type(), "authentication_error");

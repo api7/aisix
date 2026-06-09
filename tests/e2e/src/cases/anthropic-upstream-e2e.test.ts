@@ -194,7 +194,7 @@ describe("anthropic upstream e2e: OpenAI in, Anthropic out, OpenAI back to calle
 // (no text block) must surface `choices[0].message.content === null` on
 // the OpenAI shape — not `""`. The text-block join produced `""` before
 // the fix; we now map empty/absent text to `null` to match OpenAI's
-// documented `string | null` shape and LiteLLM's behaviour.
+// documented `string | null` shape and the de-facto gateway behaviour.
 const TOOL_CALLER_PLAINTEXT = "sk-an-e2e-toolnull-caller";
 const TOOL_CALLER_KEY_HASH = createHash("sha256")
   .update(TOOL_CALLER_PLAINTEXT)
