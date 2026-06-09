@@ -2,14 +2,18 @@
 //! under `rate_limit_policies/<uuid>`.
 //!
 //! Each policy targets a single subject via `(scope, scope_ref)`:
-//! - `api_key` — matches by API key entry ID
-//! - `model`   — matches by model entry ID
-//! - `team`    — matches by team ID on the API key
-//! - `member`  — matches by user ID on the API key
+//! - `api_key`     — matches by API key entry ID
+//! - `model`       — matches by model entry ID
+//! - `team`        — matches by team ID on the API key (one shared bucket)
+//! - `member`      — matches by user ID on the API key
+//! - `team_member` — matches by team ID, but buckets per member: every
+//!   key in the team inherits this default with its own independent
+//!   counter keyed on the API key's user ID
 //!
 //! The proxy iterates all policies on each request, converts the
 //! `window`+`max_requests`/`max_tokens` into a `RateLimit`, and
-//! reserves under `policy:<scope>:<scope_ref>:<policy_id>`.
+//! reserves under `policy:<scope>:<scope_ref>:<policy_id>` — with the
+//! member's `user_id` appended for the `team_member` scope.
 
 use serde::{Deserialize, Serialize};
 

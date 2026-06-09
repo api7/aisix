@@ -746,7 +746,7 @@ fn rate_limit_policy_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "name":         { "type": "string", "minLength": 1 },
-            "scope":        { "type": "string", "enum": ["api_key", "model", "team", "member"] },
+            "scope":        { "type": "string", "enum": ["api_key", "model", "team", "member", "team_member"] },
             "scope_ref":    { "type": "string", "minLength": 1 },
             "window":       { "type": "string", "enum": ["second", "minute", "hour"] },
             "max_requests": { "type": "integer", "minimum": 1 },

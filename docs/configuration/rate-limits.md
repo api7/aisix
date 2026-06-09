@@ -57,12 +57,13 @@ Example on an API key:
 ### Policy Fields
 
 - `name`: human label (string, required).
-- `scope`: which subject the policy targets — one of `api_key`, `model`, `team`, `member` (required).
+- `scope`: which subject the policy targets — one of `api_key`, `model`, `team`, `member`, `team_member` (required).
 - `scope_ref`: the resource ID the policy applies to. Interpretation depends on `scope`:
   - `api_key` → matches when the authenticated `ApiKey` entry id equals `scope_ref`.
   - `model` → matches when the resolved `Model` entry id equals `scope_ref`.
-  - `team` → matches when the authenticated `ApiKey.team_id` equals `scope_ref`.
+  - `team` → matches when the authenticated `ApiKey.team_id` equals `scope_ref`. **One shared bucket** is pooled across every key in the team.
   - `member` → matches when the authenticated `ApiKey.user_id` equals `scope_ref`.
+  - `team_member` → matches when the authenticated `ApiKey.team_id` equals `scope_ref` (like `team`), but the counter is bucketed **per member** (`ApiKey.user_id`). One policy thus gives *every* member of the team their own independent, identical quota — a per-member default. New members inherit it automatically; no per-member policy needed.
 - `window`: `second`, `minute`, or `hour` (required).
 - `max_requests`: maximum requests allowed in the window (optional).
 - `max_tokens`: maximum tokens allowed in the window (optional).
@@ -107,7 +108,21 @@ A per-member burst limit:
 }
 ```
 
-For `scope = team` or `scope = member` to match, the authenticated `ApiKey` must carry the corresponding `team_id` or `user_id` field. Set those on the API key resource at create time.
+A per-member default — every member of a team independently capped at 1M tokens per minute:
+
+```json title="RateLimitPolicy: per-member default for a team"
+{
+  "name": "team-acme-per-member-tpm",
+  "scope": "team_member",
+  "scope_ref": "team-uuid-acme",
+  "window": "minute",
+  "max_tokens": 1000000
+}
+```
+
+Unlike `scope = team` (one shared bucket for the whole team), `team_member` gives each member their own bucket: member A exhausting the cap never throttles member B, and a member's multiple keys share one bucket (the counter keys on `user_id`).
+
+For `scope = team`, `scope = member`, or `scope = team_member` to match, the authenticated `ApiKey` must carry the corresponding `team_id` / `user_id` field. `team_member` requires **both** `team_id` (to match) and `user_id` (to bucket). Set those on the API key resource at create time.
 
 ### Provisioning
 
