@@ -93,7 +93,7 @@ A target that is *too slow* fails over the same way a target that *errors* does.
 - **Non-streaming.** If a target doesn't return a complete response within its `timeout`, the gateway abandons it (a `504`-class timeout) and moves to the next target — identical to the retryable-failure path above.
 - **Streaming.** `stream_timeout` is a per-chunk read timeout (it resets after each chunk). A timeout on the **first** chunk fires before any bytes reach the caller, so the gateway fails over cleanly to the next target. Once the first chunk has been forwarded the response is committed to that target; a later inter-chunk stall **ends the stream** with an error rather than failing over (the gateway can't un-send bytes already on the wire). When `stream_timeout` is unset, the streaming budget falls back to `timeout`.
 
-Because a timed-out attempt is just another retryable failure, it composes with `retries`, `max_fallbacks`, and the runtime [cooldown](models.md#cooldown) (`trigger_on_timeout`) exactly like a `5xx`. These knobs follow the common OpenAI-proxy `timeout` / `stream_timeout` convention.
+Because a timed-out attempt is just another retryable failure, it composes with `retries`, `max_fallbacks`, and the runtime [cooldown](models.md#cooldown) (`trigger_on_timeout`) exactly like a `5xx`.
 
 ## Runtime Filtering
 

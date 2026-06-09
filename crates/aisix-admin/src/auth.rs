@@ -2,8 +2,8 @@
 //!
 //! - Admin keys come from `config.admin.admin_keys` (static, bootstrap
 //!   config), not the `ApiKey` table in etcd.
-//! - Presentation matches OpenAI convention for symmetry —
-//!   `Authorization: Bearer <key>` with an `x-api-key` fallback.
+//! - Presented as `Authorization: Bearer <key>` with an `x-api-key`
+//!   fallback.
 //!
 //! This extractor short-circuits with an `AdminError::Unauthorized`
 //! envelope before any handler runs.

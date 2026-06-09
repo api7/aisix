@@ -169,8 +169,7 @@ pub enum BridgeError {
     /// (empty secret, api key with invalid HTTP-header bytes, unparseable
     /// service-account / AAD / Bedrock credential JSON). Maps to 401
     /// `authentication_error`, not 400: this is an auth-material problem,
-    /// and 401 matches the canonical provider mapping for the same providers
-    /// (Anthropic/OpenAI/Azure raise `AuthenticationError`). Non-retryable
+    /// not a request/routing-shape problem. Non-retryable
     /// (#367 follow-up). Distinct from [`InvalidUpstreamConfig`] (400),
     /// which is request/routing shape, not credentials.
     #[error("invalid upstream credentials: {0}")]
@@ -388,7 +387,7 @@ impl BridgeError {
         }
     }
 
-    /// Stable error-type token, mirroring OpenAI's error.type field.
+    /// Stable error-type token for the error envelope's `type` field.
     pub fn error_type(&self) -> &'static str {
         match self {
             BridgeError::Timeout { .. } => "timeout",
@@ -581,8 +580,7 @@ mod tests {
     fn invalid_upstream_credentials_maps_to_401_authentication() {
         // #367 follow-up: auth-material problems (empty/invalid secret,
         // unparseable credential JSON) are a 401 authentication_error,
-        // not a 400 — they're a distinct class from request/routing shape
-        // and match the canonical AuthenticationError mapping.
+        // not a 400 — they're a distinct class from request/routing shape.
         let e = BridgeError::InvalidUpstreamCredentials("provider_key.secret is empty".into());
         assert_eq!(e.http_status(), 401);
         assert_eq!(e.error_type(), "authentication_error");

@@ -278,9 +278,9 @@ async fn dispatch(
 /// `completion_tokens`, by contrast, defaults to 0 when absent: a 200
 /// that reports a prompt side but omits the completion side is still a
 /// real billable call (the prompt was processed) and must be recorded.
-/// This matches the de-facto gateway behavior, which coerces a missing
-/// completion side to 0 and still logs/bills the event (the usage block's
-/// `completion_tokens` defaults to 0 when absent) — see
+/// A missing completion side coerces to 0 and the event is still
+/// logged/billed (the usage block's `completion_tokens` defaults to 0
+/// when absent) — see
 /// #429 follow-up. Dropping the whole event would under-record more than
 /// the zeroed-completion it was meant to avoid. Wire shape:
 /// <https://platform.openai.com/docs/api-reference/completions/object>
@@ -749,7 +749,7 @@ mod tests {
         }
     }
 
-    /// #429 (gateway-parity follow-up): a 200 whose `usage` carries
+    /// #429 follow-up: a 200 whose `usage` carries
     /// `prompt_tokens` but omits `completion_tokens` is still a real
     /// billable call — the prompt was processed. It MUST emit a
     /// UsageEvent with `completion_tokens = 0` (coercing the missing

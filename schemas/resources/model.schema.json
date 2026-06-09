@@ -86,7 +86,7 @@
       ]
     },
     "stream_timeout": {
-      "description": "Streaming read timeout in ms — the maximum gap the gateway waits for the next upstream chunk on a `stream:true` call, applied to the first chunk and to every inter-chunk gap. A positive value bounds each chunk wait; `0` or absent means \"no streaming-specific override\", so the effective streaming budget falls back to `timeout` (see [`Model::stream_timeout_effective`]) — set `timeout` to `0` too to disable streaming timeouts entirely. A *first-chunk* timeout fails over to the next target (before any bytes reach the client); a *mid-stream* timeout terminates the stream like any other upstream error. Mirrors the common OpenAI-proxy `stream_timeout` field.",
+      "description": "Streaming read timeout in ms — the maximum gap the gateway waits for the next upstream chunk on a `stream:true` call, applied to the first chunk and to every inter-chunk gap. A positive value bounds each chunk wait; `0` or absent means \"no streaming-specific override\", so the effective streaming budget falls back to `timeout` (see [`Model::stream_timeout_effective`]) — set `timeout` to `0` too to disable streaming timeouts entirely. A *first-chunk* timeout fails over to the next target (before any bytes reach the client); a *mid-stream* timeout terminates the stream like any other upstream error.",
       "type": [
         "integer",
         "null"
@@ -95,7 +95,7 @@
       "minimum": 0.0
     },
     "timeout": {
-      "description": "Non-streaming request timeout in ms — the end-to-end budget for a `stream:false` upstream call. `0` or absent = no timeout. On a routing model's target, an elapsed timeout fails over to the next target (the timeout error is retryable). For `stream:true` requests it is also the fallback streaming budget when `stream_timeout` is unset (see [`Model::stream_timeout_effective`]). Mirrors the common OpenAI-proxy `timeout` field.",
+      "description": "Non-streaming request timeout in ms — the end-to-end budget for a `stream:false` upstream call. `0` or absent = no timeout. On a routing model's target, an elapsed timeout fails over to the next target (the timeout error is retryable). For `stream:true` requests it is also the fallback streaming budget when `stream_timeout` is unset (see [`Model::stream_timeout_effective`]).",
       "type": [
         "integer",
         "null"

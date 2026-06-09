@@ -86,7 +86,7 @@ A failed probe transitions the model to `unhealthy` in the runtime status tracke
 
 ### Timeouts
 
-Two optional per-model knobs bound how long the gateway waits on the upstream. Both are in **milliseconds**. `timeout` of `0` or absent means no non-streaming timeout. `stream_timeout` of a positive value bounds streaming; `0` or absent makes streaming fall back to `timeout` instead (so to disable streaming timeouts entirely, set `timeout` to `0` as well). They follow the common OpenAI-proxy `timeout` / `stream_timeout` convention.
+Two optional per-model knobs bound how long the gateway waits on the upstream. Both are in **milliseconds**. `timeout` of `0` or absent means no non-streaming timeout. `stream_timeout` of a positive value bounds streaming; `0` or absent makes streaming fall back to `timeout` instead (so to disable streaming timeouts entirely, set `timeout` to `0` as well).
 
 ```json title="Direct model timeouts"
 {

@@ -1,6 +1,6 @@
 //! Per-chunk read-timeout combinators for streaming upstreams (#554).
 //!
-//! Mirrors the common OpenAI-proxy `stream_timeout` semantics: the deadline bounds the
+//! Per-chunk streaming read-timeout: the deadline bounds the
 //! wait for EACH chunk — the first one and every inter-chunk gap — and
 //! resets after each successful read. A *first-chunk* timeout lets the
 //! caller fail over before any bytes reach the client (issue AC2); a

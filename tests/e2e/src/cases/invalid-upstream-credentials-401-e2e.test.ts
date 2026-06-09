@@ -20,7 +20,7 @@ import {
 // api_base but a secret that can't be a valid Authorization header
 // value (a newline-injected key), so the bridge can't build the auth
 // header and errors before dispatch. Auth-material problems map to 401
-// to match the canonical AuthenticationError mapping, so SDKs that branch
+// (auth-material, not a request-shape 400), so SDKs that branch
 // on 401 to refresh credentials classify it right. (An empty secret is
 // the same error class but is rejected earlier by the admin schema's
 // min-length check, so this drives the post-admit header-bytes guard.)

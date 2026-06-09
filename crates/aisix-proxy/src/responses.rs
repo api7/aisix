@@ -850,9 +850,9 @@ async fn responses_to_target(
 ///
 /// `output_tokens`, by contrast, defaults to 0 when absent: a 200 that
 /// reports an input side but omits the output side is still a real
-/// billable call and must be recorded. This matches the de-facto gateway
-/// behavior, which coerces a missing completion/output side to 0 and still logs/bills
-/// the event (#429 follow-up; mirrors the tolerant wire-layer decode of
+/// billable call and must be recorded. A missing completion/output side
+/// coerces to 0 and the event is still logged/billed
+/// (#429 follow-up; mirrors the tolerant wire-layer decode of
 /// #474). Spec:
 /// <https://platform.openai.com/docs/api-reference/responses/object>
 fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
@@ -2551,7 +2551,7 @@ mod tests {
         }
     }
 
-    /// #429 (gateway-parity follow-up): a 200 whose `usage` carries
+    /// #429 follow-up: a 200 whose `usage` carries
     /// `input_tokens` but omits `output_tokens` is still a real billable
     /// call. It MUST emit a UsageEvent with `completion_tokens = 0`
     /// (coercing the missing side to 0), NOT be dropped. Only a

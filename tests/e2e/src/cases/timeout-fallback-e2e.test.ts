@@ -22,7 +22,7 @@ import {
 //     over before any bytes reach the client; a mid-stream stall terminates
 //     the stream like any other upstream error (no fallback once committed).
 //
-// Mirrors the common OpenAI-proxy `timeout` + `stream_timeout` knobs. Reference: OpenAI
+// Exercises the `timeout` + `stream_timeout` knobs. Reference: OpenAI
 // Chat Completions spec for the request/response shape.
 
 const CALLER_PLAINTEXT = "sk-timeout-fb-caller";

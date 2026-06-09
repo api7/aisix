@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Role of a chat message. Matches OpenAI's taxonomy; providers that only
+/// Role of a chat message. Providers that only
 /// support system/user/assistant are expected to reject `Tool` at their
 /// own boundary rather than silently collapsing roles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

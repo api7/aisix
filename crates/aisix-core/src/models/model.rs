@@ -249,8 +249,7 @@ pub struct Model {
     /// routing model's target, an elapsed timeout fails over to the next
     /// target (the timeout error is retryable). For `stream:true` requests
     /// it is also the fallback streaming budget when `stream_timeout` is
-    /// unset (see [`Model::stream_timeout_effective`]). Mirrors the
-    /// common OpenAI-proxy `timeout` field.
+    /// unset (see [`Model::stream_timeout_effective`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
 
@@ -263,7 +262,7 @@ pub struct Model {
     /// to disable streaming timeouts entirely. A *first-chunk* timeout
     /// fails over to the next target (before any bytes reach the client); a
     /// *mid-stream* timeout terminates the stream like any other upstream
-    /// error. Mirrors the common OpenAI-proxy `stream_timeout` field.
+    /// error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_timeout: Option<u64>,
 
@@ -329,10 +328,7 @@ impl Model {
     }
 
     /// Effective deadline for a streaming request: a positive
-    /// `stream_timeout`, otherwise the non-streaming `timeout`. Mirrors
-    /// the common OpenAI-proxy timeout-resolution rule, which uses
-    /// `stream_timeout` for stream calls and falls back to the general
-    /// `timeout`. Applied to the
+    /// `stream_timeout`, otherwise the non-streaming `timeout`. Applied to the
     /// connect phase, the per-chunk read timeout, and the first-chunk
     /// failover gate. Because `stream_read_timeout()` folds `0` to `None`,
     /// `stream_timeout: 0` is treated the same as absent — it falls back to
@@ -447,7 +443,7 @@ mod tests {
         assert_eq!(zero.stream_timeout_effective(), None);
 
         // Explicit `stream_timeout: 0` folds to absent → falls back to
-        // `timeout` (matches the falsy-0 convention), not "disable streaming".
+        // `timeout`, not "disable streaming".
         let stream_zero_timeout_set: Model = serde_json::from_str(
             r#"{"display_name":"x","provider":"openai","model_name":"g","provider_key_id":"pk-1","timeout":5000,"stream_timeout":0}"#,
         )

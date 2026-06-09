@@ -5,8 +5,8 @@
 //! fallback to a different target — becomes its own `UsageEvent`. Failed
 //! attempts carry zero tokens + error info; the winning attempt carries
 //! the real tokens/cost. All attempts of one request share `request_id`
-//! (the trace/group key) and are ordered by `index`. This mirrors
-//! a de-facto per-call logging model.
+//! (the trace/group key) and are ordered by `index` — each attempt
+//! is its own per-call log event.
 //!
 //! The type lives in its own module so `/v1/chat/completions`,
 //! `/v1/messages`, and `/v1/responses` cannot drift apart on how they
