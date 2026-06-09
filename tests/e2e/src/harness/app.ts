@@ -170,6 +170,16 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
     await Promise.all([
       waitForReady(`${proxyUrl}/livez`, READY_TIMEOUT_MS),
       waitForReady(`${adminUrl}/admin/v1/health`, READY_TIMEOUT_MS, adminKey),
+      // Gate on the dedicated metrics listener too, so scrapes in the test
+      // never race the listener coming up.
+      ...(metricsUrl
+        ? [
+            waitForReady(
+              `${metricsUrl}${overrides.prometheusPath ?? "/metrics"}`,
+              READY_TIMEOUT_MS,
+            ),
+          ]
+        : []),
     ]);
   } catch (err) {
     const detail = exitErr ?? "still running";

@@ -533,6 +533,16 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         let prom = &cfg.observability.metrics.prometheus;
         if let (true, Some(addr)) = (prom.enabled, prom.addr.as_deref()) {
             let metrics_addr: std::net::SocketAddr = addr.parse()?;
+            // Fail boot loudly if the metrics port is unavailable, rather
+            // than silently serving no metrics until shutdown — the
+            // listener is spawned and only joined post-shutdown, so a
+            // swallowed bind error would leave the gateway looking healthy
+            // while every scrape gets connection-refused (the exact
+            // observability gap this listener exists to close). `serve_http`
+            // re-binds; the brief gap before re-bind is benign for a boot
+            // probe.
+            std::net::TcpListener::bind(metrics_addr)
+                .map_err(|e| anyhow::anyhow!("metrics listener bind {metrics_addr} failed: {e}"))?;
             let metrics_router = aisix_admin::metrics_router(metrics.clone(), prom);
             Some(tokio::spawn(serve_http(
                 metrics_addr,

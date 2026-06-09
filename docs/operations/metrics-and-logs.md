@@ -66,7 +66,7 @@ To scrape a managed data plane (or any deployment with a dedicated listener):
          path: /metrics
    ```
 
-Restrict access to the metrics port at the network layer — it is unauthenticated, like every Prometheus exporter. Self-hosted standalone deployments can keep scraping `/metrics` on the admin listener, or set `addr` to move it onto a dedicated listener too.
+Restrict access to the metrics port at the network layer — it is unauthenticated, like every Prometheus exporter. Self-hosted standalone deployments can keep scraping `/metrics` on the admin listener, or set `addr` to also expose it on a dedicated listener.
 
 AISIX exposes native metric names with the `aisix_` prefix. Existing compatibility series remain:
 

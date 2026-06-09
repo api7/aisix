@@ -854,6 +854,28 @@ observability:
     }
 
     #[test]
+    fn shipped_managed_config_binds_a_dedicated_metrics_listener() {
+        // The baked managed-image config (`config.managed.yaml`) is the
+        // entire "no control-plane change" lever: a managed DP exposes
+        // `/metrics` only because this file binds a dedicated listener
+        // while the admin listener stays the unbindable sentinel. A typo
+        // here would silently un-scrape every managed DP — that file is
+        // only COPYd into the image, so nothing else catches it. Pin it.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.managed.yaml");
+        let cfg =
+            Config::load_from_path(Some(Path::new(path))).expect("config.managed.yaml must load");
+        assert!(cfg.managed.is_managed());
+        assert_eq!(
+            cfg.observability.metrics.prometheus.addr.as_deref(),
+            Some("0.0.0.0:9090"),
+            "managed DPs must bind a dedicated metrics listener so they can be scraped",
+        );
+        // Admin is the unbindable sentinel, so the dedicated listener is
+        // the only metrics surface in managed mode.
+        assert_eq!(cfg.admin.addr, "127.0.0.1:0");
+    }
+
+    #[test]
     fn rejects_unknown_fields() {
         let f = write_yaml(
             r#"
