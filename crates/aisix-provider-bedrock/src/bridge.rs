@@ -30,9 +30,10 @@ use aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError;
 use aws_sdk_bedrockruntime::operation::invoke_model::InvokeModelError;
 use aws_sdk_bedrockruntime::primitives::Blob;
 use aws_sdk_bedrockruntime::types::{
-    ContentBlock, ContentBlockDelta, ConversationRole, ConverseStreamOutput,
-    InferenceConfiguration, Message as BedrockMessage, StopReason as SdkStopReason,
-    SystemContentBlock,
+    AnyToolChoice, ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole,
+    ConverseStreamOutput, InferenceConfiguration, Message as BedrockMessage, SpecificToolChoice,
+    StopReason as SdkStopReason, SystemContentBlock, Tool, ToolChoice, ToolConfiguration,
+    ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolSpecification, ToolUseBlock,
 };
 use aws_sdk_bedrockruntime::Client as BedrockClient;
 use aws_smithy_runtime_api::client::result::ServiceError;
@@ -58,6 +59,7 @@ use aws_sdk_bedrockruntime::config::interceptors::BeforeTransmitInterceptorConte
 use aws_sdk_bedrockruntime::config::{ConfigBag, Intercept, RuntimeComponents};
 use aws_smithy_runtime_api::box_error::BoxError;
 
+use crate::convert::{document_to_json, json_to_document};
 use crate::wire;
 
 /// Anthropic-on-Bedrock body-shape version pin per
@@ -798,6 +800,13 @@ impl BedrockBridge {
         if let Some(cfg) = build_inference_config(req, pk_param_constraints(ctx)) {
             call = call.inference_config(cfg);
         }
+        // #560: forward OpenAI `tools` / `tool_choice` into Converse's
+        // `toolConfig`. Without this every Converse publisher silently
+        // drops tool calling and improvises the call as prose
+        // (finish_reason=stop, tool_calls=[]).
+        if let Some(tc) = build_tool_config(req) {
+            call = call.tool_config(tc);
+        }
 
         let resp = call
             .send()
@@ -861,6 +870,11 @@ impl BedrockBridge {
         if let Some(cfg) = build_inference_config(req, pk_param_constraints(ctx)) {
             call = call.inference_config(cfg);
         }
+        // #560: forward tools on the stream path too (all publishers,
+        // incl. Anthropic, stream through Converse).
+        if let Some(tc) = build_tool_config(req) {
+            call = call.tool_config(tc);
+        }
 
         let mut resp = call
             .send()
@@ -870,10 +884,19 @@ impl BedrockBridge {
         let upstream_id_owned = upstream_id.to_string();
         let stream = async_stream::try_stream! {
             let mut emitted_role = false;
+            // #560: maps each tool-use block's Converse `contentBlockIndex`
+            // to a dense 0-based OpenAI `tool_calls[].index` (a preceding
+            // text block at index 0 would otherwise shift every tool call).
+            let mut tool_blocks: Vec<i32> = Vec::new();
             loop {
                 match resp.stream.recv().await {
                     Ok(Some(event)) => {
-                        for chunk in emit_converse_chunk(event, &upstream_id_owned, &mut emitted_role) {
+                        for chunk in emit_converse_chunk(
+                            event,
+                            &upstream_id_owned,
+                            &mut emitted_role,
+                            &mut tool_blocks,
+                        ) {
                             yield chunk;
                         }
                     }
@@ -899,15 +922,33 @@ impl BedrockBridge {
 ///
 /// System messages → top-level `system[]` blocks (Converse splits
 /// them out of `messages[]` per AWS spec).
-/// User / assistant messages → `messages[]` with role + text content
-/// block. Bedrock Converse rejects empty `messages[]` so the caller
-/// must check the returned `Vec` length.
+/// User messages → `messages[]` with a text content block.
+/// Assistant messages → a text block plus a `toolUse` block per OpenAI
+/// `tool_calls` entry (#560, multi-turn history).
+/// `role:"tool"` results → `toolResult` blocks carried in a user
+/// message; consecutive results coalesce into one (Converse requires all
+/// of a turn's results in a single user message). Bedrock Converse
+/// rejects empty `messages[]` so the caller must check the returned
+/// `Vec` length.
 fn build_converse_inputs(
     req: &ChatFormat,
 ) -> Result<(Vec<SystemContentBlock>, Vec<BedrockMessage>), BridgeError> {
     let mut systems: Vec<SystemContentBlock> = Vec::new();
     let mut messages: Vec<BedrockMessage> = Vec::new();
+    // #560: buffer for coalescing consecutive `role:"tool"` results
+    // (parallel tool calls) into ONE Converse user message — Converse
+    // rejects two consecutive user messages.
+    let mut pending_tool_results: Vec<ContentBlock> = Vec::new();
+
     for msg in &req.messages {
+        // Flush buffered tool results as one user message before any
+        // non-tool message opens.
+        if !matches!(msg.role, Role::Tool) && !pending_tool_results.is_empty() {
+            messages.push(build_message(
+                ConversationRole::User,
+                std::mem::take(&mut pending_tool_results),
+            )?);
+        }
         match msg.role {
             Role::System => {
                 let content = msg.content_str();
@@ -915,57 +956,145 @@ fn build_converse_inputs(
                     systems.push(SystemContentBlock::Text(content.to_string()));
                 }
             }
-            Role::User | Role::Assistant => {
-                let role = if matches!(msg.role, Role::User) {
-                    ConversationRole::User
-                } else {
-                    ConversationRole::Assistant
-                };
-                let m = BedrockMessage::builder()
-                    .role(role)
-                    .content(ContentBlock::Text(msg.content_str().to_string()))
-                    .build()
-                    .map_err(|e| {
-                        BridgeError::Config(format!("bedrock converse: build message: {e}"))
-                    })?;
-                messages.push(m);
+            Role::User => {
+                messages.push(build_message(
+                    ConversationRole::User,
+                    vec![ContentBlock::Text(msg.content_str().to_string())],
+                )?);
+            }
+            Role::Assistant => {
+                messages.push(build_message(
+                    ConversationRole::Assistant,
+                    assistant_content_blocks(msg)?,
+                )?);
             }
             Role::Tool => {
-                // Tool-result messages are part of Anthropic's tool-use
-                // protocol; Bedrock Converse supports them via
-                // `ContentBlock::ToolResult` but the gateway's ChatMessage
-                // surface doesn't carry the structured tool_use_id +
-                // content shape needed to round-trip cleanly. Skip
-                // silently for now; a tool-use-aware follow-up PR can
-                // wire this when the upstream ChatFormat extends to
-                // carry the structured payload.
+                // #560: `role:"tool"` → Converse `toolResult` block. The
+                // correlation id rides `tool_call_id`, the result text
+                // rides `content`. Without a `tool_call_id` the result
+                // can't be correlated to a `toolUse`, so skip it.
+                if let Some(id) = msg.tool_call_id.as_deref() {
+                    pending_tool_results.push(ContentBlock::ToolResult(
+                        ToolResultBlock::builder()
+                            .tool_use_id(id)
+                            .content(ToolResultContentBlock::Text(msg.content_str().to_string()))
+                            .build()
+                            .map_err(|e| {
+                                BridgeError::Config(format!(
+                                    "bedrock converse: build tool_result: {e}"
+                                ))
+                            })?,
+                    ));
+                }
             }
         }
+    }
+    // Flush any trailing tool results (a conversation ending on a result).
+    if !pending_tool_results.is_empty() {
+        messages.push(build_message(ConversationRole::User, pending_tool_results)?);
     }
     Ok((systems, messages))
 }
 
+/// Build a Converse [`BedrockMessage`] from a role and its content blocks.
+fn build_message(
+    role: ConversationRole,
+    blocks: Vec<ContentBlock>,
+) -> Result<BedrockMessage, BridgeError> {
+    let mut builder = BedrockMessage::builder().role(role);
+    for block in blocks {
+        builder = builder.content(block);
+    }
+    builder
+        .build()
+        .map_err(|e| BridgeError::Config(format!("bedrock converse: build message: {e}")))
+}
+
+/// Translate an assistant [`ChatMessage`] into Converse content blocks:
+/// the assistant text (when non-empty) followed by a `toolUse` block per
+/// OpenAI `tool_calls` entry (#560, multi-turn history).
+///
+/// When the assistant carried no tool calls this returns a single text
+/// block — byte-identical to the pre-#560 behaviour.
+fn assistant_content_blocks(msg: &ChatMessage) -> Result<Vec<ContentBlock>, BridgeError> {
+    let tool_calls = msg
+        .extra
+        .get("tool_calls")
+        .and_then(|v| v.as_array())
+        .filter(|calls| !calls.is_empty());
+    let Some(tool_calls) = tool_calls else {
+        // No tool calls: preserve the original single-text-block shape.
+        return Ok(vec![ContentBlock::Text(msg.content_str().to_string())]);
+    };
+
+    let mut blocks: Vec<ContentBlock> = Vec::new();
+    let text = msg.content_str();
+    if !text.is_empty() {
+        blocks.push(ContentBlock::Text(text.to_string()));
+    }
+    for call in tool_calls {
+        let function = call.get("function");
+        let id = call.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        let name = function
+            .and_then(|f| f.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if id.is_empty() || name.is_empty() {
+            continue; // malformed history entry — can't build a toolUse
+        }
+        // OpenAI `arguments` is a JSON-ENCODED STRING; parse it back to a
+        // value for the Document. Tolerate a blank/invalid string as `{}`.
+        let arguments = function
+            .and_then(|f| f.get("arguments"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("{}");
+        let parsed: serde_json::Value =
+            serde_json::from_str(arguments.trim()).unwrap_or_else(|_| serde_json::json!({}));
+        blocks.push(ContentBlock::ToolUse(
+            ToolUseBlock::builder()
+                .tool_use_id(id)
+                .name(name)
+                .input(json_to_document(&parsed))
+                .build()
+                .map_err(|e| {
+                    BridgeError::Config(format!("bedrock converse: build tool_use: {e}"))
+                })?,
+        ));
+    }
+    // If every tool_calls entry was malformed, fall back to a text block
+    // so Converse still receives a valid (non-empty) assistant message.
+    if blocks.is_empty() {
+        blocks.push(ContentBlock::Text(msg.content_str().to_string()));
+    }
+    Ok(blocks)
+}
+
 /// Translate a Converse response into the gateway [`ChatResponse`].
-/// Text content blocks are concatenated; tool-use / image / document
-/// blocks (rare in chat scenarios) are skipped.
+/// Text content blocks are concatenated; `toolUse` blocks become OpenAI
+/// `tool_calls` (#560); image / document blocks (rare in chat scenarios)
+/// are skipped.
 fn converse_output_into_chat_response(
     resp: aws_sdk_bedrockruntime::operation::converse::ConverseOutput,
     upstream_id: &str,
 ) -> ChatResponse {
-    let (text, finish) = match resp.output() {
+    let (message, finish) = match resp.output() {
         Some(aws_sdk_bedrockruntime::types::ConverseOutput::Message(msg)) => {
-            let text: String = msg
-                .content()
-                .iter()
-                .filter_map(|cb| match cb {
-                    ContentBlock::Text(t) => Some(t.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
-            (text, map_stop_reason(resp.stop_reason()))
+            let mut text = String::new();
+            let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+            for block in msg.content() {
+                match block {
+                    ContentBlock::Text(t) => text.push_str(t),
+                    // #560: translate Converse `toolUse` → OpenAI `tool_calls`.
+                    ContentBlock::ToolUse(tu) => tool_calls.push(tool_use_to_openai(tu)),
+                    _ => {}
+                }
+            }
+            (
+                build_assistant_message(text, tool_calls),
+                map_stop_reason(resp.stop_reason()),
+            )
         }
-        _ => (String::new(), FinishReason::Stop),
+        _ => (ChatMessage::assistant(String::new()), FinishReason::Stop),
     };
     let usage = resp
         .usage()
@@ -979,10 +1108,47 @@ fn converse_output_into_chat_response(
     ChatResponse {
         id: String::new(),
         model: upstream_id.to_string(),
-        message: ChatMessage::assistant(text),
+        message,
         finish_reason: finish,
         usage,
     }
+}
+
+/// Translate a Converse `toolUse` content block into an OpenAI
+/// `tool_calls[]` entry (#560). `arguments` MUST be a JSON-**encoded
+/// string** per the OpenAI Chat Completions spec — SDK consumers do
+/// `JSON.parse(toolCall.function.arguments)`, so passing the parsed
+/// object would break every OpenAI-SDK caller.
+/// <https://platform.openai.com/docs/api-reference/chat/object>
+fn tool_use_to_openai(tu: &ToolUseBlock) -> serde_json::Value {
+    let arguments =
+        serde_json::to_string(&document_to_json(tu.input())).unwrap_or_else(|_| "{}".to_string());
+    serde_json::json!({
+        "id": tu.tool_use_id(),
+        "type": "function",
+        "function": { "name": tu.name(), "arguments": arguments },
+    })
+}
+
+/// Build the assistant [`ChatMessage`] for a Converse response, folding
+/// any translated `tool_calls` into the `extra["tool_calls"]` slot the
+/// rest of the gateway already reads (output guardrails, response
+/// rendering). When tool calls are present with no prose, `content` is
+/// surfaced as `null` (`None`) to mirror OpenAI's
+/// assistant-with-tool_calls shape (#395 / #514).
+fn build_assistant_message(text: String, tool_calls: Vec<serde_json::Value>) -> ChatMessage {
+    let mut message = ChatMessage::assistant(text);
+    if tool_calls.is_empty() {
+        return message;
+    }
+    if message.content.as_deref() == Some("") {
+        message.content = None;
+    }
+    message.extra.insert(
+        "tool_calls".to_string(),
+        serde_json::Value::Array(tool_calls),
+    );
+    message
 }
 
 /// Map AWS Converse `StopReason` to the gateway's [`FinishReason`]
@@ -1005,16 +1171,24 @@ fn map_stop_reason(stop: &SdkStopReason) -> FinishReason {
 /// [`ChatChunk`]s.
 ///
 /// - `MessageStart` → role chunk (role=assistant)
+/// - `ContentBlockStart` (toolUse) → tool_call delta opening the call
+///   with `id` + `function.name` (#560)
 /// - `ContentBlockDelta` (text) → content chunk
+/// - `ContentBlockDelta` (toolUse) → tool_call delta carrying an
+///   `arguments` fragment (#560)
 /// - `MessageStop` → finish-reason chunk
 /// - `Metadata` → usage chunk
-/// - Other variants (`ContentBlockStart`, `ContentBlockStop`,
-///   tool-use deltas) → no chunk emitted (covered by the AWS spec
-///   but not surfaced through the OpenAI-style ChatChunk shape).
+/// - Other variants (`ContentBlockStop`, image deltas) → no chunk.
+///
+/// `tool_blocks` records each tool-use block's Converse
+/// `contentBlockIndex` in arrival order; a block's position there is the
+/// dense 0-based OpenAI `tool_calls[].index`, so a leading text block at
+/// index 0 doesn't shift the first tool call.
 fn emit_converse_chunk(
     event: ConverseStreamOutput,
     upstream_id: &str,
     emitted_role: &mut bool,
+    tool_blocks: &mut Vec<i32>,
 ) -> Vec<ChatChunk> {
     let mut out = Vec::new();
     match event {
@@ -1033,18 +1207,52 @@ fn emit_converse_chunk(
                 });
             }
         }
+        // #560: a tool-use block opens — emit the OpenAI tool_call delta
+        // carrying `id` + `function.name`. Arguments stream in via the
+        // subsequent ContentBlockDelta(toolUse) events.
+        ConverseStreamOutput::ContentBlockStart(s) => {
+            let block_index = s.content_block_index;
+            if let Some(ContentBlockStart::ToolUse(tu)) = s.start {
+                let oai_index = tool_blocks.len() as i32;
+                tool_blocks.push(block_index);
+                out.push(tool_call_chunk(
+                    upstream_id,
+                    oai_index,
+                    Some(tu.tool_use_id()),
+                    Some(tu.name()),
+                    "",
+                ));
+            }
+        }
         ConverseStreamOutput::ContentBlockDelta(d) => {
-            if let Some(ContentBlockDelta::Text(text)) = d.delta {
-                out.push(ChatChunk {
-                    id: String::new(),
-                    model: upstream_id.to_string(),
-                    delta: ChatDelta {
-                        content: Some(text),
-                        ..Default::default()
-                    },
-                    finish_reason: None,
-                    usage: None,
-                });
+            let block_index = d.content_block_index;
+            match d.delta {
+                Some(ContentBlockDelta::Text(text)) => {
+                    out.push(ChatChunk {
+                        id: String::new(),
+                        model: upstream_id.to_string(),
+                        delta: ChatDelta {
+                            content: Some(text),
+                            ..Default::default()
+                        },
+                        finish_reason: None,
+                        usage: None,
+                    });
+                }
+                // #560: a tool-use `arguments` fragment. Correlate to the
+                // call opened by ContentBlockStart via the block index.
+                Some(ContentBlockDelta::ToolUse(tu)) => {
+                    if let Some(pos) = tool_blocks.iter().position(|&i| i == block_index) {
+                        out.push(tool_call_chunk(
+                            upstream_id,
+                            pos as i32,
+                            None,
+                            None,
+                            tu.input(),
+                        ));
+                    }
+                }
+                _ => {}
             }
         }
         ConverseStreamOutput::MessageStop(m) => {
@@ -1072,14 +1280,58 @@ fn emit_converse_chunk(
                 });
             }
         }
-        // ContentBlockStart / ContentBlockStop carry no customer-visible
-        // payload in chat scenarios; tool-use / image deltas are
-        // deferred. The catch-all is non-exhaustive because the SDK
-        // enum is non_exhaustive — future AWS event types fall here
-        // safely.
+        // ContentBlockStop carries no customer-visible payload. The
+        // catch-all is non-exhaustive because the SDK enum is
+        // non_exhaustive — future AWS event types fall here safely.
         _ => {}
     }
     out
+}
+
+/// Build a streaming OpenAI `tool_calls` delta chunk (#560). The opening
+/// chunk for a call carries `id` + `function.name` (+ an empty
+/// `arguments`); subsequent chunks carry only an `arguments` fragment.
+/// `index` is the call's dense 0-based position in the `tool_calls`
+/// array. Reference:
+/// <https://platform.openai.com/docs/api-reference/chat/streaming>
+fn tool_call_chunk(
+    upstream_id: &str,
+    index: i32,
+    id: Option<&str>,
+    name: Option<&str>,
+    arguments: &str,
+) -> ChatChunk {
+    let mut function = serde_json::Map::new();
+    if let Some(name) = name {
+        function.insert(
+            "name".to_string(),
+            serde_json::Value::String(name.to_string()),
+        );
+    }
+    function.insert(
+        "arguments".to_string(),
+        serde_json::Value::String(arguments.to_string()),
+    );
+    let mut call = serde_json::Map::new();
+    call.insert("index".to_string(), serde_json::Value::from(index));
+    if let Some(id) = id {
+        call.insert("id".to_string(), serde_json::Value::String(id.to_string()));
+        call.insert(
+            "type".to_string(),
+            serde_json::Value::String("function".to_string()),
+        );
+    }
+    call.insert("function".to_string(), serde_json::Value::Object(function));
+    ChatChunk {
+        id: String::new(),
+        model: upstream_id.to_string(),
+        delta: ChatDelta {
+            tool_calls: Some(vec![serde_json::Value::Object(call)]),
+            ..Default::default()
+        },
+        finish_reason: None,
+        usage: None,
+    }
 }
 
 /// Map the SDK's `ConverseError` SdkError variant to BridgeError.
@@ -1268,6 +1520,104 @@ fn build_inference_config(
         b = b.top_p(p);
     }
     Some(b.build())
+}
+
+/// Build a Converse [`ToolConfiguration`] from the OpenAI `tools` /
+/// `tool_choice` the caller sent — they arrive in [`ChatFormat::extra`]
+/// (the gateway captures unknown top-level request fields there). Returns
+/// `None` when there are no usable tools (#560).
+///
+/// OpenAI → Converse `tool_choice` mapping. Converse's `toolChoice` is
+/// `auto | any | tool`, with no `none`; `auto` is Converse's default, so
+/// the common cases send no explicit `toolChoice` (which also avoids the
+/// field on publishers that only accept the default):
+///   * `tool_choice:"none"` → no toolConfig at all (model answers in prose)
+///   * `tool_choice:"auto"` / omitted → tools sent, `toolChoice` omitted
+///   * `tool_choice:"required"` → `toolChoice:{any:{}}`
+///   * `tool_choice:{function:{name}}` → `toolChoice:{tool:{name}}`
+///
+/// Forcing (`any` / `tool`) is only honoured by models that support it
+/// (per AWS, specific-tool choice is Anthropic Claude 3 + Amazon Nova
+/// only); on other publishers Bedrock returns a validation error, which
+/// is the correct surface for an explicit unsupported force.
+/// References:
+/// <https://platform.openai.com/docs/api-reference/chat/create#chat-create-tool_choice>,
+/// <https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ToolChoice.html>
+fn build_tool_config(req: &ChatFormat) -> Option<ToolConfiguration> {
+    // OpenAI `tool_choice:"none"` means "don't call any tool this turn".
+    // Converse has no `none`, so send no toolConfig — the model answers
+    // in prose, honouring the user-visible contract (no tool call). Tool
+    // visibility is lost, but that matches the intent of "none".
+    if req.extra.get("tool_choice").and_then(|v| v.as_str()) == Some("none") {
+        return None;
+    }
+    let tools_json = req.extra.get("tools").and_then(|v| v.as_array())?;
+    let mut tools: Vec<Tool> = Vec::new();
+    for entry in tools_json {
+        // OpenAI only defines `type:"function"` tools today; skip any
+        // other shape rather than guessing how to translate it.
+        if entry
+            .get("type")
+            .and_then(|v| v.as_str())
+            .is_some_and(|ty| ty != "function")
+        {
+            continue;
+        }
+        let Some(function) = entry.get("function") else {
+            continue;
+        };
+        let Some(name) = function.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let mut spec = ToolSpecification::builder().name(name);
+        if let Some(description) = function.get("description").and_then(|v| v.as_str()) {
+            spec = spec.description(description);
+        }
+        // OpenAI `parameters` is a JSON Schema object; default to an empty
+        // object schema for a no-argument tool.
+        let parameters = function
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+        spec = spec.input_schema(ToolInputSchema::Json(json_to_document(&parameters)));
+        if let Ok(spec) = spec.build() {
+            tools.push(Tool::ToolSpec(spec));
+        }
+    }
+    if tools.is_empty() {
+        return None;
+    }
+    let mut config = ToolConfiguration::builder().set_tools(Some(tools));
+    if let Some(choice) = req.extra.get("tool_choice").and_then(map_tool_choice) {
+        config = config.tool_choice(choice);
+    }
+    config.build().ok()
+}
+
+/// Map an OpenAI `tool_choice` to a Converse [`ToolChoice`], or `None` to
+/// leave it unset (Converse then applies its `auto` default). `"none"` is
+/// handled by the caller (no toolConfig at all).
+fn map_tool_choice(choice: &serde_json::Value) -> Option<ToolChoice> {
+    match choice {
+        serde_json::Value::String(s) => match s.as_str() {
+            "required" => Some(ToolChoice::Any(AnyToolChoice::builder().build())),
+            // "auto" is Converse's default — omit rather than send an
+            // explicit field some publishers reject.
+            _ => None,
+        },
+        serde_json::Value::Object(map) => {
+            let name = map
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())?;
+            SpecificToolChoice::builder()
+                .name(name)
+                .build()
+                .ok()
+                .map(ToolChoice::Tool)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2634,6 +2984,354 @@ mod tests {
         assert!(
             body.get("model").is_none(),
             "Converse body must NOT carry top-level `model` field; body={body}"
+        );
+    }
+
+    // ─── #560 Bedrock Converse tool calling ────────────────────────────
+    //
+    // OpenAI `tools` / `tool_choice` (carried in ChatFormat.extra) must
+    // reach Converse's `toolConfig`, and Converse `toolUse` blocks must
+    // come back as OpenAI `tool_calls`. Before #560 the Converse builder
+    // never set `toolConfig`, so every non-Anthropic publisher silently
+    // dropped tool calling and improvised the call as prose.
+
+    /// Build a tools-bearing request whose `tools` / `tool_choice` land in
+    /// `ChatFormat.extra` exactly as an inbound OpenAI request would.
+    fn tools_request(tool_choice: serde_json::Value) -> ChatFormat {
+        serde_json::from_value(serde_json::json!({
+            "model": "my-llama",
+            "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the current weather for a city.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"]
+                    }
+                }
+            }],
+            "tool_choice": tool_choice,
+        }))
+        .expect("tools request deserializes")
+    }
+
+    /// Capture the outbound Converse body for a tools-bearing request.
+    async fn capture_converse_body(req: &ChatFormat) -> serde_json::Value {
+        let server = MockServer::start().await;
+        let responder = CapturingResponder::default();
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse$"))
+            .respond_with(responder.clone())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let _ = bridge.chat(req, &ctx).await;
+        let body = responder.captured_body.lock().unwrap().clone().unwrap();
+        body
+    }
+
+    #[tokio::test]
+    async fn chat_converse_forwards_tools_and_forced_tool_choice() {
+        // Root cause of #560: the Converse builder never set `toolConfig`.
+        // Pin that OpenAI `tools` translate to `toolConfig.tools[].toolSpec`
+        // (schema verbatim) and a forced `tool_choice` to `toolChoice.tool`.
+        let req = tools_request(serde_json::json!({
+            "type": "function",
+            "function": {"name": "get_weather"}
+        }));
+        let body = capture_converse_body(&req).await;
+
+        let tool_config = body
+            .get("toolConfig")
+            .unwrap_or_else(|| panic!("toolConfig must be present; body={body}"));
+        let tools = tool_config
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("toolConfig.tools must be an array; body={body}"));
+        assert_eq!(tools.len(), 1);
+        let spec = tools[0]
+            .get("toolSpec")
+            .unwrap_or_else(|| panic!("tool must be a toolSpec; body={body}"));
+        assert_eq!(
+            spec.get("name").and_then(|v| v.as_str()),
+            Some("get_weather")
+        );
+        assert_eq!(
+            spec.get("description").and_then(|v| v.as_str()),
+            Some("Get the current weather for a city.")
+        );
+        let schema = spec
+            .get("inputSchema")
+            .and_then(|s| s.get("json"))
+            .unwrap_or_else(|| panic!("inputSchema.json must carry the params; body={body}"));
+        assert_eq!(schema.get("type").and_then(|v| v.as_str()), Some("object"));
+        assert!(
+            schema
+                .get("properties")
+                .and_then(|p| p.get("location"))
+                .is_some(),
+            "OpenAI parameters JSON Schema must round-trip into inputSchema.json; schema={schema}"
+        );
+        assert_eq!(
+            tool_config
+                .get("toolChoice")
+                .and_then(|c| c.get("tool"))
+                .and_then(|t| t.get("name"))
+                .and_then(|v| v.as_str()),
+            Some("get_weather"),
+            "forced tool_choice must map to toolChoice.tool; body={body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_converse_maps_required_tool_choice_to_any() {
+        let body = capture_converse_body(&tools_request(serde_json::json!("required"))).await;
+        let tool_config = body.get("toolConfig").unwrap();
+        assert!(
+            tool_config
+                .get("toolChoice")
+                .and_then(|c| c.get("any"))
+                .is_some(),
+            "tool_choice:required must map to toolChoice.any; body={body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_converse_auto_tool_choice_omits_explicit_choice() {
+        // "auto" is Converse's default; we send the tools but omit an
+        // explicit toolChoice so publishers that only accept the default
+        // aren't rejected.
+        let body = capture_converse_body(&tools_request(serde_json::json!("auto"))).await;
+        let tool_config = body.get("toolConfig").unwrap();
+        assert!(
+            tool_config.get("tools").is_some(),
+            "tools must still be sent"
+        );
+        assert!(
+            tool_config.get("toolChoice").is_none(),
+            "auto must omit an explicit toolChoice (Converse default); body={body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_converse_tool_choice_none_sends_no_tool_config() {
+        // Converse has no `none`; the only faithful mapping is to send no
+        // toolConfig at all so the model answers in prose.
+        let body = capture_converse_body(&tools_request(serde_json::json!("none"))).await;
+        assert!(
+            body.get("toolConfig").is_none(),
+            "tool_choice:none must send no toolConfig; body={body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_converse_translates_tool_use_response_to_tool_calls() {
+        // The other half of #560: a Converse `toolUse` content block must
+        // surface as an OpenAI `tool_calls` entry with `arguments` as a
+        // JSON-encoded STRING, and `content: null` when there's no prose.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/model/.+/converse$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": {"message": {"role": "assistant", "content": [
+                    {"toolUse": {
+                        "toolUseId": "tooluse_abc",
+                        "name": "get_weather",
+                        "input": {"location": "Paris"}
+                    }}
+                ]}},
+                "stopReason": "tool_use",
+                "usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15},
+                "metrics": {"latencyMs": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let bridge = BedrockBridge::new().with_endpoint_override(server.uri());
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model_with("meta.llama3-3-70b-instruct-v1:0"),
+            sample_pk_with_secret(valid_secret_json()),
+        );
+        let req = ChatFormat::new("my-llama", vec![ChatMessage::user("weather in Paris?")]);
+        let chat = bridge.chat(&req, &ctx).await.unwrap();
+
+        assert_eq!(chat.finish_reason, FinishReason::ToolCalls);
+        let tool_calls = chat
+            .message
+            .extra
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .expect("tool_calls must be present");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(
+            tool_calls[0].get("id").and_then(|v| v.as_str()),
+            Some("tooluse_abc")
+        );
+        assert_eq!(
+            tool_calls[0].get("type").and_then(|v| v.as_str()),
+            Some("function")
+        );
+        assert_eq!(
+            tool_calls[0]
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str()),
+            Some("get_weather")
+        );
+        let arguments = tool_calls[0]
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(|v| v.as_str())
+            .expect("arguments MUST be a JSON-encoded STRING per the OpenAI spec");
+        let parsed: serde_json::Value =
+            serde_json::from_str(arguments).expect("arguments string must itself be valid JSON");
+        assert_eq!(
+            parsed.get("location").and_then(|v| v.as_str()),
+            Some("Paris")
+        );
+        assert!(
+            chat.message.content.is_none(),
+            "content must be null alongside tool_calls when there is no prose"
+        );
+    }
+
+    #[test]
+    fn build_converse_inputs_translates_tool_history_and_coalesces_results() {
+        // Multi-turn replay: an assistant `tool_calls` history entry must
+        // become `toolUse` blocks, and consecutive `role:"tool"` results
+        // (parallel calls) must coalesce into ONE Converse user message.
+        let req: ChatFormat = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris and Tokyo?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}},
+                    {"id": "call_2", "type": "function",
+                     "function": {"name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "15C"},
+                {"role": "tool", "tool_call_id": "call_2", "content": "20C"}
+            ]
+        }))
+        .unwrap();
+
+        let (systems, messages) = build_converse_inputs(&req).unwrap();
+        assert!(systems.is_empty());
+        // user → assistant(2× toolUse) → user(2× toolResult, coalesced)
+        assert_eq!(
+            messages.len(),
+            3,
+            "two consecutive tool results must coalesce into one user message"
+        );
+
+        assert_eq!(*messages[1].role(), ConversationRole::Assistant);
+        let tool_uses: Vec<_> = messages[1]
+            .content()
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse(tu) => Some(tu),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tool_uses.len(),
+            2,
+            "both tool_calls must become toolUse blocks"
+        );
+        assert_eq!(tool_uses[0].tool_use_id(), "call_1");
+        assert_eq!(tool_uses[0].name(), "get_weather");
+
+        assert_eq!(*messages[2].role(), ConversationRole::User);
+        let results: Vec<_> = messages[2]
+            .content()
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult(tr) => Some(tr),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results.len(),
+            2,
+            "both tool results must share ONE user message"
+        );
+        assert_eq!(results[0].tool_use_id(), "call_1");
+        assert_eq!(results[1].tool_use_id(), "call_2");
+    }
+
+    #[test]
+    fn emit_converse_chunk_streams_tool_call_deltas() {
+        use aws_sdk_bedrockruntime::types::{
+            ContentBlockDeltaEvent, ContentBlockStartEvent, ToolUseBlockDelta, ToolUseBlockStart,
+        };
+        let mut emitted_role = false;
+        let mut tool_blocks: Vec<i32> = Vec::new();
+
+        // A tool-use block opens at contentBlockIndex 0.
+        let start = ConverseStreamOutput::ContentBlockStart(
+            ContentBlockStartEvent::builder()
+                .content_block_index(0)
+                .start(ContentBlockStart::ToolUse(
+                    ToolUseBlockStart::builder()
+                        .tool_use_id("tooluse_1")
+                        .name("get_weather")
+                        .build()
+                        .unwrap(),
+                ))
+                .build()
+                .unwrap(),
+        );
+        let chunks = emit_converse_chunk(start, "m", &mut emitted_role, &mut tool_blocks);
+        assert_eq!(chunks.len(), 1);
+        let call = &chunks[0].delta.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call.get("index").and_then(|v| v.as_i64()), Some(0));
+        assert_eq!(call.get("id").and_then(|v| v.as_str()), Some("tooluse_1"));
+        assert_eq!(call.get("type").and_then(|v| v.as_str()), Some("function"));
+        assert_eq!(
+            call.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str()),
+            Some("get_weather")
+        );
+
+        // Arguments stream in via a ToolUse delta on the same block index.
+        let delta = ConverseStreamOutput::ContentBlockDelta(
+            ContentBlockDeltaEvent::builder()
+                .content_block_index(0)
+                .delta(ContentBlockDelta::ToolUse(
+                    ToolUseBlockDelta::builder()
+                        .input("{\"location\":\"Paris\"}")
+                        .build()
+                        .unwrap(),
+                ))
+                .build()
+                .unwrap(),
+        );
+        let chunks = emit_converse_chunk(delta, "m", &mut emitted_role, &mut tool_blocks);
+        assert_eq!(chunks.len(), 1);
+        let call = &chunks[0].delta.tool_calls.as_ref().unwrap()[0];
+        assert_eq!(call.get("index").and_then(|v| v.as_i64()), Some(0));
+        assert!(
+            call.get("id").is_none(),
+            "an arguments-continuation chunk carries no id/type"
+        );
+        assert_eq!(
+            call.get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|v| v.as_str()),
+            Some("{\"location\":\"Paris\"}")
         );
     }
 

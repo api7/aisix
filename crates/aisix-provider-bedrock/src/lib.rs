@@ -86,6 +86,7 @@
 #![deny(rust_2018_idioms)]
 
 mod bridge;
+mod convert;
 mod wire;
 
 pub use bridge::{BedrockBridge, BedrockPublisher};
