@@ -5,7 +5,11 @@
 //! 2. API-key inline rate limit (`auth.entry.id`)
 //! 3. Model inline rate limit (`model:<name>`) — when the resolved Model has one
 //! 4. Policy-based rate limits — looked up from the snapshot's
-//!    `rate_limit_policies` table, matched by scope (api_key/model/team/member)
+//!    `rate_limit_policies` table, matched by scope
+//!    (api_key/model/team/member/team_member). `team_member` is a
+//!    per-member default for a team: it matches every key in the team
+//!    but buckets the counter per `user_id`, so each member gets an
+//!    independent identical quota (vs. `team`, one shared bucket).
 //!
 //! All layers use AND logic — every layer must pass or the request gets
 //! 429. The returned [`MultiReservation`] commits token usage to all
@@ -101,6 +105,21 @@ fn policy_to_rate_limit(policy: &RateLimitPolicy) -> RateLimit {
     rl
 }
 
+/// Bucket key for a policy reservation. Most scopes share one counter
+/// across every key the policy matches (`policy:<scope>:<scope_ref>:<id>`).
+/// `team_member` is the exception: it appends the request's `user_id` so
+/// each member of the team counts against an independent identical bucket
+/// (LiteLLM's `{team_id}:{user_id}` shape).
+fn policy_bucket_key(policy: &RateLimitPolicy, entry_id: &str, auth: &AuthenticatedKey) -> String {
+    let base = format!("policy:{}:{}:{}", policy.scope, policy.scope_ref, entry_id);
+    if policy.scope == "team_member" {
+        if let Some(user_id) = auth.key().user_id.as_deref() {
+            return format!("{base}:{user_id}");
+        }
+    }
+    base
+}
+
 /// Reserve across all applicable rate-limit layers (api_key, model, policies).
 fn reserve_layers<'a>(
     state: &'a ProxyState,
@@ -140,6 +159,13 @@ fn reserve_layers<'a>(
             "model" => model_rl.is_some_and(|m| policy.scope_ref == m.entry_id),
             "team" => auth.key().team_id.as_deref() == Some(policy.scope_ref.as_str()),
             "member" => auth.key().user_id.as_deref() == Some(policy.scope_ref.as_str()),
+            // Per-member default for a team: matches every key whose
+            // team_id == scope_ref, but only when the key carries a
+            // user_id (the bucket is keyed per member below).
+            "team_member" => {
+                auth.key().team_id.as_deref() == Some(policy.scope_ref.as_str())
+                    && auth.key().user_id.is_some()
+            }
             _ => false,
         };
         if !applies {
@@ -149,7 +175,7 @@ fn reserve_layers<'a>(
         if rl.is_unrestricted() {
             continue;
         }
-        let bucket_key = format!("policy:{}:{}:{}", policy.scope, policy.scope_ref, entry.id);
+        let bucket_key = policy_bucket_key(policy, &entry.id, auth);
         let r = state
             .limiter
             .pre_commit(&bucket_key, &rl)
@@ -223,6 +249,61 @@ mod tests {
             "max_tokens": max_tok,
         }))
         .unwrap()
+    }
+
+    fn make_scoped_policy(scope: &str, scope_ref: &str) -> RateLimitPolicy {
+        serde_json::from_value(serde_json::json!({
+            "name": "test",
+            "scope": scope,
+            "scope_ref": scope_ref,
+            "window": "minute",
+            "max_requests": 10,
+        }))
+        .unwrap()
+    }
+
+    fn make_auth(team_id: Option<&str>, user_id: Option<&str>) -> AuthenticatedKey {
+        let key: aisix_core::ApiKey = serde_json::from_value(serde_json::json!({
+            "key_hash": "h",
+            "allowed_models": [],
+            "team_id": team_id,
+            "user_id": user_id,
+        }))
+        .unwrap();
+        AuthenticatedKey {
+            entry: std::sync::Arc::new(aisix_core::resource::ResourceEntry::new(
+                "key-entry-1",
+                key,
+                1,
+            )),
+        }
+    }
+
+    #[test]
+    fn team_member_bucket_key_is_per_user() {
+        let policy = make_scoped_policy("team_member", "team-1");
+        let auth_a = make_auth(Some("team-1"), Some("user-a"));
+        let auth_b = make_auth(Some("team-1"), Some("user-b"));
+
+        let key_a = policy_bucket_key(&policy, "pol-1", &auth_a);
+        let key_b = policy_bucket_key(&policy, "pol-1", &auth_b);
+
+        // Same team + same policy, but distinct members → distinct buckets,
+        // so member A exhausting the default never throttles member B.
+        assert_eq!(key_a, "policy:team_member:team-1:pol-1:user-a");
+        assert_eq!(key_b, "policy:team_member:team-1:pol-1:user-b");
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn team_bucket_key_is_shared_across_members() {
+        // Contrast with `team`: one bucket for the whole team regardless
+        // of which member sends the request (pooled quota).
+        let policy = make_scoped_policy("team", "team-1");
+        let key_a = policy_bucket_key(&policy, "pol-1", &make_auth(Some("team-1"), Some("user-a")));
+        let key_b = policy_bucket_key(&policy, "pol-1", &make_auth(Some("team-1"), Some("user-b")));
+        assert_eq!(key_a, "policy:team:team-1:pol-1");
+        assert_eq!(key_a, key_b);
     }
 
     #[test]

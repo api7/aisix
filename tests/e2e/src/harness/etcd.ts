@@ -45,6 +45,26 @@ export class EtcdClient {
     }
   }
 
+  /**
+   * Put a single key/value (etcd v3 `/v3/kv/put`). Used to seed
+   * resources the Admin API doesn't expose (e.g. rate_limit_policies),
+   * written under `<prefix>/<kind>/<id>` so the DP loader picks them up.
+   */
+  async put(key: string, value: string): Promise<void> {
+    const res = await harnessRequest(`${this.endpoint}/v3/kv/put`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        key: Buffer.from(key, "utf8").toString("base64"),
+        value: Buffer.from(value, "utf8").toString("base64"),
+      }),
+    });
+    if (res.statusCode >= 300) {
+      const body = await res.body.text();
+      throw new Error(`etcd put failed (${res.statusCode}): ${body}`);
+    }
+  }
+
   /** Delete every key under `prefix` (range delete in etcd v3 semantics). */
   async deletePrefix(prefix: string): Promise<void> {
     const key = Buffer.from(prefix, "utf8").toString("base64");
