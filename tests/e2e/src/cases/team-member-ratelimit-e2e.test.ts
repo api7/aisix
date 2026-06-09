@@ -102,12 +102,19 @@ describe("rate limit e2e: team_member per-member default buckets", () => {
     }
 
     // listModels doesn't consume an rpm slot — safe readiness probe.
-    const probe = new ProxyClient(app.proxyUrl, KEY_A1);
+    // Probe EVERY key the assertions use, not just KEY_A1: the keys are
+    // seeded at higher etcd revisions than the model, so a model+KEY_A1
+    // hit doesn't guarantee KEY_A2/KEY_B have propagated — an
+    // unpropagated key would 401 and flake the later assertions.
+    const keysToProbe = [KEY_A1, KEY_A2, KEY_B];
     await waitConfigPropagation(async () => {
-      const res = await probe.listModels();
-      if (res.status !== 200) return false;
-      const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
-      return data.some((m) => m.id === "tm-e2e");
+      for (const key of keysToProbe) {
+        const res = await new ProxyClient(app.proxyUrl, key).listModels();
+        if (res.status !== 200) return false;
+        const data = (res.body as { data?: Array<{ id?: string }> }).data ?? [];
+        if (!data.some((m) => m.id === "tm-e2e")) return false;
+      }
+      return true;
     });
 
     const chat = (apiKey: string) =>
