@@ -68,7 +68,7 @@ As with every exporter, cloud credentials are **never** stored in the control pl
 
 #### `credential_ref` (default) — static keys on the data plane
 
-The data plane resolves `credential_ref` to environment variables it reads locally, named `OBJSTORE_CRED_<SLUG>_<FIELD>`. `<SLUG>` is `credential_ref` upper-cased with every non-alphanumeric character folded to `_`. To keep that mapping unambiguous — so two different refs cannot silently fold onto the same variables — use only lowercase letters, digits, and underscores in `credential_ref`; the control plane and dashboard enforce `^[a-z0-9_]+$`.
+The data plane resolves `credential_ref` to environment variables it reads locally, named `OBJSTORE_CRED_<SLUG>_<FIELD>`. `<SLUG>` is `credential_ref` upper-cased with every character that is not an ASCII letter or digit folded to `_`. To keep that mapping unambiguous — so two different refs cannot silently fold onto the same variables — use only lowercase letters, digits, and underscores in `credential_ref`; the control plane and dashboard enforce `^[a-z0-9_]+$`.
 
 Per-provider variables to set on the data plane (shown for `credential_ref = acme_s3_prod`, where `<SLUG>` = `ACME_S3_PROD`):
 
