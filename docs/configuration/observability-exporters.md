@@ -142,7 +142,7 @@ Fields:
 - `logstore` — SLS logstore that receives the logs.
 - `credential_ref` — pointer to the AccessKey, resolved on the data plane (see below). The AccessKey is never stored in the control plane or sent on the wire.
 - `content_mode` — `metadata_only` (default) or `full`. See **Content capture** below.
-- `content_max_bytes` — per-field byte cap under `content_mode: full`; defaults to `131072` (128 KiB), minimum `1`. Ignored under `metadata_only`.
+- `content_max_bytes` — per-field byte cap under `content_mode: full`; defaults to `131072` (128 KiB), minimum `1`, maximum `1048576` (1 MiB). Ignored under `metadata_only`.
 
 `endpoint`, `project`, `logstore`, and `credential_ref` are required.
 
