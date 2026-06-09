@@ -6,12 +6,12 @@ sidebar_position: 40
 
 Observability exporters let the data plane send request telemetry directly to a destination you control — an OTLP/HTTP endpoint, or a cloud object-storage bucket.
 
-This page documents two kinds:
+This page documents all current exporter kinds:
 
 - `otlp_http` — request traces to an OTLP/HTTP endpoint.
 - `object_store` — batched NDJSON files to Amazon S3, Google Cloud Storage, or Azure Blob (or any S3-compatible target).
-
-(`aliyun_sls` and `datadog` are additional `kind`s in the schema; they are not yet documented on this page.)
+- `aliyun_sls` — request-event logs to an Alibaba Cloud Simple Log Service (SLS) logstore.
+- `datadog` — request events to the Datadog Logs HTTP intake.
 
 Use this page when you want request-level telemetry fan-out without restarting the process for every destination change.
 
@@ -130,6 +130,93 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/observability_exporters \
     "auth_mode": "cloud_identity"
   }'
 ```
+
+## Aliyun SLS Exporter (`kind: aliyun_sls`)
+
+`kind: "aliyun_sls"` sends request-event logs to an Alibaba Cloud Simple Log Service (SLS) logstore. The data plane signs each batch with an AccessKey it resolves locally and posts to `https://<project>.<endpoint>`.
+
+Fields:
+
+- `endpoint` — SLS region host with no scheme, e.g. `ap-southeast-3.log.aliyuncs.com`. The data plane posts to `https://<project>.<endpoint>`.
+- `project` — SLS project name.
+- `logstore` — SLS logstore that receives the logs.
+- `credential_ref` — pointer to the AccessKey, resolved on the data plane (see below). The AccessKey is never stored in the control plane or sent on the wire.
+- `content_mode` — `metadata_only` (default) or `full`. See **Content capture** below.
+- `content_max_bytes` — per-field byte cap under `content_mode: full`; defaults to `131072` (128 KiB), minimum `1`. Ignored under `metadata_only`.
+
+`endpoint`, `project`, `logstore`, and `credential_ref` are required.
+
+The data plane resolves `credential_ref` to two environment variables it reads locally — `SLS_CRED_<SLUG>_AK_ID` and `SLS_CRED_<SLUG>_AK_SECRET` — where `<SLUG>` is the reference upper-cased with every character that is not an ASCII letter or digit folded to `_` (so `acme_sls` → `ACME_SLS`).
+
+```bash title="Create an aliyun_sls exporter"
+curl -sS -X POST http://127.0.0.1:3001/admin/v1/observability_exporters \
+  -H "Authorization: Bearer YOUR_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "acme-sls",
+    "kind": "aliyun_sls",
+    "endpoint": "ap-southeast-3.log.aliyuncs.com",
+    "project": "acme-observability",
+    "logstore": "ai-gateway",
+    "credential_ref": "acme_sls"
+  }'
+```
+
+```bash title="...and the matching variables on the data plane"
+SLS_CRED_ACME_SLS_AK_ID=<your accesskey id>
+SLS_CRED_ACME_SLS_AK_SECRET=<your accesskey secret>
+```
+
+## Datadog Exporter (`kind: datadog`)
+
+`kind: "datadog"` sends each request event as one log to the Datadog Logs HTTP intake. The data plane gzip-compresses each batch and posts it to `https://http-intake.logs.<site>/api/v2/logs`.
+
+Fields:
+
+- `site` — Datadog site: one of `datadoghq.com`, `us3.datadoghq.com`, `us5.datadoghq.com`, `datadoghq.eu`, `ap1.datadoghq.com`, `ap2.datadoghq.com`, `ddog-gov.com`. The intake host is `http-intake.logs.<site>`.
+- `credential_ref` — pointer to the Datadog API key, resolved on the data plane (see below). The API key is never stored in the control plane or sent on the wire.
+- `service` — the Datadog `service` reserved attribute every log from this exporter carries.
+- `ddsource` — the Datadog `ddsource` reserved attribute. Defaults to `aisix-ai-gateway`.
+- `tags` — a list of tags rendered into Datadog's comma-joined `ddtags` attribute, e.g. `["team:platform", "tier:prod"]` becomes `team:platform,tier:prod`. Empty by default.
+- `content_mode` — `metadata_only` (default) or `full`. See **Content capture** below.
+- `content_max_bytes` — per-field byte cap under `content_mode: full`; defaults to `131072` (128 KiB), minimum `1`, maximum `1048576` (1 MiB). Ignored under `metadata_only`.
+
+`site`, `credential_ref`, and `service` are required.
+
+The data plane resolves `credential_ref` to `DD_CRED_<SLUG>_API_KEY`, read from its local environment, where `<SLUG>` is the reference upper-cased with every character that is not an ASCII letter or digit folded to `_` (so `acme_dd` → `ACME_DD`).
+
+```bash title="Create a datadog exporter"
+curl -sS -X POST http://127.0.0.1:3001/admin/v1/observability_exporters \
+  -H "Authorization: Bearer YOUR_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "acme-datadog",
+    "kind": "datadog",
+    "site": "datadoghq.com",
+    "service": "ai-gateway",
+    "tags": ["team:platform", "tier:prod"],
+    "credential_ref": "acme_dd"
+  }'
+```
+
+```bash title="...and the matching variable on the data plane"
+DD_CRED_ACME_DD_API_KEY=<your datadog api key>
+```
+
+:::caution Large `full`-mode batches can be rejected by Datadog
+Under `content_mode: full`, each log carries both the prompt and the response — each capped at `content_max_bytes` — so a single encoded log can approach twice the cap. Datadog rejects any single log over 1 MB and any request over 5 MB or 1000 logs, and the data plane does not yet split batches to those limits, so a high cap on a busy exporter can cause Datadog to reject an oversized batch (surfaced as a delivery error in the exporter's health). The 128 KiB default keeps a log well under the per-log limit.
+:::
+
+## Content capture
+
+`aliyun_sls` and `datadog` exporters control whether end-user content is delivered through `content_mode`:
+
+- `metadata_only` (the default) ships only operational metadata — never the request prompt or the response.
+- `full` additionally captures the request prompt and the assembled response, each truncated to `content_max_bytes` on a UTF-8 boundary. A log whose prompt or response was cut carries a `content_truncated` marker.
+
+:::caution `full` writes end-user content to a third party
+Enabling `content_mode: full` sends end-user prompt and response text to the destination (your SLS logstore or Datadog org). Confirm this is compatible with your data-handling and privacy obligations before turning it on.
+:::
 
 ## Endpoint Restriction
 
