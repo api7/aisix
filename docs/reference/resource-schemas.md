@@ -26,7 +26,7 @@ Use this page as the schema map. Use the configuration pages when you need opera
 - `ProviderKey` requires `display_name` and `secret`.
 - `Guardrail` is discriminated by `kind` with current `keyword` and `bedrock` shapes.
 - `CachePolicy` currently documents `name`, `enabled`, `backend`, `ttl_seconds`, and `applies_to`.
-- `ObservabilityExporter` is currently `kind=otlp_http` only.
+- `ObservabilityExporter` is discriminated by `kind` with `otlp_http`, `aliyun_sls`, `object_store`, and `datadog` shapes. `object_store` adds an `auth_mode` of `credential_ref` (default; resolved to data-plane env vars) or `cloud_identity` (keyless host identity, S3/GCS only).
 - `RateLimitPolicy` requires `name`, `scope` (`api_key` / `model` / `team` / `member`), `scope_ref`, and `window` (`second` / `minute` / `hour`); at least one of `max_requests` or `max_tokens` must be set. The standalone admin API does not currently expose CRUD routes for it — rows are written directly under the etcd `rate_limit_policies/<id>` prefix.
 
 ## How To Read These Schemas
