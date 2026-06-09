@@ -185,7 +185,7 @@ Sends each request event as one log to the Datadog Logs HTTP intake. The data pl
 | `content_mode` | string | No | `metadata_only` | `metadata_only` or `full`. See [Content capture](#content-capture). |
 | `content_max_bytes` | integer | No | `131072` | Per-field byte cap under `full`; minimum `1`, maximum `1048576` (1 MiB). Ignored under `metadata_only`. |
 
-The data plane resolves `credential_ref` to `DD_CRED_<SLUG>_API_KEY`, read from its local environment, where `<SLUG>` is the reference upper-cased with every character that is not an ASCII letter or digit folded to `_` (so `acme_dd` becomes `ACME_DD`).
+The data plane resolves `credential_ref` to `DD_CRED_<SLUG>_API_KEY`, read from its local environment, where `<SLUG>` is the reference upper-cased with every character that is not an ASCII letter or digit folded to `_` (so `acme_dd` becomes `ACME_DD`). To keep that mapping unambiguous — so two different references cannot silently fold onto the same variable — use only lowercase letters, digits, and underscores in `credential_ref`; the control plane and dashboard enforce `^[a-z0-9_]+$`.
 
 ```bash title="Create a datadog exporter"
 curl -sS -X POST http://127.0.0.1:3001/admin/v1/observability_exporters \

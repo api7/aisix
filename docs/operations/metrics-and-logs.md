@@ -78,7 +78,7 @@ Those headers are often the fastest per-request debugging hints available to a c
 
 Observability exporters are dynamic resources configured through `/admin/v1/observability_exporters`.
 
-Current exporter support is `otlp_http` only.
+Four kinds are supported — `otlp_http` (request traces), `object_store` (batched NDJSON to S3 / GCS / Azure Blob), `aliyun_sls` (Alibaba Cloud SLS logstore), and `datadog` (Datadog Logs intake). See [Observability Exporters](../configuration/observability-exporters.md) for each kind's fields, credential resolution, and destination validation.
 
 ## Operator Workflow
 
