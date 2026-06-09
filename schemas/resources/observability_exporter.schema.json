@@ -114,8 +114,7 @@
           ]
         },
         "credential_ref": {
-          "description": "Opaque pointer to the cloud credentials, resolved locally by the DP at delivery time. The plaintext key MUST NOT live in etcd/kine — the control plane stores only this reference, never the secret itself. Required when `auth_mode = credential_ref`; unused (and may be empty) when `auth_mode = cloud_identity`.",
-          "default": "",
+          "description": "Opaque pointer to the cloud credentials, resolved locally by the DP at delivery time. The plaintext key MUST NOT live in etcd/kine — the control plane stores only this reference, never the secret itself. Required when `auth_mode = credential_ref`; omitted (not empty) when `auth_mode = cloud_identity` — `skip_serializing_if` keeps an empty reference off the wire so the two encodings never diverge.",
           "type": "string"
         },
         "endpoint": {

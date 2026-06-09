@@ -280,7 +280,9 @@ pub fn build_object_store(
 /// Build the backend using the DP host's OWN attached cloud identity, with no
 /// static keys ("cloud identity" auth). **S3** uses the AWS default credential
 /// chain via [`object_store::aws::AmazonS3Builder::from_env`] (env / EKS IRSA
-/// web-identity / ECS task role / EC2 instance profile). **GCS** uses
+/// web-identity / ECS task role / EC2 instance profile); a custom `endpoint`
+/// is rejected for S3, since ambient credentials require the provider's
+/// metadata service. **GCS** uses
 /// Application Default Credentials (GKE Workload Identity / GCE metadata) by
 /// constructing the builder with no service-account key. **Azure** is not
 /// supported here — its managed identity still needs a non-secret account name
@@ -294,15 +296,23 @@ pub fn build_object_store_ambient(
 ) -> Result<Arc<dyn ObjectStore>, SinkError> {
     match provider {
         ObjectStoreProvider::S3 => {
+            // Ambient AWS credentials come from the instance metadata service
+            // (IMDS / IRSA / ECS task role), which only the provider's native
+            // endpoint exposes. A custom endpoint means an S3-compatible host
+            // (MinIO / R2 / OSS) with no cloud IAM identity, so fail fast with a
+            // clear permanent error instead of building a sink that fails soft
+            // on every delivery. (cp-api also rejects this at create time.)
+            if endpoint.is_some() {
+                return Err(SinkError::Permanent(
+                    "object_store: cloud_identity for s3 does not support a custom \
+                     endpoint (ambient AWS credentials require the provider's \
+                     metadata service); use credential_ref for S3-compatible hosts"
+                        .to_string(),
+                ));
+            }
             let mut b = object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket);
             if let Some(r) = region {
                 b = b.with_region(r);
-            }
-            if let Some(ep) = endpoint {
-                b = b.with_endpoint(ep).with_virtual_hosted_style_request(false);
-                if ep.starts_with("http://") {
-                    b = b.with_allow_http(true);
-                }
             }
             let store = b.build().map_err(|e| {
                 SinkError::Permanent(format!("object_store: build s3 (cloud identity): {e}"))
@@ -755,6 +765,29 @@ mod tests {
         let store =
             build_object_store_ambient(ObjectStoreProvider::S3, "bucket", Some("us-east-1"), None);
         assert!(store.is_ok(), "s3 ambient build: {store:?}");
+    }
+
+    #[test]
+    fn build_object_store_ambient_s3_rejects_endpoint() {
+        // A custom endpoint with cloud_identity S3 is a misconfiguration:
+        // ambient AWS credentials need the provider's metadata service, which an
+        // S3-compatible host (MinIO / R2 / OSS) does not expose. Fail fast with
+        // a clear permanent error pointing back to credential_ref.
+        let r = build_object_store_ambient(
+            ObjectStoreProvider::S3,
+            "bucket",
+            Some("us-east-1"),
+            Some("https://minio.internal:9000"),
+        );
+        match r {
+            Err(SinkError::Permanent(msg)) => {
+                assert!(msg.contains("endpoint"), "msg: {msg}");
+                assert!(msg.contains("credential_ref"), "msg: {msg}");
+            }
+            other => {
+                panic!("expected Permanent error for s3 cloud_identity + endpoint, got {other:?}")
+            }
+        }
     }
 
     #[test]

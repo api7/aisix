@@ -284,9 +284,10 @@ pub struct ObjectStoreConfig {
     /// Opaque pointer to the cloud credentials, resolved locally by the DP
     /// at delivery time. The plaintext key MUST NOT live in etcd/kine — the
     /// control plane stores only this reference, never the secret itself.
-    /// Required when `auth_mode = credential_ref`; unused (and may be empty)
-    /// when `auth_mode = cloud_identity`.
-    #[serde(default)]
+    /// Required when `auth_mode = credential_ref`; omitted (not empty) when
+    /// `auth_mode = cloud_identity` — `skip_serializing_if` keeps an empty
+    /// reference off the wire so the two encodings never diverge.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub credential_ref: String,
 }
 
@@ -629,6 +630,14 @@ mod tests {
             }
             other => panic!("expected object_store, got {other:?}"),
         }
+        // An empty credential_ref is omitted on the wire (skip_serializing_if),
+        // so a keyless config never carries an empty key reference.
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["auth_mode"], "cloud_identity");
+        assert!(
+            v.get("credential_ref").is_none(),
+            "empty credential_ref must be omitted under cloud_identity, got {v}"
+        );
     }
 
     #[test]
