@@ -66,6 +66,18 @@ Planned outcome:
 Applies to:
 - `AISIX Cloud`
 
+### First-Party Data-Warehouse Sinks
+
+Current status:
+- The `object_store` observability exporter writes batched NDJSON telemetry to Amazon S3, Google Cloud Storage, or Azure Blob today. Loading that telemetry into a warehouse such as Snowflake or Databricks is a customer-run step — for example, Snowflake's Snowpipe auto-ingesting from the bucket, as covered in [Load AI gateway logs into Snowflake](tutorials/load-gateway-logs-into-snowflake.md).
+- A first-party sink that manages the pipe, the schema, and exactly-once streaming directly to the warehouse is not yet available.
+
+Planned outcome:
+- First-party Snowflake and Databricks sinks where the gateway owns the end-to-end delivery to the warehouse table, including managed schema and exactly-once semantics.
+
+Applies to:
+- `AISIX Cloud`
+
 ## Later
 
 ### Advanced Governance And Multi-Team Controls
