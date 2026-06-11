@@ -90,7 +90,8 @@ pub struct OtlpHttpConfig {
     /// exporter's spans. `metadata_only` (default) ships only operational
     /// metadata — never a prompt or response. `full` additionally attaches
     /// the request prompt and the assembled response as span attributes
-    /// (`aisix.prompt` / `aisix.response`), each truncated to
+    /// (`gen_ai.prompt` / `gen_ai.completion` — the same keys the Datadog
+    /// sink ships the captured content under), each truncated to
     /// [`content_max_bytes`]. Enabling `full` writes end-user prompt /
     /// response text into the customer's tracing backend, so the dashboard
     /// must surface the privacy implication when an operator turns it on.
@@ -105,7 +106,7 @@ pub struct OtlpHttpConfig {
 
     /// Per-field byte cap for captured content under `content_mode = full`.
     /// The prompt and the response are each truncated to this many bytes
-    /// (UTF-8-boundary safe), and the span carries a
+    /// (UTF-8-boundary safe), and the span carries an
     /// `aisix.content_truncated` attribute when either was cut. Ignored
     /// under `metadata_only`. Defaults to 128 KiB.
     ///

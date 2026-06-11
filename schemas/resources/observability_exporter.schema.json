@@ -1,16 +1,33 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "ObservabilityExporter",
-  "description": "Top-level `ObservabilityExporter` resource. `deny_unknown_fields` deliberately NOT set — serde's `flatten` + `tag = \"kind\"` interaction makes outer-strict-mode reject the inner discriminator field. Strict typo rejection happens at the JSON Schema layer (`schema::validate_observability_exporter`) which the etcd loader runs before the serde deserialize.",
+  "description": "Top-level `ObservabilityExporter` resource. `deny_unknown_fields` deliberately NOT set — serde's `flatten` + `tag = \"kind\"` interaction makes outer-strict-mode reject the inner discriminator field. Strict typo rejection happens at the JSON Schema layer (`schema::validate_observability_exporter`) which the etcd loader runs before the serde deserialize.\n\n`PartialEq` (not `Eq`): the flattened [`ExporterKind`] carries an `f64` (`OtlpHttpConfig::sample_rate`) — see [`ExporterKind`].",
   "type": "object",
   "oneOf": [
     {
+      "description": "`PartialEq` (not `Eq`): `sample_rate` is an `f64` — see [`ExporterKind`].",
       "type": "object",
       "required": [
         "endpoint",
         "kind"
       ],
       "properties": {
+        "content_max_bytes": {
+          "description": "Per-field byte cap for captured content under `content_mode = full`. The prompt and the response are each truncated to this many bytes (UTF-8-boundary safe), and the span carries an `aisix.content_truncated` attribute when either was cut. Ignored under `metadata_only`. Defaults to 128 KiB.\n\n`0` is rejected — `full` with a zero cap captures nothing, which is a misconfiguration. The `range(min = 1)` keeps the generated JSON schema in step with the runtime validator so the CP and DP agree on the floor.",
+          "default": 131072,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1.0
+        },
+        "content_mode": {
+          "description": "Whether captured request/response content is delivered on this exporter's spans. `metadata_only` (default) ships only operational metadata — never a prompt or response. `full` additionally attaches the request prompt and the assembled response as span attributes (`gen_ai.prompt` / `gen_ai.completion` — the same keys the Datadog sink ships the captured content under), each truncated to [`content_max_bytes`]. Enabling `full` writes end-user prompt / response text into the customer's tracing backend, so the dashboard must surface the privacy implication when an operator turns it on. Reuses [`SlsContentMode`] — the codebase's existing `metadata_only | full` model — so the shared content-capture plumbing (`content_record` / `content_capture_cap`) stays single-sourced.\n\n[`content_max_bytes`]: OtlpHttpConfig::content_max_bytes",
+          "default": "metadata_only",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SlsContentMode"
+            }
+          ]
+        },
         "endpoint": {
           "description": "Full URL of the OTLP/HTTP traces endpoint. Must already include the `/v1/traces` path the receiver expects — we don't append it because some vendors (Honeycomb, Grafana) use a different path.",
           "type": "string"
@@ -27,6 +44,16 @@
           "enum": [
             "otlp_http"
           ]
+        },
+        "sample_rate": {
+          "description": "Fraction of requests whose spans are exported, `0.0`–`1.0`. Absent = `1.0` (export everything — the pre-knob behaviour). The decision is per REQUEST, made deterministically from the `request_id` hash, so every attempt span of one request (initial / retries / fallbacks, which share the id) samples consistently — a trace is exported whole or not at all. Bounds are enforced by the loader's JSON-schema validation (`schema::validate_observability_exporter`).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "maximum": 1.0,
+          "minimum": 0.0
         }
       }
     },
@@ -275,7 +302,7 @@
       ]
     },
     "SlsContentMode": {
-      "description": "Content-capture mode for an SLS / Datadog exporter. Defaults to the privacy-preserving `metadata_only`. (`Hash` so a Datadog exporter's fingerprint can cover its content config; see `fingerprint_datadog`.)",
+      "description": "Content-capture mode for an SLS / Datadog / OTLP exporter. Defaults to the privacy-preserving `metadata_only`. (`Hash` so an exporter's fingerprint can cover its content config; see `fingerprint_datadog` / `fingerprint_otlp`.)",
       "oneOf": [
         {
           "description": "Operational metadata only — never the prompt or response.",

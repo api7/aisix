@@ -29,8 +29,9 @@
 //!   exported whole or not at all — consistently across retries/fallbacks.
 //! - **`content_mode` / `content_max_bytes`** — same opt-in content capture
 //!   the SLS / Datadog sinks use ([`content_record`]); under `full` the span
-//!   carries `aisix.prompt` / `aisix.response` (plus
-//!   `aisix.content_truncated` when cut). Defaults to `metadata_only`, where
+//!   carries `gen_ai.prompt` / `gen_ai.completion` (plus
+//!   `aisix.content_truncated` when cut) — the same keys the Datadog sink
+//!   ships the captured content under. Defaults to `metadata_only`, where
 //!   the record never carries content fields, so it cannot leak.
 //!
 //! ## What's intentionally NOT here yet
@@ -576,11 +577,11 @@ impl ObservabilitySink for OtlpSink {
 ///
 /// When the record carries captured content (this exporter's
 /// `content_mode = full`, see [`content_record`]) the span additionally
-/// carries `aisix.prompt` / `aisix.response` — the same prompt / assembled
-/// response the SLS path ships as log fields — plus
+/// carries `gen_ai.prompt` / `gen_ai.completion` — the same prompt /
+/// assembled response the Datadog sink ships under those keys — plus
 /// `aisix.content_truncated` when either field was cut to the exporter's
-/// `content_max_bytes`. Metadata-only records never reach this branch with
-/// content, so the default span shape is unchanged.
+/// `content_max_bytes`. Metadata-only records never carry content, so the
+/// default span shape is unchanged.
 fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
     let event = &record.usage;
     let trace_id = random_trace_id();
@@ -681,6 +682,17 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
             &event.client_user_agent,
         ));
     }
+    // Opt-in captured content (#519 B.2) — present ONLY on a record built by
+    // [`content_record`] for a `content_mode = full` exporter. Keys match the
+    // Datadog sink's flattened content fields, so one query vocabulary works
+    // across both backends.
+    if let Some(content) = &record.content {
+        attributes.push(attr_string("gen_ai.prompt", &content.prompt));
+        attributes.push(attr_string("gen_ai.completion", &content.response));
+        if content.truncated {
+            attributes.push(attr_bool("aisix.content_truncated", true));
+        }
+    }
 
     json!({
         "traceId": trace_id,
@@ -711,12 +723,14 @@ fn otlp_export_request(spans: Vec<Value>) -> Value {
     })
 }
 
-/// One event -> one-span export request. Test-only helper for the payload
-/// assertions; production paths build spans via [`build_otlp_span`] and batch
-/// them through [`otlp_export_request`] inside [`OtlpSink`].
+/// One event -> one-span export request over a metadata-only record (the
+/// default shape). Test-only helper for the payload assertions; production
+/// paths build spans via [`build_otlp_span`] and batch them through
+/// [`otlp_export_request`] inside [`OtlpSink`].
 #[cfg(test)]
 fn build_otlp_traces_payload(event: &UsageEvent, exporter_name: &str) -> Value {
-    otlp_export_request(vec![build_otlp_span(event, exporter_name)])
+    let record = SinkRecord::metadata_only(event.clone());
+    otlp_export_request(vec![build_otlp_span(&record, exporter_name)])
 }
 
 fn attr_string(key: &str, value: &str) -> Value {
@@ -731,6 +745,13 @@ fn attr_int(key: &str, value: i64) -> Value {
         "key": key,
         // OTLP/JSON encodes int as a string to avoid JS Number precision loss.
         "value": { "intValue": value.to_string() },
+    })
+}
+
+fn attr_bool(key: &str, value: bool) -> Value {
+    json!({
+        "key": key,
+        "value": { "boolValue": value },
     })
 }
 
@@ -901,6 +922,16 @@ mod tests {
         })
     }
 
+    fn otlp_kind(content_mode: SlsContentMode, max_bytes: u32) -> ExporterKind {
+        ExporterKind::OtlpHttp(OtlpHttpConfig {
+            endpoint: "https://x/v1/traces".into(),
+            headers: Default::default(),
+            sample_rate: None,
+            content_mode,
+            content_max_bytes: max_bytes,
+        })
+    }
+
     fn datadog_kind(content_mode: SlsContentMode, max_bytes: u32) -> ExporterKind {
         ExporterKind::Datadog(DatadogConfig {
             site: "datadoghq.com".into(),
@@ -922,11 +953,9 @@ mod tests {
             truncated: false,
         };
 
-        // otlp never carries content, even when content was captured.
-        let otlp = ExporterKind::OtlpHttp(OtlpHttpConfig {
-            endpoint: "https://x/v1/traces".into(),
-            headers: Default::default(),
-        });
+        // otlp on its default (metadata_only) never carries content, even
+        // when content was captured.
+        let otlp = otlp_kind(SlsContentMode::MetadataOnly, 1024);
         assert!(content_record(&otlp, &event, Some(&captured)).is_none());
 
         // object_store never carries content either — content_record gates on
@@ -1004,6 +1033,147 @@ mod tests {
             content_record(&datadog_kind(SlsContentMode::Full, 16), &event, Some(&big)).unwrap();
         assert_eq!(rec.content.as_ref().unwrap().prompt.len(), 16);
         assert!(rec.content.as_ref().unwrap().truncated);
+
+        // otlp_http behaves identically (#519 B.2): full + captured content →
+        // a content-bearing record; full with nothing captured → metadata.
+        let otlp_full = otlp_kind(SlsContentMode::Full, 1024);
+        assert!(content_record(&otlp_full, &event, None).is_none());
+        let rec = content_record(&otlp_full, &event, Some(&captured))
+            .expect("full-capture otlp with content yields a content record");
+        let c = rec.content.as_ref().expect("content attached");
+        assert_eq!(c.prompt, "the prompt");
+        assert_eq!(c.response, "the response");
+        // Per-exporter cap truncates an otlp record too.
+        let rec = content_record(&otlp_kind(SlsContentMode::Full, 16), &event, Some(&big)).unwrap();
+        assert_eq!(rec.content.as_ref().unwrap().prompt.len(), 16);
+        assert!(rec.content.as_ref().unwrap().truncated);
+    }
+
+    #[test]
+    fn span_carries_content_attrs_only_for_content_bearing_records() {
+        let event = sample_event();
+
+        // Metadata-only record (the default): no content keys on the span.
+        let meta = SinkRecord::metadata_only(event.clone());
+        let span = build_otlp_span(&meta, "x");
+        let keys: Vec<&str> = span["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["key"].as_str().unwrap())
+            .collect();
+        assert!(!keys.contains(&"gen_ai.prompt"));
+        assert!(!keys.contains(&"gen_ai.completion"));
+        assert!(!keys.contains(&"aisix.content_truncated"));
+
+        // Content-bearing record (content_mode = full): prompt + completion
+        // ride the span under the Datadog sink's key names.
+        let captured = CapturedContent {
+            prompt: "what is 2+2?".into(),
+            response: "4".into(),
+            truncated: false,
+        };
+        let rec = content_record(
+            &otlp_kind(SlsContentMode::Full, 1024),
+            &event,
+            Some(&captured),
+        )
+        .unwrap();
+        let span = build_otlp_span(&rec, "x");
+        let attrs = span["attributes"].as_array().unwrap();
+        let find = |k: &str| attrs.iter().find(|a| a["key"] == k);
+        assert_eq!(
+            find("gen_ai.prompt").expect("prompt attr")["value"]["stringValue"],
+            "what is 2+2?"
+        );
+        assert_eq!(
+            find("gen_ai.completion").expect("completion attr")["value"]["stringValue"],
+            "4"
+        );
+        // Nothing was truncated → no flag.
+        assert!(find("aisix.content_truncated").is_none());
+
+        // Truncation (here: per-exporter cap cut the prompt) flags the span.
+        let big = CapturedContent {
+            prompt: "a".repeat(500),
+            response: "ok".into(),
+            truncated: false,
+        };
+        let rec = content_record(&otlp_kind(SlsContentMode::Full, 16), &event, Some(&big)).unwrap();
+        let span = build_otlp_span(&rec, "x");
+        let attrs = span["attributes"].as_array().unwrap();
+        let flag = attrs
+            .iter()
+            .find(|a| a["key"] == "aisix.content_truncated")
+            .expect("truncated flag");
+        assert_eq!(flag["value"]["boolValue"], true);
+    }
+
+    #[test]
+    fn sampling_extremes_drop_all_or_keep_all() {
+        let ids: Vec<String> = (0..1000).map(|i| format!("req-{i}")).collect();
+        for id in &ids {
+            // Absent (None) = 1.0 = the pre-knob behaviour: keep everything.
+            assert!(otlp_should_sample(None, id));
+            assert!(otlp_should_sample(Some(1.0), id));
+            // 0.0 drops everything.
+            assert!(!otlp_should_sample(Some(0.0), id));
+        }
+    }
+
+    #[test]
+    fn sampling_is_deterministic_and_roughly_proportional() {
+        // Same id → same decision, every time (the all-or-nothing guarantee
+        // for a request's per-attempt spans, which share request_id).
+        for id in ["req-a", "req-b", "req-c"] {
+            let first = otlp_should_sample(Some(0.5), id);
+            for _ in 0..10 {
+                assert_eq!(otlp_should_sample(Some(0.5), id), first);
+            }
+        }
+
+        // Across many distinct ids the kept fraction tracks the rate. The id
+        // set is fixed, so the count is exact and the test cannot flake.
+        let kept = (0..1000)
+            .filter(|i| otlp_should_sample(Some(0.5), &format!("req-{i}")))
+            .count();
+        assert!(
+            (350..=650).contains(&kept),
+            "rate 0.5 kept {kept}/1000 — hash badly skewed"
+        );
+    }
+
+    #[test]
+    fn fingerprint_otlp_covers_the_new_knobs() {
+        let base = OtlpHttpConfig {
+            endpoint: "https://x/v1/traces".into(),
+            headers: Default::default(),
+            sample_rate: None,
+            content_mode: SlsContentMode::MetadataOnly,
+            content_max_bytes: 128 * 1024,
+        };
+        assert_eq!(
+            fingerprint_otlp(&base),
+            fingerprint_otlp(&base.clone()),
+            "same config must fingerprint identically"
+        );
+
+        // Each knob edit must rebuild the pipeline (#519 B.2).
+        let mut sampled = base.clone();
+        sampled.sample_rate = Some(0.5);
+        assert_ne!(fingerprint_otlp(&base), fingerprint_otlp(&sampled));
+
+        let mut full = base.clone();
+        full.content_mode = SlsContentMode::Full;
+        assert_ne!(fingerprint_otlp(&base), fingerprint_otlp(&full));
+
+        let mut capped = base.clone();
+        capped.content_max_bytes = 4096;
+        assert_ne!(fingerprint_otlp(&base), fingerprint_otlp(&capped));
+
+        let mut moved = base.clone();
+        moved.endpoint = "https://y/v1/traces".into();
+        assert_ne!(fingerprint_otlp(&base), fingerprint_otlp(&moved));
     }
 
     #[test]
@@ -1060,6 +1230,29 @@ mod tests {
         assert_eq!(content_capture_cap([&full, &dd_full]), Some(16384));
         let dd_meta = datadog("dd", true, "metadata_only", 4096);
         assert_eq!(content_capture_cap([&dd_meta]), None);
+
+        // A full-capture otlp_http exporter counts toward the cap too
+        // (#519 B.2); a metadata-only one (the default) does not — the
+        // `sample_exporter()` fixture above already proved the default shape
+        // yields None.
+        fn otlp_exp(name: &str, mode: &str, max: u32) -> ObservabilityExporter {
+            serde_json::from_value(serde_json::json!({
+                "name": name,
+                "enabled": true,
+                "kind": "otlp_http",
+                "endpoint": "https://x/v1/traces",
+                "content_mode": mode,
+                "content_max_bytes": max,
+            }))
+            .unwrap()
+        }
+        let otlp_full = otlp_exp("ot", "full", 32768);
+        assert_eq!(content_capture_cap([&otlp_full]), Some(32768));
+        assert_eq!(content_capture_cap([&dd_full, &otlp_full]), Some(32768));
+        assert_eq!(
+            content_capture_cap([&otlp_exp("ot", "metadata_only", 4096)]),
+            None
+        );
     }
 
     #[test]
@@ -1321,6 +1514,61 @@ mod tests {
         exp.enabled = false;
         let f = OtlpHttpFanOut::new();
         f.fan_out(&sample_event(), None, std::iter::once(&exp));
+    }
+
+    #[tokio::test]
+    async fn fan_out_sampling_zero_skips_only_that_exporter() {
+        // Two otlp exporters on one fan-out: `sampled-out` at rate 0.0 and
+        // `control` with the rate absent (= 1.0). One event must reach the
+        // control's receiver while the rate-0 exporter enqueues nothing —
+        // its pipeline is never even created.
+        let zero_srv = wiremock::MockServer::start().await;
+        let ctrl_srv = wiremock::MockServer::start().await;
+        for srv in [&zero_srv, &ctrl_srv] {
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(wiremock::ResponseTemplate::new(200))
+                .mount(srv)
+                .await;
+        }
+        let mk = |name: &str, uri: &str, rate: Option<f64>| -> ObservabilityExporter {
+            let mut v = serde_json::json!({
+                "name": name,
+                "enabled": true,
+                "kind": "otlp_http",
+                "endpoint": format!("{uri}/v1/traces"),
+            });
+            if let Some(r) = rate {
+                v["sample_rate"] = serde_json::json!(r);
+            }
+            serde_json::from_value(v).unwrap()
+        };
+        let zero = mk("sampled-out", &zero_srv.uri(), Some(0.0));
+        let control = mk("control", &ctrl_srv.uri(), None);
+
+        let f = OtlpHttpFanOut::new();
+        f.fan_out(&sample_event(), None, [&zero, &control]);
+
+        // The control's span lands after the 1s flush…
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !ctrl_srv.received_requests().await.unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "control exporter saw no OTLP POST within 5s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        // …while the rate-0 exporter never even created a pipeline (stats
+        // read before shutdown, which tears pipelines down)…
+        assert!(!f.exporter_stats().contains_key("sampled-out"));
+        assert!(f.exporter_stats().contains_key("control"));
+        f.shutdown().await;
+
+        // …and delivered nothing: shutdown drained every pipeline, so
+        // anything enqueued would have been flushed by now.
+        assert!(zero_srv.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
