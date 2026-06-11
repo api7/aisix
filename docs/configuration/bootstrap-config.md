@@ -192,18 +192,20 @@ Bootstrap observability settings are process-wide. They are different from dynam
 
 ## `cache`
 
-Use `cache` to choose the bootstrap cache backend.
+Use `cache` to declare which cache backends the process builds at startup.
+
+The in-process memory cache is always built. The shared Redis cache is built only when the `redis` block is present. Which backend serves a given request is selected by the matched cache policy's `backend` field (a dynamic resource) — not by this section.
 
 Important fields:
 
 | Field | Description | Default |
 | --- | --- | --- |
-| `backend` | which cache backend the process uses (`memory` or `redis`) | `memory` |
-| `redis` | Redis connection block (`url`, optional `mode`); only consulted when `backend: redis` | none |
+| `backend` | legacy knob — no longer selects a single global cache; `redis` without a `redis` block is rejected at boot | `memory` |
+| `redis` | Redis connection block (`url`, optional `mode`); when present, the process builds the shared Redis cache | none |
 
-`memory` is the default path. `redis` has runtime backend selection and connection logic, but the broader cache docs and support boundaries are still being expanded.
+A cache policy that requests `backend: redis` on a process without `cache.redis` gets no caching for its requests (`cache_status = disabled`, one warning per policy in the gateway log) — never a silent fallback to memory.
 
-Use bootstrap cache settings to decide whether the process has a cache backend available at all. Use dynamic cache policies to decide which requests actually participate in caching.
+Use bootstrap cache settings to decide which cache backends the process has available. Use dynamic cache policies to decide which requests actually participate in caching, and on which backend.
 
 ## `managed`
 

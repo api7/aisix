@@ -45,11 +45,11 @@ Applies to:
 ### Redis-Backed Cache Policy Completion
 
 Current status:
-- Cache policy schema supports `memory` and `redis` as backend hints.
-- Current runtime behavior is still centered on `memory`, and Redis should not yet be treated as fully available customer behavior.
+- The data plane enforces `CachePolicy.backend` per matched policy: `memory` uses the in-process cache; `redis` uses the shared Redis cache when the bootstrap config provides `cache.redis`, otherwise caching is disabled for matching requests (no silent memory fallback).
+- Redis cluster/sentinel modes and broader support boundaries are still being expanded.
 
 Planned outcome:
-- Clear, fully supported Redis-backed cache policy behavior.
+- Clear, fully supported Redis-backed cache policy behavior across all Redis deployment modes.
 
 Applies to:
 - `AISIX AI Gateway`

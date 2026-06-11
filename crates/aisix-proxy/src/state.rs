@@ -18,11 +18,11 @@ use aisix_cache::{Cache, MemoryCache};
 use aisix_core::models::CacheBackend;
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AisixSnapshot, ProxyConfig};
-use dashmap::DashSet;
 use aisix_gateway::Hub;
 use aisix_guardrails::LiveGuardrailIndex;
 use aisix_obs::{Metrics, OtlpHttpFanOut, UsageSink};
 use aisix_ratelimit::Limiter;
+use dashmap::DashSet;
 use std::sync::Arc;
 
 use crate::budget::BudgetClient;

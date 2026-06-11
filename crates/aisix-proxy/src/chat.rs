@@ -1290,9 +1290,10 @@ async fn dispatch(
             .cloned(),
         _ => None,
     };
-    let matched_policy_ttl = policy_cache.as_ref().and(matched_policy.as_ref()).map(
-        |entry| Duration::from_secs(u64::from(entry.value.ttl_seconds)),
-    );
+    let matched_policy_ttl = policy_cache
+        .as_ref()
+        .and(matched_policy.as_ref())
+        .map(|entry| Duration::from_secs(u64::from(entry.value.ttl_seconds)));
 
     // Cache lookup keyed on the *virtual* model name so a re-request
     // hits the cache regardless of which target served the original.
@@ -1702,9 +1703,11 @@ async fn dispatch(
     // not the cache backend's global fallback. Backends without
     // per-entry support (defined via `Cache::put_with_ttl`'s default
     // impl) silently fall back to `put`.
-    if let (Some(ttl), Some(cache), Some(key)) =
-        (matched_policy_ttl, policy_cache.as_ref(), cache_key.as_ref())
-    {
+    if let (Some(ttl), Some(cache), Some(key)) = (
+        matched_policy_ttl,
+        policy_cache.as_ref(),
+        cache_key.as_ref(),
+    ) {
         if let Err(err) = cache.put_with_ttl(key, upstream.clone(), ttl).await {
             tracing::warn!(error = %err, key = %key, "cache write failed");
         }

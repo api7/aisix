@@ -534,6 +534,15 @@ mod tests {
             .insert(ResourceEntry::new(format!("cp-id-{name}"), policy, 1));
     }
 
+    /// Policy seeder with an explicit `backend` — used by the #519
+    /// B.8 tests that pin per-policy backend dispatch.
+    fn seed_cache_policy_with_backend(snap: &AisixSnapshot, name: &str, backend: &str) {
+        let cfg = format!(r#"{{"name": "{name}", "backend": "{backend}", "applies_to": "all"}}"#);
+        let policy: aisix_core::models::CachePolicy = serde_json::from_str(&cfg).unwrap();
+        snap.cache_policies
+            .insert(ResourceEntry::new(format!("cp-id-{name}"), policy, 1));
+    }
+
     fn seed_snapshot_with_limits(
         model: &str,
         allowed: &[&str],
@@ -3068,6 +3077,163 @@ data: [DONE]\n\n";
                 "disabled cache_policy must not emit x-aisix-cache header"
             );
         }
+    }
+
+    /// #519 B.8: a `backend: "redis"` policy on a DP without a redis
+    /// cache must DISABLE caching for matching requests — both
+    /// identical calls reach the upstream, neither carries an
+    /// `x-aisix-cache` header, and telemetry reports
+    /// `cache_status = "disabled"`. The pre-fix behavior (silent
+    /// fallback to the node-local memory cache) would serve the
+    /// second call from cache and fail wiremock's `.expect(2)`.
+    #[tokio::test]
+    async fn redis_backend_policy_without_redis_disables_caching() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "fresh"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(2) // hard expectation: BOTH calls must pay the upstream
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        seed_cache_policy_with_backend(&snap, "redis-cache", "redis");
+        // Default test state ships a memory cache but NO redis
+        // instance — exactly the deployment the policy mismatches.
+        let state = build_state_with_cache(snap, hub).with_usage_sink(UsageSink::new(tx));
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        for _ in 0..2 {
+            let resp = run(build_router(state.clone()), make_req()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(
+                resp.headers().get("x-aisix-cache").is_none(),
+                "redis policy without a redis backend must not emit x-aisix-cache",
+            );
+            let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .expect("usage event was never emitted")
+                .expect("sender dropped");
+            assert_eq!(
+                event.cache_status, "disabled",
+                "unavailable backend must surface as cache_status=disabled",
+            );
+        }
+    }
+
+    /// #519 B.8 positive path: when the DP HAS a redis instance, a
+    /// `backend: "redis"` policy must dispatch to it — not to the
+    /// memory instance. A second MemoryCache stands in for redis
+    /// (instance dispatch is under test, not the redis wire
+    /// protocol): the second identical call is a cache hit, the
+    /// entry lives in the redis instance, and the memory instance
+    /// never saw the key.
+    #[tokio::test]
+    async fn redis_backend_policy_dispatches_to_redis_instance() {
+        use aisix_cache::{Cache, CacheKey, MemoryCache};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-up",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "via-redis"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1) // second call must be served from the redis instance
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        seed_cache_policy_with_backend(&snap, "redis-cache", "redis");
+
+        let memory: Arc<dyn Cache> = Arc::new(MemoryCache::with_defaults());
+        let redis_standin: Arc<dyn Cache> = Arc::new(MemoryCache::with_defaults());
+        let mut state = build_state_with_cache(snap, hub);
+        state.cache = Some(CacheBackends::new(
+            memory.clone(),
+            Some(redis_standin.clone()),
+        ));
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let make_req = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let resp = run(build_router(state.clone()), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-aisix-cache")
+                .and_then(|v| v.to_str().ok()),
+            Some("miss"),
+        );
+
+        let resp = run(build_router(state), make_req()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-aisix-cache")
+                .and_then(|v| v.to_str().ok()),
+            Some("hit"),
+        );
+
+        // The entry must live in the redis instance and ONLY there —
+        // a dispatch bug that wrote to the memory instance would
+        // still produce a "hit" above, so pin the instance directly.
+        let req: aisix_gateway::ChatFormat = serde_json::from_value(body).unwrap();
+        let key = CacheKey::from_request(&req).fingerprint();
+        assert!(
+            redis_standin.get(&key).await.unwrap().is_some(),
+            "cache entry must be written to the policy's redis backend",
+        );
+        assert!(
+            memory.get(&key).await.unwrap().is_none(),
+            "memory instance must not be touched by a redis-backend policy",
+        );
     }
 
     #[tokio::test]

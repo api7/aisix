@@ -76,13 +76,12 @@ Current schema supports:
 - `memory`
 - `redis`
 
-Current runtime boundary:
+The proxy selects the cache instance per request from the matched policy's `backend` field:
 
-- `memory` is the reliable default path
-- bootstrap config can wire a Redis backend at process start
-- the dynamic `CachePolicy.backend` field should still be treated conservatively because broader Redis support boundaries are still being expanded
+- `memory` uses the in-process cache — always available
+- `redis` uses the shared Redis cache — available only when the bootstrap config carries a `cache.redis` block
 
-Note: the per-policy `backend` field is parsed and stored on the `CachePolicy` row but is not consulted by the runtime proxy — the proxy always uses the cache backend selected by bootstrap-config (`cache.backend`) regardless of what each policy specifies. The field is preserved for forward compatibility; do not depend on it to override the runtime backend.
+A `redis` policy on a process without `cache.redis` gets no caching for its requests: responses carry no `x-aisix-cache` header, telemetry reports `cache_status = disabled`, and the gateway logs a warning once per policy. There is no silent fallback to the in-process memory cache — a memory stand-in would serve per-node answers while the policy claims shared-cache semantics.
 
 ## Operator Guidance
 
@@ -94,10 +93,11 @@ Note: the per-policy `backend` field is parsed and stored on the `CachePolicy` r
 
 ### Responses never show `x-aisix-cache`
 
-Check both sides:
+Check all three:
 
-- a bootstrap cache backend must be available
 - an enabled cache policy must match the request
+- the matched policy's `backend` must be available in the process — `redis` requires `cache.redis` in the bootstrap config
+- look for the `cache policy requests backend=redis but this DP has no redis cache configured` warning in the gateway log
 
 ### A policy matches too broadly
 

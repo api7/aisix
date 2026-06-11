@@ -50,7 +50,7 @@ Field meanings (full reference in [Caching](../configuration/caching.md)):
 - `enabled: true` — the cache gate consults this policy on every request
 - `applies_to: "all"` — matches every request. For targeted rollouts use `model:<display_name>` or `api_key:<api_key_id>`.
 - `ttl_seconds: 3600` — cache entry lifetime hint. Defaults to `3600` if omitted.
-- `backend: "memory"` is the default. The standalone gateway enforces `memory`; `redis` parses and persists but currently falls back to memory until the backend wires up.
+- `backend: "memory"` is the default and uses the in-process cache. `redis` uses the shared Redis cache and requires `cache.redis` in the gateway's bootstrap config — without it, requests matching the policy get no caching at all (no silent fallback to memory).
 
 Wait for the snapshot to propagate:
 

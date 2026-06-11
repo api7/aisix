@@ -38,14 +38,11 @@ For most teams, a solid first production baseline is:
 
 ## Cache Backend Choice
 
-Current bootstrap cache backends are:
+The process always builds the in-process memory cache. Add a `cache.redis` block to also build the shared Redis cache. Which backend serves a request is selected by the matched cache policy's `backend` field — a policy that requests `redis` on a process without `cache.redis` gets no caching for its requests (no silent fallback to memory).
 
-- `memory`
-- `redis`
+The legacy `cache.backend` knob no longer selects a single global cache; `backend: redis` without `cache.redis.url` still fails at startup so misconfigurations surface early.
 
-`memory` is the simplest production baseline. If you select `redis`, the bootstrap config must include `cache.redis.url` or startup will fail.
-
-That makes `memory` the lowest-risk default for first rollout.
+`memory`-backed policies remain the simplest production baseline, making them the lowest-risk default for first rollout.
 
 ## Managed Versus Standalone
 
