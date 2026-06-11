@@ -81,7 +81,16 @@ describe("audio + images UsageEvent emission (#406/#407)", () => {
           },
           body: JSON.stringify({ model: "img-usage", prompt: "a cat", n: 1 }),
         });
-      await waitConfigPropagation(async () => (await call()).ok);
+      await waitConfigPropagation(async () => {
+        // The DP may drop the connection mid-write (EPIPE) while the
+        // route is still propagating — treat transport failures as
+        // "not ready yet", like every other spec's predicate does.
+        try {
+          return (await call()).ok;
+        } catch {
+          return false;
+        }
+      });
       expect((await call()).status).toBe(200);
 
       const emitted = await pollUsageEmitted(app.adminUrl, "images");
@@ -132,7 +141,16 @@ describe("audio + images UsageEvent emission (#406/#407)", () => {
           body: form,
         });
       };
-      await waitConfigPropagation(async () => (await call()).ok);
+      await waitConfigPropagation(async () => {
+        // The DP may drop the connection mid-write (EPIPE) while the
+        // route is still propagating — treat transport failures as
+        // "not ready yet", like every other spec's predicate does.
+        try {
+          return (await call()).ok;
+        } catch {
+          return false;
+        }
+      });
       expect((await call()).status).toBe(200);
 
       const emitted = await pollUsageEmitted(app.adminUrl, "audio");
