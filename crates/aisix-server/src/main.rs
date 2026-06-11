@@ -35,7 +35,7 @@ use aisix_provider_openai::OpenAiBridge;
 use aisix_provider_vertex::VertexBridge;
 use aisix_proxy::background::run_background_model_check_once;
 use aisix_proxy::budget::BudgetClient;
-use aisix_proxy::ProxyState;
+use aisix_proxy::{CacheBackends, ProxyState};
 use aisix_ratelimit::Limiter;
 use clap::Parser;
 use etcd_client::{Certificate, ConnectOptions, Identity, TlsOptions};
@@ -378,23 +378,31 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     let hub = Arc::new(build_hub());
     let limiter = Arc::new(Limiter::new());
     let metrics = Arc::new(Metrics::new(true));
-    // Cache backend selection. Memory by default; Redis when configured.
-    let cache: Option<Arc<dyn Cache>> = match cfg.cache.backend {
-        CacheBackend::Memory => Some(Arc::new(MemoryCache::with_defaults())),
-        CacheBackend::Redis => {
-            let url = cfg
-                .cache
-                .redis
-                .as_ref()
-                .map(|r| r.url.clone())
-                .ok_or_else(|| anyhow::anyhow!("cache.backend = redis but cache.redis missing"))?;
+    // Cache backends (#519 B.8). The memory cache is always built
+    // (in-process, cheap); the redis cache is built iff `cache.redis`
+    // is configured. Which instance serves a request is selected by
+    // the matched CachePolicy's `backend` field at the proxy's cache
+    // gate — `cache.backend` no longer picks a single global cache.
+    // It still fails fast on the contradictory `backend = redis`
+    // without a `cache.redis` block, so old configs that relied on it
+    // surface the misconfiguration at boot instead of per request.
+    if cfg.cache.backend == CacheBackend::Redis && cfg.cache.redis.is_none() {
+        anyhow::bail!("cache.backend = redis but cache.redis missing");
+    }
+    let redis_cache: Option<Arc<dyn Cache>> = match cfg.cache.redis.as_ref() {
+        Some(redis_cfg) => {
             tracing::info!(target: "aisix::cache", backend = "redis", "connecting cache backend");
-            let redis = RedisCache::connect(&url)
-                .await
-                .map_err(|e| anyhow::anyhow!("redis cache connect failed (url={url}): {e}"))?;
+            let redis = RedisCache::connect(&redis_cfg.url).await.map_err(|e| {
+                anyhow::anyhow!("redis cache connect failed (url={}): {e}", redis_cfg.url)
+            })?;
             Some(Arc::new(redis) as Arc<dyn Cache>)
         }
+        None => None,
     };
+    let cache = Some(CacheBackends::new(
+        Arc::new(MemoryCache::with_defaults()),
+        redis_cache,
+    ));
 
     let mut proxy_state = ProxyState::with_components(
         snapshot_handle.clone(),

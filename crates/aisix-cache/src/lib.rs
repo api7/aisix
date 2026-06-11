@@ -6,9 +6,13 @@
 //! and stores the response with `x-aisix-cache: miss`.
 //!
 //! Backends:
-//! - [`MemoryCache`] (moka, in-process) — default, configured by
-//!   `cfg.cache.backend = "memory"`.
-//! - Redis backend lands in a follow-up PR behind the `redis` feature.
+//! - [`MemoryCache`] (moka, in-process) — always available.
+//! - `RedisCache` (behind the `redis` feature) — built when the boot
+//!   config carries `cache.redis`.
+//!
+//! The proxy picks the backend per request from the matched
+//! `CachePolicy.backend` (see `aisix-proxy::state::CacheBackends`);
+//! the boot config only determines which instances exist.
 //!
 //! Streaming responses aren't cached at this layer — the upstream stream
 //! has no terminal value to store.

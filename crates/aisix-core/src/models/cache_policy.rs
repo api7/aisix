@@ -15,9 +15,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::resource::Resource;
 
-/// Cache backend choice. `Memory` is enforced by the DP today;
-/// `Redis` is the kine-level wire-shape stub for the upcoming
-/// shared-cluster backend (DP enforcement pending).
+/// Cache backend choice. The DP selects the cache instance per
+/// matched policy: `Memory` uses the in-process cache (always
+/// available); `Redis` uses the shared redis cache iff the deployment
+/// configured `cache.redis`. A `Redis` policy on a DP without redis
+/// gets NO caching (`cache_status = disabled`) — never a silent
+/// fallback to node-local memory.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]
@@ -47,9 +50,10 @@ pub struct CachePolicy {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
-    /// Backend hint. `memory` is the only enforced backend today;
-    /// `redis` parses + persists but the DP currently falls back
-    /// to memory until that backend wires up.
+    /// Which cache instance serves requests matched by this policy.
+    /// `memory` always works; `redis` requires the DP to have
+    /// `cache.redis` configured — otherwise matching requests get no
+    /// caching at all (visible as `cache_status = disabled`).
     #[serde(default)]
     pub backend: CacheBackend,
 

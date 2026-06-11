@@ -59,7 +59,7 @@ pub use error::{ErrorEnvelope, ProxyError};
 pub use health::{
     HealthTracker, LivezState, ModelRuntimeStatusTracker, RuntimeStatus, RuntimeStatusSnapshot,
 };
-pub use state::ProxyState;
+pub use state::{CacheBackends, ProxyState};
 
 use axum::extract::State;
 use axum::http::{header, HeaderValue, Request};

@@ -77,14 +77,21 @@ observability:
 # managed:
 #   enabled: true
 
+# Cache backend availability. The in-process memory cache is always
+# built; the shared redis cache is built iff `redis` is configured.
+# Which backend serves a request is chosen per matched CachePolicy
+# (its `backend` field, managed via the Admin API / control plane) —
+# a policy asking for redis on a DP without `cache.redis` gets NO
+# caching for its requests (cache_status = disabled), never a silent
+# fallback to node-local memory.
 cache:
-  backend: "memory"   # memory | redis | qdrant
+  # Legacy knob — no longer selects a single global cache. Kept for
+  # config compatibility; `backend: "redis"` still requires the
+  # `redis` block below (validated at boot).
+  backend: "memory"   # memory | redis
   # redis:
   #   url: "redis://127.0.0.1:6379"
   #   mode: "single"   # single | cluster | sentinel
-  # qdrant:
-  #   url: "http://127.0.0.1:6333"
-  #   collection: "aisix-semantic-cache"
 
 # Models, API keys, provider keys, guardrails, cache policies, and
 # observability exporters are NOT defined in this file. They are stored

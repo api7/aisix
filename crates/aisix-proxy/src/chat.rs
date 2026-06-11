@@ -16,7 +16,7 @@
 //!    line. Errors surface via [`ProxyError`] which carries the right
 //!    status, error type, and (for rate-limits) Retry-After.
 
-use aisix_cache::CacheKey;
+use aisix_cache::{Cache, CacheKey};
 use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeContext, BridgeError, ChatFormat};
 use aisix_guardrails::GuardrailVerdict;
@@ -1256,13 +1256,13 @@ async fn dispatch(
     //
     // Match order: first enabled policy whose `parsed_applies_to()`
     // accepts (req.model, auth.entry.id) wins. We grab the WHOLE
-    // matching entry (not just `any`) so the post-call write below
-    // can use that policy's `ttl_seconds` via `put_with_ttl`. When
-    // multiple policies match the same request, the entry-table
-    // iteration order decides — that's an unspecified-but-stable
-    // tiebreak we'll formalise (probably "narrowest scope wins") in a
-    // follow-up if operators ever care.
-    let matched_policy_ttl = snapshot
+    // matching entry (not just `any`) so the backend selection and the
+    // post-call write below can use that policy's `backend` and
+    // `ttl_seconds`. When multiple policies match the same request,
+    // the entry-table iteration order decides — that's an
+    // unspecified-but-stable tiebreak we'll formalise (probably
+    // "narrowest scope wins") in a follow-up if operators ever care.
+    let matched_policy = snapshot
         .cache_policies
         .entries()
         .iter()
@@ -1273,31 +1273,40 @@ async fn dispatch(
                     .parsed_applies_to()
                     .matches(&req.model, &auth.entry.id)
         })
-        .map(|entry| Duration::from_secs(u64::from(entry.value.ttl_seconds)));
-    let cache_active_by_policy = matched_policy_ttl.is_some();
+        .cloned();
+
+    // #519 B.8: the matched policy's `backend` selects the cache
+    // instance. `memory` always resolves; `redis` resolves only when
+    // the deployment configured `cache.redis` — otherwise caching is
+    // INACTIVE for this request (`cache_status = disabled`, warn once
+    // per policy inside `for_policy_backend`). Never fall back to
+    // node-local memory: the operator asked for a shared cache, and a
+    // silent memory stand-in would serve per-node answers while the
+    // dashboard claims redis semantics.
+    let policy_cache: Option<Arc<dyn Cache>> = match (matched_policy.as_ref(), state.cache.as_ref())
+    {
+        (Some(entry), Some(backends)) => backends
+            .for_policy_backend(entry.value.backend, &entry.id, &entry.value.name)
+            .cloned(),
+        _ => None,
+    };
+    let matched_policy_ttl = policy_cache.as_ref().and(matched_policy.as_ref()).map(
+        |entry| Duration::from_secs(u64::from(entry.value.ttl_seconds)),
+    );
 
     // Cache lookup keyed on the *virtual* model name so a re-request
     // hits the cache regardless of which target served the original.
-    // Even with `cache_active_by_policy = false` we still build the
-    // key to keep the cache_status path uniform — `disabled` is the
-    // outcome when the gate is closed, but the request itself is
-    // shaped the same way.
-    let cache_key = state
-        .cache
+    let cache_key = policy_cache
         .as_ref()
         .map(|_| CacheKey::from_request(req).fingerprint());
 
-    let cache_status = if cache_active_by_policy && state.cache.is_some() {
+    let cache_status = if policy_cache.is_some() {
         CacheStatus::Miss
     } else {
         CacheStatus::Disabled
     };
 
-    if let (true, Some(cache), Some(key)) = (
-        cache_active_by_policy,
-        state.cache.as_ref(),
-        cache_key.as_ref(),
-    ) {
+    if let (Some(cache), Some(key)) = (policy_cache.as_ref(), cache_key.as_ref()) {
         match cache.get(key).await {
             Ok(Some(cached)) => {
                 reservation.commit_tokens(0);
@@ -1694,7 +1703,7 @@ async fn dispatch(
     // per-entry support (defined via `Cache::put_with_ttl`'s default
     // impl) silently fall back to `put`.
     if let (Some(ttl), Some(cache), Some(key)) =
-        (matched_policy_ttl, state.cache.as_ref(), cache_key.as_ref())
+        (matched_policy_ttl, policy_cache.as_ref(), cache_key.as_ref())
     {
         if let Err(err) = cache.put_with_ttl(key, upstream.clone(), ttl).await {
             tracing::warn!(error = %err, key = %key, "cache write failed");

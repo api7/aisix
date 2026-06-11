@@ -517,6 +517,17 @@ impl Default for OtlpTracingConfig {
     }
 }
 
+/// Boot-level cache backend availability (#519 B.8).
+///
+/// The in-process memory cache is always built; the redis cache is
+/// built iff `redis` is set. Which instance serves a given request is
+/// selected by the matched `CachePolicy.backend` (etcd-managed, per
+/// policy) — NOT by this struct.
+///
+/// `backend` is a legacy knob kept parsing for config compatibility:
+/// it no longer selects "the one global cache". Its only remaining
+/// effect is fail-fast validation — `backend = "redis"` without a
+/// `redis` block is rejected at boot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CacheConfig {
