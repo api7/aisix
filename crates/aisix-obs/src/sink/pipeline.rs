@@ -11,7 +11,7 @@
 //! *wire encoding*, including chunking a batch down to its own per-request
 //! byte limit inside `append_batch` (only the sink knows the encoded size).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,12 +55,22 @@ impl Default for PipelineConfig {
 
 /// Live delivery counters for one sink, shared between the producer handle
 /// and the worker. Cheap atomics; read via [`SinkStats::snapshot`].
+///
+/// Lifetime note: the stats live as long as the pipeline. A reconfigured
+/// or removed-then-re-added exporter gets a fresh pipeline (see
+/// `ExporterPipelines::get_or_create`) and therefore fresh zeroed
+/// counters — consumers (heartbeat `exporter_health`, #519 D.2) must
+/// treat the counters as resettable, not lifetime-of-process totals.
 #[derive(Debug, Default)]
 pub struct SinkStats {
     sent: AtomicU64,
     dropped: AtomicU64,
     retries: AtomicU64,
+    delivered_batches: AtomicU64,
     failed_batches: AtomicU64,
+    /// Unix seconds of the most recent batch outcome; 0 = never.
+    last_success_unix: AtomicI64,
+    last_failure_unix: AtomicI64,
     last_error: Mutex<Option<String>>,
 }
 
@@ -74,10 +84,27 @@ pub struct SinkStatsSnapshot {
     pub dropped: u64,
     /// Retry attempts made across all batches.
     pub retries: u64,
+    /// Batches the sink acknowledged.
+    pub delivered_batches: u64,
     /// Batches given up on after retries (or a permanent error).
     pub failed_batches: u64,
-    /// Masked excerpt of the most recent delivery error, if any.
+    /// Masked excerpt of the most recent delivery error. Cleared on the
+    /// next successful delivery, so `Some` means "currently failing".
     pub last_error: Option<String>,
+    /// Unix seconds of the most recent successful batch delivery.
+    pub last_success_unix: Option<i64>,
+    /// Unix seconds of the most recent dropped batch. Unlike
+    /// `last_error` this persists across later successes — it answers
+    /// "when did this exporter last lose data".
+    pub last_failure_unix: Option<i64>,
+}
+
+fn now_unix_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl SinkStats {
@@ -90,8 +117,15 @@ impl SinkStats {
     fn add_retries(&self, n: u64) {
         self.retries.fetch_add(n, Ordering::Relaxed);
     }
-    fn add_failed_batch(&self) {
+    fn record_batch_delivered(&self) {
+        self.delivered_batches.fetch_add(1, Ordering::Relaxed);
+        self.last_success_unix
+            .store(now_unix_secs(), Ordering::Relaxed);
+    }
+    fn record_batch_failed(&self) {
         self.failed_batches.fetch_add(1, Ordering::Relaxed);
+        self.last_failure_unix
+            .store(now_unix_secs(), Ordering::Relaxed);
     }
     fn set_error(&self, detail: String) {
         *self.last_error.lock() = Some(detail);
@@ -102,12 +136,16 @@ impl SinkStats {
 
     /// Read the current counters.
     pub fn snapshot(&self) -> SinkStatsSnapshot {
+        let to_opt = |v: i64| (v != 0).then_some(v);
         SinkStatsSnapshot {
             sent: self.sent.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
             retries: self.retries.load(Ordering::Relaxed),
+            delivered_batches: self.delivered_batches.load(Ordering::Relaxed),
             failed_batches: self.failed_batches.load(Ordering::Relaxed),
             last_error: self.last_error.lock().clone(),
+            last_success_unix: to_opt(self.last_success_unix.load(Ordering::Relaxed)),
+            last_failure_unix: to_opt(self.last_failure_unix.load(Ordering::Relaxed)),
         }
     }
 }
@@ -256,6 +294,7 @@ impl SinkPipeline {
             match self.sink.append_batch(batch, &marker).await {
                 Ok(ack) => {
                     self.stats.add_sent(ack.accepted as u64);
+                    self.stats.record_batch_delivered();
                     self.stats.clear_error();
                     return;
                 }
@@ -275,7 +314,7 @@ impl SinkPipeline {
                         tokio::time::sleep(delay).await;
                         continue;
                     }
-                    self.stats.add_failed_batch();
+                    self.stats.record_batch_failed();
                     self.stats.add_dropped(count as u64);
                     self.stats.set_error(detail.clone());
                     tracing::warn!(
@@ -475,6 +514,13 @@ mod tests {
         assert_eq!(s.sent, 1, "record eventually delivered");
         assert_eq!(s.dropped, 0);
         assert_eq!(sink.delivered(), 1);
+        // #519 D.2 delivery-health counters: an eventual success counts
+        // one delivered batch, no failed batch, and stamps the success
+        // timestamp (retried attempts are not failed batches).
+        assert_eq!(s.delivered_batches, 1);
+        assert_eq!(s.failed_batches, 0);
+        assert!(s.last_success_unix.is_some(), "success timestamp recorded");
+        assert!(s.last_failure_unix.is_none(), "no batch was dropped");
     }
 
     #[tokio::test]
@@ -498,6 +544,11 @@ mod tests {
             s.last_error.is_some(),
             "last error recorded for the dashboard"
         );
+        // #519 D.2: a dropped batch stamps the failure timestamp and
+        // counts zero delivered batches.
+        assert_eq!(s.delivered_batches, 0);
+        assert!(s.last_failure_unix.is_some(), "failure timestamp recorded");
+        assert!(s.last_success_unix.is_none(), "nothing was delivered");
     }
 
     #[tokio::test]

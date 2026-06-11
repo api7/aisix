@@ -388,8 +388,11 @@ event apply at info level when `access_log` is enabled.
   `/admin/v1/models` instead of relying on the cp-api response.
 - **No multi-DP coordination.** Each DP instance runs its own
   supervisor against the same etcd; they pick up events
-  independently. There is no concept of "this DP has applied the
-  event, others have not" — eventual consistency only.
+  independently — eventual consistency only. Each DP does report
+  the highest revision it has applied as the `applied_revision`
+  field of its heartbeat payload, so cp-api can compare it against
+  the revision returned by its own kine write and surface per-DP
+  propagation state, but the DPs never coordinate among themselves.
 - **No partial loads.** The loader is all-or-nothing per entry —
   schema fails ⇒ entry rejected ⇒ never enters the snapshot. The
   proxy never sees a half-valid Model with a missing field. The

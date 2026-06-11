@@ -18,11 +18,13 @@
 //!   - cancelled via the shared `watch::Receiver<bool>` so graceful
 //!     shutdown doesn't leave an in-flight request dangling
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aisix_etcd::loader::RejectedEntry;
+use aisix_obs::SinkStatsSnapshot;
 use anyhow::{anyhow, Context};
 use serde::Serialize;
 use tokio::sync::watch;
@@ -36,6 +38,22 @@ use tokio::sync::watch;
 /// who saved an invalid resource in the dashboard saw "Saved" but the
 /// DP dropped the row — no signal back. See issue #115.
 pub type RejectionFetcher = Arc<dyn Fn() -> Vec<RejectedEntry> + Send + Sync>;
+
+/// Per-tick source of the highest etcd/kine revision the watch
+/// supervisor has applied to its snapshot (`WatchStatus.revision`).
+/// Reported as `applied_revision` so cp-api can compare it against the
+/// revision returned when IT wrote a resource through kine and show
+/// "propagating…" until the DP catches up (#519 B.3). `0` = the
+/// supervisor has not completed its first load yet.
+pub type AppliedRevisionFetcher = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+/// Per-tick source of the observability exporters' delivery counters,
+/// keyed by exporter name (`OtlpHttpFanOut::exporter_stats`). Reported
+/// as `exporter_health` so cp-api can surface silently-failing
+/// exporters in the dashboard (#519 D.2). Counters reset when an
+/// exporter's pipeline is rebuilt on config change — the CP must treat
+/// them as resettable, not lifetime totals.
+pub type ExporterHealthFetcher = Arc<dyn Fn() -> HashMap<String, SinkStatsSnapshot> + Send + Sync>;
 
 /// File paths to the on-disk mTLS bundle the heartbeat client presents
 /// to cp-api. Same three files written by cert-bundle provisioning and
@@ -73,6 +91,13 @@ pub struct HeartbeatConfig {
     /// kept for tests / managed-mode configs that don't have a
     /// supervisor wired in. See issue #115.
     pub rejection_fetcher: Option<RejectionFetcher>,
+    /// Optional source of the supervisor's applied etcd revision.
+    /// `None` (tests / no supervisor) reports `applied_revision: 0`,
+    /// the same value as "not yet loaded". See #519 B.3.
+    pub applied_revision_fetcher: Option<AppliedRevisionFetcher>,
+    /// Optional source of per-exporter delivery counters. `None`
+    /// reports an empty `exporter_health` array. See #519 D.2.
+    pub exporter_health_fetcher: Option<ExporterHealthFetcher>,
 }
 
 impl std::fmt::Debug for HeartbeatConfig {
@@ -85,6 +110,14 @@ impl std::fmt::Debug for HeartbeatConfig {
             .field(
                 "rejection_fetcher",
                 &self.rejection_fetcher.as_ref().map(|_| "<fn>"),
+            )
+            .field(
+                "applied_revision_fetcher",
+                &self.applied_revision_fetcher.as_ref().map(|_| "<fn>"),
+            )
+            .field(
+                "exporter_health_fetcher",
+                &self.exporter_health_fetcher.as_ref().map(|_| "<fn>"),
             )
             .finish()
     }
@@ -103,6 +136,8 @@ impl HeartbeatConfig {
             interval,
             mtls,
             rejection_fetcher: None,
+            applied_revision_fetcher: None,
+            exporter_health_fetcher: None,
         }
     }
 
@@ -110,6 +145,18 @@ impl HeartbeatConfig {
     /// per-heartbeat call (cheap — it's an Arc).
     pub fn with_rejection_fetcher(mut self, fetcher: RejectionFetcher) -> Self {
         self.rejection_fetcher = Some(fetcher);
+        self
+    }
+
+    /// Wire the supervisor's applied-revision source (#519 B.3).
+    pub fn with_applied_revision_fetcher(mut self, fetcher: AppliedRevisionFetcher) -> Self {
+        self.applied_revision_fetcher = Some(fetcher);
+        self
+    }
+
+    /// Wire the exporter delivery-counter source (#519 D.2).
+    pub fn with_exporter_health_fetcher(mut self, fetcher: ExporterHealthFetcher) -> Self {
+        self.exporter_health_fetcher = Some(fetcher);
         self
     }
 }
@@ -173,12 +220,60 @@ struct HeartbeatBody<'a> {
     dp_id: &'a str,
     uptime_seconds: i64,
     version: &'a str,
+    /// Guardrail `kind` discriminators compiled into this binary
+    /// (#519 B.6). Always present so cp-api can hide / flag kinds the
+    /// DP can't serve (e.g. a build without the `bedrock` feature).
+    supported_guardrail_kinds: &'static [&'static str],
+    /// Highest etcd/kine revision the watch supervisor has applied
+    /// (#519 B.3). `0` = snapshot not loaded yet. cp-api compares this
+    /// against the revision returned by its own kine writes: a DP with
+    /// `applied_revision >= write_revision` has seen that write.
+    applied_revision: i64,
+    /// Per-exporter delivery counters (#519 D.2), sorted by exporter
+    /// name. Always present; empty when no exporter pipeline has
+    /// started. Counters reset when an exporter's pipeline is rebuilt
+    /// on config change.
+    exporter_health: Vec<ExporterHealthWire>,
     /// Loader rejections the supervisor has accumulated since last
     /// drain. Omitted from the wire when empty so legacy / managed-mode
     /// CP endpoints (which don't yet parse this field) still see the
     /// historical body shape. See issue #115.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     rejected_resources: Vec<RejectedResourceWire>,
+}
+
+/// Cap on the `last_error` excerpt forwarded per exporter. The pipeline
+/// already trims sink errors to 200 chars; this is the wire-side
+/// guarantee so a future verbose sink can't bloat the heartbeat.
+const EXPORTER_LAST_ERROR_MAX_CHARS: usize = 256;
+
+/// On-the-wire shape of one exporter's delivery health (#519 D.2). Kept
+/// separate from `aisix_obs::SinkStatsSnapshot` so the obs crate's
+/// internal counters can evolve without forcing a wire bump.
+#[derive(Debug, Serialize)]
+struct ExporterHealthWire {
+    name: String,
+    delivered_batches: u64,
+    failed_batches: u64,
+    last_error: Option<String>,
+    last_failure_unix: Option<i64>,
+    last_success_unix: Option<i64>,
+}
+
+impl ExporterHealthWire {
+    fn from_stats(name: String, stats: &SinkStatsSnapshot) -> Self {
+        Self {
+            name,
+            delivered_batches: stats.delivered_batches,
+            failed_batches: stats.failed_batches,
+            last_error: stats
+                .last_error
+                .as_ref()
+                .map(|e| e.chars().take(EXPORTER_LAST_ERROR_MAX_CHARS).collect()),
+            last_failure_unix: stats.last_failure_unix,
+            last_success_unix: stats.last_success_unix,
+        }
+    }
 }
 
 /// On-the-wire shape for one rejection. Kept as a separate type from
@@ -212,6 +307,23 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
         .as_ref()
         .map(|fetcher| fetcher().iter().map(RejectedResourceWire::from).collect())
         .unwrap_or_default();
+    let applied_revision = cfg
+        .applied_revision_fetcher
+        .as_ref()
+        .map(|fetcher| fetcher())
+        .unwrap_or(0);
+    let mut exporter_health: Vec<ExporterHealthWire> = cfg
+        .exporter_health_fetcher
+        .as_ref()
+        .map(|fetcher| {
+            fetcher()
+                .into_iter()
+                .map(|(name, stats)| ExporterHealthWire::from_stats(name, &stats))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Deterministic order — the fetcher hands back a HashMap.
+    exporter_health.sort_by(|a, b| a.name.cmp(&b.name));
 
     let resp = client
         .post(&cfg.url)
@@ -221,6 +333,9 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
             dp_id: &cfg.dp_id,
             uptime_seconds: uptime,
             version: env!("CARGO_PKG_VERSION"),
+            supported_guardrail_kinds: aisix_guardrails::supported_kinds(),
+            applied_revision,
+            exporter_health,
             rejected_resources: rejections,
         })
         .send()
@@ -409,6 +524,117 @@ mod tests {
             req.headers.get("authorization").is_none(),
             "v3 heartbeat MUST NOT carry Authorization header (mTLS-only auth)",
         );
+    }
+
+    /// #519 B.6 + B.3 + D.2: the heartbeat body always carries the
+    /// compiled-in guardrail kinds, the applied etcd revision, and the
+    /// per-exporter delivery health (sorted by name).
+    #[tokio::test]
+    async fn send_includes_guardrail_kinds_revision_and_exporter_health() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let cfg = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls)
+            .with_applied_revision_fetcher(Arc::new(|| 42))
+            .with_exporter_health_fetcher(Arc::new(|| {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "zeta-exporter".to_string(),
+                    aisix_obs::SinkStatsSnapshot {
+                        delivered_batches: 3,
+                        failed_batches: 1,
+                        last_error: Some("HTTP 503: upstream sad".into()),
+                        last_failure_unix: Some(1_770_000_000),
+                        last_success_unix: Some(1_770_000_100),
+                        ..Default::default()
+                    },
+                );
+                m.insert(
+                    "alpha-exporter".to_string(),
+                    aisix_obs::SinkStatsSnapshot::default(),
+                );
+                m
+            }));
+        send(&plain_client(), &cfg, 7).await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+
+        // B.6 — exact compiled-in kinds under default features.
+        assert_eq!(
+            body["supported_guardrail_kinds"],
+            serde_json::json!([
+                "keyword",
+                "azure_content_safety",
+                "azure_content_safety_text_moderation",
+                "aliyun_text_moderation",
+                "bedrock",
+            ]),
+        );
+
+        // B.3 — the fetched applied revision.
+        assert_eq!(body["applied_revision"], 42);
+
+        // D.2 — both exporters, sorted by name, with the wire fields.
+        let health = body["exporter_health"].as_array().unwrap();
+        assert_eq!(health.len(), 2);
+        assert_eq!(health[0]["name"], "alpha-exporter");
+        assert_eq!(health[0]["delivered_batches"], 0);
+        assert_eq!(health[0]["last_error"], serde_json::Value::Null);
+        assert_eq!(health[1]["name"], "zeta-exporter");
+        assert_eq!(health[1]["delivered_batches"], 3);
+        assert_eq!(health[1]["failed_batches"], 1);
+        assert_eq!(health[1]["last_error"], "HTTP 503: upstream sad");
+        assert_eq!(health[1]["last_failure_unix"], 1_770_000_000_i64);
+        assert_eq!(health[1]["last_success_unix"], 1_770_000_100_i64);
+
+        // `rejected_resources` keeps its omit-when-empty behavior.
+        assert!(
+            body.get("rejected_resources").is_none(),
+            "empty rejected_resources must stay off the wire",
+        );
+    }
+
+    /// Without fetchers (tests / no supervisor), the new fields still
+    /// serialize: revision 0 and an empty exporter_health array.
+    #[tokio::test]
+    async fn send_defaults_new_fields_without_fetchers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        send(
+            &plain_client(),
+            &cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls),
+            7,
+        )
+        .await
+        .unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(body["applied_revision"], 0);
+        assert_eq!(body["exporter_health"], serde_json::json!([]));
+        assert!(body["supported_guardrail_kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k == "keyword"));
     }
 
     #[tokio::test]

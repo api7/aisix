@@ -36,7 +36,10 @@ use crate::snapshot_cache::SnapshotCache;
 /// supervisor last applied an event. Read by `/admin/v1/health` so
 /// operators can tell at a glance whether the gateway is serving from
 /// a frozen snapshot (etcd partition or watch supervisor wedged) vs
-/// from a live config stream. See issue #114.
+/// from a live config stream. See issue #114. Also read by the managed-
+/// mode heartbeat, which reports the revision as `applied_revision` so
+/// cp-api can compare it against the kine revision of its own writes
+/// (#519 B.3).
 ///
 /// The previous health endpoint only reported per-model upstream
 /// connectivity; it was silent on the gateway's own freshness, so a
@@ -630,11 +633,22 @@ impl<P: ConfigProvider> Supervisor<P> {
                 Some(Ok(WatchEvent::Put(raw))) => {
                     self.apply_put(&raw);
                 }
-                Some(Ok(WatchEvent::Delete { key, .. })) => {
+                Some(Ok(WatchEvent::Delete { key, revision })) => {
                     self.apply_delete(&key);
+                    // Advance the applied-revision floor to the delete's
+                    // mod_revision even when the key wasn't present —
+                    // "processed everything up to rev X" must cover
+                    // deletes, otherwise the heartbeat-reported
+                    // applied_revision (#519 B.3) stalls after a CP
+                    // delete until the next put arrives.
+                    self.set_revision_floor(revision);
                 }
-                Some(Ok(WatchEvent::Resync { entries, .. })) => {
+                Some(Ok(WatchEvent::Resync { entries, revision })) => {
                     self.apply_resync(&entries);
+                    // Same rationale: the resync's header revision is the
+                    // "consistent as of" point even when the entry set
+                    // is empty or only contains older mod_revisions.
+                    self.set_revision_floor(revision);
                 }
             }
         }
@@ -909,6 +923,42 @@ mod tests {
         // synchronously relative to the event stream being in-memory.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(handle.load().models.len(), 1);
+
+        tx.send(true).unwrap();
+        join.await.unwrap();
+    }
+
+    /// #519 B.3: the cycle's Delete arm must advance the applied-
+    /// revision floor to the delete event's mod_revision — without it
+    /// the heartbeat-reported `applied_revision` stalls after a CP
+    /// delete and the dashboard shows "propagating…" until an unrelated
+    /// put arrives.
+    #[tokio::test]
+    async fn run_loop_advances_revision_on_delete_event() {
+        let provider = Arc::new(FakeProvider::new(vec![], 2).with_events(vec![
+            Ok(WatchEvent::Put(entry("/aisix/models/m-1", VALID_MODEL, 5))),
+            Ok(WatchEvent::Delete {
+                key: "/aisix/models/m-1".into(),
+                revision: 9,
+            }),
+        ]));
+        let sup = Arc::new(Supervisor::new(provider, "/aisix"));
+        let status = sup.watch_status();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        let join = tokio::spawn(sup.clone().run(rx));
+
+        // Poll until the finite event stream drains (bounded — the
+        // revision floor never decreases once it reaches 9).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while status.snapshot().revision < 9 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            status.snapshot().revision,
+            9,
+            "delete event's mod_revision must advance the applied revision",
+        );
 
         tx.send(true).unwrap();
         join.await.unwrap();

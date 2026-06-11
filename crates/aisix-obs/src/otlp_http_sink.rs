@@ -43,7 +43,7 @@ use crate::sink::{
     build_object_store_sink, resolve_datadog_credential, resolve_sls_credential, AliyunSlsSink,
     BatchUnit, CapturedContent, DatadogSink, EventBatch, ExporterPipelines, IdempotencyMarker,
     IdempotencyScheme, ObservabilitySink, OrderingScope, PipelineConfig, SinkAck, SinkCapabilities,
-    SinkContent, SinkError, SinkHealth, SinkRecord, SinkResult,
+    SinkContent, SinkError, SinkHealth, SinkRecord, SinkResult, SinkStatsSnapshot,
 };
 use crate::usage::UsageEvent;
 
@@ -241,6 +241,15 @@ impl OtlpHttpFanOut {
     /// exporters.
     pub fn gc(&self, live: &std::collections::HashSet<String>) {
         self.inner.exporters.retain(live);
+    }
+
+    /// Per-exporter delivery counters, keyed by exporter name. Read by the
+    /// managed-mode heartbeat to report `exporter_health` to cp-api
+    /// (#519 D.2). Counters are per-pipeline: a reconfigured exporter gets
+    /// a rebuilt pipeline, so its counters reset — consumers must treat
+    /// them as resettable.
+    pub fn exporter_stats(&self) -> std::collections::HashMap<String, SinkStatsSnapshot> {
+        self.inner.exporters.stats()
     }
 
     /// Drain every exporter pipeline at graceful shutdown.

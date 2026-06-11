@@ -60,6 +60,29 @@ pub(crate) fn message_scan_text(m: &ChatMessage) -> String {
     }
 }
 
+/// The guardrail `kind` discriminators compiled into this binary.
+///
+/// Every non-keyword kind sits behind a cargo feature (see `build.rs`'s
+/// `BuildError::FeatureDisabled` arms); a DP built without one silently
+/// rejects rows of that kind while the dashboard still offers it
+/// (#519 B.6). The heartbeat reports this list so cp-api can hide /
+/// flag kinds the connected DP can't serve. Strings MUST stay equal to
+/// the serde `kind` tags in `aisix_core::models::GuardrailKind`
+/// (`GuardrailKind::kind_str`).
+pub fn supported_kinds() -> &'static [&'static str] {
+    &[
+        "keyword",
+        #[cfg(feature = "azure-content-safety")]
+        "azure_content_safety",
+        #[cfg(feature = "azure-content-safety")]
+        "azure_content_safety_text_moderation",
+        #[cfg(feature = "aliyun-text-moderation")]
+        "aliyun_text_moderation",
+        #[cfg(feature = "bedrock")]
+        "bedrock",
+    ]
+}
+
 #[cfg(feature = "aliyun-text-moderation")]
 pub use aliyun::AliyunTextModerationGuardrail;
 #[cfg(feature = "bedrock")]
@@ -345,6 +368,69 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Pins `supported_kinds()` under the default feature set (all
+    /// features on): exact contents, and every string round-trips
+    /// through the config parser to the matching
+    /// `GuardrailKind::kind_str` — so the heartbeat-reported list can
+    /// never drift from the wire `kind` discriminators (#519 B.6).
+    #[cfg(all(
+        feature = "bedrock",
+        feature = "azure-content-safety",
+        feature = "aliyun-text-moderation"
+    ))]
+    #[test]
+    fn supported_kinds_matches_kind_str_under_default_features() {
+        assert_eq!(
+            supported_kinds(),
+            &[
+                "keyword",
+                "azure_content_safety",
+                "azure_content_safety_text_moderation",
+                "aliyun_text_moderation",
+                "bedrock",
+            ],
+        );
+        for kind in supported_kinds() {
+            // Minimal valid config per kind; parse failure or a
+            // kind_str mismatch means the heartbeat list drifted from
+            // the schema's serde tags.
+            let config = match *kind {
+                "keyword" => serde_json::json!({
+                    "kind": "keyword",
+                    "patterns": [{"kind": "literal", "value": "x"}],
+                }),
+                "azure_content_safety" => serde_json::json!({
+                    "kind": "azure_content_safety",
+                    "endpoint": "https://x.cognitiveservices.azure.com",
+                    "api_key": "k",
+                }),
+                "azure_content_safety_text_moderation" => serde_json::json!({
+                    "kind": "azure_content_safety_text_moderation",
+                    "endpoint": "https://x.cognitiveservices.azure.com",
+                    "api_key": "k",
+                }),
+                "aliyun_text_moderation" => serde_json::json!({
+                    "kind": "aliyun_text_moderation",
+                    "region": "ap-southeast-1",
+                    "access_key_id": "ak",
+                    "access_key_secret": "sk",
+                }),
+                "bedrock" => serde_json::json!({
+                    "kind": "bedrock",
+                    "guardrail_id": "gr-1",
+                    "guardrail_version": "1",
+                    "region": "us-east-1",
+                    "aws_credentials": {"kind": "static", "access_key_id": "ak", "secret_access_key": "sk"},
+                    "latency_mode": {"kind": "serial"},
+                }),
+                other => panic!("no parse fixture for kind {other:?}"),
+            };
+            let parsed: aisix_core::models::GuardrailKind = serde_json::from_value(config)
+                .unwrap_or_else(|e| panic!("kind {kind:?} failed to parse: {e}"));
+            assert_eq!(parsed.kind_str(), *kind);
+        }
     }
 
     #[test]

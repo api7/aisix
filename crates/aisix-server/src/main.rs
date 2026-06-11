@@ -366,18 +366,6 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             }
         }
     });
-    // Issue #115: supply the supervisor's rejection callback so each
-    // heartbeat carries the loader's most recent failures up to cp-api.
-    // Pre-fix the loader logged a warning and silently moved on —
-    // dashboard customers saw "Saved successfully" but the DP had
-    // dropped the row.
-    let heartbeat_task = heartbeat_cfg.map(|mut h| {
-        let supervisor_for_heartbeat = Arc::clone(&supervisor);
-        h = h.with_rejection_fetcher(Arc::new(move || {
-            supervisor_for_heartbeat.recent_rejections()
-        }));
-        heartbeat::spawn(h, cancel_rx.clone())
-    });
     let (usage_sink, telemetry_task) = match telemetry_cfg {
         Some(cfg) => {
             let (sink, handle) = telemetry::spawn(cfg, cancel_rx.clone());
@@ -440,6 +428,25 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         snapshot_handle.clone(),
         bedrock_endpoint_url,
     ));
+    // Heartbeat worker — spawned after proxy_state exists so it can read
+    // the exporter fan-out's delivery counters. Each tick reports:
+    //   - rejected_resources: the supervisor's loader rejections (#115)
+    //   - applied_revision: the highest etcd revision the supervisor has
+    //     applied, so cp-api can show "propagating…" until the DP catches
+    //     up with a kine write (#519 B.3)
+    //   - supported_guardrail_kinds + exporter_health (#519 B.6 / D.2)
+    let heartbeat_task = heartbeat_cfg.map(|mut h| {
+        let supervisor_for_heartbeat = Arc::clone(&supervisor);
+        h = h.with_rejection_fetcher(Arc::new(move || {
+            supervisor_for_heartbeat.recent_rejections()
+        }));
+        let watch_status = supervisor.watch_status();
+        h = h.with_applied_revision_fetcher(Arc::new(move || watch_status.snapshot().revision));
+        let fan_out = proxy_state.otlp_fan_out.clone();
+        h = h.with_exporter_health_fetcher(Arc::new(move || fan_out.exporter_stats()));
+        heartbeat::spawn(h, cancel_rx.clone())
+    });
+
     // Clone shared trackers before consuming proxy_state in build_router.
     let health_tracker = proxy_state.health.clone();
     let livez_state = proxy_state.livez.clone();
