@@ -393,7 +393,10 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         Some(redis_cfg) => {
             tracing::info!(target: "aisix::cache", backend = "redis", "connecting cache backend");
             let redis = RedisCache::connect(&redis_cfg.url).await.map_err(|e| {
-                anyhow::anyhow!("redis cache connect failed (url={}): {e}", redis_cfg.url)
+                // Deliberately no URL in the message: redis URLs carry
+                // credentials (redis://user:pass@host) and this error
+                // lands in logs that may ship to centralized sinks.
+                anyhow::anyhow!("redis cache connect failed (cache.redis.url): {e}")
             })?;
             Some(Arc::new(redis) as Arc<dyn Cache>)
         }
