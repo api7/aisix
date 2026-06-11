@@ -319,6 +319,13 @@
     "name"
   ],
   "properties": {
+    "created_at": {
+      "description": "RFC3339 creation timestamp of the row, projected by cp-api so the DP can evaluate guardrail chains oldest-first — matching the order the dashboard lists them in (#519 B.4a). Optional: cp-api's `marshalGuardrailKV` doesn't emit it yet, and admin-API rows may omit it; rows without it sort after rows that have it, tied broken by id, so chain order stays total and deterministic either way. RFC3339 timestamps in a fixed (UTC) offset compare correctly as strings, so no parsing is needed.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "direction": {
       "description": "Which traffic directions this guardrail applies to when resolved through an attachment. Values: `\"input\"`, `\"output\"`, `\"both\"` (default).\n\nStored and forwarded to the CP dashboard. Direction-based filtering in `GuardrailIndex::resolve` is not yet implemented; the `hook_point` field on the guardrail definition provides equivalent per-hook-point control for keyword rules.",
       "default": "both",
