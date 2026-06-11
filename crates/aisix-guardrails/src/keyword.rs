@@ -116,9 +116,9 @@ impl Guardrail for KeywordBlocklist {
             .collect::<Vec<_>>()
             .join("\n");
         match self.first_match(&combined) {
-            Some(rule) => GuardrailVerdict::Block {
-                reason: format!("input blocked by {}", rule.description()),
-            },
+            Some(rule) => {
+                GuardrailVerdict::block(format!("input blocked by {}", rule.description()))
+            }
             None => GuardrailVerdict::Allow,
         }
     }
@@ -130,9 +130,9 @@ impl Guardrail for KeywordBlocklist {
         // Inspect content + tool-call output (#448), not just content.
         let text = resp.guardrail_output_text();
         match self.first_match(&text) {
-            Some(rule) => GuardrailVerdict::Block {
-                reason: format!("output blocked by {}", rule.description()),
-            },
+            Some(rule) => {
+                GuardrailVerdict::block(format!("output blocked by {}", rule.description()))
+            }
             None => GuardrailVerdict::Allow,
         }
     }
@@ -272,7 +272,7 @@ mod tests {
             KeywordRule::literal("beta"),
         ]);
         let v = g.check_input(&req(&[("user", "alpha and beta")])).await;
-        if let GuardrailVerdict::Block { reason } = v {
+        if let GuardrailVerdict::Block { reason, .. } = v {
             assert!(reason.contains("alpha"));
         } else {
             panic!("expected Block");

@@ -185,9 +185,10 @@ impl BedrockGuardrail {
 
         match result {
             Ok(resp) => match resp.action() {
-                GuardrailAction::GuardrailIntervened => GuardrailVerdict::Block {
-                    reason: format!("bedrock guardrail {} intervened", self.guardrail_id),
-                },
+                GuardrailAction::GuardrailIntervened => GuardrailVerdict::block(format!(
+                    "bedrock guardrail {} intervened",
+                    self.guardrail_id
+                )),
                 GuardrailAction::None => GuardrailVerdict::Allow,
                 other => {
                     // Forward-compat: an unknown enum variant from a
@@ -222,9 +223,7 @@ impl BedrockGuardrail {
                 reason: reason.into(),
             }
         } else {
-            GuardrailVerdict::Block {
-                reason: format!("bedrock unavailable ({reason})"),
-            }
+            GuardrailVerdict::block(format!("bedrock unavailable ({reason})"))
         }
     }
 }
@@ -578,7 +577,7 @@ mod tests {
             .apply(GuardrailContentSource::Input, "leak something".into())
             .await;
         match v {
-            GuardrailVerdict::Block { reason } => {
+            GuardrailVerdict::Block { reason, .. } => {
                 assert!(
                     reason.contains("abcdefgh1234"),
                     "block reason should mention guardrail_id, got {reason}",

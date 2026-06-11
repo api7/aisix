@@ -172,11 +172,10 @@ pub enum ProxyError {
     /// forbidden content from reaching the caller; echoing it in the
     /// error envelope is a partial bypass and lets anyone who can
     /// trigger the guardrail enumerate the policy's blocklist).
-    /// Constructors at `chat.rs::route_chat_completions` and
-    /// `chat.rs::dispatch_and_render` build a redacted public message
-    /// (`"request blocked by content policy"` /
-    /// `"response blocked by content policy"`) and emit the rich detail
-    /// to `tracing` for operators.
+    /// Every guardrail-block site builds the redacted public message via
+    /// [`guardrail_block_message`] — generic policy wording plus the NAME
+    /// of the guardrail that fired (#519 B.4b) — and emits the rich
+    /// detail to `tracing` for operators.
     #[error("{0}")]
     ContentFiltered(String),
     // Carries cp-api's structured reason. Display forwards the cp-api
@@ -202,6 +201,22 @@ pub enum ProxyError {
     RateLimit(#[from] RateLimitError),
     #[error(transparent)]
     Bridge(#[from] BridgeError),
+}
+
+/// The caller-visible message for a guardrail `Block` verdict.
+///
+/// Carries WHICH guardrail fired — `guardrail_name` is operator-assigned
+/// metadata, safe to surface (#519 B.4b) — but never the matched-pattern
+/// detail (per #153 that detail stays in `tracing` only; echoing it lets
+/// callers enumerate the blocklist or extract the blocked output).
+/// `side` is `"request"` (input hook) or `"response"` (output hook).
+/// Every proxy endpoint family builds its 422 / SSE-error message through
+/// this helper so the envelope shape can't drift between siblings.
+pub(crate) fn guardrail_block_message(side: &str, guardrail_name: Option<&str>) -> String {
+    match guardrail_name {
+        Some(name) => format!("{side} blocked by content policy (guardrail '{name}')"),
+        None => format!("{side} blocked by content policy"),
+    }
 }
 
 impl ProxyError {

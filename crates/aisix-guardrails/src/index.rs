@@ -46,6 +46,10 @@ pub enum ScopeKind {
 pub(crate) struct IndexEntry {
     /// UUID of the guardrail definition (for deduplication).
     guardrail_id: String,
+    /// Operator-facing name of the guardrail definition. Carried onto the
+    /// resolved chain so a `Block` verdict can be attributed to the rule
+    /// that fired (#519 B.4b).
+    guardrail_name: String,
     scope_kind: ScopeKind,
     /// `None` for `Env` scope; the UUID string for narrower scopes.
     scope_id: Option<String>,
@@ -151,7 +155,7 @@ impl GuardrailIndex {
     /// Complexity: O(n) in the number of attachment entries.
     pub fn resolve(&self, ctx: &RequestContext<'_>) -> GuardrailChain {
         let mut seen: HashSet<&str> = HashSet::new();
-        let mut chain: Vec<Arc<dyn Guardrail>> = Vec::new();
+        let mut chain: Vec<(String, Arc<dyn Guardrail>)> = Vec::new();
         // `applied` mirrors `chain` 1:1 — the `{kind, hook}` of each member
         // we keep, for applied-guardrail telemetry (#379). Pushed on the same
         // (matched + not-deduplicated) path so it never drifts from `chain`.
@@ -165,7 +169,7 @@ impl GuardrailIndex {
                 continue;
             }
             seen.insert(entry.guardrail_id.as_str());
-            chain.push(Arc::clone(&entry.guardrail));
+            chain.push((entry.guardrail_name.clone(), Arc::clone(&entry.guardrail)));
             applied.push(entry.applied.clone());
         }
 
@@ -180,6 +184,7 @@ impl GuardrailIndex {
 impl GuardrailIndex {
     pub(crate) fn push_entry(
         guardrail_id: impl Into<String>,
+        guardrail_name: impl Into<String>,
         scope_kind: ScopeKind,
         scope_id: Option<String>,
         priority: i32,
@@ -188,6 +193,7 @@ impl GuardrailIndex {
     ) -> IndexEntry {
         IndexEntry {
             guardrail_id: guardrail_id.into(),
+            guardrail_name: guardrail_name.into(),
             scope_kind,
             scope_id,
             priority,
@@ -241,6 +247,7 @@ mod tests {
         // applied descriptor is documentary here (the dedicated applied
         // tests live in build.rs against the real snapshot build path).
         GuardrailIndex::push_entry(
+            gid,
             gid,
             scope,
             sid.map(str::to_owned),

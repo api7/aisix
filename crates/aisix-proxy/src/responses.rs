@@ -253,7 +253,7 @@ async fn dispatch(
     // violent input that 422s on chat returned 200 with the content echoed
     // here). Translate the Responses-API body into the internal ChatFormat
     // and run the resolved input guardrail chain; a Block short-circuits
-    // before dispatch. (Input Rewrite/Bypass is not applied to the outgoing
+    // before dispatch. (Input Bypass is not applied to the outgoing
     // Responses body — only Block is enforced, matching /v1/messages.)
     //
     // #542: run this BEFORE the rate-limit reservation so a content-policy
@@ -266,12 +266,15 @@ async fn dispatch(
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
     if !resolved_chain.is_empty() {
         let chat = responses_input_to_chat(&model_name, body);
-        if let aisix_guardrails::GuardrailVerdict::Block { reason } =
-            aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+        } = aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
         {
             // Per #153 the matched-pattern detail stays in ops logs only; the
-            // wire envelope stays generic so callers can't enumerate the
-            // blocklist by probing error responses.
+            // wire envelope names only the guardrail that fired (#519 B.4b)
+            // so callers can't enumerate the blocklist by probing error
+            // responses.
             tracing::warn!(
                 guardrail_hook = "input",
                 model = %model_name,
@@ -279,7 +282,11 @@ async fn dispatch(
                 "guardrail blocked /v1/responses request",
             );
             return Err(
-                ProxyError::ContentFiltered("request blocked by content policy".into()).into(),
+                ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                    "request",
+                    guardrail_name.as_deref(),
+                ))
+                .into(),
             );
         }
     }
@@ -689,8 +696,10 @@ async fn responses_to_target(
             }
             let out_text = responses_sse_output_text(&buf);
             let synth = synth_chat_response(&upstream_model, out_text);
-            if let aisix_guardrails::GuardrailVerdict::Block { reason } =
-                aisix_guardrails::Guardrail::check_output(chain, &synth).await
+            if let aisix_guardrails::GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+            } = aisix_guardrails::Guardrail::check_output(chain, &synth).await
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
                 tracing::warn!(
@@ -700,7 +709,7 @@ async fn responses_to_target(
                     "guardrail blocked streaming /v1/responses response",
                 );
                 return Err(ProxyError::ContentFiltered(
-                    "response blocked by content policy".into(),
+                    crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
                 ));
             }
             let mut response = axum::response::Response::new(axum::body::Body::from(buf));
@@ -803,8 +812,10 @@ async fn responses_to_target(
         // output-hook guardrail is attached; otherwise this is a no-op.
         if aisix_guardrails::Guardrail::runs_on_output(chain) {
             let synth = synth_chat_response(&upstream_model, responses_output_text(&json_body));
-            if let aisix_guardrails::GuardrailVerdict::Block { reason } =
-                aisix_guardrails::Guardrail::check_output(chain, &synth).await
+            if let aisix_guardrails::GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+            } = aisix_guardrails::Guardrail::check_output(chain, &synth).await
             {
                 // Per #153 the matched-pattern detail stays in ops logs only.
                 tracing::warn!(
@@ -819,9 +830,10 @@ async fn responses_to_target(
                 // customer's ledger underreport spend they were charged for.
                 // This is the output analog of chat.rs's UpstreamCharge.
                 return Ok(ResponseDispatchSuccess {
-                    response: ProxyError::ContentFiltered(
-                        "response blocked by content policy".into(),
-                    )
+                    response: ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                        "response",
+                        guardrail_name.as_deref(),
+                    ))
                     .into_response(),
                     provider: provider_label,
                     usage,

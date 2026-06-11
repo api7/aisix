@@ -491,6 +491,17 @@ pub struct Guardrail {
     #[serde(default = "default_direction")]
     pub direction: String,
 
+    /// RFC3339 creation timestamp of the row, projected by cp-api so the
+    /// DP can evaluate guardrail chains oldest-first — matching the order
+    /// the dashboard lists them in (#519 B.4a). Optional: cp-api's
+    /// `marshalGuardrailKV` doesn't emit it yet, and admin-API rows may
+    /// omit it; rows without it sort after rows that have it, tied broken
+    /// by id, so chain order stays total and deterministic either way.
+    /// RFC3339 timestamps in a fixed (UTC) offset compare correctly as
+    /// strings, so no parsing is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+
     #[serde(skip)]
     pub(crate) runtime_id: String,
 }

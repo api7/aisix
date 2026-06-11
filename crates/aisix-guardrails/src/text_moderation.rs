@@ -132,7 +132,7 @@ impl TextModerationGuardrail {
             match self.analyze(&chunk).await {
                 Ok(resp) => {
                     if let Some(reason) = self.violation_reason(&resp) {
-                        return GuardrailVerdict::Block { reason };
+                        return GuardrailVerdict::block(reason);
                     }
                 }
                 Err(failure) => return self.handle_failure(failure, fail_open),
@@ -224,9 +224,7 @@ impl TextModerationGuardrail {
         if fail_open {
             GuardrailVerdict::Bypass { reason: tag.into() }
         } else {
-            GuardrailVerdict::Block {
-                reason: format!("azure content safety unavailable ({tag})"),
-            }
+            GuardrailVerdict::block(format!("azure content safety unavailable ({tag})"))
         }
     }
 

@@ -26,12 +26,45 @@ use crate::index::{GuardrailIndex, RequestContext, ScopeKind};
 use crate::keyword::{KeywordBlocklist, KeywordRule};
 use crate::{Guardrail, GuardrailChain, GuardrailVerdict, StreamOutputPolicy};
 
+/// A snapshot table's guardrail entries in deterministic chain order:
+/// `created_at` ascending (RFC3339 strings in a fixed offset compare
+/// correctly lexicographically), rows without `created_at` after rows
+/// that have it, ties broken by etcd id — so the order is always total.
+///
+/// `ResourceTable::entries()` is backed by a `DashMap`, whose iteration
+/// order is arbitrary and varies run-to-run; building the chain straight
+/// off it made "which Block fires first" random when multiple guardrails
+/// match (#519 B.4a). The dashboard lists guardrails oldest-first, so the
+/// chain evaluates oldest-first too. cp-api doesn't project `created_at`
+/// yet — until it does, every row falls back to the id tiebreak, which is
+/// still deterministic.
+fn sorted_guardrail_entries(
+    table: &ResourceTable<DomainGuardrail>,
+) -> Vec<Arc<aisix_core::resource::ResourceEntry<DomainGuardrail>>> {
+    let mut entries = table.entries();
+    entries.sort_by(|a, b| {
+        let ka = (
+            a.value.created_at.is_none(),
+            a.value.created_at.as_deref(),
+            a.id.as_str(),
+        );
+        let kb = (
+            b.value.created_at.is_none(),
+            b.value.created_at.as_deref(),
+            b.id.as_str(),
+        );
+        ka.cmp(&kb)
+    });
+    entries
+}
+
 /// Build a chain from a snapshot's `guardrails` table.
 ///
-/// Iteration order matches the table's deterministic id-sort. Each
-/// row produces at most one runtime `dyn Guardrail`. Failures
-/// (invalid regex, etc.) are logged and the row is skipped — same
-/// contract the loader uses for malformed etcd rows.
+/// Rows are evaluated in deterministic `created_at`-ascending order (see
+/// [`sorted_guardrail_entries`]). Each row produces at most one runtime
+/// `dyn Guardrail`. Failures (invalid regex, etc.) are logged and the
+/// row is skipped — same contract the loader uses for malformed etcd
+/// rows.
 ///
 /// `bedrock_endpoint_url` is the deployment-wide override for the
 /// AWS Bedrock endpoint URL (sourced from
@@ -42,14 +75,14 @@ pub fn build_chain_from_snapshot(
     table: &ResourceTable<DomainGuardrail>,
     bedrock_endpoint_url: Option<&str>,
 ) -> GuardrailChain {
-    let mut chain: Vec<Arc<dyn Guardrail>> = Vec::new();
+    let mut chain: Vec<(String, Arc<dyn Guardrail>)> = Vec::new();
     // `applied` mirrors `chain` 1:1 — the `{kind, hook}` of each member that
     // actually materialised, for applied-guardrail telemetry (#379). Pushed
     // only on the `Ok(Some)` path so inert/invalid rows (which never join the
     // chain) never show up as "governed this request".
     let mut applied: Vec<AppliedGuardrail> = Vec::new();
 
-    let entries = table.entries();
+    let entries = sorted_guardrail_entries(table);
     for entry in entries.iter() {
         let row = &entry.value;
         if !row.enabled {
@@ -57,7 +90,7 @@ pub fn build_chain_from_snapshot(
         }
         match build_one(row, bedrock_endpoint_url) {
             Ok(Some(g)) => {
-                chain.push(g);
+                chain.push((row.name.clone(), g));
                 applied.push(applied_for(row));
             }
             Ok(None) => {
@@ -362,7 +395,16 @@ pub fn build_index_from_snapshot(
     // are expressing intent; we must not override it with the env-scope fallback.
     let mut attached_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for attachment_arc in attachments.entries() {
+    // Deterministic attachment order: `GuardrailIndex::new` sorts by
+    // (priority desc, scope-specificity desc) with a STABLE sort, so
+    // insertion order decides the remaining ties. `entries()` is DashMap-
+    // backed (arbitrary, run-to-run-varying order) — sort by id so equal-
+    // priority/equal-specificity entries resolve in a stable order too
+    // (#519 B.4a, same bug class as the chain-build path).
+    let mut attachment_entries = attachments.entries();
+    attachment_entries.sort_by(|a, b| a.id.cmp(&b.id));
+
+    for attachment_arc in attachment_entries.iter() {
         let attachment = &attachment_arc.value;
         // Track ALL attachment references (enabled or not) so the backward-compat
         // fallback below treats "has an explicit attachment" as opt-in to P0c
@@ -413,6 +455,7 @@ pub fn build_index_from_snapshot(
 
         entries.push(GuardrailIndex::push_entry(
             gid.clone(),
+            row.name.clone(),
             scope_kind,
             attachment.scope_id.clone(),
             attachment.priority,
@@ -432,7 +475,11 @@ pub fn build_index_from_snapshot(
     // (tracked in https://github.com/api7/ai-gateway/issues/417).
     // After removal, a guardrail with zero attachment rows is a silent no-op —
     // operators must explicitly attach it to a scope.
-    for guardrail_arc in guardrails.entries() {
+    // Same deterministic created_at-ascending order as the chain-build
+    // path: these implicit entries all share priority 0 + env scope, so
+    // without a pre-sort their relative order — and which Block fires
+    // first — would follow the DashMap's arbitrary iteration (#519 B.4a).
+    for guardrail_arc in sorted_guardrail_entries(guardrails) {
         if attached_ids.contains(guardrail_arc.id.as_str()) {
             continue; // explicit attachment governs this guardrail
         }
@@ -449,6 +496,7 @@ pub fn build_index_from_snapshot(
                 );
                 entries.push(GuardrailIndex::push_entry(
                     guardrail_arc.id.clone(),
+                    row.name.clone(),
                     ScopeKind::Env,
                     None,
                     0,
@@ -764,6 +812,90 @@ mod tests {
         handle.store(next);
 
         assert!(live.check_input(&req("AKIA-EXAMPLE")).await.is_block());
+    }
+
+    // -----------------------------------------------------------------------
+    // Deterministic chain order (#519 B.4a)
+    // -----------------------------------------------------------------------
+
+    fn keyword_row(name: &str, created_at: Option<&str>) -> DomainGuardrail {
+        let mut v = serde_json::json!({
+            "name": name,
+            "kind": "keyword",
+            "patterns": [{ "kind": "literal", "value": "AKIA" }],
+        });
+        if let Some(ts) = created_at {
+            v["created_at"] = serde_json::Value::String(ts.to_owned());
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// (id, name, created_at) rows in deliberately shuffled insertion
+    /// order. Expected chain order: rows WITH created_at ascending (ties
+    /// broken by id), then rows WITHOUT created_at by id.
+    const SHUFFLED_ROWS: [(&str, &str, Option<&str>); 10] = [
+        ("g-09", "i", Some("2026-01-05T00:00:00Z")),
+        ("g-03", "c", Some("2026-01-01T00:00:00Z")),
+        ("g-10", "j", None),
+        ("g-05", "e", Some("2026-01-02T00:00:00Z")),
+        ("g-01", "a", None),
+        ("g-07", "g", Some("2026-01-04T00:00:00Z")),
+        ("g-02", "b", Some("2026-01-03T00:00:00Z")),
+        // same timestamp as g-02 → id tiebreak
+        ("g-08", "h", Some("2026-01-03T00:00:00Z")),
+        ("g-04", "d", None),
+        // same timestamp as g-03 → id tiebreak
+        ("g-06", "f", Some("2026-01-01T00:00:00Z")),
+    ];
+
+    const EXPECTED_ORDER: [&str; 10] = ["c", "f", "e", "b", "h", "g", "i", "a", "d", "j"];
+
+    fn shuffled_table() -> ResourceTable<DomainGuardrail> {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        for (id, name, ts) in SHUFFLED_ROWS {
+            table.insert(entry(name, id, keyword_row(name, ts)));
+        }
+        table
+    }
+
+    /// The chain evaluates rows created_at-ascending (id tiebreak; rows
+    /// without created_at last) regardless of insertion order. The table
+    /// is DashMap-backed — without the build-time sort the chain follows
+    /// the map's arbitrary, run-to-run-varying iteration order and this
+    /// assertion fails intermittently (#519 B.4a).
+    #[test]
+    fn chain_order_is_created_at_ascending_with_id_tiebreak() {
+        let chain = build_chain_from_snapshot(&shuffled_table(), None);
+        assert_eq!(chain.member_names(), EXPECTED_ORDER);
+    }
+
+    /// cp-api doesn't project `created_at` yet — a table where every row
+    /// lacks it must still build in a deterministic (id-ascending) order.
+    #[test]
+    fn chain_order_falls_back_to_id_when_created_at_absent() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        for (id, name) in [("g-3", "z"), ("g-1", "y"), ("g-2", "x")] {
+            table.insert(entry(name, id, keyword_row(name, None)));
+        }
+        let chain = build_chain_from_snapshot(&table, None);
+        assert_eq!(chain.member_names(), ["y", "x", "z"]);
+    }
+
+    /// The production per-request path: guardrails with no attachment
+    /// rows fall back to implicit env-scope entries that all share
+    /// priority 0, so their relative order in the resolved chain is
+    /// decided by the index build's iteration — which must be the same
+    /// created_at-ascending order as the chain-build path (#519 B.4a).
+    #[test]
+    fn no_attachment_fallback_resolves_in_created_at_order() {
+        let attachments: ResourceTable<GuardrailAttachment> = ResourceTable::default();
+        let index = build_index_from_snapshot(&shuffled_table(), &attachments, None);
+        let chain = index.resolve(&RequestContext {
+            model_id: "m",
+            api_key_id: "k",
+            team_id: None,
+        });
+        assert_eq!(chain.member_names(), EXPECTED_ORDER);
     }
 
     // -----------------------------------------------------------------------

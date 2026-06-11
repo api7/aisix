@@ -1,12 +1,12 @@
 //! Compose multiple guardrails into one. First [`GuardrailVerdict::Block`]
 //! short-circuits the chain; subsequent guardrails are not consulted.
-//! A [`GuardrailVerdict::Rewrite`] propagates the modified payload to all
-//! subsequent guardrails via `Cow<ChatFormat>` — the heap allocation is
-//! deferred until an actual rewrite occurs.
+//! The chain attributes each `Block` to the member that fired: it carries
+//! the member's configured name in `GuardrailVerdict::Block::guardrail_name`
+//! and prefixes the operator-facing `reason` with it (#519 B.4b), so both
+//! the wire envelope and the ops logs say WHICH rule blocked.
 //! Useful for building a single `Arc<dyn Guardrail>` to hand to the
 //! proxy from a config-driven list.
 
-use std::borrow::Cow;
 use std::sync::Arc;
 
 use aisix_core::AppliedGuardrail;
@@ -15,9 +15,19 @@ use async_trait::async_trait;
 
 use crate::{Guardrail, GuardrailVerdict, StreamOutputPolicy};
 
+/// One chain member: the runtime guardrail plus the operator-facing name
+/// of the row it was built from. The name is what `Block` verdicts are
+/// attributed to; chains built without row context ([`GuardrailChain::new`])
+/// fall back to the impl's static [`Guardrail::name`].
+#[derive(Clone)]
+struct ChainMember {
+    name: String,
+    guardrail: Arc<dyn Guardrail>,
+}
+
 #[derive(Clone)]
 pub struct GuardrailChain {
-    guardrails: Vec<Arc<dyn Guardrail>>,
+    members: Vec<ChainMember>,
     /// The `{kind, hook}` of each guardrail that materialised into this
     /// chain, captured at build time. Carried onto the telemetry
     /// `UsageEvent` so the dashboard can show which guardrails governed a
@@ -29,9 +39,8 @@ pub struct GuardrailChain {
 
 impl std::fmt::Debug for GuardrailChain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let names: Vec<&'static str> = self.guardrails.iter().map(|g| g.name()).collect();
         f.debug_struct("GuardrailChain")
-            .field("guardrails", &names)
+            .field("guardrails", &self.member_names())
             .finish()
     }
 }
@@ -39,22 +48,32 @@ impl std::fmt::Debug for GuardrailChain {
 impl GuardrailChain {
     pub fn new(guardrails: Vec<Arc<dyn Guardrail>>) -> Self {
         Self {
-            guardrails,
+            members: guardrails
+                .into_iter()
+                .map(|g| ChainMember {
+                    name: g.name().to_owned(),
+                    guardrail: g,
+                })
+                .collect(),
             applied: Vec::new(),
         }
     }
 
-    /// Build a chain that also carries the `{kind, hook}` of each member
-    /// for applied-guardrail telemetry (#379). Used by the snapshot build
-    /// points; `applied` is expected to line up 1:1 with the materialised
-    /// `guardrails`, but the chain's runtime behaviour does not depend on
+    /// Build a chain that also carries each member's configured (row) name
+    /// — used for `Block` attribution (#519 B.4b) — and the `{kind, hook}`
+    /// of each member for applied-guardrail telemetry (#379). Used by the
+    /// snapshot build points; `applied` is expected to line up 1:1 with
+    /// `members`, but the chain's runtime behaviour does not depend on
     /// that — `applied` is telemetry-only.
     pub fn new_with_applied(
-        guardrails: Vec<Arc<dyn Guardrail>>,
+        members: Vec<(String, Arc<dyn Guardrail>)>,
         applied: Vec<AppliedGuardrail>,
     ) -> Self {
         Self {
-            guardrails,
+            members: members
+                .into_iter()
+                .map(|(name, guardrail)| ChainMember { name, guardrail })
+                .collect(),
             applied,
         }
     }
@@ -66,16 +85,46 @@ impl GuardrailChain {
         &self.applied
     }
 
+    /// The members' configured names, in evaluation order. The snapshot
+    /// build points sort rows `created_at`-ascending (id-tiebreak) before
+    /// building, so this order is deterministic and matches the dashboard
+    /// listing (#519 B.4a).
+    pub fn member_names(&self) -> Vec<&str> {
+        self.members.iter().map(|m| m.name.as_str()).collect()
+    }
+
     pub fn empty() -> Self {
         Self::new(Vec::new())
     }
 
     pub fn len(&self) -> usize {
-        self.guardrails.len()
+        self.members.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.guardrails.is_empty()
+        self.members.is_empty()
+    }
+}
+
+/// Attribute a member's `Block` verdict to its configured name: fill
+/// `guardrail_name` and prefix the ops-log `reason`. A verdict that is
+/// already attributed (a nested chain) passes through untouched so the
+/// innermost — most specific — name wins and the reason isn't
+/// double-prefixed.
+fn attribute_block(
+    member_name: &str,
+    reason: String,
+    guardrail_name: Option<String>,
+) -> GuardrailVerdict {
+    match guardrail_name {
+        Some(_) => GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+        },
+        None => GuardrailVerdict::Block {
+            reason: format!("guardrail '{member_name}': {reason}"),
+            guardrail_name: Some(member_name.to_owned()),
+        },
     }
 }
 
@@ -86,7 +135,7 @@ impl Guardrail for GuardrailChain {
     }
 
     fn is_empty(&self) -> bool {
-        self.guardrails.is_empty()
+        self.members.is_empty()
     }
 
     /// The strictest streamed-output policy across the chain's
@@ -96,10 +145,10 @@ impl Guardrail for GuardrailChain {
     /// whole stream holds back and the full chain's `check_output` runs on
     /// the held content.
     fn stream_output_policy(&self) -> StreamOutputPolicy {
-        self.guardrails
+        self.members
             .iter()
-            .filter(|g| g.runs_on_output())
-            .map(|g| g.stream_output_policy())
+            .filter(|m| m.guardrail.runs_on_output())
+            .map(|m| m.guardrail.stream_output_policy())
             .fold(
                 StreamOutputPolicy::EndOfStreamCheck,
                 StreamOutputPolicy::stricter,
@@ -107,20 +156,18 @@ impl Guardrail for GuardrailChain {
     }
 
     fn runs_on_output(&self) -> bool {
-        self.guardrails.iter().any(|g| g.runs_on_output())
+        self.members.iter().any(|m| m.guardrail.runs_on_output())
     }
 
     async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
-        // `current` starts as a borrow; flips to Owned only if a Rewrite fires.
-        // This keeps the common (no-rewrite) path allocation-free.
-        let mut current: Cow<'_, ChatFormat> = Cow::Borrowed(req);
         let mut bypass: Option<String> = None;
-
-        for g in &self.guardrails {
-            let verdict = g.check_input(current.as_ref()).await;
-            match verdict {
+        for m in &self.members {
+            match m.guardrail.check_input(req).await {
                 GuardrailVerdict::Allow => continue,
-                GuardrailVerdict::Block { .. } => return verdict,
+                GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                } => return attribute_block(&m.name, reason, guardrail_name),
                 GuardrailVerdict::Bypass { reason } => {
                     // First bypass sticks; downstream guardrails still
                     // get to inspect the request (they may Block).
@@ -128,52 +175,28 @@ impl Guardrail for GuardrailChain {
                         bypass = Some(reason);
                     }
                 }
-                GuardrailVerdict::Rewrite { payload } => {
-                    // Substitute the rewritten payload for all remaining
-                    // guardrails. A Block from a later guardrail still wins.
-                    current = Cow::Owned(*payload);
-                }
             }
         }
-
-        match current {
-            Cow::Owned(rewritten) => {
-                // If a Bypass also fired earlier in the chain, surface it in
-                // the audit trail. The Rewrite takes precedence for routing
-                // but the bypass reason must not disappear from logs.
-                if let Some(ref reason) = bypass {
-                    tracing::info!(
-                        bypass_reason = %reason,
-                        "guardrail bypass shadowed by Rewrite verdict; bypass recorded"
-                    );
-                }
-                GuardrailVerdict::Rewrite {
-                    payload: Box::new(rewritten),
-                }
-            }
-            Cow::Borrowed(_) => match bypass {
-                Some(reason) => GuardrailVerdict::Bypass { reason },
-                None => GuardrailVerdict::Allow,
-            },
+        match bypass {
+            Some(reason) => GuardrailVerdict::Bypass { reason },
+            None => GuardrailVerdict::Allow,
         }
     }
 
     async fn check_output(&self, resp: &ChatResponse) -> GuardrailVerdict {
         let mut bypass: Option<String> = None;
-        for g in &self.guardrails {
-            let verdict = g.check_output(resp).await;
-            match verdict {
+        for m in &self.members {
+            match m.guardrail.check_output(resp).await {
                 GuardrailVerdict::Allow => continue,
-                GuardrailVerdict::Block { .. } => return verdict,
+                GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                } => return attribute_block(&m.name, reason, guardrail_name),
                 GuardrailVerdict::Bypass { reason } => {
                     if bypass.is_none() {
                         bypass = Some(reason);
                     }
                 }
-                // Rewrite on the output path is valid but rare; the chain
-                // ignores it (output rewrites would need a mutable `resp`
-                // which the trait doesn't provide). Treat as Allow.
-                GuardrailVerdict::Rewrite { .. } => {}
             }
         }
         match bypass {
@@ -186,7 +209,7 @@ impl Guardrail for GuardrailChain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{KeywordBlocklist, KeywordRule, MaxContentLength};
+    use crate::{KeywordBlocklist, KeywordRule};
     use aisix_gateway::{ChatMessage, FinishReason, UsageStats};
 
     fn req(msg: &str) -> ChatFormat {
@@ -222,7 +245,7 @@ mod tests {
             Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("beta")])),
         ]);
         let v = chain.check_input(&req("alpha and beta")).await;
-        if let GuardrailVerdict::Block { reason } = v {
+        if let GuardrailVerdict::Block { reason, .. } = v {
             assert!(reason.contains("alpha"));
         } else {
             panic!("expected Block");
@@ -231,15 +254,95 @@ mod tests {
 
     #[tokio::test]
     async fn allow_falls_through_to_next_guardrail() {
-        // First guardrail allows everything; second blocks on length.
+        // First guardrail allows everything; second blocks on its literal.
         let chain = GuardrailChain::new(vec![
             Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal(
                 "nope-not-here",
             )])),
-            Arc::new(MaxContentLength::input_only(5)),
+            Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("long")])),
         ]);
         let v = chain.check_input(&req("this is way too long")).await;
         assert!(v.is_block());
+    }
+
+    /// #519 B.4b: a chain Block carries the firing member's configured
+    /// name — both as the structured `guardrail_name` (for the wire
+    /// envelope) and as a `guardrail '<name>': ` prefix on the ops-log
+    /// reason.
+    #[tokio::test]
+    async fn block_is_attributed_to_the_firing_member_by_name() {
+        let chain = GuardrailChain::new_with_applied(
+            vec![
+                (
+                    "pass-through".to_owned(),
+                    Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal(
+                        "never-matches",
+                    )])) as Arc<dyn Guardrail>,
+                ),
+                (
+                    "block-secrets".to_owned(),
+                    Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")])),
+                ),
+            ],
+            Vec::new(),
+        );
+
+        match chain.check_input(&req("here is AKIAEXAMPLE")).await {
+            GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+            } => {
+                assert_eq!(guardrail_name.as_deref(), Some("block-secrets"));
+                assert!(
+                    reason.starts_with("guardrail 'block-secrets': "),
+                    "reason must be prefixed with the firing member's name: {reason}",
+                );
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+
+        // Output side uses the same attribution path.
+        match chain.check_output(&resp("the AKIA secret")).await {
+            GuardrailVerdict::Block { guardrail_name, .. } => {
+                assert_eq!(guardrail_name.as_deref(), Some("block-secrets"));
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    /// A nested chain's Block is already attributed; the outer chain must
+    /// pass it through (innermost name wins, no double prefix).
+    #[tokio::test]
+    async fn nested_chain_block_keeps_innermost_attribution() {
+        let inner = GuardrailChain::new_with_applied(
+            vec![(
+                "inner-rule".to_owned(),
+                Arc::new(KeywordBlocklist::new(vec![KeywordRule::literal("AKIA")]))
+                    as Arc<dyn Guardrail>,
+            )],
+            Vec::new(),
+        );
+        let outer = GuardrailChain::new_with_applied(
+            vec![(
+                "outer-chain".to_owned(),
+                Arc::new(inner) as Arc<dyn Guardrail>,
+            )],
+            Vec::new(),
+        );
+
+        match outer.check_input(&req("AKIA")).await {
+            GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+            } => {
+                assert_eq!(guardrail_name.as_deref(), Some("inner-rule"));
+                assert!(
+                    reason.starts_with("guardrail 'inner-rule': "),
+                    "no double prefix expected: {reason}",
+                );
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
     }
 
     /// Bypass doesn't short-circuit: a downstream Block must still
@@ -303,11 +406,13 @@ mod tests {
             Arc::new(KeywordBlocklist::output_only(vec![KeywordRule::literal(
                 "secret",
             )])),
-            Arc::new(MaxContentLength::output_only(2)),
+            Arc::new(KeywordBlocklist::output_only(vec![KeywordRule::literal(
+                "answer",
+            )])),
         ]);
-        // The keyword guardrail fires before length.
+        // The first keyword guardrail fires before the second.
         let v = chain.check_output(&resp("the secret answer")).await;
-        if let GuardrailVerdict::Block { reason } = v {
+        if let GuardrailVerdict::Block { reason, .. } = v {
             assert!(reason.contains("secret"));
         } else {
             panic!("expected Block");

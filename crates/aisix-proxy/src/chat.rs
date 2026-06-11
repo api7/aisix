@@ -744,16 +744,19 @@ async fn dispatch(
     // + fail_open=true) doesn't short-circuit; the reason is stashed
     // and attached to the telemetry event when the request finishes.
     let mut bypass_reason: Option<String> = None;
-    let mut rewritten_req: Option<Box<aisix_gateway::ChatFormat>> = None;
     match resolved_chain.check_input(req).await {
         GuardrailVerdict::Allow => {}
-        GuardrailVerdict::Block { reason } => {
+        GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+        } => {
             // The verdict's `reason` carries matched-pattern detail
             // (e.g. `"input blocked by literal \"forbidden-token\""`).
             // Keep it for operator logs but DO NOT propagate it to the
             // wire envelope — see #153. The redacted public message
-            // stays generic so callers can't enumerate the blocklist
-            // by inspecting error responses.
+            // carries only the firing guardrail's name (#519 B.4b) so
+            // callers can't enumerate the blocklist by inspecting
+            // error responses.
             tracing::warn!(
                 guardrail_hook = "input",
                 model = %req.model,
@@ -761,24 +764,13 @@ async fn dispatch(
                 "guardrail blocked request"
             );
             return Err(with_model(ProxyError::ContentFiltered(
-                "request blocked by content policy".into(),
+                crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
             )));
         }
         GuardrailVerdict::Bypass { reason } => {
             bypass_reason = Some(reason);
         }
-        GuardrailVerdict::Rewrite { payload } => {
-            // A guardrail rewrote the prompt (e.g. PII scrubbing).
-            // Substitute the returned payload for the original before
-            // dispatching to the upstream. Downstream guardrails in the
-            // chain already saw the rewritten form (propagated by
-            // GuardrailChain::check_input via Cow<ChatFormat>).
-            rewritten_req = Some(payload);
-        }
     }
-    // Shadow `req` with the possibly-rewritten payload. All downstream
-    // code (budget check, routing, bridge dispatch) uses this reference.
-    let req = rewritten_req.as_deref().unwrap_or(req);
 
     // Budget pre-check via cp-api. The DP no longer owns budget state;
     // cp-api returns a cached/live decision per api_key.
@@ -1313,7 +1305,10 @@ async fn dispatch(
                 // fresh upstream response, so it must run output guardrails
                 // before being returned — not bypass them.
                 match resolved_chain.check_output(&cached).await {
-                    GuardrailVerdict::Block { reason } => {
+                    GuardrailVerdict::Block {
+                        reason,
+                        guardrail_name,
+                    } => {
                         tracing::warn!(
                             guardrail_hook = "output",
                             model = %req.model,
@@ -1321,7 +1316,10 @@ async fn dispatch(
                             "guardrail blocked cached response",
                         );
                         return Err(with_model(ProxyError::ContentFiltered(
-                            "response blocked by content policy".into(),
+                            crate::error::guardrail_block_message(
+                                "response",
+                                guardrail_name.as_deref(),
+                            ),
                         )));
                     }
                     GuardrailVerdict::Bypass { reason } => {
@@ -1619,12 +1617,10 @@ async fn dispatch(
 
     match resolved_chain.check_output(&upstream).await {
         GuardrailVerdict::Allow => {}
-        GuardrailVerdict::Rewrite { .. } => {
-            // Output rewrites are not supported on the non-streaming path
-            // in P0c (check_output on GuardrailChain already coerces Rewrite
-            // to Allow internally; this arm is for future direct-check paths).
-        }
-        GuardrailVerdict::Block { reason } => {
+        GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+        } => {
             // Output filter fires AFTER the upstream call, so the
             // provider has already billed for these tokens. Surface
             // the captured upstream `UsageStats` to the handler so
@@ -1659,7 +1655,8 @@ async fn dispatch(
             // a real bypass of the output guardrail's purpose:
             // anyone who can trigger the rule can extract the model's
             // forbidden output via the error envelope. Redact on
-            // the wire and keep the rich detail in tracing for ops.
+            // the wire — naming only the guardrail that fired (#519
+            // B.4b) — and keep the rich detail in tracing for ops.
             tracing::warn!(
                 guardrail_hook = "output",
                 model = %req.model,
@@ -1669,7 +1666,10 @@ async fn dispatch(
             return Err(DispatchFailure::new(
                 Some(model_id.clone()),
                 Some(charge),
-                ProxyError::ContentFiltered("response blocked by content policy".into()),
+                ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                    "response",
+                    guardrail_name.as_deref(),
+                )),
             )
             .with_routing(routing));
         }
@@ -2579,7 +2579,7 @@ where
                                     }
                                 };
                                 match ctx.chain.check_output(&synthesized).await {
-                                    aisix_guardrails::GuardrailVerdict::Block { reason } => {
+                                    aisix_guardrails::GuardrailVerdict::Block { reason, guardrail_name } => {
                                         tracing::warn!(
                                             guardrail_hook = "output",
                                             model = %ctx.model_name,
@@ -2592,7 +2592,10 @@ where
                                             Event::default().event("error").data(
                                                 error_frame_payload(
                                                     "content_filter",
-                                                    "response blocked by content policy",
+                                                    &crate::error::guardrail_block_message(
+                                                        "response",
+                                                        guardrail_name.as_deref(),
+                                                    ),
                                                 ),
                                             ),
                                         );
@@ -2606,7 +2609,7 @@ where
                                     }
                                     _ => {}
                                 }
-                                // Clean (Allow / Bypass / Rewrite): release
+                                // Clean (Allow / Bypass): release
                                 // this window's events, then keep the
                                 // trailing overlap as scan context for the
                                 // next window (its events were already sent).
@@ -2721,7 +2724,7 @@ where
                             }
                         };
                         match ctx.chain.check_output(&synthesized).await {
-                            aisix_guardrails::GuardrailVerdict::Block { reason } => {
+                            aisix_guardrails::GuardrailVerdict::Block { reason, guardrail_name } => {
                                 tracing::warn!(
                                     guardrail_hook = "output",
                                     model = %ctx.model_name,
@@ -2733,7 +2736,10 @@ where
                                 yield Ok::<_, Infallible>(
                                     Event::default().event("error").data(error_frame_payload(
                                         "content_filter",
-                                        "response blocked by content policy",
+                                        &crate::error::guardrail_block_message(
+                                            "response",
+                                            guardrail_name.as_deref(),
+                                        ),
                                     )),
                                 );
                                 true
@@ -2777,13 +2783,13 @@ where
                     ),
                 };
                 match ctx.chain.check_output(&synthesized).await {
-                    aisix_guardrails::GuardrailVerdict::Block { reason } => {
+                    aisix_guardrails::GuardrailVerdict::Block { reason, guardrail_name } => {
                         // Mirror the non-streaming path's #153
                         // redaction contract: the wire-level message
-                        // is generic ("response blocked by content
-                        // policy"), and the rich verdict reason
-                        // (which carries the matched-pattern detail)
-                        // goes to operator logs only.
+                        // names only the guardrail that fired (#519
+                        // B.4b), and the rich verdict reason (which
+                        // carries the matched-pattern detail) goes to
+                        // operator logs only.
                         tracing::warn!(
                             guardrail_hook = "output",
                             model = %ctx.model_name,
@@ -2797,7 +2803,10 @@ where
                                 .event("error")
                                 .data(error_frame_payload(
                                     "content_filter",
-                                    "response blocked by content policy",
+                                    &crate::error::guardrail_block_message(
+                                        "response",
+                                        guardrail_name.as_deref(),
+                                    ),
                                 )),
                         );
                     }
@@ -2817,12 +2826,6 @@ where
                         }
                     }
                     aisix_guardrails::GuardrailVerdict::Allow => {}
-                    aisix_guardrails::GuardrailVerdict::Rewrite { .. } => {
-                        // Output rewrites on the streaming path are not
-                        // supported in P0c — GuardrailChain::check_output
-                        // already coerces Rewrite to Allow internally;
-                        // this arm handles future direct-check paths.
-                    }
                 }
             }
         }

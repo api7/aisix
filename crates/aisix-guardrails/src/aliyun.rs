@@ -140,12 +140,10 @@ impl AliyunTextModerationGuardrail {
         match self.call(service, &content, session_id).await {
             Ok(level) => {
                 if risk_rank(&level) >= self.threshold_rank {
-                    GuardrailVerdict::Block {
-                        reason: format!(
-                            "aliyun text moderation: risk level {} >= threshold (row: {})",
-                            level, self.row_name
-                        ),
-                    }
+                    GuardrailVerdict::block(format!(
+                        "aliyun text moderation: risk level {} >= threshold (row: {})",
+                        level, self.row_name
+                    ))
                 } else {
                     GuardrailVerdict::Allow
                 }
@@ -285,9 +283,7 @@ impl AliyunTextModerationGuardrail {
         if fail_open {
             GuardrailVerdict::Bypass { reason: tag.into() }
         } else {
-            GuardrailVerdict::Block {
-                reason: format!("aliyun text moderation unavailable ({tag})"),
-            }
+            GuardrailVerdict::block(format!("aliyun text moderation unavailable ({tag})"))
         }
     }
 }

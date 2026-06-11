@@ -1972,8 +1972,8 @@ data: [DONE]\n\n";
             "guardrail leaked the matched literal in the error envelope; got {error_message:?}"
         );
         assert_eq!(
-            error_message, "response blocked by content policy",
-            "wire-level message must use the redacted static string per #153"
+            error_message, "response blocked by content policy (guardrail 'stream-output-guard')",
+            "wire-level message stays redacted per #153 but names the guardrail per #519 B.4b"
         );
     }
 
@@ -4234,12 +4234,17 @@ data: [DONE]\n\n";
         // (the literal value of the forbidden pattern showing up
         // in the caller-visible message). Redaction keeps the
         // matched literal in operator logs (`tracing`) only.
+        // Per #519 B.4b the message DOES name the guardrail that
+        // fired — operator-assigned metadata, not matched content.
         let message = v["error"]["message"].as_str().unwrap();
         assert!(
             !message.contains("forbidden-token"),
             "wire-level error.message must not leak the matched literal; got {message:?}"
         );
-        assert_eq!(message, "request blocked by content policy");
+        assert_eq!(
+            message,
+            "request blocked by content policy (guardrail 'input-guard')"
+        );
     }
 
     /// Regression: a guardrail-blocked request must record the resolved
@@ -4369,7 +4374,11 @@ data: [DONE]\n\n";
             !blob.contains("secret-string"),
             "output guardrail leaked the matched literal in the envelope; got {blob}"
         );
-        assert_eq!(message, "response blocked by content policy");
+        // #519 B.4b: the redacted message names the guardrail that fired.
+        assert_eq!(
+            message,
+            "response blocked by content policy (guardrail 'output-guard')"
+        );
     }
 
     /// Regression for #226: when an output-content-filter blocks a

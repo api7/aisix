@@ -115,12 +115,10 @@ impl PromptShieldGuardrail {
         for chunk in chunk_text(text, MAX_PROMPT_CHARS) {
             match self.call_api(&chunk).await {
                 Ok(true) => {
-                    return GuardrailVerdict::Block {
-                        reason: format!(
-                            "azure content safety prompt shield detected attack (row: {})",
-                            self.row_name
-                        ),
-                    };
+                    return GuardrailVerdict::block(format!(
+                        "azure content safety prompt shield detected attack (row: {})",
+                        self.row_name
+                    ));
                 }
                 Ok(false) => {} // clean — continue to next chunk
                 Err(failure) => return self.handle_failure(failure),
@@ -196,9 +194,7 @@ impl PromptShieldGuardrail {
         if self.fail_open {
             GuardrailVerdict::Bypass { reason: tag.into() }
         } else {
-            GuardrailVerdict::Block {
-                reason: format!("azure content safety unavailable ({tag})"),
-            }
+            GuardrailVerdict::block(format!("azure content safety unavailable ({tag})"))
         }
     }
 }

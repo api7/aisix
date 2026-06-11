@@ -396,8 +396,10 @@ async fn dispatch(
     *applied_out = resolved_chain.applied().to_vec();
     if !resolved_chain.is_empty() {
         if let Ok(chat) = aisix_provider_anthropic::parse_inbound_request(body) {
-            if let aisix_guardrails::GuardrailVerdict::Block { reason } =
-                aisix_guardrails::Guardrail::check_input(resolved_chain.as_ref(), &chat).await
+            if let aisix_guardrails::GuardrailVerdict::Block {
+                reason,
+                guardrail_name,
+            } = aisix_guardrails::Guardrail::check_input(resolved_chain.as_ref(), &chat).await
             {
                 tracing::warn!(
                     guardrail_hook = "input",
@@ -405,10 +407,13 @@ async fn dispatch(
                     reason = %reason,
                     "guardrail blocked /v1/messages request",
                 );
-                return Err(ProxyError::ContentFiltered(
-                    "request blocked by content policy".into(),
-                )
-                .into());
+                return Err(
+                    ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                        "request",
+                        guardrail_name.as_deref(),
+                    ))
+                    .into(),
+                );
             }
         }
     }
@@ -1012,7 +1017,10 @@ async fn anthropic_passthrough_dispatch(
                     finish_reason: aisix_gateway::FinishReason::Stop,
                     usage: aisix_gateway::UsageStats::new(0, 0),
                 };
-                if let aisix_guardrails::GuardrailVerdict::Block { reason } =
+                if let aisix_guardrails::GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                } =
                     aisix_guardrails::Guardrail::check_output(resolved_chain.as_ref(), &synth).await
                 {
                     tracing::warn!(
@@ -1022,7 +1030,10 @@ async fn anthropic_passthrough_dispatch(
                         "guardrail blocked /v1/messages passthrough response",
                     );
                     return Err(ProxyError::ContentFiltered(
-                        "response blocked by content policy".into(),
+                        crate::error::guardrail_block_message(
+                            "response",
+                            guardrail_name.as_deref(),
+                        ),
                     ));
                 }
             }
@@ -1402,8 +1413,10 @@ async fn cross_provider_dispatch(
     // before rendering it back as Anthropic JSON — the response is
     // client-visible output just like /v1/chat/completions.
     if !resolved_chain.is_empty() {
-        if let aisix_guardrails::GuardrailVerdict::Block { reason } =
-            aisix_guardrails::Guardrail::check_output(resolved_chain.as_ref(), &resp).await
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+        } = aisix_guardrails::Guardrail::check_output(resolved_chain.as_ref(), &resp).await
         {
             tracing::warn!(
                 guardrail_hook = "output",
@@ -1412,7 +1425,7 @@ async fn cross_provider_dispatch(
                 "guardrail blocked /v1/messages response",
             );
             return Err(ProxyError::ContentFiltered(
-                "response blocked by content policy".into(),
+                crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
             ));
         }
     }
@@ -1578,8 +1591,10 @@ fn build_anthropic_sse_stream(
                     finish_reason: aisix_gateway::FinishReason::Stop,
                     usage: aisix_gateway::UsageStats::new(0, 0),
                 };
-                if let aisix_guardrails::GuardrailVerdict::Block { reason } =
-                    aisix_guardrails::Guardrail::check_output(chain.as_ref(), &synth).await
+                if let aisix_guardrails::GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                } = aisix_guardrails::Guardrail::check_output(chain.as_ref(), &synth).await
                 {
                     tracing::warn!(
                         guardrail_hook = "output",
@@ -1587,7 +1602,7 @@ fn build_anthropic_sse_stream(
                         reason = %reason,
                         "guardrail blocked streaming /v1/messages response",
                     );
-                    let frame = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"content_filter\",\"message\":\"response blocked by content policy\"}}\n\n";
+                    let frame = guardrail_block_frame(guardrail_name.as_deref());
                     yield Ok(bytes::Bytes::from(frame));
                     return;
                 }
@@ -1600,6 +1615,23 @@ fn build_anthropic_sse_stream(
         }
     };
     axum::body::Body::from_stream(stream)
+}
+
+/// Anthropic-shape SSE error frame for a streaming guardrail block. Built
+/// with serde_json so an operator-supplied guardrail name is JSON-escaped
+/// correctly; the message carries the firing guardrail's name (#519 B.4b)
+/// but never the matched-pattern detail (#153).
+fn guardrail_block_frame(guardrail_name: Option<&str>) -> String {
+    format!(
+        "event: error\ndata: {}\n\n",
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "content_filter",
+                "message": crate::error::guardrail_block_message("response", guardrail_name),
+            }
+        })
+    )
 }
 
 fn finish_reason_label(reason: &aisix_gateway::FinishReason) -> String {
@@ -2189,8 +2221,10 @@ where
                     finish_reason: aisix_gateway::FinishReason::Stop,
                     usage: aisix_gateway::UsageStats::new(0, 0),
                 };
-                if let aisix_guardrails::GuardrailVerdict::Block { reason } =
-                    aisix_guardrails::Guardrail::check_output(chain.as_ref(), &synth).await
+                if let aisix_guardrails::GuardrailVerdict::Block {
+                    reason,
+                    guardrail_name,
+                } = aisix_guardrails::Guardrail::check_output(chain.as_ref(), &synth).await
                 {
                     tracing::warn!(
                         guardrail_hook = "output",
@@ -2198,7 +2232,7 @@ where
                         reason = %reason,
                         "guardrail blocked streaming /v1/messages passthrough response",
                     );
-                    let frame = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"content_filter\",\"message\":\"response blocked by content policy\"}}\n\n";
+                    let frame = guardrail_block_frame(guardrail_name.as_deref());
                     yield Ok(Bytes::from(frame));
                 }
             }

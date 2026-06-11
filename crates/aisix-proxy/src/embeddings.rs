@@ -265,11 +265,13 @@ async fn dispatch(
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
     if !resolved_chain.is_empty() {
         let chat = embeddings_input_to_chat(&body.model, &body.input);
-        if let aisix_guardrails::GuardrailVerdict::Block { reason } =
-            aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+        } = aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
         {
             // Per #153 keep the matched-pattern detail in ops logs only; the
-            // wire envelope stays generic.
+            // wire envelope names only the guardrail that fired (#519 B.4b).
             tracing::warn!(
                 guardrail_hook = "input",
                 model = %body.model,
@@ -277,7 +279,7 @@ async fn dispatch(
                 "guardrail blocked /v1/embeddings request",
             );
             return Err(ProxyError::ContentFiltered(
-                "request blocked by content policy".into(),
+                crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
             ));
         }
     }

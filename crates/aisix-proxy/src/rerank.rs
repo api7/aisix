@@ -197,8 +197,10 @@ async fn dispatch(
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
     if !resolved_chain.is_empty() {
         let chat = rerank_input_to_chat(&model_name, &*body);
-        if let aisix_guardrails::GuardrailVerdict::Block { reason } =
-            aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+        } = aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
         {
             // Per #153 the matched-pattern detail stays in ops logs only.
             tracing::warn!(
@@ -208,7 +210,7 @@ async fn dispatch(
                 "guardrail blocked /v1/rerank request",
             );
             return Err(ProxyError::ContentFiltered(
-                "request blocked by content policy".into(),
+                crate::error::guardrail_block_message("request", guardrail_name.as_deref()),
             ));
         }
     }
