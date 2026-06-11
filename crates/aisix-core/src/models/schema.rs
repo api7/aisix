@@ -415,7 +415,7 @@ fn guardrail_schema() -> Value {
             "enabled":    { "type": "boolean" },
             "hook_point": { "enum": ["input", "output", "both"] },
             "fail_open":  { "type": "boolean" },
-            "created_at": { "type": "string" },
+            "created_at": { "type": "string", "format": "date-time" },
             "kind":       { "enum": ["keyword", "bedrock", "azure_content_safety", "azure_content_safety_text_moderation", "aliyun_text_moderation"] }
         },
         "oneOf": [
