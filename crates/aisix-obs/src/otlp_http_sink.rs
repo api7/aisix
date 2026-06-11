@@ -19,14 +19,25 @@
 //!    OpenTelemetry's GenAI semantic conventions
 //!    (<https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md>).
 //!
+//! ## Per-exporter knobs (#519 B.2)
+//!
+//! - **`sample_rate`** — fraction of requests exported, decided per REQUEST
+//!   from a deterministic FNV-1a hash of `request_id` (absent = 1.0). The
+//!   decision happens at fan-out time, before any pipeline work, so a
+//!   dropped request enqueues nothing for that exporter; and because every
+//!   attempt span of one request shares the `request_id`, a trace is
+//!   exported whole or not at all — consistently across retries/fallbacks.
+//! - **`content_mode` / `content_max_bytes`** — same opt-in content capture
+//!   the SLS / Datadog sinks use ([`content_record`]); under `full` the span
+//!   carries `aisix.prompt` / `aisix.response` (plus
+//!   `aisix.content_truncated` when cut). Defaults to `metadata_only`, where
+//!   the record never carries content fields, so it cannot leak.
+//!
 //! ## What's intentionally NOT here yet
 //!
 //! - **No gRPC** — `otlp_grpc` is a separate kind we'll add when a user
 //!   actually asks for it; the JSON-over-HTTP form works against every
 //!   receiver in the wild and avoids pulling in tonic on the hot path.
-//! - **No content_mode redaction** — defaults to `metadata_only` (no
-//!   prompt/response bodies in the span). The record never carries content
-//!   fields, so it cannot leak.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -116,10 +127,10 @@ impl OtlpHttpFanOut {
     ///
     /// `content` is the request's captured prompt/response, or `None` when the
     /// handler captured none (the default). It is attached ONLY to an
-    /// `aliyun_sls` or `datadog` exporter whose `content_mode = full`; every
-    /// other exporter — and the CP telemetry path, which is not in this loop —
-    /// receives the shared metadata-only record, so prompt/response can never
-    /// leak there.
+    /// `aliyun_sls`, `datadog`, or `otlp_http` exporter whose
+    /// `content_mode = full`; every other exporter — and the CP telemetry
+    /// path, which is not in this loop — receives the shared metadata-only
+    /// record, so prompt/response can never leak there.
     pub fn fan_out<'a, I>(
         &self,
         event: &UsageEvent,
@@ -145,6 +156,15 @@ impl OtlpHttpFanOut {
             let client = self.inner.client.clone();
             let handle = match &exp.kind {
                 ExporterKind::OtlpHttp(cfg) => {
+                    // Per-request sampling (#519 B.2), decided here — before
+                    // any pipeline work — so an unsampled request enqueues
+                    // nothing for THIS exporter (other exporters in the loop
+                    // still see the event). Deterministic on `request_id`, so
+                    // every attempt span of one request drops or ships
+                    // together.
+                    if !otlp_should_sample(cfg.sample_rate, &event.request_id) {
+                        continue;
+                    }
                     let fingerprint = fingerprint_otlp(cfg);
                     let name = exp.name.clone();
                     let endpoint = cfg.endpoint.clone();
@@ -264,15 +284,57 @@ impl Default for OtlpHttpFanOut {
     }
 }
 
-/// Hash an `otlp_http` exporter's delivery-relevant config. A change to
-/// endpoint or headers yields a new fingerprint, so the manager rebuilds the
-/// exporter's pipeline against the edited target.
+/// Hash an `otlp_http` exporter's delivery-relevant config. A change to any
+/// field — endpoint, headers, or the #519 B.2 knobs (sample_rate / content
+/// config) — yields a new fingerprint, so the manager rebuilds the exporter's
+/// pipeline against the edited config. `sample_rate` hashes by bit pattern
+/// (`f64` has no `Hash`); the schema bounds it to finite 0.0–1.0, where bit
+/// equality is value equality.
 fn fingerprint_otlp(cfg: &OtlpHttpConfig) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     cfg.endpoint.hash(&mut hasher);
     cfg.headers.hash(&mut hasher);
+    cfg.sample_rate.map(f64::to_bits).hash(&mut hasher);
+    cfg.content_mode.hash(&mut hasher);
+    cfg.content_max_bytes.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Granularity of the sampling decision: rates are compared at 1/10_000
+/// (0.01%) resolution, plenty for an operator-facing percentage knob.
+const SAMPLE_PRECISION: u64 = 10_000;
+
+/// Per-request sampling decision for an `otlp_http` exporter. `rate` is the
+/// exporter's `sample_rate` (`None` = 1.0, the pre-knob default).
+///
+/// Deterministic — no clock, no RNG: the request's `request_id` is hashed
+/// (FNV-1a 64, stable across processes and versions) into a bucket in
+/// `0..SAMPLE_PRECISION`, and the request is sampled when the bucket falls
+/// below `rate × SAMPLE_PRECISION`. Same id → same decision, so the
+/// per-attempt events of one request (#655, which share `request_id`) are
+/// exported all-or-nothing, and every DP replica samples the same set.
+fn otlp_should_sample(rate: Option<f64>, request_id: &str) -> bool {
+    let rate = rate.unwrap_or(1.0);
+    if rate >= 1.0 {
+        return true;
+    }
+    if rate <= 0.0 {
+        return false;
+    }
+    let threshold = (rate * SAMPLE_PRECISION as f64).round() as u64;
+    fnv1a_64(request_id.as_bytes()) % SAMPLE_PRECISION < threshold
+}
+
+/// FNV-1a 64-bit — implemented inline (a fold over two constants) so the
+/// sampling hash is under our control and documented, rather than tied to
+/// `DefaultHasher`'s unspecified algorithm or a `rand` dependency.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    bytes.iter().fold(OFFSET_BASIS, |hash, b| {
+        (hash ^ u64::from(*b)).wrapping_mul(PRIME)
+    })
 }
 
 /// Hash an `aliyun_sls` exporter's delivery-relevant config. The fingerprint
@@ -293,12 +355,12 @@ fn fingerprint_sls(cfg: &AliyunSlsConfig) -> u64 {
 /// The content-bearing [`SinkRecord`] for one exporter, or `None` to fall back
 /// to the shared metadata-only record.
 ///
-/// Content is attached ONLY to an `aliyun_sls` OR `datadog` exporter whose
-/// `content_mode = full`, and ONLY when the handler captured content — every
-/// other exporter (and the CP telemetry path, which never enters the fan-out)
-/// gets metadata only. The captured prompt/response are truncated to the
-/// exporter's `content_max_bytes`, ORing in any truncation the handler already
-/// applied at capture time.
+/// Content is attached ONLY to an `aliyun_sls`, `datadog`, OR `otlp_http`
+/// exporter whose `content_mode = full`, and ONLY when the handler captured
+/// content — every other exporter (and the CP telemetry path, which never
+/// enters the fan-out) gets metadata only. The captured prompt/response are
+/// truncated to the exporter's `content_max_bytes`, ORing in any truncation
+/// the handler already applied at capture time.
 fn content_record(
     kind: &ExporterKind,
     event: &UsageEvent,
@@ -310,6 +372,7 @@ fn content_record(
     let (mode, max_bytes) = match kind {
         ExporterKind::AliyunSls(cfg) => (cfg.content_mode, cfg.content_max_bytes),
         ExporterKind::Datadog(cfg) => (cfg.content_mode, cfg.content_max_bytes),
+        ExporterKind::OtlpHttp(cfg) => (cfg.content_mode, cfg.content_max_bytes),
         _ => return None,
     };
     if mode != SlsContentMode::Full {
@@ -342,6 +405,9 @@ pub fn content_capture_cap<'a>(
                 Some(cfg.content_max_bytes)
             }
             ExporterKind::Datadog(cfg) if cfg.content_mode == SlsContentMode::Full => {
+                Some(cfg.content_max_bytes)
+            }
+            ExporterKind::OtlpHttp(cfg) if cfg.content_mode == SlsContentMode::Full => {
                 Some(cfg.content_max_bytes)
             }
             _ => None,
@@ -443,7 +509,7 @@ impl ObservabilitySink for OtlpSink {
         let spans: Vec<Value> = batch
             .records
             .iter()
-            .map(|record| build_otlp_span(&record.usage, &self.name))
+            .map(|record| build_otlp_span(record, &self.name))
             .collect();
         let body = otlp_export_request(spans);
         let bytes = serde_json::to_vec(&body)
@@ -498,7 +564,7 @@ impl ObservabilitySink for OtlpSink {
     }
 }
 
-/// Build the single OTLP span object for one usage event. Attribute names
+/// Build the single OTLP span object for one sink record. Attribute names
 /// match the OpenTelemetry GenAI semantic conventions:
 /// <https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md>.
 ///
@@ -507,7 +573,16 @@ impl ObservabilitySink for OtlpSink {
 ///   `{"intValue": "..."}` (string-encoded int per OTLP/JSON spec).
 /// - Trace ID + span ID are random 16-byte / 8-byte hex values.
 /// - Timestamps are nanos-since-epoch, OTLP's required unit.
-fn build_otlp_span(event: &UsageEvent, exporter_name: &str) -> Value {
+///
+/// When the record carries captured content (this exporter's
+/// `content_mode = full`, see [`content_record`]) the span additionally
+/// carries `aisix.prompt` / `aisix.response` — the same prompt / assembled
+/// response the SLS path ships as log fields — plus
+/// `aisix.content_truncated` when either field was cut to the exporter's
+/// `content_max_bytes`. Metadata-only records never reach this branch with
+/// content, so the default span shape is unchanged.
+fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
+    let event = &record.usage;
     let trace_id = random_trace_id();
     let span_id = random_span_id();
 

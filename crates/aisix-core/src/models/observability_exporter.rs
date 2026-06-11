@@ -43,7 +43,12 @@ use crate::resource::Resource;
 /// `tag = "kind"` puts the variant tag inline with the inner struct's
 /// fields — same shape as `GuardrailKind` so the kine wire stays
 /// consistent across resource types.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+///
+/// `PartialEq` (not `Eq`) because [`OtlpHttpConfig::sample_rate`] is an
+/// `f64`, whose NaN semantics make a derived `Eq` unsound (same precedent
+/// as `ProviderKey`). Tests compare via `assert_eq!`, which only needs
+/// `PartialEq`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExporterKind {
     OtlpHttp(OtlpHttpConfig),
@@ -52,7 +57,8 @@ pub enum ExporterKind {
     Datadog(DatadogConfig),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+/// `PartialEq` (not `Eq`): `sample_rate` is an `f64` — see [`ExporterKind`].
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct OtlpHttpConfig {
     /// Full URL of the OTLP/HTTP traces endpoint. Must already include
@@ -67,6 +73,48 @@ pub struct OtlpHttpConfig {
     /// `provider_keys`. Field-level encryption arrives in Phase 2.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+
+    /// Fraction of requests whose spans are exported, `0.0`–`1.0`.
+    /// Absent = `1.0` (export everything — the pre-knob behaviour).
+    /// The decision is per REQUEST, made deterministically from the
+    /// `request_id` hash, so every attempt span of one request (initial /
+    /// retries / fallbacks, which share the id) samples consistently —
+    /// a trace is exported whole or not at all. Bounds are enforced by
+    /// the loader's JSON-schema validation
+    /// (`schema::validate_observability_exporter`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub sample_rate: Option<f64>,
+
+    /// Whether captured request/response content is delivered on this
+    /// exporter's spans. `metadata_only` (default) ships only operational
+    /// metadata — never a prompt or response. `full` additionally attaches
+    /// the request prompt and the assembled response as span attributes
+    /// (`aisix.prompt` / `aisix.response`), each truncated to
+    /// [`content_max_bytes`]. Enabling `full` writes end-user prompt /
+    /// response text into the customer's tracing backend, so the dashboard
+    /// must surface the privacy implication when an operator turns it on.
+    /// Reuses [`SlsContentMode`] — the codebase's existing
+    /// `metadata_only | full` model — so the shared content-capture
+    /// plumbing (`content_record` / `content_capture_cap`) stays
+    /// single-sourced.
+    ///
+    /// [`content_max_bytes`]: OtlpHttpConfig::content_max_bytes
+    #[serde(default)]
+    pub content_mode: SlsContentMode,
+
+    /// Per-field byte cap for captured content under `content_mode = full`.
+    /// The prompt and the response are each truncated to this many bytes
+    /// (UTF-8-boundary safe), and the span carries a
+    /// `aisix.content_truncated` attribute when either was cut. Ignored
+    /// under `metadata_only`. Defaults to 128 KiB.
+    ///
+    /// `0` is rejected — `full` with a zero cap captures nothing, which is a
+    /// misconfiguration. The `range(min = 1)` keeps the generated JSON schema
+    /// in step with the runtime validator so the CP and DP agree on the floor.
+    #[serde(default = "default_content_max_bytes")]
+    #[schemars(range(min = 1))]
+    pub content_max_bytes: u32,
 }
 
 /// Aliyun SLS (Simple Log Service) PutLogs target. Unlike `otlp_http`,
@@ -126,9 +174,10 @@ pub struct AliyunSlsConfig {
     pub content_max_bytes: u32,
 }
 
-/// Content-capture mode for an SLS / Datadog exporter. Defaults to the
-/// privacy-preserving `metadata_only`. (`Hash` so a Datadog exporter's
-/// fingerprint can cover its content config; see `fingerprint_datadog`.)
+/// Content-capture mode for an SLS / Datadog / OTLP exporter. Defaults to
+/// the privacy-preserving `metadata_only`. (`Hash` so an exporter's
+/// fingerprint can cover its content config; see `fingerprint_datadog` /
+/// `fingerprint_otlp`.)
 #[derive(
     Debug, Clone, Copy, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Hash,
 )]
@@ -338,7 +387,10 @@ pub enum ObjectStoreAuthMode {
 /// field. Strict typo rejection happens at the JSON Schema layer
 /// (`schema::validate_observability_exporter`) which the etcd loader
 /// runs before the serde deserialize.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+///
+/// `PartialEq` (not `Eq`): the flattened [`ExporterKind`] carries an `f64`
+/// (`OtlpHttpConfig::sample_rate`) — see [`ExporterKind`].
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct ObservabilityExporter {
     /// Operator-facing label, surfaced in /logs and the dashboard list.
     /// Not used for routing — the etcd-key uuid is the identity.
@@ -429,6 +481,53 @@ mod tests {
             ExporterKind::OtlpHttp(c) => assert!(c.headers.is_empty()),
             other => panic!("expected otlp_http, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn otlp_http_defaults_pin_pre_knob_behaviour() {
+        // A CP payload carrying only endpoint+headers (the current kine
+        // projection) must parse unchanged: no sampling (rate absent =
+        // 1.0) and metadata-only content — the exact pre-knob behaviour.
+        let e: ObservabilityExporter = serde_json::from_str(VALID_OTLP).unwrap();
+        match &e.kind {
+            ExporterKind::OtlpHttp(c) => {
+                assert_eq!(c.sample_rate, None);
+                assert_eq!(c.content_mode, SlsContentMode::MetadataOnly);
+                assert_eq!(c.content_max_bytes, 128 * 1024);
+            }
+            other => panic!("expected otlp_http, got {other:?}"),
+        }
+        // Absent knobs stay off the wire on re-serialize, so a round-trip
+        // through the DP cannot change what the CP wrote.
+        let v = serde_json::to_value(&e).unwrap();
+        assert!(v.get("sample_rate").is_none());
+    }
+
+    #[test]
+    fn otlp_http_opts_into_sampling_and_full_content_capture() {
+        let json = r#"{
+            "name": "otlp-knobs",
+            "kind": "otlp_http",
+            "endpoint": "https://api.honeycomb.io/v1/traces",
+            "sample_rate": 0.25,
+            "content_mode": "full",
+            "content_max_bytes": 4096
+        }"#;
+        let e: ObservabilityExporter = serde_json::from_str(json).unwrap();
+        match &e.kind {
+            ExporterKind::OtlpHttp(c) => {
+                assert_eq!(c.sample_rate, Some(0.25));
+                assert_eq!(c.content_mode, SlsContentMode::Full);
+                assert_eq!(c.content_max_bytes, 4096);
+            }
+            other => panic!("expected otlp_http, got {other:?}"),
+        }
+        // Round-trips flat with the knobs present.
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], "otlp_http");
+        assert_eq!(v["sample_rate"], 0.25);
+        assert_eq!(v["content_mode"], "full");
+        assert_eq!(v["content_max_bytes"], 4096);
     }
 
     #[test]

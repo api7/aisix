@@ -621,14 +621,20 @@ fn observability_exporter_schema() -> Value {
             "project":        { "type": "string", "minLength": 1 },
             "logstore":       { "type": "string", "minLength": 1 },
             "credential_ref": { "type": "string", "minLength": 1 },
-            // Content capture (opt-in), shared by aliyun_sls + datadog. `full`
-            // writes captured prompt / response to the sink; `content_max_bytes`
-            // truncates each FIELD. It is not a per-log bound — a datadog log
-            // carries both prompt and response, so byte-aware splitting to
-            // Datadog's 1 MB-per-log / 5 MB-per-request intake limits is tracked
-            // separately (api7/ai-gateway#556), not enforced by this cap.
+            // Content capture (opt-in), shared by aliyun_sls + datadog +
+            // otlp_http. `full` writes captured prompt / response to the sink;
+            // `content_max_bytes` truncates each FIELD. It is not a per-log
+            // bound — a datadog log carries both prompt and response, so
+            // byte-aware splitting to Datadog's 1 MB-per-log / 5 MB-per-request
+            // intake limits is tracked separately (api7/ai-gateway#556), not
+            // enforced by this cap.
             "content_mode":      { "type": "string", "enum": ["metadata_only", "full"] },
             "content_max_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+            // otlp_http per-request sampling (#519 B.2). Absent = 1.0 (export
+            // everything). serde's `deny_unknown_fields` keeps it off the
+            // other kinds; this is the bounds check the loader runs before
+            // deserialize, so an out-of-range rate never reaches the sink.
+            "sample_rate": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
             // object_store fields (S3 / GCS / Azure Blob, one variant). Cloud
             // credentials are NEVER here — only the shared `credential_ref`.
             "provider":    { "type": "string", "enum": ["s3", "gcs", "azure_blob"] },
@@ -1461,6 +1467,38 @@ mod tests {
             "endpoint": "http://api.honeycomb.io/v1/traces"
         });
         assert!(validate_observability_exporter(&v).is_err());
+    }
+
+    #[test]
+    fn exporter_otlp_http_accepts_in_range_knobs() {
+        // #519 B.2: sampling + content capture are real per-exporter knobs.
+        for rate in [0.0, 0.5, 1.0] {
+            let v = json!({
+                "name": "otlp-knobs",
+                "kind": "otlp_http",
+                "endpoint": "https://api.honeycomb.io/v1/traces",
+                "sample_rate": rate,
+                "content_mode": "full",
+                "content_max_bytes": 4096
+            });
+            validate_observability_exporter(&v).unwrap();
+        }
+    }
+
+    #[test]
+    fn exporter_otlp_http_rejects_out_of_range_sample_rate() {
+        for rate in [-0.1, 1.1, 2.0] {
+            let v = json!({
+                "name": "x",
+                "kind": "otlp_http",
+                "endpoint": "https://api.honeycomb.io/v1/traces",
+                "sample_rate": rate
+            });
+            assert!(
+                validate_observability_exporter(&v).is_err(),
+                "sample_rate {rate} must be rejected"
+            );
+        }
     }
 
     #[test]
