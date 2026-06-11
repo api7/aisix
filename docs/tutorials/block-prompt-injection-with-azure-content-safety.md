@@ -107,7 +107,7 @@ Expected: `HTTP/1.1 422 Unprocessable Entity` with this body:
 ```json
 {
   "error": {
-    "message": "request blocked by content policy",
+    "message": "request blocked by content policy (guardrail 'prompt-shield')",
     "type": "content_filter"
   }
 }

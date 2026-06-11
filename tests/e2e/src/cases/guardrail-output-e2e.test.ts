@@ -200,6 +200,9 @@ describe("output guardrail e2e: model-emitted forbidden text is blocked before r
     const messageBlob = caught.message ?? "";
     expect(errorBlob).not.toContain(FORBIDDEN_WORD);
     expect(messageBlob).not.toContain(FORBIDDEN_WORD);
+    // #519 B.4b: the redacted message DOES name which guardrail fired
+    // (operator-assigned metadata, not matched content).
+    expect(errorBlob).toContain("guardrail 'gr-out-e2e-keyword'");
 
     // Output guardrails run AFTER the upstream call, so the upstream
     // hit count MUST go up by 1 (the guardrail can only inspect what
@@ -294,7 +297,10 @@ describe("output guardrail e2e: model-emitted forbidden text is blocked before r
       error?: { type?: unknown; message?: unknown };
     };
     expect(parsed.error?.type).toBe("content_filter");
-    expect(parsed.error?.message).toBe("response blocked by content policy");
+    // #519 B.4b: the redacted message names WHICH guardrail fired.
+    expect(parsed.error?.message).toBe(
+      "response blocked by content policy (guardrail 'gr-out-e2e-keyword')",
+    );
 
     // Per #153 (mirrored to streaming): the matched literal MUST NOT
     // appear in the error envelope. (The pre-emitted `data: ...`

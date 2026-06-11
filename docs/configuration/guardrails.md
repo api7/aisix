@@ -259,7 +259,7 @@ Expected result: the request is blocked before it reaches the upstream.
 The response body carries the OpenAI-shaped error envelope with the content-filter type:
 
 ```json title="Expected 422 body"
-{ "error": { "type": "content_filter", "message": "request blocked by content policy" } }
+{ "error": { "type": "content_filter", "message": "request blocked by content policy (guardrail 'block-secrets')" } }
 ```
 
 A benign prompt to the same model returns `200`. Propagation from the admin API to the running data plane is not instant; if the guardrail does not block immediately after creation, retry for a few seconds.

@@ -158,6 +158,14 @@ describe("guardrail e2e: keyword block returns 422 and skips upstream", () => {
     expect(errorBlob).not.toContain(FORBIDDEN_WORD);
     expect(messageBlob).not.toContain(FORBIDDEN_WORD);
 
+    // #519 B.4b: while the matched literal stays redacted, the envelope
+    // message MUST name WHICH guardrail fired — the name is operator-
+    // assigned metadata (safe to surface), and callers need it to know
+    // which policy rejected them.
+    expect((caught.error as { message?: string })?.message).toContain(
+      "guardrail 'gr-e2e-keyword'",
+    );
+
     // Critical: a blocked request must never reach the upstream. If
     // the count moved, the guardrail short-circuit failed and the
     // model would have processed the forbidden content.
