@@ -2,9 +2,12 @@
 //!
 //! Public admin-listener endpoints:
 //! - `GET  /livez`
-//! - `GET  /metrics`
 //! - `GET  /admin/openapi.json`
 //! - `GET  /admin/openapi-scalar`
+//!
+//! Prometheus metrics are NOT served here — the scrape endpoint always
+//! lives on the dedicated metrics listener (see [`metrics_router`]),
+//! identical in standalone and managed mode.
 //!
 //! Admin-key protected routes:
 //! - `GET|POST            /admin/v1/models`
@@ -66,9 +69,9 @@ pub fn build_router(state: AdminState) -> Router {
     // subsequent handler call is a free lookup.
     let _ = openapi::merged_openapi();
 
-    let mut router = Router::new()
+    let router = Router::new()
         .route("/livez", get(livez))
-        // OpenAPI scalar UI is unauthenticated like /metrics — admin
+        // OpenAPI scalar UI is unauthenticated like /livez — admin
         // listener is private in production.
         .route("/admin/openapi.json", get(openapi::openapi_json))
         .route("/admin/openapi-scalar", get(openapi::openapi_scalar))
@@ -154,41 +157,32 @@ pub fn build_router(state: AdminState) -> Router {
             post(playground_handler::playground_chat_completions),
         );
 
-    if state.prometheus.enabled {
-        router = router.route(
-            &normalized_prometheus_path(&state.prometheus.path),
-            get(metrics_handler),
-        );
-    }
-
     router.with_state(state)
 }
 
-/// Build a minimal router for a **dedicated** Prometheus metrics
-/// listener — only the scrape endpoint at `prometheus.path`, backed by
-/// the shared [`Metrics`] handle. No admin state, no auth-protected
-/// routes, no playground.
+/// Build the router for the **dedicated** Prometheus metrics listener —
+/// only the scrape endpoint at `prometheus.path`, backed by the shared
+/// [`Metrics`] handle. No admin state, no auth-protected routes, no
+/// playground.
 ///
 /// `aisix-server` binds this on `observability.metrics.prometheus.addr`
-/// when that address is set. It exists because managed-mode DPs never
-/// bind the admin listener that normally hosts `/metrics`, so a separate
-/// listener is the only way they can be scraped. When the address is
-/// unset the gateway keeps `/metrics` on the admin listener and this
-/// router is not built.
+/// whenever prometheus is enabled. This is the only metrics surface —
+/// the same in standalone and managed mode; the admin listener never
+/// serves `/metrics`.
 pub fn metrics_router(metrics: Arc<Metrics>, prometheus: &PrometheusConfig) -> Router {
     Router::new()
         .route(
             &normalized_prometheus_path(&prometheus.path),
-            get(dedicated_metrics_handler),
+            get(metrics_handler),
         )
         .with_state(metrics)
 }
 
-/// Prometheus scrape handler for the dedicated metrics listener. The
-/// recorder is always present here (the handle is a required argument,
-/// unlike the admin variant's optional one), so there is no 503 branch.
-/// Emits `text/plain; version=0.0.4`.
-async fn dedicated_metrics_handler(
+/// Prometheus scrape handler. The recorder handle is a required
+/// argument, so there is no 503 branch. Unauthenticated by design —
+/// restrict access at the network layer. Emits
+/// `text/plain; version=0.0.4`.
+async fn metrics_handler(
     axum::extract::State(metrics): axum::extract::State<Arc<Metrics>>,
 ) -> Response {
     use axum::http::header::CONTENT_TYPE;
@@ -219,33 +213,6 @@ async fn livez(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     aisix_proxy::health::livez_response(&state.livez_state, params.contains_key("verbose"))
-}
-
-/// Prometheus `/metrics` endpoint. Unauthenticated by design — the admin
-/// listener is bound to a private address in production, and scrapers
-/// don't carry bearer tokens. Emits `text/plain; version=0.0.4`.
-async fn metrics_handler(
-    axum::extract::State(state): axum::extract::State<AdminState>,
-) -> axum::response::Response {
-    use axum::http::header::CONTENT_TYPE;
-    use axum::response::IntoResponse;
-
-    match state.metrics.as_ref() {
-        Some(m) => {
-            let body = m.render();
-            (
-                StatusCode::OK,
-                [(CONTENT_TYPE, "text/plain; version=0.0.4")],
-                body,
-            )
-                .into_response()
-        }
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "metrics recorder not configured",
-        )
-            .into_response(),
-    }
 }
 
 #[cfg(test)]
@@ -345,133 +312,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metrics_endpoint_returns_prometheus_text_when_configured() {
-        use aisix_obs::{Metrics, RequestOutcome};
-        use std::time::Duration;
-
-        let handle = SnapshotHandle::new(AisixSnapshot::new());
-        let store = InMemoryStore::new() as Arc<dyn ConfigStore>;
-        let metrics = Arc::new(Metrics::new(false));
-        // Pre-populate so the assertion doesn't depend on a separate
-        // proxy call landing samples.
-        metrics.record_request(
-            "openai",
-            "my-gpt4",
-            200,
-            RequestOutcome::Success,
-            Duration::from_millis(10),
-        );
-
-        let state = AdminState::new(handle, store, &cfg()).with_metrics(metrics);
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/metrics")
-            .body(Body::empty())
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert!(
-            ct.starts_with("text/plain"),
-            "unexpected content-type: {ct}"
-        );
-
-        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-        let body = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(body.contains("aisix_requests_total"));
-        assert!(body.contains("provider=\"openai\""));
-    }
-
-    #[tokio::test]
-    async fn metrics_endpoint_returns_503_when_recorder_not_wired() {
-        let state = build_state(); // no with_metrics
-        let app = build_router(state);
-        let req = Request::builder()
-            .uri("/metrics")
-            .body(Body::empty())
-            .unwrap();
-        let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    #[tokio::test]
-    async fn metrics_endpoint_uses_configured_path() {
-        use aisix_core::config::PrometheusConfig;
-        use aisix_obs::Metrics;
-
-        let state = build_state()
-            .with_metrics(Arc::new(Metrics::new(false)))
-            .with_prometheus_config(PrometheusConfig {
-                enabled: true,
-                path: "/internal/prom".into(),
-                addr: None,
-            });
-        let app = build_router(state);
-
-        let resp = run(
-            app.clone(),
-            Request::builder()
-                .uri("/metrics")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-
-        let resp = run(
-            app,
-            Request::builder()
-                .uri("/internal/prom")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn metrics_endpoint_normalizes_configured_path() {
-        use aisix_core::config::PrometheusConfig;
-        use aisix_obs::Metrics;
-
-        let state = build_state()
-            .with_metrics(Arc::new(Metrics::new(false)))
-            .with_prometheus_config(PrometheusConfig {
-                enabled: true,
-                path: "internal/prom".into(),
-                addr: None,
-            });
-        let app = build_router(state);
-
-        let resp = run(
-            app,
-            Request::builder()
-                .uri("/internal/prom")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn metrics_endpoint_can_be_disabled() {
-        use aisix_core::config::PrometheusConfig;
-        use aisix_obs::Metrics;
-
-        let state = build_state()
-            .with_metrics(Arc::new(Metrics::new(false)))
-            .with_prometheus_config(PrometheusConfig {
-                enabled: false,
-                path: "/metrics".into(),
-                addr: None,
-            });
-        let app = build_router(state);
+    async fn admin_router_does_not_serve_metrics() {
+        // The scrape endpoint lives exclusively on the dedicated metrics
+        // listener — the admin router must not mount it.
+        let app = build_router(build_state());
         let req = Request::builder()
             .uri("/metrics")
             .body(Body::empty())
@@ -481,7 +325,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedicated_metrics_router_serves_scrape_decoupled_from_admin() {
+    async fn metrics_router_serves_scrape_decoupled_from_admin() {
         use aisix_obs::{Metrics, RequestOutcome};
         use std::time::Duration;
 
@@ -499,7 +343,7 @@ mod tests {
             &PrometheusConfig {
                 enabled: true,
                 path: "/metrics".into(),
-                addr: Some("0.0.0.0:9090".into()),
+                addr: "0.0.0.0:9090".into(),
             },
         );
 
@@ -541,7 +385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedicated_metrics_router_honors_custom_path() {
+    async fn metrics_router_honors_custom_path() {
         use aisix_obs::Metrics;
 
         let app = metrics_router(
@@ -549,7 +393,7 @@ mod tests {
             &PrometheusConfig {
                 enabled: true,
                 path: "internal/prom".into(),
-                addr: Some("0.0.0.0:9090".into()),
+                addr: "0.0.0.0:9090".into(),
             },
         );
 

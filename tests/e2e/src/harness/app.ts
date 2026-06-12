@@ -16,13 +16,6 @@ export interface AppOverrides {
   prometheus?: boolean;
   /** Prometheus scrape path. Defaults to `/metrics`. */
   prometheusPath?: string;
-  /**
-   * Bind `/metrics` on a dedicated listener (its own free port) instead
-   * of only the admin listener. Mirrors how a managed DP is scraped —
-   * the admin listener is not the scrape surface. When set, `metricsUrl`
-   * on the returned handle points at that listener.
-   */
-  metricsListener?: boolean;
   /** Extra raw config keys merged into the YAML at the top level. */
   extra?: Record<string, unknown>;
   /**
@@ -50,8 +43,12 @@ export interface SpawnedApp {
   adminUrl: string;
   adminKey: string;
   etcdPrefix: string;
-  /** Dedicated metrics listener URL — set only when `metricsListener` was requested. */
-  metricsUrl?: string;
+  /**
+   * Dedicated metrics listener URL — the only Prometheus scrape surface.
+   * The port is reserved even when `prometheus: false` (nothing listens
+   * there in that case).
+   */
+  metricsUrl: string;
   signal(signal: NodeJS.Signals): void;
   exit(): Promise<void>;
 }
@@ -63,10 +60,11 @@ const SHUTDOWN_GRACE_MS = 3_000;
 
 /**
  * Per-test handle to a spawned `aisix` binary. Each call writes a fresh
- * config YAML into a tmp dir, picks two free ports, picks a unique etcd
- * prefix, and waits up to 10s for `/livez` on the proxy and `/admin/v1/health`
- * on the admin listener to respond 200. `exit()` issues SIGTERM and waits up to
- * 3s, escalating to SIGKILL.
+ * config YAML into a tmp dir, picks three free ports (proxy, admin,
+ * metrics), picks a unique etcd prefix, and waits up to 10s for `/livez`
+ * on the proxy, `/admin/v1/health` on the admin listener, and the scrape
+ * path on the metrics listener to respond 200. `exit()` issues SIGTERM
+ * and waits up to 3s, escalating to SIGKILL.
  */
 export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   const etcd = new EtcdClient();
@@ -77,10 +75,8 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
     );
   }
 
-  const wantMetricsListener = overrides.metricsListener ?? false;
-  const [proxyPort, adminPort, metricsPort] = await pickFreePorts(
-    wantMetricsListener ? 3 : 2,
-  );
+  const prometheusEnabled = overrides.prometheus ?? true;
+  const [proxyPort, adminPort, metricsPort] = await pickFreePorts(3);
   const adminKey = overrides.adminKey ?? `admin-${randomUUID()}`;
   const etcdPrefix = `/aisix-e2e-${randomUUID()}`;
 
@@ -103,9 +99,9 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
       access_log: false,
       metrics: {
         prometheus: {
-          enabled: overrides.prometheus ?? true,
+          enabled: prometheusEnabled,
           path: overrides.prometheusPath ?? "/metrics",
-          ...(wantMetricsListener ? { addr: `127.0.0.1:${metricsPort}` } : {}),
+          addr: `127.0.0.1:${metricsPort}`,
         },
         otlp: { enabled: false, endpoint: "http://127.0.0.1:4317" },
       },
@@ -162,17 +158,16 @@ export async function spawnApp(overrides: AppOverrides = {}): Promise<SpawnedApp
 
   const proxyUrl = `http://127.0.0.1:${proxyPort}`;
   const adminUrl = `http://127.0.0.1:${adminPort}`;
-  const metricsUrl = wantMetricsListener
-    ? `http://127.0.0.1:${metricsPort}`
-    : undefined;
+  const metricsUrl = `http://127.0.0.1:${metricsPort}`;
 
   try {
     await Promise.all([
       waitForReady(`${proxyUrl}/livez`, READY_TIMEOUT_MS),
       waitForReady(`${adminUrl}/admin/v1/health`, READY_TIMEOUT_MS, adminKey),
       // Gate on the dedicated metrics listener too, so scrapes in the test
-      // never race the listener coming up.
-      ...(metricsUrl
+      // never race the listener coming up. Skipped when prometheus is
+      // disabled — nothing binds the metrics port then.
+      ...(prometheusEnabled
         ? [
             waitForReady(
               `${metricsUrl}${overrides.prometheusPath ?? "/metrics"}`,

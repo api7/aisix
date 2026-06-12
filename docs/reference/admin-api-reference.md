@@ -7,11 +7,10 @@ sidebar_position: 61
 ## Public Admin-Listener Routes
 
 - `GET /livez`
-- `GET /metrics`
 - `GET /admin/openapi.json`
 - `GET /admin/openapi-scalar`
 
-These are operator-facing helper and discovery routes, not dynamic-resource write paths.
+These are operator-facing helper and discovery routes, not dynamic-resource write paths. Prometheus `/metrics` is served on the dedicated metrics listener, not the admin listener — see [Metrics And Logs](../operations/metrics-and-logs.md).
 
 ## Authenticated Operator Routes
 

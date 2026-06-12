@@ -206,7 +206,7 @@ describe("anthropic→openai streaming usage (#790)", () => {
     let inTok = 0;
     let outTok = 0;
     while (Date.now() < deadline) {
-      const scrape = await fetch(`${app.adminUrl}/metrics`).then((r) => r.text());
+      const scrape = await fetch(`${app.metricsUrl}/metrics`).then((r) => r.text());
       inTok = sumMetricByModel(scrape, "aisix_llm_input_tokens_total", "gpt-5.5");
       outTok = sumMetricByModel(scrape, "aisix_llm_output_tokens_total", "gpt-5.5");
       if (inTok >= PROMPT_TOKENS && outTok >= COMPLETION_TOKENS) break;
