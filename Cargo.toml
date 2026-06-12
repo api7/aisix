@@ -88,6 +88,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 # Time / IDs
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }
+hostname = "0.4"
 
 # Observability
 tracing = "0.1"

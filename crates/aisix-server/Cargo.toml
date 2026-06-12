@@ -49,6 +49,7 @@ reqwest.workspace = true
 rcgen.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+hostname.workspace = true
 x509-parser = "0.16"
 
 [dev-dependencies]

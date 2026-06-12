@@ -2,10 +2,17 @@
 //!
 //! Protocol (prd-09a §9A.7.2 + §9A.10A.3): the DP authenticates via
 //! its mTLS client certificate. cp-api reads the peer cert SAN URI
-//! (`x-aisix://env/<env_id>/dp/<dp_id>`) to derive identity — there
-//! is no `Authorization` header on the v3 wire. The body still
-//! carries `{ dp_id, uptime_seconds, version }` for diagnostics and
-//! to keep parity with the legacy log shape.
+//! (`x-aisix://env/<env_id>/dp/<dp_id>`) to derive the *credential*
+//! identity — there is no `Authorization` header on the v3 wire. The
+//! body still carries `{ dp_id, uptime_seconds, version }` for
+//! diagnostics and to keep parity with the legacy log shape.
+//!
+//! The cert's `dp_id` is a credential, not a runtime identity: every
+//! replica deployed from the same bundle (k8s Deployment mounting one
+//! Secret) presents the same `dp_id`. So each process additionally
+//! reports a per-boot `instance_id` (UUID v4) plus its `hostname`,
+//! letting cp-api track replicas individually instead of collapsing
+//! them into one last-writer-wins row (#592).
 //!
 //! Shape:
 //!   - spawned once from `main` after registration / bundle-on-disk
@@ -82,6 +89,14 @@ pub struct MtlsBundle {
 pub struct HeartbeatConfig {
     pub url: String,
     pub dp_id: String,
+    /// Per-boot runtime identity (UUID v4), minted once when the
+    /// config is built and stable for the process lifetime. Distinct
+    /// from `dp_id`, which is shared by every replica using the same
+    /// cert bundle (#592).
+    pub instance_id: String,
+    /// OS hostname (pod name on k8s, container id on docker). Sent
+    /// for display only — `instance_id` is the unique key.
+    pub hostname: String,
     pub interval: Duration,
     pub mtls: MtlsBundle,
     /// Optional source of supervisor-reported loader rejections. When
@@ -105,6 +120,8 @@ impl std::fmt::Debug for HeartbeatConfig {
         f.debug_struct("HeartbeatConfig")
             .field("url", &self.url)
             .field("dp_id", &self.dp_id)
+            .field("instance_id", &self.instance_id)
+            .field("hostname", &self.hostname)
             .field("interval", &self.interval)
             .field("mtls", &self.mtls)
             .field(
@@ -133,6 +150,13 @@ impl HeartbeatConfig {
         Self {
             url,
             dp_id,
+            // Minted here because this is the single constructor and
+            // main builds the config exactly once per boot — the id
+            // lives as long as the process (#592).
+            instance_id: uuid::Uuid::new_v4().to_string(),
+            hostname: hostname::get()
+                .map(|h| h.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             interval,
             mtls,
             rejection_fetcher: None,
@@ -192,6 +216,8 @@ async fn run(cfg: HeartbeatConfig, cancel: &mut watch::Receiver<bool>) {
     tracing::info!(
         url = %cfg.url,
         dp_id = %cfg.dp_id,
+        instance_id = %cfg.instance_id,
+        hostname = %cfg.hostname,
         interval_secs = cfg.interval.as_secs(),
         "heartbeat started (mTLS)",
     );
@@ -218,6 +244,12 @@ async fn run(cfg: HeartbeatConfig, cancel: &mut watch::Receiver<bool>) {
 #[derive(Debug, Serialize)]
 struct HeartbeatBody<'a> {
     dp_id: &'a str,
+    /// Per-boot runtime identity (#592). cp-api keys instance rows on
+    /// `(dp_id, instance_id)` so N replicas sharing one cert show up
+    /// as N instances instead of one last-writer-wins row.
+    instance_id: &'a str,
+    /// OS hostname for display (pod name on k8s).
+    hostname: &'a str,
     uptime_seconds: i64,
     version: &'a str,
     /// Guardrail `kind` discriminators compiled into this binary
@@ -331,6 +363,8 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
         // certificate SAN URI (§9A.7.2).
         .json(&HeartbeatBody {
             dp_id: &cfg.dp_id,
+            instance_id: &cfg.instance_id,
+            hostname: &cfg.hostname,
             uptime_seconds: uptime,
             version: env!("CARGO_PKG_VERSION"),
             supported_guardrail_kinds: aisix_guardrails::supported_kinds(),
@@ -635,6 +669,52 @@ mod tests {
             .unwrap()
             .iter()
             .any(|k| k == "keyword"));
+    }
+
+    /// #592: every heartbeat carries the per-boot instance identity —
+    /// stable across ticks of one process, distinct across processes
+    /// presenting the same cert bundle (k8s replicas).
+    #[tokio::test]
+    async fn send_includes_per_boot_instance_identity() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let cfg_a = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls.clone());
+        let cfg_b = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls);
+
+        let c = plain_client();
+        send(&c, &cfg_a, 1).await.unwrap();
+        send(&c, &cfg_a, 2).await.unwrap();
+        send(&c, &cfg_b, 1).await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        let bodies: Vec<serde_json::Value> = received
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+
+        let a0 = bodies[0]["instance_id"].as_str().unwrap();
+        uuid::Uuid::parse_str(a0).expect("instance_id must be a UUID");
+        assert_eq!(bodies[0]["instance_id"], bodies[1]["instance_id"]);
+        assert_ne!(
+            bodies[0]["instance_id"], bodies[2]["instance_id"],
+            "two configs (≈ two replicas on one cert) must not share an instance_id",
+        );
+
+        assert_eq!(
+            bodies[0]["hostname"].as_str().unwrap(),
+            hostname::get().unwrap().to_string_lossy(),
+        );
+        // The credential identity stays shared.
+        assert_eq!(bodies[0]["dp_id"], bodies[2]["dp_id"]);
     }
 
     #[tokio::test]
