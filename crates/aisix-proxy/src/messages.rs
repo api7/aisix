@@ -180,7 +180,6 @@ pub async fn messages(
             emit_failed_attempts_anthropic(
                 &state,
                 &request_id,
-                &model_id,
                 &api_key_id,
                 &provider_label,
                 &model_name,
@@ -196,14 +195,17 @@ pub async fn messages(
                 // no recorded attempt → AttemptInfo defaults (index 0,
                 // "initial", empty target). The streaming path emits the
                 // winner from its Drop guard, so it is skipped here.
-                let attempt = routing
-                    .winner()
-                    .map(AttemptInfo::from_record)
-                    .unwrap_or_default();
+                let winner = routing.winner();
+                // AISIX-Cloud#790: the event's model_id is the winning
+                // TARGET's id so pricing resolves against it.
+                let event_model_id = winner
+                    .map(|w| w.target_model_id.as_str())
+                    .unwrap_or(&model_id);
+                let attempt = winner.map(AttemptInfo::from_record).unwrap_or_default();
                 emit_anthropic_usage_event(
                     &state,
                     &request_id,
-                    &model_id,
+                    event_model_id,
                     &api_key_id,
                     &provider_label,
                     &model_name,
@@ -246,7 +248,6 @@ pub async fn messages(
             emit_failed_attempts_anthropic(
                 &state,
                 &request_id,
-                &model_id,
                 &api_key_id,
                 "unknown",
                 &model_name,
@@ -303,7 +304,6 @@ pub async fn messages(
 fn emit_failed_attempts_anthropic(
     state: &ProxyState,
     request_id: &str,
-    model_id: &str,
     api_key_id: &str,
     provider: &str,
     model: &str,
@@ -318,7 +318,9 @@ fn emit_failed_attempts_anthropic(
         emit_anthropic_usage_event(
             state,
             request_id,
-            model_id,
+            // Each failed attempt records the TARGET it actually hit
+            // (AISIX-Cloud#790), not the group it was resolved from.
+            &rec.target_model_id,
             api_key_id,
             provider,
             model,
@@ -506,6 +508,7 @@ async fn dispatch(
                     index: idx,
                     kind,
                     target_model,
+                    target_model_id: target.id.clone(),
                     provider_key_id: outcome.provider_key_id.clone(),
                     status: 200,
                     success: true,
@@ -526,6 +529,7 @@ async fn dispatch(
                     index: idx,
                     kind,
                     target_model,
+                    target_model_id: target.id.clone(),
                     provider_key_id: pk_id,
                     status: e.status().as_u16(),
                     success: false,
@@ -1796,6 +1800,9 @@ fn emit_anthropic_usage_event(
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
         api_key_id: api_key_id.to_string(),
+        // `model` is the client-sent alias on every call path
+        // (AISIX-Cloud#790) — the group name for routed requests.
+        requested_model: model.to_string(),
         prompt_tokens: metrics.prompt_tokens,
         completion_tokens: metrics.completion_tokens,
         cache_creation_tokens: metrics.cache_creation_tokens,

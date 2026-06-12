@@ -176,7 +176,7 @@ pub async fn chat_completions(
             emit_failed_attempts(
                 &state,
                 &request_id,
-                &success.model_id,
+                &model_name,
                 &api_key_id,
                 &client,
                 &applied_guardrails,
@@ -198,10 +198,17 @@ pub async fn chat_completions(
                 let winner_latency = winner
                     .map(|w| Duration::from_millis(u64::from(w.latency_ms)))
                     .unwrap_or(elapsed);
+                // AISIX-Cloud#790: the event's model_id is the winning
+                // TARGET's id so pricing resolves against it; cache hits
+                // record no attempt and keep the requested entry's id.
+                let event_model_id = winner
+                    .map(|w| w.target_model_id.as_str())
+                    .unwrap_or(&success.model_id);
                 emit_usage_event(
                     &state,
                     &request_id,
-                    &success.model_id,
+                    event_model_id,
+                    &model_name,
                     &api_key_id,
                     status,
                     winner_latency,
@@ -343,7 +350,7 @@ pub async fn chat_completions(
             emit_failed_attempts(
                 &state,
                 &request_id,
-                model_id_str,
+                &model_name,
                 &api_key_id,
                 &client,
                 &applied_guardrails,
@@ -360,10 +367,16 @@ pub async fn chat_completions(
             match charge {
                 Some(c) => {
                     let winner = routing.winner();
+                    // AISIX-Cloud#790: the billed-then-blocked event is the
+                    // winning attempt's — carry its TARGET id.
+                    let event_model_id = winner
+                        .map(|w| w.target_model_id.as_str())
+                        .unwrap_or(model_id_str);
                     emit_usage_event(
                         &state,
                         &request_id,
-                        model_id_str,
+                        event_model_id,
+                        &model_name,
                         &api_key_id,
                         status,
                         elapsed,
@@ -405,6 +418,7 @@ pub async fn chat_completions(
                         &state,
                         &request_id,
                         model_id_str,
+                        &model_name,
                         &api_key_id,
                         status,
                         elapsed,
@@ -852,6 +866,10 @@ async fn dispatch(
 
         struct StreamWin {
             model: aisix_core::Model,
+            /// Snapshot id of the winning target — the emitted event's
+            /// `model_id` (AISIX-Cloud#790). Equals the requested
+            /// entry's id for direct (non-routing) requests.
+            target_id: String,
             provider_lc: String,
             pk_id: String,
             upstream: aisix_gateway::ChatChunkStream,
@@ -942,6 +960,7 @@ async fn dispatch(
                         index: idx,
                         kind,
                         target_model,
+                        target_model_id: attempt.id.clone(),
                         provider_key_id: pk_entry.id.clone(),
                         status: 200,
                         success: true,
@@ -951,6 +970,7 @@ async fn dispatch(
                     });
                     won = Some(StreamWin {
                         model: model.clone(),
+                        target_id: attempt.id.clone(),
                         provider_lc: provider.to_ascii_lowercase(),
                         pk_id: pk_entry.id.clone(),
                         upstream,
@@ -964,6 +984,7 @@ async fn dispatch(
                         index: idx,
                         kind,
                         target_model,
+                        target_model_id: attempt.id.clone(),
                         provider_key_id: pk_entry.id.clone(),
                         status: err.http_status(),
                         success: false,
@@ -1002,6 +1023,7 @@ async fn dispatch(
         };
         let StreamWin {
             model,
+            target_id: winner_target_id,
             provider_lc: provider,
             pk_id,
             upstream,
@@ -1031,7 +1053,10 @@ async fn dispatch(
         let state_for_telem = state.clone();
         let metrics_for_stream = state.metrics.clone();
         let request_id_for_telem = request_id.to_string();
-        let model_id_for_telem = model_id.clone();
+        // AISIX-Cloud#790: the per-attempt event carries the winning
+        // TARGET's id, not the group's — pricing resolves against the
+        // target. (Equal for direct models.)
+        let model_id_for_telem = winner_target_id;
         let api_key_id_for_telem = auth.entry.id.clone();
         let team_id_for_metrics = auth.key().team_id.clone();
         let user_id_for_metrics = auth.key().user_id.clone();
@@ -1103,6 +1128,7 @@ async fn dispatch(
                     &state_for_telem,
                     &request_id_for_telem,
                     &model_id_for_telem,
+                    &model_for_metrics,
                     &api_key_id_for_telem,
                     /* status_code */ 200,
                     started.elapsed(),
@@ -1529,6 +1555,7 @@ async fn dispatch(
                         index: attempt_index,
                         kind,
                         target_model,
+                        target_model_id: attempt.id.clone(),
                         provider_key_id: pk_entry.id.clone(),
                         status: 200,
                         success: true,
@@ -1544,6 +1571,7 @@ async fn dispatch(
                         index: attempt_index,
                         kind,
                         target_model,
+                        target_model_id: attempt.id.clone(),
                         provider_key_id: pk_entry.id.clone(),
                         status: err.http_status(),
                         success: false,
@@ -1877,6 +1905,7 @@ fn emit_usage_event(
     state: &ProxyState,
     request_id: &str,
     model_id: &str,
+    requested_model: &str,
     api_key_id: &str,
     status_code: u16,
     elapsed: Duration,
@@ -1908,6 +1937,7 @@ fn emit_usage_event(
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
         api_key_id: api_key_id.to_string(),
+        requested_model: requested_model.to_string(),
         prompt_tokens,
         completion_tokens,
         cached_prompt_tokens: extras.cached_prompt_tokens,
@@ -2074,7 +2104,7 @@ struct UsageExtras {
 fn emit_failed_attempts(
     state: &ProxyState,
     request_id: &str,
-    model_id: &str,
+    requested_model: &str,
     api_key_id: &str,
     client: &ClientContext,
     applied_guardrails: &[AppliedGuardrail],
@@ -2084,7 +2114,10 @@ fn emit_failed_attempts(
         emit_usage_event(
             state,
             request_id,
-            model_id,
+            // Each failed attempt records the TARGET it actually hit
+            // (AISIX-Cloud#790), not the group it was resolved from.
+            &rec.target_model_id,
+            requested_model,
             api_key_id,
             rec.status,
             Duration::from_millis(u64::from(rec.latency_ms)),

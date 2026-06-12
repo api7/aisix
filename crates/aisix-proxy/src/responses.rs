@@ -135,7 +135,7 @@ pub async fn responses(
             emit_failed_attempts(
                 &state,
                 &request_id,
-                &success.model_id,
+                &model_name,
                 &api_key_id,
                 &client,
                 &success.routing,
@@ -160,6 +160,7 @@ pub async fn responses(
                     &state,
                     &request_id,
                     &success.model_id,
+                    &model_name,
                     &api_key_id,
                     status,
                     elapsed,
@@ -192,17 +193,24 @@ pub async fn responses(
             );
             // Per #655: emit one zero-token UsageEvent per FAILED attempt so
             // the dashboard's Logs tab surfaces each failed upstream try.
-            // `model_id` is empty on pre-dispatch failures (model never
-            // resolved); the request_id still groups the rows.
-            emit_failed_attempts(&state, &request_id, "", &api_key_id, &client, &routing);
+            emit_failed_attempts(
+                &state,
+                &request_id,
+                &model_name,
+                &api_key_id,
+                &client,
+                &routing,
+            );
             // Pre-dispatch failure (model-not-found, auth, budget) records no
             // attempts — emit a single terminal event carrying the failure
-            // class. When attempts were recorded, each was already emitted.
+            // class (`model_id` empty: the model never resolved). When
+            // attempts were recorded, each was already emitted.
             if routing.attempts.is_empty() {
                 emit_zero_token_event(
                     &state,
                     &request_id,
                     "",
+                    &model_name,
                     &api_key_id,
                     status,
                     elapsed,
@@ -356,6 +364,7 @@ async fn dispatch(
                     index: idx,
                     kind,
                     target_model,
+                    target_model_id: target.id.clone(),
                     provider_key_id: String::new(),
                     status: success.response.status().as_u16(),
                     success: true,
@@ -376,6 +385,7 @@ async fn dispatch(
                     index: idx,
                     kind,
                     target_model,
+                    target_model_id: target.id.clone(),
                     provider_key_id: String::new(),
                     status: e.status().as_u16(),
                     success: false,
@@ -1062,6 +1072,7 @@ fn emit_usage_event(
     state: &ProxyState,
     request_id: &str,
     model_id: &str,
+    requested_model: &str,
     api_key_id: &str,
     status_code: u16,
     elapsed: Duration,
@@ -1075,6 +1086,7 @@ fn emit_usage_event(
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
         api_key_id: api_key_id.to_string(),
+        requested_model: requested_model.to_string(),
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         cached_prompt_tokens: usage.cached_prompt_tokens,
@@ -1107,6 +1119,7 @@ fn emit_zero_token_event(
     state: &ProxyState,
     request_id: &str,
     model_id: &str,
+    requested_model: &str,
     api_key_id: &str,
     status_code: u16,
     elapsed: Duration,
@@ -1118,6 +1131,7 @@ fn emit_zero_token_event(
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
         api_key_id: api_key_id.to_string(),
+        requested_model: requested_model.to_string(),
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
@@ -1145,7 +1159,7 @@ fn emit_zero_token_event(
 fn emit_failed_attempts(
     state: &ProxyState,
     request_id: &str,
-    model_id: &str,
+    requested_model: &str,
     api_key_id: &str,
     client: &ClientContext,
     routing: &RoutingTelemetry,
@@ -1154,7 +1168,10 @@ fn emit_failed_attempts(
         emit_zero_token_event(
             state,
             request_id,
-            model_id,
+            // Each failed attempt records the TARGET it actually hit
+            // (AISIX-Cloud#790), not the group it was resolved from.
+            &rec.target_model_id,
+            requested_model,
             api_key_id,
             rec.status,
             Duration::from_millis(u64::from(rec.latency_ms)),

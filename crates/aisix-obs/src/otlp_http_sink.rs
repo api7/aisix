@@ -607,6 +607,12 @@ fn build_otlp_span(record: &SinkRecord, exporter_name: &str) -> Value {
         attr_string("gen_ai.system", "aisix"),
         attr_string("gen_ai.operation.name", "chat"),
     ];
+    // The model alias the client sent (`model` field) — a Model-Group
+    // name for routed requests (AISIX-Cloud#790). Semconv key for the
+    // requested (vs response) model.
+    if !event.requested_model.is_empty() {
+        attributes.push(attr_string("gen_ai.request.model", &event.requested_model));
+    }
     if !event.provider_model_version.is_empty() {
         attributes.push(attr_string(
             "gen_ai.response.model",

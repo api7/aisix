@@ -30,6 +30,12 @@ pub(crate) struct AttemptRecord {
     /// Routing target display name. Empty for direct (non-routing)
     /// models, where `model_id` already identifies the single model.
     pub target_model: String,
+    /// UUID of the concrete Model row this attempt dispatched to. For a
+    /// direct (non-routing) request this equals the requested entry's
+    /// id. Feeds the emitted event's `model_id` so pricing resolves
+    /// against the TARGET, not the group (AISIX-Cloud#790) — group ids
+    /// have no pricing rows.
+    pub target_model_id: String,
     /// Resolved ProviderKey UUID for this attempt's target — feeds the
     /// per-PK attribution tags on the emitted event. Empty when unknown.
     pub provider_key_id: String,

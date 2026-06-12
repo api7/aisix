@@ -3585,10 +3585,22 @@ data: [DONE]\n\n";
             "all attempts share the request_id (trace key)"
         );
 
+        // AISIX-Cloud#790: every attempt carries the requested group
+        // alias — model_id points at the per-attempt TARGET, so without
+        // this the group name would appear nowhere.
+        assert!(
+            events.iter().all(|e| e.requested_model == "smart"),
+            "every attempt records the requested group alias"
+        );
+
         // initial attempt on `primary` failed with the upstream's 502
         assert_eq!(events[0].attempt_index, 0);
         assert_eq!(events[0].attempt_kind, "initial");
         assert_eq!(events[0].attempt_model, "primary");
+        assert_eq!(
+            events[0].model_id, "m-flaky",
+            "failed attempt carries the TARGET's id"
+        );
         assert_eq!(events[0].status_code, 502);
         assert_eq!(events[0].error_class, "upstream_status");
         assert_eq!(events[0].prompt_tokens, 0);
@@ -3598,6 +3610,7 @@ data: [DONE]\n\n";
         assert_eq!(events[1].attempt_index, 1);
         assert_eq!(events[1].attempt_kind, "retry");
         assert_eq!(events[1].attempt_model, "primary");
+        assert_eq!(events[1].model_id, "m-flaky");
         assert_eq!(events[1].status_code, 502);
         assert!(!events[1].error_class.is_empty());
 
@@ -3605,6 +3618,10 @@ data: [DONE]\n\n";
         assert_eq!(events[2].attempt_index, 2);
         assert_eq!(events[2].attempt_kind, "fallback");
         assert_eq!(events[2].attempt_model, "secondary");
+        // AISIX-Cloud#790: the winner records the TARGET's id, not the
+        // group's — cp-api prices via model_id and group ids have no
+        // pricing rows.
+        assert_eq!(events[2].model_id, "m-good");
         assert_eq!(events[2].status_code, 200);
         assert_eq!(events[2].error_class, "");
         assert_eq!(events[2].prompt_tokens, 1);
@@ -3668,6 +3685,10 @@ data: [DONE]\n\n";
         assert_eq!(event.attempt_index, 0);
         assert_eq!(event.attempt_kind, "initial");
         assert_eq!(event.attempt_model, "primary");
+        // AISIX-Cloud#790: failed streaming attempt carries the
+        // TARGET's id + the requested group alias.
+        assert_eq!(event.model_id, "m-primary");
+        assert_eq!(event.requested_model, "smart");
         assert_eq!(event.status_code, 502);
         assert_eq!(event.error_class, "upstream_status");
         assert_eq!(event.prompt_tokens, 0);
@@ -3784,11 +3805,20 @@ data: [DONE]\n\n";
             events.iter().all(|e| e.inbound_protocol == "anthropic"),
             "/v1/messages tags inbound_protocol=anthropic on every attempt"
         );
+        // AISIX-Cloud#790: every attempt carries the requested group alias.
+        assert!(
+            events.iter().all(|e| e.requested_model == "smart"),
+            "every attempt records the requested group alias"
+        );
 
         // initial attempt on `primary` failed with the upstream's 502
         assert_eq!(events[0].attempt_index, 0);
         assert_eq!(events[0].attempt_kind, "initial");
         assert_eq!(events[0].attempt_model, "primary");
+        assert_eq!(
+            events[0].model_id, "m-bad",
+            "failed attempt carries the TARGET's id"
+        );
         assert_eq!(events[0].status_code, 502);
         assert_eq!(events[0].error_class, "upstream_status");
         assert_eq!(events[0].prompt_tokens, 0);
@@ -3798,6 +3828,9 @@ data: [DONE]\n\n";
         assert_eq!(events[1].attempt_index, 1);
         assert_eq!(events[1].attempt_kind, "fallback");
         assert_eq!(events[1].attempt_model, "secondary");
+        // AISIX-Cloud#790: the winner records the TARGET's id (pricing
+        // resolves against it), not the group's.
+        assert_eq!(events[1].model_id, "m-good");
         assert_eq!(events[1].status_code, 200);
         assert_eq!(events[1].error_class, "");
         assert_eq!(events[1].prompt_tokens, 1);
@@ -3896,11 +3929,20 @@ data: [DONE]\n\n";
             events.iter().all(|e| e.inbound_protocol == "openai"),
             "/v1/responses tags inbound_protocol=openai on every attempt"
         );
+        // AISIX-Cloud#790: every attempt carries the requested group alias.
+        assert!(
+            events.iter().all(|e| e.requested_model == "smart"),
+            "every attempt records the requested group alias"
+        );
 
         // initial attempt on `primary` failed with the upstream's 502
         assert_eq!(events[0].attempt_index, 0);
         assert_eq!(events[0].attempt_kind, "initial");
         assert_eq!(events[0].attempt_model, "primary");
+        assert_eq!(
+            events[0].model_id, "m-bad",
+            "failed attempt carries the TARGET's id"
+        );
         assert_eq!(events[0].status_code, 502);
         assert_eq!(events[0].error_class, "upstream_status");
         assert_eq!(events[0].prompt_tokens, 0);
@@ -3909,10 +3951,95 @@ data: [DONE]\n\n";
         assert_eq!(events[1].attempt_index, 1);
         assert_eq!(events[1].attempt_kind, "fallback");
         assert_eq!(events[1].attempt_model, "secondary");
+        // AISIX-Cloud#790: the winner records the TARGET's id (pricing
+        // resolves against it), not the group's.
+        assert_eq!(events[1].model_id, "m-good");
         assert_eq!(events[1].status_code, 200);
         assert_eq!(events[1].error_class, "");
         assert_eq!(events[1].prompt_tokens, 1);
         assert_eq!(events[1].completion_tokens, 1);
+    }
+
+    /// AISIX-Cloud#790: a plain direct-model request (no routing group)
+    /// records the client-sent name in `requested_model` and keeps the
+    /// direct model's own id in `model_id` — on both the OpenAI and the
+    /// Anthropic inbound protocols.
+    #[tokio::test]
+    async fn direct_model_requests_record_requested_model() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-direct",
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hi there"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(2)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+
+        // OpenAI protocol: /v1/chat/completions.
+        let chat_req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "my-gpt4",
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = run(build_router(state.clone()), chat_req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("chat usage event was never emitted")
+            .expect("sender dropped");
+        assert_eq!(event.requested_model, "my-gpt4");
+        // Direct request: target == requested entry, id unchanged.
+        assert_eq!(event.model_id, "model-id-1");
+
+        // Anthropic protocol: /v1/messages (cross-provider dispatch to
+        // the same OpenAI upstream).
+        let messages_req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "my-gpt4",
+                    "max_tokens": 100,
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = run(build_router(state), messages_req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("messages usage event was never emitted")
+            .expect("sender dropped");
+        assert_eq!(event.requested_model, "my-gpt4");
+        assert_eq!(event.model_id, "model-id-1");
+        assert_eq!(event.inbound_protocol, "anthropic");
     }
 
     #[tokio::test]

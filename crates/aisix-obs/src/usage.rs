@@ -64,6 +64,15 @@ pub struct UsageEvent {
     #[serde(default)]
     pub api_key_id: String,
 
+    /// The model alias exactly as the client sent it in the request
+    /// body (`model` field) — a Model-Group name for routed requests,
+    /// a direct model's display name otherwise. `model_id` records the
+    /// resolved TARGET model, so without this field the group a caller
+    /// asked for appears nowhere in telemetry (AISIX-Cloud#790). Empty
+    /// when the request never carried a resolvable model name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub requested_model: String,
+
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
 
@@ -712,6 +721,7 @@ mod tests {
             occurred_at: "2026-04-29T12:00:00Z".into(),
             model_id: "mod-uuid".into(),
             api_key_id: "ak-uuid".into(),
+            requested_model: "smart-group".into(),
             prompt_tokens: 12,
             completion_tokens: 34,
             latency_ms: 56,
@@ -723,6 +733,9 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains(r#""request_id":"req-1""#));
         assert!(json.contains(r#""api_key_id":"ak-uuid""#));
+        // AISIX-Cloud#790: the client-sent alias rides next to model_id
+        // so the dashboard can show the group a routed request used.
+        assert!(json.contains(r#""requested_model":"smart-group""#));
         assert!(json.contains(r#""prompt_tokens":12"#));
         assert!(json.contains(r#""completion_tokens":34"#));
         assert!(json.contains(r#""guardrail_blocked":false"#));
@@ -760,6 +773,9 @@ mod tests {
         // resolve a peer / the client sent no User-Agent.
         assert!(!json.contains("client_source_ip"));
         assert!(!json.contains("client_user_agent"));
+        // Requested alias (AISIX-Cloud#790): absent when the request
+        // never carried a resolvable model name.
+        assert!(!json.contains("requested_model"));
         // Applied guardrails (#379): absent when no guardrail governed the
         // request (the dominant guardrail-free deployment). Empty must not
         // appear on the wire — cp-api treats absent as the empty set.
