@@ -20,7 +20,7 @@ Recommended boundary:
 
 Do not assume admin auth alone is enough protection. Current admin design intentionally leaves some routes unauthenticated on that private listener.
 
-Current admin design intentionally leaves `/livez`, `/metrics`, and OpenAPI endpoints unauthenticated on that private listener, so network placement matters.
+Current admin design intentionally leaves `/livez` and OpenAPI endpoints unauthenticated on that private listener, so network placement matters. The Prometheus scrape endpoint lives on its own dedicated metrics listener (default `0.0.0.0:9090`) and is also unauthenticated — restrict that port at the network layer too.
 
 ## Secrets And Credentials
 

@@ -183,7 +183,7 @@ describe("anthropic /v1/messages streaming usage telemetry (#245)", () => {
     let inTokens = 0;
     let outTokens = 0;
     while (Date.now() < deadline) {
-      const scrape = await fetch(`${app.adminUrl}/metrics`).then((r) =>
+      const scrape = await fetch(`${app.metricsUrl}/metrics`).then((r) =>
         r.text(),
       );
       inTokens = sumMetric(scrape, "aisix_llm_input_tokens_total", "/v1/messages");

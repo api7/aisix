@@ -78,6 +78,7 @@ observability:
     prometheus:
       enabled: true
       path: "/metrics"
+      addr: "0.0.0.0:9090"
 
 cache:
   backend: "memory"
@@ -180,8 +181,9 @@ Important fields:
 | `service_name` | service-name attribute on the tracing subscriber initialised at boot | `"aisix"` | wired |
 | `log_level` | fallback `EnvFilter` directive when `RUST_LOG` is not set in the environment | `"info"` | wired |
 | `access_log` | reserved field; access logs are currently emitted by every proxy handler regardless of this setting | `true` | reserved (not yet consulted) |
-| `metrics.prometheus.enabled` | controls whether the admin listener mounts the Prometheus scrape endpoint; when `false`, no `/metrics` route is registered | `true` | wired |
+| `metrics.prometheus.enabled` | controls whether the dedicated metrics listener is bound; when `false`, the gateway serves no Prometheus scrape endpoint | `true` | wired |
 | `metrics.prometheus.path` | mount path for the Prometheus scrape endpoint | `"/metrics"` | wired |
+| `metrics.prometheus.addr` | bind address of the dedicated metrics listener — the only Prometheus scrape surface, identical in standalone and managed mode | `"0.0.0.0:9090"` | wired |
 | `metrics.otlp.enabled` | reserved field; no OTLP metrics export pipeline is installed in the current release | `false` | reserved (not yet wired) |
 | `metrics.otlp.endpoint` | OTLP/gRPC metrics endpoint | none | reserved (not yet wired) |
 | `tracing.otlp.enabled` | boot-time endpoint validation; OTLP traces pipeline deferred | `false` | partial (validation only) |

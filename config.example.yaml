@@ -54,13 +54,11 @@ observability:
     prometheus:
       enabled: true
       path: "/metrics"
-      # Optional: serve `/metrics` on a dedicated listener instead of
-      # relying on the admin listener. Set this when the admin surface is
-      # private but you still want Prometheus to scrape, or to keep the
-      # scrape port separate from the data path. Required for managed-mode
-      # DPs (the admin listener is not bound there). Unset = `/metrics`
-      # stays on the admin listener.
-      # addr: "0.0.0.0:9090"
+      # Dedicated metrics listener — the only Prometheus scrape surface,
+      # the same in every deployment mode. Point Prometheus at this
+      # address; the endpoint is unauthenticated, so restrict access at
+      # the network layer.
+      addr: "0.0.0.0:9090"
     otlp:
       enabled: false
       endpoint: "http://127.0.0.1:4317"

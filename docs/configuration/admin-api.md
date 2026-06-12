@@ -1,6 +1,6 @@
 ---
 title: Admin API
-description: Use the AISIX AI Gateway admin API to manage models, API keys, provider keys, guardrails, cache policies, observability exporters, health, metrics, and the in-process playground.
+description: Use the AISIX AI Gateway admin API to manage models, API keys, provider keys, guardrails, cache policies, observability exporters, health, and the in-process playground.
 sidebar_position: 31
 ---
 
@@ -33,9 +33,10 @@ Admin authentication is static and bootstrap-based for the authenticated operato
 The following routes are currently public on the admin listener:
 
 - `GET /livez`
-- `GET /metrics`
 - `GET /admin/openapi.json`
 - `GET /admin/openapi-scalar`
+
+Prometheus `/metrics` is not part of the admin surface — it is served on the dedicated metrics listener (`observability.metrics.prometheus.addr`, default `0.0.0.0:9090`). See [Metrics And Logs](../operations/metrics-and-logs.md).
 
 Example:
 
@@ -56,7 +57,6 @@ Do not mix them.
 The current admin router exposes:
 
 - `GET /livez`
-- `GET /metrics`
 - `GET /admin/openapi.json`
 - `GET /admin/openapi-scalar`
 - `GET|POST /admin/v1/models`
@@ -77,7 +77,7 @@ The current admin router exposes:
 
 Think about these routes in three groups:
 
-- public operator helpers: livez, metrics, and OpenAPI discovery
+- public operator helpers: livez and OpenAPI discovery
 - CRUD resources: models, API keys, provider keys, guardrails, cache policies, exporters
 - convenience operator workflow: the in-process playground
 
@@ -101,7 +101,7 @@ Current status behavior includes:
 - `409` for conflicts such as duplicate names
 - `500` for store failures
 
-Public routes such as `/livez`, `/metrics`, and the OpenAPI endpoints do not require admin auth.
+Public routes such as `/livez` and the OpenAPI endpoints do not require admin auth.
 
 Use `GET /livez` for simple admin-listener reachability. Use `GET /admin/v1/health` when you need authenticated per-model operator health.
 
@@ -223,10 +223,6 @@ Use it to answer operator questions such as:
 - is the admin surface alive
 - does the process have a current snapshot
 - are configured models currently healthy from the gateway's point of view
-
-### `GET /metrics`
-
-This is the Prometheus scrape endpoint on the admin listener.
 
 ### `POST /playground/chat/completions`
 

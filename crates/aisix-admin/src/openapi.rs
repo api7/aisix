@@ -78,16 +78,6 @@ const OPENAPI_JSON_BASE: &str = r##"{
         }
       }
     },
-    "/metrics": {
-      "get": {
-        "summary": "Prometheus metrics (text/plain; version=0.0.4)",
-        "security": [],
-        "responses": {
-          "200": {"description": "OK"},
-          "503": {"description": "metrics recorder not configured"}
-        }
-      }
-    },
     "/admin/openapi.json": {
       "get": {
         "summary": "this OpenAPI document",
@@ -505,7 +495,6 @@ mod tests {
         // Every route mounted in build_router should be documented.
         for path in [
             "/livez",
-            "/metrics",
             "/admin/openapi.json",
             "/admin/openapi-scalar",
             "/admin/v1/models",
@@ -559,19 +548,13 @@ mod tests {
 
     #[tokio::test]
     async fn openapi_unauthenticated_routes_carry_empty_security() {
-        // /livez, /metrics, and the openapi self-references are public
-        // (mirrors the `unauthenticated like /metrics` design note in
-        // build_router). The spec must mark them with security: [] so
-        // Scalar's "Try it" doesn't prompt for an admin key on those
-        // routes.
+        // /livez and the openapi self-references are public (mirrors the
+        // design note in build_router). The spec must mark them with
+        // security: [] so Scalar's "Try it" doesn't prompt for an admin
+        // key on those routes.
         let parsed: serde_json::Value =
             serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
-        for path in [
-            "/livez",
-            "/metrics",
-            "/admin/openapi.json",
-            "/admin/openapi-scalar",
-        ] {
+        for path in ["/livez", "/admin/openapi.json", "/admin/openapi-scalar"] {
             let security = &parsed["paths"][path]["get"]["security"];
             assert!(
                 security.is_array() && security.as_array().unwrap().is_empty(),

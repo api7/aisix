@@ -10,9 +10,9 @@ Use them together. No single signal tells the whole story.
 
 ## Metrics
 
-`GET /metrics` is the Prometheus scrape endpoint. By default it is served on the admin listener. You can change the path with `observability.metrics.prometheus.path`, disable it with `observability.metrics.prometheus.enabled: false`, or serve it on a **dedicated listener** with `observability.metrics.prometheus.addr` (for example `0.0.0.0:9090`). A dedicated listener is what lets you scrape a Cloud managed data plane — see [Managed data plane metrics](#managed-data-plane-metrics).
+`GET /metrics` is the Prometheus scrape endpoint, served on a **dedicated metrics listener** bound at `observability.metrics.prometheus.addr` (default `0.0.0.0:9090`). The mechanism is identical in every deployment mode — standalone and Cloud managed data planes are scraped the same way, and the admin listener does not serve `/metrics`. You can change the path with `observability.metrics.prometheus.path` or disable the listener entirely with `observability.metrics.prometheus.enabled: false`.
 
-This endpoint is unauthenticated by design. Keep it on a private listener and restrict access at the network layer (firewall, security group, or Kubernetes NetworkPolicy).
+This endpoint is unauthenticated by design. Keep it on a private network and restrict access at the network layer (firewall, security group, or Kubernetes NetworkPolicy).
 
 Treat `/metrics` as infrastructure-facing, not as a public diagnostics surface.
 
@@ -20,11 +20,9 @@ Treat `/metrics` as infrastructure-facing, not as a public diagnostics surface.
 Metric families are registered lazily on first observation — the gateway does not pre-register `# HELP` / `# TYPE` lines at startup. Immediately after boot, `GET /metrics` returns an empty body. This is expected, not a misconfigured endpoint. To smoke-test, send one model request and then re-check `/metrics`; you should now see series such as `aisix_requests_total` and `aisix_tokens_consumed_total`.
 :::
 
-### Managed Data Plane Metrics
+### Scraping The Data Plane
 
-The `/metrics` endpoint is served on the **admin listener**, which a Cloud managed data plane does not bind. A managed DP therefore exposes metrics on a **dedicated metrics listener** instead, configured by `observability.metrics.prometheus.addr`. The managed image binds this on `0.0.0.0:9090` by default, so **no control-plane configuration is required** — you scrape it directly with your own Prometheus, from inside the data plane's network.
-
-To scrape a managed data plane (or any deployment with a dedicated listener):
+To scrape any data plane (standalone or managed):
 
 1. **Expose the metrics port** in your data plane deployment. The proxy and admin ports are unaffected — only the metrics port needs to be reachable by your Prometheus.
 
@@ -66,7 +64,7 @@ To scrape a managed data plane (or any deployment with a dedicated listener):
          path: /metrics
    ```
 
-Restrict access to the metrics port at the network layer — it is unauthenticated, like every Prometheus exporter. Self-hosted standalone deployments can keep scraping `/metrics` on the admin listener, or set `addr` to also expose it on a dedicated listener.
+Restrict access to the metrics port at the network layer — it is unauthenticated, like every Prometheus exporter.
 
 AISIX exposes native metric names with the `aisix_` prefix. Existing compatibility series remain:
 

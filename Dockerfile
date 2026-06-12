@@ -86,8 +86,8 @@ COPY config.managed.yaml /etc/aisix/config.managed.yaml
 COPY docker/entrypoint.sh /usr/local/bin/aisix-entrypoint
 RUN chmod 0755 /usr/local/bin/aisix-entrypoint
 
-# Proxy + admin listeners from config.example.yaml.
-EXPOSE 3000 3001
+# Proxy + admin + metrics listeners from config.example.yaml.
+EXPOSE 3000 3001 9090
 
 USER aisix
 

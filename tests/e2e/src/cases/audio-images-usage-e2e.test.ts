@@ -93,7 +93,7 @@ describe("audio + images UsageEvent emission (#406/#407)", () => {
       });
       expect((await call()).status).toBe(200);
 
-      const emitted = await pollUsageEmitted(app.adminUrl, "images");
+      const emitted = await pollUsageEmitted(app.metricsUrl, "images");
       expect(emitted, "handler=images emit counter must be > 0 (#407)").toBeGreaterThan(0);
     } finally {
       await app.exit();
@@ -153,7 +153,7 @@ describe("audio + images UsageEvent emission (#406/#407)", () => {
       });
       expect((await call()).status).toBe(200);
 
-      const emitted = await pollUsageEmitted(app.adminUrl, "audio");
+      const emitted = await pollUsageEmitted(app.metricsUrl, "audio");
       expect(emitted, "handler=audio emit counter must be > 0 (#406)").toBeGreaterThan(0);
     } finally {
       await app.exit();
@@ -169,11 +169,11 @@ describe("audio + images UsageEvent emission (#406/#407)", () => {
  * consistent). Bounded so a regression (no emit) fails rather than
  * hangs. Sums all label-sets for the handler.
  */
-async function pollUsageEmitted(adminUrl: string, handler: string): Promise<number> {
+async function pollUsageEmitted(metricsUrl: string, handler: string): Promise<number> {
   const deadline = Date.now() + 5_000;
   let total = 0;
   while (Date.now() < deadline) {
-    const text = await fetch(`${adminUrl}/metrics`).then((r) => r.text());
+    const text = await fetch(`${metricsUrl}/metrics`).then((r) => r.text());
     total = 0;
     for (const line of text.split("\n")) {
       if (!line.startsWith("aisix_usage_events_emitted_total{")) continue;

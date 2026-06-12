@@ -8,7 +8,7 @@
 //!  5. Bootstrap initial snapshot
 //!  6. Spawn watch supervisor
 //!  7. Build proxy router
-//!  8. Build admin router (+ dedicated metrics listener when configured)
+//!  8. Build admin router + dedicated metrics listener
 //!  9. Bind + serve the ports (tokio::select! with shutdown signal)
 //! 10. On SIGINT/SIGTERM: cancel supervisor, stop accepting, join
 
@@ -502,8 +502,6 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         let admin_store: Arc<dyn ConfigStore> =
             Arc::new(EtcdConfigStore::new(admin_client, etcd_prefix.clone()));
         let admin_state = AdminState::new(snapshot_handle.clone(), admin_store, &cfg.admin)
-            .with_metrics(metrics.clone())
-            .with_prometheus_config(cfg.observability.metrics.prometheus.clone())
             // Share the health tracker so /admin/v1/health reflects live
             // per-model upstream failure counts.
             .with_health_tracker(health_tracker)
@@ -539,18 +537,14 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
         None
     };
 
-    // Dedicated metrics listener. The admin listener that normally hosts
-    // `/metrics` is never bound in managed mode, so a managed DP can only
-    // be scraped through a separate listener. Bound whenever
-    // `observability.metrics.prometheus.addr` is set — `config.managed.yaml`
-    // sets it by default (no control-plane change needed); self-hosted
-    // deployments keep `/metrics` on the admin listener unless they opt in
-    // by setting the address. Shares the same `metrics` handle as the proxy
-    // and admin surfaces, so one scrape reflects all request paths.
+    // Dedicated metrics listener — the only Prometheus scrape surface,
+    // bound whenever prometheus is enabled, identical in standalone and
+    // managed mode (default `0.0.0.0:9090`). Shares the same `metrics`
+    // handle as the proxy, so one scrape reflects all request paths.
     let metrics_serve_handle = {
         let prom = &cfg.observability.metrics.prometheus;
-        if let (true, Some(addr)) = (prom.enabled, prom.addr.as_deref()) {
-            let metrics_addr: std::net::SocketAddr = addr.parse()?;
+        if prom.enabled {
+            let metrics_addr: std::net::SocketAddr = prom.addr.parse()?;
             // Fail boot loudly if the metrics port is unavailable, rather
             // than silently serving no metrics until shutdown — the
             // listener is spawned and only joined post-shutdown, so a
