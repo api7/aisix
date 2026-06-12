@@ -29,7 +29,12 @@ The current `/dp/*` managed surface includes:
 
 Each endpoint has a different purpose:
 
-- `heartbeat` proves liveness and identity from the data plane
+- `heartbeat` proves liveness and identity from the data plane; its
+  body also carries a per-boot `instance_id` and the OS `hostname`, so
+  multiple replicas sharing one certificate bundle (for example a
+  Kubernetes Deployment with `replicas > 1`) are tracked as separate
+  instances by the control plane — the cert's `dp_id` is only the
+  shared credential
 - `telemetry` sends usage-oriented data to the control plane
 - `rotate-cert` supports certificate lifecycle management
 - `budget_check` supports managed budget enforcement decisions
