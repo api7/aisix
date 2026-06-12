@@ -82,6 +82,15 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.licenses=Apache-2.0
 
+      # Same short sha the `type=sha,prefix=sha-` tag uses, stamped into
+      # the binary so the DP's heartbeat reports `0.1.0+sha-<short>` and
+      # operators can match a node to its image tag.
+      - name: Compute short sha
+        id: shortsha
+        # First 7 chars of the commit sha — identical to what
+        # metadata-action's `type=sha,format=short` puts in the tag.
+        run: echo "value=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -89,6 +98,8 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_SHA=${{ steps.shortsha.outputs.value }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false   # keep manifest format compatible with older clients

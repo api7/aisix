@@ -35,6 +35,14 @@ RUN apt-get update \
 
 WORKDIR /src
 
+# Short git sha stamped into the binary (heartbeat `version` =
+# `<crate-version>+sha-<BUILD_SHA>`) so a running DP can be matched to
+# its image tag. CI passes the same short sha that tags the image;
+# plain `docker build` (no arg) produces a binary that reports the bare
+# crate version.
+ARG BUILD_SHA=
+ENV AISIX_BUILD_SHA=$BUILD_SHA
+
 # BuildKit cache mounts carry `~/.cargo/registry` + `target/` across
 # builds, so changes to source files still reuse compiled dependencies.
 # We could split dep-build from source-build via a manifests-only warm

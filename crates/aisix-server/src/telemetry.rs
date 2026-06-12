@@ -241,7 +241,7 @@ fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
 
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
-        .user_agent(format!("aisix-dp/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("aisix-dp/{}", &*crate::heartbeat::BUILD_VERSION))
         .identity(identity)
         .add_root_certificate(ca)
         // Pin HTTP/1.1 — see heartbeat::build_client. dp-manager cmux

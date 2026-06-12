@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use aisix_etcd::loader::RejectedEntry;
@@ -28,6 +29,25 @@ use aisix_obs::SinkStatsSnapshot;
 use anyhow::{anyhow, Context};
 use serde::Serialize;
 use tokio::sync::watch;
+
+/// Build identity reported to cp-api (heartbeat `version` field + HTTP
+/// User-Agent). CI stamps `AISIX_BUILD_SHA` — the same short git sha
+/// that tags the container image — at compile time, so the wire carries
+/// `0.1.0+sha-103d3ec` and an operator can match a DP node directly to
+/// its `ghcr.io/...:sha-103d3ec` image. Local builds (no stamp) report
+/// the bare crate version. cp-api persists this into
+/// `dpmgr_nodes.dp_version`, replacing the `"pending"` placeholder it
+/// wrote at install-command time.
+pub static BUILD_VERSION: LazyLock<String> = LazyLock::new(|| {
+    format_build_version(env!("CARGO_PKG_VERSION"), option_env!("AISIX_BUILD_SHA"))
+});
+
+fn format_build_version(pkg_version: &str, build_sha: Option<&str>) -> String {
+    match build_sha {
+        Some(sha) if !sha.is_empty() => format!("{pkg_version}+sha-{sha}"),
+        _ => pkg_version.to_string(),
+    }
+}
 
 /// Cheap clonable callback the heartbeat invokes once per tick to pull
 /// the supervisor's most recent loader rejections. Returning a clone
@@ -332,7 +352,7 @@ async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> a
         .json(&HeartbeatBody {
             dp_id: &cfg.dp_id,
             uptime_seconds: uptime,
-            version: env!("CARGO_PKG_VERSION"),
+            version: &BUILD_VERSION,
             supported_guardrail_kinds: aisix_guardrails::supported_kinds(),
             applied_revision,
             exporter_health,
@@ -395,7 +415,7 @@ fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
 
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
-        .user_agent(format!("aisix-dp/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("aisix-dp/{}", &*BUILD_VERSION))
         .identity(identity)
         .add_root_certificate(ca)
         // Pin HTTP/1.1 for the dp-manager REST calls. dp-manager
@@ -429,6 +449,20 @@ mod tests {
     use std::path::Path;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The reported version must correlate a DP node with its container
+    /// image: CI stamps the image-tag sha, local builds stay bare.
+    #[test]
+    fn build_version_appends_stamped_image_sha() {
+        assert_eq!(
+            format_build_version("0.1.0", Some("103d3ec")),
+            "0.1.0+sha-103d3ec"
+        );
+        assert_eq!(format_build_version("0.1.0", None), "0.1.0");
+        // An empty stamp (e.g. `AISIX_BUILD_SHA=` in a misconfigured CI
+        // env) must not produce a dangling "0.1.0+sha-".
+        assert_eq!(format_build_version("0.1.0", Some("")), "0.1.0");
+    }
 
     /// Bundle on disk used by the build_client test: generates a real
     /// self-signed CA + leaf so reqwest's PEM parser actually accepts
