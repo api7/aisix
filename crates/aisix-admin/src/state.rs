@@ -4,18 +4,14 @@
 //! - the bootstrap-config-provided `admin_keys` (auth)
 //! - the `ConfigStore` trait object (CRUD backend)
 //! - a `SnapshotHandle` for authenticated operator-health handlers
-//! - an optional `Metrics` handle — when present, `/metrics` renders
-//!   the same Prometheus exposition that the proxy's middleware writes to
 //!
 //! The store is held behind an `Arc<dyn ConfigStore>` so production can
 //! wire an etcd-backed impl and tests can use `InMemoryStore` via the
 //! same type.
 
-use aisix_core::config::PrometheusConfig;
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::{AdminConfig, AisixSnapshot};
 use aisix_etcd::WatchStatus;
-use aisix_obs::Metrics;
 use aisix_proxy::{HealthTracker, LivezState, ModelRuntimeStatusTracker};
 use axum::Router;
 use std::sync::Arc;
@@ -27,8 +23,6 @@ pub struct AdminState {
     pub snapshot: SnapshotHandle<AisixSnapshot>,
     pub admin_keys: Arc<[String]>,
     pub store: Arc<dyn ConfigStore>,
-    pub metrics: Option<Arc<Metrics>>,
-    pub prometheus: PrometheusConfig,
     /// Shared in-process health tracker from the proxy. Used by the
     /// `/admin/v1/health` endpoint to report per-model health status.
     pub health_tracker: Option<Arc<HealthTracker>>,
@@ -60,8 +54,6 @@ impl AdminState {
             snapshot,
             admin_keys: Arc::from(cfg.admin_keys.clone()),
             store,
-            metrics: None,
-            prometheus: PrometheusConfig::default(),
             health_tracker: None,
             runtime_status_tracker: None,
             watch_status: None,
@@ -75,19 +67,6 @@ impl AdminState {
     /// age so operators can spot a wedged config stream.
     pub fn with_watch_status(mut self, status: WatchStatus) -> Self {
         self.watch_status = Some(status);
-        self
-    }
-
-    /// Attach a metrics handle. Production wires the same handle that
-    /// lives in `ProxyState` so a single call to `/metrics` reflects
-    /// requests from both surfaces.
-    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
-        self.metrics = Some(metrics);
-        self
-    }
-
-    pub fn with_prometheus_config(mut self, prometheus: PrometheusConfig) -> Self {
-        self.prometheus = prometheus;
         self
     }
 

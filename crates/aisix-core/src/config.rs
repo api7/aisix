@@ -458,22 +458,16 @@ pub struct MetricsConfig {
 pub struct PrometheusConfig {
     pub enabled: bool,
     pub path: String,
-    /// Optional bind address for a **dedicated** metrics listener
-    /// (e.g. `0.0.0.0:9090`). When set, the gateway serves `path` on
-    /// its own listener — separate from the admin listener that
-    /// normally hosts `/metrics`.
-    ///
-    /// This is what lets a managed-mode DP be scraped at all: managed
-    /// mode never binds the admin listener (`ManagedConfig::is_managed`),
-    /// so without a dedicated address `/metrics` is configured but
-    /// stranded on a listener that never comes up. The baked-in
-    /// `config.managed.yaml` sets this so managed DPs expose metrics by
-    /// default with no control-plane change.
-    ///
-    /// Unset (the default) keeps `/metrics` on the admin listener only,
-    /// preserving the prior behavior for self-hosted deployments.
-    #[serde(default)]
-    pub addr: Option<String>,
+    /// Bind address of the **dedicated** metrics listener (default
+    /// `0.0.0.0:9090`). The scrape endpoint always lives on its own
+    /// listener — identical in standalone and managed mode — so the
+    /// scrape surface never depends on which other listeners a
+    /// deployment binds. The admin listener does not serve `/metrics`.
+    pub addr: String,
+}
+
+impl PrometheusConfig {
+    pub const DEFAULT_ADDR: &'static str = "0.0.0.0:9090";
 }
 
 impl Default for PrometheusConfig {
@@ -481,7 +475,7 @@ impl Default for PrometheusConfig {
         Self {
             enabled: true,
             path: "/metrics".into(),
-            addr: None,
+            addr: Self::DEFAULT_ADDR.into(),
         }
     }
 }
@@ -656,15 +650,13 @@ impl Config {
                 "proxy.real_ip.trusted_proxies invalid CIDR/IP: {bad}"
             )));
         }
-        // Dedicated metrics listener address, when configured, must be a
-        // bindable socket address. Unset keeps `/metrics` on the admin
-        // listener (no dedicated listener), so only validate when present.
-        if let Some(addr) = self.observability.metrics.prometheus.addr.as_deref() {
-            if addr.parse::<std::net::SocketAddr>().is_err() {
-                return Err(BootstrapError::Config(format!(
-                    "observability.metrics.prometheus.addr invalid socket address: {addr}"
-                )));
-            }
+        // The dedicated metrics listener address must be a bindable
+        // socket address — it is always bound when prometheus is enabled.
+        let metrics_addr = &self.observability.metrics.prometheus.addr;
+        if metrics_addr.parse::<std::net::SocketAddr>().is_err() {
+            return Err(BootstrapError::Config(format!(
+                "observability.metrics.prometheus.addr invalid socket address: {metrics_addr}"
+            )));
         }
         Ok(())
     }
@@ -699,9 +691,9 @@ admin:
         assert_eq!(cfg.etcd.endpoints, vec!["http://127.0.0.1:2379"]);
         assert_eq!(cfg.proxy.request_body_limit_bytes, 10 * 1024 * 1024);
         assert!(cfg.observability.metrics.prometheus.enabled);
-        // No dedicated metrics listener unless an addr is set — `/metrics`
-        // stays on the admin listener for self-hosted deployments.
-        assert!(cfg.observability.metrics.prometheus.addr.is_none());
+        // The dedicated metrics listener defaults to 0.0.0.0:9090 in
+        // every mode — no admin-listener fallback to fall out of sync with.
+        assert_eq!(cfg.observability.metrics.prometheus.addr, "0.0.0.0:9090");
         assert_eq!(cfg.cache.backend, CacheBackend::Memory);
         // real_ip defaults: trust nothing, non-recursive, x-forwarded-for.
         assert!(cfg.proxy.real_ip.trusted_proxies.is_empty());
@@ -811,9 +803,7 @@ admin:
 
     #[test]
     fn parses_prometheus_addr_for_dedicated_listener() {
-        // A dedicated metrics listener address parses and round-trips.
-        // This is the managed-mode shape: `/metrics` is served on its
-        // own bound listener because the admin listener is never bound.
+        // An explicit metrics listener address parses and round-trips.
         let f = write_yaml(
             r#"
 etcd:
@@ -828,14 +818,11 @@ observability:
     prometheus:
       enabled: true
       path: "/metrics"
-      addr: "0.0.0.0:9090"
+      addr: "127.0.0.1:19090"
 "#,
         );
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
-        assert_eq!(
-            cfg.observability.metrics.prometheus.addr.as_deref(),
-            Some("0.0.0.0:9090"),
-        );
+        assert_eq!(cfg.observability.metrics.prometheus.addr, "127.0.0.1:19090");
     }
 
     #[test]
@@ -865,25 +852,32 @@ observability:
     }
 
     #[test]
-    fn shipped_managed_config_binds_a_dedicated_metrics_listener() {
-        // The baked managed-image config (`config.managed.yaml`) is the
-        // entire "no control-plane change" lever: a managed DP exposes
-        // `/metrics` only because this file binds a dedicated listener
-        // while the admin listener stays the unbindable sentinel. A typo
-        // here would silently un-scrape every managed DP — that file is
-        // only COPYd into the image, so nothing else catches it. Pin it.
+    fn shipped_managed_config_binds_the_metrics_listener() {
+        // The baked managed-image config (`config.managed.yaml`) is only
+        // COPYd into the image, so nothing else catches a typo that would
+        // silently un-scrape every managed DP. Pin the scrape address.
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.managed.yaml");
         let cfg =
             Config::load_from_path(Some(Path::new(path))).expect("config.managed.yaml must load");
         assert!(cfg.managed.is_managed());
+        assert!(cfg.observability.metrics.prometheus.enabled);
         assert_eq!(
-            cfg.observability.metrics.prometheus.addr.as_deref(),
-            Some("0.0.0.0:9090"),
-            "managed DPs must bind a dedicated metrics listener so they can be scraped",
+            cfg.observability.metrics.prometheus.addr, "0.0.0.0:9090",
+            "managed DPs are scraped on the dedicated metrics listener",
         );
-        // Admin is the unbindable sentinel, so the dedicated listener is
-        // the only metrics surface in managed mode.
         assert_eq!(cfg.admin.addr, "127.0.0.1:0");
+    }
+
+    #[test]
+    fn shipped_example_config_binds_the_metrics_listener() {
+        // `config.example.yaml` is the self-hosted reference shape; pin
+        // the explicit unified scrape address so standalone and managed
+        // deployments document the same metrics surface.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.example.yaml");
+        let cfg =
+            Config::load_from_path(Some(Path::new(path))).expect("config.example.yaml must load");
+        assert!(cfg.observability.metrics.prometheus.enabled);
+        assert_eq!(cfg.observability.metrics.prometheus.addr, "0.0.0.0:9090");
     }
 
     #[test]

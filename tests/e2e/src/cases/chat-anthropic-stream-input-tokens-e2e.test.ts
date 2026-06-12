@@ -113,7 +113,7 @@ describe("/v1/chat/completions anthropic streaming input tokens (#450)", () => {
     let inTok = 0;
     let outTok = 0;
     while (Date.now() < deadline) {
-      const scrape = await fetch(`${app.adminUrl}/metrics`).then((r) => r.text());
+      const scrape = await fetch(`${app.metricsUrl}/metrics`).then((r) => r.text());
       inTok = sumMetric(scrape, "aisix_llm_input_tokens_total", "/v1/chat/completions");
       outTok = sumMetric(scrape, "aisix_llm_output_tokens_total", "/v1/chat/completions");
       if (inTok > 0 && outTok > 0) break;

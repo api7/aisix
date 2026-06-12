@@ -53,11 +53,10 @@ observability:
     prometheus:
       enabled: true
       path: "/metrics"
-      # Dedicated metrics listener. Managed mode never binds the admin
-      # listener that otherwise hosts `/metrics`, so this is what makes a
-      # managed DP scrapeable. Bound by default here (no control-plane
-      # change needed); expose this port in your deployment and point
-      # Prometheus at it. Override with AISIX_OBSERVABILITY__METRICS__PROMETHEUS__ADDR.
+      # Dedicated metrics listener — the only Prometheus scrape surface,
+      # the same in every deployment mode. Expose this port in your
+      # deployment and point Prometheus at it. Override with
+      # AISIX_OBSERVABILITY__METRICS__PROMETHEUS__ADDR.
       addr: "0.0.0.0:9090"
     otlp:
       enabled: false

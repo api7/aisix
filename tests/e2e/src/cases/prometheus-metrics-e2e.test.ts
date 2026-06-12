@@ -61,7 +61,7 @@ describe("prometheus metrics e2e", () => {
     });
     expect(status, JSON.stringify(body)).toBe(200);
 
-    const scrape = await fetch(`${app.adminUrl}/metrics`);
+    const scrape = await fetch(`${app.metricsUrl}/metrics`);
     expect(scrape.status).toBe(200);
     const text = await scrape.text();
 
@@ -104,10 +104,10 @@ describe("prometheus metrics e2e", () => {
         return probe.status === 200;
       });
 
-      const defaultScrape = await fetch(`${customApp.adminUrl}/metrics`);
+      const defaultScrape = await fetch(`${customApp.metricsUrl}/metrics`);
       expect(defaultScrape.status).toBe(404);
 
-      const scrape = await fetch(`${customApp.adminUrl}/custom-metrics`);
+      const scrape = await fetch(`${customApp.metricsUrl}/custom-metrics`);
       expect(scrape.status).toBe(200);
       const text = await scrape.text();
       expect(text).toMatch(
@@ -146,7 +146,7 @@ describe("prometheus metrics e2e", () => {
       return probe.status === 200;
     });
 
-    const before = await fetch(`${app.adminUrl}/metrics`).then((r) => r.text());
+    const before = await fetch(`${app.metricsUrl}/metrics`).then((r) => r.text());
     const beforeCount = parseUsageEmittedCount(before, "chat", "2xx", "openai");
 
     const { status } = await proxy.chat({
@@ -155,7 +155,7 @@ describe("prometheus metrics e2e", () => {
     });
     expect(status).toBe(200);
 
-    const after = await fetch(`${app.adminUrl}/metrics`).then((r) => r.text());
+    const after = await fetch(`${app.metricsUrl}/metrics`).then((r) => r.text());
     expect(after).toContain("aisix_usage_events_emitted_total");
     // The counter line must carry all three #408 labels — handler,
     // bucketed status_code, inbound_protocol. A regression that
@@ -180,7 +180,7 @@ describe("prometheus metrics e2e", () => {
     expect(afterCount - beforeCount).toBeGreaterThanOrEqual(1);
   });
 
-  test("disabled prometheus endpoint is not mounted", async (ctx) => {
+  test("disabled prometheus leaves the metrics port unbound", async (ctx) => {
     if (!etcdReachable) {
       ctx.skip();
       return;
@@ -188,77 +188,53 @@ describe("prometheus metrics e2e", () => {
 
     const disabledApp = await spawnApp({ prometheus: false });
     try {
-      const scrape = await fetch(`${disabledApp.adminUrl}/metrics`);
-      expect(scrape.status).toBe(404);
-      expect(await scrape.text()).not.toContain("aisix_");
+      // No listener at all: the fetch must fail at the connection level,
+      // not return an HTTP error.
+      await expect(fetch(`${disabledApp.metricsUrl}/metrics`)).rejects.toThrow();
     } finally {
       await disabledApp.exit();
     }
   });
 
-  // Issue #580: a managed DP never binds the admin listener that hosts
-  // `/metrics`, so the scrape surface must be available on a dedicated
-  // listener bound from `observability.metrics.prometheus.addr`. This
-  // pins the mechanism end-to-end: a separate port (distinct from admin)
-  // serves the AISIX-native series after real proxy traffic, and that
-  // listener carries ONLY metrics — no admin routes leak onto it.
-  test("dedicated metrics listener serves scrape on its own port", async (ctx) => {
-    if (!etcdReachable) {
+  // The dedicated metrics listener is the ONLY scrape surface — the same
+  // mechanism in standalone and managed mode. This pins the topology
+  // end-to-end: the metrics port (distinct from admin) serves the
+  // AISIX-native series after real proxy traffic, no admin routes leak
+  // onto it, and the admin listener does not serve `/metrics` at all.
+  test("metrics listener is the only scrape surface", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
       ctx.skip();
       return;
     }
 
-    const dedicatedUpstream = await startOpenAiUpstream({
-      nonStreamBody: responseBody(),
+    // A different port from the admin listener.
+    expect(app.metricsUrl).not.toBe(app.adminUrl);
+
+    // Drive traffic so the AISIX-native series exist regardless of
+    // which tests ran before this one.
+    const proxy = new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT);
+    await waitConfigPropagation(async () => {
+      const probe = await proxy.chat({
+        model: "prometheus-gpt",
+        messages: [{ role: "user", content: "ready" }],
+      });
+      return probe.status === 200;
     });
-    const dedicatedApp = await spawnApp({ metricsListener: true });
-    try {
-      expect(dedicatedApp.metricsUrl).toBeDefined();
-      const metricsUrl = dedicatedApp.metricsUrl as string;
-      // The dedicated listener is a different port from the admin listener.
-      expect(metricsUrl).not.toBe(dedicatedApp.adminUrl);
 
-      const dedicatedAdmin = new AdminClient(
-        dedicatedApp.adminUrl,
-        dedicatedApp.adminKey,
-      );
-      await configureOpenAi(
-        dedicatedAdmin,
-        dedicatedUpstream,
-        "prometheus-dedicated-gpt",
-      );
-      const proxy = new ProxyClient(dedicatedApp.proxyUrl, CALLER_PLAINTEXT);
-      await waitConfigPropagation(async () => {
-        const probe = await proxy.chat({
-          model: "prometheus-dedicated-gpt",
-          messages: [{ role: "user", content: "ready" }],
-        });
-        return probe.status === 200;
-      });
+    const scrape = await fetch(`${app.metricsUrl}/metrics`);
+    expect(scrape.status).toBe(200);
+    const text = await scrape.text();
+    expect(text).toContain("aisix_proxy_requests_total");
+    expect(text).toContain("aisix_llm_total_tokens_total");
 
-      const { status, body } = await proxy.chat({
-        model: "prometheus-dedicated-gpt",
-        messages: [{ role: "user", content: "metrics" }],
-      });
-      expect(status, JSON.stringify(body)).toBe(200);
+    // The metrics listener carries ONLY metrics — admin routes are not
+    // mounted there.
+    const adminProbe = await fetch(`${app.metricsUrl}/admin/v1/health`);
+    expect(adminProbe.status).toBe(404);
 
-      const scrape = await fetch(`${metricsUrl}/metrics`);
-      expect(scrape.status).toBe(200);
-      const text = await scrape.text();
-      expect(text).toContain("aisix_proxy_requests_total");
-      expect(text).toContain("aisix_llm_total_tokens_total");
-      expect(text).toMatch(
-        /aisix_proxy_requests_total\{[^}]*model="prometheus-dedicated-gpt"/,
-      );
-
-      // The dedicated listener carries ONLY metrics — admin routes are not
-      // mounted there, proving the scrape surface is decoupled from admin.
-      const adminProbe = await fetch(`${metricsUrl}/admin/v1/health`);
-      expect(adminProbe.status).toBe(404);
-    } finally {
-      await dedicatedApp.exit();
-      await dedicatedUpstream.close();
-    }
+    // And the admin listener no longer hosts the scrape endpoint.
+    const adminScrape = await fetch(`${app.adminUrl}/metrics`);
+    expect(adminScrape.status).toBe(404);
   });
 });
 

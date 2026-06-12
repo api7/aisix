@@ -15,7 +15,7 @@ import { EtcdClient, pickFreePorts } from "../harness/index.js";
 // serving plain HTTP while the docs claimed TLS. This spec configures a
 // self-signed cert on both listeners and asserts:
 //   1. HTTPS works on the proxy listener (`/livez`).
-//   2. HTTPS works on the admin listener (`/metrics`, unauthenticated).
+//   2. HTTPS works on the admin listener (`/livez`, unauthenticated).
 //   3. A plain-HTTP request to the TLS proxy port does NOT succeed.
 
 const BIN_PATH =
@@ -63,7 +63,8 @@ describe("listener TLS (#473)", () => {
       "-addext", "subjectAltName=IP:127.0.0.1",
     ]);
 
-    [proxyPort, adminPort] = await pickFreePorts(2);
+    let metricsPort = 0;
+    [proxyPort, adminPort, metricsPort] = await pickFreePorts(3);
     const adminKey = `admin-${randomUUID()}`;
     const cfg = {
       etcd: {
@@ -86,7 +87,15 @@ describe("listener TLS (#473)", () => {
         service_name: "aisix-e2e-tls",
         log_level: "warn",
         access_log: false,
-        metrics: { prometheus: { enabled: true, path: "/metrics" } },
+        // Explicit free port so concurrent test files never collide on
+        // the default 0.0.0.0:9090 metrics listener.
+        metrics: {
+          prometheus: {
+            enabled: true,
+            path: "/metrics",
+            addr: `127.0.0.1:${metricsPort}`,
+          },
+        },
       },
       cache: { backend: "memory" },
     };
@@ -136,7 +145,7 @@ describe("listener TLS (#473)", () => {
 
   test("admin listener serves HTTPS", async (ctx) => {
     if (!etcdReachable) return ctx.skip();
-    const res = await request(`https://127.0.0.1:${adminPort}/metrics`, {
+    const res = await request(`https://127.0.0.1:${adminPort}/livez`, {
       dispatcher: insecureAgent,
     });
     res.body.dump();

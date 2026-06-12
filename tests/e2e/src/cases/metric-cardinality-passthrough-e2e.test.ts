@@ -39,7 +39,7 @@ describe("metric label cardinality for passthrough (#451)", () => {
       }).catch(() => {});
     }
 
-    const scrape = await fetch(`${app.adminUrl}/metrics`).then((r) => r.text());
+    const scrape = await fetch(`${app.metricsUrl}/metrics`).then((r) => r.text());
     const inFlightLines = scrape
       .split("\n")
       .filter((l) => l.startsWith("aisix_proxy_in_flight_requests{"));
