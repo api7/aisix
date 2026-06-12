@@ -2857,6 +2857,67 @@ mod tests {
         assert_eq!(v["usage"]["output_tokens"], 3);
     }
 
+    /// #597: Claude Code/cc-switch send `role: "system"` inside
+    /// `messages[]`. The cross-provider path must keep it as an OpenAI
+    /// system message instead of rejecting the request with a 400.
+    /// The wiremock matcher is strict on the translated body — if the
+    /// system turn is dropped or reordered the upstream 404s.
+    #[tokio::test]
+    async fn non_anthropic_model_preserves_system_role_in_messages() {
+        use aisix_provider_openai::OpenAiBridge;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "system", "content": "respond in French"},
+                    {"role": "user", "content": "hello again"},
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-XYZ",
+                "object": "chat.completion",
+                "created": 1_715_000_000_u64,
+                "model": "gpt-4o",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Bonjour!"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai(&upstream.uri());
+        snap.models.insert(openai_model("my-claude-alias"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let app = crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache());
+
+        let body = serde_json::json!({
+            "model": "my-claude-alias",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "respond in French"},
+                {"role": "user", "content": "hello again"},
+            ],
+            "max_tokens": 100
+        });
+        let resp = app.oneshot(make_req(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["type"], "message");
+        assert_eq!(v["content"][0]["text"], "Bonjour!");
+    }
+
     /// Streaming variant: the client asks for SSE; we translate
     /// OpenAI delta chunks to Anthropic message_start /
     /// content_block_delta / message_stop events.

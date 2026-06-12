@@ -690,7 +690,7 @@ pub enum AnthropicInboundError {
     MissingMessages,
     #[error("messages[{idx}] missing `role`")]
     MessageMissingRole { idx: usize },
-    #[error("messages[{idx}] role {role:?} is not 'user' or 'assistant'")]
+    #[error("messages[{idx}] role {role:?} is not 'user', 'assistant' or 'system'")]
     UnsupportedRole { idx: usize, role: String },
     #[error("messages[{idx}].content must be a string or an array of text blocks")]
     UnsupportedContent { idx: usize },
@@ -768,6 +768,10 @@ pub fn parse_inbound_request(
         match role {
             "user" => messages.push(ChatMessage::user(content)),
             "assistant" => messages.push(ChatMessage::assistant(content)),
+            // Not in the Anthropic spec, but Claude Code/cc-switch send it
+            // (#597). Keep it as a system message so OpenAI-compatible
+            // upstreams receive it natively instead of a 400 here.
+            "system" => messages.push(ChatMessage::system(content)),
             other => {
                 return Err(AnthropicInboundError::UnsupportedRole {
                     idx,
@@ -1955,6 +1959,27 @@ mod tests {
         assert!(chat.extra.contains_key("tools"));
         assert!(!chat.extra.contains_key("model"));
         assert!(!chat.extra.contains_key("messages"));
+    }
+
+    /// #597: Claude Code/cc-switch send `role: "system"` inside `messages[]`
+    /// even though the Anthropic spec only allows user/assistant. Parse it
+    /// as Role::System instead of rejecting the whole request with a 400.
+    #[test]
+    fn parse_inbound_accepts_system_role_in_messages() {
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "respond in French"},
+                {"role": "user", "content": "hello again"},
+            ],
+        });
+        let chat = parse_inbound_request(&body).unwrap();
+        assert_eq!(chat.messages.len(), 3);
+        assert_eq!(chat.messages[0].role, Role::User);
+        assert_eq!(chat.messages[1].role, Role::System);
+        assert_eq!(chat.messages[1].content_str(), "respond in French");
+        assert_eq!(chat.messages[2].role, Role::User);
     }
 
     #[test]
