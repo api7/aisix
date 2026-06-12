@@ -1083,6 +1083,17 @@ async fn dispatch(
         // `content_cap` (None on the common content-free path).
         let captured_prompt_for_telem =
             content_cap.map(|_| serde_json::to_string(req).unwrap_or_default());
+        // #790: the bridge injects `stream_options.include_usage` on the
+        // upstream leg whenever the client didn't set stream_options — the
+        // terminal usage-only chunk that produces is for the gateway's own
+        // telemetry. It reaches the client only when the client itself
+        // asked for usage.
+        let client_requested_usage = req
+            .extra
+            .get("stream_options")
+            .and_then(|so| so.get("include_usage"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let sse_stream = build_sse_stream(
             upstream,
             now,
@@ -1090,6 +1101,7 @@ async fn dispatch(
             started,
             req.model.clone(),
             content_cap,
+            client_requested_usage,
             move |comp: StreamCompletion| {
                 // Rate-limit accounting (TPM cap) for all layers.
                 for key in &post_stream_keys {
@@ -2333,6 +2345,7 @@ impl<F: FnOnce(StreamCompletion)> Drop for CompleteOnDrop<F> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_sse_stream<F>(
     upstream: aisix_gateway::ChatChunkStream,
     created: i64,
@@ -2345,6 +2358,10 @@ fn build_sse_stream<F>(
     // Largest content cap any content-capturing exporter wants, or `None` to
     // skip response accumulation entirely (the common, content-free path).
     content_cap: Option<u32>,
+    // Whether the CLIENT asked for `stream_options.include_usage`. The
+    // gateway asks the upstream regardless (#790, for telemetry); the
+    // terminal usage-only chunk is forwarded only when this is true.
+    client_requested_usage: bool,
     on_complete: F,
 ) -> impl Stream<Item = Result<Event, Infallible>>
 where
@@ -2516,6 +2533,21 @@ where
                         if u.cache_read_tokens > comp.cache_read_tokens {
                             comp.cache_read_tokens = u.cache_read_tokens;
                         }
+                    }
+                    // #790: a usage-only terminal chunk (no delta payload, no
+                    // finish_reason) exists because the gateway injected
+                    // `include_usage` on the upstream leg. Its counts are
+                    // already folded into `comp` above — forward it only when
+                    // the client itself asked for usage.
+                    if !client_requested_usage
+                        && chunk.usage.is_some()
+                        && chunk.finish_reason.is_none()
+                        && chunk.delta.role.is_none()
+                        && chunk.delta.content.is_none()
+                        && chunk.delta.tool_calls.is_none()
+                        && chunk.delta.reasoning_content.is_none()
+                    {
+                        continue;
                     }
                     let rendered = render_chunk(created, chunk, &client_facing_model);
                     match serde_json::to_string(&rendered) {

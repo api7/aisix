@@ -44,6 +44,15 @@ pub struct OpenAiRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     pub stream: bool,
+    /// `{"include_usage": true}` injected on streaming requests when the
+    /// caller didn't set `stream_options` itself — OpenAI-protocol
+    /// upstreams omit the terminal `usage` frame without it, which
+    /// zeroed token telemetry for every streaming request whose client
+    /// didn't ask (AISIX-Cloud#790). `None` whenever `extra` already
+    /// carries a client-supplied `stream_options` (the flattened map
+    /// wins; a typed duplicate would emit the key twice).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<serde_json::Value>,
     #[serde(flatten)]
     pub extra: &'a serde_json::Map<String, serde_json::Value>,
 }
@@ -99,6 +108,8 @@ pub fn build_request<'a>(
         top_p: req.top_p,
         max_tokens: req.max_tokens,
         stream,
+        stream_options: (stream && !req.extra.contains_key("stream_options"))
+            .then(|| serde_json::json!({"include_usage": true})),
         extra: &req.extra,
     }
 }
@@ -1277,6 +1288,76 @@ mod tests {
         assert_eq!(json["stream"], true);
         assert_eq!(json["messages"][0]["role"], "user");
         assert_eq!(json["messages"][0]["content"], "hi");
+    }
+
+    /// #790: streaming requests must ask the upstream for the terminal
+    /// usage frame — without `stream_options.include_usage` an OpenAI
+    /// upstream never sends usage and token telemetry records 0.
+    #[test]
+    fn build_request_injects_include_usage_on_streaming() {
+        let req = ChatFormat {
+            model: "m".into(),
+            messages: vec![ChatMessage::user("hi")],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stream: Some(true),
+            extra: serde_json::Map::new(),
+        };
+        let msgs = messages_from(&req);
+        let json = serde_json::to_value(build_request(&req, "gpt-4o", &msgs, true)).unwrap();
+        assert_eq!(
+            json["stream_options"],
+            serde_json::json!({"include_usage": true})
+        );
+    }
+
+    /// A client-supplied `stream_options` wins verbatim — the typed
+    /// injection must not duplicate or override it.
+    #[test]
+    fn build_request_respects_client_stream_options() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "stream_options".into(),
+            serde_json::json!({"include_usage": false}),
+        );
+        let req = ChatFormat {
+            model: "m".into(),
+            messages: vec![],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stream: Some(true),
+            extra,
+        };
+        let msgs = messages_from(&req);
+        let raw = serde_json::to_string(&build_request(&req, "gpt-4o", &msgs, true)).unwrap();
+        // Exactly one stream_options key on the wire (flatten + typed
+        // field would double-emit if both were set).
+        assert_eq!(raw.matches("stream_options").count(), 1);
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            json["stream_options"],
+            serde_json::json!({"include_usage": false})
+        );
+    }
+
+    /// Non-streaming requests must not carry stream_options at all —
+    /// OpenAI rejects it when `stream` is false.
+    #[test]
+    fn build_request_omits_stream_options_when_not_streaming() {
+        let req = ChatFormat {
+            model: "m".into(),
+            messages: vec![],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stream: None,
+            extra: serde_json::Map::new(),
+        };
+        let msgs = messages_from(&req);
+        let json = serde_json::to_value(build_request(&req, "gpt-4o", &msgs, false)).unwrap();
+        assert!(json.get("stream_options").is_none());
     }
 
     #[test]

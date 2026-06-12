@@ -950,6 +950,18 @@ pub struct AnthropicSseEncoder {
     next_block_index: usize,
     /// Per-OpenAI-delta-index tool call state.
     tool_calls: std::collections::BTreeMap<u64, ToolCallState>,
+    /// Stop reason captured at the `finish_reason` chunk while the
+    /// closing `message_delta`/`message_stop` pair is withheld. With
+    /// `stream_options.include_usage` (AISIX-Cloud#790) an OpenAI
+    /// upstream sends its only `usage` frame AFTER the stop chunk;
+    /// emitting the pair at the stop chunk would hand the client
+    /// `output_tokens: 0` and drop the usage frame unread.
+    pending_stop_reason: Option<&'static str>,
+    /// Best-known cumulative usage across all chunks. Max semantics —
+    /// robust to providers that double-emit usage.
+    seen_input_tokens: u32,
+    seen_output_tokens: u32,
+    usage_seen: bool,
 }
 
 impl AnthropicSseEncoder {
@@ -972,13 +984,35 @@ impl AnthropicSseEncoder {
             finished: false,
             next_block_index: 0,
             tool_calls: std::collections::BTreeMap::new(),
+            pending_stop_reason: None,
+            seen_input_tokens: 0,
+            seen_output_tokens: 0,
+            usage_seen: false,
         }
     }
 
     /// Translate one chunk into the Anthropic SSE events to emit.
-    /// Returns an empty Vec on no-op chunks (e.g. usage-only).
+    /// Returns an empty Vec on no-op chunks.
     pub fn next_events(&mut self, chunk: &ChatChunk) -> Vec<AnthropicSseEvent> {
         if self.finished {
+            return Vec::new();
+        }
+
+        if let Some(u) = chunk.usage.as_ref() {
+            self.usage_seen = true;
+            self.seen_input_tokens = self.seen_input_tokens.max(u.prompt_tokens);
+            self.seen_output_tokens = self.seen_output_tokens.max(u.completion_tokens);
+        }
+
+        // Closing pair withheld at the stop chunk: only the trailing
+        // usage frame releases it (stream end does too, via
+        // `force_finish`). Post-stop chunks carry no renderable
+        // content, so nothing else is emitted from here.
+        if let Some(reason) = self.pending_stop_reason {
+            if self.usage_seen {
+                self.pending_stop_reason = None;
+                return self.closing_pair(reason);
+            }
             return Vec::new();
         }
 
@@ -1113,12 +1147,35 @@ impl AnthropicSseEncoder {
                 FinishReason::ToolCalls => "tool_use",
                 FinishReason::Other(_) => "end_turn",
             };
-            let output_tokens = chunk
-                .usage
-                .as_ref()
-                .map(|u| u.completion_tokens)
-                .unwrap_or(0);
-            events.push(AnthropicSseEvent {
+            if self.usage_seen {
+                // Usage already known (provider attached it to the stop
+                // chunk or earlier) — close out immediately.
+                events.extend(self.closing_pair(stop_reason));
+            } else {
+                // OpenAI's `stream_options.include_usage` frame arrives
+                // AFTER the stop chunk — withhold the closing pair so
+                // it can carry real token counts.
+                self.pending_stop_reason = Some(stop_reason);
+            }
+        }
+
+        events
+    }
+
+    /// The closing `message_delta` + `message_stop` pair, carrying the
+    /// best-known cumulative usage. `input_tokens` is included when
+    /// known — on a translated stream `message_start` fires before any
+    /// usage frame exists and always reports 0, so this is the only
+    /// place the client can learn the prompt token count.
+    fn closing_pair(&mut self, stop_reason: &'static str) -> Vec<AnthropicSseEvent> {
+        let mut usage = serde_json::Map::new();
+        if self.seen_input_tokens > 0 {
+            usage.insert("input_tokens".into(), self.seen_input_tokens.into());
+        }
+        usage.insert("output_tokens".into(), self.seen_output_tokens.into());
+        self.finished = true;
+        vec![
+            AnthropicSseEvent {
                 event: "message_delta",
                 data: serde_json::json!({
                     "type": "message_delta",
@@ -1126,17 +1183,14 @@ impl AnthropicSseEncoder {
                         "stop_reason": stop_reason,
                         "stop_sequence": serde_json::Value::Null,
                     },
-                    "usage": {"output_tokens": output_tokens},
+                    "usage": serde_json::Value::Object(usage),
                 }),
-            });
-            events.push(AnthropicSseEvent {
+            },
+            AnthropicSseEvent {
                 event: "message_stop",
                 data: serde_json::json!({"type": "message_stop"}),
-            });
-            self.finished = true;
-        }
-
-        events
+            },
+        ]
     }
 
     pub fn is_finished(&self) -> bool {
@@ -1144,12 +1198,21 @@ impl AnthropicSseEncoder {
     }
 
     /// Force-close the stream when the upstream ended without
-    /// emitting a chunk with `finish_reason`. Emits the closing trio
-    /// with `stop_reason: "end_turn"` and `output_tokens: 0`.
+    /// releasing the closing pair — either no `finish_reason` chunk at
+    /// all (closes with `end_turn`), or a stop chunk arrived but the
+    /// trailing usage frame never did (flushes the withheld pair with
+    /// the real stop reason). Usage carries the best-known counts.
     /// Idempotent.
     pub fn force_finish(&mut self) -> Vec<AnthropicSseEvent> {
         if self.finished {
             return Vec::new();
+        }
+        // A withheld closing pair (stop seen, but the upstream ignored
+        // `stream_options` and never sent a usage frame): flush it with
+        // the real stop reason. Content blocks were already closed at
+        // the stop chunk.
+        if let Some(reason) = self.pending_stop_reason.take() {
+            return self.closing_pair(reason);
         }
         let mut events = Vec::new();
         if !self.sent_message_start {
@@ -1164,22 +1227,7 @@ impl AnthropicSseEncoder {
                 events.push(content_block_stop_event(state.content_block_index));
             }
         }
-        events.push(AnthropicSseEvent {
-            event: "message_delta",
-            data: serde_json::json!({
-                "type": "message_delta",
-                "delta": {
-                    "stop_reason": "end_turn",
-                    "stop_sequence": serde_json::Value::Null,
-                },
-                "usage": {"output_tokens": 0},
-            }),
-        });
-        events.push(AnthropicSseEvent {
-            event: "message_stop",
-            data: serde_json::json!({"type": "message_stop"}),
-        });
-        self.finished = true;
+        events.extend(self.closing_pair("end_turn"));
         events
     }
 
@@ -2079,6 +2127,70 @@ mod tests {
         assert!(enc.is_finished());
         // Subsequent chunks are silent.
         assert!(enc.next_events(&delta_chunk("ignored")).is_empty());
+    }
+
+    /// #790: OpenAI's `stream_options.include_usage` frame arrives
+    /// AFTER the stop chunk. The closing pair must wait for it so the
+    /// client sees real token counts instead of `output_tokens: 0`.
+    #[test]
+    fn sse_encoder_holds_close_until_post_stop_usage_frame() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
+        let _ = enc.next_events(&delta_chunk("hi"));
+
+        // Stop chunk with NO usage — only the content block closes.
+        let stop_no_usage = ChatChunk {
+            id: "cmpl-1".into(),
+            model: "u".into(),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::Stop),
+            usage: None,
+        };
+        let events = enc.next_events(&stop_no_usage);
+        let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
+        assert_eq!(kinds, vec!["content_block_stop"]);
+        assert!(!enc.is_finished());
+
+        // The trailing usage-only frame releases the closing pair,
+        // carrying both input and output tokens.
+        let usage_only = ChatChunk {
+            id: "cmpl-1".into(),
+            model: "u".into(),
+            delta: ChatDelta::default(),
+            finish_reason: None,
+            usage: Some(UsageStats::new(17, 23)),
+        };
+        let events = enc.next_events(&usage_only);
+        let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
+        assert_eq!(kinds, vec!["message_delta", "message_stop"]);
+        assert_eq!(events[0].data["delta"]["stop_reason"], "end_turn");
+        assert_eq!(events[0].data["usage"]["input_tokens"], 17);
+        assert_eq!(events[0].data["usage"]["output_tokens"], 23);
+        assert!(enc.is_finished());
+    }
+
+    /// An upstream that ignores `stream_options` never sends the usage
+    /// frame — stream end (force_finish) must flush the withheld pair
+    /// with the REAL stop reason, not `end_turn`.
+    #[test]
+    fn sse_encoder_force_finish_flushes_held_close_with_real_stop_reason() {
+        let mut enc = AnthropicSseEncoder::new("msg_01", "alias", 0);
+        let _ = enc.next_events(&delta_chunk("hi"));
+        let stop_no_usage = ChatChunk {
+            id: "cmpl-1".into(),
+            model: "u".into(),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::ToolCalls),
+            usage: None,
+        };
+        let _ = enc.next_events(&stop_no_usage);
+        assert!(!enc.is_finished());
+
+        let events = enc.force_finish();
+        let kinds: Vec<_> = events.iter().map(|e| e.event).collect();
+        assert_eq!(kinds, vec!["message_delta", "message_stop"]);
+        assert_eq!(events[0].data["delta"]["stop_reason"], "tool_use");
+        assert_eq!(events[0].data["usage"]["output_tokens"], 0);
+        assert!(enc.is_finished());
     }
 
     #[test]

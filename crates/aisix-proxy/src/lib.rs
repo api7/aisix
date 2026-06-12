@@ -2466,12 +2466,12 @@ data: [DONE]\n\n"
     #[tokio::test]
     async fn streaming_chat_tpm_cap_enforced_after_post_stream_commit_issue_108() {
         let upstream = MockServer::start().await;
-        // Final SSE chunk carries usage. OpenAI emits this when the
-        // client sets `stream_options.include_usage=true`; the proxy
-        // doesn't yet add that on the streamed leg, but the OpenAI
-        // bridge does parse `usage` off any chunk that has one — so
-        // our mock can include it on the terminal chunk and the
-        // bridge will surface it.
+        // Final SSE chunk carries usage attached to the stop chunk —
+        // some OpenAI-compatible servers do this instead of OpenAI's
+        // separate usage-only terminal frame. The bridge parses
+        // `usage` off any chunk that has one, so both shapes commit
+        // tokens (the separate-frame shape is covered by the #790
+        // tests below).
         let sse = "\
 data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
 data: {\"id\":\"up-1\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
@@ -2532,6 +2532,153 @@ data: [DONE]\n\n";
         let body_bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(v["error"]["type"], "rate_limit_exceeded");
+    }
+
+    /// #790 (AISIX-Cloud): every OpenAI-protocol streaming leg now asks
+    /// the upstream for the terminal usage frame by injecting
+    /// `stream_options: {"include_usage": true}` when the client didn't
+    /// set stream_options itself. Token telemetry used to record 0 for
+    /// every streaming request whose client didn't ask. Three contracts,
+    /// one mock (OpenAI's real include_usage shape — stop chunk without
+    /// usage, then a usage-only frame with empty `choices`):
+    ///  1. the outbound upstream body carries the injected stream_options;
+    ///  2. the usage frame feeds the UsageEvent (500/1000, not 0/0);
+    ///  3. the usage-only frame is stripped from the client-visible
+    ///     stream — the client never asked for usage.
+    #[tokio::test]
+    async fn streaming_chat_injects_include_usage_and_strips_usage_frame_issue_790() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"up-790\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-790\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-790\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: {\"id\":\"up-790\",\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":500,\"completion_tokens\":1000,\"total_tokens\":1500}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(build_router(state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut client_bytes = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            client_bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let client_body = String::from_utf8(client_bytes).unwrap();
+
+        // (3) Content reaches the client; the unrequested usage frame
+        // does not.
+        assert!(client_body.contains("hi"));
+        assert!(
+            !client_body.contains("\"usage\""),
+            "usage-only frame must be stripped when the client didn't \
+             request stream_options.include_usage; got:\n{client_body}"
+        );
+
+        // (2) Telemetry carries the upstream-billed counts.
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("usage event was never emitted")
+            .expect("sender dropped without sending");
+        assert_eq!(event.prompt_tokens, 500);
+        assert_eq!(event.completion_tokens, 1000);
+
+        // (1) The outbound request asked for the usage frame.
+        let reqs = upstream.received_requests().await.unwrap();
+        let sent: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(
+            sent["stream_options"],
+            serde_json::json!({"include_usage": true}),
+            "streaming leg must inject stream_options.include_usage (#790)"
+        );
+    }
+
+    /// Companion to the #790 test above: a client that asked for usage
+    /// itself still receives the usage frame, and its stream_options
+    /// passes through verbatim (no duplicate injection).
+    #[tokio::test]
+    async fn streaming_chat_forwards_usage_frame_when_client_asked_issue_790() {
+        let upstream = MockServer::start().await;
+        let sse = "\
+data: {\"id\":\"up-790b\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"up-790b\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: {\"id\":\"up-790b\",\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7,\"total_tokens\":12}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = seed_snapshot("my-gpt4", &["my-gpt4"], &upstream.uri());
+        let state = build_state(snap, hub);
+
+        let body = serde_json::json!({
+            "model": "my-gpt4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(build_router(state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut client_bytes = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            client_bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let client_body = String::from_utf8(client_bytes).unwrap();
+        assert!(
+            client_body.contains("\"prompt_tokens\":5"),
+            "client asked for usage — the frame must be forwarded; got:\n{client_body}"
+        );
+
+        let reqs = upstream.received_requests().await.unwrap();
+        let raw = String::from_utf8(reqs[0].body.clone()).unwrap();
+        assert_eq!(
+            raw.matches("stream_options").count(),
+            1,
+            "client-supplied stream_options must pass through exactly once"
+        );
     }
 
     #[tokio::test]
