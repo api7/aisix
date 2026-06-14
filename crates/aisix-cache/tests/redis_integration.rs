@@ -105,6 +105,47 @@ async fn ttl_eviction_drops_entry_after_window() {
 }
 
 #[tokio::test]
+async fn put_with_ttl_honors_per_entry_window_over_global() {
+    // Regression: a Redis-backed `CachePolicy` carries its own
+    // `ttl_seconds`, which the proxy passes via `put_with_ttl`. The entry
+    // must expire on that per-policy window, NOT the instance-global
+    // default. With a 300s global and a 1s per-entry TTL, a backend that
+    // drops the per-entry value keeps the entry alive well past 1.5s; the
+    // contract requires it gone.
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: CACHE_TEST_REDIS_URL not set");
+        return;
+    };
+
+    let cache = RedisCache::connect(&url)
+        .await
+        .expect("redis connect")
+        .with_prefix(format!("aisix:test:{}", uuid_like()))
+        .with_ttl(Duration::from_secs(300));
+
+    cache
+        .put_with_ttl(
+            "per-entry-ttl",
+            sample("short-lived"),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert!(
+        cache.get("per-entry-ttl").await.unwrap().is_some(),
+        "entry must be present immediately after write"
+    );
+
+    // Per-entry TTL is 1s (EX 1 = expire within ≤1s); sleep past it with
+    // headroom. The 300s instance global must not win.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(
+        cache.get("per-entry-ttl").await.unwrap().is_none(),
+        "per-policy ttl_seconds (1s) must be honored, not the 300s instance global"
+    );
+}
+
+#[tokio::test]
 async fn missing_key_returns_none() {
     let Some(url) = redis_url() else {
         eprintln!("skipping: CACHE_TEST_REDIS_URL not set");

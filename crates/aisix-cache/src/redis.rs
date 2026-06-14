@@ -60,8 +60,10 @@ impl RedisCache {
         })
     }
 
-    /// Override the per-entry TTL. Caps at `u64::MAX / 1000` to stay
-    /// inside Redis's `EX` second range.
+    /// Override the instance **default** TTL — the fallback `put` uses
+    /// when a write carries no per-entry value. Per-policy writes go
+    /// through `put_with_ttl` and use their own `CachePolicy.ttl_seconds`
+    /// instead, ignoring this. Floors at 1s (`EX 0` expires immediately).
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         self.ttl_secs = ttl.as_secs().max(1);
         self
@@ -97,12 +99,29 @@ impl Cache for RedisCache {
     }
 
     async fn put(&self, key: &str, value: ChatResponse) -> Result<(), CacheError> {
+        // No per-entry TTL supplied: fall back to the instance default.
+        self.put_with_ttl(key, value, Duration::from_secs(self.ttl_secs))
+            .await
+    }
+
+    /// Honors the caller-supplied per-entry TTL — the matched
+    /// `CachePolicy.ttl_seconds` the proxy threads in — rather than the
+    /// instance default, so a Redis-backed policy expires its entries on
+    /// its own schedule. Floors at 1s: Redis `EX 0` expires immediately,
+    /// turning every entry into a guaranteed miss.
+    async fn put_with_ttl(
+        &self,
+        key: &str,
+        value: ChatResponse,
+        ttl: Duration,
+    ) -> Result<(), CacheError> {
         let json = serde_json::to_string(&value)
             .map_err(|e| CacheError::Backend(format!("redis encode: {e}")))?;
         let mut conn = self.conn.clone();
         let full = self.full_key(key);
+        let secs = ttl.as_secs().max(1);
         let _: () = conn
-            .set_ex(&full, json, self.ttl_secs)
+            .set_ex(&full, json, secs)
             .await
             .map_err(|e| CacheError::Backend(format!("redis SET EX: {e}")))?;
         Ok(())
