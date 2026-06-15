@@ -33,15 +33,17 @@ use crate::state::ProxyState;
 
 /// Per-request payload from a successful dispatch — carries the
 /// response + provider label + the bits of usage data needed for
-/// UsageEvent emission (#404). The streaming path returns
-/// `usage = None` because the byte stream is passed through verbatim
-/// and the gateway doesn't parse SSE chunks here today; emission
-/// for the streaming path is tracked as a follow-up.
+/// UsageEvent emission (#404). On the verbatim streaming path the
+/// emission is owned by the response stream's Drop guard (#808), so
+/// `usage = None` here and `usage_handled_by_stream = true` tells the
+/// handler not to double-emit.
 struct ResponseDispatchSuccess {
     response: Response,
     provider: String,
-    /// Set on non-streaming 2xx; `None` on streaming (where the
-    /// gateway doesn't parse the SSE chunks to extract usage).
+    /// Set on the non-streaming 2xx path and the buffered output-guardrail
+    /// path (both parse the full body here). `None` on the verbatim
+    /// streaming path, where the stream's Drop guard emits the UsageEvent
+    /// from the terminal SSE event instead (#808).
     usage: Option<ResponseUsage>,
     /// UUID of the resolved Model row — needed for UsageEvent
     /// `model_id` field. Always present on success.
@@ -56,6 +58,10 @@ struct ResponseDispatchSuccess {
     /// it (silently zeroing the tokens would underreport spend the operator
     /// paid the provider for).
     guardrail_blocked: bool,
+    /// `true` on the verbatim streaming path: the response stream's Drop
+    /// guard owns the UsageEvent emit (parsed from the terminal SSE event),
+    /// so the top-level handler must NOT emit the winner event again (#808).
+    usage_handled_by_stream: bool,
 }
 
 /// Dispatch error carrying the per-attempt telemetry accumulated before
@@ -81,6 +87,7 @@ impl From<ProxyError> for ResponsesDispatchError {
 /// `output_tokens_details.audio_tokens`, etc.) are intentionally
 /// dropped here — cp-api's `dpmgr_usage_events` table records only
 /// the ones below.
+#[derive(Default, Clone)]
 struct ResponseUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -110,7 +117,7 @@ pub async fn responses(
         .unwrap_or("")
         .to_string();
 
-    match dispatch(&state, &auth, &body, &request_id, &client.source_ip).await {
+    match dispatch(&state, &auth, &body, &request_id, started, &client).await {
         Ok(success) => {
             let elapsed = started.elapsed();
             let status = success.response.status().as_u16();
@@ -145,30 +152,37 @@ pub async fn responses(
             // spend. Pre-#404 the responses handler dropped the event
             // entirely — every o1/o3/GPT-5 traffic via Responses API
             // was invisible to budget enforcement and billing
-            // reconciliation. Non-streaming-only MVP; streaming
-            // emission requires SSE byte-stream interception and is
-            // tracked as a follow-up.
-            if let Some(usage) = success.usage {
-                // Winning-attempt classification (#655). Direct models
-                // have no recorded attempt → AttemptInfo defaults.
-                let attempt = success
-                    .routing
-                    .winner()
-                    .map(AttemptInfo::from_record)
-                    .unwrap_or_default();
-                emit_usage_event(
-                    &state,
-                    &request_id,
-                    &success.model_id,
-                    &model_name,
-                    &api_key_id,
-                    status,
-                    elapsed,
-                    &usage,
-                    &client,
-                    attempt,
-                    success.guardrail_blocked,
-                );
+            // reconciliation.
+            //
+            // #808: the verbatim streaming path can't extract usage
+            // synchronously here (the SSE bytes are consumed by the client
+            // after this handler returns), so its UsageEvent is emitted from
+            // the response stream's Drop guard, which parses the terminal
+            // `response.completed` event. `usage_handled_by_stream` guards
+            // against a double-emit; `usage` is `None` on that path.
+            if !success.usage_handled_by_stream {
+                if let Some(usage) = success.usage {
+                    // Winning-attempt classification (#655). Direct models
+                    // have no recorded attempt → AttemptInfo defaults.
+                    let attempt = success
+                        .routing
+                        .winner()
+                        .map(AttemptInfo::from_record)
+                        .unwrap_or_default();
+                    emit_usage_event(
+                        &state,
+                        &request_id,
+                        &success.model_id,
+                        &model_name,
+                        &api_key_id,
+                        status,
+                        elapsed,
+                        &usage,
+                        &client,
+                        attempt,
+                        success.guardrail_blocked,
+                    );
+                }
             }
             success.response
         }
@@ -232,7 +246,11 @@ async fn dispatch(
     auth: &AuthenticatedKey,
     body: &Value,
     request_id: &str,
-    source_ip: &str,
+    // Request-scoped clock + downstream client attribution, threaded so the
+    // streaming path's Drop guard can stamp latency + client IP/UA on the
+    // end-of-stream UsageEvent it emits (#808).
+    started: Instant,
+    client: &ClientContext,
 ) -> Result<ResponseDispatchSuccess, ResponsesDispatchError> {
     let snapshot = state.snapshot.load();
 
@@ -252,7 +270,7 @@ async fn dispatch(
     }
 
     // Client-IP allowlist gate (#557): reject before guardrails / upstream.
-    crate::dispatch::check_ip_access(&model_entry.value, source_ip)?;
+    crate::dispatch::check_ip_access(&model_entry.value, &client.source_ip)?;
 
     // #719: /v1/responses must run input guardrails like /v1/chat/completions
     // and /v1/messages. Before this, user input reached the upstream without
@@ -356,6 +374,19 @@ async fn dispatch(
             &target.id,
             request_id,
             &resolved_chain,
+            started,
+            &model_name,
+            &auth.entry.id,
+            client,
+            // Winning-attempt classification (#655) for the streaming
+            // path's end-of-stream UsageEvent (#808). The non-streaming
+            // and buffered paths emit from the handler and ignore it.
+            AttemptInfo {
+                index: idx,
+                kind: kind.to_string(),
+                model: target_model.clone(),
+                ..Default::default()
+            },
         )
         .await
         {
@@ -511,6 +542,7 @@ fn responses_value_text(v: &Value) -> String {
 /// Dispatch one concrete OpenAI target's Responses-API passthrough to
 /// `{api_base}/v1/responses`. The caller has already confirmed
 /// `model.provider == openai`.
+#[allow(clippy::too_many_arguments)]
 async fn responses_to_target(
     state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
@@ -519,6 +551,14 @@ async fn responses_to_target(
     model_id: &str,
     request_id: &str,
     chain: &aisix_guardrails::GuardrailChain,
+    // #808: end-of-stream UsageEvent context for the verbatim streaming
+    // path's Drop guard. Unused by the non-streaming / buffered paths,
+    // which emit from the handler.
+    started: Instant,
+    requested_model: &str,
+    api_key_id: &str,
+    client_ctx: &ClientContext,
+    attempt: AttemptInfo,
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
     let mut body = body.clone();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
@@ -722,15 +762,20 @@ async fn responses_to_target(
                     crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
                 ));
             }
+            // #808: the whole SSE response is buffered here, so parse its
+            // terminal event for usage and let the handler emit (the body is
+            // a single complete chunk now, not a live stream).
+            let usage = responses_sse_usage(&buf);
             let mut response = axum::response::Response::new(axum::body::Body::from(buf));
             apply_passthrough_headers(&mut response, &headers, request_id);
             return Ok(ResponseDispatchSuccess {
                 response,
                 provider: provider_label,
-                usage: None,
+                usage,
                 model_id: model_id.to_string(),
                 routing: RoutingTelemetry::default(),
                 guardrail_blocked: false,
+                usage_handled_by_stream: false,
             });
         }
 
@@ -781,20 +826,50 @@ async fn responses_to_target(
         } else {
             wrapped
         };
+        // #808: wrap the verbatim byte stream so the terminal
+        // `response.completed` SSE event's `usage` block is parsed in-flight
+        // and a UsageEvent is emitted from the stream's Drop guard at
+        // end-of-stream (or client-disconnect). Bytes forward unchanged — the
+        // client still sees the exact upstream SSE wire shape. Pre-#808 this
+        // path dropped the event entirely, so every streaming /v1/responses
+        // call (e.g. all Codex traffic, which always streams) was invisible
+        // to the dashboard Logs and the budget ledger.
+        let state_c = state.clone();
+        let request_id_c = request_id.to_string();
+        let model_id_c = model_id.to_string();
+        let requested_model_c = requested_model.to_string();
+        let api_key_id_c = api_key_id.to_string();
+        let client_c = client_ctx.clone();
+        let parsed_stream = build_responses_passthrough_stream(body_stream, move |usage| {
+            // Streams that reach here are committed 200s — the
+            // `!status.is_success()` guard above returned early on errors.
+            emit_usage_event(
+                &state_c,
+                &request_id_c,
+                &model_id_c,
+                &requested_model_c,
+                &api_key_id_c,
+                200,
+                started.elapsed(),
+                &usage,
+                &client_c,
+                attempt,
+                /* guardrail_blocked */ false,
+            );
+        });
         let mut response =
-            axum::response::Response::new(axum::body::Body::from_stream(body_stream));
+            axum::response::Response::new(axum::body::Body::from_stream(Box::pin(parsed_stream)));
         apply_passthrough_headers(&mut response, &headers, request_id);
 
-        // Verbatim passthrough (no output guardrail). The gateway doesn't
-        // parse SSE chunks here, so usage stays None — streaming usage
-        // emission is tracked as a #404 follow-up (see PR body).
         Ok(ResponseDispatchSuccess {
             response,
             provider: provider_label,
+            // The Drop guard owns the emit; the handler must not double-emit.
             usage: None,
             model_id: model_id.to_string(),
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
+            usage_handled_by_stream: true,
         })
     } else {
         let json_body: Value = upstream_resp
@@ -850,6 +925,7 @@ async fn responses_to_target(
                     model_id: model_id.to_string(),
                     routing: RoutingTelemetry::default(),
                     guardrail_blocked: true,
+                    usage_handled_by_stream: false,
                 });
             }
         }
@@ -861,6 +937,7 @@ async fn responses_to_target(
             model_id: model_id.to_string(),
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
+            usage_handled_by_stream: false,
         })
     }
 }
@@ -904,6 +981,142 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         reasoning_tokens,
         cached_prompt_tokens,
     })
+}
+
+/// Pull usage out of one parsed Responses-API SSE event if it is a terminal
+/// event that carries the authoritative `usage` block (#808). The full usage
+/// rides `response.completed`, and **also `response.incomplete` /
+/// `response.failed`** which fire on `max_output_tokens` truncation or
+/// cancellation — billing those keeps streaming parity with non-streaming.
+/// The `usage` lives under the nested `response` object (unlike the
+/// non-streaming body where it is top-level), so the same `extract_response_usage`
+/// gate is applied to `json.response`.
+/// <https://platform.openai.com/docs/api-reference/responses-streaming>
+fn parse_responses_terminal_usage(json: &Value) -> Option<ResponseUsage> {
+    matches!(
+        json.get("type").and_then(|t| t.as_str()),
+        Some("response.completed" | "response.incomplete" | "response.failed")
+    )
+    .then(|| json.get("response").and_then(extract_response_usage))
+    .flatten()
+}
+
+/// Scan a fully-buffered Responses-API SSE body for the terminal event's
+/// usage block (#808). Used by the buffered output-guardrail path, which
+/// already holds the whole response. Returns `None` (skip emission, matching
+/// the non-streaming gate) when no terminal event carried a usage block.
+fn responses_sse_usage(bytes: &[u8]) -> Option<ResponseUsage> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut usage = None;
+    for line in text.lines() {
+        let data = match line.strip_prefix("data:") {
+            Some(d) => d.trim(),
+            None => continue,
+        };
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        if let Ok(json) = serde_json::from_str::<Value>(data) {
+            if let Some(u) = parse_responses_terminal_usage(&json) {
+                usage = Some(u);
+            }
+        }
+    }
+    usage
+}
+
+/// Drain every complete SSE frame from `buf`, updating `acc` with the latest
+/// terminal-event usage (#808). A frame ends at the first blank line; an
+/// incomplete trailing frame is left in `buf` for the next chunk. Reuses the
+/// shared SSE framing helpers from the `/v1/messages` passthrough so the two
+/// surfaces parse identically.
+fn drain_responses_sse_frames(buf: &mut Vec<u8>, acc: &mut Option<ResponseUsage>) {
+    while let Some(end) = crate::messages::find_frame_end(buf) {
+        let frame: Vec<u8> = buf.drain(..end).collect();
+        if let Some(data) = crate::messages::extract_sse_data_line(&frame) {
+            if data == b"[DONE]" {
+                continue;
+            }
+            if let Ok(json) = serde_json::from_slice::<Value>(data) {
+                if let Some(u) = parse_responses_terminal_usage(&json) {
+                    *acc = Some(u);
+                }
+            }
+        }
+    }
+}
+
+/// Drop guard that fires `on_complete` exactly once with the usage parsed from
+/// the stream's terminal SSE event — on normal end-of-stream AND on
+/// client-disconnect (the async-stream generator drops at its suspension
+/// point), mirroring the `/v1/messages` and chat.rs CompleteOnDrop pattern.
+/// `None` means no terminal usage was seen (e.g. an abort before completion);
+/// the emit then records a zero-token 200 so the request still appears in the
+/// dashboard Logs.
+struct ResponsesUsageGuard<F: FnOnce(ResponseUsage)> {
+    slot: Option<(F, Option<ResponseUsage>)>,
+}
+
+impl<F: FnOnce(ResponseUsage)> ResponsesUsageGuard<F> {
+    fn usage(&mut self) -> &mut Option<ResponseUsage> {
+        &mut self
+            .slot
+            .as_mut()
+            .expect("ResponsesUsageGuard accessed after take")
+            .1
+    }
+}
+
+impl<F: FnOnce(ResponseUsage)> Drop for ResponsesUsageGuard<F> {
+    fn drop(&mut self) {
+        if let Some((f, usage)) = self.slot.take() {
+            f(usage.unwrap_or_default());
+        }
+    }
+}
+
+/// Wrap a Responses-API upstream byte stream so the terminal event's usage is
+/// parsed in-flight and `on_complete` fires once at end-of-stream (or
+/// client-disconnect) with the accumulated counts (#808). Bytes forward
+/// verbatim — the client sees the exact upstream SSE wire shape.
+fn build_responses_passthrough_stream<S, F>(
+    upstream: S,
+    on_complete: F,
+) -> impl futures::Stream<Item = reqwest::Result<bytes::Bytes>>
+where
+    S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send + 'static,
+    F: FnOnce(ResponseUsage) + Send + 'static,
+{
+    async_stream::stream! {
+        let mut guard = ResponsesUsageGuard { slot: Some((on_complete, None)) };
+        futures::pin_mut!(upstream);
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(item) = upstream.next().await {
+            if let Ok(bytes) = &item {
+                // Side-channel parse: copy into the frame buffer (the original
+                // `bytes` is yielded unchanged below) and drain complete frames.
+                buf.extend_from_slice(bytes);
+                drain_responses_sse_frames(&mut buf, guard.usage());
+                // Bound the frame buffer: the happy path drains complete frames
+                // above so `buf` only holds a partial trailing frame. A
+                // non-conformant upstream streaming bytes without a blank-line
+                // terminator would otherwise grow `buf` unboundedly; drop it
+                // (losing usage parsing for that pathological case) rather than
+                // OOM. Bytes still forward verbatim — only telemetry is affected.
+                if buf.len() > crate::messages::MAX_SSE_FRAME_BUF_BYTES {
+                    tracing::warn!(
+                        buffered = buf.len(),
+                        "responses stream: SSE frame buffer exceeded cap without a \
+                         terminator; dropping buffer (usage parsing skipped)"
+                    );
+                    buf.clear();
+                }
+            }
+            // Forward the original item verbatim (Ok bytes OR a mid-stream Err).
+            yield item;
+        }
+        // guard drops here → on_complete fires.
+    }
 }
 
 /// Collect the assistant's output text from a Responses-API response object
@@ -2389,22 +2602,26 @@ mod tests {
         }
     }
 
-    /// Issue #404 streaming follow-up coverage: the streaming path
-    /// MUST NOT regress on the non-streaming emission. A streaming
-    /// request should pass the byte stream through verbatim and
-    /// (today's MVP) skip emission — without crashing or hanging.
-    /// Streaming emission requires SSE byte-stream interception
-    /// and is tracked as a separate follow-up; this test pins the
-    /// "no regression, no emission today" contract.
+    /// #808: a streaming `/v1/responses` 200 (e.g. all Codex traffic, which
+    /// always streams) MUST emit a UsageEvent with the tokens carried on the
+    /// terminal `response.completed` event — pre-#808 the streaming path
+    /// dropped the event entirely, so successful streamed calls were invisible
+    /// to the dashboard Logs and the budget ledger while 4xx/5xx still logged.
+    /// Bytes must still pass through verbatim (SSE shape preserved). Fails
+    /// before the fix (no event), passes after.
     #[tokio::test]
-    async fn streaming_path_does_not_emit_today_but_passes_through() {
+    async fn streaming_path_emits_usage_event_from_terminal_event_issue_808() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
-        // Minimal SSE-style body. Real Responses-API streaming uses
-        // `response.completed` events with a usage block in the
-        // final chunk; the gateway doesn't parse these today.
-        let sse_body = "data: {\"type\":\"response.created\",\"response\":{}}\n\ndata: [DONE]\n\n";
+        // Real Responses-API streaming: deltas then a terminal
+        // `response.completed` carrying the authoritative `usage` block
+        // (nested under `response`, with reasoning + cached sub-counts).
+        let sse_body = "\
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"output_tokens_details\":{\"reasoning_tokens\":3},\"input_tokens_details\":{\"cached_tokens\":2}}}}\n\n\
+data: [DONE]\n\n";
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
             .respond_with(
@@ -2437,33 +2654,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        // Drain the body and pin its shape — audit LOW-2 on this
-        // PR. A regression that dropped headers in the refactored
-        // `ResponseDispatchSuccess` path could surface as a 200
-        // with an empty body; the SSE prefix check guards against
-        // the byte-stream being silently rewritten.
+        // Draining the body runs the stream to completion → the Drop guard
+        // fires the end-of-stream emit. Bytes must survive verbatim.
         let body_bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
         assert!(
-            !body_bytes.is_empty(),
-            "streaming body must pass through verbatim",
+            body_bytes.starts_with(b"data: "),
+            "SSE shape must pass through verbatim",
         );
         assert!(
-            body_bytes.starts_with(b"data: "),
-            "SSE shape must survive the refactor",
+            body_bytes.windows(b"[DONE]".len()).any(|w| w == b"[DONE]"),
+            "terminal frames must reach the client unchanged",
         );
 
-        // Streaming path MVP: no UsageEvent emitted today. Follow-up
-        // tracked to wire SSE byte-stream interception. `Ok(None)`
-        // = channel closed (state dropped); `Err` = timeout. Both
-        // are "no event"; only `Ok(Some(_))` is a real failure.
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "streaming /v1/responses must not emit UsageEvent yet \
-                 (follow-up tracked), but got prompt_tokens={}",
-                ev.prompt_tokens,
-            );
-        }
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for a streaming 200 (#808)")
+            .expect("usage event sender dropped");
+        assert_eq!(ev.status_code, 200);
+        assert_eq!(ev.inbound_protocol, "openai");
+        assert_eq!(ev.prompt_tokens, 11);
+        assert_eq!(ev.completion_tokens, 7);
+        assert_eq!(ev.reasoning_tokens, 3);
+        assert_eq!(ev.cached_prompt_tokens, 2);
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one UsageEvent for a single streamed request",
+        );
     }
 
     /// Per #655: a 5xx upstream now emits ONE zero-token UsageEvent for the
