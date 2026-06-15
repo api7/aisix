@@ -190,13 +190,27 @@ impl EnsembleError {
     }
 }
 
-/// Run one ensemble request to completion. See the module docs for the
-/// three phases.
-pub async fn run_ensemble(
+/// Run only the panel phase of an ensemble request: fan out to every
+/// panel member concurrently (phase 1), enforce `min_responses` (phase 2),
+/// and build the judge's synthesis request from the labeled candidates.
+/// The judge itself is NOT called — that is left to the caller so the
+/// streaming dispatch path can stream the judge's tokens while the
+/// non-streaming path ([`run_ensemble`]) buffers them.
+///
+/// Returns the per-member accounting (`panel`), the raw candidate
+/// responses (`candidates`, kept so the caller can re-derive context if
+/// needed), and the ready-to-dispatch `judge_req`. The returned
+/// `judge_req` is non-streaming (`stream = Some(false)`); a streaming
+/// caller flips it to `Some(true)` before dispatching.
+///
+/// An exhausted panel returns [`EnsembleError::InsufficientPanel`] with
+/// the already-billed survivors, exactly as before — the dispatch layer
+/// must still commit + emit their usage.
+pub(crate) async fn run_ensemble_panel(
     req: &ChatFormat,
     config: &EnsembleConfig,
     caller: &dyn ModelCaller,
-) -> Result<EnsembleOutcome, EnsembleError> {
+) -> Result<(Vec<PanelOutcome>, Vec<ChatResponse>, ChatFormat), EnsembleError> {
     let per_call_timeout = config.timeout();
 
     // Phase 1: fan out to every panel member concurrently.
@@ -239,16 +253,30 @@ pub async fn run_ensemble(
         });
     }
 
+    // Build the judge's synthesis request from the labeled candidates.
+    let judge_req = judge_request(req, &config.judge, &candidates);
+    Ok((panel, candidates, judge_req))
+}
+
+/// Run one ensemble request to completion. See the module docs for the
+/// three phases.
+pub async fn run_ensemble(
+    req: &ChatFormat,
+    config: &EnsembleConfig,
+    caller: &dyn ModelCaller,
+) -> Result<EnsembleOutcome, EnsembleError> {
+    // Phases 1-2 + judge-request construction.
+    let (panel, _candidates, judge_req) = run_ensemble_panel(req, config, caller).await?;
+
     // Phase 3: synthesize via the judge, retrying once on a transient error.
     // The judge call gets the same per-call timeout as each panel member
     // (`config.timeout()`), so the ensemble-level deadline applies uniformly
     // across the whole fan-out.
-    let judge_req = judge_request(req, &config.judge, &candidates);
     let response = match call_judge_with_retry(
         caller,
         &config.judge.model,
         &judge_req,
-        per_call_timeout,
+        config.timeout(),
     )
     .await
     {

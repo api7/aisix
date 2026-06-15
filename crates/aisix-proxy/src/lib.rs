@@ -5744,11 +5744,53 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(v["error"]["type"], "invalid_request_error");
     }
 
-    /// Streaming is not supported for ensemble models yet (separate PR);
-    /// the request must be rejected with a 400, not silently downgraded.
+    /// Streaming ensemble (OPTION A): the panel runs non-streaming (buffered
+    /// to synthesize) and ONLY the judge's tokens are streamed back as SSE.
+    /// The client must receive the judge's synthesized content + a `[DONE]`
+    /// sentinel, every chunk re-stamped under the requested ensemble model
+    /// name ("council") — never an upstream id. Telemetry must emit one event
+    /// per panel member + one judge event, all sharing the same request_id.
     #[tokio::test]
-    async fn ensemble_rejects_streaming_with_400() {
+    async fn ensemble_streams_judge_synthesis() {
+        use aisix_obs::UsageSink;
         let upstream = MockServer::start().await;
+        // Judge synthesis call (matched by its "Answer 1:" prompt) streams its
+        // answer back as SSE — this is the leg the gateway now streams to the
+        // client. The terminal chunk carries the judge's usage block.
+        let judge_sse = "\
+data: {\"id\":\"cmpl-judge\",\"model\":\"judge-upstream\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-judge\",\"model\":\"judge-upstream\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"synthesized final answer\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-judge\",\"model\":\"judge-upstream\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":7,\"total_tokens\":37}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("Answer 1:"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(judge_sse),
+            )
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        // Panel members — catch-all, NON-streaming JSON (the executor buffers
+        // these to build the judge prompt).
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-panel",
+                "model": "panel-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "a panel candidate answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 11, "total_tokens": 16}
+            })))
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(openai_test_bridge()));
 
@@ -5756,15 +5798,149 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         snap.models
             .insert(direct_model_entry("m-panel-a", "panel-a", "panel-upstream"));
         snap.models
+            .insert(direct_model_entry("m-panel-b", "panel-b", "panel-upstream"));
+        snap.models
             .insert(direct_model_entry("m-judge", "judge-m", "judge-upstream"));
         snap.models.insert(ensemble_model_entry(
             "m-council",
             "council",
-            &["panel-a"],
+            &["panel-a", "panel-b"],
             "judge-m",
         ));
         snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
-        let app = build_router(build_state(snap, hub));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+
+        let body = serde_json::json!({
+            "model": "council",
+            "messages": [{"role": "user", "content": "what is the best answer?"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .contains("text/event-stream"));
+
+        // Drain + decode the SSE body. Assert the judge's content streamed
+        // through, a [DONE] sentinel terminates it, and every data chunk is
+        // re-stamped under "council" (no upstream id leakage).
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut decoder = SseDecoder::new();
+        let mut events = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            events.extend(decoder.feed(chunk.unwrap().as_ref()));
+        }
+        assert!(events.contains(&SseEvent::Done), "missing [DONE] sentinel");
+        let data: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                SseEvent::Data(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        let joined = data.join("\n");
+        assert!(
+            joined.contains("synthesized final answer"),
+            "client must receive the judge's synthesized content; got: {joined}"
+        );
+        // Every chunk's `model` is the ensemble alias, never the judge upstream.
+        for d in &data {
+            let v: serde_json::Value = serde_json::from_str(d).unwrap();
+            assert_eq!(
+                v["model"], "council",
+                "streamed chunk must be re-stamped under the ensemble model name"
+            );
+            assert_ne!(v["model"], "judge-upstream");
+        }
+
+        // Telemetry (emitted from on_complete once the stream is drained):
+        // two panel events + one judge event, all sharing one request_id.
+        let mut usage = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+        {
+            usage.push(ev);
+            if usage.len() == 3 {
+                break;
+            }
+        }
+        assert_eq!(
+            usage.len(),
+            3,
+            "expected 3 usage events (2 panel + 1 judge); got {}",
+            usage.len()
+        );
+        let panel_events: Vec<_> = usage.iter().filter(|e| e.attempt_kind == "panel").collect();
+        let judge_events: Vec<_> = usage.iter().filter(|e| e.attempt_kind == "judge").collect();
+        assert_eq!(panel_events.len(), 2, "both panel members must emit");
+        assert_eq!(judge_events.len(), 1, "the judge must emit one event");
+        let rid = usage[0].request_id.clone();
+        assert!(
+            !rid.is_empty() && usage.iter().all(|e| e.request_id == rid),
+            "all sub-call events share the request_id (trace key)"
+        );
+        // The judge event carries the streamed terminal-chunk usage.
+        assert_eq!(judge_events[0].prompt_tokens, 30);
+        assert_eq!(judge_events[0].completion_tokens, 7);
+    }
+
+    /// Streaming ensemble, judge connect failure: the panel members all
+    /// succeed (and are billed) but the judge upstream returns a hard error
+    /// on the streaming connect. The panel's usage events must STILL fire —
+    /// every panel member round-tripped an upstream, exactly like the
+    /// non-streaming judge-failure path.
+    #[tokio::test]
+    async fn ensemble_streaming_judge_connect_failure_still_bills_panel() {
+        use aisix_obs::UsageSink;
+        let upstream = MockServer::start().await;
+        // Judge synthesis call (matched by "Answer 1:") → 500 on connect. A
+        // non-2xx upstream status surfaces as a connect-time error from
+        // `chat_stream`, so the gateway never commits a 200 to the client.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("Answer 1:"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": {"message": "judge upstream exploded", "type": "server_error"}
+            })))
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        // Panel members → 200 (catch-all). Both survive, so min_responses is
+        // met and the run proceeds to the (failing) judge connect.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-panel",
+                "model": "panel-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "a panel candidate answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 11, "total_tokens": 16}
+            })))
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        seed_two_member_council(&snap);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
 
         let body = serde_json::json!({
             "model": "council",
@@ -5779,10 +5955,39 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             .body(Body::from(body.to_string()))
             .unwrap();
         let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let v: serde_json::Value =
-            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
-        assert_eq!(v["error"]["type"], "invalid_request_error");
+        // Judge 5xx collapses to 502 for the client (connect failed before any
+        // SSE byte was committed).
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        // Both panel members already hit upstream and were billed, so their
+        // usage events must still fire. The judge produced no response → no
+        // judge event.
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+        {
+            events.push(ev);
+        }
+        let panel_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.attempt_kind == "panel")
+            .collect();
+        assert_eq!(
+            panel_events.len(),
+            2,
+            "both billed panel members must emit a usage event; got {} events total",
+            events.len()
+        );
+        assert!(
+            panel_events
+                .iter()
+                .all(|e| e.prompt_tokens == 5 && e.completion_tokens == 11),
+            "panel events must carry the panel call's own tokens"
+        );
+        assert!(
+            events.iter().all(|e| e.attempt_kind != "judge"),
+            "the judge connect failed, so no judge usage event"
+        );
     }
 
     /// Like `ensemble_model_entry` but with an explicit `min_responses`.
