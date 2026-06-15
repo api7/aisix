@@ -62,6 +62,10 @@ use axum::routing::{get, post};
 use axum::{http::StatusCode, response::Response, Router};
 use std::sync::Arc;
 
+pub fn admin_openapi_json() -> &'static str {
+    openapi::merged_openapi()
+}
+
 pub fn build_router(state: AdminState) -> Router {
     // Eagerly build the merged OpenAPI doc so any panic in schema
     // parsing surfaces at boot, not at first `/admin/openapi.json`

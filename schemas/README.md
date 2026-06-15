@@ -8,6 +8,8 @@ types. The files are **auto-generated** from the Rust type definitions in
 
 ```text
 schemas/
+├── openapi/
+│   └── admin-api.json
 └── resources/
     ├── api_key.schema.json
     ├── cache_policy.schema.json
@@ -24,6 +26,10 @@ Each file is a self-contained JSON Schema draft-07 document. Nested
 types (e.g. `Adapter`, `RoutingTarget`, `TelemetryTags`) live in the
 `definitions/` section of the parent resource — no cross-file `$ref` is
 emitted.
+
+`schemas/openapi/admin-api.json` is the canonical generated Admin API
+OpenAPI document. It is emitted from the same merged document served by
+`GET /admin/openapi.json`.
 
 File names use the snake_case singular form of the Rust type
 (`api_key.schema.json`, `provider_key.schema.json`). The corresponding
@@ -58,14 +64,29 @@ re-run:
 cargo run -p aisix-core --bin dump-schema
 ```
 
-CI runs the same command and fails the build if `schemas/` drifts from
-the Rust types (drift-check workflow, separate PR).
+After modifying Admin API routes, OpenAPI metadata, or the generated
+resource schemas, re-run:
+
+```bash
+cargo run -p aisix-admin --bin dump-openapi > schemas/openapi/admin-api.json
+```
+
+CI runs the same commands and fails the build if `schemas/` drifts from
+the Rust types or the Admin API OpenAPI source.
+
+Release builds publish the Admin API OpenAPI document to
+`/ai-gateway/openapi-<version>.json` and `/ai-gateway/openapi-latest.json`
+on the configured `run.api7.ai` bucket. Main-branch builds publish
+`/ai-gateway/openapi-dev.json` when the S3 and CloudFront secrets are
+configured in the repository.
 
 ## Downstream consumers
 
 - `crates/aisix-admin/src/openapi.rs` — DP admin OpenAPI 3.1 document.
   Refactor target: replace inline schema objects with `$ref` into these
   files. (Follow-up PR.)
+- `api7/docs` — consumes the generated Admin API OpenAPI document for
+  the AISIX AI Gateway Admin API reference.
 - `api7/AISIX-Cloud` cp-api — pulls these files (via submodule or
   pinned tag) for REST input validation against the same shape DP
   consumes from etcd.
