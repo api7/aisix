@@ -6,7 +6,7 @@
 
 **One OpenAI-compatible API in front of every model.** Route, govern, secure, cache, and
 observe all your LLM and AI-agent traffic from a single control point — shipped as one
-static binary with sub-millisecond overhead. Self-host for free, forever.
+static binary with low per-request overhead. Self-host for free, forever.
 
 *Built by the original creators of [Apache APISIX](https://apisix.apache.org/).*
 
@@ -31,8 +31,8 @@ static binary with sub-millisecond overhead. Self-host for free, forever.
 **AISIX AI Gateway** is a Rust-native gateway that puts a single, OpenAI-compatible API in
 front of every LLM provider — OpenAI, Anthropic, Google Gemini, AWS Bedrock, Azure OpenAI,
 DeepSeek, and any OpenAI-compatible endpoint. It gives platform teams one place to route,
-govern, secure, and observe LLM traffic, with first-class SSE streaming and sub-millisecond
-gateway overhead.
+govern, secure, and observe LLM traffic, with first-class SSE streaming and low gateway
+overhead.
 
 It runs as a **single static binary** — low cold-start, lock-free config reads, dynamic
 configuration over etcd with no restarts. Run it **self-hosted and free**, or connect it to
@@ -46,27 +46,32 @@ for a managed control plane with team governance, budgets, audit, and a dashboar
 
 ## ⚡ Quickstart
 
-```bash
-# Run the gateway: proxy on :3000, admin API on :3001
-docker run -p 3000:3000 -p 3001:3001 ghcr.io/api7/ai-gateway:dev
+AISIX is etcd-backed, so the fastest local run is Docker Compose (gateway + etcd). Grab the
+ready-to-run `docker-compose.yml` and example `config.yaml` from the
+[self-hosted quickstart](docs/quickstart/self-hosted.md), then:
 
-# Once a model + key are configured, call it like OpenAI
+```bash
+docker compose up          # proxy → :3000, admin API → :3001
+```
+
+Configure a model and an API key through the admin API on `:3001`
+([first model, first key, first request](docs/quickstart/first-model-first-key-first-request.md)),
+then call the gateway exactly like OpenAI:
+
+```bash
 curl http://localhost:3000/v1/chat/completions \
   -H "Authorization: Bearer $AISIX_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello"}]}'
+  -d '{"model":"my-model","messages":[{"role":"user","content":"hello"}]}'
 ```
-
-Full walkthrough → **[Self-hosted quickstart](docs/quickstart/self-hosted.md)** →
-**[First model, first key, first request](docs/quickstart/first-model-first-key-first-request.md)**.
 
 ## ✨ Why AISIX
 
 - **One API, every model.** Speak the OpenAI *or* Anthropic wire format in; the gateway
   translates to whichever provider each model points at. Point an OpenAI or Claude SDK at
   one `base_url` and switch models without changing code.
-- **A real gateway, in Rust.** Single static binary, low cold-start, sub-millisecond
-  overhead, native streaming.
+- **A real gateway, in Rust.** Single static binary, low cold-start, lock-free config reads
+  on the hot path, native streaming.
 - **Open-source core, free forever.** Apache-2.0, self-hostable end to end. Reach for
   AISIX Cloud only when you want the managed control plane.
 - **Production controls built in.** Routing & failover, rate limits, budgets, guardrails,
@@ -95,8 +100,9 @@ Anchored to the [feature matrix](docs/overview/feature-matrix.md); covered by 90
 - **Caching** — exact-match response cache with per-policy TTL and model/key scope matchers;
   memory and Redis backends; cost-saved telemetry on every hit.
 - **Observability** — Prometheus `/metrics`, structured per-request access logs, usage
-  events, and OTLP/GenAI span export to Langfuse, Honeycomb, Grafana Cloud, Datadog,
-  Aliyun SLS, or any OTLP receiver.
+  events, OTLP/GenAI span export (Langfuse, Honeycomb, Grafana Cloud, or any OTLP receiver),
+  plus dedicated Datadog and Aliyun SLS log exporters and object-storage (S3/GCS/Azure Blob)
+  telemetry.
 - **Admin API** (`:3001`) — JSON-Schema-validated CRUD for every resource, OpenAPI 3 with a
   Scalar UI at `/admin/openapi-scalar`, per-model upstream health, and a built-in playground.
 
@@ -130,7 +136,7 @@ Same gateway binary, same proxy API. **AISIX Cloud** adds the managed control pl
 | Tenancy | Single instance / namespace | Org → Team → Member → Environment |
 | Provider keys | Stored in etcd (mTLS channel) | Envelope-encrypted at rest |
 | API keys | Hashed, shown once, rotation | Hashed + masked reveal, rotation, PATs |
-| Budgets | Per-key rate limits (no budget engine) | Per key / provider / env / org, hard-stop & alerts |
+| Budgets | Per-key rate limits; budgets are Cloud-only | Per key / provider / env / org, hard-stop & alerts |
 | RBAC | Admin key = full access | Org roles (owner / admin / developer / viewer), invites |
 | Audit log | — | Full org-scoped audit with diff viewer |
 | Billing & metering | — | Plans, usage metering, Stripe portal |
@@ -189,8 +195,8 @@ cargo test --workspace
 # Coverage (matches the CI gate)
 cargo llvm-cov --workspace --lcov --output-path lcov.info
 
-# Run locally
-cargo run -p aisix-server -- --config config.example.yaml
+# Run locally (needs a reachable etcd + a config.yaml — see the quickstart)
+cargo run -p aisix-server --bin aisix -- --config config.yaml
 ```
 
 ## 💬 Community
