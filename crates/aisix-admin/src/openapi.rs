@@ -2925,8 +2925,7 @@ mod tests {
             serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
 
         let content =
-            &parsed["paths"]["/playground/chat/completions"]["post"]["responses"]["200"]
-                ["content"];
+            &parsed["paths"]["/playground/chat/completions"]["post"]["responses"]["200"]["content"];
         assert!(
             content["application/json"]["schema"].is_object(),
             "playground should document non-streaming JSON responses"
