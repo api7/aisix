@@ -223,12 +223,46 @@ fn model_schema() -> Value {
                     "trigger_on_timeout":   { "type": "boolean" },
                     "trigger_on_transport": { "type": "boolean" }
                 }
+            },
+            "ensemble": {
+                "type": "object",
+                "required": ["panel", "judge"],
+                "additionalProperties": false,
+                "properties": {
+                    "panel": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "required": ["model"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "model":       { "type": "string", "minLength": 1 },
+                                "temperature": { "type": "number", "minimum": 0 },
+                                "seed":        { "type": "integer", "minimum": 0 },
+                                "weight":      { "type": "integer", "minimum": 0 }
+                            }
+                        }
+                    },
+                    "judge": {
+                        "type": "object",
+                        "required": ["model"],
+                        "additionalProperties": false,
+                        "properties": {
+                            "model":            { "type": "string", "minLength": 1 },
+                            "synthesis_prompt": { "type": "string", "minLength": 1 }
+                        }
+                    },
+                    "min_responses": { "type": "integer", "minimum": 1 },
+                    "timeout_ms":    { "type": "integer", "minimum": 0 }
+                }
             }
         },
-        // Direct vs routing model: a model EITHER ships a `routing`
-        // block (virtual router — provider/model_name/provider_key_id
-        // forbidden) OR ships those three required fields together
-        // (direct upstream — routing forbidden).
+        // Direct vs routing vs ensemble model: a model ships EXACTLY one
+        // of — a `routing` block (virtual router), an `ensemble` block
+        // (panel + judge fan-out), or the three direct upstream fields
+        // (provider/model_name/provider_key_id) together. The three
+        // shapes are mutually exclusive.
         "oneOf": [
             {
                 "required": ["routing"],
@@ -237,12 +271,27 @@ fn model_schema() -> Value {
                     { "required": ["model_name"] },
                     { "required": ["provider_key_id"] },
                     { "required": ["background_model_check"] },
-                    { "required": ["cooldown"] }
+                    { "required": ["cooldown"] },
+                    { "required": ["ensemble"] }
                 ]}
             },
             {
                 "required": ["provider", "model_name", "provider_key_id"],
-                "not": { "required": ["routing"] }
+                "not": { "anyOf": [
+                    { "required": ["routing"] },
+                    { "required": ["ensemble"] }
+                ]}
+            },
+            {
+                "required": ["ensemble"],
+                "not": { "anyOf": [
+                    { "required": ["provider"] },
+                    { "required": ["model_name"] },
+                    { "required": ["provider_key_id"] },
+                    { "required": ["routing"] },
+                    { "required": ["background_model_check"] },
+                    { "required": ["cooldown"] }
+                ]}
             }
         ],
         "$defs": {
@@ -821,6 +870,103 @@ mod tests {
             }
         });
         validate_model(&v).unwrap();
+    }
+
+    #[test]
+    fn model_ensemble_form_passes() {
+        let v = json!({
+            "display_name": "council",
+            "ensemble": {
+                "panel": [
+                    {"model": "my-gpt4", "temperature": 0.5},
+                    {"model": "my-claude", "temperature": 1.0}
+                ],
+                "judge": {"model": "my-opus"},
+                "min_responses": 2,
+                "timeout_ms": 45000
+            }
+        });
+        validate_model(&v).unwrap();
+    }
+
+    #[test]
+    fn model_ensemble_can_be_ip_restricted_and_rate_limited() {
+        // Top-level gates apply to the ensemble entry model too.
+        let v = json!({
+            "display_name": "council",
+            "ensemble": {
+                "panel": [{"model": "a"}, {"model": "b"}],
+                "judge": {"model": "j"}
+            },
+            "allowed_cidrs": ["10.0.0.0/8"],
+            "rate_limit": {"rpm": 60}
+        });
+        validate_model(&v).unwrap();
+    }
+
+    #[test]
+    fn model_ensemble_with_direct_fields_fails() {
+        // ensemble is mutually exclusive with the direct upstream triple.
+        let v = json!({
+            "display_name": "x",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk-1",
+            "ensemble": {
+                "panel": [{"model": "a"}],
+                "judge": {"model": "j"}
+            }
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn model_ensemble_with_routing_fails() {
+        // A model can't be both an ensemble and a router.
+        let v = json!({
+            "display_name": "x",
+            "routing": {"targets": [{"model": "a"}]},
+            "ensemble": {
+                "panel": [{"model": "a"}],
+                "judge": {"model": "j"}
+            }
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn model_ensemble_missing_judge_fails() {
+        let v = json!({
+            "display_name": "x",
+            "ensemble": {
+                "panel": [{"model": "a"}, {"model": "b"}]
+            }
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn model_ensemble_empty_panel_fails() {
+        let v = json!({
+            "display_name": "x",
+            "ensemble": {
+                "panel": [],
+                "judge": {"model": "j"}
+            }
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn model_ensemble_unknown_panel_field_fails() {
+        let v = json!({
+            "display_name": "x",
+            "ensemble": {
+                "panel": [{"model": "a", "bogus": true}],
+                "judge": {"model": "j"}
+            }
+        });
+        assert!(validate_model(&v).is_err());
     }
 
     #[test]

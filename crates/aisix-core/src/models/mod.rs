@@ -17,6 +17,7 @@
 
 pub mod apikey;
 pub mod cache_policy;
+pub mod ensemble;
 pub mod guardrail;
 pub mod model;
 pub mod observability_exporter;
@@ -29,6 +30,7 @@ pub mod snapshot;
 
 pub use apikey::ApiKey;
 pub use cache_policy::{AppliesTo, CacheBackend, CachePolicy};
+pub use ensemble::{EnsembleConfig, Judge, PanelMember};
 pub use guardrail::{
     AliyunTextModerationConfig, AppliedGuardrail, AzureContentSafetyConfig,
     AzureContentSafetyTextModerationConfig, BedrockAWSCredentials, BedrockConfig,

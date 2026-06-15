@@ -31,8 +31,8 @@ use std::path::{Path, PathBuf};
 use schemars::JsonSchema;
 
 use aisix_core::models::{
-    ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter, ProviderKey, RateLimit,
-    RateLimitPolicy, Routing,
+    ApiKey, CachePolicy, EnsembleConfig, Guardrail, Model, ObservabilityExporter, ProviderKey,
+    RateLimit, RateLimitPolicy, Routing,
 };
 
 fn main() {
@@ -41,6 +41,7 @@ fn main() {
 
     dump::<ApiKey>(&out_dir, "api_key");
     dump::<CachePolicy>(&out_dir, "cache_policy");
+    dump::<EnsembleConfig>(&out_dir, "ensemble");
     dump::<Guardrail>(&out_dir, "guardrail");
     dump::<Model>(&out_dir, "model");
     dump::<ObservabilityExporter>(&out_dir, "observability_exporter");

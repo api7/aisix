@@ -14,6 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::ensemble::EnsembleConfig;
 use super::rate_limit::RateLimit;
 use super::routing::Routing;
 use crate::resource::Resource;
@@ -287,6 +288,14 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<Routing>,
 
+    /// Ensemble config. When set, the proxy fans the request out to every
+    /// panel member concurrently and synthesizes their responses via the
+    /// judge model, instead of dispatching a single upstream. Mutually
+    /// exclusive with `provider`/`model_name`/`provider_key_id` and
+    /// `routing` (enforced by the runtime schema in `super::schema`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ensemble: Option<EnsembleConfig>,
+
     /// Per-token cost for budget tracking. Absent = no cost tracked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<ModelCost>,
@@ -313,6 +322,12 @@ impl Model {
     /// instead of dispatching its own upstream config).
     pub fn is_routing(&self) -> bool {
         self.routing.is_some()
+    }
+
+    /// Whether this Model is an ensemble (fans out to a panel + judge
+    /// instead of dispatching a single upstream).
+    pub fn is_ensemble(&self) -> bool {
+        self.ensemble.is_some()
     }
 
     /// Convenience: borrow the upstream model id if this Model is a
@@ -572,6 +587,25 @@ mod tests {
         )
         .unwrap();
         assert!(m.is_routing());
+        assert!(m.provider.is_none());
+        assert!(m.model_name.is_none());
+        assert!(m.provider_key_id.is_none());
+    }
+
+    #[test]
+    fn ensemble_form_has_no_provider_and_reports_is_ensemble() {
+        let m: Model = serde_json::from_str(
+            r#"{
+              "display_name": "council",
+              "ensemble": {
+                "panel": [{"model": "my-gpt4"}, {"model": "my-claude"}],
+                "judge": {"model": "my-opus"}
+              }
+            }"#,
+        )
+        .unwrap();
+        assert!(m.is_ensemble());
+        assert!(!m.is_routing());
         assert!(m.provider.is_none());
         assert!(m.model_name.is_none());
         assert!(m.provider_key_id.is_none());
