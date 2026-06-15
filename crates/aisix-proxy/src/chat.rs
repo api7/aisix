@@ -1977,19 +1977,25 @@ async fn dispatch_ensemble(
     // path, which likewise holds the socket bytes-free across panel + judge;
     // warming it would need an early SSE handshake before the panel completes.
     if req.is_streaming() {
-        // Commit + emit the already-billed panel survivors, then fail. Shared
-        // by both streaming error exits (panel exhausted, or judge connect
-        // failed): in either case every surviving panel member round-tripped
-        // an upstream and must be billed, exactly like the non-streaming error
-        // paths. `charge: None` — the per-member events already carry the bill.
-        let bill_panel_and_fail =
-            |panel: Vec<crate::ensemble::PanelOutcome>,
-             reservation: aisix_ratelimit::MultiReservation<'a, aisix_ratelimit::SystemClock>,
-             proxy_err: ProxyError|
-             -> DispatchFailure {
-                let survivor_total: u64 =
-                    panel.iter().map(|p| u64::from(p.usage.total_tokens)).sum();
-                reservation.commit_tokens(survivor_total);
+        // Emit the already-billed panel survivors, then build the failure.
+        // Shared by both streaming error exits (panel exhausted, or judge
+        // connect failed): in either case every surviving panel member
+        // round-tripped an upstream and must be billed, exactly like the
+        // non-streaming error paths. `charge: None` — the per-member events
+        // already carry the bill.
+        //
+        // The token commit is NOT done here: `MultiReservation::commit_tokens`
+        // is async (#607's cluster-Redis path), and this helper is sync so
+        // `emit_panel_member` stays callable across every exit. Each call site
+        // therefore `.await`s `reservation.commit_tokens(survivor_total)`
+        // inline FIRST (mirroring the non-streaming ensemble path), then calls
+        // this for the emit + `DispatchFailure`. `panel` is borrowed so the
+        // call site still owns it to compute `survivor_total`.
+        let survivor_total = |panel: &[crate::ensemble::PanelOutcome]| -> u64 {
+            panel.iter().map(|p| u64::from(p.usage.total_tokens)).sum()
+        };
+        let emit_panel_then_fail =
+            |panel: &[crate::ensemble::PanelOutcome], proxy_err: ProxyError| -> DispatchFailure {
                 for (index, member) in panel.iter().enumerate() {
                     emit_panel_member(
                         member, index, /* blocked */ false, /* bypass */ "",
@@ -2005,9 +2011,9 @@ async fn dispatch_ensemble(
             match crate::ensemble::run_ensemble_panel(req, ensemble_cfg, &caller).await {
                 Ok(triple) => triple,
                 Err(crate::ensemble::EnsembleError::InsufficientPanel { panel, .. }) => {
-                    return Err(bill_panel_and_fail(
-                        panel,
-                        reservation,
+                    reservation.commit_tokens(survivor_total(&panel)).await;
+                    return Err(emit_panel_then_fail(
+                        &panel,
                         ProxyError::Bridge(BridgeError::upstream_status(
                             502,
                             "ensemble panel did not reach the required number of responses",
@@ -2017,11 +2023,8 @@ async fn dispatch_ensemble(
                 // `run_ensemble_panel` never returns `Judge` (it stops before
                 // the judge call), but the enum is non-exhaustive to us here.
                 Err(crate::ensemble::EnsembleError::Judge { panel, source }) => {
-                    return Err(bill_panel_and_fail(
-                        panel,
-                        reservation,
-                        ProxyError::Bridge(source),
-                    ));
+                    reservation.commit_tokens(survivor_total(&panel)).await;
+                    return Err(emit_panel_then_fail(&panel, ProxyError::Bridge(source)));
                 }
             };
 
@@ -2035,9 +2038,9 @@ async fn dispatch_ensemble(
         // snapshot, and the judge is required config), but stay total: bill the
         // panel + fail rather than panic if the entry vanished mid-request.
         let Some(judge_entry) = snapshot.models.get_by_name(&ensemble_cfg.judge.model) else {
-            return Err(bill_panel_and_fail(
-                panel,
-                reservation,
+            reservation.commit_tokens(survivor_total(&panel)).await;
+            return Err(emit_panel_then_fail(
+                &panel,
                 ProxyError::Bridge(BridgeError::InvalidUpstreamConfig(
                     "ensemble judge references an unknown model".into(),
                 )),
@@ -2048,9 +2051,9 @@ async fn dispatch_ensemble(
             Ok(pk) => pk,
             Err(e) => {
                 tracing::warn!(error = %e, "ensemble judge provider key unresolved");
-                return Err(bill_panel_and_fail(
-                    panel,
-                    reservation,
+                reservation.commit_tokens(survivor_total(&panel)).await;
+                return Err(emit_panel_then_fail(
+                    &panel,
                     ProxyError::Bridge(BridgeError::InvalidUpstreamConfig(
                         "ensemble judge has an unresolved provider key".into(),
                     )),
@@ -2059,9 +2062,9 @@ async fn dispatch_ensemble(
         };
         let Some(judge_bridge) = crate::dispatch::resolve_bridge(&state.hub, &judge_pk.value)
         else {
-            return Err(bill_panel_and_fail(
-                panel,
-                reservation,
+            reservation.commit_tokens(survivor_total(&panel)).await;
+            return Err(emit_panel_then_fail(
+                &panel,
                 ProxyError::Bridge(BridgeError::Config(
                     "ensemble judge has no registered bridge".into(),
                 )),
@@ -2082,11 +2085,8 @@ async fn dispatch_ensemble(
             // panel (same invariant as the non-streaming judge-failure path),
             // then surface the bridge error (5xx → 502, 4xx preserved).
             Err(be) => {
-                return Err(bill_panel_and_fail(
-                    panel,
-                    reservation,
-                    ProxyError::Bridge(be),
-                ));
+                reservation.commit_tokens(survivor_total(&panel)).await;
+                return Err(emit_panel_then_fail(&panel, ProxyError::Bridge(be)));
             }
         };
 
@@ -2156,7 +2156,7 @@ async fn dispatch_ensemble(
         // Hold concurrency for the stream's full lifetime (#450). Snapshot the
         // keys BEFORE consuming the reservation into the owned guard.
         let post_stream_keys = reservation.keys();
-        let stream_concurrency_hold = reservation.into_stream_hold(Arc::clone(&state.limiter));
+        let stream_concurrency_hold = reservation.into_stream_hold();
         let limiter = Arc::clone(&state.limiter);
 
         let sse_stream = build_sse_stream(
