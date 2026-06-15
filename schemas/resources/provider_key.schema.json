@@ -57,7 +57,7 @@
       ]
     },
     "secret": {
-      "description": "Upstream provider's API key, stored in plaintext on the standalone path (the etcd channel is mTLS-only — same trust boundary as Guardrail credentials and ObservabilityExporter headers). On the AISIX-Cloud path cp-api decrypts the envelope-encrypted secret at projection time and writes the plaintext here.",
+      "description": "Upstream provider's API key, stored in plaintext on the self-hosted path (the etcd channel is mTLS-only — same trust boundary as Guardrail credentials and ObservabilityExporter headers). On the AISIX-Cloud path cp-api decrypts the envelope-encrypted secret at projection time and writes the plaintext here.",
       "type": "string"
     },
     "strip_headers": {

@@ -36,22 +36,25 @@ use serde_json::Value;
 const OPENAPI_JSON_BASE: &str = r##"{
   "openapi": "3.1.0",
   "info": {
-    "title": "aisix admin API",
+    "title": "AISIX Admin API",
     "version": "0.1.0",
-    "description": "Admin surface for the standalone aisix gateway. All `/admin/v1/*` routes require Bearer admin-key auth (configured via `admin.admin_keys`). Errors use {\"error_msg\": \"...\"}.\n\nIn managed mode (aisix.cloud tenant) the admin listener is not bound — the dashboard owns CRUD via the AISIX-Cloud control plane."
+    "description": "Admin surface for the self-hosted AISIX gateway. All `/admin/v1/*` routes require Bearer admin-key auth configured with `admin.admin_keys`. Errors use {\"error_msg\": \"...\"}.\n\nIn managed mode, the admin listener is not bound. The AISIX Cloud control plane manages configuration resources."
   },
   "paths": {
     "/livez": {
       "get": {
-        "summary": "minimal public liveness probe",
+        "summary": "Get Liveness Status",
         "security": [],
         "parameters": [
           {
             "name": "verbose",
             "in": "query",
             "required": false,
-            "schema": {"type": "string"},
-            "description": "When present, returns a multi-line text report instead of the terse `ok` body."
+            "schema": {
+              "type": "string"
+            },
+            "description": "When present, returns a multi-line text report instead of the terse `ok` body.",
+            "example": "1"
           }
         ],
         "responses": {
@@ -75,187 +78,2494 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           }
-        }
+        },
+        "tags": [
+          "Health"
+        ],
+        "description": "Get the liveness status of the admin process. Add the `verbose` query parameter to return detailed shutdown and readiness information."
       }
     },
     "/admin/openapi.json": {
       "get": {
-        "summary": "this OpenAPI document",
+        "summary": "Get OpenAPI Document",
         "security": [],
-        "responses": {"200": {"description": "OK"}}
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "OpenAPI"
+        ],
+        "description": "Get the machine-readable OpenAPI 3.1 document served by this gateway process."
       }
     },
     "/admin/openapi-scalar": {
       "get": {
-        "summary": "Scalar UI (HTML) for browsing this spec",
+        "summary": "Open Scalar UI",
         "security": [],
-        "responses": {"200": {"description": "OK"}}
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "OpenAPI"
+        ],
+        "description": "Open the browser UI that loads `/admin/openapi.json` from the admin listener."
       }
     },
     "/admin/v1/models": {
       "get": {
-        "summary": "list models",
+        "summary": "List Models",
         "responses": {
           "200": {
             "description": "OK",
-            "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/ModelEntry"}}}}
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ModelEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
           }
-        }
+        },
+        "tags": [
+          "Models"
+        ],
+        "description": "List all configured model resources."
       },
       "post": {
-        "summary": "create model",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Model"}}}},
+        "summary": "Create Model",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Model"
+              }
+            }
+          },
+          "description": "Model configuration to validate and store. The Admin API generates the resource ID."
+        },
         "responses": {
-          "200": {"description": "OK", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ModelEntry"}}}},
-          "400": {"description": "schema validation failed"},
-          "409": {"description": "duplicate display_name"}
-        }
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed or the JSON body is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate display_name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Models"
+        ],
+        "description": "Create a model resource. The gateway validates the payload against the Model schema, rejects duplicate `display_name` values, and returns the stored resource entry."
       }
     },
     "/admin/v1/models/{id}": {
-      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-      "get":    { "summary": "get model",    "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} },
-      "put":    {
-        "summary": "update model",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Model"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "404": {"description": "not found"}, "409": {"description": "duplicate display_name"}}
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "Model resource ID generated by the Admin API.",
+          "example": "11111111-1111-4111-8111-111111111111"
+        }
+      ],
+      "get": {
+        "summary": "Get Model by ID",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelEntry"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Models"
+        ],
+        "description": "Get a model resource by ID."
       },
-      "delete": { "summary": "delete model", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
+      "put": {
+        "summary": "Update Model by ID",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Model"
+              }
+            }
+          },
+          "description": "Replacement model configuration to validate and store under the existing resource ID."
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed or the JSON body is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate display_name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Models"
+        ],
+        "description": "Update a model resource by ID. The gateway validates the payload, rejects duplicate `display_name` values, preserves the resource ID, and increments the revision."
+      },
+      "delete": {
+        "summary": "Delete Model by ID",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Models"
+        ],
+        "description": "Delete a model resource by ID."
+      }
     },
     "/admin/v1/models/status": {
       "get": {
-        "summary": "list per-model runtime status",
+        "summary": "List Model Runtime Status",
         "description": "Returns runtime routing/exclusion state for every Model. Direct models surface live runtime state keyed by resolved direct-model id; routing models return `not_applicable`. Request-path retryable failures surface as `cooldown`. Background checks can surface `unhealthy` or a healthy row with `status_reason=ignored_transient_error`.",
         "responses": {
           "200": {
             "description": "OK",
-            "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/ModelStatusView"}}}}
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ModelStatusView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
           }
-        }
+        },
+        "tags": [
+          "Models"
+        ]
       }
     },
     "/admin/v1/apikeys": {
-      "get":  { "summary": "list api keys",  "responses": {"200": {"description": "OK"}} },
+      "get": {
+        "summary": "List API Keys",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PublicApiKeyEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "API Keys"
+        ],
+        "description": "List caller API keys with plaintext credentials redacted."
+      },
       "post": {
-        "summary": "create api key",
-        "description": "Body carries `key_hash` (SHA-256 of plaintext). The plaintext is generated client-side; the gateway never sees it.",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiKey"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "409": {"description": "duplicate key_hash"}}
+        "summary": "Create API Key",
+        "description": "Create a caller API key. The gateway validates the payload, rejects duplicate `key_hash` values, and returns the stored resource entry with plaintext credentials redacted.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApiKeyRequest"
+              }
+            }
+          },
+          "description": "Caller API key configuration. Send the SHA-256 hash of the plaintext key; the Admin API never receives or returns the plaintext except on key rotation."
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicApiKeyEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed or the JSON body is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate key_hash",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "API Keys"
+        ]
       }
     },
     "/admin/v1/apikeys/{id}": {
-      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-      "get":    { "summary": "get api key",    "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} },
-      "put":    {
-        "summary": "update api key",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiKey"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "404": {"description": "not found"}, "409": {"description": "duplicate key_hash"}}
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "Caller API key resource ID generated by the Admin API.",
+          "example": "11111111-1111-4111-8111-111111111111"
+        }
+      ],
+      "get": {
+        "summary": "Get API Key by ID",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicApiKeyEntry"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "API Keys"
+        ],
+        "description": "Get a caller API key by ID with plaintext credentials redacted."
       },
-      "delete": { "summary": "delete api key", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
+      "put": {
+        "summary": "Update API Key by ID",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApiKeyRequest"
+              }
+            }
+          },
+          "description": "Caller API key configuration. Send the SHA-256 hash of the plaintext key; the Admin API never receives or returns the plaintext except on key rotation."
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicApiKeyEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed or the JSON body is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate key_hash",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "API Keys"
+        ],
+        "description": "Update a caller API key by ID. The gateway validates the payload, rejects duplicate `key_hash` values, preserves the resource ID, and increments the revision."
+      },
+      "delete": {
+        "summary": "Delete API Key by ID",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "API Keys"
+        ],
+        "description": "Delete a caller API key by ID."
+      }
     },
     "/admin/v1/apikeys/{id}/rotate": {
-      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-      "post": {
-        "summary": "rotate api key",
-        "description": "Generates a new plaintext bearer, persists its SHA-256 hash, and returns the plaintext **once** under `plaintext`. Caller MUST capture — subsequent GETs only expose the hash.",
-        "responses": {
-          "200": {"description": "OK", "content": {"application/json": {"schema": {
-            "type": "object",
-            "required": ["entry", "plaintext"],
-            "properties": {
-              "entry":     {"$ref": "#/components/schemas/ApiKeyEntry"},
-              "plaintext": {"type": "string", "example": "sk-abcd1234ef567890"}
-            }
-          }}}},
-          "404": {"description": "not found"}
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "Caller API key resource ID generated by the Admin API.",
+          "example": "11111111-1111-4111-8111-111111111111"
         }
+      ],
+      "post": {
+        "summary": "Rotate API Key by ID",
+        "description": "Rotate a caller API key by ID. The gateway generates a new plaintext key, stores only its SHA-256 hash, and returns the plaintext once.",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyRotateResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "API Keys"
+        ]
       }
     },
     "/admin/v1/provider_keys": {
-      "get":  { "summary": "list provider keys",  "responses": {"200": {"description": "OK"}} },
+      "get": {
+        "summary": "List Provider Keys",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ProviderKeyEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Provider Keys"
+        ],
+        "description": "List all configured provider key resources."
+      },
       "post": {
-        "summary": "create provider key",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderKey"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "409": {"description": "duplicate display_name"}}
+        "summary": "Create Provider Key",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderKey"
+              }
+            }
+          },
+          "description": "Provider key configuration containing the upstream credential and provider routing metadata. The Admin API generates the resource ID."
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderKeyEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed or the JSON body is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate display_name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Provider Keys"
+        ],
+        "description": "Create a provider key resource. The gateway validates the payload, rejects duplicate `display_name` values, and returns the stored resource entry."
       }
     },
     "/admin/v1/provider_keys/{id}": {
-      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-      "get":    { "summary": "get provider key",    "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} },
-      "put":    {
-        "summary": "update provider key",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderKey"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "404": {"description": "not found"}, "409": {"description": "duplicate display_name"}}
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "Provider key resource ID generated by the Admin API.",
+          "example": "11111111-1111-4111-8111-111111111111"
+        }
+      ],
+      "get": {
+        "summary": "Get Provider Key by ID",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderKeyEntry"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Provider Keys"
+        ],
+        "description": "Get a provider key resource by ID."
       },
-      "delete": { "summary": "delete provider key", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
+      "put": {
+        "summary": "Update Provider Key by ID",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderKey"
+              }
+            }
+          },
+          "description": "Replacement provider key configuration to validate and store under the existing resource ID."
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderKeyEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed or the JSON body is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate display_name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Provider Keys"
+        ],
+        "description": "Update a provider key resource by ID. The gateway validates the payload, rejects duplicate `display_name` values, preserves the resource ID, and increments the revision."
+      },
+      "delete": {
+        "summary": "Delete Provider Key by ID",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Provider Keys"
+        ],
+        "description": "Delete a provider key resource by ID."
+      }
     },
     "/admin/v1/guardrails": {
-      "get":  { "summary": "list guardrails", "responses": {"200": {"description": "OK"}} },
+      "get": {
+        "summary": "List Guardrails",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/GuardrailEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Guardrails"
+        ],
+        "description": "List all configured guardrail resources."
+      },
       "post": {
-        "summary": "create guardrail",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Guardrail"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "409": {"description": "duplicate name"}}
+        "summary": "Create Guardrail",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Guardrail"
+              }
+            }
+          },
+          "description": "Guardrail configuration to validate and store. The Admin API generates the resource ID."
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuardrailEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed or the JSON body is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Guardrails"
+        ],
+        "description": "Create a guardrail resource. The gateway validates the payload, rejects duplicate `name` values, and returns the stored resource entry."
       }
     },
     "/admin/v1/guardrails/{id}": {
-      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-      "get":    { "summary": "get guardrail",    "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} },
-      "put":    {
-        "summary": "update guardrail",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Guardrail"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "404": {"description": "not found"}, "409": {"description": "duplicate name"}}
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "Guardrail resource ID generated by the Admin API.",
+          "example": "11111111-1111-4111-8111-111111111111"
+        }
+      ],
+      "get": {
+        "summary": "Get Guardrail by ID",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuardrailEntry"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Guardrails"
+        ],
+        "description": "Get a guardrail resource by ID."
       },
-      "delete": { "summary": "delete guardrail", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
+      "put": {
+        "summary": "Update Guardrail by ID",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Guardrail"
+              }
+            }
+          },
+          "description": "Replacement guardrail configuration to validate and store under the existing resource ID."
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuardrailEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed or the JSON body is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Guardrails"
+        ],
+        "description": "Update a guardrail resource by ID. The gateway validates the payload, rejects duplicate `name` values, preserves the resource ID, and increments the revision."
+      },
+      "delete": {
+        "summary": "Delete Guardrail by ID",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Guardrails"
+        ],
+        "description": "Delete a guardrail resource by ID."
+      }
     },
     "/admin/v1/cache_policies": {
-      "get":  { "summary": "list cache policies", "responses": {"200": {"description": "OK"}} },
+      "get": {
+        "summary": "List Cache Policies",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CachePolicyEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Cache Policies"
+        ],
+        "description": "List all configured cache policy resources."
+      },
       "post": {
-        "summary": "create cache policy",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CachePolicy"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "409": {"description": "duplicate name"}}
+        "summary": "Create Cache Policy",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CachePolicy"
+              }
+            }
+          },
+          "description": "Cache policy configuration to validate and store. The Admin API generates the resource ID."
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CachePolicyEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed or the JSON body is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Cache Policies"
+        ],
+        "description": "Create a cache policy resource. The gateway validates the payload, rejects duplicate `name` values, and returns the stored resource entry."
       }
     },
     "/admin/v1/cache_policies/{id}": {
-      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-      "get":    { "summary": "get cache policy",    "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} },
-      "put":    {
-        "summary": "update cache policy",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CachePolicy"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "404": {"description": "not found"}, "409": {"description": "duplicate name"}}
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "Cache policy resource ID generated by the Admin API.",
+          "example": "11111111-1111-4111-8111-111111111111"
+        }
+      ],
+      "get": {
+        "summary": "Get Cache Policy by ID",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CachePolicyEntry"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Cache Policies"
+        ],
+        "description": "Get a cache policy resource by ID."
       },
-      "delete": { "summary": "delete cache policy", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
+      "put": {
+        "summary": "Update Cache Policy by ID",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CachePolicy"
+              }
+            }
+          },
+          "description": "Replacement cache policy configuration to validate and store under the existing resource ID."
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CachePolicyEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed or the JSON body is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Cache Policies"
+        ],
+        "description": "Update a cache policy resource by ID. The gateway validates the payload, rejects duplicate `name` values, preserves the resource ID, and increments the revision."
+      },
+      "delete": {
+        "summary": "Delete Cache Policy by ID",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Cache Policies"
+        ],
+        "description": "Delete a cache policy resource by ID."
+      }
     },
     "/admin/v1/observability_exporters": {
-      "get":  { "summary": "list observability exporters", "responses": {"200": {"description": "OK"}} },
+      "get": {
+        "summary": "List Observability Exporters",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ObservabilityExporterEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Observability Exporters"
+        ],
+        "description": "List all configured observability exporter resources."
+      },
       "post": {
-        "summary": "create observability exporter",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ObservabilityExporter"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "409": {"description": "duplicate name"}}
+        "summary": "Create Observability Exporter",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ObservabilityExporter"
+              }
+            }
+          },
+          "description": "Observability exporter configuration to validate and store. The Admin API generates the resource ID."
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObservabilityExporterEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed or the JSON body is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Observability Exporters"
+        ],
+        "description": "Create an observability exporter resource. The gateway validates the payload, rejects duplicate `name` values, and returns the stored resource entry."
       }
     },
     "/admin/v1/observability_exporters/{id}": {
-      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-      "get":    { "summary": "get observability exporter",    "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} },
-      "put":    {
-        "summary": "update observability exporter",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ObservabilityExporter"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "404": {"description": "not found"}, "409": {"description": "duplicate name"}}
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "Observability exporter resource ID generated by the Admin API.",
+          "example": "11111111-1111-4111-8111-111111111111"
+        }
+      ],
+      "get": {
+        "summary": "Get Observability Exporter by ID",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObservabilityExporterEntry"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Observability Exporters"
+        ],
+        "description": "Get an observability exporter resource by ID."
       },
-      "delete": { "summary": "delete observability exporter", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
+      "put": {
+        "summary": "Update Observability Exporter by ID",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ObservabilityExporter"
+              }
+            }
+          },
+          "description": "Replacement observability exporter configuration to validate and store under the existing resource ID."
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObservabilityExporterEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed or the JSON body is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Observability Exporters"
+        ],
+        "description": "Update an observability exporter resource by ID. The gateway validates the payload, rejects duplicate `name` values, preserves the resource ID, and increments the revision."
+      },
+      "delete": {
+        "summary": "Delete Observability Exporter by ID",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Observability Exporters"
+        ],
+        "description": "Delete an observability exporter resource by ID."
+      }
     },
     "/admin/v1/health": {
       "get": {
-        "summary": "per-Model upstream health",
+        "summary": "List Model Health Levels",
         "description": "Returns each Model's health level: 0=Healthy, 1=Degraded (4-7 consecutive upstream failures), 2=Down (8+).",
-        "responses": {"200": {"description": "OK"}}
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration store operation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Health"
+        ]
       }
     },
     "/playground/chat/completions": {
       "post": {
-        "summary": "in-process forward to the proxy router",
+        "summary": "Create Playground Chat Completion",
         "description": "Forwards a chat completion through the proxy in-process — no extra network hop, but the request is fully audited as if it had arrived on the proxy listener. Auth is a **proxy** ApiKey (`Authorization: Bearer sk-aisix-...`), not an admin key — the proxy middleware validates it inside the forwarded request.",
-        "security": [{"ProxyBearer": []}],
-        "responses": {"200": {"description": "OK (OpenAI-shape chat completion)"}, "401": {"description": "missing/invalid api key"}}
+        "security": [
+          {
+            "ProxyBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK. OpenAI-compatible chat completion response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "description": "Server-sent events returned when the request body sets `stream` to `true`."
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed or invalid JSON request body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid proxy API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Requested model is not allowed for the proxy API key or client IP.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Requested model is not configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the proxy body-size limit.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Proxy validation or guardrail error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Proxy rate limit or budget limit exceeded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Proxy router is not wired into this admin router.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Upstream proxy error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Proxy route unavailable or all routing targets filtered.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Playground"
+        ],
+        "requestBody": {
+          "description": "OpenAI-compatible chat completion request forwarded through the in-process proxy router.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        }
       }
     }
   },
@@ -275,61 +2585,498 @@ const OPENAPI_JSON_BASE: &str = r##"{
     "schemas": {
       "ModelEntry": {
         "type": "object",
-        "required": ["id", "value", "revision"],
+        "required": [
+          "id",
+          "value",
+          "revision"
+        ],
         "properties": {
-          "id":       {"type": "string"},
-          "value":    {"$ref": "#/components/schemas/Model"},
-          "revision": {"type": "integer"}
-        }
+          "id": {
+            "type": "string",
+            "description": "Resource ID generated by the Admin API.",
+            "example": "11111111-1111-4111-8111-111111111111"
+          },
+          "value": {
+            "$ref": "#/components/schemas/Model",
+            "description": "Stored model configuration."
+          },
+          "revision": {
+            "type": "integer",
+            "description": "Monotonic resource revision. Create operations start at 1, and update or rotate operations increment the revision.",
+            "example": 1
+          }
+        },
+        "description": "Stored Admin API resource entry."
       },
       "ModelStatusView": {
         "type": "object",
-        "required": ["id", "display_name", "kind", "status"],
+        "required": [
+          "id",
+          "display_name",
+          "kind",
+          "status"
+        ],
         "properties": {
-          "id": {"type": "string", "description": "Resolved model id. Direct-model runtime status is keyed by this id."},
-          "display_name": {"type": "string"},
-          "kind": {"$ref": "#/components/schemas/ModelKind"},
-          "status": {"$ref": "#/components/schemas/RuntimeStatus"},
-          "cooldown_until": {"$ref": "#/components/schemas/SystemTime"},
-          "last_checked_at": {"$ref": "#/components/schemas/SystemTime"},
-          "last_check_status": {"type": "integer", "minimum": 100, "maximum": 599},
-          "status_reason": {"type": "string", "description": "Machine-readable explanation such as `retryable_failure`, `background_check_failed`, or `ignored_transient_error`."}
+          "id": {
+            "type": "string",
+            "description": "Resolved model id. Direct-model runtime status is keyed by this id."
+          },
+          "display_name": {
+            "type": "string",
+            "description": "Model alias used by proxy callers.",
+            "example": "gpt-4o"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ModelKind",
+            "description": "Whether the row describes a direct upstream model or a routing model."
+          },
+          "status": {
+            "$ref": "#/components/schemas/RuntimeStatus",
+            "description": "Runtime routing status for this model."
+          },
+          "cooldown_until": {
+            "$ref": "#/components/schemas/SystemTime"
+          },
+          "last_checked_at": {
+            "$ref": "#/components/schemas/SystemTime"
+          },
+          "last_check_status": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 599,
+            "description": "HTTP status code from the last background model check.",
+            "example": 503
+          },
+          "status_reason": {
+            "type": "string",
+            "description": "Machine-readable explanation such as `retryable_failure`, `background_check_failed`, or `ignored_transient_error`.",
+            "example": "retryable_failure"
+          }
         },
         "description": "Per-model runtime routing status. Routing rows always return `kind=routing` and `status=not_applicable`."
       },
       "ModelKind": {
         "type": "string",
-        "enum": ["direct", "routing"]
+        "enum": [
+          "direct",
+          "routing"
+        ],
+        "description": "Model resource kind. `direct` models dispatch to one upstream target; `routing` models select from configured routing targets.",
+        "example": "direct"
       },
       "RuntimeStatus": {
         "type": "string",
-        "enum": ["healthy", "unhealthy", "cooldown", "not_applicable"]
+        "enum": [
+          "healthy",
+          "unhealthy",
+          "cooldown",
+          "not_applicable"
+        ],
+        "description": "Runtime routing status. `healthy` is selectable, `unhealthy` is excluded after background checks fail, `cooldown` is temporarily excluded after retryable request failures, and `not_applicable` is used for routing models.",
+        "example": "healthy"
       },
       "SystemTime": {
         "type": "object",
-        "required": ["secs_since_epoch", "nanos_since_epoch"],
+        "required": [
+          "secs_since_epoch",
+          "nanos_since_epoch"
+        ],
         "properties": {
-          "secs_since_epoch": {"type": "integer", "minimum": 0},
-          "nanos_since_epoch": {"type": "integer", "minimum": 0, "maximum": 999999999}
-        }
+          "secs_since_epoch": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Whole seconds since the Unix epoch.",
+            "example": 1710000000
+          },
+          "nanos_since_epoch": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 999999999,
+            "description": "Nanosecond offset within the current second.",
+            "example": 0
+          }
+        },
+        "description": "System timestamp serialized from Rust `SystemTime`."
       },
       "ApiKeyEntry": {
         "type": "object",
-        "required": ["id", "value", "revision"],
+        "required": [
+          "id",
+          "value",
+          "revision"
+        ],
         "properties": {
-          "id":       {"type": "string"},
-          "value":    {"$ref": "#/components/schemas/ApiKey"},
-          "revision": {"type": "integer"}
-        }
+          "id": {
+            "type": "string",
+            "description": "Resource ID generated by the Admin API.",
+            "example": "11111111-1111-4111-8111-111111111111"
+          },
+          "value": {
+            "$ref": "#/components/schemas/PublicApiKey",
+            "description": "Stored caller API key configuration with plaintext credentials redacted."
+          },
+          "revision": {
+            "type": "integer",
+            "description": "Monotonic resource revision. Create operations start at 1, and update or rotate operations increment the revision.",
+            "example": 1
+          }
+        },
+        "description": "Stored Admin API resource entry."
       },
       "AdminError": {
         "type": "object",
-        "required": ["error_msg"],
-        "properties": {"error_msg": {"type": "string"}}
+        "required": [
+          "error_msg"
+        ],
+        "properties": {
+          "error_msg": {
+            "type": "string",
+            "description": "Human-readable error message.",
+            "example": "missing or invalid admin key"
+          }
+        },
+        "description": "Admin API error response envelope."
+      },
+      "PublicApiKey": {
+        "type": "object",
+        "required": [
+          "key_hash",
+          "allowed_models"
+        ],
+        "properties": {
+          "key_hash": {
+            "type": "string",
+            "description": "SHA-256 hash of the caller-facing plaintext key."
+          },
+          "allowed_models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Model aliases this caller API key may use.",
+            "example": [
+              "gpt-4o"
+            ]
+          },
+          "rate_limit": {
+            "$ref": "#/components/schemas/RateLimit"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PublicApiKeyEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "value",
+          "revision"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Resource ID generated by the Admin API.",
+            "example": "11111111-1111-4111-8111-111111111111"
+          },
+          "value": {
+            "$ref": "#/components/schemas/PublicApiKey",
+            "description": "Stored caller API key configuration with plaintext credentials redacted."
+          },
+          "revision": {
+            "type": "integer",
+            "description": "Monotonic resource revision. Create operations start at 1, and update or rotate operations increment the revision.",
+            "example": 1
+          }
+        },
+        "description": "Stored Admin API resource entry."
+      },
+      "ApiKeyRotateResponse": {
+        "type": "object",
+        "required": [
+          "entry",
+          "plaintext"
+        ],
+        "properties": {
+          "entry": {
+            "$ref": "#/components/schemas/PublicApiKeyEntry"
+          },
+          "plaintext": {
+            "type": "string",
+            "example": "sk-abcd1234ef567890"
+          }
+        }
+      },
+      "ProviderKeyEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "value",
+          "revision"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Resource ID generated by the Admin API.",
+            "example": "11111111-1111-4111-8111-111111111111"
+          },
+          "value": {
+            "$ref": "#/components/schemas/ProviderKey",
+            "description": "Stored provider key configuration."
+          },
+          "revision": {
+            "type": "integer",
+            "description": "Monotonic resource revision. Create operations start at 1, and update or rotate operations increment the revision.",
+            "example": 1
+          }
+        },
+        "description": "Stored Admin API resource entry."
+      },
+      "GuardrailEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "value",
+          "revision"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Resource ID generated by the Admin API.",
+            "example": "11111111-1111-4111-8111-111111111111"
+          },
+          "value": {
+            "$ref": "#/components/schemas/Guardrail",
+            "description": "Stored guardrail configuration."
+          },
+          "revision": {
+            "type": "integer",
+            "description": "Monotonic resource revision. Create operations start at 1, and update or rotate operations increment the revision.",
+            "example": 1
+          }
+        },
+        "description": "Stored Admin API resource entry."
+      },
+      "CachePolicyEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "value",
+          "revision"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Resource ID generated by the Admin API.",
+            "example": "11111111-1111-4111-8111-111111111111"
+          },
+          "value": {
+            "$ref": "#/components/schemas/CachePolicy",
+            "description": "Stored cache policy configuration."
+          },
+          "revision": {
+            "type": "integer",
+            "description": "Monotonic resource revision. Create operations start at 1, and update or rotate operations increment the revision.",
+            "example": 1
+          }
+        },
+        "description": "Stored Admin API resource entry."
+      },
+      "ObservabilityExporterEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "value",
+          "revision"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Resource ID generated by the Admin API.",
+            "example": "11111111-1111-4111-8111-111111111111"
+          },
+          "value": {
+            "$ref": "#/components/schemas/ObservabilityExporter",
+            "description": "Stored observability exporter configuration."
+          },
+          "revision": {
+            "type": "integer",
+            "description": "Monotonic resource revision. Create operations start at 1, and update or rotate operations increment the revision.",
+            "example": 1
+          }
+        },
+        "description": "Stored Admin API resource entry."
+      },
+      "DeleteResponse": {
+        "type": "object",
+        "required": [
+          "deleted",
+          "id"
+        ],
+        "properties": {
+          "deleted": {
+            "type": "boolean",
+            "enum": [
+              true
+            ],
+            "description": "Always `true` when the resource was deleted.",
+            "example": true
+          },
+          "id": {
+            "type": "string"
+          }
+        }
+      },
+      "ModelHealth": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "health"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Model resource ID.",
+            "example": "11111111-1111-4111-8111-111111111111"
+          },
+          "name": {
+            "type": "string",
+            "description": "Model alias used by proxy callers.",
+            "example": "gpt-4o"
+          },
+          "health": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2,
+            "description": "Numeric model health level: 0 is healthy, 1 is degraded, and 2 is down.",
+            "example": 0
+          }
+        }
+      },
+      "ConfigStatus": {
+        "type": "object",
+        "required": [
+          "snapshot_revision",
+          "snapshot_age_seconds"
+        ],
+        "properties": {
+          "snapshot_revision": {
+            "type": "integer",
+            "description": "Highest configuration-store revision reflected in the current snapshot.",
+            "example": 1234567
+          },
+          "snapshot_age_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Seconds since the watch supervisor last applied a snapshot, or null before the first apply.",
+            "example": 5
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "models"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok"
+            ],
+            "description": "Overall health response status. The endpoint always returns `ok`; inspect each model health level for actionable signal.",
+            "example": "ok"
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelHealth"
+            },
+            "description": "Per-model health levels."
+          },
+          "config": {
+            "$ref": "#/components/schemas/ConfigStatus",
+            "description": "Configuration watch freshness. Omitted when the watch supervisor is not wired into the admin state."
+          }
+        }
+      },
+      "ApiKeyRequest": {
+        "type": "object",
+        "required": [
+          "key_hash",
+          "allowed_models"
+        ],
+        "properties": {
+          "key_hash": {
+            "type": "string",
+            "description": "SHA-256 hash of the caller-facing plaintext key.",
+            "example": "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"
+          },
+          "allowed_models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Model aliases this caller API key may use.",
+            "example": [
+              "gpt-4o"
+            ]
+          },
+          "rate_limit": {
+            "$ref": "#/components/schemas/RateLimit"
+          }
+        },
+        "additionalProperties": false,
+        "description": "Self-hosted Admin API request body for creating or updating a caller API key. Cloud-projected ownership fields are not accepted by this API."
       }
     }
   },
-  "security": [{ "AdminBearer": [] }]
+  "security": [
+    {
+      "AdminBearer": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "Health",
+      "description": "Public liveness and model health endpoints."
+    },
+    {
+      "name": "OpenAPI",
+      "description": "Machine-readable Admin API specification and browser UI."
+    },
+    {
+      "name": "Models",
+      "description": "Model aliases and routing models used by proxy requests."
+    },
+    {
+      "name": "API Keys",
+      "description": "Caller-facing proxy API keys and key rotation."
+    },
+    {
+      "name": "Provider Keys",
+      "description": "Upstream provider credentials referenced by models."
+    },
+    {
+      "name": "Guardrails",
+      "description": "Guardrail policies attached to proxy traffic."
+    },
+    {
+      "name": "Cache Policies",
+      "description": "Semantic cache policies attached to models."
+    },
+    {
+      "name": "Observability Exporters",
+      "description": "Exporter configurations for request and response telemetry."
+    },
+    {
+      "name": "Playground",
+      "description": "In-process proxy playground endpoint for chat completions."
+    }
+  ]
 }"##;
 
 const SCALAR_HTML: &str = r#"<!DOCTYPE html>
@@ -529,20 +3276,394 @@ mod tests {
             "RuntimeStatus",
             "SystemTime",
             "ApiKey",
+            "ApiKeyRequest",
             "ApiKeyEntry",
+            "PublicApiKey",
+            "PublicApiKeyEntry",
+            "ApiKeyRotateResponse",
             "ProviderKey",
+            "ProviderKeyEntry",
             "Guardrail",
+            "GuardrailEntry",
             "CachePolicy",
+            "CachePolicyEntry",
             "ObservabilityExporter",
+            "ObservabilityExporterEntry",
             "RateLimit",
             "Routing",
             "ModelCost",
+            "DeleteResponse",
+            "ModelHealth",
+            "ConfigStatus",
+            "HealthResponse",
             "AdminError",
         ] {
             assert!(
                 parsed["components"]["schemas"][schema].is_object(),
                 "merged OpenAPI missing schema {schema}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn openapi_documents_exact_admin_path_set() {
+        use std::collections::BTreeSet;
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let actual: BTreeSet<_> = parsed["paths"]
+            .as_object()
+            .expect("paths must be an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected = BTreeSet::from([
+            "/livez",
+            "/admin/openapi.json",
+            "/admin/openapi-scalar",
+            "/admin/v1/models",
+            "/admin/v1/models/{id}",
+            "/admin/v1/models/status",
+            "/admin/v1/apikeys",
+            "/admin/v1/apikeys/{id}",
+            "/admin/v1/apikeys/{id}/rotate",
+            "/admin/v1/provider_keys",
+            "/admin/v1/provider_keys/{id}",
+            "/admin/v1/guardrails",
+            "/admin/v1/guardrails/{id}",
+            "/admin/v1/cache_policies",
+            "/admin/v1/cache_policies/{id}",
+            "/admin/v1/observability_exporters",
+            "/admin/v1/observability_exporters/{id}",
+            "/admin/v1/health",
+            "/playground/chat/completions",
+        ]);
+
+        assert_eq!(
+            actual, expected,
+            "OpenAPI paths must match the admin router exactly; metrics live on the dedicated metrics listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn openapi_uses_self_hosted_apikey_request_schema() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        for (path, method) in [
+            ("/admin/v1/apikeys", "post"),
+            ("/admin/v1/apikeys/{id}", "put"),
+        ] {
+            assert_eq!(
+                parsed["paths"][path][method]["requestBody"]["content"]["application/json"]
+                    ["schema"]["$ref"],
+                "#/components/schemas/ApiKeyRequest",
+                "{method} {path} should document the self-hosted Admin API request body"
+            );
+        }
+
+        let request = &parsed["components"]["schemas"]["ApiKeyRequest"];
+        assert_eq!(request["required"][0], "key_hash");
+        assert_eq!(request["required"][1], "allowed_models");
+        assert!(request["properties"].get("team_id").is_none());
+        assert!(request["properties"].get("user_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn openapi_documents_response_schemas_for_all_statuses() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let paths = parsed["paths"]
+            .as_object()
+            .expect("paths must be an object");
+
+        for (path, path_item) in paths {
+            let path_item = path_item.as_object().expect("path item must be an object");
+            for (method, operation) in path_item {
+                if method == "parameters" {
+                    continue;
+                }
+                let responses = operation["responses"]
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{method} {path} must define responses"));
+                for (status, response) in responses {
+                    let Some(content) = response["content"].as_object() else {
+                        panic!("{method} {path} response {status} missing content schema");
+                    };
+                    let has_schema = content.values().any(|media| media["schema"].is_object());
+                    assert!(
+                        has_schema,
+                        "{method} {path} response {status} missing media schema"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openapi_internal_refs_resolve() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let mut missing = Vec::new();
+        collect_missing_refs(&parsed, &parsed, String::new(), &mut missing);
+        assert!(
+            missing.is_empty(),
+            "OpenAPI contains unresolved internal refs: {missing:#?}"
+        );
+    }
+
+    fn collect_missing_refs(
+        root: &serde_json::Value,
+        value: &serde_json::Value,
+        path: String,
+        missing: &mut Vec<String>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(reference) = map.get("$ref").and_then(|reference| reference.as_str()) {
+                    if !reference.starts_with("#/") {
+                        return;
+                    }
+                    if !internal_ref_exists(root, reference) {
+                        missing.push(format!("{path}: {reference}"));
+                    }
+                }
+                for (key, child) in map {
+                    let child_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    collect_missing_refs(root, child, child_path, missing);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    collect_missing_refs(root, item, format!("{path}[{index}]"), missing);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn internal_ref_exists(root: &serde_json::Value, reference: &str) -> bool {
+        let mut current = root;
+        for token in reference.trim_start_matches("#/").split('/') {
+            let token = token.replace("~1", "/").replace("~0", "~");
+            let Some(next) = current.get(&token) else {
+                return false;
+            };
+            current = next;
+        }
+        true
+    }
+
+    #[tokio::test]
+    async fn openapi_documents_reference_metadata_for_all_operations() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let paths = parsed["paths"]
+            .as_object()
+            .expect("paths must be an object");
+
+        for (path, path_item) in paths {
+            let path_item = path_item.as_object().expect("path item must be an object");
+            for (method, operation) in path_item {
+                if method == "parameters" {
+                    continue;
+                }
+                assert!(
+                    operation["tags"]
+                        .as_array()
+                        .is_some_and(|tags| !tags.is_empty()),
+                    "{method} {path} missing tags"
+                );
+                assert!(
+                    operation["description"]
+                        .as_str()
+                        .is_some_and(|description| !description.trim().is_empty()),
+                    "{method} {path} missing description"
+                );
+
+                if let Some(request_body) = operation.get("requestBody") {
+                    assert!(
+                        request_body["description"]
+                            .as_str()
+                            .is_some_and(|description| !description.trim().is_empty()),
+                        "{method} {path} request body missing description"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openapi_documents_parameter_descriptions_and_examples() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let paths = parsed["paths"]
+            .as_object()
+            .expect("paths must be an object");
+
+        for (path, path_item) in paths {
+            let path_item = path_item.as_object().expect("path item must be an object");
+            for parameter in path_item
+                .get("parameters")
+                .and_then(|parameters| parameters.as_array())
+                .into_iter()
+                .flatten()
+            {
+                assert_complete_parameter("path item", path, parameter);
+            }
+            for (method, operation) in path_item {
+                if method == "parameters" {
+                    continue;
+                }
+                for parameter in operation
+                    .get("parameters")
+                    .and_then(|parameters| parameters.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    assert_complete_parameter(method, path, parameter);
+                }
+            }
+        }
+    }
+
+    fn assert_complete_parameter(method: &str, path: &str, parameter: &serde_json::Value) {
+        let name = parameter["name"].as_str().unwrap_or("<unnamed>");
+        assert!(
+            parameter["description"]
+                .as_str()
+                .is_some_and(|description| !description.trim().is_empty()),
+            "{method} {path} parameter {name} missing description"
+        );
+        assert!(
+            parameter.get("example").is_some() || parameter.get("examples").is_some(),
+            "{method} {path} parameter {name} missing example"
+        );
+        if parameter["schema"].get("enum").is_some() {
+            assert!(
+                parameter["description"]
+                    .as_str()
+                    .is_some_and(|description| !description.trim().is_empty()),
+                "{method} {path} enum parameter {name} missing enum description"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn openapi_documents_admin_enum_schemas() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let schemas = &parsed["components"]["schemas"];
+
+        for schema in ["ModelKind", "RuntimeStatus"] {
+            assert!(
+                schemas[schema]["description"]
+                    .as_str()
+                    .is_some_and(|description| !description.trim().is_empty()),
+                "{schema} enum missing description"
+            );
+            assert!(
+                schemas[schema].get("example").is_some(),
+                "{schema} enum missing example"
+            );
+        }
+
+        assert_eq!(
+            schemas["DeleteResponse"]["properties"]["deleted"]["description"],
+            "Always `true` when the resource was deleted."
+        );
+        assert_eq!(
+            schemas["HealthResponse"]["properties"]["status"]["description"],
+            "Overall health response status. The endpoint always returns `ok`; inspect each model health level for actionable signal."
+        );
+    }
+
+    #[tokio::test]
+    async fn openapi_documents_playground_response_media_types() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+
+        let responses = &parsed["paths"]["/playground/chat/completions"]["post"]["responses"];
+        let content = &responses["200"]["content"];
+        assert!(
+            content["application/json"]["schema"].is_object(),
+            "playground should document non-streaming JSON responses"
+        );
+        assert!(
+            content["text/event-stream"]["schema"].is_object(),
+            "playground should document streaming SSE responses"
+        );
+        assert!(
+            responses["400"]["content"]["application/json"]["schema"].is_object(),
+            "playground should document proxy invalid-request responses"
+        );
+        for status in ["403", "404", "413", "429"] {
+            assert!(
+                responses[status]["content"]["application/json"]["schema"].is_object(),
+                "playground should document forwarded proxy response {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn openapi_documents_admin_json_body_limit_rejections() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+
+        for (path, method) in [
+            ("/admin/v1/models", "post"),
+            ("/admin/v1/models/{id}", "put"),
+            ("/admin/v1/apikeys", "post"),
+            ("/admin/v1/apikeys/{id}", "put"),
+            ("/admin/v1/provider_keys", "post"),
+            ("/admin/v1/provider_keys/{id}", "put"),
+            ("/admin/v1/guardrails", "post"),
+            ("/admin/v1/guardrails/{id}", "put"),
+            ("/admin/v1/cache_policies", "post"),
+            ("/admin/v1/cache_policies/{id}", "put"),
+            ("/admin/v1/observability_exporters", "post"),
+            ("/admin/v1/observability_exporters/{id}", "put"),
+        ] {
+            let response = &parsed["paths"][path][method]["responses"]["413"];
+            assert_eq!(
+                response["content"]["text/plain"]["schema"]["type"], "string",
+                "{method} {path} should document admin JSON body-limit rejections"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn openapi_documents_admin_auth_and_error_envelope() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let paths = parsed["paths"]
+            .as_object()
+            .expect("paths must be an object");
+
+        for (path, path_item) in paths {
+            if !path.starts_with("/admin/v1/") {
+                continue;
+            }
+            let path_item = path_item.as_object().expect("path item must be an object");
+            for (method, operation) in path_item {
+                if method == "parameters" {
+                    continue;
+                }
+                let responses = operation["responses"]
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{method} {path} must define responses"));
+                let unauthorized = responses
+                    .get("401")
+                    .unwrap_or_else(|| panic!("{method} {path} missing 401 response"));
+                assert_eq!(
+                    unauthorized["content"]["application/json"]["schema"]["$ref"],
+                    "#/components/schemas/AdminError",
+                    "{method} {path} 401 should use AdminError"
+                );
+            }
         }
     }
 
