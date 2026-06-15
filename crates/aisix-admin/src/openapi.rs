@@ -37,8 +37,8 @@ const OPENAPI_JSON_BASE: &str = r##"{
   "openapi": "3.1.0",
   "info": {
     "title": "AISIX Admin API",
-    "version": "0.1.0",
-    "description": "Admin surface for the self-hosted AISIX gateway. All `/admin/v1/*` routes require Bearer admin-key auth configured with `admin.admin_keys`. Errors use {\"error_msg\": \"...\"}.\n\nIn managed mode, the admin listener is not bound. The AISIX Cloud control plane manages configuration resources."
+    "version": "dev",
+    "description": "Admin surface for the self-hosted AISIX gateway. All `/admin/v1/*` routes require Bearer admin-key auth configured with `admin.admin_keys`. Errors use `{\"error_msg\": \"...\"}`.\n\nIn managed mode, the admin listener is not bound. The AISIX Cloud control plane manages configuration resources."
   },
   "paths": {
     "/livez": {
@@ -2635,10 +2635,12 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "description": "Runtime routing status for this model."
           },
           "cooldown_until": {
-            "$ref": "#/components/schemas/SystemTime"
+            "$ref": "#/components/schemas/SystemTime",
+            "description": "Time when the current request-path cooldown expires. Omitted when the model is not in cooldown."
           },
           "last_checked_at": {
-            "$ref": "#/components/schemas/SystemTime"
+            "$ref": "#/components/schemas/SystemTime",
+            "description": "Time of the last background model health check. Omitted before a check has completed."
           },
           "last_check_status": {
             "type": "integer",
@@ -2759,7 +2761,8 @@ const OPENAPI_JSON_BASE: &str = r##"{
             ]
           },
           "rate_limit": {
-            "$ref": "#/components/schemas/RateLimit"
+            "$ref": "#/components/schemas/RateLimit",
+            "description": "Optional request, token, and concurrency limits for this key."
           }
         },
         "additionalProperties": false
@@ -2797,10 +2800,12 @@ const OPENAPI_JSON_BASE: &str = r##"{
         ],
         "properties": {
           "entry": {
-            "$ref": "#/components/schemas/PublicApiKeyEntry"
+            "$ref": "#/components/schemas/PublicApiKeyEntry",
+            "description": "Updated caller API key resource with the new key hash stored and plaintext credentials redacted."
           },
           "plaintext": {
             "type": "string",
+            "description": "New plaintext bearer token. The Admin API returns it only once after rotation.",
             "example": "sk-abcd1234ef567890"
           }
         }

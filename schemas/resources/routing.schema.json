@@ -43,6 +43,7 @@
       ]
     },
     "strategy": {
+      "description": "Strategy used to select a target for each request.",
       "default": "failover",
       "allOf": [
         {
@@ -51,6 +52,7 @@
       ]
     },
     "targets": {
+      "description": "Ordered set of direct models available to this routing model.",
       "type": "array",
       "items": {
         "$ref": "#/definitions/RoutingTarget"
@@ -104,6 +106,7 @@
       ],
       "properties": {
         "model": {
+          "description": "Model alias for a direct model that can receive routed traffic.",
           "type": "string"
         },
         "weight": {

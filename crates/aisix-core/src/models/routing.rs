@@ -33,6 +33,7 @@ pub enum RoutingStrategy {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingTarget {
+    /// Model alias for a direct model that can receive routed traffic.
     pub model: String,
     /// Only meaningful for `weighted`. Optional everywhere else; falls
     /// back to 1 when missing.
@@ -93,8 +94,10 @@ pub enum OnAllFilteredPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Routing {
+    /// Strategy used to select a target for each request.
     #[serde(default)]
     pub strategy: RoutingStrategy,
+    /// Ordered set of direct models available to this routing model.
     pub targets: Vec<RoutingTarget>,
     /// Retry attempts on the current target before failing over.
     #[serde(default, skip_serializing_if = "Option::is_none")]

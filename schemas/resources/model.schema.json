@@ -248,7 +248,12 @@
       ],
       "properties": {
         "judge": {
-          "$ref": "#/definitions/Judge"
+          "description": "Direct model that combines successful panel responses.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Judge"
+            }
+          ]
         },
         "min_responses": {
           "description": "Minimum successful panel responses required to proceed to synthesis. Absent = `min(DEFAULT_MIN_RESPONSES, panel.len())`. A value larger than the panel is clamped to the panel size.",
@@ -260,6 +265,7 @@
           "minimum": 0.0
         },
         "panel": {
+          "description": "Direct models called concurrently for each ensemble request.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/PanelMember"
@@ -285,6 +291,7 @@
       ],
       "properties": {
         "model": {
+          "description": "Model alias for the direct model that synthesizes panel responses.",
           "type": "string"
         },
         "synthesis_prompt": {
@@ -345,6 +352,7 @@
       ],
       "properties": {
         "model": {
+          "description": "Model alias for a direct model that receives one panel request.",
           "type": "string"
         },
         "seed": {
@@ -488,6 +496,7 @@
           ]
         },
         "strategy": {
+          "description": "Strategy used to select a target for each request.",
           "default": "failover",
           "allOf": [
             {
@@ -496,6 +505,7 @@
           ]
         },
         "targets": {
+          "description": "Ordered set of direct models available to this routing model.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/RoutingTarget"
@@ -530,6 +540,7 @@
       ],
       "properties": {
         "model": {
+          "description": "Model alias for a direct model that can receive routed traffic.",
           "type": "string"
         },
         "weight": {

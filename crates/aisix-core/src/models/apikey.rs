@@ -27,6 +27,7 @@ pub struct ApiKey {
     /// array** denies every model (spec §3 authz rule).
     pub allowed_models: Vec<String>,
 
+    /// Optional request, token, and concurrency limits for this key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
 

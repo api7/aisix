@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PanelMember {
+    /// Model alias for a direct model that receives one panel request.
     pub model: String,
     /// Sampling temperature for THIS member's call. Overrides the
     /// request's `temperature`, so a panel of the same model repeated N
@@ -52,6 +53,7 @@ impl PanelMember {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Judge {
+    /// Model alias for the direct model that synthesizes panel responses.
     pub model: String,
     /// Optional override for the built-in synthesis prompt template.
     /// Absent = use the default template.
@@ -77,7 +79,9 @@ const DEFAULT_MIN_RESPONSES: usize = 2;
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EnsembleConfig {
+    /// Direct models called concurrently for each ensemble request.
     pub panel: Vec<PanelMember>,
+    /// Direct model that combines successful panel responses.
     pub judge: Judge,
     /// Minimum successful panel responses required to proceed to
     /// synthesis. Absent = `min(DEFAULT_MIN_RESPONSES, panel.len())`.
