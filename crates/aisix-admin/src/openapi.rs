@@ -145,7 +145,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -225,7 +225,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -282,7 +282,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -372,7 +372,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -417,7 +417,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -458,7 +458,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -498,7 +498,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -579,7 +579,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -636,7 +636,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -726,7 +726,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -771,7 +771,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -829,7 +829,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -869,7 +869,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -949,7 +949,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1006,7 +1006,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1096,7 +1096,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1141,7 +1141,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1181,7 +1181,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1261,7 +1261,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1318,7 +1318,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1408,7 +1408,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1453,7 +1453,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1493,7 +1493,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1573,7 +1573,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1630,7 +1630,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1720,7 +1720,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1765,7 +1765,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1805,7 +1805,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1885,7 +1885,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -1942,7 +1942,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -2032,7 +2032,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -2077,7 +2077,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
@@ -2115,7 +2115,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "500": {
-            "description": "Store error",
+            "description": "Configuration store operation failed",
             "content": {
               "application/json": {
                 "schema": {
