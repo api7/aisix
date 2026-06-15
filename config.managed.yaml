@@ -1,0 +1,88 @@
+# aisix — managed-mode bootstrap config (aisix.cloud tenant).
+#
+# Used by the official Docker image as `/etc/aisix/config.yaml`.
+# Only the bare minimum is set here:
+#
+#   - `managed.enabled: true`           always on for this image
+#   - `etcd.endpoints: [placeholder]`   overridden at boot from managed
+#                                       CP endpoint config
+#   - `admin.admin_keys: [placeholder]` validation requires the slot,
+#                                       but the admin listener is never
+#                                       bound in managed mode
+#
+# Operators inject these env vars at `docker run` time:
+#
+#   AISIX_MANAGED__CP_BASE_URL=https://api.us.aisix.cloud
+#   AISIX_MANAGED__CP_ETCD_ENDPOINT=etcd.us.aisix.cloud:7943
+#   AISIX_MANAGED__CP_CERT_PEM=...
+#   AISIX_MANAGED__CP_KEY_PEM=...
+#   AISIX_MANAGED__CP_CA_PEM=...
+#
+# Plus optionally `AISIX_PROXY__ADDR`, `AISIX_OBSERVABILITY__LOG_LEVEL`,
+# `AISIX_CACHE__BACKEND`, etc. — every config field is reachable via
+# `AISIX_<UPPER>__<UPPER>` (see crates/aisix-core/src/config.rs).
+#
+# For a multi-replica deployment, enable cluster-level rate limiting so
+# the cluster enforces one global window instead of N× per replica
+# (api7/AISIX-Cloud#798):
+#   AISIX_RATELIMIT__BACKEND=redis
+#   AISIX_RATELIMIT__REDIS__URL=redis://<host>:6379
+#
+# Subsequent boots re-use the mTLS bundle written under
+# `managed.mtls_dir`.
+
+etcd:
+  # Placeholder — overwritten at boot before opening the gRPC channel.
+  endpoints:
+    - "https://placeholder-overridden-at-register:2379"
+  prefix: "/aisix"
+  dial_timeout_ms: 5000
+  request_timeout_ms: 5000
+
+proxy:
+  addr: "0.0.0.0:3000"
+  request_body_limit_bytes: 10485760
+
+admin:
+  # Bind to an unbindable port so even if managed mode somehow
+  # toggled off, the admin surface wouldn't accidentally come up
+  # without an operator-supplied key.
+  addr: "127.0.0.1:0"
+  admin_keys:
+    - "managed-mode-admin-disabled"
+
+observability:
+  service_name: "aisix"
+  log_level: "info"
+  access_log: true
+  metrics:
+    prometheus:
+      enabled: true
+      path: "/metrics"
+      # Dedicated metrics listener — the only Prometheus scrape surface,
+      # the same in every deployment mode. Expose this port in your
+      # deployment and point Prometheus at it. Override with
+      # AISIX_OBSERVABILITY__METRICS__PROMETHEUS__ADDR.
+      addr: "0.0.0.0:9090"
+    otlp:
+      enabled: false
+  tracing:
+    otlp:
+      enabled: false
+      sample_ratio: 1.0
+
+managed:
+  enabled: true
+  # CP URL, etcd endpoint, and cert bundle come from env vars — never
+  # bake secrets into the image.
+  mtls_dir: "/var/lib/aisix/mtls"
+  dp_id_file: "/var/lib/aisix/dp_id"
+  # On-disk snapshot cache (prd-09 §9.7.2). The supervisor writes the
+  # last-known etcd contents here on every successful resync / put /
+  # delete, and re-loads it at boot before opening the etcd connection
+  # — so the proxy stays up across CP outages and full restarts.
+  # Set to "" to disable.
+  snapshot_cache_path: "/var/lib/aisix/config_cache.json"
+
+cache:
+  backend: "memory"

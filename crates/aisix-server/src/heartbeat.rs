@@ -1,0 +1,908 @@
+//! Periodic `POST /dp/heartbeat` so cp-api knows the DP is alive.
+//!
+//! Protocol (prd-09a §9A.7.2 + §9A.10A.3): the DP authenticates via
+//! its mTLS client certificate. cp-api reads the peer cert SAN URI
+//! (`x-aisix://env/<env_id>/dp/<dp_id>`) to derive the *credential*
+//! identity — there is no `Authorization` header on the v3 wire. The
+//! body still carries `{ dp_id, uptime_seconds, version }` for
+//! diagnostics and to keep parity with the legacy log shape.
+//!
+//! The cert's `dp_id` is a credential, not a runtime identity: every
+//! replica deployed from the same bundle (k8s Deployment mounting one
+//! Secret) presents the same `dp_id`. So each process additionally
+//! reports a per-boot `instance_id` (UUID v4) plus its `hostname`,
+//! letting cp-api track replicas individually instead of collapsing
+//! them into one last-writer-wins row (#592).
+//!
+//! Shape:
+//!   - spawned once from `main` after registration / bundle-on-disk
+//!     load is complete
+//!   - ticks at the interval returned by the register response
+//!     (default 15s)
+//!   - individual heartbeats fail fast on network errors; the ticker
+//!     keeps running so a transient outage doesn't stop the DP from
+//!     being seen when the CP comes back
+//!   - cancelled via the shared `watch::Receiver<bool>` so graceful
+//!     shutdown doesn't leave an in-flight request dangling
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
+
+use aisix_etcd::loader::RejectedEntry;
+use aisix_obs::SinkStatsSnapshot;
+use anyhow::{anyhow, Context};
+use serde::Serialize;
+use tokio::sync::watch;
+
+/// Build identity reported to cp-api (heartbeat `version` field + HTTP
+/// User-Agent). CI stamps `AISIX_BUILD_SHA` — the same short git sha
+/// that tags the container image — at compile time, so the wire carries
+/// `0.1.0+sha-103d3ec` and an operator can match a DP node directly to
+/// its `ghcr.io/...:sha-103d3ec` image. Local builds (no stamp) report
+/// the bare crate version. cp-api persists this into
+/// `dpmgr_nodes.dp_version`, replacing the `"pending"` placeholder it
+/// wrote at install-command time.
+pub static BUILD_VERSION: LazyLock<String> = LazyLock::new(|| {
+    format_build_version(env!("CARGO_PKG_VERSION"), option_env!("AISIX_BUILD_SHA"))
+});
+
+fn format_build_version(pkg_version: &str, build_sha: Option<&str>) -> String {
+    match build_sha {
+        Some(sha) if !sha.is_empty() => format!("{pkg_version}+sha-{sha}"),
+        _ => pkg_version.to_string(),
+    }
+}
+
+/// Cheap clonable callback the heartbeat invokes once per tick to pull
+/// the supervisor's most recent loader rejections. Returning a clone
+/// (not borrowing) lets the heartbeat send the list over the wire
+/// without holding the supervisor's lock across the HTTP call.
+///
+/// Pre-fix the loader logged a warning and silently moved on. Customers
+/// who saved an invalid resource in the dashboard saw "Saved" but the
+/// DP dropped the row — no signal back. See issue #115.
+pub type RejectionFetcher = Arc<dyn Fn() -> Vec<RejectedEntry> + Send + Sync>;
+
+/// Per-tick source of the highest etcd/kine revision the watch
+/// supervisor has applied to its snapshot (`WatchStatus.revision`).
+/// Reported as `applied_revision` so cp-api can compare it against the
+/// revision returned when IT wrote a resource through kine and show
+/// "propagating…" until the DP catches up (#519 B.3). `0` = the
+/// supervisor has not completed its first load yet.
+pub type AppliedRevisionFetcher = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+/// Per-tick source of the observability exporters' delivery counters,
+/// keyed by exporter name (`OtlpHttpFanOut::exporter_stats`). Reported
+/// as `exporter_health` so cp-api can surface silently-failing
+/// exporters in the dashboard (#519 D.2). Counters reset when an
+/// exporter's pipeline is rebuilt on config change — the CP must treat
+/// them as resettable, not lifetime totals.
+pub type ExporterHealthFetcher = Arc<dyn Fn() -> HashMap<String, SinkStatsSnapshot> + Send + Sync>;
+
+/// File paths to the on-disk mTLS bundle the heartbeat client presents
+/// to cp-api. Same three files written by cert-bundle provisioning and
+/// re-used on every subsequent boot when the bundle is already on disk.
+///
+/// `extra_ca_pem` is an optional second CA bundle the operator points
+/// at via `managed.cp_ca_cert_file` — needed in e2e / on-prem
+/// deployments where dp-manager's *server* cert is signed by a CA
+/// distinct from the cert-manager-issued one (which only signs DP
+/// *client* certs). When set, every outbound mTLS client built from
+/// this bundle (heartbeat, telemetry, BudgetClient) appends it to
+/// the verify chain. Production with public-CA certs leaves this
+/// `None`.
+#[derive(Debug, Clone)]
+pub struct MtlsBundle {
+    pub ca_cert_path: PathBuf,
+    pub client_cert_path: PathBuf,
+    pub client_key_path: PathBuf,
+    pub extra_ca_pem: Option<Vec<u8>>,
+}
+
+/// Configuration captured at register time. `url`, `dp_id`, `interval`
+/// come from the register response (or are synthesised on bundle-on-disk
+/// boots); `mtls` points at the persisted bundle.
+#[derive(Clone)]
+pub struct HeartbeatConfig {
+    pub url: String,
+    pub dp_id: String,
+    /// Per-boot runtime identity (UUID v4), minted once when the
+    /// config is built and stable for the process lifetime. Distinct
+    /// from `dp_id`, which is shared by every replica using the same
+    /// cert bundle (#592).
+    pub instance_id: String,
+    /// OS hostname (pod name on k8s, container id on docker). Sent
+    /// for display only — `instance_id` is the unique key.
+    pub hostname: String,
+    pub interval: Duration,
+    pub mtls: MtlsBundle,
+    /// Optional source of supervisor-reported loader rejections. When
+    /// set, every heartbeat includes a `rejected_resources` array so
+    /// cp-api can surface "your DP rejected these resources" in the
+    /// dashboard. None means the legacy schema (no rejection field) —
+    /// kept for tests / managed-mode configs that don't have a
+    /// supervisor wired in. See issue #115.
+    pub rejection_fetcher: Option<RejectionFetcher>,
+    /// Optional source of the supervisor's applied etcd revision.
+    /// `None` (tests / no supervisor) reports `applied_revision: 0`,
+    /// the same value as "not yet loaded". See #519 B.3.
+    pub applied_revision_fetcher: Option<AppliedRevisionFetcher>,
+    /// Optional source of per-exporter delivery counters. `None`
+    /// reports an empty `exporter_health` array. See #519 D.2.
+    pub exporter_health_fetcher: Option<ExporterHealthFetcher>,
+}
+
+impl std::fmt::Debug for HeartbeatConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeartbeatConfig")
+            .field("url", &self.url)
+            .field("dp_id", &self.dp_id)
+            .field("instance_id", &self.instance_id)
+            .field("hostname", &self.hostname)
+            .field("interval", &self.interval)
+            .field("mtls", &self.mtls)
+            .field(
+                "rejection_fetcher",
+                &self.rejection_fetcher.as_ref().map(|_| "<fn>"),
+            )
+            .field(
+                "applied_revision_fetcher",
+                &self.applied_revision_fetcher.as_ref().map(|_| "<fn>"),
+            )
+            .field(
+                "exporter_health_fetcher",
+                &self.exporter_health_fetcher.as_ref().map(|_| "<fn>"),
+            )
+            .finish()
+    }
+}
+
+impl HeartbeatConfig {
+    /// Clamp the server-suggested interval into a safe band. Defence
+    /// against a buggy CP config that returns 0 or a week.
+    pub fn sanitised(url: String, dp_id: String, interval: Duration, mtls: MtlsBundle) -> Self {
+        const MIN: Duration = Duration::from_secs(5);
+        const MAX: Duration = Duration::from_secs(300);
+        let interval = interval.clamp(MIN, MAX);
+        Self {
+            url,
+            dp_id,
+            // Minted here because this is the single constructor and
+            // main builds the config exactly once per boot — the id
+            // lives as long as the process (#592).
+            instance_id: uuid::Uuid::new_v4().to_string(),
+            hostname: hostname::get()
+                .map(|h| h.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            interval,
+            mtls,
+            rejection_fetcher: None,
+            applied_revision_fetcher: None,
+            exporter_health_fetcher: None,
+        }
+    }
+
+    /// Wire a supervisor's rejection callback. The closure is cloned
+    /// per-heartbeat call (cheap — it's an Arc).
+    pub fn with_rejection_fetcher(mut self, fetcher: RejectionFetcher) -> Self {
+        self.rejection_fetcher = Some(fetcher);
+        self
+    }
+
+    /// Wire the supervisor's applied-revision source (#519 B.3).
+    pub fn with_applied_revision_fetcher(mut self, fetcher: AppliedRevisionFetcher) -> Self {
+        self.applied_revision_fetcher = Some(fetcher);
+        self
+    }
+
+    /// Wire the exporter delivery-counter source (#519 D.2).
+    pub fn with_exporter_health_fetcher(mut self, fetcher: ExporterHealthFetcher) -> Self {
+        self.exporter_health_fetcher = Some(fetcher);
+        self
+    }
+}
+
+/// Spawn the heartbeat worker. Returns the JoinHandle so `main` can
+/// await it at shutdown. Errors during individual heartbeats are
+/// logged, not propagated — a heartbeat that can't reach the CP is
+/// noisy, not fatal.
+pub fn spawn(
+    cfg: HeartbeatConfig,
+    mut cancel: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        run(cfg, &mut cancel).await;
+    })
+}
+
+async fn run(cfg: HeartbeatConfig, cancel: &mut watch::Receiver<bool>) {
+    let client = match build_client(&cfg.mtls) {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            tracing::error!(error = %e, "heartbeat: build mTLS reqwest client failed; disabled");
+            return;
+        }
+    };
+    let started = Instant::now();
+    let mut ticker = tokio::time::interval(cfg.interval);
+    // Skip the catch-up fire — we want the first beat to happen
+    // immediately at spawn but subsequent ones to follow the tick
+    // schedule without bursting if we fall behind.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    tracing::info!(
+        url = %cfg.url,
+        dp_id = %cfg.dp_id,
+        instance_id = %cfg.instance_id,
+        hostname = %cfg.hostname,
+        interval_secs = cfg.interval.as_secs(),
+        "heartbeat started (mTLS)",
+    );
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let uptime = started.elapsed().as_secs() as i64;
+                match send(&client, &cfg, uptime).await {
+                    Ok(()) => tracing::debug!("heartbeat ok"),
+                    Err(e) => tracing::warn!(error = %e, "heartbeat failed"),
+                }
+            }
+            _ = cancel.changed() => {
+                if *cancel.borrow() {
+                    tracing::info!("heartbeat shutting down");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct HeartbeatBody<'a> {
+    dp_id: &'a str,
+    /// Per-boot runtime identity (#592). cp-api keys instance rows on
+    /// `(dp_id, instance_id)` so N replicas sharing one cert show up
+    /// as N instances instead of one last-writer-wins row.
+    instance_id: &'a str,
+    /// OS hostname for display (pod name on k8s).
+    hostname: &'a str,
+    uptime_seconds: i64,
+    version: &'a str,
+    /// Guardrail `kind` discriminators compiled into this binary
+    /// (#519 B.6). Always present so cp-api can hide / flag kinds the
+    /// DP can't serve (e.g. a build without the `bedrock` feature).
+    supported_guardrail_kinds: &'static [&'static str],
+    /// Highest etcd/kine revision the watch supervisor has applied
+    /// (#519 B.3). `0` = snapshot not loaded yet. cp-api compares this
+    /// against the revision returned by its own kine writes: a DP with
+    /// `applied_revision >= write_revision` has seen that write.
+    applied_revision: i64,
+    /// Per-exporter delivery counters (#519 D.2), sorted by exporter
+    /// name. Always present; empty when no exporter pipeline has
+    /// started. Counters reset when an exporter's pipeline is rebuilt
+    /// on config change.
+    exporter_health: Vec<ExporterHealthWire>,
+    /// Loader rejections the supervisor has accumulated since last
+    /// drain. Omitted from the wire when empty so legacy / managed-mode
+    /// CP endpoints (which don't yet parse this field) still see the
+    /// historical body shape. See issue #115.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    rejected_resources: Vec<RejectedResourceWire>,
+}
+
+/// Cap on the `last_error` excerpt forwarded per exporter. The pipeline
+/// already trims sink errors to 200 chars; this is the wire-side
+/// guarantee so a future verbose sink can't bloat the heartbeat.
+const EXPORTER_LAST_ERROR_MAX_CHARS: usize = 256;
+
+/// On-the-wire shape of one exporter's delivery health (#519 D.2). Kept
+/// separate from `aisix_obs::SinkStatsSnapshot` so the obs crate's
+/// internal counters can evolve without forcing a wire bump.
+#[derive(Debug, Serialize)]
+struct ExporterHealthWire {
+    name: String,
+    delivered_batches: u64,
+    failed_batches: u64,
+    last_error: Option<String>,
+    last_failure_unix: Option<i64>,
+    last_success_unix: Option<i64>,
+}
+
+impl ExporterHealthWire {
+    fn from_stats(name: String, stats: &SinkStatsSnapshot) -> Self {
+        Self {
+            name,
+            delivered_batches: stats.delivered_batches,
+            failed_batches: stats.failed_batches,
+            last_error: stats
+                .last_error
+                .as_ref()
+                .map(|e| e.chars().take(EXPORTER_LAST_ERROR_MAX_CHARS).collect()),
+            last_failure_unix: stats.last_failure_unix,
+            last_success_unix: stats.last_success_unix,
+        }
+    }
+}
+
+/// On-the-wire shape for one rejection. Kept as a separate type from
+/// `aisix_etcd::loader::RejectedEntry` so the loader's internal
+/// representation can evolve without forcing a wire bump. The two
+/// converge today; `kind` is serialised as a string ("bad_key",
+/// "non_json", "schema_failed", "parse_failed", "unknown_kind") so
+/// cp-api can match without depending on Rust enum repr.
+#[derive(Debug, Serialize)]
+struct RejectedResourceWire {
+    key: String,
+    kind: &'static str,
+    error: String,
+    timestamp_unix_secs: u64,
+}
+
+impl From<&RejectedEntry> for RejectedResourceWire {
+    fn from(r: &RejectedEntry) -> Self {
+        Self {
+            key: r.key.clone(),
+            kind: r.kind.as_str(),
+            error: r.error.clone(),
+            timestamp_unix_secs: r.timestamp_unix_secs,
+        }
+    }
+}
+
+async fn send(client: &reqwest::Client, cfg: &HeartbeatConfig, uptime: i64) -> anyhow::Result<()> {
+    let rejections: Vec<RejectedResourceWire> = cfg
+        .rejection_fetcher
+        .as_ref()
+        .map(|fetcher| fetcher().iter().map(RejectedResourceWire::from).collect())
+        .unwrap_or_default();
+    let applied_revision = cfg
+        .applied_revision_fetcher
+        .as_ref()
+        .map(|fetcher| fetcher())
+        .unwrap_or(0);
+    let mut exporter_health: Vec<ExporterHealthWire> = cfg
+        .exporter_health_fetcher
+        .as_ref()
+        .map(|fetcher| {
+            fetcher()
+                .into_iter()
+                .map(|(name, stats)| ExporterHealthWire::from_stats(name, &stats))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Deterministic order — the fetcher hands back a HashMap.
+    exporter_health.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let resp = client
+        .post(&cfg.url)
+        // No bearer header — cp-api authenticates via the peer
+        // certificate SAN URI (§9A.7.2).
+        .json(&HeartbeatBody {
+            dp_id: &cfg.dp_id,
+            instance_id: &cfg.instance_id,
+            hostname: &cfg.hostname,
+            uptime_seconds: uptime,
+            version: &BUILD_VERSION,
+            supported_guardrail_kinds: aisix_guardrails::supported_kinds(),
+            applied_revision,
+            exporter_health,
+            rejected_resources: rejections,
+        })
+        .send()
+        .await
+        .with_context(|| format!("POST {}", cfg.url))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "heartbeat {} returned {} — {}",
+            cfg.url,
+            status,
+            body.trim().chars().take(200).collect::<String>()
+        ));
+    }
+    Ok(())
+}
+
+/// Build a reqwest client wired up with the on-disk mTLS bundle: the
+/// CA from cp-api as a trust root, plus the DP's client cert + key as
+/// the presenting identity. Files are read here (not at config-load
+/// time) so an unreadable/rotated bundle surfaces an actionable error
+/// at the same place every other heartbeat error does.
+///
+/// Public so the BudgetClient (aisix-proxy) and any future per-request
+/// CP caller can reuse the same identity without duplicating the PEM-
+/// loading dance. `aisix-server::telemetry` keeps its own copy because
+/// it predates the extraction; consolidating later is fine.
+pub fn build_mtls_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
+    build_client(mtls)
+}
+
+fn build_client(mtls: &MtlsBundle) -> anyhow::Result<reqwest::Client> {
+    let ca_pem = std::fs::read(&mtls.ca_cert_path)
+        .with_context(|| format!("read {}", mtls.ca_cert_path.display()))?;
+    let cert_pem = std::fs::read(&mtls.client_cert_path)
+        .with_context(|| format!("read {}", mtls.client_cert_path.display()))?;
+    let key_pem = std::fs::read(&mtls.client_key_path)
+        .with_context(|| format!("read {}", mtls.client_key_path.display()))?;
+
+    // reqwest::Identity::from_pem expects a single PEM blob containing
+    // BOTH the private key and the cert chain. Concatenate in that
+    // order — rustls is order-tolerant but it's the convention.
+    // Ensure a newline separates the two blocks; PEM files from env
+    // vars (dashboard deploy scripts) may lack a trailing newline.
+    let mut identity_pem = Vec::with_capacity(cert_pem.len() + key_pem.len() + 1);
+    identity_pem.extend_from_slice(&key_pem);
+    if !key_pem.ends_with(b"\n") {
+        identity_pem.push(b'\n');
+    }
+    identity_pem.extend_from_slice(&cert_pem);
+    let identity = reqwest::Identity::from_pem(&identity_pem)
+        .context("build mTLS Identity from client cert + key")?;
+
+    let ca = reqwest::Certificate::from_pem(&ca_pem).context("parse CA certificate")?;
+
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent(format!("aisix-dp/{}", &*BUILD_VERSION))
+        .identity(identity)
+        .add_root_certificate(ca)
+        // Pin HTTP/1.1 for the dp-manager REST calls. dp-manager
+        // multiplexes gRPC (kine/etcd, HTTP/2) and the REST surface
+        // (/dp/*) on one TLS port via cmux, which routes by the
+        // negotiated ALPN protocol. When the observability cloud-sink
+        // crates pulled reqwest's `http2` feature into the workspace
+        // (Cargo feature unification), this client began advertising `h2`
+        // in ALPN, so cmux handed these REST requests to the gRPC handler
+        // and every POST failed with "error sending request". Forcing
+        // http/1.1 keeps ALPN at `http/1.1` so cmux routes to the REST
+        // mux. The etcd/gRPC client is a separate tonic h2 connection and
+        // is unaffected.
+        .http1_only()
+        .use_rustls_tls();
+    // Operator-supplied extra root (e2e / on-prem). Covers the dp-
+    // manager server cert when it's signed by a CA distinct from the
+    // cert-manager-issued client-cert CA.
+    if let Some(extra) = mtls.extra_ca_pem.as_ref() {
+        let extra_ca = reqwest::Certificate::from_pem(extra)
+            .context("parse managed.cp_ca_cert_file as PEM certificate")?;
+        builder = builder.add_root_certificate(extra_ca);
+    }
+    builder.build().context("build reqwest client with mTLS")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcgen::{CertificateParams, DistinguishedName, KeyPair, PKCS_ECDSA_P256_SHA256};
+    use std::path::Path;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The reported version must correlate a DP node with its container
+    /// image: CI stamps the image-tag sha, local builds stay bare.
+    #[test]
+    fn build_version_appends_stamped_image_sha() {
+        assert_eq!(
+            format_build_version("0.1.0", Some("103d3ec")),
+            "0.1.0+sha-103d3ec"
+        );
+        assert_eq!(format_build_version("0.1.0", None), "0.1.0");
+        // An empty stamp (e.g. `AISIX_BUILD_SHA=` in a misconfigured CI
+        // env) must not produce a dangling "0.1.0+sha-".
+        assert_eq!(format_build_version("0.1.0", Some("")), "0.1.0");
+    }
+
+    /// Bundle on disk used by the build_client test: generates a real
+    /// self-signed CA + leaf so reqwest's PEM parser actually accepts
+    /// it. Lives in a TempDir that's dropped at end of test.
+    fn write_test_bundle(dir: &Path) -> MtlsBundle {
+        // Self-signed CA: subject = issuer = "aisix-test-ca".
+        let ca_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.distinguished_name = {
+            let mut dn = DistinguishedName::new();
+            dn.push(rcgen::DnType::CommonName, "aisix-test-ca");
+            dn
+        };
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_kp).unwrap();
+
+        // Leaf signed by the CA.
+        let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut leaf_params = CertificateParams::new(vec!["dp-test".to_string()]).unwrap();
+        leaf_params.distinguished_name = {
+            let mut dn = DistinguishedName::new();
+            dn.push(rcgen::DnType::CommonName, "dp-test");
+            dn
+        };
+        let leaf_cert = leaf_params.signed_by(&leaf_kp, &ca_cert, &ca_kp).unwrap();
+
+        let ca_path = dir.join("ca.crt");
+        let cert_path = dir.join("client.crt");
+        let key_path = dir.join("client.key");
+        std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+        std::fs::write(&cert_path, leaf_cert.pem()).unwrap();
+        std::fs::write(&key_path, leaf_kp.serialize_pem()).unwrap();
+
+        MtlsBundle {
+            ca_cert_path: ca_path,
+            client_cert_path: cert_path,
+            client_key_path: key_path,
+            extra_ca_pem: None,
+        }
+    }
+
+    fn cfg_with_bundle(url: String, mtls: MtlsBundle) -> HeartbeatConfig {
+        HeartbeatConfig::sanitised(
+            url,
+            "dp_test_node_42".into(),
+            Duration::from_millis(50),
+            mtls,
+        )
+    }
+
+    fn plain_client() -> reqwest::Client {
+        // Plain HTTP client used by the wiremock-based send tests.
+        // We don't want to drag the wiremock test through TLS termination
+        // — the protocol-level assertions (body shape, HTTP error
+        // propagation) are independent of the mTLS handshake.
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn send_omits_authorization_header_and_posts_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .and(body_string_contains("\"dp_id\":\"dp_test_node_42\""))
+            .and(body_string_contains("\"uptime_seconds\":"))
+            // Negative-match the Authorization header below via
+            // `received_requests()` since wiremock has no built-in
+            // header-absence matcher.
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let c = plain_client();
+        send(
+            &c,
+            &cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls),
+            7,
+        )
+        .await
+        .unwrap();
+
+        // Inspect the recorded request to confirm no Authorization header.
+        let received = server.received_requests().await.unwrap();
+        let req = received.first().expect("expected one request");
+        assert!(
+            req.headers.get("authorization").is_none(),
+            "v3 heartbeat MUST NOT carry Authorization header (mTLS-only auth)",
+        );
+    }
+
+    /// #519 B.6 + B.3 + D.2: the heartbeat body always carries the
+    /// compiled-in guardrail kinds, the applied etcd revision, and the
+    /// per-exporter delivery health (sorted by name).
+    #[tokio::test]
+    async fn send_includes_guardrail_kinds_revision_and_exporter_health() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let cfg = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls)
+            .with_applied_revision_fetcher(Arc::new(|| 42))
+            .with_exporter_health_fetcher(Arc::new(|| {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "zeta-exporter".to_string(),
+                    aisix_obs::SinkStatsSnapshot {
+                        delivered_batches: 3,
+                        failed_batches: 1,
+                        last_error: Some("HTTP 503: upstream sad".into()),
+                        last_failure_unix: Some(1_770_000_000),
+                        last_success_unix: Some(1_770_000_100),
+                        ..Default::default()
+                    },
+                );
+                m.insert(
+                    "alpha-exporter".to_string(),
+                    aisix_obs::SinkStatsSnapshot::default(),
+                );
+                m
+            }));
+        send(&plain_client(), &cfg, 7).await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+
+        // B.6 — exact compiled-in kinds under default features.
+        assert_eq!(
+            body["supported_guardrail_kinds"],
+            serde_json::json!([
+                "keyword",
+                "azure_content_safety",
+                "azure_content_safety_text_moderation",
+                "aliyun_text_moderation",
+                "bedrock",
+            ]),
+        );
+
+        // B.3 — the fetched applied revision.
+        assert_eq!(body["applied_revision"], 42);
+
+        // D.2 — both exporters, sorted by name, with the wire fields.
+        let health = body["exporter_health"].as_array().unwrap();
+        assert_eq!(health.len(), 2);
+        assert_eq!(health[0]["name"], "alpha-exporter");
+        assert_eq!(health[0]["delivered_batches"], 0);
+        assert_eq!(health[0]["last_error"], serde_json::Value::Null);
+        assert_eq!(health[1]["name"], "zeta-exporter");
+        assert_eq!(health[1]["delivered_batches"], 3);
+        assert_eq!(health[1]["failed_batches"], 1);
+        assert_eq!(health[1]["last_error"], "HTTP 503: upstream sad");
+        assert_eq!(health[1]["last_failure_unix"], 1_770_000_000_i64);
+        assert_eq!(health[1]["last_success_unix"], 1_770_000_100_i64);
+
+        // `rejected_resources` keeps its omit-when-empty behavior.
+        assert!(
+            body.get("rejected_resources").is_none(),
+            "empty rejected_resources must stay off the wire",
+        );
+    }
+
+    /// Without fetchers (tests / no supervisor), the new fields still
+    /// serialize: revision 0 and an empty exporter_health array.
+    #[tokio::test]
+    async fn send_defaults_new_fields_without_fetchers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        send(
+            &plain_client(),
+            &cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls),
+            7,
+        )
+        .await
+        .unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(body["applied_revision"], 0);
+        assert_eq!(body["exporter_health"], serde_json::json!([]));
+        assert!(body["supported_guardrail_kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k == "keyword"));
+    }
+
+    /// #592: every heartbeat carries the per-boot instance identity —
+    /// stable across ticks of one process, distinct across processes
+    /// presenting the same cert bundle (k8s replicas).
+    #[tokio::test]
+    async fn send_includes_per_boot_instance_identity() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let cfg_a = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls.clone());
+        let cfg_b = cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls);
+
+        let c = plain_client();
+        send(&c, &cfg_a, 1).await.unwrap();
+        send(&c, &cfg_a, 2).await.unwrap();
+        send(&c, &cfg_b, 1).await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        let bodies: Vec<serde_json::Value> = received
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect();
+
+        let a0 = bodies[0]["instance_id"].as_str().unwrap();
+        uuid::Uuid::parse_str(a0).expect("instance_id must be a UUID");
+        assert_eq!(bodies[0]["instance_id"], bodies[1]["instance_id"]);
+        assert_ne!(
+            bodies[0]["instance_id"], bodies[2]["instance_id"],
+            "two configs (≈ two replicas on one cert) must not share an instance_id",
+        );
+
+        assert_eq!(
+            bodies[0]["hostname"].as_str().unwrap(),
+            hostname::get().unwrap().to_string_lossy(),
+        );
+        // The credential identity stays shared.
+        assert_eq!(bodies[0]["dp_id"], bodies[2]["dp_id"]);
+    }
+
+    #[tokio::test]
+    async fn send_propagates_non_success_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": {"code": "DP_NOT_FOUND", "message": "no registered DP matches this id"}
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let c = plain_client();
+        let err = send(
+            &c,
+            &cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls),
+            7,
+        )
+        .await
+        .unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("404"), "expected status in error: {s}");
+        assert!(s.contains("DP_NOT_FOUND"), "expected body in error: {s}");
+    }
+
+    #[tokio::test]
+    async fn run_stops_on_cancel() {
+        // Start a server that 200s fast enough that the first tick
+        // completes, then cancel and make sure the task exits.
+        // Bundle is real but the tick uses plain HTTP wiremock — the
+        // mTLS client builder still has to succeed for `run` to enter
+        // its loop, which is what this test exercises.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/dp/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let (tx, rx) = watch::channel(false);
+        let handle = spawn(
+            cfg_with_bundle(format!("{}/dp/heartbeat", server.uri()), mtls),
+            rx,
+        );
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        tx.send(true).unwrap();
+
+        // Runs to completion within a small grace window.
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("heartbeat did not stop after cancel")
+            .unwrap();
+    }
+
+    #[test]
+    fn sanitised_interval_clamps_extremes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let a = HeartbeatConfig::sanitised(
+            "http://x".into(),
+            "id".into(),
+            Duration::from_millis(10),
+            mtls.clone(),
+        );
+        assert_eq!(a.interval, Duration::from_secs(5));
+
+        let b = HeartbeatConfig::sanitised(
+            "http://x".into(),
+            "id".into(),
+            Duration::from_secs(86_400),
+            mtls.clone(),
+        );
+        assert_eq!(b.interval, Duration::from_secs(300));
+
+        let c = HeartbeatConfig::sanitised(
+            "http://x".into(),
+            "id".into(),
+            Duration::from_secs(30),
+            mtls,
+        );
+        assert_eq!(c.interval, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn build_client_loads_real_mtls_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mtls = write_test_bundle(dir.path());
+        let _client = build_client(&mtls).expect("build_client should succeed with valid bundle");
+    }
+
+    #[test]
+    fn build_client_surfaces_missing_files() {
+        let mtls = MtlsBundle {
+            ca_cert_path: "/definitely/missing/ca.crt".into(),
+            client_cert_path: "/definitely/missing/client.crt".into(),
+            client_key_path: "/definitely/missing/client.key".into(),
+            extra_ca_pem: None,
+        };
+        let err = build_client(&mtls).unwrap_err();
+        // The error must mention which file was missing — operators
+        // should not have to diff config against filesystem state.
+        assert!(
+            err.to_string().contains("ca.crt"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Regression: PEM files from dashboard deploy scripts may lack a
+    /// trailing newline. Without the separator fix, key + cert merge
+    /// into `-----END EC PRIVATE KEY----------BEGIN CERTIFICATE-----`
+    /// and reqwest's PEM parser rejects the blob.
+    #[test]
+    fn build_client_works_without_trailing_newlines() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let ca_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.distinguished_name = {
+            let mut dn = DistinguishedName::new();
+            dn.push(rcgen::DnType::CommonName, "aisix-test-ca");
+            dn
+        };
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_kp).unwrap();
+
+        let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut leaf_params = CertificateParams::new(vec!["dp-test".to_string()]).unwrap();
+        leaf_params.distinguished_name = {
+            let mut dn = DistinguishedName::new();
+            dn.push(rcgen::DnType::CommonName, "dp-test");
+            dn
+        };
+        let leaf_cert = leaf_params.signed_by(&leaf_kp, &ca_cert, &ca_kp).unwrap();
+
+        let ca_path = dir.path().join("ca.crt");
+        let cert_path = dir.path().join("client.crt");
+        let key_path = dir.path().join("client.key");
+        // Strip trailing newlines to mimic dashboard-generated PEMs.
+        std::fs::write(&ca_path, ca_cert.pem().trim_end()).unwrap();
+        std::fs::write(&cert_path, leaf_cert.pem().trim_end()).unwrap();
+        std::fs::write(&key_path, leaf_kp.serialize_pem().trim_end()).unwrap();
+
+        let mtls = MtlsBundle {
+            ca_cert_path: ca_path,
+            client_cert_path: cert_path,
+            client_key_path: key_path,
+            extra_ca_pem: None,
+        };
+        build_client(&mtls).expect("build_client must tolerate PEM without trailing newline");
+    }
+}

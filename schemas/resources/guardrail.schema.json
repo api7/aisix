@@ -1,0 +1,504 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Guardrail",
+  "description": "Top-level `Guardrail` resource shape. Mirrors what cp-api writes to kine at `/aisix/<env>/guardrails/<uuid>`.\n\n`deny_unknown_fields` is intentionally NOT set here: serde's `flatten` + `tag = \"kind\"` interaction can't pass the \"I consumed this field\" signal up to the outer struct, so a `deny_unknown_fields` outer would reject the very `kind` the inner enum needs. Strict typo-rejection happens earlier in the JSON Schema (`schema::validate_guardrail`) which the loader runs before deserialise on every watch event.",
+  "type": "object",
+  "oneOf": [
+    {
+      "description": "In-process literal/regex blocklist. Always available.",
+      "type": "object",
+      "required": [
+        "kind",
+        "patterns"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "keyword"
+          ]
+        },
+        "patterns": {
+          "description": "Blocklist patterns. Empty list is legal but pointless — the guardrail will allow every request, same as `enabled: false`.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/KeywordPattern"
+          }
+        }
+      }
+    },
+    {
+      "description": "AWS Bedrock managed guardrail. The chain builder constructs a `BedrockGuardrail` that calls AWS `ApplyGuardrail` (real SigV4 dispatch) on input and/or output per the row's hook point.",
+      "type": "object",
+      "required": [
+        "aws_credentials",
+        "guardrail_id",
+        "guardrail_version",
+        "kind",
+        "latency_mode",
+        "region"
+      ],
+      "properties": {
+        "aws_credentials": {
+          "description": "IAM credentials. v1 = static access keys (encrypted).",
+          "allOf": [
+            {
+              "$ref": "#/definitions/BedrockAWSCredentials"
+            }
+          ]
+        },
+        "guardrail_id": {
+          "description": "AWS-console-issued guardrail identifier (12 chars today).",
+          "type": "string"
+        },
+        "guardrail_version": {
+          "description": "Version label: `DRAFT`, `1`, `2`, ...",
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "bedrock"
+          ]
+        },
+        "latency_mode": {
+          "description": "`serial` (default) or `timed { timeout_ms }`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/BedrockLatencyMode"
+            }
+          ]
+        },
+        "region": {
+          "description": "AWS region the Bedrock endpoint lives in (e.g. `us-east-1`).",
+          "type": "string"
+        }
+      }
+    },
+    {
+      "description": "Azure AI Content Safety Prompt Shield. Detects jailbreak and indirect injection attacks via the `/contentsafety/text:shieldPrompt` API. P1 (PRD-09c §6 P1).",
+      "type": "object",
+      "required": [
+        "api_key",
+        "endpoint",
+        "kind"
+      ],
+      "properties": {
+        "api_key": {
+          "description": "Subscription key (`Ocp-Apim-Subscription-Key`). Decrypted by cp-api before kine projection; plaintext in memory only, never logged.",
+          "type": "string"
+        },
+        "endpoint": {
+          "description": "Azure Cognitive Services resource endpoint, e.g. `https://my-resource.cognitiveservices.azure.com`. The DP appends `/contentsafety/text:shieldPrompt?api-version=2024-09-01`.",
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "azure_content_safety"
+          ]
+        },
+        "timeout_ms": {
+          "description": "HTTP call timeout in milliseconds. When elapsed the `fail_open` flag governs the verdict. Defaults to 5 000 ms.\n\n**`0` does not mean \"no timeout\".** `Duration::ZERO` causes `tokio::time::timeout` to fire on the first poll, so every call immediately maps to a timeout failure. Use `u32::MAX` (≈ 49 days) for an effectively unlimited timeout.",
+          "default": 5000,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    {
+      "description": "Azure AI Content Safety Text Moderation. Category-severity + blocklist moderation via the `/contentsafety/text:analyze` API, on input and/or output (including streaming output). P2 (PRD-09c §6 P2, #379).",
+      "type": "object",
+      "required": [
+        "api_key",
+        "endpoint",
+        "kind"
+      ],
+      "properties": {
+        "api_key": {
+          "description": "Subscription key (`Ocp-Apim-Subscription-Key`). Plaintext in memory only, never logged.",
+          "type": "string"
+        },
+        "blocklist_names": {
+          "description": "Azure CS blocklist names to match against.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "categories": {
+          "description": "Categories to analyze. Defaults to all four.",
+          "default": [
+            "Hate",
+            "Sexual",
+            "SelfHarm",
+            "Violence"
+          ],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "endpoint": {
+          "description": "Azure Cognitive Services resource endpoint. The DP appends `/contentsafety/text:analyze?api-version=2024-09-01`.",
+          "type": "string"
+        },
+        "halt_on_blocklist_hit": {
+          "description": "Forwarded to Azure's `haltOnBlocklistHit`.",
+          "default": false,
+          "type": "boolean"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "azure_content_safety_text_moderation"
+          ]
+        },
+        "max_buffer_bytes": {
+          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies. Default 262 144.",
+          "default": 262144,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "on_buffer_exceeded": {
+          "description": "`fail_closed` (default) or `fail_open` when the buffer cap is hit.",
+          "default": "fail_closed",
+          "type": "string"
+        },
+        "output_fail_open": {
+          "description": "Fail-open policy for the OUTPUT hook. Defaults `false` (fail-closed) so an Azure outage can't release unscanned model output.",
+          "default": false,
+          "type": "boolean"
+        },
+        "output_type": {
+          "description": "`FourSeverityLevels` (0,2,4,6; default) or `EightSeverityLevels` (0..7).",
+          "default": "FourSeverityLevels",
+          "type": "string"
+        },
+        "severity_threshold": {
+          "description": "General severity threshold; a category at or above it blocks.",
+          "default": 2,
+          "type": "integer",
+          "format": "uint8",
+          "minimum": 0.0
+        },
+        "severity_threshold_by_category": {
+          "description": "Per-category threshold overrides (take precedence over the general one).",
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "format": "uint8",
+            "minimum": 0.0
+          }
+        },
+        "stream_processing_mode": {
+          "description": "`window` (sliding-window incremental release; default) or `buffer_full` (whole-response hold-back).",
+          "default": "window",
+          "type": "string"
+        },
+        "text_source": {
+          "description": "Input-hook text selection: `concatenate_user_content` (default) or `concatenate_all_content`. Ignored on the output hook.",
+          "default": "concatenate_user_content",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "HTTP call timeout (ms); `fail_open` / `output_fail_open` govern the verdict when it elapses. See the `AzureContentSafetyConfig` note on why `0` means \"fire immediately\", not \"no timeout\".",
+          "default": 5000,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "window_overlap_size": {
+          "description": "Chars carried between windows so a span split across a boundary is still caught. Default 256.",
+          "default": 256,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "window_size": {
+          "description": "Sliding-window size in chars (window mode); cp-api caps it at the 10 000-char Azure limit. Default 10 000.",
+          "default": 10000,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    },
+    {
+      "description": "Aliyun content-safety guardrail. Risk-level moderation via the `TextModerationPlus` action on `green-cip.<region>.aliyuncs.com`, on input and/or output (including streaming output). #603.",
+      "type": "object",
+      "required": [
+        "access_key_id",
+        "access_key_secret",
+        "kind",
+        "region"
+      ],
+      "properties": {
+        "access_key_id": {
+          "description": "Aliyun AccessKey ID.",
+          "type": "string"
+        },
+        "access_key_secret": {
+          "description": "Aliyun AccessKey secret. Decrypted by cp-api before kine projection; plaintext in memory only, never logged. Used to sign the request.",
+          "type": "string"
+        },
+        "endpoint": {
+          "description": "Explicit endpoint override (full URL, no trailing slash). When set it wins over `region`; used by tests/dev to point at a mock server.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "aliyun_text_moderation"
+          ]
+        },
+        "max_buffer_bytes": {
+          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies. Default 262 144.",
+          "default": 262144,
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "on_buffer_exceeded": {
+          "description": "`fail_closed` (default) or `fail_open` when the buffer cap is hit.",
+          "default": "fail_closed",
+          "type": "string"
+        },
+        "output_fail_open": {
+          "description": "Fail-open policy for the OUTPUT hook. Defaults `false` (fail-closed) so an Aliyun outage can't release unscanned model output.",
+          "default": false,
+          "type": "boolean"
+        },
+        "region": {
+          "description": "Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The DP builds the endpoint `https://green-cip.<region>.aliyuncs.com`.",
+          "type": "string"
+        },
+        "risk_level_threshold": {
+          "description": "Minimum risk level that triggers a block: `low`, `medium`, or `high` (default). A returned level at or above this blocks.",
+          "default": "high",
+          "type": "string"
+        },
+        "stream_processing_mode": {
+          "description": "`window` (sliding-window incremental release; default) or `buffer_full` (whole-response hold-back).",
+          "default": "window",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "HTTP call timeout (ms); `fail_open` / `output_fail_open` govern the verdict when it elapses. See the `AzureContentSafetyConfig` note on why `0` means \"fire immediately\", not \"no timeout\".",
+          "default": 5000,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "window_overlap_size": {
+          "description": "Chars carried between windows so a span split across a boundary is still caught. Default 128.",
+          "default": 128,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "window_size": {
+          "description": "Sliding-window size in chars (window mode). Default 2 000 — Aliyun's `llm_response_moderation` per-call content cap.",
+          "default": 2000,
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        }
+      }
+    }
+  ],
+  "required": [
+    "name"
+  ],
+  "properties": {
+    "created_at": {
+      "description": "RFC3339 creation timestamp of the row, projected by cp-api so the DP can evaluate guardrail chains oldest-first — matching the order the dashboard lists them in (#519 B.4a). Optional: cp-api's `marshalGuardrailKV` doesn't emit it yet, and admin-API rows may omit it; rows without it sort after rows that have it, tied broken by id, so chain order stays total and deterministic either way. RFC3339 timestamps in a fixed (UTC) offset compare correctly as strings, so no parsing is needed.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "direction": {
+      "description": "Which traffic directions this guardrail applies to when resolved through an attachment. Values: `\"input\"`, `\"output\"`, `\"both\"` (default).\n\nStored and forwarded to the CP dashboard. Direction-based filtering in `GuardrailIndex::resolve` is not yet implemented; the `hook_point` field on the guardrail definition provides equivalent per-hook-point control for keyword rules.",
+      "default": "both",
+      "type": "string"
+    },
+    "enabled": {
+      "description": "When false the chain skips this rule entirely. Lets operators stage a rule (write it, sanity-check it via dry runs, then flip it on) without deleting + recreating.",
+      "default": true,
+      "type": "boolean"
+    },
+    "enforcement_mode": {
+      "description": "How the DP behaves when this guardrail fires. `\"block\"` (default) — reject the request. `\"monitor\"` — let the request through and record the event (**not yet implemented**; the DP currently always blocks regardless of this field — do not set `\"monitor\"` expecting pass-through behavior until a future release wires it into the chain).",
+      "default": "block",
+      "type": "string"
+    },
+    "fail_open": {
+      "description": "Behavior when a remote-API guardrail (today `kind=bedrock`) can't reach its upstream. `true` lets the request through (recorded in usage_events.guardrail_bypassed_reason); `false` blocks with 422. No-op for `kind=keyword`. Defaults `true` (matches the PG schema default + PRD-09c §6.4).",
+      "default": true,
+      "type": "boolean"
+    },
+    "hook_point": {
+      "description": "Where in the lifecycle this rule runs. Defaults to `both`.",
+      "default": "both",
+      "allOf": [
+        {
+          "$ref": "#/definitions/GuardrailHookPoint"
+        }
+      ]
+    },
+    "mandatory": {
+      "description": "When `true`, a runtime error in this guardrail's evaluation (e.g. a Bedrock timeout) is treated as fatal: the request is blocked regardless of `fail_open`. When `false` (default), `fail_open` governs the error path.\n\n**Not yet implemented** — the field is stored and forwarded to the CP dashboard but the DP does not yet consult it; `fail_open` alone governs error behavior in the current release.",
+      "default": false,
+      "type": "boolean"
+    },
+    "name": {
+      "description": "Operator-facing name; surfaces in metric labels + error reasons.",
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "BedrockAWSCredentials": {
+      "description": "AWS credentials for `kind: \"bedrock\"`. Phase 2 supports `static` (access-key pair); Phase 4 adds `role_arn` (sts:AssumeRole) under the same tag.\n\nWire shape on the kine path is plaintext: cp-api decrypts the envelope-encrypted secret at projection time (same trust boundary as `provider_keys` — see PRD-09c §6.3). The DP only ever holds plaintext in memory; it does not need a master key.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "access_key_id",
+            "kind",
+            "secret_access_key"
+          ],
+          "properties": {
+            "access_key_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "static"
+              ]
+            },
+            "secret_access_key": {
+              "description": "Decrypted by cp-api before kine projection; plaintext in memory only, never logged. The DP feeds it to the AWS SDK's static credentials provider.",
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "BedrockLatencyMode": {
+      "description": "Per-guardrail latency policy for `kind: \"bedrock\"`. `serial` waits unconditionally; `timed` aborts at `timeout_ms` and applies the row-level `fail_open` flag. Range matches cp-api's validator (100..5000ms) — see PRD-09c §6.6.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "serial"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "timeout_ms"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "timed"
+              ]
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          }
+        }
+      ]
+    },
+    "GuardrailHookPoint": {
+      "description": "What part of the request lifecycle a guardrail inspects.",
+      "oneOf": [
+        {
+          "description": "Run on the request payload before bridge dispatch.",
+          "type": "string",
+          "enum": [
+            "input"
+          ]
+        },
+        {
+          "description": "Run on the upstream response before the cache write + render.",
+          "type": "string",
+          "enum": [
+            "output"
+          ]
+        },
+        {
+          "description": "Run on both. Default for keyword blocklists.",
+          "type": "string",
+          "enum": [
+            "both"
+          ]
+        }
+      ]
+    },
+    "KeywordPattern": {
+      "description": "One pattern in a `keyword`-kind guardrail's blocklist. The DP translates `Literal` to a case-insensitive substring match and `Regex` to a compiled `regex::Regex`. Invalid regex at parse time is loader-rejected (the DP refuses to apply a guardrail it can't compile, so a typo doesn't silently disarm the policy).",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "literal"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "value"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "regex"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

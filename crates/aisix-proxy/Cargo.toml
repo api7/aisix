@@ -1,0 +1,66 @@
+[package]
+name = "aisix-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix: /v1/* proxy router (OpenAI-compatible) + middleware + hooks"
+
+[dependencies]
+aisix-core = { path = "../aisix-core" }
+aisix-gateway = { path = "../aisix-gateway" }
+# /v1/messages handler reaches into the Anthropic wire helpers
+# (parse_inbound_request / chat_response_into_anthropic_json /
+# AnthropicSseEncoder) so it can translate Anthropic-protocol
+# requests into ChatFormat for any upstream and back. The
+# Anthropic-passthrough branch also reaches into aisix-provider-openai's
+# `overrides::apply_*` primitives so the PK `request.*` block (param
+# renames, constraints, default body fields, default headers) takes
+# effect on outbound `/v1/messages` requests — without this the
+# override pipeline silently no-ops on the Anthropic path (#335 /
+# #337). These two crates are the only provider crates the proxy
+# depends on directly — others stay behind the Bridge trait.
+aisix-provider-anthropic = { path = "../aisix-provider-anthropic" }
+aisix-provider-openai = { path = "../aisix-provider-openai" }
+aisix-obs = { path = "../aisix-obs" }
+aisix-ratelimit = { path = "../aisix-ratelimit" }
+aisix-cache = { path = "../aisix-cache" }
+aisix-guardrails = { path = "../aisix-guardrails" }
+tokio.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+async-trait.workspace = true
+async-stream = "0.3"
+dashmap.workspace = true
+# Per-request weighted-random target selection in `routing::weighted_pick`.
+# `thread_rng()` gives proper per-request entropy that converges to the
+# configured weights over a finite sample (fix for #197 — the prior
+# nanos-clock-mod-total entropy collapsed to a single bin under
+# rapid-fire calls because consecutive subsec_nanos values differ by
+# a constant that aliases against the modulus).
+rand = { workspace = true }
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+# Real-ip resolver: trusted-proxy CIDR matching for x-forwarded-for (#492)
+ipnet.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+# aisix-provider-anthropic + aisix-provider-openai moved to
+# [dependencies] so the /v1/messages handler can use their primitives
+# in non-test builds too.
+wiremock.workspace = true

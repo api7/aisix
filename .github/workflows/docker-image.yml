@@ -1,0 +1,177 @@
+name: docker-image
+
+# Build and publish the aisix container image to GHCR.
+#
+# Tag strategy. Every push always carries a :sha-<shortsha> tag for
+# traceability; the other tags layer on top based on the trigger:
+#   - push to main              → :dev + :sha-<shortsha>
+#   - push to poc               → :poc + :sha-<shortsha>
+#   - push tag vX.Y.Z           → :X.Y.Z + :X.Y + :X + :latest
+#                                 + :sha-<shortsha>
+#   - pull request              → build-only (no push), sanity check
+#   - workflow_dispatch         → :sha-<shortsha> + optional tag input
+
+on:
+  push:
+    branches: [main, poc]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - .github/workflows/docker-image.yml
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - "crates/**"
+      - "schemas/**"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional extra tag to publish (e.g. aisix-e2e)"
+        required: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}   # ghcr.io/moonming/ai-gateway
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags + labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=dev,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=raw,value=poc,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/poc' }}
+            type=ref,event=pr
+            type=sha,prefix=sha-,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' }}
+          labels: |
+            org.opencontainers.image.title=aisix
+            org.opencontainers.image.description=AISIX — Rust AI Gateway
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      # Same short sha the `type=sha,prefix=sha-` tag uses, stamped into
+      # the binary so the DP's heartbeat reports `0.1.0+sha-<short>` and
+      # operators can match a node to its image tag.
+      - name: Compute short sha
+        id: shortsha
+        # First 7 chars of the commit sha — identical to what
+        # metadata-action's `type=sha,format=short` puts in the tag.
+        run: echo "value=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_SHA=${{ steps.shortsha.outputs.value }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false   # keep manifest format compatible with older clients
+
+      - name: Check OpenAPI publishing secrets
+        id: openapi-secrets
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          S3_BUCKET_REGION: ${{ secrets.S3_BUCKET_REGION }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+        run: |
+          if [ -n "$AWS_ACCESS_KEY_ID" ] \
+            && [ -n "$AWS_SECRET_ACCESS_KEY" ] \
+            && [ -n "$S3_BUCKET_REGION" ] \
+            && [ -n "$S3_BUCKET" ] \
+            && [ -n "$CLOUDFRONT_DISTRIBUTION_ID" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::OpenAPI publishing skipped because S3/CloudFront secrets are not configured."
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.openapi-secrets.outputs.enabled == 'true'
+
+      - uses: ./.github/actions/setup-protoc
+        if: steps.openapi-secrets.outputs.enabled == 'true'
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.openapi-secrets.outputs.enabled == 'true'
+
+      - name: Build Admin API OpenAPI
+        if: steps.openapi-secrets.outputs.enabled == 'true'
+        run: cargo run -p aisix-admin --bin dump-openapi > openapi.json
+
+      - name: Configure AWS credentials
+        if: steps.openapi-secrets.outputs.enabled == 'true'
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.S3_BUCKET_REGION }}
+
+      - name: Publish main Admin API OpenAPI
+        if: steps.openapi-secrets.outputs.enabled == 'true' && github.ref == 'refs/heads/main'
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+        run: |
+          aws s3 cp ./openapi.json "s3://${S3_BUCKET}/ai-gateway/openapi-dev.json"
+          echo "/ai-gateway/openapi-dev.json" > .updated_openapi_files
+
+      - name: Publish release Admin API OpenAPI
+        if: steps.openapi-secrets.outputs.enabled == 'true' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          jq --arg version "$VERSION" '.info.version = $version' ./openapi.json > "openapi-${VERSION}.json"
+          aws s3 cp "./openapi-${VERSION}.json" "s3://${S3_BUCKET}/ai-gateway/openapi-${VERSION}.json"
+          aws s3 cp "./openapi-${VERSION}.json" "s3://${S3_BUCKET}/ai-gateway/openapi-latest.json"
+          echo "/ai-gateway/openapi-${VERSION}.json /ai-gateway/openapi-latest.json" > .updated_openapi_files
+
+      - name: Invalidate OpenAPI CloudFront paths
+        if: steps.openapi-secrets.outputs.enabled == 'true'
+        uses: chetan/invalidate-cloudfront-action@v2
+        env:
+          DISTRIBUTION: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+          PATHS_FROM: .updated_openapi_files
+          AWS_REGION: "${{ secrets.S3_BUCKET_REGION }}"
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}

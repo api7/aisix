@@ -1,0 +1,91 @@
+# Real-cloud object_store smoke e2e — KEYLESS cloud_identity path.
+#
+# Proves `build_object_store_ambient` writes to real S3 with NO static keys: the
+# runner mints a GitHub OIDC token to assume an AWS IAM role
+# (aws-actions/configure-aws-credentials), and the object_store ambient chain
+# (AWS `from_env`) picks it up — exactly what a cloud-deployed DP does via an EC2
+# instance role / EKS IRSA. The static-key credential_ref path is covered by
+# objstore-real-cloud.yml.
+#
+# Scope note — GCS keyless is NOT exercised here. On a non-GCE GitHub runner,
+# object_store's GCS Application Default Credentials resolution targets the GCE
+# metadata server (169.254.169.254), which the runner doesn't have; it does not
+# consume the Workload Identity Federation credentials file. GCS cloud_identity
+# works on a real GKE/GCE deployment (the metadata path that
+# build_object_store_ambient(Gcs, …) uses in production); its real-runner
+# round-trip is tracked in #573. objstore_smoke_gcs_cloud_identity self-skips here.
+#
+# Gated: never on a normal push. workflow_dispatch / nightly / same-repo PR
+# labeled `objstore real cloud`. S3 self-skips when its OIDC is unconfigured.
+#
+# Required repository secrets (identifiers, not static keys):
+#   AISIX_E2E_OIDC_AWS_ROLE_ARN   IAM role to assume (trusts repo:api7/ai-gateway via GitHub OIDC)
+#   AISIX_E2E_OBJSTORE_S3_BUCKET  the S3 test bucket (reused from the credential_ref job)
+#   AISIX_E2E_OBJSTORE_S3_REGION  the bucket's region (configure-aws-credentials requires it)
+name: objstore-cloud-identity
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "45 0 * * *" # 00:45 UTC (08:45 Asia/Shanghai)
+  pull_request:
+    types: [labeled, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write # REQUIRED: lets the OIDC action mint a token to assume the role
+
+concurrency:
+  group: objstore-cloud-identity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: objstore keyless smoke (S3 via GitHub OIDC role)
+    # Same-repo + label gate on PRs; always run on manual dispatch / schedule.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       contains(github.event.pull_request.labels.*.name, 'objstore real cloud'))
+    runs-on: ubicloud-standard-2
+    env:
+      AWS_ROLE_ARN: ${{ secrets.AISIX_E2E_OIDC_AWS_ROLE_ARN }}
+      AWS_REGION_CFG: ${{ secrets.AISIX_E2E_OBJSTORE_S3_REGION }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Report configuration
+        run: |
+          if [ -n "$AWS_ROLE_ARN" ] && [ -n "$AWS_REGION_CFG" ]; then
+            echo "AWS OIDC: configured (role + region)"
+          elif [ -n "$AWS_ROLE_ARN" ]; then
+            echo "::warning::AWS_ROLE_ARN set but AISIX_E2E_OBJSTORE_S3_REGION is empty — S3 keyless self-skips"
+          else
+            echo "::warning::AWS OIDC role absent — S3 keyless self-skips"
+          fi
+          if [ "${{ github.event_name }}" != "pull_request" ] && { [ -z "$AWS_ROLE_ARN" ] || [ -z "$AWS_REGION_CFG" ]; }; then
+            echo "::error::AWS OIDC not fully configured (role ARN + region); this ${{ github.event_name }} run would test nothing."
+            exit 1
+          fi
+
+      - name: Assume the AWS IAM role via GitHub OIDC (keyless)
+        if: env.AWS_ROLE_ARN != '' && env.AWS_REGION_CFG != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION_CFG }}
+
+      - name: Keyless round-trip (S3)
+        env:
+          # Set the bucket only when the OIDC role + region are BOTH present, so
+          # the smoke self-skips rather than running with no ambient credentials.
+          AISIX_E2E_OBJSTORE_CLOUDID_S3_BUCKET: ${{ (secrets.AISIX_E2E_OIDC_AWS_ROLE_ARN != '' && secrets.AISIX_E2E_OBJSTORE_S3_REGION != '') && secrets.AISIX_E2E_OBJSTORE_S3_BUCKET || '' }}
+          AISIX_E2E_OBJSTORE_CLOUDID_S3_REGION: ${{ secrets.AISIX_E2E_OBJSTORE_S3_REGION }}
+          # GCS keyless self-skips on a non-GCE runner (no metadata server) — see
+          # the scope note above and #573. The test stays in the cargo filter so
+          # it runs (and greens) when executed on a real GKE/GCE runner.
+        run: cargo test -p aisix-obs -- --ignored --nocapture objstore_smoke_s3_cloud_identity objstore_smoke_gcs_cloud_identity

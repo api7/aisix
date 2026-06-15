@@ -1,0 +1,37 @@
+# Rust
+/target
+Cargo.lock.bak
+**/*.rs.bk
+*.profraw
+*.profdata
+/coverage
+
+# Node (tests/e2e harness)
+node_modules
+dist
+.pnpm-store
+*.tsbuildinfo
+coverage/
+.nyc_output
+
+# Editor / OS
+.DS_Store
+.idea
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+*.swo
+
+# Local runtime / test artifacts
+/tmp
+/.claude-local
+/test-results
+/playwright-report
+/etcd-data
+.env
+.env.*
+!.env.example
+
+# Filled-in real-cloud objstore credentials (template: real-cloud.env.example)
+/crates/aisix-obs/tests/real-cloud.env

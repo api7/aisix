@@ -1,0 +1,79 @@
+# Object-storage emulators for the `objstore_smoke` real-backend e2e in
+# `crates/aisix-obs/src/sink/object_store.rs` (`mod smoke`). All three speak the
+# real protocol over the wire, are free, and run locally — no cloud account.
+# Borrowed from the `object_store` crate's CI and Quickwit's docker-compose
+# (the cleanest multi-cloud emulator set in the wild).
+#
+# Bring up + run the smoke tests:
+#   docker compose -f crates/aisix-obs/tests/object-store-emulators.compose.yml up -d
+#   set -a; source crates/aisix-obs/tests/object-store-emulators.env; set +a
+#   cargo test -p aisix-obs -- --ignored objstore_smoke
+#   docker compose -f crates/aisix-obs/tests/object-store-emulators.compose.yml down -v
+#
+# The smoke tests are `#[ignore]` + env-gated, so the normal suite never needs
+# Docker; only this explicit run does.
+services:
+  # ── S3 (MinIO, S3-compatible) ────────────────────────────────────────────
+  minio:
+    image: minio/minio:RELEASE.2025-02-28T09-55-16Z
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["9000:9000"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  minio-init:
+    image: minio/mc:RELEASE.2025-02-21T16-00-46Z
+    depends_on: [minio]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >
+        until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done &&
+        mc mb -p local/aisix-smoke && echo "minio bucket aisix-smoke ready"
+    restart: "no"
+
+  # ── Azure Blob (Azurite, Microsoft's official emulator) ──────────────────
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.34.0
+    command: azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
+    ports: ["10000:10000"]
+  azurite-init:
+    image: mcr.microsoft.com/azure-cli:2.67.0
+    depends_on: [azurite]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >
+        sleep 3 &&
+        az storage container create -n aisix-smoke
+        --connection-string "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;"
+        && echo "azurite container aisix-smoke ready"
+    restart: "no"
+
+  # ── GCS (fake-gcs-server) ────────────────────────────────────────────────
+  # NOTE: build + auth (service-account `gcs_base_url` + disable_oauth) verify
+  # against fake-gcs, but its XML API does not round-trip object_store's
+  # percent-encoded object names (the `/` in partition keys → %2F), so the
+  # `objstore_smoke_gcs_roundtrip` PUT only greens against REAL GCS. S3 (MinIO)
+  # and Azure (Azurite) are the round-trip-capable local emulators.
+  fake-gcs:
+    image: fsouza/fake-gcs-server:1.49.2
+    command: -scheme http -backend memory -public-host localhost:4443 -port 4443
+    ports: ["4443:4443"]
+  fake-gcs-init:
+    image: curlimages/curl:8.11.1
+    depends_on: [fake-gcs]
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >
+        sleep 2 &&
+        curl -fsS -X POST http://fake-gcs:4443/storage/v1/b
+        -H "Content-Type: application/json" -d '{"name":"aisix-smoke"}'
+        && echo "fake-gcs bucket aisix-smoke ready"
+    restart: "no"

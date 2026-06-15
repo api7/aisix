@@ -1,0 +1,70 @@
+[package]
+name = "aisix-guardrails"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix: pluggable guardrails (pre_call / during_call / post_call)"
+
+[dependencies]
+aisix-core = { path = "../aisix-core" }
+aisix-gateway = { path = "../aisix-gateway" }
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+regex.workspace = true
+
+# kind=bedrock guardrail (PRD-09c §6 Phase 2). Behind a default
+# feature so a build that never touches Bedrock can opt out via
+# `--no-default-features` on this crate to avoid the AWS SDK
+# transitive cost (~30s cold build + ~150 transitive crates).
+aws-config = { workspace = true, optional = true }
+aws-sdk-bedrockruntime = { workspace = true, optional = true }
+aws-credential-types = { workspace = true, optional = true }
+aws-smithy-async = { workspace = true, optional = true }
+aws-smithy-runtime-api = { workspace = true, optional = true }
+aws-smithy-types = { workspace = true, optional = true }
+
+# kind=azure_content_safety guardrail (PRD-09c §6 P1). reqwest is the
+# HTTP client for the Prompt Shield API call; behind a default feature
+# so a slim build can opt out.
+reqwest = { workspace = true, optional = true }
+
+# kind=aliyun_text_moderation guardrail (#603). The Aliyun green-cip
+# TextModerationPlus call is signed (RPC signature v1, HMAC-SHA1) and POSTed
+# over the shared reqwest client. There is no official Aliyun Rust SDK, so the
+# RPC signature is hand-rolled with these primitives (all workspace deps).
+hmac = { workspace = true, optional = true }
+sha1 = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+
+[features]
+default = ["bedrock", "azure-content-safety", "aliyun-text-moderation"]
+bedrock = [
+    "dep:aws-config",
+    "dep:aws-sdk-bedrockruntime",
+    "dep:aws-credential-types",
+    "dep:aws-smithy-async",
+    "dep:aws-smithy-runtime-api",
+    "dep:aws-smithy-types",
+]
+azure-content-safety = ["dep:reqwest"]
+aliyun-text-moderation = [
+    "dep:reqwest",
+    "dep:hmac",
+    "dep:sha1",
+    "dep:base64",
+    "dep:chrono",
+    "dep:uuid",
+]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock.workspace = true

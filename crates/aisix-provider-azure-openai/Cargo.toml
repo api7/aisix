@@ -1,0 +1,35 @@
+[package]
+name = "aisix-provider-azure-openai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix: Azure OpenAI Service provider bridge (skeleton — deployment-keyed dispatch)"
+
+[dependencies]
+aisix-core = { path = "../aisix-core" }
+aisix-gateway = { path = "../aisix-gateway" }
+# Azure OpenAI's chat-completions wire shape is the OpenAI shape with
+# a different URL pattern + auth header + a tolerated `content_filter_results`
+# extension field. We reuse `aisix-provider-openai`'s typed wire structs
+# (`OpenAiResponse` / `OpenAiStreamChunk`) and override apply helpers
+# (param_renames / default_headers / etc.) instead of re-implementing
+# them — keeping a single source of truth for the OpenAI JSON contract.
+aisix-provider-openai = { path = "../aisix-provider-openai" }
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-stream = "0.3"
+bytes.workspace = true
+http.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+wiremock.workspace = true

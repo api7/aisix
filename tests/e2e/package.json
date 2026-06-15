@@ -1,0 +1,23 @@
+{
+  "name": "aisix-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end test harness for the aisix AI Gateway (spec §12).",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "@types/node": "20.11.30",
+    "@vitest/coverage-v8": "2.1.9",
+    "typescript": "5.5.4",
+    "vitest": "2.1.9"
+  },
+  "dependencies": {
+    "openai": "4.65.0",
+    "undici": "6.19.8",
+    "yaml": "2.5.1"
+  }
+}

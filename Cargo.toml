@@ -1,0 +1,166 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aisix-core",
+    "crates/aisix-etcd",
+    "crates/aisix-gateway",
+    "crates/aisix-provider-openai",
+    "crates/aisix-provider-anthropic",
+    "crates/aisix-provider-vertex",
+    "crates/aisix-provider-azure-openai",
+    "crates/aisix-provider-bedrock",
+    "crates/aisix-proxy",
+    "crates/aisix-admin",
+    "crates/aisix-obs",
+    "crates/aisix-ratelimit",
+    "crates/aisix-cache",
+    "crates/aisix-guardrails",
+    "crates/aisix-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+license = "Apache-2.0"
+repository = "https://github.com/moonming/ai-gateway"
+authors = ["moonming"]
+
+[workspace.dependencies]
+# Runtime
+tokio = { version = "1.41", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
+futures = "0.3"
+futures-util = "0.3"
+async-trait = "0.1"
+
+# HTTP server
+axum = { version = "0.7", features = ["macros", "ws", "tracing", "multipart"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "limit", "compression-gzip", "set-header"] }
+hyper = "1.5"
+hyper-util = "0.1"
+http = "1.2"
+http-body-util = "0.1"
+mime = "0.3"
+# Trusted-proxy CIDR matching for real-ip resolution (#492)
+ipnet = "2"
+
+# Aliyun SLS sink (aisix-obs): the official protobuf + signature sub-crates
+# ONLY — not the full `aliyun-log-rust-sdk`, which forces reqwest native-tls
+# (OpenSSL) + ~13 C/TLS crates. Transport is our own rustls reqwest, so these
+# stay pure-Rust with no OpenSSL.
+aliyun-log-sdk-protobuf = "0.1"
+aliyun-log-sdk-sign = "0.2"
+lz4_flex = "0.11"
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "multipart"] }
+eventsource-stream = "0.2"
+
+# TLS
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+
+# Serialization / validation
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+jsonschema = "0.28"
+schemars = "0.8"
+
+# Concurrency primitives
+arc-swap = "1.7"
+dashmap = "6.1"
+once_cell = "1.20"
+parking_lot = "0.12"
+
+# etcd
+etcd-client = { version = "0.14", features = ["tls"] }
+
+# Config
+config = { version = "0.14", default-features = false, features = ["yaml", "toml", "json"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Time / IDs
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+hostname = "0.4"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "registry"] }
+tracing-opentelemetry = "0.28"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "metrics", "trace"] }
+opentelemetry-semantic-conventions = "0.27"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# Errors / utilities
+anyhow = "1"
+thiserror = "1"
+bytes = "1"
+rand = "0.8"
+regex = "1"
+base64 = "0.22"
+
+# Crypto (M6 v3 CP register flow + ApiKey hash auth)
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+hex = "0.4"
+
+# Caching / storage backends
+moka = { version = "0.12", features = ["future"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "cluster-async"] }
+
+# Object-storage observability sink (aisix-obs): ONE crate covering S3 / GCS /
+# Azure Blob (+ S3-compatible MinIO/R2) behind a single `ObjectStore` trait, so
+# the sink is written once, not per-provider. The cloud features pull reqwest
+# default-features=false + rustls, so this stays rustls-only — no OpenSSL /
+# native-tls (same posture as the SLS sub-crates above).
+object_store = { version = "0.13", default-features = false, features = ["aws", "gcp", "azure", "tls-webpki-roots"] }
+# NDJSON gzip for the object-storage sink. flate2's default miniz_oxide backend
+# is pure Rust — no zlib/C, consistent with the no-OpenSSL posture.
+flate2 = "1"
+
+# Tokenization / counting (optional hard-mode TPM)
+tiktoken-rs = "0.5"
+
+# Duration / humanised types
+humantime = "2.1"
+humantime-serde = "1.1"
+
+# AWS SDK — kind=bedrock guardrail dispatcher (PRD-09c §6 Phase 2).
+# Pulled into aisix-guardrails only; opt-out via `--no-default-features`
+# on the crate when the operator never plans to use Bedrock.
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"] }
+aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["rustls", "rt-tokio"] }
+aws-credential-types = "1"
+aws-smithy-async = { version = "1", features = ["rt-tokio"] }
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
+
+# Test-only
+wiremock = "0.6"
+rstest = "0.23"
+insta = { version = "1", features = ["json", "yaml"] }
+testcontainers = "0.23"
+tempfile = "3.13"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.coverage]
+inherits = "dev"
+opt-level = 0
+debug = 2
+incremental = false

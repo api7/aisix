@@ -1,0 +1,39 @@
+[package]
+name = "aisix-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix: core types (Config, ResourceEntry, Snapshot, errors)"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+arc-swap.workspace = true
+dashmap.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+config.workspace = true
+humantime-serde.workspace = true
+jsonschema.workspace = true
+schemars.workspace = true
+once_cell.workspace = true
+regex.workspace = true
+# ApiKey::hash_bearer (prd-09a §9A.7B.4) is the canonical SHA-256 the
+# proxy uses to compare an incoming Authorization: Bearer <plaintext>
+# against the snapshot's `key_hash` column.
+sha2.workspace = true
+hex.workspace = true
+# Trusted-proxy CIDR parsing/validation for proxy.real_ip (#492)
+ipnet.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+rstest.workspace = true
+serde_yaml.workspace = true
+tempfile.workspace = true

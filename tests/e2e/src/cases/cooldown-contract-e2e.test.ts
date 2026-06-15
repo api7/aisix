@@ -1,0 +1,713 @@
+import { createHash } from "node:crypto";
+import OpenAI from "openai";
+import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import {
+  AdminClient,
+  EtcdClient,
+  spawnApp,
+  startOpenAiUpstream,
+  waitConfigPropagation,
+  type OpenAiUpstream,
+  type SpawnedApp,
+} from "../harness/index.js";
+
+/**
+ * E2E contract tests for the post-#268 cooldown / filter behavior.
+ *
+ * These tests cover the audit findings from issue #264 that the
+ * initial PR landed:
+ *  - H1: 401 (auth failure) cools down even though it is non-retryable.
+ *  - H2: Retry-After header from upstream drives the cooldown TTL.
+ *  - H3: When every routing candidate is filtered out, the proxy
+ *        fails fast with 503 + Retry-After (default policy).
+ *  - H3 escape hatch: `on_all_filtered: original_order` preserves the
+ *        legacy "send to known-bad" behavior for operators that
+ *        explicitly opt in.
+ *  - M1: 429 cools down regardless of `retry_on_429` — cooldown and
+ *        retry are independent layers.
+ *
+ * Every test exercises the real backend with mock upstreams (no
+ * stubbing of the bridge or network layer) and asserts both client-
+ * visible outcome and per-upstream request evidence.
+ */
+
+const CALLER_PLAINTEXT = "sk-cooldown-contract-caller";
+const CALLER_KEY_HASH = createHash("sha256")
+  .update(CALLER_PLAINTEXT)
+  .digest("hex");
+
+describe("cooldown contract (H1) — 401 cools down despite being non-retryable", () => {
+  let app: SpawnedApp | undefined;
+  let admin: AdminClient | undefined;
+  let etcdReachable = false;
+  let authFailUpstream: OpenAiUpstream | undefined;
+  let stableUpstream: OpenAiUpstream | undefined;
+  let authFailModelID = "";
+
+  beforeAll(async () => {
+    etcdReachable = await new EtcdClient().ping();
+    if (!etcdReachable) return;
+
+    authFailUpstream = await startOpenAiUpstream({
+      status: 401,
+      errorBody: {
+        error: { message: "Incorrect API key provided", type: "invalid_request_error" },
+      },
+    });
+    stableUpstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "cmpl-h1-stable",
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: "gpt-4o-mini",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "h1 stable fallback" },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
+    });
+
+    app = await spawnApp();
+    admin = new AdminClient(app.adminUrl, app.adminKey);
+
+    const failPk = await admin.createProviderKey({
+      display_name: "h1-401-pk",
+      secret: "sk-mock",
+      api_base: `${authFailUpstream.baseUrl}/v1`,
+    });
+    const stablePk = await admin.createProviderKey({
+      display_name: "h1-stable-pk",
+      secret: "sk-mock",
+      api_base: `${stableUpstream.baseUrl}/v1`,
+    });
+
+    authFailModelID = (
+      await admin.createModel({
+        display_name: "h1-401-model",
+        provider: "openai",
+        model_name: "gpt-4o-mini",
+        provider_key_id: failPk.id,
+      })
+    ).id;
+    await admin.createModel({
+      display_name: "h1-stable-model",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: stablePk.id,
+    });
+    await admin.createModel({
+      display_name: "h1-router",
+      routing: {
+        strategy: "failover",
+        targets: [{ model: "h1-401-model" }, { model: "h1-stable-model" }],
+        max_fallbacks: 1,
+      },
+    });
+    await admin.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["h1-router", "h1-stable-model"],
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await authFailUpstream?.close();
+    await stableUpstream?.close();
+  });
+
+  test("a 401 surfaces as 401 to the caller (non-retryable) AND cools down the target; next request skips the cooled target", async (ctx) => {
+    if (!etcdReachable || !app || !admin || !authFailUpstream || !stableUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    await waitConfigPropagation(async () => {
+      try {
+        const probe = await client.chat.completions.create({
+          model: "h1-stable-model",
+          messages: [{ role: "user", content: "ready-h1-stable" }],
+        });
+        return probe.choices[0]?.message.content === "h1 stable fallback";
+      } catch {
+        return false;
+      }
+    });
+
+    // First request: 401 is non-retryable, so the dispatch loop
+    // does NOT failover within this request — the 401 propagates
+    // to the caller. This matches PR #263's retry semantics where
+    // non-retryable 4xx stops the loop entirely. The new behavior
+    // is purely that COOLDOWN is recorded anyway.
+    let firstError: unknown;
+    try {
+      await client.chat.completions.create({
+        model: "h1-router",
+        messages: [{ role: "user", content: "trip 401 cooldown" }],
+      });
+    } catch (err) {
+      firstError = err;
+    }
+    expect(firstError).toBeTruthy();
+    expect((firstError as { status?: number }).status).toBe(401);
+    expect(authFailUpstream.receivedRequests.length).toBeGreaterThanOrEqual(1);
+
+    // The H1 contract: even though 401 is non-retryable, cooldown
+    // was set on the failing target.
+    const statuses = await admin.listModelStatuses();
+    const failed = statuses.find((row) => row.id === authFailModelID)!;
+    expect(failed.status).toBe("cooldown");
+    expect(failed.status_reason).toBe("upstream_auth_failure");
+    expect(failed.cooldown_until).toBeTruthy();
+
+    // Second request: routing filter sees the 401 target is in
+    // cooldown, picks the stable fallback as the first attempt.
+    const failBaseline = authFailUpstream.receivedRequests.length;
+    const stableBaseline = stableUpstream.receivedRequests.length;
+
+    const second = await client.chat.completions.create({
+      model: "h1-router",
+      messages: [{ role: "user", content: "skip cooled-down 401 target" }],
+    });
+    expect(second.choices[0]?.message.content).toBe("h1 stable fallback");
+    expect(authFailUpstream.receivedRequests.length - failBaseline).toBe(0);
+    expect(stableUpstream.receivedRequests.length - stableBaseline).toBe(1);
+  });
+});
+
+describe("cooldown contract (M1) — 429 cools down even when retry_on_429=false", () => {
+  let app: SpawnedApp | undefined;
+  let admin: AdminClient | undefined;
+  let etcdReachable = false;
+  let rateLimitedUpstream: OpenAiUpstream | undefined;
+  let stableUpstream: OpenAiUpstream | undefined;
+  let rateLimitedModelID = "";
+
+  beforeAll(async () => {
+    etcdReachable = await new EtcdClient().ping();
+    if (!etcdReachable) return;
+
+    rateLimitedUpstream = await startOpenAiUpstream({
+      status: 429,
+      errorBody: {
+        error: { message: "Rate limit reached", type: "rate_limit_error" },
+      },
+    });
+    stableUpstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "cmpl-m1-stable",
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: "gpt-4o-mini",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "m1 stable fallback" },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
+    });
+
+    app = await spawnApp();
+    admin = new AdminClient(app.adminUrl, app.adminKey);
+
+    const rateLimitedPk = await admin.createProviderKey({
+      display_name: "m1-429-pk",
+      secret: "sk-mock",
+      api_base: `${rateLimitedUpstream.baseUrl}/v1`,
+    });
+    const stablePk = await admin.createProviderKey({
+      display_name: "m1-stable-pk",
+      secret: "sk-mock",
+      api_base: `${stableUpstream.baseUrl}/v1`,
+    });
+
+    rateLimitedModelID = (
+      await admin.createModel({
+        display_name: "m1-429-model",
+        provider: "openai",
+        model_name: "gpt-4o-mini",
+        provider_key_id: rateLimitedPk.id,
+      })
+    ).id;
+    await admin.createModel({
+      display_name: "m1-stable-model",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: stablePk.id,
+    });
+    // Note: retry_on_429 defaults to false here. The pre-#268-fix
+    // behavior would NOT cooldown a 429 in this configuration; the
+    // M1 fix decouples cooldown from retry so the 429 must still
+    // mark the target for backoff.
+    await admin.createModel({
+      display_name: "m1-router",
+      routing: {
+        strategy: "failover",
+        targets: [{ model: "m1-429-model" }, { model: "m1-stable-model" }],
+        max_fallbacks: 1,
+      },
+    });
+    await admin.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["m1-router", "m1-stable-model"],
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await rateLimitedUpstream?.close();
+    await stableUpstream?.close();
+  });
+
+  test("429 surfaces to caller (retry_on_429=false → non-retryable) AND cools down; next request skips the cooled target", async (ctx) => {
+    if (!etcdReachable || !app || !admin || !rateLimitedUpstream || !stableUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    await waitConfigPropagation(async () => {
+      try {
+        const probe = await client.chat.completions.create({
+          model: "m1-stable-model",
+          messages: [{ role: "user", content: "ready-m1-stable" }],
+        });
+        return probe.choices[0]?.message.content === "m1 stable fallback";
+      } catch {
+        return false;
+      }
+    });
+
+    // First request: with retry_on_429 unset (default false), the
+    // 429 is non-retryable so the dispatch loop does not failover
+    // — the 429 propagates to the caller. This is the same
+    // retry-vs-cooldown decoupling the M1 contract pins.
+    let firstError: unknown;
+    try {
+      await client.chat.completions.create({
+        model: "m1-router",
+        messages: [{ role: "user", content: "trip 429 cooldown" }],
+      });
+    } catch (err) {
+      firstError = err;
+    }
+    expect(firstError).toBeTruthy();
+    expect((firstError as { status?: number }).status).toBe(429);
+    expect(rateLimitedUpstream.receivedRequests.length).toBeGreaterThanOrEqual(1);
+
+    // The M1 contract: 429 cools down regardless of retry_on_429.
+    const statuses = await admin.listModelStatuses();
+    const rateLimited = statuses.find((row) => row.id === rateLimitedModelID)!;
+    expect(rateLimited.status).toBe("cooldown");
+    expect(rateLimited.status_reason).toBe("upstream_rate_limited");
+
+    // Second request: routing filter skips the cooled target.
+    const rateLimitedBaseline = rateLimitedUpstream.receivedRequests.length;
+    const stableBaseline = stableUpstream.receivedRequests.length;
+
+    const second = await client.chat.completions.create({
+      model: "m1-router",
+      messages: [{ role: "user", content: "skip 429 target after cooldown" }],
+    });
+    expect(second.choices[0]?.message.content).toBe("m1 stable fallback");
+    expect(rateLimitedUpstream.receivedRequests.length - rateLimitedBaseline).toBe(0);
+    expect(stableUpstream.receivedRequests.length - stableBaseline).toBe(1);
+  });
+});
+
+describe("cooldown contract (H2) — Retry-After header from upstream drives TTL", () => {
+  let app: SpawnedApp | undefined;
+  let admin: AdminClient | undefined;
+  let etcdReachable = false;
+  let upstream: OpenAiUpstream | undefined;
+  let stableUpstream: OpenAiUpstream | undefined;
+  let rateLimitedModelID = "";
+
+  beforeAll(async () => {
+    etcdReachable = await new EtcdClient().ping();
+    if (!etcdReachable) return;
+
+    upstream = await startOpenAiUpstream({
+      status: 429,
+      errorBody: { error: { message: "slow down", type: "rate_limit_error" } },
+      // Force the upstream to advertise a long Retry-After. The
+      // gateway must honor it instead of using the default 30s.
+      // Test asserts cooldown_until lands well beyond the default.
+      responseHeaders: { "retry-after": "180" },
+    });
+    stableUpstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "cmpl-h2-stable",
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: "gpt-4o-mini",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "h2 stable fallback" },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
+    });
+
+    app = await spawnApp();
+    admin = new AdminClient(app.adminUrl, app.adminKey);
+
+    const upstreamPk = await admin.createProviderKey({
+      display_name: "h2-upstream-pk",
+      secret: "sk-mock",
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    const stablePk = await admin.createProviderKey({
+      display_name: "h2-stable-pk",
+      secret: "sk-mock",
+      api_base: `${stableUpstream.baseUrl}/v1`,
+    });
+
+    rateLimitedModelID = (
+      await admin.createModel({
+        display_name: "h2-429-with-retry-after",
+        provider: "openai",
+        model_name: "gpt-4o-mini",
+        provider_key_id: upstreamPk.id,
+      })
+    ).id;
+    await admin.createModel({
+      display_name: "h2-stable-model",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: stablePk.id,
+    });
+    await admin.createModel({
+      display_name: "h2-router",
+      routing: {
+        strategy: "failover",
+        targets: [
+          { model: "h2-429-with-retry-after" },
+          { model: "h2-stable-model" },
+        ],
+        max_fallbacks: 1,
+      },
+    });
+    await admin.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["h2-router", "h2-stable-model"],
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await upstream?.close();
+    await stableUpstream?.close();
+  });
+
+  test("Retry-After: 180 from upstream produces a cooldown_until far beyond the 30s default", async (ctx) => {
+    if (!etcdReachable || !app || !admin || !upstream || !stableUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    const client = new OpenAI({
+      apiKey: CALLER_PLAINTEXT,
+      baseURL: `${app.proxyUrl}/v1`,
+      maxRetries: 0,
+    });
+
+    await waitConfigPropagation(async () => {
+      try {
+        const probe = await client.chat.completions.create({
+          model: "h2-stable-model",
+          messages: [{ role: "user", content: "ready-h2-stable" }],
+        });
+        return probe.choices[0]?.message.content === "h2 stable fallback";
+      } catch {
+        return false;
+      }
+    });
+
+    const before = Date.now();
+    // 429 with retry_on_429 unset (default false) → non-retryable
+    // → propagates to caller. We don't care about the response
+    // path here, only about the cooldown TTL the gateway derived
+    // from the upstream's Retry-After header.
+    let firstError: unknown;
+    try {
+      await client.chat.completions.create({
+        model: "h2-router",
+        messages: [{ role: "user", content: "trip 429 retry-after" }],
+      });
+    } catch (err) {
+      firstError = err;
+    }
+    expect((firstError as { status?: number }).status).toBe(429);
+
+    const statuses = await admin.listModelStatuses();
+    const row = statuses.find((r) => r.id === rateLimitedModelID)!;
+    expect(row.status).toBe("cooldown");
+    expect(row.cooldown_until).toBeTruthy();
+
+    // The reported cooldown_until should be ~180s in the future.
+    // 30s default is the wrong answer — that would prove H2 isn't
+    // wired. `cooldown_until` is serialized via SystemTime's default
+    // serde shape: `{secs_since_epoch, nanos_since_epoch}`. Assert
+    // the wire shape first so a future change to the admin
+    // serialization (e.g. RFC3339 strings) fails this test with a
+    // clear message rather than a silent NaN parse.
+    const cooldownUntil = row.cooldown_until as { secs_since_epoch?: unknown };
+    expect(
+      typeof cooldownUntil.secs_since_epoch,
+      "cooldown_until shape changed — update this test to match the new admin wire format",
+    ).toBe("number");
+    const cooldownUntilMs = (cooldownUntil.secs_since_epoch as number) * 1000;
+    const horizonMs = cooldownUntilMs - before;
+    expect(horizonMs).toBeGreaterThan(120_000);
+    expect(horizonMs).toBeLessThan(240_000);
+  });
+});
+
+describe("filter contract (H3) — all candidates unhealthy returns 503", () => {
+  let app: SpawnedApp | undefined;
+  let admin: AdminClient | undefined;
+  let etcdReachable = false;
+  let downAUpstream: OpenAiUpstream | undefined;
+  let downBUpstream: OpenAiUpstream | undefined;
+
+  beforeAll(async () => {
+    etcdReachable = await new EtcdClient().ping();
+    if (!etcdReachable) return;
+
+    downAUpstream = await startOpenAiUpstream({
+      status: 503,
+      errorBody: { error: { message: "all-down A", type: "server_error" } },
+    });
+    downBUpstream = await startOpenAiUpstream({
+      status: 503,
+      errorBody: { error: { message: "all-down B", type: "server_error" } },
+    });
+
+    app = await spawnApp();
+    admin = new AdminClient(app.adminUrl, app.adminKey);
+
+    const aPk = await admin.createProviderKey({
+      display_name: "h3-down-a-pk",
+      secret: "sk-mock",
+      api_base: `${downAUpstream.baseUrl}/v1`,
+    });
+    const bPk = await admin.createProviderKey({
+      display_name: "h3-down-b-pk",
+      secret: "sk-mock",
+      api_base: `${downBUpstream.baseUrl}/v1`,
+    });
+
+    await admin.createModel({
+      display_name: "h3-down-a",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: aPk.id,
+      background_model_check: {
+        enabled: true,
+        interval_seconds: 5,
+        timeout_seconds: 10,
+        prompt: "Respond with OK",
+        max_tokens: 8,
+        ignore_statuses: [408, 429],
+        stale_after_seconds: 120,
+      },
+    });
+    await admin.createModel({
+      display_name: "h3-down-b",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: bPk.id,
+      background_model_check: {
+        enabled: true,
+        interval_seconds: 5,
+        timeout_seconds: 10,
+        prompt: "Respond with OK",
+        max_tokens: 8,
+        ignore_statuses: [408, 429],
+        stale_after_seconds: 120,
+      },
+    });
+    // Default on_all_filtered policy is "fail" — explicit here for
+    // clarity even though it's the default.
+    await admin.createModel({
+      display_name: "h3-router-fail",
+      routing: {
+        strategy: "failover",
+        targets: [{ model: "h3-down-a" }, { model: "h3-down-b" }],
+        max_fallbacks: 1,
+        on_all_filtered: "fail",
+      },
+    });
+    await admin.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["h3-router-fail"],
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await downAUpstream?.close();
+    await downBUpstream?.close();
+  });
+
+  test("when both candidates are background-unhealthy, the proxy fails fast with 503 + Retry-After", async (ctx) => {
+    if (!etcdReachable || !app || !admin || !downAUpstream || !downBUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    // Wait for the background probe to mark both candidates unhealthy.
+    await waitConfigPropagation(async () => {
+      const statuses = await admin!.listModelStatuses();
+      const a = statuses.find((row) => row.display_name === "h3-down-a");
+      const b = statuses.find((row) => row.display_name === "h3-down-b");
+      return a?.status === "unhealthy" && b?.status === "unhealthy";
+    });
+
+    const aBaseline = downAUpstream.receivedRequests.length;
+    const bBaseline = downBUpstream.receivedRequests.length;
+
+    // Raw fetch instead of the OpenAI SDK so we can inspect the
+    // 503 response shape and Retry-After header directly. The SDK
+    // would convert 503 to an APIError and obscure the headers.
+    const resp = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+      },
+      body: JSON.stringify({
+        model: "h3-router-fail",
+        messages: [{ role: "user", content: "should fail fast" }],
+      }),
+    });
+
+    expect(resp.status).toBe(503);
+    expect(resp.headers.get("retry-after")).toBeTruthy();
+    const body = (await resp.json()) as { error?: { type?: string } };
+    expect(body.error?.type).toBe("all_candidates_unavailable");
+
+    // Crucially: the proxy must NOT have sent a request to either
+    // upstream during the fail-fast path. This is the whole point
+    // of H3 — don't pile on known-bad targets.
+    expect(downAUpstream.receivedRequests.length - aBaseline).toBe(0);
+    expect(downBUpstream.receivedRequests.length - bBaseline).toBe(0);
+  });
+});
+
+describe("filter contract (H3 escape hatch) — original_order sends to known-bad", () => {
+  let app: SpawnedApp | undefined;
+  let admin: AdminClient | undefined;
+  let etcdReachable = false;
+  let downUpstream: OpenAiUpstream | undefined;
+
+  beforeAll(async () => {
+    etcdReachable = await new EtcdClient().ping();
+    if (!etcdReachable) return;
+
+    downUpstream = await startOpenAiUpstream({
+      status: 503,
+      errorBody: { error: { message: "still down", type: "server_error" } },
+    });
+
+    app = await spawnApp();
+    admin = new AdminClient(app.adminUrl, app.adminKey);
+
+    const pk = await admin.createProviderKey({
+      display_name: "h3-escape-pk",
+      secret: "sk-mock",
+      api_base: `${downUpstream.baseUrl}/v1`,
+    });
+
+    await admin.createModel({
+      display_name: "h3-escape-down",
+      provider: "openai",
+      model_name: "gpt-4o-mini",
+      provider_key_id: pk.id,
+      background_model_check: {
+        enabled: true,
+        interval_seconds: 5,
+        timeout_seconds: 10,
+        prompt: "Respond with OK",
+        max_tokens: 8,
+        ignore_statuses: [408, 429],
+        stale_after_seconds: 120,
+      },
+    });
+    await admin.createModel({
+      display_name: "h3-router-escape",
+      routing: {
+        strategy: "failover",
+        targets: [{ model: "h3-escape-down" }],
+        max_fallbacks: 0,
+        on_all_filtered: "original_order",
+      },
+    });
+    await admin.createApiKey({
+      key_hash: CALLER_KEY_HASH,
+      allowed_models: ["h3-router-escape"],
+    });
+  });
+
+  afterAll(async () => {
+    await app?.exit();
+    await downUpstream?.close();
+  });
+
+  test("with on_all_filtered=original_order, the proxy still tries the unhealthy target (legacy opt-in)", async (ctx) => {
+    if (!etcdReachable || !app || !admin || !downUpstream) {
+      ctx.skip();
+      return;
+    }
+
+    await waitConfigPropagation(async () => {
+      const statuses = await admin!.listModelStatuses();
+      const row = statuses.find((r) => r.display_name === "h3-escape-down");
+      return row?.status === "unhealthy";
+    });
+
+    const baseline = downUpstream.receivedRequests.length;
+
+    // With original_order, the request goes out to the unhealthy
+    // target. The upstream still returns 503 and the SDK throws,
+    // but the key point is that a request *was sent*.
+    const resp = await fetch(`${app.proxyUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${CALLER_PLAINTEXT}`,
+      },
+      body: JSON.stringify({
+        model: "h3-router-escape",
+        messages: [{ role: "user", content: "send anyway please" }],
+      }),
+    });
+
+    // 503 surfaces from the upstream (collapsed to 502 by the bridge
+    // mapping in BridgeError::http_status, but the upstream request
+    // is what we're verifying here).
+    expect([502, 503]).toContain(resp.status);
+    expect(downUpstream.receivedRequests.length - baseline).toBe(1);
+  });
+});

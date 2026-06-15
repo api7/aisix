@@ -1,0 +1,239 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: lint (fmt + clippy)
+    runs-on: ubicloud-standard-2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  schema-drift:
+    name: schema drift (resources)
+    runs-on: ubicloud-standard-2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@v2
+      - name: regenerate schemas
+        run: cargo run -p aisix-core --bin dump-schema
+      - name: assert no drift
+        run: |
+          if ! git diff --exit-code schemas/; then
+            echo "::error::Resource JSON Schemas in 'schemas/resources/' drift from the Rust types in 'crates/aisix-core/src/models/'."
+            echo "::error::Fix: run 'cargo run -p aisix-core --bin dump-schema' locally and commit the diff."
+            exit 1
+          fi
+
+  openapi-drift:
+    name: schema drift (admin openapi)
+    runs-on: ubicloud-standard-2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@v2
+      - name: regenerate Admin API OpenAPI
+        run: |
+          mkdir -p schemas/openapi
+          cargo run -p aisix-admin --bin dump-openapi > schemas/openapi/admin-api.json
+      - name: assert no drift
+        run: |
+          if ! git diff --exit-code schemas/openapi/admin-api.json; then
+            echo "::error::Admin API OpenAPI in 'schemas/openapi/admin-api.json' drifted from the gateway source."
+            echo "::error::Fix: run 'cargo run -p aisix-admin --bin dump-openapi > schemas/openapi/admin-api.json' locally and commit the diff."
+            exit 1
+          fi
+
+  rust-unit:
+    name: rust unit + coverage
+    runs-on: ubicloud-standard-2
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+      # Real etcd for crates/aisix-admin/tests/etcd_integration.rs —
+      # exercises the full Admin handler → EtcdConfigStore →
+      # aisix-etcd::loader round-trip so regressions in subkey
+      # constants or KV serde shape get caught here, not at runtime.
+      #
+      # Use the upstream Quay-hosted image (Bitnami retired the
+      # `bitnami/etcd:3.5` floating tag from Docker Hub in 2025; the
+      # GHA runner's anonymous docker pull fails with "manifest
+      # unknown" against that registry now). The upstream image
+      # honours `ETCD_*` env vars directly so we don't need a
+      # command override.
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.18
+        ports: ["2379:2379"]
+        env:
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_ADVERTISE_CLIENT_URLS: http://0.0.0.0:2379
+    env:
+      # Picked up by crates/aisix-cache/tests/redis_integration.rs.
+      # The tests no-op when this is unset (local dev), so absence is safe.
+      #
+      # MUST NOT start with the `AISIX_` prefix — Config::load_from_path
+      # merges every AISIX_* env var into the root Config (via
+      # config-rs Environment::with_prefix("AISIX")), and Config has
+      # `#[serde(deny_unknown_fields)]`. An AISIX_REDIS_URL leaks into
+      # every Config::load_from_path test as `redis_url` and breaks
+      # the entire `aisix-core::config::tests` module.
+      CACHE_TEST_REDIS_URL: redis://127.0.0.1:6379
+      # Picked up by crates/aisix-ratelimit/tests/redis_integration.rs
+      # (shared cluster-level counters, #798). Same skip-if-unset /
+      # no-AISIX_-prefix rules as CACHE_TEST_REDIS_URL above.
+      RATELIMIT_TEST_REDIS_URL: redis://127.0.0.1:6379
+      # Picked up by crates/aisix-admin/tests/etcd_integration.rs.
+      # Same skip-if-unset pattern as the Redis case above.
+      ADMIN_TEST_ETCD_URL: http://127.0.0.1:2379
+      # Picked up by crates/aisix-etcd/tests/watch_integration.rs.
+      ETCD_TEST_URL: http://127.0.0.1:2379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: unit tests with coverage
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov-unit.info
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-unit
+          path: lcov-unit.info
+          retention-days: 7
+
+  build-bin:
+    name: build aisix (instrumented)
+    runs-on: ubicloud-standard-2
+    env:
+      RUSTFLAGS: "-C instrument-coverage"
+      LLVM_PROFILE_FILE: "coverage/aisix-%p-%m.profraw"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build -p aisix-server --bin aisix
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aisix-bin
+          path: target/debug/aisix
+          # 72 MB binary × many runs will refill the quota quickly;
+          # keep only as long as the downstream e2e job needs it.
+          retention-days: 1
+
+  e2e:
+    name: e2e (vitest) + coverage
+    needs: [build-bin]
+    runs-on: ubicloud-standard-2
+    services:
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.15
+        env:
+          ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+          ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
+        ports: ["2379:2379"]
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: aisix-bin
+          path: target/debug
+      - run: chmod +x target/debug/aisix
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - name: check harness exists
+        id: harness
+        run: |
+          if [ -f tests/e2e/package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::tests/e2e harness not present yet — skipping"
+          fi
+      - name: e2e install
+        if: steps.harness.outputs.present == 'true'
+        working-directory: tests/e2e
+        run: pnpm install --no-frozen-lockfile
+      - name: run e2e
+        if: steps.harness.outputs.present == 'true'
+        working-directory: tests/e2e
+        run: pnpm test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-e2e
+          path: tests/e2e/coverage/lcov.info
+          if-no-files-found: ignore
+          retention-days: 7
+
+  coverage-gate:
+    name: coverage >= 90%
+    needs: [rust-unit, e2e]
+    runs-on: ubicloud-standard-2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: coverage-unit, path: cov/unit }
+      - uses: actions/download-artifact@v4
+        # The e2e job invokes `pnpm test` which is `vitest run` with no
+        # `--coverage` flag, so `tests/e2e/coverage/lcov.info` is never
+        # written and no `coverage-e2e` artifact is produced. The upload
+        # step at ~L182 has `if-no-files-found: ignore` so the absence
+        # is silent. Until the e2e job actually emits coverage (tracked
+        # follow-up), this download must remain soft — otherwise the
+        # coverage-gate hard-fails every run on `Artifact not found`.
+        continue-on-error: true
+        with: { name: coverage-e2e, path: cov/e2e }
+      - name: merge + threshold
+        run: |
+          npm i -g lcov-result-merger @lcov-viewer/cli
+          merged=cov/combined.info
+          files=(cov/unit/*.info)
+          [ -d cov/e2e ] && files+=(cov/e2e/*.info)
+          lcov-result-merger "${files[@]}" "$merged" || cp "${files[0]}" "$merged"
+          pct=$(awk -F: '/^LF:/ {tot+=$2} /^LH:/ {hit+=$2} END {if (tot>0) printf "%.2f", hit/tot*100; else print 0}' "$merged")
+          echo "Combined line coverage: ${pct}%"
+          threshold=${COVERAGE_THRESHOLD:-90}
+          awk -v p="$pct" -v t="$threshold" 'BEGIN { exit (p+0 < t+0) }' || {
+            echo "::error::Coverage ${pct}% below threshold ${threshold}%"
+            exit 1
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-combined
+          path: cov/combined.info
+          retention-days: 7

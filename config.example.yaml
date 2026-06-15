@@ -1,0 +1,115 @@
+# aisix — example configuration
+# Reference: ai-gateway spec §1–§2.
+
+etcd:
+  endpoints:
+    - "http://127.0.0.1:2379"
+  prefix: "/aisix"
+  # user: "aisix"
+  # password_env: "AISIX_ETCD_PASSWORD"
+  dial_timeout_ms: 5000
+  request_timeout_ms: 5000
+  # Optional TLS / mTLS bundle. Required when connecting to an
+  # aisix.cloud DP Manager (endpoint is https:// and the CP issues
+  # a client cert via IssueAIDataplaneCertificate). Uncomment and
+  # point to your mTLS bundle.
+  # tls:
+  #   ca_cert_file:     "/etc/aisix/mtls/ca.crt"
+  #   client_cert_file: "/etc/aisix/mtls/client.crt"
+  #   client_key_file:  "/etc/aisix/mtls/client.key"
+  #   # Optional: override the TLS SNI / cert-subject-alt-name.
+  #   # Defaults to the hostname portion of endpoints[0].
+  #   # domain_name: "etcd.aisix.cloud"
+
+proxy:
+  addr: "0.0.0.0:3000"
+  request_body_limit_bytes: 10485760   # 10 MiB
+  # tls:
+  #   cert_file: "/etc/aisix/tls/proxy.crt"
+  #   key_file:  "/etc/aisix/tls/proxy.key"
+  # Real-client-IP resolution for usage logs (#492). nginx
+  # set_real_ip_from + real_ip_recursive parity. Default trusts nothing
+  # and logs the immediate TCP peer; configure trusted_proxies when the
+  # gateway sits behind an L7 LB / ingress that sets x-forwarded-for.
+  # real_ip:
+  #   trusted_proxies: ["10.0.0.0/8", "127.0.0.1/32"]
+  #   recursive: true
+  #   header: x-forwarded-for
+
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys:
+    # Provide via env to avoid committing secrets.
+    # - "${AISIX_ADMIN_KEY}"
+    - "admin-local-only-change-me"
+  # tls:
+  #   cert_file: "/etc/aisix/tls/admin.crt"
+  #   key_file:  "/etc/aisix/tls/admin.key"
+
+observability:
+  service_name: "aisix"
+  log_level: "info"
+  access_log: true
+  metrics:
+    prometheus:
+      enabled: true
+      path: "/metrics"
+      # Dedicated metrics listener — the only Prometheus scrape surface,
+      # the same in every deployment mode. Point Prometheus at this
+      # address; the endpoint is unauthenticated, so restrict access at
+      # the network layer.
+      addr: "0.0.0.0:9090"
+    otlp:
+      enabled: false
+      endpoint: "http://127.0.0.1:4317"
+  tracing:
+    otlp:
+      enabled: false
+      endpoint: "http://127.0.0.1:4317"
+      sample_ratio: 1.0
+
+# Managed-mode switch. Uncomment when running as an aisix.cloud
+# tenant: the admin API and Playground will NOT be bound — all
+# configuration flows from etcd via the mTLS channel above, driven
+# by the aisix.cloud control plane.
+# managed:
+#   enabled: true
+
+# Cache backend availability. The in-process memory cache is always
+# built; the shared redis cache is built iff `redis` is configured.
+# Which backend serves a request is chosen per matched CachePolicy
+# (its `backend` field, managed via the Admin API / control plane) —
+# a policy asking for redis on a DP without `cache.redis` gets NO
+# caching for its requests (cache_status = disabled), never a silent
+# fallback to node-local memory.
+cache:
+  # Legacy knob — no longer selects a single global cache. Kept for
+  # config compatibility; `backend: "redis"` still requires the
+  # `redis` block below (validated at boot).
+  backend: "memory"   # memory | redis
+  # redis:
+  #   url: "redis://127.0.0.1:6379"
+  #   mode: "single"   # single | cluster | sentinel
+
+# Rate-limit counter backend (api7/AISIX-Cloud#798).
+#
+# `memory` (default) keeps counters in this process, so a cluster of N
+# replicas enforces N× every configured limit. `redis` shares the
+# counters across every replica via one Redis, so the whole cluster
+# enforces ONE global window — set this on multi-replica deployments.
+# May point at the same Redis as `cache` (keys are namespaced
+# `aisix:rl:`). On a Redis outage the limiter fails open to per-replica
+# in-memory counting (logged) so traffic keeps flowing.
+ratelimit:
+  backend: "memory"   # memory | redis
+  # redis:
+  #   url: "redis://127.0.0.1:6379"
+  #   mode: "single"   # single | cluster | sentinel
+  # Seconds before an unreleased concurrency slot (crashed replica /
+  # hung upstream) is reclaimed. Redis backend only.
+  # concurrency_ttl_secs: 300
+
+# Models, API keys, provider keys, guardrails, cache policies, and
+# observability exporters are NOT defined in this file. They are stored
+# in etcd and managed via the Admin API (see docs/api-admin.md). This
+# file only bootstraps the gateway.
