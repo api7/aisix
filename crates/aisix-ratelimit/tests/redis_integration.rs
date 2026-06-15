@@ -158,13 +158,19 @@ async fn concurrency_slot_is_shared_and_released_across_replicas() {
         "concurrency slot must be shared across replicas"
     );
 
-    // A finishes → releases the slot (sync + detached ZREM).
+    // A finishes → releases the slot (sync + detached ZREM). The ZREM is
+    // fire-and-forget, so poll until the slot frees (bounded) rather than
+    // assuming a fixed propagation delay that could flake on slow CI.
     a.release(&key, "a-1");
-    tokio::time::sleep(Duration::from_millis(200)).await; // let the detached ZREM land
-
-    b.acquire(&key, &limits, "b-2")
-        .await
-        .expect("slot frees up cluster-wide after release");
+    let mut acquired = false;
+    for _ in 0..50 {
+        if b.acquire(&key, &limits, "b-2").await.is_ok() {
+            acquired = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(acquired, "slot must free up cluster-wide after release");
 }
 
 #[tokio::test]

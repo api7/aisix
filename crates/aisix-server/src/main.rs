@@ -24,7 +24,7 @@ mod telemetry;
 use aisix_admin::{AdminState, ConfigStore, EtcdConfigStore};
 use aisix_cache::{Cache, MemoryCache, RedisCache};
 use aisix_core::models::Adapter;
-use aisix_core::{CacheBackend, Config, EtcdConfig, EtcdTlsConfig};
+use aisix_core::{CacheBackend, Config, EtcdConfig, EtcdTlsConfig, RateLimitBackend};
 use aisix_etcd::{EtcdConfigProvider, SnapshotCache, Supervisor};
 use aisix_gateway::Hub;
 use aisix_obs::{init_tracing, install_otlp_tracer, Metrics};
@@ -378,11 +378,17 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     let hub = Arc::new(build_hub());
     // Rate-limit backend (#798). Default `memory` keeps per-process
     // counters; `redis` shares them across every replica so a cluster
-    // enforces one global window instead of one-per-replica. Fail fast on
-    // `backend = redis` without a `ratelimit.redis` block (validated in
-    // Config::validate, re-checked here before connecting).
-    let limiter = Arc::new(match cfg.ratelimit.redis.as_ref() {
-        Some(redis_cfg) => {
+    // enforces one global window instead of one-per-replica. The
+    // `ratelimit.backend` field is the selector — a stray `redis` block
+    // under `backend: memory` is ignored (Config::validate already
+    // guarantees a `redis` block when `backend = redis`).
+    let limiter = Arc::new(match cfg.ratelimit.backend {
+        RateLimitBackend::Redis => {
+            let redis_cfg = cfg
+                .ratelimit
+                .redis
+                .as_ref()
+                .expect("validated: ratelimit.redis present when backend = redis");
             tracing::info!(
                 target: "aisix::ratelimit",
                 backend = "redis",
@@ -397,7 +403,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
                 .with_conc_ttl(cfg.ratelimit.concurrency_ttl_secs);
             Limiter::with_store(Arc::new(store))
         }
-        None => Limiter::new(),
+        RateLimitBackend::Memory => Limiter::new(),
     });
     let metrics = Arc::new(Metrics::new(true));
     // Cache backends (#519 B.8). The memory cache is always built

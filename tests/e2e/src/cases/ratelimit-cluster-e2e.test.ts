@@ -142,8 +142,9 @@ describe("rate limit is shared across replicas with backend=redis (#798)", () =>
     await appB?.exit();
     await upstream?.close();
     // The harness cleans the unique prefixes it generated, not our shared
-    // override — drop it ourselves.
-    await new EtcdClient().deletePrefix(prefix);
+    // override — drop it ourselves. Skip when infra was unavailable (the
+    // suite skipped) so teardown doesn't fail on an unreachable etcd.
+    if (infraReady) await new EtcdClient().deletePrefix(prefix);
   });
 
   test("first call on A succeeds, second call on B is 429", async (ctx) => {
@@ -192,7 +193,7 @@ describe("rate limit is NOT shared with backend=memory (per-replica, the #798 bu
     await appA?.exit();
     await appB?.exit();
     await upstream?.close();
-    await new EtcdClient().deletePrefix(prefix);
+    if (etcdReady) await new EtcdClient().deletePrefix(prefix);
   });
 
   test("first call on A and first call on B both succeed", async (ctx) => {

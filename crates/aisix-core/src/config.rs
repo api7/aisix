@@ -701,10 +701,19 @@ impl Config {
                 "observability.metrics.prometheus.addr invalid socket address: {metrics_addr}"
             )));
         }
-        if self.ratelimit.backend == RateLimitBackend::Redis && self.ratelimit.redis.is_none() {
-            return Err(BootstrapError::Config(
-                "ratelimit.backend = redis requires a ratelimit.redis block".into(),
-            ));
+        if self.ratelimit.backend == RateLimitBackend::Redis {
+            if self.ratelimit.redis.is_none() {
+                return Err(BootstrapError::Config(
+                    "ratelimit.backend = redis requires a ratelimit.redis block".into(),
+                ));
+            }
+            // A zero concurrency TTL would prune a slot in the same second
+            // it was taken, silently disabling concurrency limiting.
+            if self.ratelimit.concurrency_ttl_secs == 0 {
+                return Err(BootstrapError::Config(
+                    "ratelimit.concurrency_ttl_secs must be > 0 for the redis backend".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -868,6 +877,28 @@ ratelimit:
         );
         let err = Config::load_from_path(Some(f.path())).unwrap_err();
         assert!(err.to_string().contains("ratelimit.redis"));
+    }
+
+    #[test]
+    fn rejects_zero_concurrency_ttl_for_redis_backend() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+ratelimit:
+  backend: "redis"
+  redis:
+    url: "redis://127.0.0.1:6379"
+  concurrency_ttl_secs: 0
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(err.to_string().contains("concurrency_ttl_secs"));
     }
 
     #[test]
