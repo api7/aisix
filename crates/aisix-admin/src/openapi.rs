@@ -2582,7 +2582,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           }
         },
         "additionalProperties": false,
-        "description": "Standalone Admin API request body for creating or updating a caller API key. Cloud-projected ownership fields are not accepted by the self-hosted Admin API."
+        "description": "Self-hosted Admin API request body for creating or updating a caller API key. Cloud-projected ownership fields are not accepted by this API."
       }
     }
   },
@@ -2860,7 +2860,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openapi_uses_standalone_apikey_request_schema() {
+    async fn openapi_uses_self_hosted_apikey_request_schema() {
         let parsed: serde_json::Value =
             serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
         for (path, method) in [
@@ -2871,7 +2871,7 @@ mod tests {
                 parsed["paths"][path][method]["requestBody"]["content"]["application/json"]
                     ["schema"]["$ref"],
                 "#/components/schemas/ApiKeyRequest",
-                "{method} {path} should document the standalone Admin API request body"
+                "{method} {path} should document the self-hosted Admin API request body"
             );
         }
 
