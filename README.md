@@ -141,7 +141,7 @@ Same gateway binary, same proxy API. **AISIX Cloud** adds the managed control pl
 | Provider keys | Stored in etcd (mTLS channel) | Envelope-encrypted at rest |
 | API keys | Hashed, shown once, rotation | Hashed + masked reveal, rotation, PATs |
 | Budgets | Per-key rate limits; budgets are Cloud-only | Per key / provider / env / org, hard-stop & alerts |
-| RBAC | Admin key = full access | Org roles (owner / admin / developer / viewer), invites |
+| RBAC | Admin key = full access | Org roles (owner / admin / member), invites |
 | Audit log | — | Full org-scoped audit with diff viewer |
 | Billing & metering | — | Plans, usage metering, Stripe portal |
 | Surface | OpenAPI + playground | Full dashboard + per-environment playground |
