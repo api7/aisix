@@ -38,13 +38,14 @@ The current root config includes:
 - `admin`
 - `observability`
 - `cache`
+- `ratelimit`
 - `managed`
 - optional top-level `bedrock_endpoint_url`
 
 As a practical split:
 
 - `etcd`, `proxy`, and `admin` define how the process starts
-- `observability` and `cache` define process-wide runtime helpers
+- `observability`, `cache`, and `ratelimit` define process-wide runtime helpers
 - `managed` switches the bootstrap mode from standalone to control-plane-managed
 
 ## Minimal Self-Hosted Example
@@ -81,6 +82,9 @@ observability:
       addr: "0.0.0.0:9090"
 
 cache:
+  backend: "memory"
+
+ratelimit:
   backend: "memory"
 ```
 
@@ -208,6 +212,40 @@ Important fields:
 A cache policy that requests `backend: redis` on a process without `cache.redis` gets no caching for its requests (`cache_status = disabled`, one warning per policy in the gateway log) — never a silent fallback to memory.
 
 Use bootstrap cache settings to decide which cache backends the process has available. Use dynamic cache policies to decide which requests actually participate in caching, and on which backend.
+
+## `ratelimit`
+
+Use `ratelimit` to choose where rate-limit counters live. This is the difference between each replica counting on its own and the whole cluster sharing one counter.
+
+The `memory` backend (the default) keeps counters in the process. With a single replica this is exact, but with **N replicas behind a load balancer every limit is effectively multiplied by N** — each replica only counts the traffic it personally served, so a key capped at `rpm: 60` can pass up to `60 × N` per minute. The `redis` backend shares the counters across every replica through one Redis, so the cluster enforces **one global window** regardless of replica count. All dimensions are shared — requests, tokens, and concurrency.
+
+Important fields:
+
+| Field | Description | Default |
+| --- | --- | --- |
+| `backend` | `memory` (per-process) or `redis` (shared across replicas). The selector — a `redis` block under `backend: memory` is ignored | `memory` |
+| `redis` | Redis connection block (`url`, optional `mode`); **required** when `backend: redis`, rejected at boot otherwise | none |
+| `concurrency_ttl_secs` | Redis backend only — seconds before an unreleased concurrency slot (crashed replica / hung upstream) is reclaimed. Must be `> 0` | `300` |
+
+```yaml title="Shared rate limiting for a multi-replica cluster"
+ratelimit:
+  backend: "redis"
+  redis:
+    url: "redis://127.0.0.1:6379"
+    mode: "single"   # single | cluster | sentinel
+  concurrency_ttl_secs: 300
+```
+
+Or via environment overrides on a containerized deployment:
+
+```bash
+export AISIX_RATELIMIT__BACKEND="redis"
+export AISIX_RATELIMIT__REDIS__URL="redis://my-redis:6379"
+```
+
+The rate-limit Redis may be the same instance used by `cache.redis` — counter keys are namespaced `aisix:rl:` and hash-tagged per bucket so they never collide with cache entries. If Redis becomes unreachable the limiter **fails open** to per-replica in-memory counting (logged once) so traffic keeps flowing; cluster-wide enforcement resumes automatically when Redis recovers.
+
+The *limits themselves* (`ApiKey.rate_limit`, `Model.rate_limit`, `RateLimitPolicy` rows) are unchanged dynamic resources — this section only changes where their counters are stored. See [Rate Limits](rate-limits.md) for the limit fields and policy scopes.
 
 ## `managed`
 
