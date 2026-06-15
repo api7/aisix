@@ -214,6 +214,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "415": {
             "description": "Missing or unsupported JSON content type",
             "content": {
@@ -357,6 +367,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -568,6 +588,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "415": {
             "description": "Missing or unsupported JSON content type",
             "content": {
@@ -711,6 +741,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -938,6 +978,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "415": {
             "description": "Missing or unsupported JSON content type",
             "content": {
@@ -1081,6 +1131,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1250,6 +1310,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "415": {
             "description": "Missing or unsupported JSON content type",
             "content": {
@@ -1393,6 +1463,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1562,6 +1642,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "415": {
             "description": "Missing or unsupported JSON content type",
             "content": {
@@ -1705,6 +1795,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1874,6 +1974,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
           "415": {
             "description": "Missing or unsupported JSON content type",
             "content": {
@@ -2017,6 +2127,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON request body exceeds the admin body-size limit",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -2997,6 +3117,33 @@ mod tests {
             assert!(
                 responses[status]["content"]["application/json"]["schema"].is_object(),
                 "playground should document forwarded proxy response {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn openapi_documents_admin_json_body_limit_rejections() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+
+        for (path, method) in [
+            ("/admin/v1/models", "post"),
+            ("/admin/v1/models/{id}", "put"),
+            ("/admin/v1/apikeys", "post"),
+            ("/admin/v1/apikeys/{id}", "put"),
+            ("/admin/v1/provider_keys", "post"),
+            ("/admin/v1/provider_keys/{id}", "put"),
+            ("/admin/v1/guardrails", "post"),
+            ("/admin/v1/guardrails/{id}", "put"),
+            ("/admin/v1/cache_policies", "post"),
+            ("/admin/v1/cache_policies/{id}", "put"),
+            ("/admin/v1/observability_exporters", "post"),
+            ("/admin/v1/observability_exporters/{id}", "put"),
+        ] {
+            let response = &parsed["paths"][path][method]["responses"]["413"];
+            assert_eq!(
+                response["content"]["text/plain"]["schema"]["type"], "string",
+                "{method} {path} should document admin JSON body-limit rejections"
             );
         }
     }
