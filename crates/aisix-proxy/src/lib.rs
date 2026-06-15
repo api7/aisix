@@ -36,6 +36,7 @@ pub(crate) mod cooldown;
 mod count_tokens;
 mod dispatch;
 mod embeddings;
+mod ensemble;
 mod error;
 mod error_translate;
 pub mod health;
@@ -5554,5 +5555,471 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
         assert_eq!(v["choices"][0]["message"]["content"], "Hello from Cohere!");
         assert_eq!(v["usage"]["total_tokens"], 7);
+    }
+
+    // ---------------------------------------------------------------
+    // Ensemble dispatch glue (feat/ensemble-model).
+    //
+    // The pure fan-out / synthesis logic is covered by the unit tests
+    // in `ensemble.rs` with a mock caller. This e2e test exercises the
+    // chat.rs wiring end-to-end through the real HTTP handler +
+    // ProxyModelCaller + bridge: an ensemble model fans out to two
+    // panel members and a judge over real (wiremock) upstreams, and the
+    // client receives the judge's synthesized answer rendered under the
+    // requested ensemble model name.
+    // ---------------------------------------------------------------
+
+    /// A direct OpenAI model with a caller-chosen id + upstream model
+    /// name, sharing the single test ProviderKey. Distinct `model_name`
+    /// values let the wiremock body-matchers tell panel calls from the
+    /// judge call apart.
+    fn direct_model_entry(id: &str, name: &str, upstream_model: &str) -> ResourceEntry<Model> {
+        let cfg = format!(
+            r#"{{
+                "display_name": "{name}",
+                "provider": "openai",
+                "model_name": "{upstream_model}",
+                "provider_key_id": "{PK_ID}"
+            }}"#
+        );
+        let model: Model = serde_json::from_str(&cfg).unwrap();
+        ResourceEntry::new(id, model, 1)
+    }
+
+    /// An ensemble model referencing `panel` display names + a `judge`
+    /// display name. Carries no provider/model_name of its own.
+    fn ensemble_model_entry(
+        id: &str,
+        name: &str,
+        panel: &[&str],
+        judge: &str,
+    ) -> ResourceEntry<Model> {
+        let panel_json = panel
+            .iter()
+            .map(|m| format!(r#"{{"model":"{m}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let cfg = format!(
+            r#"{{
+                "display_name": "{name}",
+                "ensemble": {{
+                    "panel": [{panel_json}],
+                    "judge": {{"model": "{judge}"}}
+                }}
+            }}"#
+        );
+        let model: Model = serde_json::from_str(&cfg).unwrap();
+        ResourceEntry::new(id, model, 1)
+    }
+
+    #[tokio::test]
+    async fn ensemble_fans_out_to_panel_and_returns_judge_synthesis() {
+        let upstream = MockServer::start().await;
+        // Judge synthesis call — its prompt embeds the neutrally-labeled
+        // candidate answers ("Answer 1:"). Highest priority so it wins
+        // over the catch-all panel mock for the judge request only.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("Answer 1:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-judge",
+                "model": "judge-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "synthesized final answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 30, "completion_tokens": 7, "total_tokens": 37}
+            })))
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        // Panel members — catch-all for any chat call that isn't the judge.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-panel",
+                "model": "panel-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "a panel candidate answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 11, "total_tokens": 16}
+            })))
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+
+        let snap = new_snap(&upstream.uri());
+        snap.models
+            .insert(direct_model_entry("m-panel-a", "panel-a", "panel-upstream"));
+        snap.models
+            .insert(direct_model_entry("m-panel-b", "panel-b", "panel-upstream"));
+        snap.models
+            .insert(direct_model_entry("m-judge", "judge-m", "judge-upstream"));
+        snap.models.insert(ensemble_model_entry(
+            "m-council",
+            "council",
+            &["panel-a", "panel-b"],
+            "judge-m",
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "council",
+            "messages": [{"role": "user", "content": "what is the best answer?"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+        // The client sees the JUDGE's synthesized answer, not a panel one.
+        assert_eq!(v["object"], "chat.completion");
+        assert_eq!(
+            v["choices"][0]["message"]["content"],
+            "synthesized final answer"
+        );
+        // Rendered under the requested ensemble model name — never the
+        // judge's upstream model id (no provider/model leakage).
+        assert_eq!(v["model"], "council");
+        // Client-facing usage is the judge call's own (the executor's
+        // `EnsembleOutcome.response` carries the judge usage).
+        assert_eq!(v["usage"]["total_tokens"], 37);
+    }
+
+    /// Tool-using requests can't be fanned out coherently across a panel,
+    /// so the ensemble path rejects them with a 400 before any upstream
+    /// call. `tools` is a flattened key in the request body.
+    #[tokio::test]
+    async fn ensemble_rejects_tool_requests_with_400() {
+        let upstream = MockServer::start().await;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+
+        let snap = new_snap(&upstream.uri());
+        snap.models
+            .insert(direct_model_entry("m-panel-a", "panel-a", "panel-upstream"));
+        snap.models
+            .insert(direct_model_entry("m-judge", "judge-m", "judge-upstream"));
+        snap.models.insert(ensemble_model_entry(
+            "m-council",
+            "council",
+            &["panel-a"],
+            "judge-m",
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "council",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {"name": "get_weather", "parameters": {}}
+            }]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    /// Streaming is not supported for ensemble models yet (separate PR);
+    /// the request must be rejected with a 400, not silently downgraded.
+    #[tokio::test]
+    async fn ensemble_rejects_streaming_with_400() {
+        let upstream = MockServer::start().await;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+
+        let snap = new_snap(&upstream.uri());
+        snap.models
+            .insert(direct_model_entry("m-panel-a", "panel-a", "panel-upstream"));
+        snap.models
+            .insert(direct_model_entry("m-judge", "judge-m", "judge-upstream"));
+        snap.models.insert(ensemble_model_entry(
+            "m-council",
+            "council",
+            &["panel-a"],
+            "judge-m",
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "council",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+    }
+
+    /// Like `ensemble_model_entry` but with an explicit `min_responses`.
+    fn ensemble_model_entry_min(
+        id: &str,
+        name: &str,
+        panel: &[&str],
+        judge: &str,
+        min_responses: u32,
+    ) -> ResourceEntry<Model> {
+        let panel_json = panel
+            .iter()
+            .map(|m| format!(r#"{{"model":"{m}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let cfg = format!(
+            r#"{{
+                "display_name": "{name}",
+                "ensemble": {{
+                    "panel": [{panel_json}],
+                    "judge": {{"model": "{judge}"}},
+                    "min_responses": {min_responses}
+                }}
+            }}"#
+        );
+        let model: Model = serde_json::from_str(&cfg).unwrap();
+        ResourceEntry::new(id, model, 1)
+    }
+
+    /// Output-guardrail block path — the case FIX 1 (billing) targets. The
+    /// judge's synthesized answer trips an output keyword guardrail. The
+    /// client must get the content-filtered status, AND every per-sub-call
+    /// usage event (panel members + judge) must still fire with
+    /// `guardrail_blocked == true` — the panel tokens are already committed,
+    /// so dropping these events would under-report panel usage to cp-api.
+    #[tokio::test]
+    async fn ensemble_output_block_still_emits_panel_and_judge_usage() {
+        use aisix_obs::UsageSink;
+        let upstream = MockServer::start().await;
+        // Judge synthesis call returns content that the output guardrail
+        // blocks ("secret-string"). Highest priority for the judge request.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("Answer 1:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-judge",
+                "model": "judge-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "here is the secret-string"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 30, "completion_tokens": 7, "total_tokens": 37}
+            })))
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        // Panel members — catch-all, benign content.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-panel",
+                "model": "panel-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "a panel candidate answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 11, "total_tokens": 16}
+            })))
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+
+        let snap = new_snap(&upstream.uri());
+        snap.models
+            .insert(direct_model_entry("m-panel-a", "panel-a", "panel-upstream"));
+        snap.models
+            .insert(direct_model_entry("m-panel-b", "panel-b", "panel-upstream"));
+        snap.models
+            .insert(direct_model_entry("m-judge", "judge-m", "judge-upstream"));
+        snap.models.insert(ensemble_model_entry(
+            "m-council",
+            "council",
+            &["panel-a", "panel-b"],
+            "judge-m",
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
+        // Output keyword guardrail blocking the judge's synthesized answer.
+        seed_guardrail(
+            &state.snapshot,
+            "g-ensemble-out",
+            r#"{"name":"ens-out-guard","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"secret-string"}]}"#,
+        );
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "council",
+            "messages": [{"role": "user", "content": "what is the answer?"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        // Content-filtered status reaches the client (ProxyError::ContentFiltered).
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(v["error"]["type"], "content_filter");
+
+        // Drain the usage sink: the two panel members + the judge must all
+        // have emitted, each flagged guardrail_blocked (FIX 1 — the panel
+        // bill is not lost on a block).
+        let mut events = Vec::new();
+        while let Ok(Some(ev)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+        {
+            events.push(ev);
+            if events.len() == 3 {
+                break;
+            }
+        }
+        assert_eq!(
+            events.len(),
+            3,
+            "expected 3 usage events (2 panel + judge) on the block path; got {}",
+            events.len()
+        );
+        let panel_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.attempt_kind == "panel")
+            .collect();
+        let judge_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.attempt_kind == "judge")
+            .collect();
+        assert_eq!(panel_events.len(), 2, "both panel members must emit");
+        assert_eq!(judge_events.len(), 1, "the judge must emit");
+        assert!(
+            events.iter().all(|e| e.guardrail_blocked),
+            "every sub-call event on the block path must be guardrail_blocked"
+        );
+        // Panel token counts survive (the bug under-reported these).
+        assert!(
+            panel_events
+                .iter()
+                .all(|e| e.prompt_tokens == 5 && e.completion_tokens == 11),
+            "panel usage must carry the panel call's own tokens"
+        );
+        assert_eq!(judge_events[0].prompt_tokens, 30);
+        assert_eq!(judge_events[0].completion_tokens, 7);
+    }
+
+    /// A panel that can't reach `min_responses` (one member 503s, min=2 on a
+    /// 2-member panel) surfaces as a 502 to the client — the executor's
+    /// `InsufficientPanel` maps to an upstream-fault status.
+    #[tokio::test]
+    async fn ensemble_insufficient_panel_returns_502() {
+        let upstream = MockServer::start().await;
+        // The failing panel member (distinct upstream model name) → 503.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains(
+                "panel-fail-upstream",
+            ))
+            .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+                "error": {"message": "upstream busy", "type": "server_error"}
+            })))
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        // Everything else (the surviving panel member) → 200. The judge is
+        // never reached because min_responses isn't met.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-panel",
+                "model": "panel-ok-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "only survivor"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 11, "total_tokens": 16}
+            })))
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(direct_model_entry(
+            "m-panel-ok",
+            "panel-ok",
+            "panel-ok-upstream",
+        ));
+        snap.models.insert(direct_model_entry(
+            "m-panel-fail",
+            "panel-fail",
+            "panel-fail-upstream",
+        ));
+        snap.models
+            .insert(direct_model_entry("m-judge", "judge-m", "judge-upstream"));
+        snap.models.insert(ensemble_model_entry_min(
+            "m-council",
+            "council",
+            &["panel-ok", "panel-fail"],
+            "judge-m",
+            2,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "council",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 }

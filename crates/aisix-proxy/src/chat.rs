@@ -819,7 +819,12 @@ async fn dispatch(
     // proper 503 rather than burying it inside a generic Bridge error.
     // Routing requests rely on the loop's `is_retryable` path so a
     // single bad provider doesn't take down the whole request.
-    if attempt_models.len() == 1 {
+    //
+    // Skip an ensemble entry: it intentionally carries no
+    // provider/provider_key_id (those live on its panel/judge members),
+    // so `require_provider` would 400 here. Its members are resolved
+    // and dispatched in `dispatch_ensemble`, branched below.
+    if attempt_models.len() == 1 && !virtual_entry.value.is_ensemble() {
         let only = &attempt_models[0].model;
         let _provider = crate::dispatch::require_provider(only).map_err(with_model)?;
         // Pre-flight the PK-based two-tier dispatch so a missing
@@ -842,6 +847,32 @@ async fn dispatch(
         crate::quota::enforce_rate_limit(state, auth, Some(&model_rl)).map_err(&with_model)?;
 
     let now = created_ts();
+
+    // Ensemble path: fan the request out to the panel + judge instead of
+    // dispatching a single upstream. Branches here — after the single
+    // entry-level rate-limit reservation, before the streaming/failover
+    // machinery — because an ensemble entry has no provider/provider_key_id
+    // and no `routing.targets`, so the attempt loop below does not apply to
+    // it. `dispatch_ensemble` owns the fan-out, judge synthesis, output
+    // guardrail, token commit, and per-sub-call telemetry.
+    if virtual_entry.value.is_ensemble() {
+        return dispatch_ensemble(
+            state,
+            &snapshot,
+            &virtual_entry,
+            req,
+            request_id,
+            now,
+            reservation,
+            &resolved_chain,
+            &applied_guardrails,
+            bypass_reason,
+            &model_id,
+            &auth.entry.id,
+            client,
+        )
+        .await;
+    }
 
     // Streaming path (#554): walk the target list with first-chunk
     // fallback. For each target we connect, then peek the first stream
@@ -1811,6 +1842,289 @@ async fn dispatch(
         served_by_target,
         routing,
         captured_content,
+    })
+}
+
+/// Orchestrate one ensemble request: fan out to the panel + judge via
+/// [`crate::ensemble::run_ensemble`], run the output guardrail on the
+/// synthesized answer, commit the aggregate token usage against the
+/// single entry-level reservation, and emit one usage event per
+/// sub-call (each panel member + the judge), all sharing `request_id`.
+///
+/// Lives here (not in `ensemble.rs`) so it can use the chat.rs-private
+/// `Success` / `DispatchFailure` types, `emit_usage_event`, and
+/// `UsageExtras`. The pure fan-out / min-responses / judge-synthesis
+/// logic stays in `ensemble.rs`; this is only the dispatch glue.
+///
+/// `created_ts` is the shared `created` unix timestamp for the rendered
+/// response. `reservation` is the SINGLE entry-level reservation taken
+/// in `dispatch` — ensemble does not add per-sub-call reservations.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_ensemble<'a>(
+    state: &'a ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    virtual_entry: &aisix_core::ResourceEntry<aisix_core::Model>,
+    req: &ChatFormat,
+    request_id: &str,
+    created_ts: i64,
+    reservation: aisix_ratelimit::MultiReservation<'a, aisix_ratelimit::SystemClock>,
+    resolved_chain: &Arc<dyn aisix_guardrails::Guardrail>,
+    applied_guardrails: &[AppliedGuardrail],
+    mut bypass_reason: Option<String>,
+    model_id: &str,
+    api_key_id: &str,
+    client: &ClientContext,
+) -> Result<Success, DispatchFailure> {
+    let started = Instant::now();
+    let with_model = |e: ProxyError| DispatchFailure::new(Some(model_id.to_string()), None, e);
+
+    // The ensemble executor needs every panel member's full answer to
+    // synthesize, so a tool-using request can't be fanned out coherently
+    // (panel members might emit tool calls the judge can't reconcile).
+    // `tools` / `tool_choice` are flattened keys in `ChatFormat.extra`,
+    // not struct fields. Reject up front with a 400.
+    if req.extra.contains_key("tools") || req.extra.contains_key("tool_choice") {
+        return Err(with_model(ProxyError::InvalidRequest(
+            "ensemble models do not support tools".into(),
+        )));
+    }
+    // TODO(PR3): ensemble streaming. There is no single-ChatResponse→SSE
+    // helper today, and streaming the judge's synthesized answer is a
+    // separate piece of work; reject streaming requests for now.
+    if req.is_streaming() {
+        return Err(with_model(ProxyError::InvalidRequest(
+            "streaming is not supported for ensemble models".into(),
+        )));
+    }
+
+    // `is_ensemble()` is the branch guard, so `ensemble` is always Some
+    // here; surface a 400 rather than panic if a future refactor breaks
+    // that invariant.
+    let ensemble_cfg = virtual_entry.value.ensemble.as_ref().ok_or_else(|| {
+        with_model(ProxyError::InvalidRequest(
+            "model is not an ensemble".into(),
+        ))
+    })?;
+
+    let caller = crate::ensemble::ProxyModelCaller {
+        state,
+        snapshot,
+        request_id,
+    };
+    let outcome = match crate::ensemble::run_ensemble(req, ensemble_cfg, &caller).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            // Map the executor error to a dispatch failure, preserving the
+            // executor's HTTP-status intent (`EnsembleError::http_status`
+            // is the single source of truth):
+            //  - Judge(be): carry the bridge error itself so its full
+            //    envelope + status mapping survives (judge 4xx stays 4xx,
+            //    upstream 5xx → 502), richer than a bare status code.
+            //  - InsufficientPanel: the panel fan-out is exhausted — an
+            //    upstream-side fault — surfaced at the executor's canonical
+            //    status (502).
+            let status = err.http_status();
+            let proxy_err = match err {
+                crate::ensemble::EnsembleError::Judge(be) => ProxyError::Bridge(be),
+                crate::ensemble::EnsembleError::InsufficientPanel { .. } => {
+                    ProxyError::Bridge(BridgeError::upstream_status(
+                        status,
+                        "ensemble panel did not reach the required number of responses",
+                    ))
+                }
+            };
+            return Err(with_model(proxy_err));
+        }
+    };
+
+    // Aggregate client-facing usage: every billed sub-call (panel members
+    // + judge) counts against quota, since each one already hit an
+    // upstream. Commit once against the single entry-level reservation.
+    let panel_total: u64 = outcome
+        .panel
+        .iter()
+        .map(|p| u64::from(p.usage.total_tokens))
+        .sum();
+    let judge_usage = outcome.response.usage.clone();
+    let total_tokens = panel_total + u64::from(judge_usage.total_tokens);
+    reservation.commit_tokens(total_tokens);
+
+    // Emit one usage event per sub-call (each panel member + the judge),
+    // all sharing `request_id`. Each event re-resolves its target by
+    // display_name to recover the sub-call's `model_id` + `provider_key_id`;
+    // a sub-call whose target was deleted between dispatch and emit lands
+    // with those fields empty (cp-api stores NULL). `attempt_kind` is the
+    // new `"panel"` / `"judge"` value; `attempt_index` is 0..N for the
+    // panel and N for the judge.
+    //
+    // This MUST run before the output-guardrail check on BOTH paths
+    // (allow and block): the panel + judge tokens are already committed
+    // above, so skipping these events on a block would under-report panel
+    // usage to cp-api. The `emit_subcalls` closure is therefore defined
+    // here and invoked from each branch of the guardrail match below —
+    // never from the post-match continuation alone.
+    let elapsed = started.elapsed();
+    let resolve_sub = |display_name: &str| -> (String, String) {
+        match snapshot.models.get_by_name(display_name) {
+            Some(entry) => (
+                entry.id.clone(),
+                entry.value.provider_key_id.clone().unwrap_or_default(),
+            ),
+            None => (String::new(), String::new()),
+        }
+    };
+    // `bypass` is passed per call (not captured) so the closure holds no
+    // borrow of the mutable `bypass_reason`, and so a block can carry the
+    // input-only bypass while the allow/bypass continuation carries the
+    // final (possibly output-bypass) value. `blocked` sets each event's
+    // `guardrail_blocked` flag.
+    let emit_subcalls = |blocked: bool, bypass: &str| {
+        for (index, member) in outcome.panel.iter().enumerate() {
+            let (sub_model_id, sub_provider_key_id) = resolve_sub(&member.model);
+            emit_usage_event(
+                state,
+                request_id,
+                &sub_model_id,
+                &req.model,
+                api_key_id,
+                200,
+                elapsed,
+                member.usage.prompt_tokens,
+                member.usage.completion_tokens,
+                UsageExtras {
+                    cached_prompt_tokens: member.usage.cached_prompt_tokens,
+                    reasoning_tokens: member.usage.reasoning_tokens,
+                    cache_creation_tokens: member.usage.cache_creation_tokens,
+                    cache_read_tokens: member.usage.cache_read_tokens,
+                    bypass_reason: bypass.to_string(),
+                    cache_status: CacheStatus::Disabled.as_str().to_string(),
+                    attempt_index: index as u32,
+                    attempt_kind: "panel".to_string(),
+                    attempt_model: member.model.clone(),
+                    applied_guardrails: applied_guardrails.to_vec(),
+                    provider_key_id: sub_provider_key_id,
+                    ..UsageExtras::default()
+                },
+                /* cost_usd */ 0.0,
+                blocked,
+                client,
+                /* content */ None,
+            );
+        }
+        let (judge_model_id, judge_provider_key_id) = resolve_sub(&outcome.judge_model);
+        emit_usage_event(
+            state,
+            request_id,
+            &judge_model_id,
+            &req.model,
+            api_key_id,
+            200,
+            elapsed,
+            judge_usage.prompt_tokens,
+            judge_usage.completion_tokens,
+            UsageExtras {
+                cached_prompt_tokens: judge_usage.cached_prompt_tokens,
+                reasoning_tokens: judge_usage.reasoning_tokens,
+                cache_creation_tokens: judge_usage.cache_creation_tokens,
+                cache_read_tokens: judge_usage.cache_read_tokens,
+                provider_request_id: outcome.response.id.clone(),
+                provider_model_version: outcome.response.model.clone(),
+                finish_reason: finish_reason_label(&outcome.response.finish_reason),
+                bypass_reason: bypass.to_string(),
+                cache_status: CacheStatus::Disabled.as_str().to_string(),
+                attempt_index: outcome.panel.len() as u32,
+                attempt_kind: "judge".to_string(),
+                attempt_model: outcome.judge_model.clone(),
+                applied_guardrails: applied_guardrails.to_vec(),
+                provider_key_id: judge_provider_key_id,
+                ..UsageExtras::default()
+            },
+            /* cost_usd */ 0.0,
+            blocked,
+            client,
+            /* content */ None,
+        );
+    };
+
+    // Output guardrail on the synthesized answer — same contract as the
+    // non-streaming path. The tokens are already committed above and the
+    // per-sub-call usage events fire inside each branch (so a block still
+    // bills the full panel + judge): on a block we therefore pass
+    // `charge: None` rather than a judge-only `UpstreamCharge`, which
+    // would double-count the judge AND still miss the panel.
+    match resolved_chain.check_output(&outcome.response).await {
+        GuardrailVerdict::Allow => {}
+        GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+        } => {
+            tracing::warn!(
+                guardrail_hook = "output",
+                model = %req.model,
+                reason = %reason,
+                "guardrail blocked ensemble response"
+            );
+            // Block is not a bypass, so the output guardrail did not mutate
+            // `bypass_reason`; carry the input-only bypass (if any).
+            emit_subcalls(true, &bypass_reason.clone().unwrap_or_default());
+            return Err(DispatchFailure::new(
+                Some(model_id.to_string()),
+                None,
+                ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                    "response",
+                    guardrail_name.as_deref(),
+                )),
+            ));
+        }
+        GuardrailVerdict::Bypass { reason } => {
+            // First bypass wins — keep an earlier input bypass if present.
+            if bypass_reason.is_none() {
+                bypass_reason = Some(reason);
+            }
+        }
+    }
+    // Allow / Bypass continuation: emit the (non-blocked) sub-call events
+    // with the final bypass value (which an output bypass above may have
+    // set).
+    emit_subcalls(false, &bypass_reason.clone().unwrap_or_default());
+
+    // The synthesized answer is the client-facing response, rendered with
+    // the requested (ensemble) model name. `telemetry_handled_by_stream`
+    // is reused as the "telemetry already emitted, do not double-emit"
+    // flag — `chat_completions` skips its own `emit_usage_event` when it
+    // is set, exactly as it does for the streaming path.
+    let response = Json(render_response(created_ts, outcome.response, &req.model)).into_response();
+    Ok(Success {
+        response,
+        // No single provider/model/key governs an ensemble response.
+        provider: "ensemble".to_string(),
+        model_id: model_id.to_string(),
+        // Per-sub-call usage was emitted above; the entry-level telemetry
+        // event is suppressed, so these top-level token fields are unused.
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
+        cached_prompt_tokens: 0,
+        reasoning_tokens: 0,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+        provider_request_id: String::new(),
+        provider_model_version: String::new(),
+        provider_key_id: String::new(),
+        upstream_model: String::new(),
+        finish_reason: String::new(),
+        cost_usd: 0.0,
+        bypass_reason,
+        cache_status: CacheStatus::Disabled,
+        cache_hit_saved_input_tokens: 0,
+        cache_hit_saved_output_tokens: 0,
+        // Telemetry already emitted per-sub-call above; suppress the
+        // handler's own entry-level emission.
+        telemetry_handled_by_stream: true,
+        // Not a routing request — no `x-aisix-served-by` header.
+        served_by_target: None,
+        routing: RoutingTelemetry::default(),
+        captured_content: None,
     })
 }
 

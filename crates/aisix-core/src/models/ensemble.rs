@@ -84,9 +84,9 @@ pub struct EnsembleConfig {
     /// A value larger than the panel is clamped to the panel size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_responses: Option<u32>,
-    /// End-to-end budget in ms for the whole panel fan-out. `0` or absent
-    /// = no ensemble-level deadline. Each panel member is still bound by
-    /// its own model `timeout`.
+    /// Per-call upstream deadline applied to each panel member and the
+    /// judge call (in addition to each member model's own `timeout`). `0`
+    /// or absent = no ensemble-level per-call deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
 }
@@ -103,9 +103,10 @@ impl EnsembleConfig {
             .max(1)
     }
 
-    /// End-to-end fan-out deadline. Folds the `0`/absent sentinel into
-    /// `None` like [`Model::request_timeout`](super::Model::request_timeout)
-    /// so callers can apply it unconditionally.
+    /// Per-call upstream deadline applied to each panel member and the
+    /// judge call. Folds the `0`/absent sentinel into `None` like
+    /// [`Model::request_timeout`](super::Model::request_timeout) so callers
+    /// can apply it unconditionally.
     pub fn timeout(&self) -> Option<std::time::Duration> {
         self.timeout_ms
             .filter(|&ms| ms > 0)
