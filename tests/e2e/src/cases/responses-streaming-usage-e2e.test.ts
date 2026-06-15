@@ -109,20 +109,35 @@ async function startOtlpReceiver(): Promise<OtlpReceiver> {
   };
 }
 
-async function waitForSpan(
+/**
+ * Collect every usage span emitted for `requestId`. Waits for the first to
+ * arrive, then settles briefly so a (buggy) duplicate emit has time to show
+ * up — the caller asserts cardinality, which is the point: the fix must emit
+ * exactly one usage event per streamed request (the `usage_handled_by_stream`
+ * guard prevents the handler from double-emitting alongside the Drop guard).
+ */
+async function collectUsageSpans(
   recv: OtlpReceiver,
   requestId: string,
   timeoutMs = 10_000,
-): Promise<Record<string, string>> {
+): Promise<Array<Record<string, string>>> {
+  const matches = () =>
+    recv.spanAttrs.filter(
+      (a) =>
+        a["aisix.request_id"] === requestId &&
+        a["gen_ai.usage.input_tokens"] !== undefined,
+    );
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const hit = recv.spanAttrs.find(
-      (a) => a["aisix.request_id"] === requestId,
-    );
-    if (hit) return hit;
+    if (matches().length > 0) break;
     await new Promise((r) => setTimeout(r, 50));
   }
-  throw new Error(`no usage span for request_id=${requestId}`);
+  if (matches().length === 0) {
+    throw new Error(`no usage span for request_id=${requestId}`);
+  }
+  // Settle: catch a duplicate emitted shortly after the first.
+  await new Promise((r) => setTimeout(r, 300));
+  return matches();
 }
 
 describe("responses streaming usage emission (#808)", () => {
@@ -231,8 +246,11 @@ describe("responses streaming usage emission (#808)", () => {
     expect(lastReq?.path).toBe("/v1/responses");
     expect((JSON.parse(lastReq!.body) as { stream?: unknown }).stream).toBe(true);
 
-    // The emitted UsageEvent carries the terminal-event token counts.
-    const span = await waitForSpan(otlp, requestId!);
+    // Exactly one UsageEvent for the streamed request (not zero, not a
+    // double-emit), carrying the terminal-event token counts.
+    const spans = await collectUsageSpans(otlp, requestId!);
+    expect(spans).toHaveLength(1);
+    const [span] = spans;
     expect(span["gen_ai.usage.input_tokens"]).toBe(String(INPUT_TOKENS));
     expect(span["gen_ai.usage.output_tokens"]).toBe(String(OUTPUT_TOKENS));
     expect(span["http.response.status_code"]).toBe("200");
