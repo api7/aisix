@@ -36,9 +36,9 @@ use serde_json::Value;
 const OPENAPI_JSON_BASE: &str = r##"{
   "openapi": "3.1.0",
   "info": {
-    "title": "aisix admin API",
+    "title": "AISIX Admin API",
     "version": "0.1.0",
-    "description": "Admin surface for the standalone aisix gateway. All `/admin/v1/*` routes require Bearer admin-key auth (configured via `admin.admin_keys`). Errors use {\"error_msg\": \"...\"}.\n\nIn managed mode (aisix.cloud tenant) the admin listener is not bound — the dashboard owns CRUD via the AISIX-Cloud control plane."
+    "description": "Admin surface for the self-hosted AISIX gateway. All `/admin/v1/*` routes require Bearer admin-key auth configured with `admin.admin_keys`. Errors use {\"error_msg\": \"...\"}.\n\nIn managed mode, the admin listener is not bound. The AISIX Cloud control plane manages configuration resources."
   },
   "paths": {
     "/livez": {
@@ -50,7 +50,9 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "name": "verbose",
             "in": "query",
             "required": false,
-            "schema": {"type": "string"},
+            "schema": {
+              "type": "string"
+            },
             "description": "When present, returns a multi-line text report instead of the terse `ok` body."
           }
         ],
@@ -82,14 +84,37 @@ const OPENAPI_JSON_BASE: &str = r##"{
       "get": {
         "summary": "this OpenAPI document",
         "security": [],
-        "responses": {"200": {"description": "OK"}}
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/admin/openapi-scalar": {
       "get": {
         "summary": "Scalar UI (HTML) for browsing this spec",
         "security": [],
-        "responses": {"200": {"description": "OK"}}
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/admin/v1/models": {
@@ -98,29 +123,281 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "responses": {
           "200": {
             "description": "OK",
-            "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/ModelEntry"}}}}
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ModelEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
           }
         }
       },
       "post": {
         "summary": "create model",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Model"}}}},
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Model"
+              }
+            }
+          }
+        },
         "responses": {
-          "200": {"description": "OK", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ModelEntry"}}}},
-          "400": {"description": "schema validation failed"},
-          "409": {"description": "duplicate display_name"}
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate display_name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
         }
       }
     },
     "/admin/v1/models/{id}": {
-      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-      "get":    { "summary": "get model",    "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} },
-      "put":    {
-        "summary": "update model",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Model"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "404": {"description": "not found"}, "409": {"description": "duplicate display_name"}}
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "get model",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelEntry"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
       },
-      "delete": { "summary": "delete model", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
+      "put": {
+        "summary": "update model",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Model"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate display_name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "delete model",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
+      }
     },
     "/admin/v1/models/status": {
       "get": {
@@ -129,133 +406,1623 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "responses": {
           "200": {
             "description": "OK",
-            "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/ModelStatusView"}}}}
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ModelStatusView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
           }
         }
       }
     },
     "/admin/v1/apikeys": {
-      "get":  { "summary": "list api keys",  "responses": {"200": {"description": "OK"}} },
+      "get": {
+        "summary": "list api keys",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PublicApiKeyEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
+      },
       "post": {
         "summary": "create api key",
         "description": "Body carries `key_hash` (SHA-256 of plaintext). The plaintext is generated client-side; the gateway never sees it.",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiKey"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "409": {"description": "duplicate key_hash"}}
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApiKey"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicApiKeyEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate key_hash",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/admin/v1/apikeys/{id}": {
-      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-      "get":    { "summary": "get api key",    "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} },
-      "put":    {
-        "summary": "update api key",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ApiKey"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "404": {"description": "not found"}, "409": {"description": "duplicate key_hash"}}
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "get api key",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicApiKeyEntry"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
       },
-      "delete": { "summary": "delete api key", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
+      "put": {
+        "summary": "update api key",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApiKey"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicApiKeyEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate key_hash",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "delete api key",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
+      }
     },
     "/admin/v1/apikeys/{id}/rotate": {
-      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
       "post": {
         "summary": "rotate api key",
         "description": "Generates a new plaintext bearer, persists its SHA-256 hash, and returns the plaintext **once** under `plaintext`. Caller MUST capture — subsequent GETs only expose the hash.",
         "responses": {
-          "200": {"description": "OK", "content": {"application/json": {"schema": {
-            "type": "object",
-            "required": ["entry", "plaintext"],
-            "properties": {
-              "entry":     {"$ref": "#/components/schemas/ApiKeyEntry"},
-              "plaintext": {"type": "string", "example": "sk-abcd1234ef567890"}
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyRotateResponse"
+                }
+              }
             }
-          }}}},
-          "404": {"description": "not found"}
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
         }
       }
     },
     "/admin/v1/provider_keys": {
-      "get":  { "summary": "list provider keys",  "responses": {"200": {"description": "OK"}} },
+      "get": {
+        "summary": "list provider keys",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ProviderKeyEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
+      },
       "post": {
         "summary": "create provider key",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderKey"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "409": {"description": "duplicate display_name"}}
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderKey"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderKeyEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate display_name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/admin/v1/provider_keys/{id}": {
-      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-      "get":    { "summary": "get provider key",    "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} },
-      "put":    {
-        "summary": "update provider key",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProviderKey"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "404": {"description": "not found"}, "409": {"description": "duplicate display_name"}}
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "get provider key",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderKeyEntry"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
       },
-      "delete": { "summary": "delete provider key", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
+      "put": {
+        "summary": "update provider key",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderKey"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderKeyEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate display_name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "delete provider key",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
+      }
     },
     "/admin/v1/guardrails": {
-      "get":  { "summary": "list guardrails", "responses": {"200": {"description": "OK"}} },
+      "get": {
+        "summary": "list guardrails",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/GuardrailEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
+      },
       "post": {
         "summary": "create guardrail",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Guardrail"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "409": {"description": "duplicate name"}}
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Guardrail"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuardrailEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/admin/v1/guardrails/{id}": {
-      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-      "get":    { "summary": "get guardrail",    "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} },
-      "put":    {
-        "summary": "update guardrail",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Guardrail"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "404": {"description": "not found"}, "409": {"description": "duplicate name"}}
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "get guardrail",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuardrailEntry"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
       },
-      "delete": { "summary": "delete guardrail", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
+      "put": {
+        "summary": "update guardrail",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Guardrail"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GuardrailEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "delete guardrail",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
+      }
     },
     "/admin/v1/cache_policies": {
-      "get":  { "summary": "list cache policies", "responses": {"200": {"description": "OK"}} },
+      "get": {
+        "summary": "list cache policies",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CachePolicyEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
+      },
       "post": {
         "summary": "create cache policy",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CachePolicy"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "409": {"description": "duplicate name"}}
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CachePolicy"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CachePolicyEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/admin/v1/cache_policies/{id}": {
-      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-      "get":    { "summary": "get cache policy",    "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} },
-      "put":    {
-        "summary": "update cache policy",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CachePolicy"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "404": {"description": "not found"}, "409": {"description": "duplicate name"}}
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "get cache policy",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CachePolicyEntry"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
       },
-      "delete": { "summary": "delete cache policy", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
+      "put": {
+        "summary": "update cache policy",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CachePolicy"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CachePolicyEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "delete cache policy",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
+      }
     },
     "/admin/v1/observability_exporters": {
-      "get":  { "summary": "list observability exporters", "responses": {"200": {"description": "OK"}} },
+      "get": {
+        "summary": "list observability exporters",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ObservabilityExporterEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
+      },
       "post": {
         "summary": "create observability exporter",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ObservabilityExporter"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "409": {"description": "duplicate name"}}
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ObservabilityExporter"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObservabilityExporterEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/admin/v1/observability_exporters/{id}": {
-      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
-      "get":    { "summary": "get observability exporter",    "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} },
-      "put":    {
-        "summary": "update observability exporter",
-        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ObservabilityExporter"}}}},
-        "responses": {"200": {"description": "OK"}, "400": {"description": "schema validation failed"}, "404": {"description": "not found"}, "409": {"description": "duplicate name"}}
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "get observability exporter",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObservabilityExporterEntry"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
       },
-      "delete": { "summary": "delete observability exporter", "responses": {"200": {"description": "OK"}, "404": {"description": "not found"}} }
+      "put": {
+        "summary": "update observability exporter",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ObservabilityExporter"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObservabilityExporterEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Schema validation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Duplicate name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "delete observability exporter",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
+      }
     },
     "/admin/v1/health": {
       "get": {
         "summary": "per-Model upstream health",
         "description": "Returns each Model's health level: 0=Healthy, 1=Degraded (4-7 consecutive upstream failures), 2=Down (8+).",
-        "responses": {"200": {"description": "OK"}}
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Store error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/playground/chat/completions": {
       "post": {
         "summary": "in-process forward to the proxy router",
         "description": "Forwards a chat completion through the proxy in-process — no extra network hop, but the request is fully audited as if it had arrived on the proxy listener. Auth is a **proxy** ApiKey (`Authorization: Bearer sk-aisix-...`), not an admin key — the proxy middleware validates it inside the forwarded request.",
-        "security": [{"ProxyBearer": []}],
-        "responses": {"200": {"description": "OK (OpenAI-shape chat completion)"}, "401": {"description": "missing/invalid api key"}}
+        "security": [
+          {
+            "ProxyBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK. OpenAI-compatible chat completion response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid proxy API key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Proxy validation or guardrail error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Proxy router is not wired into this admin router.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Upstream proxy error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Proxy route unavailable or all routing targets filtered.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
       }
     }
   },
@@ -275,61 +2042,351 @@ const OPENAPI_JSON_BASE: &str = r##"{
     "schemas": {
       "ModelEntry": {
         "type": "object",
-        "required": ["id", "value", "revision"],
+        "required": [
+          "id",
+          "value",
+          "revision"
+        ],
         "properties": {
-          "id":       {"type": "string"},
-          "value":    {"$ref": "#/components/schemas/Model"},
-          "revision": {"type": "integer"}
+          "id": {
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/Model"
+          },
+          "revision": {
+            "type": "integer"
+          }
         }
       },
       "ModelStatusView": {
         "type": "object",
-        "required": ["id", "display_name", "kind", "status"],
+        "required": [
+          "id",
+          "display_name",
+          "kind",
+          "status"
+        ],
         "properties": {
-          "id": {"type": "string", "description": "Resolved model id. Direct-model runtime status is keyed by this id."},
-          "display_name": {"type": "string"},
-          "kind": {"$ref": "#/components/schemas/ModelKind"},
-          "status": {"$ref": "#/components/schemas/RuntimeStatus"},
-          "cooldown_until": {"$ref": "#/components/schemas/SystemTime"},
-          "last_checked_at": {"$ref": "#/components/schemas/SystemTime"},
-          "last_check_status": {"type": "integer", "minimum": 100, "maximum": 599},
-          "status_reason": {"type": "string", "description": "Machine-readable explanation such as `retryable_failure`, `background_check_failed`, or `ignored_transient_error`."}
+          "id": {
+            "type": "string",
+            "description": "Resolved model id. Direct-model runtime status is keyed by this id."
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ModelKind"
+          },
+          "status": {
+            "$ref": "#/components/schemas/RuntimeStatus"
+          },
+          "cooldown_until": {
+            "$ref": "#/components/schemas/SystemTime"
+          },
+          "last_checked_at": {
+            "$ref": "#/components/schemas/SystemTime"
+          },
+          "last_check_status": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 599
+          },
+          "status_reason": {
+            "type": "string",
+            "description": "Machine-readable explanation such as `retryable_failure`, `background_check_failed`, or `ignored_transient_error`."
+          }
         },
         "description": "Per-model runtime routing status. Routing rows always return `kind=routing` and `status=not_applicable`."
       },
       "ModelKind": {
         "type": "string",
-        "enum": ["direct", "routing"]
+        "enum": [
+          "direct",
+          "routing"
+        ]
       },
       "RuntimeStatus": {
         "type": "string",
-        "enum": ["healthy", "unhealthy", "cooldown", "not_applicable"]
+        "enum": [
+          "healthy",
+          "unhealthy",
+          "cooldown",
+          "not_applicable"
+        ]
       },
       "SystemTime": {
         "type": "object",
-        "required": ["secs_since_epoch", "nanos_since_epoch"],
+        "required": [
+          "secs_since_epoch",
+          "nanos_since_epoch"
+        ],
         "properties": {
-          "secs_since_epoch": {"type": "integer", "minimum": 0},
-          "nanos_since_epoch": {"type": "integer", "minimum": 0, "maximum": 999999999}
+          "secs_since_epoch": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "nanos_since_epoch": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 999999999
+          }
         }
       },
       "ApiKeyEntry": {
         "type": "object",
-        "required": ["id", "value", "revision"],
+        "required": [
+          "id",
+          "value",
+          "revision"
+        ],
         "properties": {
-          "id":       {"type": "string"},
-          "value":    {"$ref": "#/components/schemas/ApiKey"},
-          "revision": {"type": "integer"}
+          "id": {
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/PublicApiKey"
+          },
+          "revision": {
+            "type": "integer"
+          }
         }
       },
       "AdminError": {
         "type": "object",
-        "required": ["error_msg"],
-        "properties": {"error_msg": {"type": "string"}}
+        "required": [
+          "error_msg"
+        ],
+        "properties": {
+          "error_msg": {
+            "type": "string"
+          }
+        }
+      },
+      "PublicApiKey": {
+        "type": "object",
+        "required": [
+          "key_hash",
+          "allowed_models"
+        ],
+        "properties": {
+          "key_hash": {
+            "type": "string",
+            "description": "SHA-256 hash of the caller-facing plaintext key."
+          },
+          "allowed_models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "rate_limit": {
+            "$ref": "#/components/schemas/RateLimit"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PublicApiKeyEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "value",
+          "revision"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/PublicApiKey"
+          },
+          "revision": {
+            "type": "integer"
+          }
+        }
+      },
+      "ApiKeyRotateResponse": {
+        "type": "object",
+        "required": [
+          "entry",
+          "plaintext"
+        ],
+        "properties": {
+          "entry": {
+            "$ref": "#/components/schemas/PublicApiKeyEntry"
+          },
+          "plaintext": {
+            "type": "string",
+            "example": "sk-abcd1234ef567890"
+          }
+        }
+      },
+      "ProviderKeyEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "value",
+          "revision"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/ProviderKey"
+          },
+          "revision": {
+            "type": "integer"
+          }
+        }
+      },
+      "GuardrailEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "value",
+          "revision"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/Guardrail"
+          },
+          "revision": {
+            "type": "integer"
+          }
+        }
+      },
+      "CachePolicyEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "value",
+          "revision"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/CachePolicy"
+          },
+          "revision": {
+            "type": "integer"
+          }
+        }
+      },
+      "ObservabilityExporterEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "value",
+          "revision"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "value": {
+            "$ref": "#/components/schemas/ObservabilityExporter"
+          },
+          "revision": {
+            "type": "integer"
+          }
+        }
+      },
+      "DeleteResponse": {
+        "type": "object",
+        "required": [
+          "deleted",
+          "id"
+        ],
+        "properties": {
+          "deleted": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "id": {
+            "type": "string"
+          }
+        }
+      },
+      "ModelHealth": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "health"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "health": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2,
+            "description": "0 healthy, 1 degraded, 2 down."
+          }
+        }
+      },
+      "ConfigStatus": {
+        "type": "object",
+        "required": [
+          "snapshot_revision",
+          "snapshot_age_seconds"
+        ],
+        "properties": {
+          "snapshot_revision": {
+            "type": "integer"
+          },
+          "snapshot_age_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": [
+          "status",
+          "models"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok"
+            ]
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelHealth"
+            }
+          },
+          "config": {
+            "$ref": "#/components/schemas/ConfigStatus"
+          }
+        }
       }
     }
   },
-  "security": [{ "AdminBearer": [] }]
+  "security": [
+    {
+      "AdminBearer": []
+    }
+  ]
 }"##;
 
 const SCALAR_HTML: &str = r#"<!DOCTYPE html>
@@ -530,19 +2587,103 @@ mod tests {
             "SystemTime",
             "ApiKey",
             "ApiKeyEntry",
+            "PublicApiKey",
+            "PublicApiKeyEntry",
+            "ApiKeyRotateResponse",
             "ProviderKey",
+            "ProviderKeyEntry",
             "Guardrail",
+            "GuardrailEntry",
             "CachePolicy",
+            "CachePolicyEntry",
             "ObservabilityExporter",
+            "ObservabilityExporterEntry",
             "RateLimit",
             "Routing",
             "ModelCost",
+            "DeleteResponse",
+            "ModelHealth",
+            "ConfigStatus",
+            "HealthResponse",
             "AdminError",
         ] {
             assert!(
                 parsed["components"]["schemas"][schema].is_object(),
                 "merged OpenAPI missing schema {schema}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn openapi_does_not_document_metrics_on_admin_listener() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        assert!(
+            parsed["paths"].get("/metrics").is_none(),
+            "metrics live on the dedicated metrics listener, not the admin router"
+        );
+    }
+
+    #[tokio::test]
+    async fn openapi_documents_response_schemas_for_all_statuses() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let paths = parsed["paths"]
+            .as_object()
+            .expect("paths must be an object");
+
+        for (path, path_item) in paths {
+            let path_item = path_item.as_object().expect("path item must be an object");
+            for (method, operation) in path_item {
+                if method == "parameters" {
+                    continue;
+                }
+                let responses = operation["responses"]
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{method} {path} must define responses"));
+                for (status, response) in responses {
+                    let Some(content) = response["content"].as_object() else {
+                        panic!("{method} {path} response {status} missing content schema");
+                    };
+                    let has_schema = content.values().any(|media| media["schema"].is_object());
+                    assert!(
+                        has_schema,
+                        "{method} {path} response {status} missing media schema"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openapi_documents_admin_auth_and_error_envelope() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let paths = parsed["paths"]
+            .as_object()
+            .expect("paths must be an object");
+
+        for (path, path_item) in paths {
+            if !path.starts_with("/admin/v1/") {
+                continue;
+            }
+            let path_item = path_item.as_object().expect("path item must be an object");
+            for (method, operation) in path_item {
+                if method == "parameters" {
+                    continue;
+                }
+                let responses = operation["responses"]
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{method} {path} must define responses"));
+                let unauthorized = responses
+                    .get("401")
+                    .unwrap_or_else(|| panic!("{method} {path} missing 401 response"));
+                assert_eq!(
+                    unauthorized["content"]["application/json"]["schema"]["$ref"],
+                    "#/components/schemas/AdminError",
+                    "{method} {path} 401 should use AdminError"
+                );
+            }
         }
     }
 
