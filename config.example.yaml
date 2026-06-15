@@ -91,6 +91,24 @@ cache:
   #   url: "redis://127.0.0.1:6379"
   #   mode: "single"   # single | cluster | sentinel
 
+# Rate-limit counter backend (api7/AISIX-Cloud#798).
+#
+# `memory` (default) keeps counters in this process, so a cluster of N
+# replicas enforces N× every configured limit. `redis` shares the
+# counters across every replica via one Redis, so the whole cluster
+# enforces ONE global window — set this on multi-replica deployments.
+# May point at the same Redis as `cache` (keys are namespaced
+# `aisix:rl:`). On a Redis outage the limiter fails open to per-replica
+# in-memory counting (logged) so traffic keeps flowing.
+ratelimit:
+  backend: "memory"   # memory | redis
+  # redis:
+  #   url: "redis://127.0.0.1:6379"
+  #   mode: "single"   # single | cluster | sentinel
+  # Seconds before an unreleased concurrency slot (crashed replica /
+  # hung upstream) is reclaimed. Redis backend only.
+  # concurrency_ttl_secs: 300
+
 # Models, API keys, provider keys, guardrails, cache policies, and
 # observability exporters are NOT defined in this file. They are stored
 # in etcd and managed via the Admin API (see docs/api-admin.md). This

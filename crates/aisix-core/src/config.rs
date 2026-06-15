@@ -43,6 +43,12 @@ pub struct Config {
     pub observability: ObservabilityConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    /// Rate-limit counter backend. Defaults to per-process memory
+    /// (historical behaviour). Set `backend: redis` with a `redis` block
+    /// to share counters across every DP replica so a cluster enforces
+    /// one global window instead of one-per-replica (api7/AISIX-Cloud#798).
+    #[serde(default)]
+    pub ratelimit: RateLimitConfig,
     /// Optional managed-mode configuration. When `managed.enabled = true`
     /// the admin API and Playground endpoints are **not** bound — the DP
     /// is a pure etcd reader driven by the aisix.cloud control plane.
@@ -559,6 +565,43 @@ impl RedisCacheConfig {
     }
 }
 
+/// Rate-limit counter backend (api7/AISIX-Cloud#798).
+///
+/// `Memory` is the default: per-process fixed-window counters, so an
+/// N-replica cluster enforces N× the configured limit. `Redis` shares
+/// the counters across replicas via a single Redis so the whole cluster
+/// enforces one global window. The `redis` block is required iff
+/// `backend = redis` (validated at boot). Reuses [`RedisCacheConfig`]
+/// for the connection shape; may point at the same Redis as `cache`
+/// (keys are namespaced `aisix:rl:`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RateLimitConfig {
+    pub backend: RateLimitBackend,
+    pub redis: Option<RedisCacheConfig>,
+    /// Seconds after which an unreleased concurrency slot is reclaimed
+    /// (crashed replica / hung upstream). Generous enough for a long
+    /// streaming response. Redis backend only.
+    pub concurrency_ttl_secs: u64,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            backend: RateLimitBackend::Memory,
+            redis: None,
+            concurrency_ttl_secs: 300,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RateLimitBackend {
+    Memory,
+    Redis,
+}
+
 impl Config {
     /// Load + merge + validate.
     ///
@@ -657,6 +700,11 @@ impl Config {
             return Err(BootstrapError::Config(format!(
                 "observability.metrics.prometheus.addr invalid socket address: {metrics_addr}"
             )));
+        }
+        if self.ratelimit.backend == RateLimitBackend::Redis && self.ratelimit.redis.is_none() {
+            return Err(BootstrapError::Config(
+                "ratelimit.backend = redis requires a ratelimit.redis block".into(),
+            ));
         }
         Ok(())
     }
@@ -782,6 +830,71 @@ admin:
         );
         let err = Config::load_from_path(Some(f.path())).unwrap_err();
         assert!(err.to_string().contains("admin.admin_keys"));
+    }
+
+    #[test]
+    fn ratelimit_defaults_to_memory_backend() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.ratelimit.backend, RateLimitBackend::Memory);
+        assert!(cfg.ratelimit.redis.is_none());
+        assert_eq!(cfg.ratelimit.concurrency_ttl_secs, 300);
+    }
+
+    #[test]
+    fn ratelimit_redis_backend_requires_redis_block() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+ratelimit:
+  backend: "redis"
+"#,
+        );
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(err.to_string().contains("ratelimit.redis"));
+    }
+
+    #[test]
+    fn loads_ratelimit_redis_config() {
+        let f = write_yaml(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+ratelimit:
+  backend: "redis"
+  redis:
+    url: "redis://127.0.0.1:6379"
+  concurrency_ttl_secs: 120
+"#,
+        );
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.ratelimit.backend, RateLimitBackend::Redis);
+        assert_eq!(
+            cfg.ratelimit.redis.as_ref().unwrap().url,
+            "redis://127.0.0.1:6379"
+        );
+        assert_eq!(cfg.ratelimit.concurrency_ttl_secs, 120);
     }
 
     #[test]

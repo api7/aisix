@@ -16,6 +16,7 @@
 pub mod clock;
 mod error;
 mod limiter;
+pub mod store;
 mod window;
 
 pub use clock::{Clock, SystemClock, TestClock};
@@ -23,4 +24,7 @@ pub use error::RateLimitError;
 pub use limiter::{
     Limiter, MultiReservation, RateLimitStatus, Reservation, StreamConcurrencyGuard,
 };
+pub use store::local::LocalStore;
+pub use store::redis::RedisStore;
+pub use store::RateStore;
 pub use window::{FixedWindowCounter, WindowCheck};

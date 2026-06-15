@@ -22,6 +22,12 @@
 # `AISIX_CACHE__BACKEND`, etc. — every config field is reachable via
 # `AISIX_<UPPER>__<UPPER>` (see crates/aisix-core/src/config.rs).
 #
+# For a multi-replica deployment, enable cluster-level rate limiting so
+# the cluster enforces one global window instead of N× per replica
+# (api7/AISIX-Cloud#798):
+#   AISIX_RATELIMIT__BACKEND=redis
+#   AISIX_RATELIMIT__REDIS__URL=redis://<host>:6379
+#
 # Subsequent boots re-use the mTLS bundle written under
 # `managed.mtls_dir`.
 

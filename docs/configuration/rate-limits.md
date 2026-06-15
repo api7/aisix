@@ -136,9 +136,35 @@ When any layer rejects the request, the proxy returns `429`. For rate-limit-styl
 
 Successful non-streaming chat responses include `x-ratelimit-*` headers based on the post-dispatch limiter state. Those headers are useful for debugging and for client-side adaptive throttling.
 
+## Counter Storage: Single Node vs Cluster
+
+Every limit above is enforced against a counter. Where that counter lives is set by the `ratelimit` block in the gateway bootstrap config:
+
+```yaml title="ratelimit backend"
+ratelimit:
+  backend: "memory"   # memory | redis
+  # redis:
+  #   url: "redis://127.0.0.1:6379"
+  #   mode: "single"
+  # concurrency_ttl_secs: 300
+```
+
+- `memory` (default) — counters live in each gateway process. With a single replica this is exact. With **N replicas behind a load balancer, every limit is effectively multiplied by N**: a key capped at `rpm: 60` gets up to `60 × N` per minute, because each replica counts only the traffic it personally served.
+- `redis` — counters are shared across every replica through one Redis, so the whole cluster enforces **one global window** regardless of replica count. Enable this on any multi-replica deployment. The Redis may be the same instance used for the response cache; rate-limit keys are namespaced `aisix:rl:` and hash-tagged per bucket. All dimensions are shared — requests, tokens, and `concurrency` (tracked as a crash-safe distributed semaphore; a slot held by a crashed replica is reclaimed after `concurrency_ttl_secs`, default 300s).
+
+Enable it via config, or via env on a managed/containerized deployment:
+
+```bash
+AISIX_RATELIMIT__BACKEND=redis
+AISIX_RATELIMIT__REDIS__URL=redis://my-redis:6379
+```
+
+If Redis becomes unreachable, the limiter **fails open** to per-replica in-memory counting (logged once) so requests keep flowing; cluster-wide limits are not enforced for the duration of the outage and resume automatically when Redis recovers.
+
 ## Operator Guidance
 
 - put caller-facing safety limits on `ApiKey.rate_limit`
+- on multi-replica deployments, set `ratelimit.backend: redis` so configured limits are enforced cluster-wide instead of per replica
 - use `Model.rate_limit` to protect a specific upstream model alias
 - use `RateLimitPolicy` rows when the limit applies to a population that is wider than one key or one model — for example, a whole team
 - keep token-based caps proportionate to the burst-control caps; a tight `rpm` with an unlimited `tpm` lets a single long completion still saturate upstream

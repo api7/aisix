@@ -121,11 +121,11 @@ fn policy_bucket_key(policy: &RateLimitPolicy, entry_id: &str, auth: &Authentica
 }
 
 /// Reserve across all applicable rate-limit layers (api_key, model, policies).
-fn reserve_layers<'a>(
-    state: &'a ProxyState,
+async fn reserve_layers(
+    state: &ProxyState,
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
-) -> Result<MultiReservation<'a, aisix_ratelimit::SystemClock>, ProxyError> {
+) -> Result<MultiReservation, ProxyError> {
     let mut reservations = Vec::with_capacity(8);
 
     // Layer 1: API key inline rate limit.
@@ -134,6 +134,7 @@ fn reserve_layers<'a>(
         let r = state
             .limiter
             .pre_commit(&auth.entry.id, &key_limits)
+            .await
             .map_err(ProxyError::from)?;
         reservations.push(r);
     }
@@ -145,6 +146,7 @@ fn reserve_layers<'a>(
             let r = state
                 .limiter
                 .pre_commit(&key, limits)
+                .await
                 .map_err(ProxyError::from)?;
             reservations.push(r);
         }
@@ -179,6 +181,7 @@ fn reserve_layers<'a>(
         let r = state
             .limiter
             .pre_commit(&bucket_key, &rl)
+            .await
             .map_err(ProxyError::from)?;
         reservations.push(r);
     }
@@ -190,11 +193,11 @@ fn reserve_layers<'a>(
 /// `model_rl` carries the resolved model identity for policy matching
 /// and optional inline limits. Pass `None` only for endpoints that
 /// don't resolve a model (e.g. passthrough).
-pub(crate) async fn enforce<'a>(
-    state: &'a ProxyState,
+pub(crate) async fn enforce(
+    state: &ProxyState,
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
-) -> Result<MultiReservation<'a, aisix_ratelimit::SystemClock>, ProxyError> {
+) -> Result<MultiReservation, ProxyError> {
     let decision = state.budgets.check(&auth.entry.id).await;
     let budget_labels = aisix_obs::BudgetLabels {
         api_key_id: &auth.entry.id,
@@ -222,17 +225,17 @@ pub(crate) async fn enforce<'a>(
         )));
     }
 
-    reserve_layers(state, auth, model_rl)
+    reserve_layers(state, auth, model_rl).await
 }
 
 /// Rate-limit-only enforcement (no budget check). Used by `chat.rs`
 /// which handles budget separately.
-pub(crate) fn enforce_rate_limit<'a>(
-    state: &'a ProxyState,
+pub(crate) async fn enforce_rate_limit(
+    state: &ProxyState,
     auth: &AuthenticatedKey,
     model_rl: Option<&ModelRateLimit>,
-) -> Result<MultiReservation<'a, aisix_ratelimit::SystemClock>, ProxyError> {
-    reserve_layers(state, auth, model_rl)
+) -> Result<MultiReservation, ProxyError> {
+    reserve_layers(state, auth, model_rl).await
 }
 
 #[cfg(test)]

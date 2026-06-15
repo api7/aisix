@@ -79,6 +79,10 @@ jobs:
       # every Config::load_from_path test as `redis_url` and breaks
       # the entire `aisix-core::config::tests` module.
       CACHE_TEST_REDIS_URL: redis://127.0.0.1:6379
+      # Picked up by crates/aisix-ratelimit/tests/redis_integration.rs
+      # (shared cluster-level counters, #798). Same skip-if-unset /
+      # no-AISIX_-prefix rules as CACHE_TEST_REDIS_URL above.
+      RATELIMIT_TEST_REDIS_URL: redis://127.0.0.1:6379
       # Picked up by crates/aisix-admin/tests/etcd_integration.rs.
       # Same skip-if-unset pattern as the Redis case above.
       ADMIN_TEST_ETCD_URL: http://127.0.0.1:2379

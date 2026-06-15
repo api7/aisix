@@ -321,7 +321,9 @@ async fn dispatch(
             // and finalise RPM. Embeddings do report prompt_tokens via
             // EmbeddingResponse.usage; thread it through so TPM works
             // here even though other handlers commit 0.
-            reservation.commit_tokens(embed_resp.usage.total_tokens as u64);
+            reservation
+                .commit_tokens(embed_resp.usage.total_tokens as u64)
+                .await;
             let provider_label = provider.to_ascii_lowercase();
             // Capture the prompt_tokens count BEFORE moving the
             // embed_resp into the JSON response — the handler needs
@@ -342,7 +344,7 @@ async fn dispatch(
             // (`upstream_called: false` → handler skips emit per the
             // chat.rs convention that we only attribute usage on a
             // real upstream completion).
-            reservation.commit_tokens(0);
+            reservation.commit_tokens(0).await;
             let env = ErrorEnvelope::new(msg, "not_implemented");
             Ok(EmbedDispatchSuccess {
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
@@ -357,7 +359,7 @@ async fn dispatch(
             })
         }
         Err(e) => {
-            reservation.commit_tokens(0);
+            reservation.commit_tokens(0).await;
             Err(ProxyError::Bridge(e))
         }
     }

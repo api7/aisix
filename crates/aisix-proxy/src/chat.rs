@@ -245,7 +245,7 @@ pub async fn chat_completions(
             // current window state. We peek *after* the commit so
             // remaining-requests reflects the post-dispatch tally.
             let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
-            if let Some(rl_status) = state.limiter.peek(&api_key_id, &rl_limits) {
+            if let Some(rl_status) = state.limiter.peek(&api_key_id, &rl_limits).await {
                 crate::render::inject_ratelimit_headers(&mut success.response, &rl_status);
                 state.metrics.set_rate_limit_remaining(
                     &api_key_id,
@@ -843,8 +843,9 @@ async fn dispatch(
         &virtual_entry.id,
         &virtual_entry.value,
     );
-    let reservation =
-        crate::quota::enforce_rate_limit(state, auth, Some(&model_rl)).map_err(&with_model)?;
+    let reservation = crate::quota::enforce_rate_limit(state, auth, Some(&model_rl))
+        .await
+        .map_err(&with_model)?;
 
     let now = created_ts();
 
@@ -1073,7 +1074,7 @@ async fn dispatch(
         // permit was released here, letting a key capped at N run far more
         // than N simultaneous streams (#450).
         let post_stream_keys = reservation.keys();
-        let stream_concurrency_hold = reservation.into_stream_hold(Arc::clone(&state.limiter));
+        let stream_concurrency_hold = reservation.into_stream_hold();
         // Capture everything the stream-completion callback needs so
         // it can fire `emit_usage_event` once the terminal SSE chunk
         // has yielded its `usage` block. Telemetry emission has to
@@ -1379,7 +1380,7 @@ async fn dispatch(
     if let (Some(cache), Some(key)) = (policy_cache.as_ref(), cache_key.as_ref()) {
         match cache.get(key).await {
             Ok(Some(cached)) => {
-                reservation.commit_tokens(0);
+                reservation.commit_tokens(0).await;
                 // #448: a cache hit is client-visible output just like a
                 // fresh upstream response, so it must run output guardrails
                 // before being returned — not bypass them.
@@ -1690,7 +1691,7 @@ async fn dispatch(
     let provider_request_id = upstream.id.clone();
     let provider_model_version = upstream.model.clone();
     let finish_reason = finish_reason_label(&upstream.finish_reason);
-    reservation.commit_tokens(total);
+    reservation.commit_tokens(total).await;
 
     // cp-api recomputes cost server-side from its pricing catalog when
     // ingesting telemetry; the DP just records 0.0 on the wire.
@@ -1860,14 +1861,14 @@ async fn dispatch(
 /// response. `reservation` is the SINGLE entry-level reservation taken
 /// in `dispatch` — ensemble does not add per-sub-call reservations.
 #[allow(clippy::too_many_arguments)]
-async fn dispatch_ensemble<'a>(
-    state: &'a ProxyState,
+async fn dispatch_ensemble(
+    state: &ProxyState,
     snapshot: &aisix_core::AisixSnapshot,
     virtual_entry: &aisix_core::ResourceEntry<aisix_core::Model>,
     req: &ChatFormat,
     request_id: &str,
     created_ts: i64,
-    reservation: aisix_ratelimit::MultiReservation<'a, aisix_ratelimit::SystemClock>,
+    reservation: aisix_ratelimit::MultiReservation,
     resolved_chain: &Arc<dyn aisix_guardrails::Guardrail>,
     applied_guardrails: &[AppliedGuardrail],
     mut bypass_reason: Option<String>,
@@ -2006,7 +2007,7 @@ async fn dispatch_ensemble<'a>(
                 ),
             };
             let survivor_total: u64 = panel.iter().map(|p| u64::from(p.usage.total_tokens)).sum();
-            reservation.commit_tokens(survivor_total);
+            reservation.commit_tokens(survivor_total).await;
             for (index, member) in panel.iter().enumerate() {
                 emit_panel_member(
                     member, index, /* blocked */ false, /* bypass */ "",
@@ -2030,7 +2031,7 @@ async fn dispatch_ensemble<'a>(
         .sum();
     let judge_usage = outcome.response.usage.clone();
     let total_tokens = panel_total + u64::from(judge_usage.total_tokens);
-    reservation.commit_tokens(total_tokens);
+    reservation.commit_tokens(total_tokens).await;
 
     // Emit one usage event per sub-call (each panel member + the judge),
     // all sharing `request_id`. `attempt_kind` is `"panel"` / `"judge"`;

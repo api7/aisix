@@ -18,6 +18,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
+async-trait.workspace = true
+redis.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true
