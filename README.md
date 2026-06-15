@@ -22,8 +22,6 @@ static binary with low per-request overhead. Self-host for free, forever.
 [**AISIX Cloud**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) ·
 [**Roadmap**](docs/roadmap.md)
 
-<!-- TODO: 10-15s demo GIF of the playground / routing here -->
-
 </div>
 
 ---
@@ -128,6 +126,12 @@ Plus specialized handling for vendor quirks (e.g. DeepSeek reasoning content) an
 ## ☁️ Self-hosted vs AISIX Cloud
 
 Same gateway binary, same proxy API. **AISIX Cloud** adds the managed control plane on top.
+
+<p align="center">
+  <img src="docs/assets/aisix-cloud-playground.gif" alt="AISIX Cloud dashboard — test a model in the playground" width="100%">
+  <br>
+  <em>The AISIX Cloud dashboard — test a model in the playground, with routing, guardrails, budgets, and observability across your gateways.</em>
+</p>
 
 | | Self-hosted (this repo) | [AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) (managed) |
 |---|---|---|
