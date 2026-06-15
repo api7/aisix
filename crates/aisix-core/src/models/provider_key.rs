@@ -7,7 +7,7 @@
 //! every Model that uses it.
 //!
 //! Naming intentionally aligns with the AISIX-Cloud control plane's
-//! `ProviderKey` table — same concept, same name. The standalone
+//! `ProviderKey` table — same concept, same name. The self-hosted
 //! Admin API and the SaaS-tier dashboard exposition stay in lockstep.
 //!
 //! etcd path: `{prefix}/provider_keys/{uuid}`. Secondary index on
@@ -35,7 +35,7 @@ pub struct ProviderKey {
     pub display_name: String,
 
     /// Upstream provider's API key, stored in plaintext on the
-    /// standalone path (the etcd channel is mTLS-only — same trust
+    /// self-hosted path (the etcd channel is mTLS-only — same trust
     /// boundary as Guardrail credentials and ObservabilityExporter
     /// headers). On the AISIX-Cloud path cp-api decrypts the
     /// envelope-encrypted secret at projection time and writes the
