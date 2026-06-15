@@ -3400,6 +3400,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openapi_internal_refs_resolve() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let mut missing = Vec::new();
+        collect_missing_refs(&parsed, &parsed, String::new(), &mut missing);
+        assert!(
+            missing.is_empty(),
+            "OpenAPI contains unresolved internal refs: {missing:#?}"
+        );
+    }
+
+    fn collect_missing_refs(
+        root: &serde_json::Value,
+        value: &serde_json::Value,
+        path: String,
+        missing: &mut Vec<String>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(reference) = map.get("$ref").and_then(|reference| reference.as_str()) {
+                    if !reference.starts_with("#/") {
+                        return;
+                    }
+                    if !internal_ref_exists(root, reference) {
+                        missing.push(format!("{path}: {reference}"));
+                    }
+                }
+                for (key, child) in map {
+                    let child_path = if path.is_empty() {
+                        key.to_string()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    collect_missing_refs(root, child, child_path, missing);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    collect_missing_refs(root, item, format!("{path}[{index}]"), missing);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn internal_ref_exists(root: &serde_json::Value, reference: &str) -> bool {
+        let mut current = root;
+        for token in reference.trim_start_matches("#/").split('/') {
+            let token = token.replace("~1", "/").replace("~0", "~");
+            let Some(next) = current.get(&token) else {
+                return false;
+            };
+            current = next;
+        }
+        true
+    }
+
+    #[tokio::test]
     async fn openapi_documents_reference_metadata_for_all_operations() {
         let parsed: serde_json::Value =
             serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
