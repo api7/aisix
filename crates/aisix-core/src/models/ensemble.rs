@@ -112,10 +112,6 @@ impl EnsembleConfig {
             .filter(|&ms| ms > 0)
             .map(std::time::Duration::from_millis)
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.panel.is_empty()
-    }
 }
 
 #[cfg(test)]
@@ -157,7 +153,7 @@ mod tests {
         assert!(e.panel[0].temperature.is_none());
         assert!(e.judge.synthesis_prompt.is_none());
         assert_eq!(e.timeout(), None);
-        assert!(!e.is_empty());
+        assert!(!e.panel.is_empty());
     }
 
     #[test]

@@ -88,7 +88,21 @@ pub(crate) fn resolve_provider_key(
 /// `ProviderKey.adapter` + `ProviderKey.provider` — this helper just
 /// confirms the Model has a non-routing shape and returns the vendor
 /// id for telemetry / logs.
+///
+/// An ensemble model is rejected here with an explicit, accurate message:
+/// it has no `provider` (its panel/judge members do), so without this guard
+/// the generic "routing models can't be dispatched directly" branch below
+/// would fire — misleading, since the model is an *ensemble*, not a router.
+/// chat.rs branches to `dispatch_ensemble` before reaching this chokepoint,
+/// so this guard is what every NON-chat endpoint (embeddings, images,
+/// audio, completions, …) hits for an ensemble model.
 pub(crate) fn require_provider(model: &Model) -> Result<&str, ProxyError> {
+    if model.is_ensemble() {
+        return Err(ProxyError::InvalidRequest(format!(
+            "model `{}` is an ensemble model; only /v1/chat/completions is supported",
+            model.display_name
+        )));
+    }
     model.provider.as_deref().ok_or_else(|| {
         ProxyError::InvalidRequest(format!(
             "model {:?} has no provider (routing models can't be dispatched directly)",

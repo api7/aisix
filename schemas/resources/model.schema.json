@@ -266,7 +266,7 @@
           }
         },
         "timeout_ms": {
-          "description": "End-to-end budget in ms for the whole panel fan-out. `0` or absent = no ensemble-level deadline. Each panel member is still bound by its own model `timeout`.",
+          "description": "Per-call upstream deadline applied to each panel member and the judge call (in addition to each member model's own `timeout`). `0` or absent = no ensemble-level per-call deadline.",
           "type": [
             "integer",
             "null"

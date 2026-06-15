@@ -104,11 +104,17 @@ impl ModelCaller for ProxyModelCaller<'_> {
         let model = &entry.value;
 
         // ProviderKey + Bridge resolution mirrors the direct-dispatch path.
-        // `resolve_provider_key` yields a `ProxyError`; collapse it to a
-        // 400-class BridgeError so the ensemble executor's status mapping
-        // (judge 4xx preserved, panel failures dropped) stays well-defined.
-        let pk_entry = crate::dispatch::resolve_provider_key(self.snapshot, model)
-            .map_err(|e| BridgeError::InvalidUpstreamConfig(e.to_string()))?;
+        // `resolve_provider_key` yields a `ProxyError` whose message embeds
+        // the member's `display_name` + `provider_key_id`. For a misconfigured
+        // judge that error reaches the client envelope verbatim (judge err →
+        // EnsembleError::Judge → ProxyError::Bridge → transparent), so redact
+        // it the same way as the get_by_name path: detail to server logs only.
+        let pk_entry = crate::dispatch::resolve_provider_key(self.snapshot, model).map_err(|e| {
+            tracing::warn!(member = %target, error = %e, "ensemble member provider key unresolved");
+            BridgeError::InvalidUpstreamConfig(
+                "ensemble member has an unresolved provider key".to_string(),
+            )
+        })?;
         let bridge =
             crate::dispatch::resolve_bridge(&self.state.hub, &pk_entry.value).ok_or_else(|| {
                 tracing::warn!(member = %target, "ensemble member has no registered bridge");
@@ -150,9 +156,25 @@ pub struct EnsembleOutcome {
 #[derive(Debug, thiserror::Error)]
 pub enum EnsembleError {
     #[error("ensemble panel produced {got} response(s), need at least {needed}")]
-    InsufficientPanel { got: usize, needed: usize },
+    InsufficientPanel {
+        got: usize,
+        needed: usize,
+        /// The panel members that DID succeed before the run was abandoned.
+        /// Each one already hit an upstream and was billed, so the dispatch
+        /// layer must still commit + emit their usage even though the request
+        /// fails — dropping them would under-report panel usage to cp-api.
+        panel: Vec<PanelOutcome>,
+    },
     #[error("ensemble judge call failed")]
-    Judge(#[source] BridgeError),
+    Judge {
+        #[source]
+        source: BridgeError,
+        /// The panel members that DID succeed before the judge failed. The
+        /// full panel met `min_responses` and was billed, so the dispatch
+        /// layer must still commit + emit their usage on this exit too —
+        /// same invariant as `InsufficientPanel`.
+        panel: Vec<PanelOutcome>,
+    },
 }
 
 impl EnsembleError {
@@ -163,7 +185,7 @@ impl EnsembleError {
     pub fn http_status(&self) -> u16 {
         match self {
             EnsembleError::InsufficientPanel { .. } => 502,
-            EnsembleError::Judge(err) => err.http_status(),
+            EnsembleError::Judge { source, .. } => source.http_status(),
         }
     }
 }
@@ -208,9 +230,12 @@ pub async fn run_ensemble(
     }
     let needed = config.min_responses_or_default();
     if candidates.len() < needed {
+        // Carry the survivors out on the error: they were already billed,
+        // so the dispatch layer commits + emits their usage before failing.
         return Err(EnsembleError::InsufficientPanel {
             got: candidates.len(),
             needed,
+            panel,
         });
     }
 
@@ -219,8 +244,19 @@ pub async fn run_ensemble(
     // (`config.timeout()`), so the ensemble-level deadline applies uniformly
     // across the whole fan-out.
     let judge_req = judge_request(req, &config.judge, &candidates);
-    let response =
-        call_judge_with_retry(caller, &config.judge.model, &judge_req, per_call_timeout).await?;
+    let response = match call_judge_with_retry(
+        caller,
+        &config.judge.model,
+        &judge_req,
+        per_call_timeout,
+    )
+    .await
+    {
+        Ok(r) => r,
+        // Carry the (already-billed) panel survivors out on the judge
+        // failure so the dispatch layer commits + emits them too.
+        Err(source) => return Err(EnsembleError::Judge { source, panel }),
+    };
 
     Ok(EnsembleOutcome {
         response,
@@ -340,15 +376,13 @@ async fn call_judge_with_retry(
     target: &str,
     req: &ChatFormat,
     timeout: Option<Duration>,
-) -> Result<ChatResponse, EnsembleError> {
+) -> Result<ChatResponse, BridgeError> {
     match call_with_optional_timeout(caller, target, req, timeout).await {
         Ok(resp) => Ok(resp),
         Err(first) if is_transient(&first) => {
-            call_with_optional_timeout(caller, target, req, timeout)
-                .await
-                .map_err(EnsembleError::Judge)
+            call_with_optional_timeout(caller, target, req, timeout).await
         }
-        Err(err) => Err(EnsembleError::Judge(err)),
+        Err(err) => Err(err),
     }
 }
 
@@ -496,9 +530,13 @@ mod tests {
             .unwrap_err();
 
         match err {
-            EnsembleError::InsufficientPanel { got, needed } => {
+            EnsembleError::InsufficientPanel { got, needed, panel } => {
                 assert_eq!(got, 1);
                 assert_eq!(needed, 2);
+                // The one survivor (gpt) is carried out so the dispatch
+                // layer can still commit + emit its (already-billed) usage.
+                assert_eq!(panel.len(), 1);
+                assert_eq!(panel[0].model, "gpt");
             }
             other => panic!("unexpected error: {other:?}"),
         }
@@ -570,6 +608,16 @@ mod tests {
 
         assert_eq!(err.http_status(), 400); // judge 4xx preserved
         assert_eq!(caller.calls_to("judge").len(), 1); // not retried
+                                                       // The full panel succeeded and was billed before the judge failed,
+                                                       // so the survivors are carried out on the error for the dispatch
+                                                       // layer to commit + emit (FIX G).
+        match err {
+            EnsembleError::Judge { source, panel } => {
+                assert_eq!(source.http_status(), 400);
+                assert_eq!(panel.len(), 2);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[tokio::test]

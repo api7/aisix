@@ -1879,11 +1879,22 @@ async fn dispatch_ensemble<'a>(
     let with_model = |e: ProxyError| DispatchFailure::new(Some(model_id.to_string()), None, e);
 
     // The ensemble executor needs every panel member's full answer to
-    // synthesize, so a tool-using request can't be fanned out coherently
+    // synthesize, so a tool-USING request can't be fanned out coherently
     // (panel members might emit tool calls the judge can't reconcile).
     // `tools` / `tool_choice` are flattened keys in `ChatFormat.extra`,
-    // not struct fields. Reject up front with a 400.
-    if req.extra.contains_key("tools") || req.extra.contains_key("tool_choice") {
+    // not struct fields. Reject only when tools is a NON-EMPTY array, or
+    // `tool_choice` forces a call — an empty `tools: []` (which many SDKs
+    // always send) means "no tools" and must still fan out. `tool_choice`
+    // values `"none"` / `"auto"` don't force a call.
+    let has_tools = req
+        .extra
+        .get("tools")
+        .is_some_and(|v| v.as_array().is_none_or(|a| !a.is_empty()));
+    let forces_tool = req
+        .extra
+        .get("tool_choice")
+        .is_some_and(|v| v != "none" && v != "auto");
+    if has_tools || forces_tool {
         return Err(with_model(ProxyError::InvalidRequest(
             "ensemble models do not support tools".into(),
         )));
@@ -1906,64 +1917,9 @@ async fn dispatch_ensemble<'a>(
         ))
     })?;
 
-    let caller = crate::ensemble::ProxyModelCaller {
-        state,
-        snapshot,
-        request_id,
-    };
-    let outcome = match crate::ensemble::run_ensemble(req, ensemble_cfg, &caller).await {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            // Map the executor error to a dispatch failure, preserving the
-            // executor's HTTP-status intent (`EnsembleError::http_status`
-            // is the single source of truth):
-            //  - Judge(be): carry the bridge error itself so its full
-            //    envelope + status mapping survives (judge 4xx stays 4xx,
-            //    upstream 5xx → 502), richer than a bare status code.
-            //  - InsufficientPanel: the panel fan-out is exhausted — an
-            //    upstream-side fault — surfaced at the executor's canonical
-            //    status (502).
-            let status = err.http_status();
-            let proxy_err = match err {
-                crate::ensemble::EnsembleError::Judge(be) => ProxyError::Bridge(be),
-                crate::ensemble::EnsembleError::InsufficientPanel { .. } => {
-                    ProxyError::Bridge(BridgeError::upstream_status(
-                        status,
-                        "ensemble panel did not reach the required number of responses",
-                    ))
-                }
-            };
-            return Err(with_model(proxy_err));
-        }
-    };
-
-    // Aggregate client-facing usage: every billed sub-call (panel members
-    // + judge) counts against quota, since each one already hit an
-    // upstream. Commit once against the single entry-level reservation.
-    let panel_total: u64 = outcome
-        .panel
-        .iter()
-        .map(|p| u64::from(p.usage.total_tokens))
-        .sum();
-    let judge_usage = outcome.response.usage.clone();
-    let total_tokens = panel_total + u64::from(judge_usage.total_tokens);
-    reservation.commit_tokens(total_tokens);
-
-    // Emit one usage event per sub-call (each panel member + the judge),
-    // all sharing `request_id`. Each event re-resolves its target by
-    // display_name to recover the sub-call's `model_id` + `provider_key_id`;
-    // a sub-call whose target was deleted between dispatch and emit lands
-    // with those fields empty (cp-api stores NULL). `attempt_kind` is the
-    // new `"panel"` / `"judge"` value; `attempt_index` is 0..N for the
-    // panel and N for the judge.
-    //
-    // This MUST run before the output-guardrail check on BOTH paths
-    // (allow and block): the panel + judge tokens are already committed
-    // above, so skipping these events on a block would under-report panel
-    // usage to cp-api. The `emit_subcalls` closure is therefore defined
-    // here and invoked from each branch of the guardrail match below —
-    // never from the post-match continuation alone.
-    let elapsed = started.elapsed();
+    // Resolve a sub-call's target by display_name → (model_id, provider_key_id)
+    // for telemetry; empty pair if the target was deleted between dispatch and
+    // emit (cp-api stores NULL). Shared by both the success and 502 paths.
     let resolve_sub = |display_name: &str| -> (String, String) {
         match snapshot.models.get_by_name(display_name) {
             Some(entry) => (
@@ -1973,13 +1929,14 @@ async fn dispatch_ensemble<'a>(
             None => (String::new(), String::new()),
         }
     };
+    // Emit one usage event for a single (already-billed) panel member.
+    // Defined before the `run_ensemble` match so the InsufficientPanel arm
+    // can bill the survivors too — they hit upstream just like a full panel.
     // `bypass` is passed per call (not captured) so the closure holds no
-    // borrow of the mutable `bypass_reason`, and so a block can carry the
-    // input-only bypass while the allow/bypass continuation carries the
-    // final (possibly output-bypass) value. `blocked` sets each event's
-    // `guardrail_blocked` flag.
-    let emit_subcalls = |blocked: bool, bypass: &str| {
-        for (index, member) in outcome.panel.iter().enumerate() {
+    // borrow of the mutable `bypass_reason`. `attempt_index` is the member's
+    // 0-based slot; `blocked` sets the event's `guardrail_blocked` flag.
+    let emit_panel_member =
+        |member: &crate::ensemble::PanelOutcome, index: usize, blocked: bool, bypass: &str| {
             let (sub_model_id, sub_provider_key_id) = resolve_sub(&member.model);
             emit_usage_event(
                 state,
@@ -1988,7 +1945,7 @@ async fn dispatch_ensemble<'a>(
                 &req.model,
                 api_key_id,
                 200,
-                elapsed,
+                started.elapsed(),
                 member.usage.prompt_tokens,
                 member.usage.completion_tokens,
                 UsageExtras {
@@ -2010,6 +1967,84 @@ async fn dispatch_ensemble<'a>(
                 client,
                 /* content */ None,
             );
+        };
+
+    let caller = crate::ensemble::ProxyModelCaller {
+        state,
+        snapshot,
+        request_id,
+    };
+    let outcome = match crate::ensemble::run_ensemble(req, ensemble_cfg, &caller).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            // Both error variants carry the panel members that already
+            // succeeded — those hit upstream and were billed, so the
+            // "successful panel members are always billed" invariant must
+            // hold on the failure exits too (same class as the output-block
+            // path). Extract the survivors + the client-facing ProxyError,
+            // then commit + emit them BEFORE returning. No judge usage event:
+            // the judge either never ran (InsufficientPanel) or produced no
+            // response (Judge). `charge: None` — the per-member events
+            // already carry the bill, so passing a charge would double-count.
+            //
+            // `EnsembleError::http_status` is the single source of truth for
+            // the status (judge → its bridge status; exhausted panel → 502);
+            // read it before destructuring.
+            let status = err.http_status();
+            let (panel, proxy_err) = match err {
+                crate::ensemble::EnsembleError::Judge { source, panel } => {
+                    // Carry the bridge error itself so its full envelope +
+                    // status mapping survives (richer than a bare status).
+                    (panel, ProxyError::Bridge(source))
+                }
+                crate::ensemble::EnsembleError::InsufficientPanel { panel, .. } => (
+                    panel,
+                    ProxyError::Bridge(BridgeError::upstream_status(
+                        status,
+                        "ensemble panel did not reach the required number of responses",
+                    )),
+                ),
+            };
+            let survivor_total: u64 = panel.iter().map(|p| u64::from(p.usage.total_tokens)).sum();
+            reservation.commit_tokens(survivor_total);
+            for (index, member) in panel.iter().enumerate() {
+                emit_panel_member(
+                    member, index, /* blocked */ false, /* bypass */ "",
+                );
+            }
+            return Err(DispatchFailure::new(
+                Some(model_id.to_string()),
+                None,
+                proxy_err,
+            ));
+        }
+    };
+
+    // Aggregate client-facing usage: every billed sub-call (panel members
+    // + judge) counts against quota, since each one already hit an
+    // upstream. Commit once against the single entry-level reservation.
+    let panel_total: u64 = outcome
+        .panel
+        .iter()
+        .map(|p| u64::from(p.usage.total_tokens))
+        .sum();
+    let judge_usage = outcome.response.usage.clone();
+    let total_tokens = panel_total + u64::from(judge_usage.total_tokens);
+    reservation.commit_tokens(total_tokens);
+
+    // Emit one usage event per sub-call (each panel member + the judge),
+    // all sharing `request_id`. `attempt_kind` is `"panel"` / `"judge"`;
+    // `attempt_index` is 0..N for the panel and N for the judge.
+    //
+    // This MUST run before the output-guardrail check on BOTH paths
+    // (allow and block): the panel + judge tokens are already committed
+    // above, so skipping these events on a block would under-report panel
+    // usage to cp-api. The `emit_subcalls` closure is therefore defined
+    // here and invoked from each branch of the guardrail match below —
+    // never from the post-match continuation alone.
+    let emit_subcalls = |blocked: bool, bypass: &str| {
+        for (index, member) in outcome.panel.iter().enumerate() {
+            emit_panel_member(member, index, blocked, bypass);
         }
         let (judge_model_id, judge_provider_key_id) = resolve_sub(&outcome.judge_model);
         emit_usage_event(
@@ -2019,7 +2054,7 @@ async fn dispatch_ensemble<'a>(
             &req.model,
             api_key_id,
             200,
-            elapsed,
+            started.elapsed(),
             judge_usage.prompt_tokens,
             judge_usage.completion_tokens,
             UsageExtras {
