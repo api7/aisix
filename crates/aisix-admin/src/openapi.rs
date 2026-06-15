@@ -2145,6 +2145,12 @@ const OPENAPI_JSON_BASE: &str = r##"{
                   "type": "object",
                   "additionalProperties": true
                 }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "description": "Server-sent events returned when the request body sets `stream` to `true`."
+                }
               }
             }
           },
@@ -2911,6 +2917,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn openapi_documents_playground_streaming_response() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+
+        let content =
+            &parsed["paths"]["/playground/chat/completions"]["post"]["responses"]["200"]
+                ["content"];
+        assert!(
+            content["application/json"]["schema"].is_object(),
+            "playground should document non-streaming JSON responses"
+        );
+        assert!(
+            content["text/event-stream"]["schema"].is_object(),
+            "playground should document streaming SSE responses"
+        );
     }
 
     #[tokio::test]
