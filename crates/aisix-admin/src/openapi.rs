@@ -2176,8 +2176,52 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
+          "403": {
+            "description": "Requested model is not allowed for the proxy API key or client IP.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Requested model is not configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the proxy body-size limit.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
           "422": {
             "description": "Proxy validation or guardrail error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Proxy rate limit or budget limit exceeded.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2949,6 +2993,12 @@ mod tests {
             responses["400"]["content"]["application/json"]["schema"].is_object(),
             "playground should document proxy invalid-request responses"
         );
+        for status in ["403", "404", "413", "429"] {
+            assert!(
+                responses[status]["content"]["application/json"]["schema"].is_object(),
+                "playground should document forwarded proxy response {status}"
+            );
+        }
     }
 
     #[tokio::test]
