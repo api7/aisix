@@ -180,11 +180,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed",
+            "description": "Schema validation failed or the JSON body is malformed",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -205,6 +210,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -302,11 +317,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed",
+            "description": "Schema validation failed or the JSON body is malformed",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -337,6 +357,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -487,7 +517,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ApiKey"
+                "$ref": "#/components/schemas/ApiKeyRequest"
               }
             }
           }
@@ -504,11 +534,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed",
+            "description": "Schema validation failed or the JSON body is malformed",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -529,6 +564,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -609,7 +654,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/ApiKey"
+                "$ref": "#/components/schemas/ApiKeyRequest"
               }
             }
           }
@@ -626,11 +671,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed",
+            "description": "Schema validation failed or the JSON body is malformed",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -661,6 +711,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -844,11 +904,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed",
+            "description": "Schema validation failed or the JSON body is malformed",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -869,6 +934,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -966,11 +1041,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed",
+            "description": "Schema validation failed or the JSON body is malformed",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1001,6 +1081,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1126,11 +1216,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed",
+            "description": "Schema validation failed or the JSON body is malformed",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1151,6 +1246,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1248,11 +1353,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed",
+            "description": "Schema validation failed or the JSON body is malformed",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1283,6 +1393,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1408,11 +1528,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed",
+            "description": "Schema validation failed or the JSON body is malformed",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1433,6 +1558,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1530,11 +1665,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed",
+            "description": "Schema validation failed or the JSON body is malformed",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1565,6 +1705,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1690,11 +1840,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed",
+            "description": "Schema validation failed or the JSON body is malformed",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1715,6 +1870,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1812,11 +1977,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "Schema validation failed",
+            "description": "Schema validation failed or the JSON body is malformed",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -1847,6 +2017,16 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Missing or unsupported JSON content type",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -2379,6 +2559,30 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "$ref": "#/components/schemas/ConfigStatus"
           }
         }
+      },
+      "ApiKeyRequest": {
+        "type": "object",
+        "required": [
+          "key_hash",
+          "allowed_models"
+        ],
+        "properties": {
+          "key_hash": {
+            "type": "string",
+            "description": "SHA-256 hash of the caller-facing plaintext key."
+          },
+          "allowed_models": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "rate_limit": {
+            "$ref": "#/components/schemas/RateLimit"
+          }
+        },
+        "additionalProperties": false,
+        "description": "Standalone Admin API request body for creating or updating a caller API key. Cloud-projected ownership fields are not accepted by the self-hosted Admin API."
       }
     }
   },
@@ -2586,6 +2790,7 @@ mod tests {
             "RuntimeStatus",
             "SystemTime",
             "ApiKey",
+            "ApiKeyRequest",
             "ApiKeyEntry",
             "PublicApiKey",
             "PublicApiKeyEntry",
@@ -2615,13 +2820,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openapi_does_not_document_metrics_on_admin_listener() {
+    async fn openapi_documents_exact_admin_path_set() {
+        use std::collections::BTreeSet;
+
         let parsed: serde_json::Value =
             serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
-        assert!(
-            parsed["paths"].get("/metrics").is_none(),
-            "metrics live on the dedicated metrics listener, not the admin router"
+        let actual: BTreeSet<_> = parsed["paths"]
+            .as_object()
+            .expect("paths must be an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected = BTreeSet::from([
+            "/livez",
+            "/admin/openapi.json",
+            "/admin/openapi-scalar",
+            "/admin/v1/models",
+            "/admin/v1/models/{id}",
+            "/admin/v1/models/status",
+            "/admin/v1/apikeys",
+            "/admin/v1/apikeys/{id}",
+            "/admin/v1/apikeys/{id}/rotate",
+            "/admin/v1/provider_keys",
+            "/admin/v1/provider_keys/{id}",
+            "/admin/v1/guardrails",
+            "/admin/v1/guardrails/{id}",
+            "/admin/v1/cache_policies",
+            "/admin/v1/cache_policies/{id}",
+            "/admin/v1/observability_exporters",
+            "/admin/v1/observability_exporters/{id}",
+            "/admin/v1/health",
+            "/playground/chat/completions",
+        ]);
+
+        assert_eq!(
+            actual, expected,
+            "OpenAPI paths must match the admin router exactly; metrics live on the dedicated metrics listener"
         );
+    }
+
+    #[tokio::test]
+    async fn openapi_uses_standalone_apikey_request_schema() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        for (path, method) in [
+            ("/admin/v1/apikeys", "post"),
+            ("/admin/v1/apikeys/{id}", "put"),
+        ] {
+            assert_eq!(
+                parsed["paths"][path][method]["requestBody"]["content"]["application/json"]
+                    ["schema"]["$ref"],
+                "#/components/schemas/ApiKeyRequest",
+                "{method} {path} should document the standalone Admin API request body"
+            );
+        }
+
+        let request = &parsed["components"]["schemas"]["ApiKeyRequest"];
+        assert_eq!(request["required"][0], "key_hash");
+        assert_eq!(request["required"][1], "allowed_models");
+        assert!(request["properties"].get("team_id").is_none());
+        assert!(request["properties"].get("user_id").is_none());
     }
 
     #[tokio::test]
