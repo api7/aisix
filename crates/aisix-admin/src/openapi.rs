@@ -184,7 +184,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Model configuration to validate and store. The Admin API generates the resource ID on create and preserves it on update."
+          "description": "Model configuration to validate and store. The Admin API generates the resource ID."
         },
         "responses": {
           "200": {
@@ -342,7 +342,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Model configuration to validate and store. The Admin API generates the resource ID on create and preserves it on update."
+          "description": "Replacement model configuration to validate and store under the existing resource ID."
         },
         "responses": {
           "200": {
@@ -1003,7 +1003,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Provider key configuration containing upstream credential and provider routing metadata. The Admin API generates the resource ID on create and preserves it on update."
+          "description": "Provider key configuration containing the upstream credential and provider routing metadata. The Admin API generates the resource ID."
         },
         "responses": {
           "200": {
@@ -1161,7 +1161,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Provider key configuration containing upstream credential and provider routing metadata. The Admin API generates the resource ID on create and preserves it on update."
+          "description": "Replacement provider key configuration to validate and store under the existing resource ID."
         },
         "responses": {
           "200": {
@@ -1359,7 +1359,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Guardrail configuration to validate and store. The Admin API generates the resource ID on create and preserves it on update."
+          "description": "Guardrail configuration to validate and store. The Admin API generates the resource ID."
         },
         "responses": {
           "200": {
@@ -1517,7 +1517,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Guardrail configuration to validate and store. The Admin API generates the resource ID on create and preserves it on update."
+          "description": "Replacement guardrail configuration to validate and store under the existing resource ID."
         },
         "responses": {
           "200": {
@@ -1715,7 +1715,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Cache policy configuration to validate and store. The Admin API generates the resource ID on create and preserves it on update."
+          "description": "Cache policy configuration to validate and store. The Admin API generates the resource ID."
         },
         "responses": {
           "200": {
@@ -1873,7 +1873,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Cache policy configuration to validate and store. The Admin API generates the resource ID on create and preserves it on update."
+          "description": "Replacement cache policy configuration to validate and store under the existing resource ID."
         },
         "responses": {
           "200": {
@@ -2071,7 +2071,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Observability exporter configuration to validate and store. The Admin API generates the resource ID on create and preserves it on update."
+          "description": "Observability exporter configuration to validate and store. The Admin API generates the resource ID."
         },
         "responses": {
           "200": {
@@ -2229,7 +2229,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Observability exporter configuration to validate and store. The Admin API generates the resource ID on create and preserves it on update."
+          "description": "Replacement observability exporter configuration to validate and store under the existing resource ID."
         },
         "responses": {
           "200": {
@@ -2622,13 +2622,17 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "description": "Resolved model id. Direct-model runtime status is keyed by this id."
           },
           "display_name": {
-            "type": "string"
+            "type": "string",
+            "description": "Model alias used by proxy callers.",
+            "example": "gpt-4o"
           },
           "kind": {
-            "$ref": "#/components/schemas/ModelKind"
+            "$ref": "#/components/schemas/ModelKind",
+            "description": "Whether the row describes a direct upstream model or a routing model."
           },
           "status": {
-            "$ref": "#/components/schemas/RuntimeStatus"
+            "$ref": "#/components/schemas/RuntimeStatus",
+            "description": "Runtime routing status for this model."
           },
           "cooldown_until": {
             "$ref": "#/components/schemas/SystemTime"
@@ -2639,11 +2643,14 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "last_check_status": {
             "type": "integer",
             "minimum": 100,
-            "maximum": 599
+            "maximum": 599,
+            "description": "HTTP status code from the last background model check.",
+            "example": 503
           },
           "status_reason": {
             "type": "string",
-            "description": "Machine-readable explanation such as `retryable_failure`, `background_check_failed`, or `ignored_transient_error`."
+            "description": "Machine-readable explanation such as `retryable_failure`, `background_check_failed`, or `ignored_transient_error`.",
+            "example": "retryable_failure"
           }
         },
         "description": "Per-model runtime routing status. Routing rows always return `kind=routing` and `status=not_applicable`."
@@ -2653,7 +2660,9 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "enum": [
           "direct",
           "routing"
-        ]
+        ],
+        "description": "Model resource kind. `direct` models dispatch to one upstream target; `routing` models select from configured routing targets.",
+        "example": "direct"
       },
       "RuntimeStatus": {
         "type": "string",
@@ -2662,7 +2671,9 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "unhealthy",
           "cooldown",
           "not_applicable"
-        ]
+        ],
+        "description": "Runtime routing status. `healthy` is selectable, `unhealthy` is excluded after background checks fail, `cooldown` is temporarily excluded after retryable request failures, and `not_applicable` is used for routing models.",
+        "example": "healthy"
       },
       "SystemTime": {
         "type": "object",
@@ -2673,14 +2684,19 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "properties": {
           "secs_since_epoch": {
             "type": "integer",
-            "minimum": 0
+            "minimum": 0,
+            "description": "Whole seconds since the Unix epoch.",
+            "example": 1710000000
           },
           "nanos_since_epoch": {
             "type": "integer",
             "minimum": 0,
-            "maximum": 999999999
+            "maximum": 999999999,
+            "description": "Nanosecond offset within the current second.",
+            "example": 0
           }
-        }
+        },
+        "description": "System timestamp serialized from Rust `SystemTime`."
       },
       "ApiKeyEntry": {
         "type": "object",
@@ -2900,7 +2916,9 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "type": "boolean",
             "enum": [
               true
-            ]
+            ],
+            "description": "Always `true` when the resource was deleted.",
+            "example": true
           },
           "id": {
             "type": "string"
@@ -2916,16 +2934,21 @@ const OPENAPI_JSON_BASE: &str = r##"{
         ],
         "properties": {
           "id": {
-            "type": "string"
+            "type": "string",
+            "description": "Model resource ID.",
+            "example": "11111111-1111-4111-8111-111111111111"
           },
           "name": {
-            "type": "string"
+            "type": "string",
+            "description": "Model alias used by proxy callers.",
+            "example": "gpt-4o"
           },
           "health": {
             "type": "integer",
             "minimum": 0,
             "maximum": 2,
-            "description": "0 healthy, 1 degraded, 2 down."
+            "description": "Numeric model health level: 0 is healthy, 1 is degraded, and 2 is down.",
+            "example": 0
           }
         }
       },
@@ -2937,14 +2960,18 @@ const OPENAPI_JSON_BASE: &str = r##"{
         ],
         "properties": {
           "snapshot_revision": {
-            "type": "integer"
+            "type": "integer",
+            "description": "Highest configuration-store revision reflected in the current snapshot.",
+            "example": 1234567
           },
           "snapshot_age_seconds": {
             "type": [
               "integer",
               "null"
             ],
-            "minimum": 0
+            "minimum": 0,
+            "description": "Seconds since the watch supervisor last applied a snapshot, or null before the first apply.",
+            "example": 5
           }
         }
       },
@@ -2959,16 +2986,20 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "type": "string",
             "enum": [
               "ok"
-            ]
+            ],
+            "description": "Overall health response status. The endpoint always returns `ok`; inspect each model health level for actionable signal.",
+            "example": "ok"
           },
           "models": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ModelHealth"
-            }
+            },
+            "description": "Per-model health levels."
           },
           "config": {
-            "$ref": "#/components/schemas/ConfigStatus"
+            "$ref": "#/components/schemas/ConfigStatus",
+            "description": "Configuration watch freshness. Omitted when the watch supervisor is not wired into the admin state."
           }
         }
       },
@@ -3452,6 +3483,43 @@ mod tests {
         assert!(
             parameter.get("example").is_some() || parameter.get("examples").is_some(),
             "{method} {path} parameter {name} missing example"
+        );
+        if parameter["schema"].get("enum").is_some() {
+            assert!(
+                parameter["description"]
+                    .as_str()
+                    .is_some_and(|description| !description.trim().is_empty()),
+                "{method} {path} enum parameter {name} missing enum description"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn openapi_documents_admin_enum_schemas() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let schemas = &parsed["components"]["schemas"];
+
+        for schema in ["ModelKind", "RuntimeStatus"] {
+            assert!(
+                schemas[schema]["description"]
+                    .as_str()
+                    .is_some_and(|description| !description.trim().is_empty()),
+                "{schema} enum missing description"
+            );
+            assert!(
+                schemas[schema].get("example").is_some(),
+                "{schema} enum missing example"
+            );
+        }
+
+        assert_eq!(
+            schemas["DeleteResponse"]["properties"]["deleted"]["description"],
+            "Always `true` when the resource was deleted."
+        );
+        assert_eq!(
+            schemas["HealthResponse"]["properties"]["status"]["description"],
+            "Overall health response status. The endpoint always returns `ok`; inspect each model health level for actionable signal."
         );
     }
 
