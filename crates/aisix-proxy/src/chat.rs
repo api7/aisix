@@ -1900,15 +1900,6 @@ async fn dispatch_ensemble(
             "ensemble models do not support tools".into(),
         )));
     }
-    // TODO(PR3): ensemble streaming. There is no single-ChatResponse→SSE
-    // helper today, and streaming the judge's synthesized answer is a
-    // separate piece of work; reject streaming requests for now.
-    if req.is_streaming() {
-        return Err(with_model(ProxyError::InvalidRequest(
-            "streaming is not supported for ensemble models".into(),
-        )));
-    }
-
     // `is_ensemble()` is the branch guard, so `ensemble` is always Some
     // here; surface a 400 rather than panic if a future refactor breaks
     // that invariant.
@@ -1975,6 +1966,332 @@ async fn dispatch_ensemble(
         snapshot,
         request_id,
     };
+
+    // Streaming ensemble (OPTION A): the panel must be buffered to synthesize,
+    // so phases 1-2 run NON-streaming; only the judge's tokens are streamed,
+    // by reusing `build_sse_stream` exactly as the single-upstream path does.
+    //
+    // TODO(follow-up): keep the socket warm during the panel phase. The panel
+    // fan-out runs BEFORE the `Sse` is constructed, so it is not covered by the
+    // 15s keep-alive below. This is no worse than the non-streaming ensemble
+    // path, which likewise holds the socket bytes-free across panel + judge;
+    // warming it would need an early SSE handshake before the panel completes.
+    if req.is_streaming() {
+        // Commit + emit the already-billed panel survivors, then fail. Shared
+        // by both streaming error exits (panel exhausted, or judge connect
+        // failed): in either case every surviving panel member round-tripped
+        // an upstream and must be billed, exactly like the non-streaming error
+        // paths. `charge: None` — the per-member events already carry the bill.
+        let bill_panel_and_fail =
+            |panel: Vec<crate::ensemble::PanelOutcome>,
+             reservation: aisix_ratelimit::MultiReservation<'a, aisix_ratelimit::SystemClock>,
+             proxy_err: ProxyError|
+             -> DispatchFailure {
+                let survivor_total: u64 =
+                    panel.iter().map(|p| u64::from(p.usage.total_tokens)).sum();
+                reservation.commit_tokens(survivor_total);
+                for (index, member) in panel.iter().enumerate() {
+                    emit_panel_member(
+                        member, index, /* blocked */ false, /* bypass */ "",
+                    );
+                }
+                DispatchFailure::new(Some(model_id.to_string()), None, proxy_err)
+            };
+
+        // Phases 1-2 + judge-request construction. An exhausted panel bills
+        // the survivors and returns 502 (same status mapping as the
+        // non-streaming `InsufficientPanel` path).
+        let (panel, _candidates, mut judge_req) =
+            match crate::ensemble::run_ensemble_panel(req, ensemble_cfg, &caller).await {
+                Ok(triple) => triple,
+                Err(crate::ensemble::EnsembleError::InsufficientPanel { panel, .. }) => {
+                    return Err(bill_panel_and_fail(
+                        panel,
+                        reservation,
+                        ProxyError::Bridge(BridgeError::upstream_status(
+                            502,
+                            "ensemble panel did not reach the required number of responses",
+                        )),
+                    ));
+                }
+                // `run_ensemble_panel` never returns `Judge` (it stops before
+                // the judge call), but the enum is non-exhaustive to us here.
+                Err(crate::ensemble::EnsembleError::Judge { panel, source }) => {
+                    return Err(bill_panel_and_fail(
+                        panel,
+                        reservation,
+                        ProxyError::Bridge(source),
+                    ));
+                }
+            };
+
+        // Stream the judge's synthesized answer. Flip the judge request to
+        // streaming (the executor built it non-streaming for the buffered
+        // path) and resolve its bridge exactly as `ProxyModelCaller::call`
+        // does for the non-streaming judge.
+        judge_req.stream = Some(true);
+        // Resolve the judge model from the snapshot. Effectively unreachable
+        // (the panel calls already resolved member names against the same
+        // snapshot, and the judge is required config), but stay total: bill the
+        // panel + fail rather than panic if the entry vanished mid-request.
+        let Some(judge_entry) = snapshot.models.get_by_name(&ensemble_cfg.judge.model) else {
+            return Err(bill_panel_and_fail(
+                panel,
+                reservation,
+                ProxyError::Bridge(BridgeError::InvalidUpstreamConfig(
+                    "ensemble judge references an unknown model".into(),
+                )),
+            ));
+        };
+        let judge_model = &judge_entry.value;
+        let judge_pk = match crate::dispatch::resolve_provider_key(snapshot, judge_model) {
+            Ok(pk) => pk,
+            Err(e) => {
+                tracing::warn!(error = %e, "ensemble judge provider key unresolved");
+                return Err(bill_panel_and_fail(
+                    panel,
+                    reservation,
+                    ProxyError::Bridge(BridgeError::InvalidUpstreamConfig(
+                        "ensemble judge has an unresolved provider key".into(),
+                    )),
+                ));
+            }
+        };
+        let Some(judge_bridge) = crate::dispatch::resolve_bridge(&state.hub, &judge_pk.value)
+        else {
+            return Err(bill_panel_and_fail(
+                panel,
+                reservation,
+                ProxyError::Bridge(BridgeError::Config(
+                    "ensemble judge has no registered bridge".into(),
+                )),
+            ));
+        };
+        let mut judge_ctx = BridgeContext::new(
+            request_id,
+            Arc::new(judge_model.clone()),
+            Arc::new(judge_pk.value.clone()),
+        );
+        if let Some(deadline) = judge_model.request_timeout() {
+            judge_ctx = judge_ctx.with_deadline(deadline);
+        }
+
+        let judge_stream = match judge_bridge.chat_stream(&judge_req, &judge_ctx).await {
+            Ok(s) => s,
+            // Judge connect failed AFTER the panel round-tripped: bill the
+            // panel (same invariant as the non-streaming judge-failure path),
+            // then surface the bridge error (5xx → 502, 4xx preserved).
+            Err(be) => {
+                return Err(bill_panel_and_fail(
+                    panel,
+                    reservation,
+                    ProxyError::Bridge(be),
+                ));
+            }
+        };
+
+        // Pre-resolve every owned value the `'static` on_complete needs. It
+        // CANNOT borrow `state`/`snapshot`/`req`/`client` (the closure outlives
+        // this frame — it fires on stream drop), so the `emit_panel_member` /
+        // `resolve_sub` borrowing closures above are unusable inside it. Clone
+        // the per-member + judge telemetry inputs up front.
+        struct PanelTelem {
+            model_id: String,
+            provider_key_id: String,
+            attempt_model: String,
+            usage: aisix_gateway::chat::UsageStats,
+        }
+        let panel_telem: Vec<PanelTelem> = panel
+            .iter()
+            .map(|p| {
+                let (model_id, provider_key_id) = resolve_sub(&p.model);
+                PanelTelem {
+                    model_id,
+                    provider_key_id,
+                    attempt_model: p.model.clone(),
+                    usage: p.usage.clone(),
+                }
+            })
+            .collect();
+        let panel_total: u64 = panel.iter().map(|p| u64::from(p.usage.total_tokens)).sum();
+        let (judge_model_id, judge_provider_key_id) = resolve_sub(&ensemble_cfg.judge.model);
+        let judge_attempt_model = ensemble_cfg.judge.model.clone();
+        let judge_attempt_index = panel.len() as u32;
+
+        // Output guardrail context — built the same way as the single-upstream
+        // streaming path (skip entirely when the resolved chain is empty).
+        let stream_guardrail = if resolved_chain.is_empty() {
+            None
+        } else {
+            Some(StreamGuardrailContext {
+                chain: Arc::clone(resolved_chain),
+                model_name: req.model.clone(),
+            })
+        };
+        // #790: the client only receives the terminal usage-only chunk when it
+        // asked for `stream_options.include_usage`. Computed exactly as the
+        // single-upstream path does.
+        let client_requested_usage = req
+            .extra
+            .get("stream_options")
+            .and_then(|so| so.get("include_usage"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // Content-capturing exporters: the ensemble streams the JUDGE answer,
+        // so content capture would mirror the single-upstream path. v1 keeps
+        // the ensemble content-free (matching the non-streaming ensemble path,
+        // which also passes `content: None`), so no per-chunk accumulation.
+        let content_cap: Option<u32> = None;
+
+        // Owned clones for the on_complete telemetry closure (mirrors the
+        // single-upstream path's capture block).
+        let state_for_telem = state.clone();
+        let request_id_for_telem = request_id.to_string();
+        let client_model_for_telem = req.model.clone();
+        let api_key_id_for_telem = api_key_id.to_string();
+        let applied_guardrails_for_telem = applied_guardrails.to_vec();
+        let client_for_telem = client.clone();
+        let bypass_for_telem = bypass_reason.clone().unwrap_or_default();
+
+        // Hold concurrency for the stream's full lifetime (#450). Snapshot the
+        // keys BEFORE consuming the reservation into the owned guard.
+        let post_stream_keys = reservation.keys();
+        let stream_concurrency_hold = reservation.into_stream_hold(Arc::clone(&state.limiter));
+        let limiter = Arc::clone(&state.limiter);
+
+        let sse_stream = build_sse_stream(
+            judge_stream,
+            created_ts,
+            stream_guardrail,
+            started,
+            // Re-stamp the client-facing ensemble model name (e.g. "council")
+            // onto every chunk — never the judge's upstream model id.
+            req.model.clone(),
+            content_cap,
+            client_requested_usage,
+            move |comp: StreamCompletion| {
+                // Rate-limit accounting: the panel tokens (already round-tripped)
+                // plus the streamed judge's final total, against every layer.
+                for key in &post_stream_keys {
+                    limiter.add_tokens_post_stream(key, panel_total + comp.total_tokens);
+                }
+                // Telemetry: one event per panel member (attempt_kind "panel",
+                // index 0..N) carrying that member's own buffered usage, then
+                // one judge event (attempt_kind "judge", index N) from the
+                // streamed `StreamCompletion`. All share `request_id`. This
+                // mirrors the non-streaming ensemble's per-sub-call emission,
+                // moved into on_complete because the judge counts only land on
+                // the terminal SSE chunk.
+                for (index, member) in panel_telem.iter().enumerate() {
+                    emit_usage_event(
+                        &state_for_telem,
+                        &request_id_for_telem,
+                        &member.model_id,
+                        &client_model_for_telem,
+                        &api_key_id_for_telem,
+                        200,
+                        started.elapsed(),
+                        member.usage.prompt_tokens,
+                        member.usage.completion_tokens,
+                        UsageExtras {
+                            cached_prompt_tokens: member.usage.cached_prompt_tokens,
+                            reasoning_tokens: member.usage.reasoning_tokens,
+                            cache_creation_tokens: member.usage.cache_creation_tokens,
+                            cache_read_tokens: member.usage.cache_read_tokens,
+                            bypass_reason: bypass_for_telem.clone(),
+                            cache_status: CacheStatus::Disabled.as_str().to_string(),
+                            attempt_index: index as u32,
+                            attempt_kind: "panel".to_string(),
+                            attempt_model: member.attempt_model.clone(),
+                            applied_guardrails: applied_guardrails_for_telem.clone(),
+                            provider_key_id: member.provider_key_id.clone(),
+                            ..UsageExtras::default()
+                        },
+                        /* cost_usd */ 0.0,
+                        comp.guardrail_blocked,
+                        &client_for_telem,
+                        /* content */ None,
+                    );
+                }
+                emit_usage_event(
+                    &state_for_telem,
+                    &request_id_for_telem,
+                    &judge_model_id,
+                    &client_model_for_telem,
+                    &api_key_id_for_telem,
+                    200,
+                    started.elapsed(),
+                    comp.prompt_tokens,
+                    comp.completion_tokens,
+                    UsageExtras {
+                        cached_prompt_tokens: comp.cached_prompt_tokens,
+                        reasoning_tokens: comp.reasoning_tokens,
+                        cache_creation_tokens: comp.cache_creation_tokens,
+                        cache_read_tokens: comp.cache_read_tokens,
+                        provider_request_id: comp.provider_request_id,
+                        provider_model_version: comp.provider_model_version,
+                        finish_reason: comp.finish_reason,
+                        bypass_reason: if !bypass_for_telem.is_empty() {
+                            bypass_for_telem.clone()
+                        } else {
+                            comp.bypass_reason
+                        },
+                        cache_status: CacheStatus::Disabled.as_str().to_string(),
+                        ttft_ms: comp.ttft_ms,
+                        attempt_index: judge_attempt_index,
+                        attempt_kind: "judge".to_string(),
+                        attempt_model: judge_attempt_model.clone(),
+                        applied_guardrails: applied_guardrails_for_telem.clone(),
+                        provider_key_id: judge_provider_key_id.clone(),
+                        ..UsageExtras::default()
+                    },
+                    /* cost_usd */ 0.0,
+                    comp.guardrail_blocked,
+                    &client_for_telem,
+                    /* content */ None,
+                );
+                // Release the concurrency permit(s) now the stream is done
+                // (or was cancelled) — on_complete fires on both paths (#450).
+                drop(stream_concurrency_hold);
+            },
+        );
+        let response =
+            Sse::new(sse_stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)));
+        return Ok(Success {
+            response: response.into_response(),
+            // No single provider/model/key governs an ensemble response.
+            provider: "ensemble".to_string(),
+            model_id: model_id.to_string(),
+            // Token totals land on the SSE terminal chunk and are forwarded
+            // into telemetry from on_complete; the handler skips its own
+            // emission via `telemetry_handled_by_stream`.
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            cost_usd: 0.0,
+            cached_prompt_tokens: 0,
+            reasoning_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            provider_request_id: String::new(),
+            provider_model_version: String::new(),
+            provider_key_id: String::new(),
+            upstream_model: String::new(),
+            finish_reason: String::new(),
+            bypass_reason,
+            cache_status: CacheStatus::Disabled,
+            cache_hit_saved_input_tokens: 0,
+            cache_hit_saved_output_tokens: 0,
+            // Per-sub-call usage is emitted from on_complete; suppress the
+            // handler's own entry-level emission.
+            telemetry_handled_by_stream: true,
+            // Not a routing request — no `x-aisix-served-by` header.
+            served_by_target: None,
+            routing: RoutingTelemetry::default(),
+            captured_content: None,
+        });
+    }
+
     let outcome = match crate::ensemble::run_ensemble(req, ensemble_cfg, &caller).await {
         Ok(outcome) => outcome,
         Err(err) => {
