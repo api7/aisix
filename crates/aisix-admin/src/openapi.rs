@@ -2154,6 +2154,17 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
+          "400": {
+            "description": "Malformed or invalid JSON request body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
           "401": {
             "description": "Missing or invalid proxy API key.",
             "content": {
@@ -2920,12 +2931,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openapi_documents_playground_streaming_response() {
+    async fn openapi_documents_playground_response_media_types() {
         let parsed: serde_json::Value =
             serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
 
-        let content =
-            &parsed["paths"]["/playground/chat/completions"]["post"]["responses"]["200"]["content"];
+        let responses = &parsed["paths"]["/playground/chat/completions"]["post"]["responses"];
+        let content = &responses["200"]["content"];
         assert!(
             content["application/json"]["schema"].is_object(),
             "playground should document non-streaming JSON responses"
@@ -2933,6 +2944,10 @@ mod tests {
         assert!(
             content["text/event-stream"]["schema"].is_object(),
             "playground should document streaming SSE responses"
+        );
+        assert!(
+            responses["400"]["content"]["application/json"]["schema"].is_object(),
+            "playground should document proxy invalid-request responses"
         );
     }
 
