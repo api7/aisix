@@ -38,7 +38,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
   "info": {
     "title": "AISIX Admin API",
     "version": "dev",
-    "description": "Admin surface for the self-hosted AISIX gateway. `/admin/v1/*` routes require Bearer admin-key auth from `admin.admin_keys`. Errors use `{\"error_msg\": \"...\"}`.\n\nIn managed mode, the admin listener is not bound."
+    "description": "Use the AISIX Admin API to manage self-hosted gateway resources such as models, API keys, provider credentials, guardrails, cache policies, and observability exporters. All `/admin/v1/*` routes require a Bearer admin key configured in `admin.admin_keys`. Error responses use `{\"error_msg\": \"...\"}`.\n\nAISIX Cloud does not expose this listener; managed configuration is handled by the Cloud control plane."
   },
   "paths": {
     "/livez": {
