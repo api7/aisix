@@ -1159,6 +1159,8 @@ async fn dispatch(
             req.model.clone(),
             content_cap,
             client_requested_usage,
+            // Single upstream: nothing pre-incurred, so no usage to fold in.
+            aisix_gateway::chat::UsageStats::default(),
             move |comp: StreamCompletion| {
                 // Rate-limit accounting (TPM cap) for all layers.
                 for key in &post_stream_keys {
@@ -2114,6 +2116,15 @@ async fn dispatch_ensemble(
             })
             .collect();
         let panel_total: u64 = panel.iter().map(|p| u64::from(p.usage.total_tokens)).sum();
+        // #614: field-wise panel usage sum (not just total_tokens) folded into
+        // the client-facing terminal usage chunk via build_sse_stream's
+        // `base_usage`, so a streamed ensemble reports the full panel+judge
+        // aggregate — matching the non-streaming path.
+        let panel_usage_sum = panel
+            .iter()
+            .fold(aisix_gateway::chat::UsageStats::default(), |acc, p| {
+                acc.saturating_add(&p.usage)
+            });
         let (judge_model_id, judge_provider_key_id) = resolve_sub(&ensemble_cfg.judge.model);
         let judge_attempt_model = ensemble_cfg.judge.model.clone();
         let judge_attempt_index = panel.len() as u32;
@@ -2169,6 +2180,7 @@ async fn dispatch_ensemble(
             req.model.clone(),
             content_cap,
             client_requested_usage,
+            panel_usage_sum,
             move |comp: StreamCompletion| {
                 // Rate-limit accounting: the panel tokens (already round-tripped)
                 // plus the streamed judge's final total, against every layer.
@@ -2292,7 +2304,7 @@ async fn dispatch_ensemble(
         });
     }
 
-    let outcome = match crate::ensemble::run_ensemble(req, ensemble_cfg, &caller).await {
+    let mut outcome = match crate::ensemble::run_ensemble(req, ensemble_cfg, &caller).await {
         Ok(outcome) => outcome,
         Err(err) => {
             // Both error variants carry the panel members that already
@@ -2446,6 +2458,17 @@ async fn dispatch_ensemble(
     // is reused as the "telemetry already emitted, do not double-emit"
     // flag — `chat_completions` skips its own `emit_usage_event` when it
     // is set, exactly as it does for the streaming path.
+    // #614: the client-facing response reports the AGGREGATE usage — every
+    // panel member plus the judge (api7/AISIX-Cloud#804) — so the caller sees
+    // the full fan-out cost, not just the judge sub-call's. The per-sub-call
+    // breakdown stays in the usage events emitted above (`judge_usage` carried
+    // the judge-only count for its event; starting the fold from it adds the
+    // judge once, then every panel member).
+    let aggregate_usage = outcome
+        .panel
+        .iter()
+        .fold(judge_usage.clone(), |acc, p| acc.saturating_add(&p.usage));
+    outcome.response.usage = aggregate_usage;
     let response = Json(render_response(created_ts, outcome.response, &req.model)).into_response();
     Ok(Success {
         response,
@@ -3062,6 +3085,12 @@ fn build_sse_stream<F>(
     // gateway asks the upstream regardless (#790, for telemetry); the
     // terminal usage-only chunk is forwarded only when this is true.
     client_requested_usage: bool,
+    // Usage already incurred before this stream begins — the buffered panel
+    // members of an ensemble (#614). Folded into the client-facing terminal
+    // usage chunk so the caller sees the full panel+judge aggregate; the
+    // `on_complete` (`comp`) counts stay stream-only. Zero for single-upstream
+    // callers, where the fold is a no-op.
+    base_usage: aisix_gateway::chat::UsageStats,
     on_complete: F,
 ) -> impl Stream<Item = Result<Event, Infallible>>
 where
@@ -3145,7 +3174,7 @@ where
         let mut first_chunk_seen = false;
         while let Some(item) = upstream.next().await {
             let (ev, is_error_ev) = match item {
-                Ok(chunk) => {
+                Ok(mut chunk) => {
                     // Record TTFT on the first chunk carrying generated
                     // output (content or tool calls). Skip role-only
                     // chunks that OpenAI emits before actual tokens.
@@ -3248,6 +3277,21 @@ where
                         && chunk.delta.reasoning_content.is_none()
                     {
                         continue;
+                    }
+                    // #614: fold the ensemble panel's usage (`base_usage`) into
+                    // the client-facing usage frame, AFTER `comp` captured the
+                    // stream-only counts above. No-op when `base_usage` is zero
+                    // (every single-upstream caller).
+                    //
+                    // Assumes the judge emits `usage` on a SINGLE terminal frame
+                    // (true for the OpenAI/Anthropic/DeepSeek bridges via the
+                    // injected include_usage, so the panel sum lands exactly
+                    // once). A judge that stamps usage on multiple chunks
+                    // (Gemini/Vertex) would add the panel sum more than once —
+                    // tracked in #617 (fix: synthesize one terminal usage frame
+                    // from `comp + base_usage`).
+                    if let Some(u) = chunk.usage.as_mut() {
+                        *u = u.saturating_add(&base_usage);
                     }
                     let rendered = render_chunk(created, chunk, &client_facing_model);
                     match serde_json::to_string(&rendered) {
