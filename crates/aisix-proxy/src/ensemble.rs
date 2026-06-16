@@ -26,7 +26,7 @@ use futures::future::join_all;
 
 use aisix_core::models::{EnsembleConfig, Judge, PanelMember};
 use aisix_core::AisixSnapshot;
-use aisix_gateway::bridge::{BridgeContext, BridgeError};
+use aisix_gateway::bridge::{BridgeContext, BridgeError, UpstreamWire};
 use aisix_gateway::chat::{ChatFormat, ChatMessage, ChatResponse, Role, UsageStats};
 
 use crate::state::ProxyState;
@@ -130,7 +130,32 @@ impl ModelCaller for ProxyModelCaller<'_> {
         if let Some(deadline) = model.request_timeout() {
             ctx = ctx.with_deadline(deadline);
         }
-        bridge.chat(req, &ctx).await
+
+        // Enforce THIS member's own model rate limit before the sub-call and
+        // bill its own tokens after (#620). The request-level layers (api_key
+        // / team / member) are already reserved on the entry alias; here we add
+        // only the member's `model:` layer + model-scope policies. A member
+        // that exceeds its own limit becomes a failed sub-call: the panel drops
+        // it toward `min_responses`, and the judge surfaces it as a 429 judge
+        // failure. An unlimited member reserves nothing (zero overhead).
+        let reservation = crate::quota::reserve_model_only(self.state, target, &entry.id, model)
+            .await
+            .map_err(|_| BridgeError::UpstreamStatus {
+                status: 429,
+                message: "rate limit exceeded for an ensemble sub-call".to_string(),
+                parsed: None,
+                wire: UpstreamWire::Unknown,
+                retry_after: None,
+            })?;
+
+        // On a bridge error the reservation drops here → concurrency slots
+        // release and no tokens are counted. On success we commit the member's
+        // own token cost to its model bucket.
+        let response = bridge.chat(req, &ctx).await?;
+        reservation
+            .commit_tokens(u64::from(response.usage.total_tokens))
+            .await;
+        Ok(response)
     }
 }
 
