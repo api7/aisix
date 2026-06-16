@@ -116,7 +116,7 @@ The default synthesis instructions tell the judge to treat the candidates as evi
 
 ## Streaming
 
-Ensemble models accept `stream: true` (they do not reject it). Because the panel must be fully collected before the judge can synthesize, the panel phase runs non-streaming and only the **judge's** tokens are streamed to the caller. During the panel-and-judge wait the gateway sends SSE keep-alive frames (every 15 seconds) so first-byte timeouts do not drop the connection.
+Ensemble models accept `stream: true` (they do not reject it). Because the panel must be fully collected before the judge can synthesize, the panel phase runs non-streaming and only the **judge's** tokens are streamed to the caller. Once the judge starts streaming, the gateway sends SSE keep-alive frames (every 15 seconds) to hold the connection open. The panel phase runs before any bytes are sent and is not yet covered by keep-alive, so budget a client read timeout that absorbs `max(panel latency) + judge time-to-first-token` (see the note below).
 
 :::note
 Ensemble time-to-first-token is inherently high — roughly `max(panel latency) + judge time-to-first-token` — because no judge token exists until the panel returns. Budget client read timeouts accordingly.
@@ -125,6 +125,8 @@ Ensemble time-to-first-token is inherently high — roughly `max(panel latency) 
 ## Client-facing usage
 
 The response `usage` object is the **aggregate** of every panel call plus the judge call (a flat sum of `prompt_tokens`, `completion_tokens`, and `total_tokens`). This reflects the real cost of the request, so `prompt_tokens` intentionally exceeds the number of tokens the caller sent — each panel member and the judge processed the prompt (the judge also processes the panel answers).
+
+On a streaming request, this aggregate is delivered in the terminal `usage` chunk only when the caller sets `stream_options.include_usage: true` (see [Streaming](../integration/streaming.md)); without it, a streaming response carries no `usage`, exactly as for a direct model.
 
 ## Response shape
 
