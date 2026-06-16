@@ -56,7 +56,7 @@ pub struct OtlpHttpConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
 
-    /// Fraction of requests exported as traces, from `0.0` to `1.0`. Defaults to `1.0`.
+    /// Fraction of requests exported as traces, from `0.0` to `1.0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0.0, max = 1.0))]
     pub sample_rate: Option<f64>,

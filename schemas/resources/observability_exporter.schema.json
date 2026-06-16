@@ -46,7 +46,7 @@
           ]
         },
         "sample_rate": {
-          "description": "Fraction of requests exported as traces, from `0.0` to `1.0`. Defaults to `1.0`.",
+          "description": "Fraction of requests exported as traces, from `0.0` to `1.0`.",
           "type": [
             "number",
             "null"

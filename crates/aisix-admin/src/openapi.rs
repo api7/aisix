@@ -3194,6 +3194,7 @@ pub(crate) fn merged_openapi() -> &'static str {
         collapse_single_ref_all_of(&mut doc);
         add_variant_titles(&mut doc);
         add_missing_property_descriptions(&mut doc);
+        add_schema_defaults(&mut doc);
         wrap_ref_siblings_for_redoc(&mut doc);
 
         serde_json::to_string(&doc).expect("merged OpenAPI must serialise")
@@ -3350,6 +3351,17 @@ fn add_missing_property_descriptions(doc: &mut Value) {
         if let Some(Value::Object(map)) = doc.pointer_mut(pointer) {
             map.entry("description".to_string())
                 .or_insert_with(|| Value::String(description.to_string()));
+        }
+    }
+}
+
+fn add_schema_defaults(doc: &mut Value) {
+    for (pointer, default_value) in [(
+        "/components/schemas/ObservabilityExporter/oneOf/0/properties/sample_rate",
+        serde_json::json!(1.0),
+    )] {
+        if let Some(Value::Object(map)) = doc.pointer_mut(pointer) {
+            map.entry("default".to_string()).or_insert(default_value);
         }
     }
 }
@@ -3857,6 +3869,11 @@ mod tests {
         assert_eq!(
             schemas["HealthResponse"]["properties"]["status"]["description"],
             "Fixed success marker for this response. Successful responses currently always return `ok`. This field does not summarize model health. Use `models[].health` and `config` for actionable health details."
+        );
+        assert_eq!(
+            schemas["ObservabilityExporter"]["oneOf"][0]["properties"]["sample_rate"]["default"],
+            serde_json::json!(1.0),
+            "runtime default for OTLP sampling should be visible in OpenAPI"
         );
     }
 
