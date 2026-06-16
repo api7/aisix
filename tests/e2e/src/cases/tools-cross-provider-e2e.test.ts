@@ -271,10 +271,21 @@ describe("tools cross-provider e2e: OpenAI tools → Anthropic upstream tool_use
       model: "tools-xprov",
       messages: [
         { role: "user", content: "What's the weather in SF?" },
-        // (real callers would also include the assistant's
-        // tool_calls turn here; we skip it because Anthropic only
-        // requires the tool_use_id to be referenced in the next
-        // user-side tool_result.)
+        // The assistant's tool_calls turn is replayed too: the bridge
+        // translates it to an Anthropic `tool_use` block so the
+        // following `tool_result` references a tool_use the upstream saw
+        // (and roles still alternate user → assistant → user).
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "toolu_xprov_01",
+              type: "function",
+              function: { name: "get_weather", arguments: '{"location":"SF"}' },
+            },
+          ],
+        },
         {
           role: "tool",
           tool_call_id: "toolu_xprov_01",

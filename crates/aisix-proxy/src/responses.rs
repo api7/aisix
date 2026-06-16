@@ -1200,8 +1200,14 @@ async fn responses_cross_provider_to_target(
         requested_model,
         created_at,
     );
+    let mut response = Json(json_body).into_response();
+    if let Ok(hv) = HeaderValue::from_str(request_id) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-aisix-request-id"), hv);
+    }
     Ok(ResponseDispatchSuccess {
-        response: Json(json_body).into_response(),
+        response,
         provider: provider_label,
         usage: Some(usage),
         model_id: model_id.to_string(),

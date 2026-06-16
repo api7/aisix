@@ -19,27 +19,24 @@ import {
 // Two user journeys pinned, both derived from the gateway's own
 // published contract in `docs/api-proxy.md` §4.6:
 //
-//   > Native OpenAI Responses API. OpenAI Models only — non-OpenAI
-//   > providers return 400.
-//
-//   1. Happy path — POST /v1/responses with an OpenAI-provider
+//   1. Happy path (OpenAI) — POST /v1/responses with an OpenAI-provider
 //      Model. Gateway dispatches to upstream's /v1/responses
 //      (NOT /v1/chat/completions), caller receives the upstream's
 //      Responses-shape body byte-for-byte, with the configured
 //      Model's display name translated to upstream model_name.
 //
-//   2. Provider mismatch — POST /v1/responses with an Anthropic-
-//      provider Model. Gateway must return 400 per the published
-//      contract; upstream must NOT be hit (the entire point of
-//      the restriction is OpenAI-Responses-shape doesn't translate
-//      to Anthropic Messages today).
+//   2. Cross-provider (#825) — POST /v1/responses with a non-OpenAI
+//      Model. The gateway no longer rejects with 400; it bridges the
+//      Responses request through the canonical ChatFormat to the
+//      provider's native endpoint and re-encodes the reply into the
+//      Responses shape. (Anthropic streaming/tool coverage lives in
+//      responses-cross-provider-e2e; here we pin the OpenAI-compatible
+//      deepseek bridge as the representative non-OpenAI case.)
 //
 // References:
 // - OpenAI Responses API spec
 //   <https://platform.openai.com/docs/api-reference/responses>
 // - Gateway's own /v1/responses contract: `docs/api-proxy.md` §4.6
-// - OpenAI error envelope spec
-//   <https://platform.openai.com/docs/guides/error-codes/api-errors>
 
 const CALLER_PLAINTEXT = "sk-resp-e2e-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -218,132 +215,99 @@ describe("responses endpoint e2e: /v1/responses dispatch + provider mismatch", (
     expect(sentBody.input).toBe("Say hello");
   });
 
-  // All three non-OpenAI providers per docs §6 (anthropic, gemini,
-  // deepseek). Per docs §4.6, /v1/responses on any of them must
-  // return 400. Parametrizing across all three catches a regression
-  // that special-cased one provider but mis-handled others — gemini
-  // and deepseek's bridges *do* speak OpenAI wire shape upstream, so
-  // a regression that "just dispatched anyway" would actually return
-  // 200 from the upstream-compat layer, billing the caller and
-  // silently violating the published contract.
-  const NON_OPENAI_PROVIDERS = [
-    {
-      provider: "anthropic" as const,
-      modelName: "claude-3-5-haiku-20241022",
-      secret: "sk-ant-mock",
-      // Anthropic's documented endpoint is `https://api.anthropic.com/v1/messages`
-      // → api_base is the bare host.
-      apiBaseSuffix: "" as const,
-    },
-    {
-      provider: "google" as const,
-      modelName: "gemini-2.0-flash",
+  // #825: a non-OpenAI provider on /v1/responses is now bridged, not
+  // rejected. deepseek is the representative case — its bridge speaks the
+  // OpenAI chat wire shape upstream, so the default mock body (a
+  // chat.completion) round-trips cleanly. The gateway must translate the
+  // Responses request into a chat completion, hit the provider's native
+  // /chat/completions endpoint (NOT /v1/responses), and re-encode the
+  // reply back into the Responses shape. (Richer Anthropic streaming/tool
+  // coverage lives in responses-cross-provider-e2e.)
+  test("non-OpenAI provider (deepseek): /v1/responses is bridged to a Responses-shape 200", async (ctx) => {
+    if (!etcdReachable || !app || !admin) {
+      ctx.skip();
+      return;
+    }
+
+    const upstream = await startOpenAiUpstream({
+      nonStreamBody: {
+        id: "chatcmpl-ds-01",
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: "deepseek-chat",
+        choices: [
+          {
+            index: 0,
+            message: { role: "assistant", content: "bridged reply" },
+            finish_reason: "stop",
+          },
+        ],
+        usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 },
+      },
+    });
+    upstreams.push(upstream);
+
+    const pk = await admin.createProviderKey({
+      display_name: "resp-deepseek-pk",
+      provider: "deepseek",
+      adapter: "openai",
       secret: "sk-mock",
-      apiBaseSuffix: "/v1" as const,
-    },
-    {
-      provider: "deepseek" as const,
-      modelName: "deepseek-chat",
-      secret: "sk-mock",
-      apiBaseSuffix: "/v1" as const,
-    },
-  ];
+      api_base: `${upstream.baseUrl}/v1`,
+    });
+    await admin.createModel({
+      display_name: "resp-deepseek",
+      provider: "deepseek",
+      model_name: "deepseek-chat",
+      provider_key_id: pk.id,
+    });
 
-  for (const tc of NON_OPENAI_PROVIDERS) {
-    test(`non-OpenAI provider (${tc.provider}): caller sees 400 invalid_request_error, upstream untouched (per docs §4.6)`, async (ctx) => {
-      if (!etcdReachable || !app || !admin) {
-        ctx.skip();
-        return;
-      }
+    const headers = {
+      authorization: `Bearer ${CALLER_PLAINTEXT}`,
+      "content-type": "application/json",
+    };
 
-      const upstream = await startOpenAiUpstream();
-      upstreams.push(upstream);
-
-      const pk = await admin.createProviderKey({
-        display_name: `resp-${tc.provider}-pk`,
-        secret: tc.secret,
-        api_base: `${upstream.baseUrl}${tc.apiBaseSuffix}`,
-      });
-      const modelDisplayName = `resp-${tc.provider}`;
-      await admin.createModel({
-        display_name: modelDisplayName,
-        provider: tc.provider,
-        model_name: tc.modelName,
-        provider_key_id: pk.id,
-      });
-
-      const headers = {
-        authorization: `Bearer ${CALLER_PLAINTEXT}`,
-        "content-type": "application/json",
-      };
-
-      // Readiness gate: poll until the gateway returns the
-      // documented 400 with `error.type: "invalid_request_error"`
-      // per docs §2 status→type table. A 404 here would be the
-      // snapshot-lag "model not found" case (model_not_found is
-      // mapped to 404, NOT 400, per the docs), so probing on
-      // 400 + invalid_request_error specifically gates on the
-      // gateway resolving the model AND refusing per §4.6.
-      await waitConfigPropagation(async () => {
-        try {
-          const r = await fetch(`${app!.proxyUrl}/v1/responses`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify({
-              model: modelDisplayName,
-              input: "ready-probe",
-            }),
-          });
-          if (r.status !== 400) {
-            await r.text();
-            return false;
-          }
-          const j = (await r.json()) as {
-            error?: { type?: unknown };
-          };
-          return j.error?.type === "invalid_request_error";
-        } catch {
+    // Readiness gate: poll until the bridged path returns a Responses-shape
+    // 200 (no longer the pre-#825 400).
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await fetch(`${app!.proxyUrl}/v1/responses`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ model: "resp-deepseek", input: "ready-probe" }),
+        });
+        if (r.status !== 200) {
+          await r.text();
           return false;
         }
-      });
-
-      const upstreamHitsBefore = upstream.receivedRequests.length;
-
-      const res = await fetch(`${app.proxyUrl}/v1/responses`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({
-          model: modelDisplayName,
-          input: "Say hello",
-        }),
-      });
-
-      // Per docs §4.6: non-OpenAI providers return 400. Status
-      // family 5xx would mean the gateway crashed (it should
-      // refuse cleanly, not panic).
-      expect(res.status).toBe(400);
-
-      const body = (await res.json()) as {
-        error?: { type?: unknown; message?: unknown };
-      };
-      // Per docs §2 status→type table: 400 → invalid_request_error.
-      // Pinning the exact value catches a regression where the
-      // gateway's refusal vocabulary drifts from the published
-      // contract (e.g. emits "service_unavailable" or
-      // "model_not_found"). Same convention body-edges-e2e and
-      // error-envelope-normalization-e2e use.
-      expect(body.error?.type).toBe("invalid_request_error");
-      expect(typeof body.error?.message).toBe("string");
-      expect((body.error?.message as string).length).toBeGreaterThan(0);
-
-      // Hard contract: upstream must never be hit when the gateway
-      // refuses for provider mismatch — otherwise the gateway is
-      // billing the caller's quota on a request it claims to reject.
-      // Critical for gemini and deepseek specifically, whose bridges
-      // DO speak OpenAI wire shape upstream — a regression that
-      // dispatched anyway would silently 200 from the upstream-
-      // compat layer.
-      expect(upstream.receivedRequests.length).toBe(upstreamHitsBefore);
+        const j = (await r.json()) as { object?: unknown };
+        return j.object === "response";
+      } catch {
+        return false;
+      }
     });
-  }
+
+    const baseline = upstream.receivedRequests.length;
+    const res = await fetch(`${app.proxyUrl}/v1/responses`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model: "resp-deepseek", input: "Say hello" }),
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      object?: unknown;
+      status?: unknown;
+      output?: Array<{ type?: unknown; content?: Array<{ text?: unknown }> }>;
+    };
+    expect(body.object).toBe("response");
+    expect(body.status).toBe("completed");
+    expect(body.output?.[0]?.type).toBe("message");
+    expect(body.output?.[0]?.content?.[0]?.text).toBe("bridged reply");
+
+    // The bridge dispatched to the provider's chat endpoint, not
+    // /v1/responses (the verbatim path is OpenAI-only).
+    const calls = upstream.receivedRequests.slice(baseline);
+    expect(calls.some((r) => r.path.endsWith("/chat/completions"))).toBe(true);
+    expect(calls.some((r) => r.path === "/v1/responses")).toBe(false);
+  });
 });
