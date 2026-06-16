@@ -1,6 +1,6 @@
 ---
 title: Core Concepts
-description: Understand the core AISIX AI Gateway and AISIX Cloud concepts, including models, provider keys, API keys, routing models, guardrails, cache policies, and observability exporters.
+description: Understand the core AISIX AI Gateway and AISIX Cloud concepts, including models, provider keys, API keys, routing models, ensemble models, guardrails, cache policies, and observability exporters.
 sidebar_position: 3
 ---
 
@@ -79,6 +79,12 @@ Current routing strategies include:
 - `weighted`
 
 The gateway resolves the routing model to one of its target models at request time.
+
+## Ensemble Model
+
+An ensemble model is a virtual model with an `ensemble` block instead of direct provider fields. It names a panel of direct models plus a judge model.
+
+On a chat request, the gateway calls every panel member concurrently, then the judge synthesizes their answers into one response. Unlike a routing model — which resolves to one target — an ensemble calls all panel members and combines their output. Ensembles are chat-only in v1. See [Model Ensembles](../configuration/ensemble-models.md).
 
 ## Guardrail
 
