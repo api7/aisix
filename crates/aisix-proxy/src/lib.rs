@@ -5612,6 +5612,434 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         ResourceEntry::new(id, model, 1)
     }
 
+    fn direct_model_entry_rl(
+        id: &str,
+        name: &str,
+        upstream_model: &str,
+        rate_limit: serde_json::Value,
+    ) -> ResourceEntry<Model> {
+        let cfg = format!(
+            r#"{{
+                "display_name": "{name}",
+                "provider": "openai",
+                "model_name": "{upstream_model}",
+                "provider_key_id": "{PK_ID}",
+                "rate_limit": {rate_limit}
+            }}"#
+        );
+        let model: Model = serde_json::from_str(&cfg).unwrap();
+        ResourceEntry::new(id, model, 1)
+    }
+
+    /// #620: a panel member must reserve its OWN model rate limit during
+    /// fan-out. A self-ensemble of two copies of a model capped at
+    /// `concurrency: 1` can only run one copy at a time, so the second is
+    /// dropped and the panel falls below `min_responses` (which defaults to 2
+    /// for a two-member panel) → 502. Before the per-target reservation both
+    /// copies ran and the request returned 200.
+    #[tokio::test]
+    async fn ensemble_panel_member_concurrency_limit_enforced_per_target() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-panel",
+                "model": "panel-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "a panel candidate answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 11, "total_tokens": 16}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+
+        let snap = new_snap(&upstream.uri());
+        // Panel member capped at one concurrent call.
+        snap.models.insert(direct_model_entry_rl(
+            "m-capped",
+            "capped",
+            "panel-upstream",
+            serde_json::json!({ "concurrency": 1 }),
+        ));
+        snap.models
+            .insert(direct_model_entry("m-judge", "judge-m", "judge-upstream"));
+        // Self-ensemble: the SAME capped model twice → two concurrent calls
+        // contend for one concurrency:1 bucket. Default min_responses = 2.
+        snap.models.insert(ensemble_model_entry(
+            "m-council",
+            "council",
+            &["capped", "capped"],
+            "judge-m",
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "council",
+            "messages": [{"role": "user", "content": "what is the best answer?"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        // Only one copy acquires the concurrency:1 slot; the other is dropped,
+        // leaving one panel response < min_responses(2) → insufficient panel.
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// #620: the per-member reservation must RELEASE on success (commit), not
+    /// leak the slot. Two sequential requests through a single-member panel
+    /// whose model is capped at `concurrency: 1` must BOTH succeed — if the
+    /// first request leaked the slot, the second would be starved (502).
+    #[tokio::test]
+    async fn ensemble_panel_member_concurrency_slot_released_after_success() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("Answer 1:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-judge",
+                "model": "judge-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "synthesized final answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 30, "completion_tokens": 7, "total_tokens": 37}
+            })))
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-panel",
+                "model": "panel-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "a panel candidate answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 11, "total_tokens": 16}
+            })))
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(direct_model_entry_rl(
+            "m-capped",
+            "capped",
+            "panel-upstream",
+            serde_json::json!({ "concurrency": 1 }),
+        ));
+        snap.models
+            .insert(direct_model_entry("m-judge", "judge-m", "judge-upstream"));
+        // Single-member panel → min_responses defaults to 1.
+        snap.models.insert(ensemble_model_entry(
+            "m-council",
+            "council",
+            &["capped"],
+            "judge-m",
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
+        let app = build_router(build_state(snap, hub));
+
+        let make_req = || {
+            let body = serde_json::json!({
+                "model": "council",
+                "messages": [{"role": "user", "content": "what is the best answer?"}]
+            });
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        // First request acquires + releases the capped model's only slot.
+        assert_eq!(run(app.clone(), make_req()).await.status(), StatusCode::OK);
+        // Second request must find the slot free (released on commit).
+        assert_eq!(run(app, make_req()).await.status(), StatusCode::OK);
+    }
+
+    /// #620: the STREAMING judge bypasses `ProxyModelCaller::call` (it streams
+    /// via `build_sse_stream`), so its own rate limit must be reserved on the
+    /// streaming path too. With the judge capped at `rpm: 1`, the first streamed
+    /// ensemble request consumes the judge's only request slot (200); the second
+    /// finds it exhausted and fails before opening the stream (429).
+    #[tokio::test]
+    async fn ensemble_streaming_judge_rate_limit_enforced() {
+        let upstream = MockServer::start().await;
+        let judge_sse = "\
+data: {\"id\":\"cmpl-judge\",\"model\":\"judge-upstream\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-judge\",\"model\":\"judge-upstream\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":7,\"total_tokens\":37}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("Answer 1:"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(judge_sse),
+            )
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-panel",
+                "model": "panel-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "a panel candidate answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 11, "total_tokens": 16}
+            })))
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        snap.models
+            .insert(direct_model_entry("m-panel-a", "panel-a", "panel-upstream"));
+        snap.models
+            .insert(direct_model_entry("m-panel-b", "panel-b", "panel-upstream"));
+        // Judge capped at one request per minute.
+        snap.models.insert(direct_model_entry_rl(
+            "m-judge",
+            "judge-m",
+            "judge-upstream",
+            serde_json::json!({ "rpm": 1 }),
+        ));
+        snap.models.insert(ensemble_model_entry(
+            "m-council",
+            "council",
+            &["panel-a", "panel-b"],
+            "judge-m",
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
+        let app = build_router(build_state(snap, hub));
+
+        let make_req = || {
+            let body = serde_json::json!({
+                "model": "council",
+                "messages": [{"role": "user", "content": "what is the best answer?"}],
+                "stream": true
+            });
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        // First streamed request consumes the judge's only rpm slot.
+        assert_eq!(run(app.clone(), make_req()).await.status(), StatusCode::OK);
+        // Second finds the judge rpm exhausted → 429 before the stream opens.
+        assert_eq!(
+            run(app, make_req()).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    /// #620 (audit M-1): the per-member `commit_tokens` must accrue to the
+    /// member's OWN `model:` TPM bucket. Panel member capped at tpm:10 returns
+    /// 16 tokens: request 1 succeeds and commits 16 (overshoot allowed for the
+    /// in-flight call); request 2's pre-commit sees tpm 16 ≥ 10 and refuses, so
+    /// the single-member panel falls below min_responses → 502. If the member's
+    /// tokens were never committed (or committed to the wrong bucket), tpm would
+    /// stay 0 and request 2 would also succeed.
+    #[tokio::test]
+    async fn ensemble_panel_member_token_commit_accrues_to_model_bucket() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("Answer 1:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-judge",
+                "model": "judge-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "synthesized final answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 30, "completion_tokens": 7, "total_tokens": 37}
+            })))
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-panel",
+                "model": "panel-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "a panel candidate answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 11, "total_tokens": 16}
+            })))
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        // Member's TPM cap (10) is below its per-call token cost (16).
+        snap.models.insert(direct_model_entry_rl(
+            "m-capped",
+            "capped",
+            "panel-upstream",
+            serde_json::json!({ "tpm": 10 }),
+        ));
+        snap.models
+            .insert(direct_model_entry("m-judge", "judge-m", "judge-upstream"));
+        // Single-member panel → min_responses defaults to 1.
+        snap.models.insert(ensemble_model_entry(
+            "m-council",
+            "council",
+            &["capped"],
+            "judge-m",
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
+        let app = build_router(build_state(snap, hub));
+
+        let make_req = || {
+            let body = serde_json::json!({
+                "model": "council",
+                "messages": [{"role": "user", "content": "what is the best answer?"}]
+            });
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        // First request commits the member's 16 tokens to its model: TPM bucket.
+        assert_eq!(run(app.clone(), make_req()).await.status(), StatusCode::OK);
+        // Second request: the committed 16 now exceeds tpm:10 → member refused →
+        // panel below min_responses → 502.
+        assert_eq!(run(app, make_req()).await.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// #620 (audit M-2): a panel member's reservation must RELEASE on a bridge
+    /// ERROR (not just on commit). The member is capped at concurrency:1 and the
+    /// upstream 503s on the first call: request 1's member fails (panel < min →
+    /// 502), and its reservation must drop, freeing the slot. Request 2 (upstream
+    /// 200) must then acquire the slot and succeed. A leaked slot would starve
+    /// request 2 → 502.
+    #[tokio::test]
+    async fn ensemble_panel_member_reservation_released_on_bridge_error() {
+        let upstream = MockServer::start().await;
+        // First panel call fails (503), one time only.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        // Judge synthesis (only reached on the successful second request).
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("Answer 1:"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-judge",
+                "model": "judge-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "synthesized final answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 30, "completion_tokens": 7, "total_tokens": 37}
+            })))
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+        // Panel candidate (the second request's panel call, after the 503 is spent).
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-panel",
+                "model": "panel-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "a panel candidate answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 11, "total_tokens": 16}
+            })))
+            .with_priority(3)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(direct_model_entry_rl(
+            "m-capped",
+            "capped",
+            "panel-upstream",
+            serde_json::json!({ "concurrency": 1 }),
+        ));
+        snap.models
+            .insert(direct_model_entry("m-judge", "judge-m", "judge-upstream"));
+        snap.models.insert(ensemble_model_entry(
+            "m-council",
+            "council",
+            &["capped"],
+            "judge-m",
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
+        let app = build_router(build_state(snap, hub));
+
+        let make_req = || {
+            let body = serde_json::json!({
+                "model": "council",
+                "messages": [{"role": "user", "content": "what is the best answer?"}]
+            });
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        // Request 1: the member's upstream 503s → member fails → panel below
+        // min_responses → 502. Its concurrency:1 slot must be released on drop.
+        assert_eq!(
+            run(app.clone(), make_req()).await.status(),
+            StatusCode::BAD_GATEWAY
+        );
+        // Request 2: upstream now 200. The slot is free (released on the prior
+        // error), so the member succeeds and the ensemble synthesizes → 200.
+        assert_eq!(run(app, make_req()).await.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn ensemble_fans_out_to_panel_and_returns_judge_synthesis() {
         let upstream = MockServer::start().await;

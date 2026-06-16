@@ -238,6 +238,63 @@ pub(crate) async fn enforce_rate_limit(
     reserve_layers(state, auth, model_rl).await
 }
 
+/// Reserve ONLY the model-scoped layers (a model's inline `rate_limit` plus
+/// any `model`-scope `RateLimitPolicy` rows) for one model, identified by its
+/// display name + entry id.
+///
+/// The ensemble fan-out uses this per sub-call: each panel member and the
+/// judge is a separate upstream call that must honor its own model limits,
+/// even though the request-level layers (api_key / team / member) are reserved
+/// once on the entry alias and committed with the aggregate (#620). It
+/// deliberately omits those request-level layers so they are not double-counted
+/// per member. Returns an empty [`MultiReservation`] (zero overhead, no
+/// `pre_commit` calls) when the model carries no limits, so unlimited members
+/// pay nothing. On a partial failure the already-acquired layers release on the
+/// dropped `Vec`, same as [`reserve_layers`].
+pub(crate) async fn reserve_model_only(
+    state: &ProxyState,
+    model_name: &str,
+    model_entry_id: &str,
+    model: &aisix_core::Model,
+) -> Result<MultiReservation, ProxyError> {
+    let mut reservations = Vec::new();
+
+    // Inline model rate limit.
+    let mrl = ModelRateLimit::from_model(model_name, model_entry_id, model);
+    if let Some(ref limits) = mrl.limits {
+        let key = format!("model:{}", mrl.name);
+        let r = state
+            .limiter
+            .pre_commit(&key, limits)
+            .await
+            .map_err(ProxyError::from)?;
+        reservations.push(r);
+    }
+
+    // `model`-scope rate-limit policies for this model. (model scope never
+    // buckets per-user, so the base bucket key suffices — no auth needed.)
+    let snap = state.snapshot.load();
+    for entry in snap.rate_limit_policies.entries() {
+        let policy = &entry.value;
+        if policy.scope != "model" || policy.scope_ref != model_entry_id {
+            continue;
+        }
+        let rl = policy_to_rate_limit(policy);
+        if rl.is_unrestricted() {
+            continue;
+        }
+        let bucket_key = format!("policy:{}:{}:{}", policy.scope, policy.scope_ref, entry.id);
+        let r = state
+            .limiter
+            .pre_commit(&bucket_key, &rl)
+            .await
+            .map_err(ProxyError::from)?;
+        reservations.push(r);
+    }
+
+    Ok(MultiReservation::new(reservations))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
