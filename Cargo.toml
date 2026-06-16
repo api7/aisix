@@ -29,10 +29,7 @@ authors = ["moonming"]
 [workspace.dependencies]
 # Runtime
 tokio = { version = "1.41", features = ["full"] }
-tokio-stream = "0.1"
-tokio-util = "0.7"
 futures = "0.3"
-futures-util = "0.3"
 async-trait = "0.1"
 
 # HTTP server
@@ -40,11 +37,8 @@ axum = { version = "0.7", features = ["macros", "ws", "tracing", "multipart"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "limit", "compression-gzip", "set-header"] }
-hyper = "1.5"
-hyper-util = "0.1"
 http = "1.2"
 http-body-util = "0.1"
-mime = "0.3"
 # Trusted-proxy CIDR matching for real-ip resolution (#492)
 ipnet = "2"
 
@@ -58,17 +52,13 @@ lz4_flex = "0.11"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "multipart"] }
-eventsource-stream = "0.2"
 
 # TLS
 rustls = "0.23"
-tokio-rustls = "0.26"
-rustls-pemfile = "2"
 
 # Serialization / validation
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
 jsonschema = "0.28"
 schemars = "0.8"
 
@@ -93,11 +83,6 @@ hostname = "0.4"
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "registry"] }
-tracing-opentelemetry = "0.28"
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "metrics", "trace"] }
-opentelemetry-semantic-conventions = "0.27"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 
@@ -130,13 +115,6 @@ object_store = { version = "0.13", default-features = false, features = ["aws", 
 # is pure Rust — no zlib/C, consistent with the no-OpenSSL posture.
 flate2 = "1"
 
-# Tokenization / counting (optional hard-mode TPM)
-tiktoken-rs = "0.5"
-
-# Duration / humanised types
-humantime = "2.1"
-humantime-serde = "1.1"
-
 # AWS SDK — kind=bedrock guardrail dispatcher (PRD-09c §6 Phase 2).
 # Pulled into aisix-guardrails only; opt-out via `--no-default-features`
 # on the crate when the operator never plans to use Bedrock.
@@ -149,8 +127,6 @@ aws-smithy-types = "1"
 
 # Test-only
 wiremock = "0.6"
-rstest = "0.23"
-insta = { version = "1", features = ["json", "yaml"] }
 testcontainers = "0.23"
 tempfile = "3.13"
 

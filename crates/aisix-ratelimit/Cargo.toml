@@ -13,14 +13,8 @@ aisix-core = { path = "../aisix-core" }
 tokio.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-chrono.workspace = true
 async-trait.workspace = true
 redis.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-rstest.workspace = true

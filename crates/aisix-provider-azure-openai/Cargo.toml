@@ -19,7 +19,6 @@ aisix-gateway = { path = "../aisix-gateway" }
 # them — keeping a single source of truth for the OpenAI JSON contract.
 aisix-provider-openai = { path = "../aisix-provider-openai" }
 async-trait.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
 serde.workspace = true

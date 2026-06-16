@@ -11,18 +11,13 @@ description = "aisix: Hub-and-Bridge gateway core (ChatFormat, BridgeContext, SS
 [dependencies]
 aisix-core = { path = "../aisix-core" }
 tokio.workspace = true
-tokio-stream.workspace = true
 futures.workspace = true
-futures-util.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
-eventsource-stream.workspace = true
 bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-anyhow.workspace = true
-tracing.workspace = true
 http.workspace = true
 dashmap.workspace = true
 

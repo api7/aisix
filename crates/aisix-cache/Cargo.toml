@@ -9,14 +9,11 @@ authors.workspace = true
 description = "aisix: response cache (in-memory / Redis / semantic)"
 
 [dependencies]
-aisix-core = { path = "../aisix-core" }
 aisix-gateway = { path = "../aisix-gateway" }
 tokio.workspace = true
 async-trait.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
 moka.workspace = true
 redis = { workspace = true, optional = true }
 

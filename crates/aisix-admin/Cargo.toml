@@ -15,7 +15,6 @@ aisix-proxy = { path = "../aisix-proxy" }
 tokio.workspace = true
 axum.workspace = true
 tower.workspace = true
-tower-http.workspace = true
 http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,7 +25,6 @@ async-trait.workspace = true
 dashmap.workspace = true
 etcd-client.workspace = true
 aisix-obs = { path = "../aisix-obs" }
-chrono.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

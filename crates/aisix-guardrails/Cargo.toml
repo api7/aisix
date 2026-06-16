@@ -28,7 +28,6 @@ aws-sdk-bedrockruntime = { workspace = true, optional = true }
 aws-credential-types = { workspace = true, optional = true }
 aws-smithy-async = { workspace = true, optional = true }
 aws-smithy-runtime-api = { workspace = true, optional = true }
-aws-smithy-types = { workspace = true, optional = true }
 
 # kind=azure_content_safety guardrail (PRD-09c §6 P1). reqwest is the
 # HTTP client for the Prompt Shield API call; behind a default feature
@@ -53,7 +52,6 @@ bedrock = [
     "dep:aws-credential-types",
     "dep:aws-smithy-async",
     "dep:aws-smithy-runtime-api",
-    "dep:aws-smithy-types",
 ]
 azure-content-safety = ["dep:reqwest"]
 aliyun-text-moderation = [
