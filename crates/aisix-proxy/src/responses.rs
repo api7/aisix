@@ -1062,7 +1062,9 @@ async fn responses_cross_provider_to_target(
         } else {
             upstream
         };
-        state.health.record_success(requested_model);
+        // Health tracks the concrete resolved target, not the (possibly
+        // group-alias) requested model — matching the non-streaming branch.
+        state.health.record_success(&model.display_name);
         state.runtime_status.mark_healthy(model_id);
 
         let response_id = format!("resp_{}", Uuid::new_v4().simple());
@@ -1072,10 +1074,20 @@ async fn responses_cross_provider_to_target(
             requested_model,
             created_at,
         );
-        // Only an output-hook guardrail needs the streamed response text.
+        // Only an output-hook guardrail needs the streamed response text. When
+        // attached, the bridge buffers the SSE and scans before releasing it
+        // (#719 secure default); cap the buffer the same way the verbatim path
+        // does so a huge response can't OOM the gateway.
         let output_guardrail = (!chain.is_empty()
             && aisix_guardrails::Guardrail::runs_on_output(chain.as_ref()))
         .then(|| chain.clone());
+        let max_buffer_bytes =
+            match aisix_guardrails::Guardrail::stream_output_policy(chain.as_ref()) {
+                aisix_guardrails::StreamOutputPolicy::BufferFull {
+                    max_buffer_bytes, ..
+                } => max_buffer_bytes,
+                _ => aisix_guardrails::DEFAULT_STREAM_OUTPUT_BUFFER_BYTES,
+            };
 
         let state_c = state.clone();
         let request_id_c = request_id.to_string();
@@ -1089,6 +1101,7 @@ async fn responses_cross_provider_to_target(
             encoder,
             started,
             output_guardrail,
+            max_buffer_bytes,
             requested_model.to_string(),
             move |comp| {
                 // Streams that reach here are committed 200s.
@@ -1097,7 +1110,7 @@ async fn responses_cross_provider_to_target(
                     completion_tokens: comp.completion_tokens,
                     reasoning_tokens: comp.reasoning_tokens,
                     cached_prompt_tokens: comp.cached_prompt_tokens,
-                    cache_creation_tokens: 0,
+                    cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
                 };
                 emit_usage_event(
@@ -2244,6 +2257,111 @@ mod tests {
             body.starts_with("event: ") || body.starts_with("data: "),
             "SSE shape preserved on release",
         );
+    }
+
+    /// Anthropic Messages streaming SSE carrying a single text delta.
+    fn anthropic_text_sse(text: &str) -> String {
+        format!(
+            "event: message_start\n\
+             data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_g\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-haiku-20240307\",\"content\":[],\"usage\":{{\"input_tokens\":5,\"output_tokens\":0}}}}}}\n\n\
+             event: content_block_start\n\
+             data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+             event: content_block_delta\n\
+             data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":{text}}}}}\n\n\
+             event: content_block_stop\n\
+             data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n\
+             event: message_delta\n\
+             data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":3}}}}\n\n\
+             event: message_stop\n\
+             data: {{\"type\":\"message_stop\"}}\n\n",
+            text = serde_json::to_string(text).unwrap(),
+        )
+    }
+
+    /// #825 + #719: the cross-provider (bridged) streaming path must enforce
+    /// output guardrails too — else `stream:true` against a non-OpenAI model
+    /// bypasses the block. The bridge buffers the encoded SSE and, on a
+    /// block, emits only a terminal `error` event; no output_text delta with
+    /// the blocked literal reaches the client.
+    #[tokio::test]
+    async fn output_guardrail_blocks_streaming_cross_provider_response() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(anthropic_text_sse("sure: BLOCKME here")),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic_at(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"claude-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        // The SSE 200 is committed by the first-chunk failover peek; the block
+        // surfaces as an in-band terminal error event.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("content_filter"),
+            "missing block error: {body}"
+        );
+        assert!(
+            !body.contains("BLOCKME"),
+            "blocked content leaked in stream: {body}"
+        );
+        assert!(
+            !body.contains("response.output_text.delta"),
+            "held-back deltas leaked: {body}"
+        );
+    }
+
+    /// #825 companion: a clean bridged streaming response with an output
+    /// guardrail is scanned then released in full.
+    #[tokio::test]
+    async fn output_guardrail_allows_clean_streaming_cross_provider_response() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(anthropic_text_sse("a clean answer")),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic_at(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"claude-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("a clean answer"),
+            "clean body withheld: {body}"
+        );
+        assert!(body.contains("response.completed"));
     }
 
     /// #719 (audit HIGH-1): the streaming hold-back buffer is capped so a

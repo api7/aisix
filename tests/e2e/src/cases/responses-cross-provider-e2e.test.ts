@@ -101,8 +101,10 @@ async function startOtlpReceiver(): Promise<OtlpReceiver> {
             }
           }
         }
-      } catch {
-        // ignore malformed bodies — assertions fail on missing spans
+      } catch (err) {
+        // Surface malformed OTLP so a decode bug is obvious rather than only
+        // showing up later as a missing-span assertion failure.
+        console.error("OTLP receiver failed to parse body:", err);
       }
       res.statusCode = 200;
       res.end("{}");

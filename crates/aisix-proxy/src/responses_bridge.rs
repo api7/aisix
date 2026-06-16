@@ -65,12 +65,14 @@ pub fn responses_request_to_chat(model: &str, body: &Value) -> ChatFormat {
         .map(|f| f as f32);
     chat.top_p = body.get("top_p").and_then(|v| v.as_f64()).map(|f| f as f32);
     // Responses calls the cap `max_output_tokens`; tolerate `max_tokens`
-    // too for clients that send the chat-style name.
+    // too for clients that send the chat-style name. A value that doesn't
+    // fit u32 is dropped (left unset) rather than silently wrapped to a
+    // small/zero cap.
     chat.max_tokens = body
         .get("max_output_tokens")
         .or_else(|| body.get("max_tokens"))
         .and_then(|v| v.as_u64())
-        .map(|n| n as u32);
+        .and_then(|n| u32::try_from(n).ok());
     chat.stream = body.get("stream").and_then(|v| v.as_bool());
 
     // Tools/tool_choice ride `extra` in OpenAI chat shape; every provider
@@ -416,17 +418,23 @@ pub struct ResponsesSseEncoder {
     text_item_id: Option<String>,
     text_output_index: u32,
     text_accum: String,
-    text_done_emitted: bool,
+    /// Set once the per-item `*.done` events have been emitted, so
+    /// `close_items` is idempotent across the finish chunk + `force_finish`.
+    items_closed: bool,
     // Tool-call items keyed by the OpenAI delta index.
     tool_calls: std::collections::BTreeMap<u64, ToolCallState>,
-    /// Withheld terminal status while waiting on a trailing usage frame.
+    /// Withheld terminal status + incomplete reason while waiting on a
+    /// trailing usage frame.
     pending_status: Option<&'static str>,
+    pending_reason: Option<&'static str>,
     // Accumulated usage (max semantics, robust to double-emit).
     usage_seen: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
+    total_tokens: u32,
     reasoning_tokens: u32,
     cached_prompt_tokens: u32,
+    cache_creation_tokens: u32,
     cache_read_tokens: u32,
 }
 
@@ -447,14 +455,17 @@ impl ResponsesSseEncoder {
             text_item_id: None,
             text_output_index: 0,
             text_accum: String::new(),
-            text_done_emitted: false,
+            items_closed: false,
             tool_calls: std::collections::BTreeMap::new(),
             pending_status: None,
+            pending_reason: None,
             usage_seen: false,
             prompt_tokens: 0,
             completion_tokens: 0,
+            total_tokens: 0,
             reasoning_tokens: 0,
             cached_prompt_tokens: 0,
+            cache_creation_tokens: 0,
             cache_read_tokens: 0,
         }
     }
@@ -475,22 +486,54 @@ impl ResponsesSseEncoder {
             self.usage_seen = true;
             self.prompt_tokens = self.prompt_tokens.max(u.prompt_tokens);
             self.completion_tokens = self.completion_tokens.max(u.completion_tokens);
+            self.total_tokens = self.total_tokens.max(u.total_tokens);
             self.reasoning_tokens = self.reasoning_tokens.max(u.reasoning_tokens);
             self.cached_prompt_tokens = self.cached_prompt_tokens.max(u.cached_prompt_tokens);
+            self.cache_creation_tokens = self.cache_creation_tokens.max(u.cache_creation_tokens);
             self.cache_read_tokens = self.cache_read_tokens.max(u.cache_read_tokens);
         }
     }
 
     fn usage_value(&self) -> Value {
+        // `responses_usage_json` keeps a provider-supplied `total_tokens`
+        // when present and only falls back to prompt+completion when it's 0.
         responses_usage_json(&UsageStats {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
-            total_tokens: self.prompt_tokens.saturating_add(self.completion_tokens),
+            total_tokens: self.total_tokens,
             cached_prompt_tokens: self.cached_prompt_tokens,
             reasoning_tokens: self.reasoning_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
             cache_read_tokens: self.cache_read_tokens,
             ..Default::default()
         })
+    }
+
+    /// The assembled assistant output for an end-of-stream output guardrail
+    /// scan: the full accumulated text plus the fully-reassembled tool calls
+    /// in canonical OpenAI `{id, type, function:{name, arguments}}` shape (so
+    /// an argument literal split across chunks is scanned as one string, not
+    /// as disjoint fragments).
+    pub fn assembled_assistant_message(&self) -> (String, Vec<Value>) {
+        let mut tool_calls: Vec<(u32, Value)> = self
+            .tool_calls
+            .values()
+            .map(|tc| {
+                (
+                    tc.output_index,
+                    json!({
+                        "id": tc.call_id,
+                        "type": "function",
+                        "function": {"name": tc.name, "arguments": tc.arguments},
+                    }),
+                )
+            })
+            .collect();
+        tool_calls.sort_by_key(|(idx, _)| *idx);
+        (
+            self.text_accum.clone(),
+            tool_calls.into_iter().map(|(_, v)| v).collect(),
+        )
     }
 
     /// The bare response object embedded in lifecycle events.
@@ -553,7 +596,8 @@ impl ResponsesSseEncoder {
         if let Some(status) = self.pending_status {
             if self.usage_seen {
                 self.pending_status = None;
-                return vec![self.completed_event(status)];
+                let reason = self.pending_reason.take();
+                return vec![self.completed_event(status, reason)];
             }
             return Vec::new();
         }
@@ -702,12 +746,13 @@ impl ResponsesSseEncoder {
         // ── Finish ──
         if let Some(fr) = chunk.finish_reason.as_ref() {
             events.extend(self.close_items());
-            let (status, _) = responses_status(fr);
+            let (status, reason) = responses_status(fr);
             if self.usage_seen {
-                events.push(self.completed_event(status));
+                events.push(self.completed_event(status, reason));
             } else {
                 // Hold response.completed until the trailing usage frame.
                 self.pending_status = Some(status);
+                self.pending_reason = reason;
             }
         }
 
@@ -715,11 +760,16 @@ impl ResponsesSseEncoder {
     }
 
     /// Emit the per-item `*.done` closing events for the open text + tool
-    /// items. Idempotent across calls.
+    /// items. Idempotent: a no-op after the first call, so the finish chunk
+    /// and a later `force_finish` (when the completed event was withheld for
+    /// usage) don't double-emit the done events.
     fn close_items(&mut self) -> Vec<ResponsesSseEvent> {
+        if self.items_closed {
+            return Vec::new();
+        }
+        self.items_closed = true;
         let mut events = Vec::new();
-        if self.text_item_id.is_some() && !self.text_done_emitted {
-            self.text_done_emitted = true;
+        if self.text_item_id.is_some() {
             let item_id = self.text_item_id.clone().unwrap_or_default();
             let output_index = self.text_output_index;
             let text = self.text_accum.clone();
@@ -785,17 +835,18 @@ impl ResponsesSseEncoder {
         events
     }
 
-    fn completed_event(&mut self, status: &str) -> ResponsesSseEvent {
+    fn completed_event(&mut self, status: &str, reason: Option<&'static str>) -> ResponsesSseEvent {
         self.finished = true;
         let event_type = if status == "completed" {
             "response.completed"
         } else {
             "response.incomplete"
         };
-        self.event(
-            event_type,
-            json!({"response": self.response_object(status, true, true)}),
-        )
+        let mut response = self.response_object(status, true, true);
+        if let Some(reason) = reason {
+            response["incomplete_details"] = json!({"reason": reason});
+        }
+        self.event(event_type, json!({"response": response}))
     }
 
     pub fn is_finished(&self) -> bool {
@@ -823,8 +874,9 @@ impl ResponsesSseEncoder {
             ));
         }
         let status = self.pending_status.take().unwrap_or("completed");
+        let reason = self.pending_reason.take();
         events.extend(self.close_items());
-        events.push(self.completed_event(status));
+        events.push(self.completed_event(status, reason));
         events
     }
 }
@@ -836,6 +888,7 @@ pub struct ResponsesStreamCompletion {
     pub completion_tokens: u32,
     pub reasoning_tokens: u32,
     pub cached_prompt_tokens: u32,
+    pub cache_creation_tokens: u32,
     pub cache_read_tokens: u32,
     pub finish_reason: String,
     pub ttft_ms: u32,
@@ -864,17 +917,24 @@ impl<F: FnOnce(ResponsesStreamCompletion)> Drop for CompleteOnDrop<F> {
 }
 
 /// Wrap a bridge [`ChatChunkStream`] as a Responses-API SSE body, encoding
-/// each chunk via [`ResponsesSseEncoder`]. Mirrors the `/v1/messages`
-/// `build_anthropic_sse_stream`: the assistant output text is accumulated
-/// for the end-of-stream output guardrail (#719) and an end-of-stream
-/// telemetry callback fires from a Drop guard (so it runs on normal end and
-/// on client disconnect). On an output-guardrail block a terminal `error`
-/// event is emitted instead of completing the stream.
+/// each chunk via [`ResponsesSseEncoder`]. An end-of-stream telemetry
+/// callback fires from a Drop guard (so it runs on normal end and on client
+/// disconnect).
+///
+/// When `output_guardrail` is `Some`, the encoded SSE is **held back** and
+/// released only after the assembled assistant output passes the scan —
+/// mirroring the verbatim `/v1/responses` path's secure BufferFull default
+/// (#719), so a configured output block can't be bypassed by streaming a
+/// non-OpenAI model. The scan reads the fully-reassembled text + tool calls
+/// (not raw deltas), and the buffer is capped — an output guardrail must
+/// never release content it couldn't fully buffer to scan, so an overflow
+/// fails closed. With no output guardrail the bytes forward live.
 pub fn build_responses_bridge_stream(
     upstream: ChatChunkStream,
     encoder: ResponsesSseEncoder,
     started: Instant,
     output_guardrail: Option<Arc<aisix_guardrails::GuardrailChain>>,
+    max_buffer_bytes: usize,
     model_label: String,
     on_complete: impl FnOnce(ResponsesStreamCompletion) + Send + 'static,
 ) -> axum::body::Body {
@@ -885,8 +945,12 @@ pub fn build_responses_bridge_stream(
         let mut guard = CompleteOnDrop { slot: Some((on_complete, ResponsesStreamCompletion::default())) };
         let mut upstream = upstream;
         let mut first_chunk_seen = false;
-        let mut content_text = String::new();
-        let mut tool_call_fragments: Vec<Value> = Vec::new();
+        let buffering = output_guardrail.is_some();
+        // Held SSE events when an output guardrail is attached; empty (and
+        // unused) on the live-forward path.
+        let mut held: Vec<bytes::Bytes> = Vec::new();
+        let mut held_bytes = 0usize;
+        let mut overflowed = false;
         while let Some(item) = upstream.next().await {
             match item {
                 Ok(chunk) => {
@@ -907,21 +971,24 @@ pub fn build_responses_bridge_stream(
                             comp.completion_tokens = comp.completion_tokens.max(u.completion_tokens);
                             comp.reasoning_tokens = comp.reasoning_tokens.max(u.reasoning_tokens);
                             comp.cached_prompt_tokens = comp.cached_prompt_tokens.max(u.cached_prompt_tokens);
+                            comp.cache_creation_tokens = comp.cache_creation_tokens.max(u.cache_creation_tokens);
                             comp.cache_read_tokens = comp.cache_read_tokens.max(u.cache_read_tokens);
                         }
                     }
-                    if output_guardrail.is_some() {
-                        if let Some(t) = chunk.delta.content.as_deref() {
-                            content_text.push_str(t);
-                        }
-                        if let Some(tcs) = chunk.delta.tool_calls.as_ref() {
-                            tool_call_fragments.extend(tcs.iter().cloned());
-                        }
-                    }
                     for ev in encoder.next_events(&chunk) {
-                        yield Ok::<_, std::io::Error>(bytes::Bytes::from(ev.to_sse_string()));
+                        let b = bytes::Bytes::from(ev.to_sse_string());
+                        if buffering {
+                            held_bytes += b.len();
+                            if held_bytes > max_buffer_bytes {
+                                overflowed = true;
+                                break;
+                            }
+                            held.push(b);
+                        } else {
+                            yield Ok::<_, std::io::Error>(b);
+                        }
                     }
-                    if encoder.is_finished() {
+                    if overflowed || encoder.is_finished() {
                         break;
                     }
                 }
@@ -936,56 +1003,86 @@ pub fn build_responses_bridge_stream(
                 }
             }
         }
-        // End-of-stream output guardrail (#719): scan accumulated output and,
-        // on a block, emit a terminal error event rather than completing.
-        if let Some(chain) = output_guardrail.as_ref() {
-            if !content_text.is_empty() || !tool_call_fragments.is_empty() {
-                let mut message =
-                    aisix_gateway::ChatMessage::assistant(std::mem::take(&mut content_text));
-                if !tool_call_fragments.is_empty() {
-                    message.extra.insert(
-                        "tool_calls".to_string(),
-                        Value::Array(std::mem::take(&mut tool_call_fragments)),
-                    );
-                }
-                let synth = ChatResponse {
-                    id: String::new(),
-                    model: model_label.clone(),
-                    message,
-                    finish_reason: FinishReason::Stop,
-                    usage: UsageStats::new(0, 0),
-                };
-                if let aisix_guardrails::GuardrailVerdict::Block {
-                    reason,
-                    guardrail_name,
-                } = aisix_guardrails::Guardrail::check_output(chain.as_ref(), &synth).await
-                {
-                    tracing::warn!(
-                        guardrail_hook = "output",
-                        model = %model_label,
-                        reason = %reason,
-                        "guardrail blocked streaming /v1/responses (cross-provider) response",
-                    );
-                    let frame = format!(
-                        "event: error\ndata: {}\n\n",
-                        json!({
-                            "type": "error",
-                            "code": "content_filter",
-                            "message": crate::error::guardrail_block_message("response", guardrail_name.as_deref()),
-                        })
-                    );
-                    yield Ok(bytes::Bytes::from(frame));
-                    return;
+        if !encoder.is_finished() {
+            for ev in encoder.force_finish() {
+                let b = bytes::Bytes::from(ev.to_sse_string());
+                if buffering {
+                    held_bytes += b.len();
+                    if held_bytes > max_buffer_bytes {
+                        overflowed = true;
+                        break;
+                    }
+                    held.push(b);
+                } else {
+                    yield Ok(b);
                 }
             }
         }
-        if !encoder.is_finished() {
-            for ev in encoder.force_finish() {
-                yield Ok(bytes::Bytes::from(ev.to_sse_string()));
+
+        // Live-forward path: nothing held, nothing to scan.
+        let Some(chain) = output_guardrail.as_ref() else { return; };
+
+        // Buffer overflow: an output guardrail must not release content it
+        // couldn't fully buffer to scan — fail closed (#719).
+        if overflowed {
+            tracing::warn!(
+                guardrail_hook = "output",
+                model = %model_label,
+                max_buffer_bytes,
+                "streaming /v1/responses (cross-provider) output exceeded buffer cap; failing closed",
+            );
+            yield Ok(bytes::Bytes::from(guardrail_error_frame(None)));
+            return;
+        }
+
+        // End-of-stream output guardrail (#719): scan the fully-reassembled
+        // assistant output (canonical tool calls, so a literal split across
+        // argument deltas can't slip through), then release or block.
+        let (text, tool_calls) = encoder.assembled_assistant_message();
+        if !text.is_empty() || !tool_calls.is_empty() {
+            let mut message = aisix_gateway::ChatMessage::assistant(text);
+            if !tool_calls.is_empty() {
+                message.extra.insert("tool_calls".to_string(), Value::Array(tool_calls));
             }
+            let synth = ChatResponse {
+                id: String::new(),
+                model: model_label.clone(),
+                message,
+                finish_reason: FinishReason::Stop,
+                usage: UsageStats::new(0, 0),
+            };
+            if let aisix_guardrails::GuardrailVerdict::Block { reason, guardrail_name } =
+                aisix_guardrails::Guardrail::check_output(chain.as_ref(), &synth).await
+            {
+                tracing::warn!(
+                    guardrail_hook = "output",
+                    model = %model_label,
+                    reason = %reason,
+                    "guardrail blocked streaming /v1/responses (cross-provider) response",
+                );
+                yield Ok(bytes::Bytes::from(guardrail_error_frame(guardrail_name.as_deref())));
+                return;
+            }
+        }
+        // Passed: release the held events verbatim.
+        for b in held {
+            yield Ok(b);
         }
     };
     axum::body::Body::from_stream(stream)
+}
+
+/// Responses-API SSE `error` frame for an output-guardrail block. Carries the
+/// firing guardrail's name (#519 B.4b) but never the matched-pattern detail.
+fn guardrail_error_frame(guardrail_name: Option<&str>) -> String {
+    format!(
+        "event: error\ndata: {}\n\n",
+        json!({
+            "type": "error",
+            "code": "content_filter",
+            "message": crate::error::guardrail_block_message("response", guardrail_name),
+        })
+    )
 }
 
 fn finish_reason_label(reason: &FinishReason) -> String {
@@ -1111,6 +1208,14 @@ mod tests {
         );
         assert!(!chat.extra.contains_key("reasoning"));
         assert!(!chat.extra.contains_key("store"));
+    }
+
+    #[test]
+    fn out_of_range_max_output_tokens_is_ignored_not_truncated() {
+        // A value above u32::MAX must not wrap to a small/zero cap.
+        let body = json!({"model": "m", "input": "hi", "max_output_tokens": 10_000_000_000u64});
+        let chat = responses_request_to_chat("m", &body);
+        assert_eq!(chat.max_tokens, None);
     }
 
     // ── Non-streaming response translation ───────────────────────
@@ -1327,5 +1432,86 @@ mod tests {
             ]
         );
         assert!(enc.is_finished());
+    }
+
+    #[test]
+    fn tool_call_finish_without_usage_then_force_finish_does_not_double_close() {
+        // Finish chunk lacks usage → done events emitted, completed withheld.
+        // force_finish must NOT re-emit the per-item done events.
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let _ = enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta {
+                tool_calls: Some(vec![json!({
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "shell", "arguments": "{}"},
+                })]),
+                ..Default::default()
+            },
+            finish_reason: None,
+            usage: None,
+        });
+        let at_finish = enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::ToolCalls),
+            usage: None,
+        });
+        assert_eq!(
+            types_of(&at_finish)
+                .iter()
+                .filter(|t| **t == "response.output_item.done")
+                .count(),
+            1
+        );
+        assert!(!enc.is_finished());
+        let tail = enc.force_finish();
+        // The trailing close emits only response.completed, not a second
+        // round of done events.
+        assert_eq!(types_of(&tail), vec!["response.completed"]);
+    }
+
+    #[test]
+    fn streaming_preserves_provider_total_tokens() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let _ = enc.next_events(&content_chunk("hi"));
+        let done = enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::Stop),
+            // Provider reports an authoritative total that differs from
+            // prompt+completion (e.g. it counts tool/system overhead).
+            usage: Some(UsageStats {
+                prompt_tokens: 5,
+                completion_tokens: 2,
+                total_tokens: 11,
+                ..Default::default()
+            }),
+        });
+        let completed = done.last().unwrap();
+        assert_eq!(completed.data["response"]["usage"]["total_tokens"], 11);
+    }
+
+    #[test]
+    fn streaming_length_finish_emits_incomplete_with_reason() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0);
+        let _ = enc.next_events(&content_chunk("partial"));
+        let done = enc.next_events(&ChatChunk {
+            id: "c".into(),
+            model: "m".into(),
+            delta: ChatDelta::default(),
+            finish_reason: Some(FinishReason::Length),
+            usage: Some(UsageStats::new(3, 9)),
+        });
+        let completed = done.last().unwrap();
+        assert_eq!(completed.event_type, "response.incomplete");
+        assert_eq!(completed.data["response"]["status"], "incomplete");
+        assert_eq!(
+            completed.data["response"]["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
     }
 }
