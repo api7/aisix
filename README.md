@@ -135,6 +135,8 @@ Same gateway binary, same proxy API. **AISIX Cloud** adds the managed control pl
   <img src="docs/assets/aisix-cloud-console-tour.gif" alt="AISIX Cloud dashboard tour — overview metrics, multi-provider models, guardrails, budgets with hard-stop spend caps, and observability exporters" width="100%">
   <br>
   <em>The AISIX Cloud dashboard — overview metrics, multi-provider models, guardrails, budgets (with hard-stop spend caps), and observability exporters, across all your gateways.</em>
+  <br><br>
+  <a href="https://aisix-demo.api7.ai/"><b>▶ Try the live dashboard demo — aisix-demo.api7.ai</b></a>
 </p>
 
 | | Self-hosted (this repo) | [AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) (managed) |
