@@ -53,7 +53,7 @@ jobs:
       AWS_ROLE_ARN: ${{ secrets.AISIX_E2E_OIDC_AWS_ROLE_ARN }}
       AWS_REGION_CFG: ${{ secrets.AISIX_E2E_OBJSTORE_S3_REGION }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
@@ -74,7 +74,7 @@ jobs:
 
       - name: Assume the AWS IAM role via GitHub OIDC (keyless)
         if: env.AWS_ROLE_ARN != '' && env.AWS_REGION_CFG != ''
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION_CFG }}

@@ -15,7 +15,7 @@ jobs:
     name: lint (fmt + clippy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -30,7 +30,7 @@ jobs:
     name: schema drift (resources)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
@@ -48,7 +48,7 @@ jobs:
     name: generate admin openapi
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
@@ -115,7 +115,7 @@ jobs:
       # Picked up by crates/aisix-etcd/tests/watch_integration.rs.
       ETCD_TEST_URL: http://127.0.0.1:2379
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -125,7 +125,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: unit tests with coverage
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov-unit.info
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage-unit
           path: lcov-unit.info
@@ -138,7 +138,7 @@ jobs:
       RUSTFLAGS: "-C instrument-coverage"
       LLVM_PROFILE_FILE: "coverage/aisix-%p-%m.profraw"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -146,7 +146,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: build
         run: cargo build -p aisix-server --bin aisix
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: aisix-bin
           path: target/debug/aisix
@@ -169,16 +169,16 @@ jobs:
         image: redis:7-alpine
         ports: ["6379:6379"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
         with:
           name: aisix-bin
           path: target/debug
       - run: chmod +x target/debug/aisix
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 9
       - name: check harness exists
@@ -198,7 +198,7 @@ jobs:
         if: steps.harness.outputs.present == 'true'
         working-directory: tests/e2e
         run: pnpm test
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: coverage-e2e
@@ -211,10 +211,10 @@ jobs:
     needs: [rust-unit, e2e]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
         with: { name: coverage-unit, path: cov/unit }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         # The e2e job invokes `pnpm test` which is `vitest run` with no
         # `--coverage` flag, so `tests/e2e/coverage/lcov.info` is never
         # written and no `coverage-e2e` artifact is produced. The upload
@@ -238,7 +238,7 @@ jobs:
             echo "::error::Coverage ${pct}% below threshold ${threshold}%"
             exit 1
           }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage-combined
           path: cov/combined.info

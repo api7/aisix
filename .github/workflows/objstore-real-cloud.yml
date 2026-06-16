@@ -84,7 +84,7 @@ jobs:
       AISIX_E2E_OBJSTORE_AZURE_CONTAINER: ${{ secrets.AISIX_E2E_OBJSTORE_AZURE_CONTAINER }}
       AISIX_E2E_OBJSTORE_AZURE_ENDPOINT: ${{ secrets.AISIX_E2E_OBJSTORE_AZURE_ENDPOINT }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
