@@ -1,0 +1,88 @@
+<svg viewBox="0 0 1200 510" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="ttl dsc" font-family="ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title id="ttl">AISIX AI Gateway architecture</title>
+  <desc id="dsc">Your apps speak one OpenAI- or Anthropic-compatible API to the AISIX gateway, which applies API key auth, rate limiting and budgets, guardrails, caching, routing and failover, and observability, then dispatches to providers including OpenAI, Anthropic, Google Gemini and Vertex, AWS Bedrock, Azure OpenAI, DeepSeek, and any OpenAI-compatible endpoint.</desc>
+  <defs>
+    <marker id="arw" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2f54eb"/>
+    </marker>
+  </defs>
+  <style>
+    .bg{fill:#f6f8fc;}
+    .zlabel{fill:#6b7280;font-size:13px;font-weight:700;letter-spacing:1.5px;}
+    .pill{fill:#ffffff;stroke:#dfe3ee;stroke-width:1.5;}
+    .ptext{fill:#1f2733;font-size:15px;font-weight:600;}
+    .cap{fill:#8a909c;font-size:12.5px;}
+    .gw{fill:#ffffff;stroke:#2f54eb;stroke-width:2;}
+    .gwtitle{fill:#2f54eb;font-size:21px;font-weight:800;}
+    .gwsub{fill:#8a909c;font-size:12.5px;font-weight:600;}
+    .chip{fill:#eef2ff;stroke:#c7d2fe;stroke-width:1.5;}
+    .ctext{fill:#1e2746;font-size:14.5px;font-weight:700;}
+    .csub{fill:#6b7280;font-size:11.5px;}
+    .obs{fill:#f0f4ff;stroke:#c7d2fe;stroke-width:1.5;}
+    .otext{fill:#3a4668;font-size:13px;font-weight:600;}
+    .flow{stroke:#2f54eb;stroke-width:2.5;fill:none;}
+    .dot{fill:#2f54eb;}
+  </style>
+
+  <rect class="bg" x="0" y="0" width="1200" height="510" rx="18"/>
+
+  <text class="zlabel" x="48" y="78">YOUR APPS &amp; AGENTS</text>
+  <rect class="pill" x="48" y="98" width="196" height="44" rx="11"/>
+  <text class="ptext" x="146" y="126" text-anchor="middle">OpenAI SDK</text>
+  <rect class="pill" x="48" y="152" width="196" height="44" rx="11"/>
+  <text class="ptext" x="146" y="180" text-anchor="middle">Anthropic SDK</text>
+  <rect class="pill" x="48" y="206" width="196" height="44" rx="11"/>
+  <text class="ptext" x="146" y="234" text-anchor="middle">LangChain · agents</text>
+  <rect class="pill" x="48" y="260" width="196" height="44" rx="11"/>
+  <text class="ptext" x="146" y="288" text-anchor="middle">curl · HTTP</text>
+  <text class="cap" x="48" y="332">one OpenAI- / Anthropic-</text>
+  <text class="cap" x="48" y="350">compatible API</text>
+
+  <path class="flow" d="M250,210 L302,210" marker-end="url(#arw)"/>
+
+  <rect class="gw" x="312" y="70" width="576" height="312" rx="18"/>
+  <circle class="dot" cx="338" cy="106" r="6"/>
+  <text class="gwtitle" x="356" y="113">AISIX AI Gateway</text>
+  <text class="gwsub" x="357" y="134">open-source core · single Rust binary</text>
+
+  <rect class="chip" x="332" y="156" width="170" height="86" rx="12"/>
+  <text class="ctext" x="417" y="195" text-anchor="middle">API key auth</text>
+  <text class="csub" x="417" y="215" text-anchor="middle">allowlist · model ACL</text>
+  <rect class="chip" x="517" y="156" width="170" height="86" rx="12"/>
+  <text class="ctext" x="602" y="195" text-anchor="middle">Rate limit &amp; budget</text>
+  <text class="csub" x="602" y="215" text-anchor="middle">RPM/TPM · spend caps</text>
+  <rect class="chip" x="702" y="156" width="170" height="86" rx="12"/>
+  <text class="ctext" x="787" y="195" text-anchor="middle">Guardrails</text>
+  <text class="csub" x="787" y="215" text-anchor="middle">input &amp; output</text>
+
+  <rect class="chip" x="332" y="256" width="170" height="86" rx="12"/>
+  <text class="ctext" x="417" y="295" text-anchor="middle">Cache</text>
+  <text class="csub" x="417" y="315" text-anchor="middle">memory · Redis</text>
+  <rect class="chip" x="517" y="256" width="170" height="86" rx="12"/>
+  <text class="ctext" x="602" y="295" text-anchor="middle">Routing &amp; failover</text>
+  <text class="csub" x="602" y="315" text-anchor="middle">weighted · retries</text>
+  <rect class="chip" x="702" y="256" width="170" height="86" rx="12"/>
+  <text class="ctext" x="787" y="295" text-anchor="middle">Observability</text>
+  <text class="csub" x="787" y="315" text-anchor="middle">metrics · logs · traces</text>
+
+  <path class="flow" d="M888,210 L940,210" marker-end="url(#arw)"/>
+
+  <text class="zlabel" x="954" y="78">PROVIDERS</text>
+  <rect class="pill" x="954" y="98" width="200" height="40" rx="11"/>
+  <text class="ptext" x="1054" y="123" text-anchor="middle">OpenAI</text>
+  <rect class="pill" x="954" y="146" width="200" height="40" rx="11"/>
+  <text class="ptext" x="1054" y="171" text-anchor="middle">Anthropic</text>
+  <rect class="pill" x="954" y="194" width="200" height="40" rx="11"/>
+  <text class="ptext" x="1054" y="219" text-anchor="middle">Gemini · Vertex</text>
+  <rect class="pill" x="954" y="242" width="200" height="40" rx="11"/>
+  <text class="ptext" x="1054" y="267" text-anchor="middle">Bedrock · Azure</text>
+  <rect class="pill" x="954" y="290" width="200" height="40" rx="11"/>
+  <text class="ptext" x="1054" y="315" text-anchor="middle">DeepSeek</text>
+  <text class="cap" x="954" y="352">+ any OpenAI-compatible</text>
+
+  <path class="flow" d="M600,382 L600,420" marker-end="url(#arw)"/>
+
+  <rect class="obs" x="48" y="426" width="1106" height="58" rx="12"/>
+  <text class="zlabel" x="72" y="452" fill="#2f54eb">OBSERVABILITY</text>
+  <text class="otext" x="72" y="472">Prometheus   ·   OTLP / GenAI spans   ·   Langfuse   ·   Honeycomb   ·   Datadog   ·   Grafana Cloud   ·   Aliyun SLS</text>
+</svg>

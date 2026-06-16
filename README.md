@@ -22,6 +22,10 @@ static binary with low per-request overhead. Self-host for free, forever.
 [**AISIX Cloud**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) ·
 [**Roadmap**](docs/roadmap.md)
 
+<br>
+
+<img src="docs/assets/aisix-architecture.svg" alt="AISIX AI Gateway architecture — one OpenAI- or Anthropic-compatible API in front of OpenAI, Anthropic, Gemini/Vertex, Bedrock, Azure OpenAI, and DeepSeek, with API key auth, rate limits and budgets, guardrails, caching, routing and failover, and observability in between" width="100%">
+
 </div>
 
 ---
@@ -128,9 +132,9 @@ Plus specialized handling for vendor quirks (e.g. DeepSeek reasoning content) an
 Same gateway binary, same proxy API. **AISIX Cloud** adds the managed control plane on top.
 
 <p align="center">
-  <img src="docs/assets/aisix-cloud-playground.gif" alt="AISIX Cloud dashboard — test a model in the playground" width="100%">
+  <img src="docs/assets/aisix-cloud-console-tour.gif" alt="AISIX Cloud dashboard tour — overview metrics, multi-provider models, guardrails, budgets with hard-stop spend caps, and observability exporters" width="100%">
   <br>
-  <em>The AISIX Cloud dashboard — test a model in the playground, with routing, guardrails, budgets, and observability across your gateways.</em>
+  <em>The AISIX Cloud dashboard — overview metrics, multi-provider models, guardrails, budgets (with hard-stop spend caps), and observability exporters, across all your gateways.</em>
 </p>
 
 | | Self-hosted (this repo) | [AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) (managed) |
