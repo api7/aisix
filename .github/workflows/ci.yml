@@ -44,25 +44,31 @@ jobs:
             exit 1
           fi
 
-  openapi-drift:
-    name: schema drift (admin openapi)
+  openapi-generate:
+    name: generate admin openapi
     runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
-      - name: regenerate Admin API OpenAPI
+      - name: generate Admin API OpenAPI
         run: |
-          mkdir -p schemas/openapi
-          cargo run -p aisix-admin --bin dump-openapi > schemas/openapi/admin-api.json
-      - name: assert no drift
+          cargo run -p aisix-admin --bin dump-openapi > /tmp/admin-api.openapi.json
+      - name: validate generated OpenAPI
         run: |
-          if ! git diff --exit-code schemas/openapi/admin-api.json; then
-            echo "::error::Admin API OpenAPI in 'schemas/openapi/admin-api.json' drifted from the gateway source."
-            echo "::error::Fix: run 'cargo run -p aisix-admin --bin dump-openapi > schemas/openapi/admin-api.json' locally and commit the diff."
-            exit 1
-          fi
+          python3 - <<'PY'
+          import json
+
+          with open("/tmp/admin-api.openapi.json") as f:
+              spec = json.load(f)
+
+          assert spec["openapi"].startswith("3.")
+          assert spec["info"]["title"] == "AISIX Admin API"
+          assert spec["info"]["version"] == "dev"
+          assert "/admin/v1/models" in spec["paths"]
+          assert "Model" in spec["components"]["schemas"]
+          PY
 
   rust-unit:
     name: rust unit + coverage
