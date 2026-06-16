@@ -5,14 +5,14 @@
 # /etc/aisix/config.yaml). Two intended modes:
 #
 #   Standalone — operator mounts their own config:
-#       docker run -v ./config.yaml:/etc/aisix/config.yaml ghcr.io/moonming/ai-gateway:main
+#       docker run -v ./config.yaml:/etc/aisix/config.yaml ghcr.io/api7/ai-gateway:dev
 #
 #   Managed (aisix.cloud tenant) — use the baked-in template + env vars:
 #       docker run \
 #         -e AISIX_CONFIG_PATH=/etc/aisix/config.managed.yaml \
 #         -e AISIX_MANAGED__REGISTRATION_TOKEN=$DEPLOYMENT_TOKEN \
 #         -e AISIX_MANAGED__CP_BASE_URL=https://api.us.aisix.cloud \
-#         ghcr.io/moonming/ai-gateway:main
+#         ghcr.io/api7/ai-gateway:dev
 #
 # The Rust binary's `Config::load_from_path` already layers
 # `AISIX_<UPPER>__<UPPER>` env vars on top of the YAML, so any field
