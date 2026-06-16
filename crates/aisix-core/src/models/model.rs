@@ -40,9 +40,9 @@ pub enum Adapter {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelCost {
-    /// Input (prompt) token cost in USD per 1,000 tokens.
+    /// Prompt token cost in USD per 1,000 tokens.
     pub input_per_1k: f64,
-    /// Output (completion) token cost in USD per 1,000 tokens.
+    /// Completion token cost in USD per 1,000 tokens.
     pub output_per_1k: f64,
 }
 
@@ -80,19 +80,18 @@ pub struct BackgroundModelCheck {
 #[serde(deny_unknown_fields)]
 pub struct CooldownConfig {
     /// Whether cooldown is active for this model. Default: true.
-    /// Set to `false` to disable cooldown entirely (the model stays in
-    /// rotation regardless of upstream failures).
+    /// Set to `false` to keep the model in rotation regardless of upstream failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
-    /// Cooldown TTL in seconds when the upstream did not supply a
-    /// `Retry-After` header (or `honor_retry_after=false`). Default: 30.
+    /// Cooldown TTL in seconds when the upstream did not supply a `Retry-After`
+    /// header or `honor_retry_after` is `false`. Default: 30.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_seconds: Option<u64>,
     /// Upper bound on cooldown TTL when `Retry-After` is used. Default: 600 seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_seconds: Option<u64>,
-    /// Whether to use the upstream's `Retry-After` header (seconds form)
-    /// as the cooldown TTL when present. Default: true.
+    /// Whether to use the upstream's `Retry-After` header as the cooldown TTL
+    /// when it contains seconds. Default: true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub honor_retry_after: Option<bool>,
     /// Status codes that trigger cooldown. Defaults to

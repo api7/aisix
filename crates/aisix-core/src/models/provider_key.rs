@@ -215,7 +215,7 @@ pub struct ResponseOverrides {
 
     /// When `true`, the request-body `messages[*].content` array of
     /// text blocks gets flattened to a single string before dispatch.
-    /// Defaults to `false` (no flattening).
+    /// Defaults to `false`, so no flattening is applied.
     #[serde(default)]
     pub content_list_to_string: bool,
 

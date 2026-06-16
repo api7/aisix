@@ -75,12 +75,11 @@ pub struct OtlpHttpConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AliyunSlsConfig {
-    /// SLS region endpoint host with no scheme, e.g.
-    /// `ap-southeast-3.log.aliyuncs.com`. The signed request host is
-    /// `<project>.<endpoint>`.
+    /// SLS regional endpoint host without a scheme, such as `ap-southeast-3.log.aliyuncs.com`.
+    /// Signed requests are sent to this endpoint with the SLS project as the host prefix.
     pub endpoint: String,
 
-    /// SLS project name (the `<project>` in the request host).
+    /// SLS project that prefixes the regional endpoint in signed requests.
     pub project: String,
 
     /// SLS logstore that receives the request-event logs.
@@ -137,8 +136,8 @@ pub struct DatadogConfig {
     pub ddsource: String,
 
     /// Operator-defined tags rendered into Datadog's comma-joined `ddtags`
-    /// reserved attribute (e.g. `["team:platform", "tier:prod"]` →
-    /// `team:platform,tier:prod`). Empty by default.
+    /// reserved attribute. For example, `["team:platform", "tier:prod"]`
+    /// becomes `team:platform,tier:prod`. Empty by default.
     #[serde(default)]
     pub tags: Vec<String>,
 
@@ -215,7 +214,7 @@ pub enum ObjectStoreProvider {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectStoreCompression {
-    /// gzip compression (RFC 1952). This is the default and is accepted by Snowpipe and Auto Loader.
+    /// gzip compression as defined by RFC 1952. This is the default and is accepted by Snowpipe and Auto Loader.
     #[default]
     Gzip,
     /// No compression. Emits raw NDJSON.
@@ -228,8 +227,8 @@ pub enum ObjectStoreCompression {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectStoreAuthMode {
-    /// Resolve `credential_ref` to static keys from the data plane environment
-    /// (`OBJSTORE_CRED_<SLUG>_<FIELD>`). The default.
+    /// Resolve `credential_ref` to static keys from data plane environment
+    /// variables named `OBJSTORE_CRED_<SLUG>_<FIELD>`. The default.
     #[default]
     CredentialRef,
     /// Use the data plane host's attached cloud identity. Supported for S3 and GCS only.

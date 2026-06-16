@@ -188,7 +188,7 @@
       "type": "object",
       "properties": {
         "default_seconds": {
-          "description": "Cooldown TTL in seconds when the upstream did not supply a `Retry-After` header (or `honor_retry_after=false`). Default: 30.",
+          "description": "Cooldown TTL in seconds when the upstream did not supply a `Retry-After` header or `honor_retry_after` is `false`. Default: 30.",
           "type": [
             "integer",
             "null"
@@ -197,14 +197,14 @@
           "minimum": 0.0
         },
         "enabled": {
-          "description": "Whether cooldown is active for this model. Default: true. Set to `false` to disable cooldown entirely (the model stays in rotation regardless of upstream failures).",
+          "description": "Whether cooldown is active for this model. Default: true. Set to `false` to keep the model in rotation regardless of upstream failures.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "honor_retry_after": {
-          "description": "Whether to use the upstream's `Retry-After` header (seconds form) as the cooldown TTL when present. Default: true.",
+          "description": "Whether to use the upstream's `Retry-After` header as the cooldown TTL when it contains seconds. Default: true.",
           "type": [
             "boolean",
             "null"
@@ -321,12 +321,12 @@
       ],
       "properties": {
         "input_per_1k": {
-          "description": "Input (prompt) token cost in USD per 1,000 tokens.",
+          "description": "Prompt token cost in USD per 1,000 tokens.",
           "type": "number",
           "format": "double"
         },
         "output_per_1k": {
-          "description": "Output (completion) token cost in USD per 1,000 tokens.",
+          "description": "Completion token cost in USD per 1,000 tokens.",
           "type": "number",
           "format": "double"
         }
@@ -405,7 +405,7 @@
           "minimum": 0.0
         },
         "rpd": {
-          "description": "Requests per day (86400s window).",
+          "description": "Requests per 86,400-second window.",
           "type": [
             "integer",
             "null"
@@ -414,7 +414,7 @@
           "minimum": 0.0
         },
         "rph": {
-          "description": "Requests per hour (3600s window). There is no per-hour token limit field.",
+          "description": "Requests per 3,600-second window. There is no per-hour token limit field.",
           "type": [
             "integer",
             "null"
@@ -423,7 +423,7 @@
           "minimum": 0.0
         },
         "rpm": {
-          "description": "Requests per minute (60s window).",
+          "description": "Requests per 60-second window.",
           "type": [
             "integer",
             "null"
@@ -432,7 +432,7 @@
           "minimum": 0.0
         },
         "rps": {
-          "description": "Requests per second (1s window). There is no per-second token limit field.",
+          "description": "Requests per 1-second window. There is no per-second token limit field.",
           "type": [
             "integer",
             "null"
@@ -441,7 +441,7 @@
           "minimum": 0.0
         },
         "tpd": {
-          "description": "Tokens per day (86400s window).",
+          "description": "Tokens per 86,400-second window.",
           "type": [
             "integer",
             "null"
@@ -450,7 +450,7 @@
           "minimum": 0.0
         },
         "tpm": {
-          "description": "Tokens per minute (60s window).",
+          "description": "Tokens per 60-second window.",
           "type": [
             "integer",
             "null"

@@ -16,29 +16,27 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimit {
-    /// Tokens per minute (60s window).
+    /// Tokens per 60-second window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tpm: Option<u64>,
 
-    /// Tokens per day (86400s window).
+    /// Tokens per 86,400-second window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tpd: Option<u64>,
 
-    /// Requests per second (1s window). There is no per-second token limit
-    /// field.
+    /// Requests per 1-second window. There is no per-second token limit field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rps: Option<u64>,
 
-    /// Requests per minute (60s window).
+    /// Requests per 60-second window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpm: Option<u64>,
 
-    /// Requests per hour (3600s window). There is no per-hour token limit
-    /// field.
+    /// Requests per 3,600-second window. There is no per-hour token limit field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rph: Option<u64>,
 
-    /// Requests per day (86400s window).
+    /// Requests per 86,400-second window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpd: Option<u64>,
 

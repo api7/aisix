@@ -48,7 +48,7 @@
           ]
         },
         "guardrail_id": {
-          "description": "AWS-console-issued guardrail identifier (12 chars today).",
+          "description": "Guardrail identifier issued by the AWS console.",
           "type": "string"
         },
         "guardrail_version": {
@@ -62,7 +62,7 @@
           ]
         },
         "latency_mode": {
-          "description": "`serial` (default) or `timed { timeout_ms }`.",
+          "description": "Bedrock guardrail latency policy. Defaults to `serial`. Use `timed` with `timeout_ms` to cap wait time.",
           "allOf": [
             {
               "$ref": "#/definitions/BedrockLatencyMode"
@@ -70,7 +70,7 @@
           ]
         },
         "region": {
-          "description": "AWS region the Bedrock endpoint lives in (e.g. `us-east-1`).",
+          "description": "AWS region for the Bedrock endpoint, such as `us-east-1`.",
           "type": "string"
         }
       }
@@ -85,7 +85,7 @@
       ],
       "properties": {
         "api_key": {
-          "description": "Subscription key (`Ocp-Apim-Subscription-Key`). Decrypted before projection. Plaintext is held in memory only and is not logged.",
+          "description": "Azure subscription key sent with the `Ocp-Apim-Subscription-Key` header. Decrypted before projection. Plaintext is held in memory only and is not logged.",
           "type": "string"
         },
         "endpoint": {
@@ -117,7 +117,7 @@
       ],
       "properties": {
         "api_key": {
-          "description": "Subscription key (`Ocp-Apim-Subscription-Key`). Plaintext is held in memory only and is not logged.",
+          "description": "Azure subscription key sent with the `Ocp-Apim-Subscription-Key` header. Plaintext is held in memory only and is not logged.",
           "type": "string"
         },
         "blocklist_names": {
@@ -164,17 +164,17 @@
           "minimum": 0.0
         },
         "on_buffer_exceeded": {
-          "description": "`fail_closed` (default) or `fail_open` when the buffer cap is hit.",
+          "description": "Buffer-overflow policy. Defaults to `fail_closed`. Use `fail_open` to allow output when the buffer cap is hit.",
           "default": "fail_closed",
           "type": "string"
         },
         "output_fail_open": {
-          "description": "Fail-open policy for the output hook. Defaults to `false` (fail-closed), so an Azure outage does not release unscanned model output.",
+          "description": "Fail-open policy for the output hook. Defaults to `false`, so an Azure outage does not release unscanned model output.",
           "default": false,
           "type": "boolean"
         },
         "output_type": {
-          "description": "`FourSeverityLevels` (0, 2, 4, 6) or `EightSeverityLevels` (0 through 7).",
+          "description": "Severity scale. Use `FourSeverityLevels` for 0, 2, 4, and 6, or `EightSeverityLevels` for 0 through 7.",
           "default": "FourSeverityLevels",
           "type": "string"
         },
@@ -186,7 +186,7 @@
           "minimum": 0.0
         },
         "severity_threshold_by_category": {
-          "description": "Per-category threshold overrides (take precedence over the general one).",
+          "description": "Per-category threshold overrides. These take precedence over the general threshold.",
           "default": {},
           "type": "object",
           "additionalProperties": {
@@ -201,7 +201,7 @@
           "type": "string"
         },
         "text_source": {
-          "description": "Input-hook text selection: `concatenate_user_content` (default) or `concatenate_all_content`. Ignored on the output hook.",
+          "description": "Input-hook text selection. Defaults to `concatenate_user_content`. Use `concatenate_all_content` to include all message content. Ignored on the output hook.",
           "default": "concatenate_user_content",
           "type": "string"
         },
@@ -268,12 +268,12 @@
           "minimum": 0.0
         },
         "on_buffer_exceeded": {
-          "description": "`fail_closed` (default) or `fail_open` when the buffer cap is hit.",
+          "description": "Buffer-overflow policy. Defaults to `fail_closed`. Use `fail_open` to allow output when the buffer cap is hit.",
           "default": "fail_closed",
           "type": "string"
         },
         "output_fail_open": {
-          "description": "Fail-open policy for the OUTPUT hook. Defaults `false` (fail-closed) so an Aliyun outage does not release unscanned model output.",
+          "description": "Fail-open policy for the output hook. Defaults to `false`, so an Aliyun outage does not release unscanned model output.",
           "default": false,
           "type": "boolean"
         },
@@ -282,7 +282,7 @@
           "type": "string"
         },
         "risk_level_threshold": {
-          "description": "Minimum risk level that triggers a block: `low`, `medium`, or `high` (default). A returned level at or above this blocks.",
+          "description": "Minimum risk level that triggers a block: `low`, `medium`, or `high`. Defaults to `high`. A returned level at or above this blocks.",
           "default": "high",
           "type": "string"
         },

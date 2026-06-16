@@ -116,7 +116,7 @@ pub struct AzureContentSafetyConfig {
     /// `https://my-resource.cognitiveservices.azure.com`.
     /// The data plane appends `/contentsafety/text:shieldPrompt?api-version=2024-09-01`.
     pub endpoint: String,
-    /// Subscription key (`Ocp-Apim-Subscription-Key`). Decrypted before
+    /// Azure subscription key sent with the `Ocp-Apim-Subscription-Key` header. Decrypted before
     /// projection. Plaintext is held in memory only and is not logged.
     pub api_key: String,
     /// HTTP call timeout in milliseconds. A value of `0` triggers the timeout immediately.
@@ -143,7 +143,7 @@ pub struct AzureContentSafetyTextModerationConfig {
     /// Azure Cognitive Services resource endpoint. The data plane appends
     /// `/contentsafety/text:analyze?api-version=2024-09-01`.
     pub endpoint: String,
-    /// Subscription key (`Ocp-Apim-Subscription-Key`). Plaintext is held in
+    /// Azure subscription key sent with the `Ocp-Apim-Subscription-Key` header. Plaintext is held in
     /// memory only and is not logged.
     pub api_key: String,
     /// HTTP call timeout in milliseconds. `fail_open` and `output_fail_open`
@@ -153,7 +153,7 @@ pub struct AzureContentSafetyTextModerationConfig {
     pub timeout_ms: u32,
 
     // --- moderation parameters ---
-    /// `FourSeverityLevels` (0, 2, 4, 6) or `EightSeverityLevels` (0 through 7).
+    /// Severity scale. Use `FourSeverityLevels` for 0, 2, 4, and 6, or `EightSeverityLevels` for 0 through 7.
     #[serde(default = "default_acs_output_type")]
     pub output_type: String,
     /// Categories to analyze. Defaults to all four.
@@ -162,7 +162,7 @@ pub struct AzureContentSafetyTextModerationConfig {
     /// General severity threshold. A category at or above it blocks.
     #[serde(default = "default_acs_severity_threshold")]
     pub severity_threshold: u8,
-    /// Per-category threshold overrides (take precedence over the general one).
+    /// Per-category threshold overrides. These take precedence over the general threshold.
     #[serde(default)]
     pub severity_threshold_by_category: std::collections::BTreeMap<String, u8>,
     /// Azure CS blocklist names to match against.
@@ -171,8 +171,8 @@ pub struct AzureContentSafetyTextModerationConfig {
     /// Forwarded to Azure's `haltOnBlocklistHit`.
     #[serde(default)]
     pub halt_on_blocklist_hit: bool,
-    /// Input-hook text selection: `concatenate_user_content` (default) or
-    /// `concatenate_all_content`. Ignored on the output hook.
+    /// Input-hook text selection. Defaults to `concatenate_user_content`.
+    /// Use `concatenate_all_content` to include all message content. Ignored on the output hook.
     #[serde(default = "default_acs_text_source")]
     pub text_source: String,
 
@@ -192,11 +192,10 @@ pub struct AzureContentSafetyTextModerationConfig {
     /// applies. Default 262 144.
     #[serde(default = "default_acs_max_buffer_bytes")]
     pub max_buffer_bytes: u64,
-    /// `fail_closed` (default) or `fail_open` when the buffer cap is hit.
+    /// Buffer-overflow policy. Defaults to `fail_closed`. Use `fail_open` to allow output when the buffer cap is hit.
     #[serde(default = "default_acs_on_buffer_exceeded")]
     pub on_buffer_exceeded: String,
-    /// Fail-open policy for the output hook. Defaults to `false`
-    /// (fail-closed), so an Azure outage does not release unscanned model output.
+    /// Fail-open policy for the output hook. Defaults to `false`, so an Azure outage does not release unscanned model output.
     #[serde(default)]
     pub output_fail_open: bool,
 }
@@ -271,7 +270,7 @@ pub struct AliyunTextModerationConfig {
     /// in memory only and is not logged. Used to sign the request.
     pub access_key_secret: String,
     /// Minimum risk level that triggers a block: `low`, `medium`, or
-    /// `high` (default). A returned level at or above this blocks.
+    /// `high`. Defaults to `high`. A returned level at or above this blocks.
     #[serde(default = "default_aliyun_risk_level_threshold")]
     pub risk_level_threshold: String,
     /// HTTP call timeout in milliseconds. `fail_open` and `output_fail_open`
@@ -279,8 +278,8 @@ pub struct AliyunTextModerationConfig {
     /// immediately.
     #[serde(default = "default_acs_timeout_ms")]
     pub timeout_ms: u32,
-    /// Fail-open policy for the OUTPUT hook. Defaults `false` (fail-closed)
-    /// so an Aliyun outage does not release unscanned model output.
+    /// Fail-open policy for the output hook. Defaults to `false`, so an Aliyun
+    /// outage does not release unscanned model output.
     #[serde(default)]
     pub output_fail_open: bool,
 
@@ -301,7 +300,7 @@ pub struct AliyunTextModerationConfig {
     /// applies. Default 262 144.
     #[serde(default = "default_acs_max_buffer_bytes")]
     pub max_buffer_bytes: u64,
-    /// `fail_closed` (default) or `fail_open` when the buffer cap is hit.
+    /// Buffer-overflow policy. Defaults to `fail_closed`. Use `fail_open` to allow output when the buffer cap is hit.
     #[serde(default = "default_acs_on_buffer_exceeded")]
     pub on_buffer_exceeded: String,
 }
@@ -324,15 +323,15 @@ fn default_aliyun_window_overlap_size() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BedrockConfig {
-    /// AWS-console-issued guardrail identifier (12 chars today).
+    /// Guardrail identifier issued by the AWS console.
     pub guardrail_id: String,
     /// Version label: `DRAFT`, `1`, `2`, ...
     pub guardrail_version: String,
-    /// AWS region the Bedrock endpoint lives in (e.g. `us-east-1`).
+    /// AWS region for the Bedrock endpoint, such as `us-east-1`.
     pub region: String,
     /// IAM credentials for Bedrock requests.
     pub aws_credentials: BedrockAWSCredentials,
-    /// `serial` (default) or `timed { timeout_ms }`.
+    /// Bedrock guardrail latency policy. Defaults to `serial`. Use `timed` with `timeout_ms` to cap wait time.
     pub latency_mode: BedrockLatencyMode,
 }
 

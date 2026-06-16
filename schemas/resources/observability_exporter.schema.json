@@ -89,7 +89,7 @@
           "type": "string"
         },
         "endpoint": {
-          "description": "SLS region endpoint host with no scheme, e.g. `ap-southeast-3.log.aliyuncs.com`. The signed request host is `<project>.<endpoint>`.",
+          "description": "SLS regional endpoint host without a scheme, such as `ap-southeast-3.log.aliyuncs.com`. Signed requests are sent to this endpoint with the SLS project as the host prefix.",
           "type": "string"
         },
         "kind": {
@@ -103,7 +103,7 @@
           "type": "string"
         },
         "project": {
-          "description": "SLS project name (the `<project>` in the request host).",
+          "description": "SLS project that prefixes the regional endpoint in signed requests.",
           "type": "string"
         }
       }
@@ -229,7 +229,7 @@
           "type": "string"
         },
         "tags": {
-          "description": "Operator-defined tags rendered into Datadog's comma-joined `ddtags` reserved attribute (e.g. `[\"team:platform\", \"tier:prod\"]` → `team:platform,tier:prod`). Empty by default.",
+          "description": "Operator-defined tags rendered into Datadog's comma-joined `ddtags` reserved attribute. For example, `[\"team:platform\", \"tier:prod\"]` becomes `team:platform,tier:prod`. Empty by default.",
           "default": [],
           "type": "array",
           "items": {
@@ -258,7 +258,7 @@
       "description": "How the data plane obtains credentials for the object-storage bucket.",
       "oneOf": [
         {
-          "description": "Resolve `credential_ref` to static keys from the data plane environment (`OBJSTORE_CRED_<SLUG>_<FIELD>`). The default.",
+          "description": "Resolve `credential_ref` to static keys from data plane environment variables named `OBJSTORE_CRED_<SLUG>_<FIELD>`. The default.",
           "type": "string",
           "enum": [
             "credential_ref"
@@ -277,7 +277,7 @@
       "description": "File compression for object-storage uploads.",
       "oneOf": [
         {
-          "description": "gzip compression (RFC 1952). This is the default and is accepted by Snowpipe and Auto Loader.",
+          "description": "gzip compression as defined by RFC 1952. This is the default and is accepted by Snowpipe and Auto Loader.",
           "type": "string",
           "enum": [
             "gzip"

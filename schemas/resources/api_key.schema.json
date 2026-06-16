@@ -59,7 +59,7 @@
           "minimum": 0.0
         },
         "rpd": {
-          "description": "Requests per day (86400s window).",
+          "description": "Requests per 86,400-second window.",
           "type": [
             "integer",
             "null"
@@ -68,7 +68,7 @@
           "minimum": 0.0
         },
         "rph": {
-          "description": "Requests per hour (3600s window). There is no per-hour token limit field.",
+          "description": "Requests per 3,600-second window. There is no per-hour token limit field.",
           "type": [
             "integer",
             "null"
@@ -77,7 +77,7 @@
           "minimum": 0.0
         },
         "rpm": {
-          "description": "Requests per minute (60s window).",
+          "description": "Requests per 60-second window.",
           "type": [
             "integer",
             "null"
@@ -86,7 +86,7 @@
           "minimum": 0.0
         },
         "rps": {
-          "description": "Requests per second (1s window). There is no per-second token limit field.",
+          "description": "Requests per 1-second window. There is no per-second token limit field.",
           "type": [
             "integer",
             "null"
@@ -95,7 +95,7 @@
           "minimum": 0.0
         },
         "tpd": {
-          "description": "Tokens per day (86400s window).",
+          "description": "Tokens per 86,400-second window.",
           "type": [
             "integer",
             "null"
@@ -104,7 +104,7 @@
           "minimum": 0.0
         },
         "tpm": {
-          "description": "Tokens per minute (60s window).",
+          "description": "Tokens per 60-second window.",
           "type": [
             "integer",
             "null"
