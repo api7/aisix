@@ -111,6 +111,87 @@ impl<'a> AnthropicMessage<'a> {
             _lifetime: std::marker::PhantomData,
         }
     }
+
+    /// Assistant turn replayed from conversation history, carrying its
+    /// text (when any) plus any OpenAI-shape `tool_calls` translated into
+    /// Anthropic `tool_use` blocks. An agent loop replays the assistant's
+    /// prior tool calls before sending the matching tool results; without
+    /// translating `tool_calls` here the following `tool_result` would
+    /// reference a `tool_use` the upstream never saw and 400. Empty text
+    /// with no tool calls degrades to an empty text block so the message
+    /// isn't dropped (Anthropic rejects an empty `content` array).
+    pub(crate) fn assistant(text: &str, tool_calls: Option<&[serde_json::Value]>) -> Self {
+        let mut content: Vec<serde_json::Value> = Vec::new();
+        if !text.is_empty() {
+            content.push(serde_json::json!({"type": "text", "text": text}));
+        }
+        if let Some(tcs) = tool_calls {
+            content.extend(tool_use_blocks_from_openai(tcs));
+        }
+        if content.is_empty() {
+            content.push(serde_json::json!({"type": "text", "text": ""}));
+        }
+        Self {
+            role: "assistant",
+            content,
+            _lifetime: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Translate an array of OpenAI-shape `tool_calls`
+/// (`{id, type:"function", function:{name, arguments}}`, `arguments` a
+/// JSON string) into Anthropic `tool_use` content blocks
+/// (`{type:"tool_use", id, name, input}`, `input` the parsed arguments
+/// object). Entries missing an id or name are skipped; arguments that
+/// don't parse to an object degrade to `{}`. Shared by the request-history
+/// path ([`AnthropicMessage::assistant`]) and the response path
+/// ([`chat_response_into_anthropic_json`]).
+fn tool_use_blocks_from_openai(tool_calls: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    tool_calls
+        .iter()
+        .filter_map(|tc| {
+            let id = tc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())?;
+            let name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .filter(|s| !s.is_empty())?;
+            let input = tc
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(|a| a.as_str())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .filter(|v| v.is_object())
+                .unwrap_or(serde_json::json!({}));
+            Some(serde_json::json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                "input": input,
+            }))
+        })
+        .collect()
+}
+
+/// Merge adjacent messages that share a role by concatenating their
+/// content blocks. Anthropic requires strictly alternating user/assistant
+/// turns; a multi-turn tool loop (or parallel tool calls) produces
+/// consecutive same-role turns — e.g. several `tool_result` replies, each
+/// a `user` turn — that the upstream rejects with "messages: roles must
+/// alternate" unless folded into one message.
+fn merge_consecutive_roles(messages: Vec<AnthropicMessage<'_>>) -> Vec<AnthropicMessage<'_>> {
+    let mut merged: Vec<AnthropicMessage<'_>> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        match merged.last_mut() {
+            Some(last) if last.role == msg.role => last.content.extend(msg.content),
+            _ => merged.push(msg),
+        }
+    }
+    merged
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -153,7 +234,12 @@ pub fn split_system<'a>(
             }
             Role::Assistant => {
                 seen_non_system = true;
-                messages.push(AnthropicMessage::text("assistant", m.content_str()));
+                let tool_calls = m
+                    .extra
+                    .get("tool_calls")
+                    .and_then(|v| v.as_array())
+                    .map(Vec::as_slice);
+                messages.push(AnthropicMessage::assistant(m.content_str(), tool_calls));
             }
             Role::Tool => {
                 seen_non_system = true;
@@ -171,7 +257,10 @@ pub fn split_system<'a>(
     } else {
         Some(system_parts.join("\n\n"))
     };
-    Ok((system, messages))
+    // Fold consecutive same-role turns so the alternating-role invariant
+    // Anthropic enforces holds for multi-turn tool loops and parallel
+    // tool calls.
+    Ok((system, merge_consecutive_roles(messages)))
 }
 
 pub fn build_request<'a>(
@@ -847,33 +936,7 @@ pub fn chat_response_into_anthropic_json(
         .get("tool_calls")
         .and_then(|v| v.as_array())
     {
-        for tc in tool_calls {
-            let id = match tc.get("id").and_then(|v| v.as_str()) {
-                Some(s) if !s.is_empty() => s,
-                _ => continue,
-            };
-            let name = match tc
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-            {
-                Some(s) if !s.is_empty() => s,
-                _ => continue,
-            };
-            let input = tc
-                .get("function")
-                .and_then(|f| f.get("arguments"))
-                .and_then(|a| a.as_str())
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                .filter(|v| v.is_object())
-                .unwrap_or(serde_json::json!({}));
-            content.push(serde_json::json!({
-                "type": "tool_use",
-                "id": id,
-                "name": name,
-                "input": input,
-            }));
-        }
+        content.extend(tool_use_blocks_from_openai(tool_calls));
     }
 
     if content.is_empty() {
@@ -1311,8 +1374,15 @@ mod tests {
         );
         let (system, msgs) = split_system(&req).unwrap();
         assert!(system.is_none());
-        assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[1].role, "user"); // former system message
+        // The interleaved system message becomes a user turn and folds into
+        // the adjacent user turn (alternating-role invariant): one user
+        // message carrying both text blocks, then the assistant turn.
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content.len(), 2);
+        assert_eq!(msgs[0].content[0]["text"], "hi");
+        assert_eq!(msgs[0].content[1]["text"], "forget everything");
+        assert_eq!(msgs[1].role, "assistant");
     }
 
     #[test]
@@ -1348,7 +1418,7 @@ mod tests {
             "claude",
             vec![
                 ChatMessage::user("What's the weather in SF?"),
-                // (skipping the assistant turn for brevity in test setup)
+                tool_call_assistant("toolu_abc", "get_weather", "{\"city\":\"SF\"}"),
                 ChatMessage {
                     role: Role::Tool,
                     content: Some("72F, sunny".into()),
@@ -1360,13 +1430,123 @@ mod tests {
             ],
         );
         let (_system, msgs) = split_system(&req).unwrap();
-        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs.len(), 3);
         // Tool turn became a user turn with a tool_result block.
-        assert_eq!(msgs[1].role, "user");
-        assert_eq!(msgs[1].content.len(), 1);
-        assert_eq!(msgs[1].content[0]["type"], "tool_result");
-        assert_eq!(msgs[1].content[0]["tool_use_id"], "toolu_abc");
-        assert_eq!(msgs[1].content[0]["content"], "72F, sunny");
+        assert_eq!(msgs[2].role, "user");
+        assert_eq!(msgs[2].content.len(), 1);
+        assert_eq!(msgs[2].content[0]["type"], "tool_result");
+        assert_eq!(msgs[2].content[0]["tool_use_id"], "toolu_abc");
+        assert_eq!(msgs[2].content[0]["content"], "72F, sunny");
+    }
+
+    /// Build an assistant ChatMessage replaying a single tool call, the
+    /// OpenAI history shape an agent loop sends back.
+    fn tool_call_assistant(id: &str, name: &str, arguments: &str) -> ChatMessage {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "tool_calls".into(),
+            serde_json::json!([{
+                "id": id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }]),
+        );
+        ChatMessage {
+            role: Role::Assistant,
+            content: None,
+            content_blocks: None,
+            name: None,
+            tool_call_id: None,
+            extra,
+        }
+    }
+
+    #[test]
+    fn split_system_translates_assistant_tool_calls_to_tool_use() {
+        // Agent-loop turn 2: the caller replays the assistant's prior
+        // tool call as OpenAI-shape `tool_calls` in message.extra. Without
+        // translation the tool_use is dropped and the following
+        // tool_result orphans → Anthropic 400.
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                ChatMessage::user("weather in SF?"),
+                tool_call_assistant("toolu_1", "get_weather", "{\"city\":\"SF\"}"),
+                ChatMessage {
+                    role: Role::Tool,
+                    content: Some("72F".into()),
+                    content_blocks: None,
+                    name: None,
+                    tool_call_id: Some("toolu_1".into()),
+                    extra: serde_json::Map::new(),
+                },
+            ],
+        );
+        let (_system, msgs) = split_system(&req).unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1].role, "assistant");
+        let block = &msgs[1].content[0];
+        assert_eq!(block["type"], "tool_use");
+        assert_eq!(block["id"], "toolu_1");
+        assert_eq!(block["name"], "get_weather");
+        assert_eq!(block["input"]["city"], "SF");
+        // The tool result alternates back as a user turn.
+        assert_eq!(msgs[2].role, "user");
+        assert_eq!(msgs[2].content[0]["type"], "tool_result");
+    }
+
+    #[test]
+    fn split_system_merges_parallel_tool_results_into_one_user_turn() {
+        // Parallel tool calls produce two consecutive tool_result turns;
+        // they must fold into a single user message so roles still
+        // alternate (assistant → user) for the upstream.
+        let mut assistant_extra = serde_json::Map::new();
+        assistant_extra.insert(
+            "tool_calls".into(),
+            serde_json::json!([
+                {"id": "t1", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+                {"id": "t2", "type": "function", "function": {"name": "b", "arguments": "{}"}},
+            ]),
+        );
+        let req = ChatFormat::new(
+            "claude",
+            vec![
+                ChatMessage::user("go"),
+                ChatMessage {
+                    role: Role::Assistant,
+                    content: None,
+                    content_blocks: None,
+                    name: None,
+                    tool_call_id: None,
+                    extra: assistant_extra,
+                },
+                ChatMessage {
+                    role: Role::Tool,
+                    content: Some("r1".into()),
+                    content_blocks: None,
+                    name: None,
+                    tool_call_id: Some("t1".into()),
+                    extra: serde_json::Map::new(),
+                },
+                ChatMessage {
+                    role: Role::Tool,
+                    content: Some("r2".into()),
+                    content_blocks: None,
+                    name: None,
+                    tool_call_id: Some("t2".into()),
+                    extra: serde_json::Map::new(),
+                },
+            ],
+        );
+        let (_system, msgs) = split_system(&req).unwrap();
+        // user, assistant(2 tool_use), user(2 tool_result)
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(msgs[1].content.len(), 2);
+        assert_eq!(msgs[2].role, "user");
+        assert_eq!(msgs[2].content.len(), 2);
+        assert_eq!(msgs[2].content[0]["tool_use_id"], "t1");
+        assert_eq!(msgs[2].content[1]["tool_use_id"], "t2");
     }
 
     #[test]

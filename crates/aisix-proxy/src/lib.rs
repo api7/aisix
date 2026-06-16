@@ -50,6 +50,7 @@ mod render;
 mod request_id;
 mod rerank;
 mod responses;
+mod responses_bridge;
 mod routing;
 mod state;
 mod stream_timeout;
