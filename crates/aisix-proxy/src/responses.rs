@@ -20,7 +20,9 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::StreamExt;
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 use crate::attempt::{
     attempt_error_from_proxy, ms_since, AttemptInfo, AttemptRecord, RoutingTelemetry,
@@ -83,7 +85,8 @@ impl From<ProxyError> for ResponsesDispatchError {
 }
 
 /// Subset of the OpenAI Responses-API `usage` block the gateway
-/// surfaces for telemetry. Other fields (`total_tokens`,
+/// surfaces for telemetry (plus the two Anthropic cache counters carried
+/// only on the #825 cross-provider bridge path). Other fields (`total_tokens`,
 /// `output_tokens_details.audio_tokens`, etc.) are intentionally
 /// dropped here — cp-api's `dpmgr_usage_events` table records only
 /// the ones below.
@@ -99,6 +102,15 @@ struct ResponseUsage {
     /// OpenAI prompt-cache hit count, subset of `prompt_tokens`,
     /// surfaced via `usage.input_tokens_details.cached_tokens`.
     cached_prompt_tokens: u32,
+    /// Anthropic `cache_creation_input_tokens` (cache write). Always 0 on
+    /// the verbatim OpenAI path; carried for the cross-provider bridge
+    /// path (#825) so an Anthropic-backed /v1/responses call bills cache
+    /// writes the same way /v1/messages does.
+    cache_creation_tokens: u32,
+    /// Anthropic `cache_read_input_tokens` (cache read). Always 0 on the
+    /// verbatim OpenAI path (OpenAI surfaces cache hits via
+    /// `cached_prompt_tokens` instead).
+    cache_read_tokens: u32,
 }
 
 pub async fn responses(
@@ -289,13 +301,16 @@ async fn dispatch(
         api_key_id: &auth.entry.id,
         team_id: auth.key().team_id.as_deref(),
     };
-    let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    // Arc so the chain can be cloned into the cross-provider streaming
+    // response body (which outlives this handler) for end-of-stream output
+    // guardrails (#825), mirroring /v1/messages.
+    let resolved_chain = Arc::new(state.guardrail_index.resolve(&guardrail_ctx));
     if !resolved_chain.is_empty() {
         let chat = responses_input_to_chat(&model_name, body);
         if let aisix_guardrails::GuardrailVerdict::Block {
             reason,
             guardrail_name,
-        } = aisix_guardrails::Guardrail::check_input(&resolved_chain, &chat).await
+        } = aisix_guardrails::Guardrail::check_input(resolved_chain.as_ref(), &chat).await
         {
             // Per #153 the matched-pattern detail stays in ops logs only; the
             // wire envelope names only the guardrail that fired (#519 B.4b)
@@ -321,9 +336,11 @@ async fn dispatch(
         crate::quota::ModelRateLimit::from_model(&model_name, &model_entry.id, &model_entry.value);
     let _reservation = crate::quota::enforce(state, auth, Some(&model_rl)).await?;
 
-    // Resolve the attempt list (routing-aware). /v1/responses is
-    // OpenAI-only, so we attempt the group's OpenAI targets in order; a
-    // direct model resolves to itself (#471).
+    // Resolve the attempt list (routing-aware). A Model Group walks its
+    // targets in order; a direct model resolves to itself (#471). OpenAI
+    // targets take the verbatim Responses passthrough; every other provider
+    // is bridged through ChatFormat (#825), so a group can mix and fail over
+    // across both kinds.
     let attempt_models = crate::routing::resolve_attempt_models(
         &state.routing,
         &state.runtime_status,
@@ -341,24 +358,13 @@ async fn dispatch(
     let is_routing_request = model_entry.value.routing.is_some();
     let mut routing = RoutingTelemetry::default();
 
-    let not_openai = || {
-        ProxyError::InvalidRequest(format!(
-            "model `{model_name}` is not an OpenAI provider; /v1/responses requires OpenAI"
-        ))
-    };
-
-    // Walk the OpenAI targets, failing over on a retryable failure.
-    // Streaming and non-streaming share this loop: `responses_to_target`
-    // branches internally and, for streaming, only returns Ok once the
-    // first chunk has arrived under `stream_timeout` (#554) — so the 200 is
-    // committed to exactly one target and a slow first chunk fails over.
+    // Walk the targets, failing over on a retryable failure. Streaming and
+    // non-streaming share this loop: the per-target dispatch branches
+    // internally and, for streaming, only returns Ok once the first chunk
+    // has arrived under `stream_timeout` (#554) — so the 200 is committed to
+    // exactly one target and a slow first chunk fails over.
     let mut last_err: Option<ProxyError> = None;
-    let mut any_openai = false;
     for target in &attempt_models {
-        if target.model.provider.as_deref() != Some("openai") {
-            continue;
-        }
-        any_openai = true;
         let (idx, kind) = routing.begin_attempt(&target.model.display_name);
         let target_model = if is_routing_request {
             target.model.display_name.clone()
@@ -366,30 +372,49 @@ async fn dispatch(
             String::new()
         };
         let attempt_started = Instant::now();
-        match responses_to_target(
-            state,
-            &snapshot,
-            body,
-            &target.model,
-            &target.id,
-            request_id,
-            &resolved_chain,
-            started,
-            &model_name,
-            &auth.entry.id,
-            client,
-            // Winning-attempt classification (#655) for the streaming
-            // path's end-of-stream UsageEvent (#808). The non-streaming
-            // and buffered paths emit from the handler and ignore it.
-            AttemptInfo {
-                index: idx,
-                kind: kind.to_string(),
-                model: target_model.clone(),
-                ..Default::default()
-            },
-        )
-        .await
-        {
+        // Winning-attempt classification (#655) for the streaming path's
+        // end-of-stream UsageEvent. The non-streaming / buffered paths emit
+        // from the handler and ignore it.
+        let attempt = AttemptInfo {
+            index: idx,
+            kind: kind.to_string(),
+            model: target_model.clone(),
+            ..Default::default()
+        };
+        let result = if target.model.provider.as_deref() == Some("openai") {
+            responses_to_target(
+                state,
+                &snapshot,
+                body,
+                &target.model,
+                &target.id,
+                request_id,
+                resolved_chain.as_ref(),
+                started,
+                &model_name,
+                &auth.entry.id,
+                client,
+                attempt,
+            )
+            .await
+        } else {
+            responses_cross_provider_to_target(
+                state,
+                &snapshot,
+                body,
+                &target.model,
+                &target.id,
+                request_id,
+                resolved_chain.clone(),
+                started,
+                &model_name,
+                &auth.entry.id,
+                client,
+                attempt,
+            )
+            .await
+        };
+        match result {
             Ok(mut success) => {
                 routing.attempts.push(AttemptRecord {
                     index: idx,
@@ -432,9 +457,6 @@ async fn dispatch(
         }
     }
 
-    if !any_openai {
-        return Err(not_openai().into());
-    }
     Err(ResponsesDispatchError {
         err: last_err.unwrap_or(ProxyError::ProviderUnavailable),
         routing,
@@ -942,6 +964,253 @@ async fn responses_to_target(
     }
 }
 
+/// Dispatch one non-OpenAI target by bridging the Responses-API request
+/// through the gateway's canonical [`ChatFormat`] and the provider
+/// [`Bridge`](aisix_gateway::Bridge), then re-encoding the response back
+/// into the Responses-API shape (#825). This is what lets clients like
+/// `codex` — which speak only the OpenAI Responses API — reach an
+/// Anthropic (or any other) backend. Mirrors `messages::cross_provider_dispatch`.
+#[allow(clippy::too_many_arguments)]
+async fn responses_cross_provider_to_target(
+    state: &ProxyState,
+    snapshot: &aisix_core::AisixSnapshot,
+    body: &Value,
+    model: &aisix_core::Model,
+    model_id: &str,
+    request_id: &str,
+    chain: Arc<aisix_guardrails::GuardrailChain>,
+    started: Instant,
+    requested_model: &str,
+    api_key_id: &str,
+    client_ctx: &ClientContext,
+    attempt: AttemptInfo,
+) -> Result<ResponseDispatchSuccess, ProxyError> {
+    use aisix_gateway::{Bridge, BridgeContext};
+
+    let provider = model
+        .provider
+        .as_deref()
+        .ok_or_else(|| {
+            ProxyError::InvalidRequest(format!("model `{requested_model}` has no provider prefix"))
+        })?
+        .to_string();
+    let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
+    let bridge: Arc<dyn Bridge> = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
+        .ok_or(ProxyError::ProviderUnavailable)?;
+
+    // Faithful Responses → ChatFormat transform; `chat.model` stays the
+    // operator-facing name so the bridge re-resolves the upstream id via
+    // `ctx.model.upstream_model()` exactly like chat.rs.
+    let chat = crate::responses_bridge::responses_request_to_chat(requested_model, body);
+
+    let is_stream = chat.is_streaming();
+    let model_arc = Arc::new(model.clone());
+    let pk_arc = Arc::new(pk_entry.value.clone());
+    let mut ctx = BridgeContext::new(request_id, model_arc, pk_arc);
+    let connect_deadline = if is_stream {
+        model.stream_timeout_effective()
+    } else {
+        model.request_timeout()
+    };
+    if let Some(d) = connect_deadline {
+        ctx = ctx.with_deadline(d);
+    }
+    let provider_label = provider.to_ascii_lowercase();
+
+    if is_stream {
+        let upstream = bridge.chat_stream(&chat, &ctx).await.map_err(|err| {
+            if let Some((ttl, reason)) =
+                crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+            {
+                state.runtime_status.mark_cooldown(model_id, ttl, reason);
+            }
+            ProxyError::Bridge(err)
+        })?;
+        // #554: peek the first chunk so a slow/erroring first token fails
+        // over before the 200 is committed (when a stream budget is set);
+        // the wrapper keeps enforcing the per-chunk read timeout either way.
+        let stream_budget = model.stream_timeout_effective();
+        let upstream = crate::stream_timeout::with_read_timeout(upstream, stream_budget);
+        let upstream: aisix_gateway::ChatChunkStream = if stream_budget.is_some() {
+            let mut upstream = upstream;
+            let first_chunk = match upstream.next().await {
+                Some(Ok(chunk)) => chunk,
+                Some(Err(err)) => {
+                    if let Some((ttl, reason)) =
+                        crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                    {
+                        state.runtime_status.mark_cooldown(model_id, ttl, reason);
+                    }
+                    return Err(ProxyError::Bridge(err));
+                }
+                None => {
+                    let err = aisix_gateway::BridgeError::StreamAborted;
+                    if let Some((ttl, reason)) =
+                        crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+                    {
+                        state.runtime_status.mark_cooldown(model_id, ttl, reason);
+                    }
+                    return Err(ProxyError::Bridge(err));
+                }
+            };
+            Box::pin(
+                futures::stream::once(std::future::ready(Ok::<_, aisix_gateway::BridgeError>(
+                    first_chunk,
+                )))
+                .chain(upstream),
+            )
+        } else {
+            upstream
+        };
+        state.health.record_success(requested_model);
+        state.runtime_status.mark_healthy(model_id);
+
+        let response_id = format!("resp_{}", Uuid::new_v4().simple());
+        let created_at = chrono::Utc::now().timestamp();
+        let encoder = crate::responses_bridge::ResponsesSseEncoder::new(
+            response_id,
+            requested_model,
+            created_at,
+        );
+        // Only an output-hook guardrail needs the streamed response text.
+        let output_guardrail = (!chain.is_empty()
+            && aisix_guardrails::Guardrail::runs_on_output(chain.as_ref()))
+        .then(|| chain.clone());
+
+        let state_c = state.clone();
+        let request_id_c = request_id.to_string();
+        let model_id_c = model_id.to_string();
+        let requested_model_c = requested_model.to_string();
+        let api_key_id_c = api_key_id.to_string();
+        let client_c = client_ctx.clone();
+        let attempt_c = attempt.clone();
+        let sse_body = crate::responses_bridge::build_responses_bridge_stream(
+            upstream,
+            encoder,
+            started,
+            output_guardrail,
+            requested_model.to_string(),
+            move |comp| {
+                // Streams that reach here are committed 200s.
+                let usage = ResponseUsage {
+                    prompt_tokens: comp.prompt_tokens,
+                    completion_tokens: comp.completion_tokens,
+                    reasoning_tokens: comp.reasoning_tokens,
+                    cached_prompt_tokens: comp.cached_prompt_tokens,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: comp.cache_read_tokens,
+                };
+                emit_usage_event(
+                    &state_c,
+                    &request_id_c,
+                    &model_id_c,
+                    &requested_model_c,
+                    &api_key_id_c,
+                    200,
+                    started.elapsed(),
+                    &usage,
+                    &client_c,
+                    attempt_c,
+                    /* guardrail_blocked */ false,
+                );
+            },
+        );
+        let mut response = axum::response::Response::new(sse_body);
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        );
+        if let Ok(hv) = HeaderValue::from_str(request_id) {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static("x-aisix-request-id"), hv);
+        }
+        return Ok(ResponseDispatchSuccess {
+            response,
+            provider: provider_label,
+            usage: None,
+            model_id: model_id.to_string(),
+            routing: RoutingTelemetry::default(),
+            guardrail_blocked: false,
+            usage_handled_by_stream: true,
+        });
+    }
+
+    // Non-streaming.
+    let resp = bridge.chat(&chat, &ctx).await.map_err(|err| {
+        if let Some((ttl, reason)) = crate::cooldown::decide_cooldown(&err, model.cooldown.as_ref())
+        {
+            state.runtime_status.mark_cooldown(model_id, ttl, reason);
+        }
+        ProxyError::Bridge(err)
+    })?;
+    state.health.record_success(&model.display_name);
+    state.runtime_status.mark_healthy(model_id);
+
+    let usage = ResponseUsage {
+        prompt_tokens: resp.usage.prompt_tokens,
+        completion_tokens: resp.usage.completion_tokens,
+        reasoning_tokens: resp.usage.reasoning_tokens,
+        cached_prompt_tokens: resp.usage.cached_prompt_tokens,
+        cache_creation_tokens: resp.usage.cache_creation_tokens,
+        cache_read_tokens: resp.usage.cache_read_tokens,
+    };
+
+    // #719: run output guardrails on the bridged response before re-encoding
+    // it as Responses JSON — the assistant text + tool calls are
+    // client-visible output, scanned the same way /v1/chat/completions does.
+    if aisix_guardrails::Guardrail::runs_on_output(chain.as_ref()) {
+        if let aisix_guardrails::GuardrailVerdict::Block {
+            reason,
+            guardrail_name,
+        } = aisix_guardrails::Guardrail::check_output(chain.as_ref(), &resp).await
+        {
+            tracing::warn!(
+                guardrail_hook = "output",
+                model = %requested_model,
+                reason = %reason,
+                "guardrail blocked /v1/responses (cross-provider) response",
+            );
+            // #543: the upstream already billed — return the 422 body but
+            // carry the billed usage (marked guardrail_blocked) so the
+            // ledger doesn't underreport spend.
+            return Ok(ResponseDispatchSuccess {
+                response: ProxyError::ContentFiltered(crate::error::guardrail_block_message(
+                    "response",
+                    guardrail_name.as_deref(),
+                ))
+                .into_response(),
+                provider: provider_label,
+                usage: Some(usage),
+                model_id: model_id.to_string(),
+                routing: RoutingTelemetry::default(),
+                guardrail_blocked: true,
+                usage_handled_by_stream: false,
+            });
+        }
+    }
+
+    let created_at = chrono::Utc::now().timestamp();
+    let json_body = crate::responses_bridge::chat_response_to_responses_json(
+        &resp,
+        requested_model,
+        created_at,
+    );
+    Ok(ResponseDispatchSuccess {
+        response: Json(json_body).into_response(),
+        provider: provider_label,
+        usage: Some(usage),
+        model_id: model_id.to_string(),
+        routing: RoutingTelemetry::default(),
+        guardrail_blocked: false,
+        usage_handled_by_stream: false,
+    })
+}
+
 /// Pull the usage counters out of a Responses-API non-streaming
 /// response body. Returns `None` only when:
 ///   - The `usage` block is missing entirely, OR
@@ -980,6 +1249,9 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         completion_tokens,
         reasoning_tokens,
         cached_prompt_tokens,
+        // OpenAI verbatim path: no Anthropic-style cache counters.
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
     })
 }
 
@@ -1267,10 +1539,12 @@ fn apply_passthrough_headers(
 /// `embeddings::emit_usage_event` (#402) for the fields that matter
 /// to /v1/responses, with one extension: `reasoning_tokens` is
 /// surfaced for o1/o3/GPT-5 class models. `inbound_protocol` is
-/// `"openai"` — Responses API is OpenAI-only.
+/// `"openai"` — the Responses API is OpenAI-shaped on the wire even when
+/// the resolved model is bridged to a non-OpenAI provider (#825).
 ///
 /// Other fields left at `UsageEvent::default()`:
-///   - cache_creation_tokens / cache_read_tokens — Anthropic-only
+///   - cache_creation_tokens / cache_read_tokens — populated only on the
+///     #825 cross-provider bridge path (Anthropic backends); 0 otherwise
 ///   - provider_request_id / provider_model_version / finish_reason
 ///     — not yet plumbed for non-chat handlers (follow-up)
 ///   - cost_usd — cp-api computes server-side from pricing catalog
@@ -1304,6 +1578,10 @@ fn emit_usage_event(
         completion_tokens: usage.completion_tokens,
         cached_prompt_tokens: usage.cached_prompt_tokens,
         reasoning_tokens: usage.reasoning_tokens,
+        // Anthropic cache counters (#825 cross-provider path); 0 on the
+        // verbatim OpenAI path.
+        cache_creation_tokens: usage.cache_creation_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
@@ -1441,6 +1719,7 @@ mod tests {
     use aisix_core::snapshot::SnapshotHandle;
     use aisix_core::{AisixSnapshot, ApiKey, Model, ProxyConfig};
     use aisix_gateway::Hub;
+    use aisix_provider_anthropic::AnthropicBridge;
     use aisix_provider_openai::OpenAiBridge;
     use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
@@ -1485,10 +1764,11 @@ mod tests {
         ResourceEntry::new(OPENAI_PK_ID, pk, 1)
     }
 
-    fn anthropic_pk() -> ResourceEntry<aisix_core::ProviderKey> {
-        let pk: aisix_core::ProviderKey =
-            serde_json::from_str(r#"{"display_name":"anthropic-up","secret":"sk-ant-test","provider":"anthropic","adapter":"anthropic"}"#)
-                .unwrap();
+    fn anthropic_pk_at(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"anthropic-up","secret":"sk-ant-test","api_base":"{api_base}","provider":"anthropic","adapter":"anthropic"}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(ANTHROPIC_PK_ID, pk, 1)
     }
 
@@ -1498,9 +1778,9 @@ mod tests {
         snap
     }
 
-    fn new_snap_anthropic() -> AisixSnapshot {
+    fn new_snap_anthropic_at(api_base: &str) -> AisixSnapshot {
         let snap = AisixSnapshot::new();
-        snap.provider_keys.insert(anthropic_pk());
+        snap.provider_keys.insert(anthropic_pk_at(api_base));
         snap
     }
 
@@ -1516,6 +1796,10 @@ mod tests {
     fn build_app(snap: AisixSnapshot) -> axum::Router {
         let hub = Arc::new(Hub::new());
         hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        // #825: the cross-provider /v1/responses path bridges non-OpenAI
+        // targets through the provider Bridge; register Anthropic so those
+        // tests resolve a bridge.
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
         let handle = SnapshotHandle::new(snap);
         crate::build_router(crate::ProxyState::new(handle, hub, &cfg()).without_cache())
     }
@@ -2310,9 +2594,29 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// #825: an Anthropic-backed model is no longer rejected on
+    /// /v1/responses — the request is bridged through ChatFormat to the
+    /// Anthropic Messages upstream and the reply is re-encoded into the
+    /// Responses-API shape. This is the codex-against-Anthropic path.
     #[tokio::test]
-    async fn non_openai_model_returns_400() {
-        let snap = new_snap_anthropic();
+    async fn non_openai_model_bridges_to_responses_shape() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "sk-ant-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "msg_xprov",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-3-haiku-20240307",
+                "content": [{"type": "text", "text": "Hi from Claude"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 9, "output_tokens": 4}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic_at(&upstream.uri());
         snap.models.insert(anthropic_model("claude-haiku"));
         snap.apikeys.insert(apikey_entry(&["*"]));
         let app = build_app(snap);
@@ -2324,7 +2628,73 @@ mod tests {
             })))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["object"], "response");
+        assert_eq!(body["status"], "completed");
+        // Operator-facing model name echoed, not the upstream id.
+        assert_eq!(body["model"], "claude-haiku");
+        assert_eq!(body["output"][0]["type"], "message");
+        assert_eq!(body["output"][0]["content"][0]["type"], "output_text");
+        assert_eq!(body["output"][0]["content"][0]["text"], "Hi from Claude");
+        assert_eq!(body["usage"]["input_tokens"], 9);
+        assert_eq!(body["usage"]["output_tokens"], 4);
+    }
+
+    /// #825 streaming: a streamed Anthropic-backed /v1/responses call emits
+    /// the canonical Responses SSE event sequence ending in
+    /// `response.completed` (the exact codex-tui path).
+    #[tokio::test]
+    async fn non_openai_streaming_bridges_to_responses_sse() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-haiku-20240307\",\"content\":[],\"usage\":{\"input_tokens\":6,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic_at(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-haiku"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "claude-haiku",
+                "input": "hi",
+                "stream": true
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            text.contains("event: response.created"),
+            "missing created: {text}"
+        );
+        assert!(text.contains("event: response.output_text.delta"));
+        assert!(text.contains("\"delta\":\"Hi\""));
+        assert!(text.contains("event: response.completed"));
     }
 
     #[tokio::test]
