@@ -26,9 +26,8 @@ pub struct PanelMember {
     /// Optional sampling seed for this panel member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
-    /// Reserved for the future voting/quorum strategy; ignored by the v1
-    /// synthesis path. Carried on the wire now so enabling voting later
-    /// does not require a wire-format change.
+    /// Reserved for the future voting/quorum strategy. Ignored by the v1
+    /// synthesis path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
 }

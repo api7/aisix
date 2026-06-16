@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::resource::Resource;
 
-/// Cache backend choice for requests matched by a cache policy. `redis` requires `cache.redis`; otherwise matching requests are not cached.
+/// Cache backend choice for requests matched by a cache policy. `redis` requires `cache.redis`. Otherwise matching requests are not cached.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]
@@ -29,11 +29,11 @@ pub enum CacheBackend {
 /// Semantic cache policy for chat requests.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct CachePolicy {
-    /// Operator-facing name; surfaces in metric labels + cache headers.
+    /// Operator-facing name that surfaces in metric labels and cache headers.
     pub name: String,
 
-    /// When false the cache gate skips this policy. Lets operators
-    /// stage a rule (write it, sanity-check it, then flip it on).
+    /// When false, the cache gate skips this policy. Allows operators
+    /// to stage a rule before enabling it.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
@@ -53,7 +53,7 @@ pub struct CachePolicy {
     pub applies_to: String,
 
     /// Set by the loader from the kine path's UUID segment. The DP
-    /// uses this for metric labels + log correlation; not part of
+    /// uses this for metric labels and log correlation. Not part of
     /// the wire shape.
     #[serde(skip)]
     pub(crate) runtime_id: String,

@@ -5,7 +5,7 @@
   "type": "object",
   "oneOf": [
     {
-      "description": "`PartialEq` (not `Eq`): `sample_rate` is an `f64` — see [`ExporterKind`].",
+      "description": "OTLP/HTTP trace exporter configuration.",
       "type": "object",
       "required": [
         "endpoint",
@@ -20,7 +20,7 @@
           "minimum": 1.0
         },
         "content_mode": {
-          "description": "Controls whether spans include prompt and response content. `metadata_only` omits content; `full` includes content truncated by `content_max_bytes`.",
+          "description": "Controls whether spans include prompt and response content. `metadata_only` omits content. `full` includes content truncated by `content_max_bytes`.",
           "default": "metadata_only",
           "allOf": [
             {
@@ -29,7 +29,7 @@
           ]
         },
         "endpoint": {
-          "description": "Full URL of the OTLP/HTTP traces endpoint. Must already include the `/v1/traces` path the receiver expects — we don't append it because some vendors (Honeycomb, Grafana) use a different path.",
+          "description": "Full URL of the OTLP/HTTP traces endpoint. Include the receiver's expected path, such as `/v1/traces`.",
           "type": "string"
         },
         "headers": {
@@ -76,7 +76,7 @@
           "minimum": 1.0
         },
         "content_mode": {
-          "description": "Controls whether logs include prompt and response content. `metadata_only` omits content; `full` includes content truncated by `content_max_bytes`.",
+          "description": "Controls whether logs include prompt and response content. `metadata_only` omits content. `full` includes content truncated by `content_max_bytes`.",
           "default": "metadata_only",
           "allOf": [
             {
@@ -85,7 +85,7 @@
           ]
         },
         "credential_ref": {
-          "description": "Credential reference resolved by the data plane at delivery time; the plaintext AccessKey is not stored in this resource.",
+          "description": "Credential reference resolved by the data plane at delivery time. The plaintext AccessKey is not stored in this resource.",
           "type": "string"
         },
         "endpoint": {
@@ -170,7 +170,7 @@
           ]
         },
         "region": {
-          "description": "AWS region for S3 (SigV4 signature scope) — recommended; `object_store` defaults to `us-east-1` when unset, so a non-default-region bucket should set it. Ignored for GCS / Azure Blob.",
+          "description": "AWS region for S3 SigV4 signature scope. Recommended because `object_store` defaults to `us-east-1` when unset, so a non-default-region bucket should set it. Ignored for GCS / Azure Blob.",
           "type": [
             "string",
             "null"
@@ -197,7 +197,7 @@
           "minimum": 1.0
         },
         "content_mode": {
-          "description": "Controls whether logs include prompt and response content. `metadata_only` omits content; `full` includes content truncated by `content_max_bytes`.",
+          "description": "Controls whether logs include prompt and response content. `metadata_only` omits content. `full` includes content truncated by `content_max_bytes`.",
           "default": "metadata_only",
           "allOf": [
             {
@@ -206,11 +206,11 @@
           ]
         },
         "credential_ref": {
-          "description": "Credential reference resolved by the data plane at delivery time; the plaintext Datadog API key is not stored in this resource.",
+          "description": "Credential reference resolved by the data plane at delivery time. The plaintext Datadog API key is not stored in this resource.",
           "type": "string"
         },
         "ddsource": {
-          "description": "Datadog `ddsource` reserved attribute — the integration/source name. Defaults to `aisix-ai-gateway`.",
+          "description": "Datadog `ddsource` reserved attribute. Identifies the integration or source. Defaults to `aisix-ai-gateway`.",
           "default": "aisix-ai-gateway",
           "type": "string"
         },
@@ -221,7 +221,7 @@
           ]
         },
         "service": {
-          "description": "Datadog `service` reserved attribute — the service name every log from this exporter is tagged with in Datadog's Log Explorer.",
+          "description": "Datadog `service` reserved attribute. Every log from this exporter is tagged with this service name in Datadog Log Explorer.",
           "type": "string"
         },
         "site": {
@@ -244,12 +244,12 @@
   ],
   "properties": {
     "enabled": {
-      "description": "Soft kill switch. Disabled exporters stay in the snapshot but the fan-out sink skips them. Lets operators pause an exporter without losing the row's headers / endpoint.",
+      "description": "Soft disable switch. Disabled exporters stay in the snapshot, but the fan-out sink skips them.",
       "default": true,
       "type": "boolean"
     },
     "name": {
-      "description": "Operator-facing label, surfaced in /logs and the dashboard list. Not used for routing — the etcd-key uuid is the identity.",
+      "description": "Operator-facing label, surfaced in logs and dashboard lists. The etcd key UUID is the resource identity.",
       "type": "string"
     }
   },
@@ -277,14 +277,14 @@
       "description": "File compression for object-storage uploads.",
       "oneOf": [
         {
-          "description": "gzip (RFC 1952) — the default; smaller egress, accepted by Snowpipe and Auto Loader.",
+          "description": "gzip (RFC 1952). Default compression with smaller egress, accepted by Snowpipe and Auto Loader.",
           "type": "string",
           "enum": [
             "gzip"
           ]
         },
         {
-          "description": "No compression — raw NDJSON.",
+          "description": "No compression. Emits raw NDJSON.",
           "type": "string",
           "enum": [
             "none"
@@ -293,7 +293,7 @@
       ]
     },
     "ObjectStoreProvider": {
-      "description": "Object-storage backend selector. The sink builds one backend client per variant; everything downstream (batching, key layout, retry) is shared.",
+      "description": "Object-storage backend selector. The sink builds one backend client per variant. Batching, key layout, and retry behavior are shared.",
       "type": "string",
       "enum": [
         "s3",
@@ -305,7 +305,7 @@
       "description": "Content-capture mode for an observability exporter.",
       "oneOf": [
         {
-          "description": "Operational metadata only — never the prompt or response.",
+          "description": "Operational metadata only. Prompt and response content are omitted.",
           "type": "string",
           "enum": [
             "metadata_only"

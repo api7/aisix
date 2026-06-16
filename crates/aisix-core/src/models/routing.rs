@@ -20,10 +20,12 @@ use serde::{Deserialize, Serialize};
 )]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingStrategy {
+    /// Cycle through targets in declaration order.
     RoundRobin,
+    /// Pick targets by configured weight. Missing target weights fall back to 1.
     Weighted,
-    /// Failover is the safest default — predictable order, no shared
-    /// state, no surprises on first deploy.
+    /// Always start with the first target and move to later targets only
+    /// after failure.
     #[default]
     Failover,
 }
@@ -35,7 +37,7 @@ pub enum RoutingStrategy {
 pub struct RoutingTarget {
     /// Model alias for a direct model that can receive routed traffic.
     pub model: String,
-    /// Only meaningful for `weighted`. Optional everywhere else; falls
+    /// Only meaningful for `weighted`. Optional everywhere else and falls
     /// back to 1 when missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
@@ -68,10 +70,10 @@ pub enum OnAllFilteredPolicy {
     /// Return `503` with a fixed `Retry-After` hint. Default.
     #[default]
     Fail,
-    /// Send to the original candidate list anyway, in declaration
-    /// order. Preserves availability over caller-facing correctness.
-    /// Use only when the operator explicitly accepts the risk of
-    /// sending traffic to a target the gateway just probed as broken.
+    /// Route to the original candidate list in declaration order even
+    /// when all targets were filtered by health or cooldown status. Use
+    /// only when maintaining availability is preferred over avoiding
+    /// recently unhealthy targets.
     OriginalOrder,
 }
 

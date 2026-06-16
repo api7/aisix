@@ -8,14 +8,14 @@
   ],
   "properties": {
     "allowed_models": {
-      "description": "Whitelisted Model identifiers. cp-api stores them as model UUIDs; self-hosted dev fixtures may still use names — the DP does string equality and doesn't care which. An **empty array** denies every model (spec §3 authz rule).",
+      "description": "Whitelisted Model identifiers. cp-api stores them as model UUIDs. Self-hosted dev fixtures may still use names because the DP uses string equality. An empty array denies every model.",
       "type": "array",
       "items": {
         "type": "string"
       }
     },
     "key_hash": {
-      "description": "SHA-256 hex of the plaintext bearer. Secondary-indexed for O(1) auth — the proxy hashes incoming bearers before lookup.",
+      "description": "SHA-256 hexadecimal hash of the plaintext bearer. The proxy hashes incoming bearer tokens before lookup.",
       "type": "string"
     },
     "rate_limit": {

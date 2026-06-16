@@ -22,12 +22,12 @@
       ]
     },
     "enabled": {
-      "description": "When false the cache gate skips this policy. Lets operators stage a rule (write it, sanity-check it, then flip it on).",
+      "description": "When false, the cache gate skips this policy. Allows operators to stage a rule before enabling it.",
       "default": true,
       "type": "boolean"
     },
     "name": {
-      "description": "Operator-facing name; surfaces in metric labels + cache headers.",
+      "description": "Operator-facing name that surfaces in metric labels and cache headers.",
       "type": "string"
     },
     "ttl_seconds": {
@@ -40,7 +40,7 @@
   },
   "definitions": {
     "CacheBackend": {
-      "description": "Cache backend choice for requests matched by a cache policy. `redis` requires `cache.redis`; otherwise matching requests are not cached.",
+      "description": "Cache backend choice for requests matched by a cache policy. `redis` requires `cache.redis`. Otherwise matching requests are not cached.",
       "type": "string",
       "enum": [
         "memory",

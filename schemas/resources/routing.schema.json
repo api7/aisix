@@ -72,7 +72,7 @@
           ]
         },
         {
-          "description": "Send to the original candidate list anyway, in declaration order. Preserves availability over caller-facing correctness. Use only when the operator explicitly accepts the risk of sending traffic to a target the gateway just probed as broken.",
+          "description": "Route to the original candidate list in declaration order even when all targets were filtered by health or cooldown status. Use only when maintaining availability is preferred over avoiding recently unhealthy targets.",
           "type": "string",
           "enum": [
             "original_order"
@@ -83,14 +83,21 @@
     "RoutingStrategy": {
       "oneOf": [
         {
+          "description": "Cycle through targets in declaration order.",
           "type": "string",
           "enum": [
-            "round_robin",
+            "round_robin"
+          ]
+        },
+        {
+          "description": "Pick targets by configured weight. Missing target weights fall back to 1.",
+          "type": "string",
+          "enum": [
             "weighted"
           ]
         },
         {
-          "description": "Failover is the safest default — predictable order, no shared state, no surprises on first deploy.",
+          "description": "Always start with the first target and move to later targets only after failure.",
           "type": "string",
           "enum": [
             "failover"
@@ -110,7 +117,7 @@
           "type": "string"
         },
         "weight": {
-          "description": "Only meaningful for `weighted`. Optional everywhere else; falls back to 1 when missing.",
+          "description": "Only meaningful for `weighted`. Optional everywhere else and falls back to 1 when missing.",
           "type": [
             "integer",
             "null"

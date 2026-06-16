@@ -35,7 +35,7 @@ pub struct ProviderKey {
     pub display_name: String,
 
     /// Upstream provider's API key. The data plane receives plaintext so it
-    /// can authenticate to the upstream provider; protect the configuration
+    /// can authenticate to the upstream provider. Protect the configuration
     /// store and transport accordingly.
     pub secret: String,
 
@@ -82,7 +82,7 @@ pub struct ProviderKey {
 /// Default header-strip list for a freshly-created ProviderKey
 /// on the passthrough endpoint, per issue #411. These four headers
 /// are credentials that the upstream LLM provider has no legitimate
-/// use for; stripping by default protects against accidental
+/// use for. Stripping by default protects against accidental
 /// session-token disclosure. Customers can remove entries via the
 /// dashboard (with a warning) if they have a specific audit /
 /// forwarding need.
@@ -98,7 +98,7 @@ pub fn default_strip_headers() -> Vec<String> {
 /// Normalize a single strip-list entry: trim whitespace, lowercase
 /// ASCII. Returns `None` for entries that, post-trim, are empty or
 /// reference-invalid HTTP header names. Non-ASCII chars survive
-/// `to_ascii_lowercase` (no-op for them) but are unusual in practice;
+/// `to_ascii_lowercase` (no-op for them) but are unusual in practice.
 /// the passthrough handler's `to_ascii_lowercase` comparison will
 /// still match correctly.
 fn normalize_strip_entry(raw: &str) -> Option<String> {
@@ -171,7 +171,8 @@ pub struct RequestOverrides {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub param_renames: HashMap<String, String>,
 
-    /// `apply_param_constraints` input. `None` means no clamping.
+    /// Parameter constraints applied to the outbound request. If omitted,
+    /// no clamping is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub param_constraints: Option<ParamConstraints>,
 
@@ -194,12 +195,12 @@ pub struct RequestOverrides {
 #[serde(deny_unknown_fields)]
 pub struct ParamConstraints {
     /// Upper bound for `temperature`. Values above this are clamped
-    /// to this value. `None` means "no upper clamp".
+    /// to this value. If omitted, no upper bound is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature_max: Option<f64>,
 
     /// Lower bound for `temperature`. Values below this are clamped
-    /// to this value. `None` means "no lower clamp".
+    /// to this value. If omitted, no lower bound is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature_min: Option<f64>,
 }
@@ -210,8 +211,8 @@ pub struct ParamConstraints {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseOverrides {
-    /// Stream `[DONE]` terminator expectation. `None` means "no
-    /// opinion" — same effect as [`StreamDoneMarker::Optional`].
+    /// Stream `[DONE]` terminator expectation. If omitted, either presence
+    /// or absence of the terminator is accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_done_marker: Option<StreamDoneMarker>,
 
@@ -222,14 +223,14 @@ pub struct ResponseOverrides {
     pub content_list_to_string: bool,
 
     /// Error-translation strategy. `"openai"` projects upstream errors into the
-    /// OpenAI-compatible envelope; `"passthrough"` returns the upstream body
+    /// OpenAI-compatible envelope. `"passthrough"` returns the upstream body
     /// as-is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_envelope: Option<String>,
 
-    /// `extract_reasoning_field` path. Empty / `None` means no lift.
-    /// Example: `"delta.reasoning_content"` (DeepSeek's canonical
-    /// shape, already aligned with the gateway's emit slot).
+    /// Path used to extract reasoning content from the provider response.
+    /// If omitted or empty, no reasoning field is lifted. Example:
+    /// `"delta.reasoning_content"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_field: Option<String>,
 }
@@ -239,14 +240,13 @@ pub struct ResponseOverrides {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum StreamDoneMarker {
-    /// Upstream must emit `data: [DONE]`. Absence is a wire-shape
-    /// violation. OpenAI proper, DeepSeek, Groq.
+    /// Upstream is expected to emit `data: [DONE]`. Absence is treated as
+    /// an invalid stream response.
     Required,
     /// Either presence or absence is acceptable. Used when the
-    /// upstream is OpenAI-compat but does not promise the terminator.
+    /// upstream is OpenAI-compatible but does not require the terminator.
     Optional,
-    /// Upstream is expected to *omit* the marker. Some Azure / Vertex
-    /// flavors terminate cleanly on connection close.
+    /// Upstream is expected to omit the marker and terminate on connection close.
     None,
 }
 

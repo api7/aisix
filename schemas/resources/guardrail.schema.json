@@ -19,7 +19,7 @@
           ]
         },
         "patterns": {
-          "description": "Blocklist patterns. Empty list is legal but pointless — the guardrail will allow every request, same as `enabled: false`.",
+          "description": "Blocklist patterns. An empty list is valid and allows every request, equivalent to `enabled: false`.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/KeywordPattern"
@@ -85,7 +85,7 @@
       ],
       "properties": {
         "api_key": {
-          "description": "Subscription key (`Ocp-Apim-Subscription-Key`). Decrypted by cp-api before kine projection; plaintext in memory only, never logged.",
+          "description": "Subscription key (`Ocp-Apim-Subscription-Key`). Decrypted before projection. Plaintext is held in memory only and is not logged.",
           "type": "string"
         },
         "endpoint": {
@@ -99,7 +99,7 @@
           ]
         },
         "timeout_ms": {
-          "description": "HTTP call timeout in milliseconds. `0` times out immediately; use a large value for an effectively unlimited timeout.",
+          "description": "HTTP call timeout in milliseconds. A value of `0` triggers the timeout immediately.",
           "default": 5000,
           "type": "integer",
           "format": "uint32",
@@ -117,7 +117,7 @@
       ],
       "properties": {
         "api_key": {
-          "description": "Subscription key (`Ocp-Apim-Subscription-Key`). Plaintext in memory only, never logged.",
+          "description": "Subscription key (`Ocp-Apim-Subscription-Key`). Plaintext is held in memory only and is not logged.",
           "type": "string"
         },
         "blocklist_names": {
@@ -169,17 +169,17 @@
           "type": "string"
         },
         "output_fail_open": {
-          "description": "Fail-open policy for the OUTPUT hook. Defaults `false` (fail-closed) so an Azure outage can't release unscanned model output.",
+          "description": "Fail-open policy for the output hook. Defaults to `false` (fail-closed), so an Azure outage does not release unscanned model output.",
           "default": false,
           "type": "boolean"
         },
         "output_type": {
-          "description": "`FourSeverityLevels` (0,2,4,6; default) or `EightSeverityLevels` (0..7).",
+          "description": "`FourSeverityLevels` (0, 2, 4, 6) or `EightSeverityLevels` (0 through 7).",
           "default": "FourSeverityLevels",
           "type": "string"
         },
         "severity_threshold": {
-          "description": "General severity threshold; a category at or above it blocks.",
+          "description": "General severity threshold. A category at or above it blocks.",
           "default": 2,
           "type": "integer",
           "format": "uint8",
@@ -196,7 +196,7 @@
           }
         },
         "stream_processing_mode": {
-          "description": "`window` (sliding-window incremental release; default) or `buffer_full` (whole-response hold-back).",
+          "description": "`window` for sliding-window incremental release or `buffer_full` for whole-response hold-back.",
           "default": "window",
           "type": "string"
         },
@@ -206,7 +206,7 @@
           "type": "string"
         },
         "timeout_ms": {
-          "description": "HTTP call timeout (ms); `fail_open` / `output_fail_open` govern the verdict when it elapses. See the `AzureContentSafetyConfig` note on why `0` means \"fire immediately\", not \"no timeout\".",
+          "description": "HTTP call timeout in milliseconds. `fail_open` and `output_fail_open` govern the verdict when it elapses. A value of `0` triggers the timeout immediately.",
           "default": 5000,
           "type": "integer",
           "format": "uint32",
@@ -220,7 +220,7 @@
           "minimum": 0.0
         },
         "window_size": {
-          "description": "Sliding-window size in chars (window mode); cp-api caps it at the 10 000-char Azure limit. Default 10 000.",
+          "description": "Sliding-window size in chars for window mode. cp-api caps it at the 10 000-char Azure limit. Default 10 000.",
           "default": 10000,
           "type": "integer",
           "format": "uint32",
@@ -243,11 +243,11 @@
           "type": "string"
         },
         "access_key_secret": {
-          "description": "Aliyun AccessKey secret. Decrypted by cp-api before kine projection; plaintext in memory only, never logged. Used to sign the request.",
+          "description": "Aliyun AccessKey secret. Decrypted before projection. Plaintext is held in memory only and is not logged. Used to sign the request.",
           "type": "string"
         },
         "endpoint": {
-          "description": "Explicit endpoint override (full URL, no trailing slash). When set it wins over `region`; used by tests/dev to point at a mock server.",
+          "description": "Explicit endpoint override (full URL, no trailing slash). When set it wins over `region`. Used by tests/dev to point at a mock server.",
           "default": null,
           "type": [
             "string",
@@ -273,7 +273,7 @@
           "type": "string"
         },
         "output_fail_open": {
-          "description": "Fail-open policy for the OUTPUT hook. Defaults `false` (fail-closed) so an Aliyun outage can't release unscanned model output.",
+          "description": "Fail-open policy for the OUTPUT hook. Defaults `false` (fail-closed) so an Aliyun outage does not release unscanned model output.",
           "default": false,
           "type": "boolean"
         },
@@ -287,12 +287,12 @@
           "type": "string"
         },
         "stream_processing_mode": {
-          "description": "`window` (sliding-window incremental release; default) or `buffer_full` (whole-response hold-back).",
+          "description": "`window` for sliding-window incremental release or `buffer_full` for whole-response hold-back.",
           "default": "window",
           "type": "string"
         },
         "timeout_ms": {
-          "description": "HTTP call timeout (ms); `fail_open` / `output_fail_open` govern the verdict when it elapses. See the `AzureContentSafetyConfig` note on why `0` means \"fire immediately\", not \"no timeout\".",
+          "description": "HTTP call timeout in milliseconds. `fail_open` and `output_fail_open` govern the verdict when it elapses. A value of `0` triggers the timeout immediately.",
           "default": 5000,
           "type": "integer",
           "format": "uint32",
@@ -306,7 +306,7 @@
           "minimum": 0.0
         },
         "window_size": {
-          "description": "Sliding-window size in chars (window mode). Default 2 000 — Aliyun's `llm_response_moderation` per-call content cap.",
+          "description": "Sliding-window size in characters when window mode is used. Defaults to 2,000, which is Aliyun's per-call content limit for `llm_response_moderation`.",
           "default": 2000,
           "type": "integer",
           "format": "uint32",
@@ -320,19 +320,19 @@
   ],
   "properties": {
     "created_at": {
-      "description": "RFC3339 creation timestamp of the row. When present, the data plane can evaluate guardrail chains oldest-first. Rows without this timestamp sort after rows that have it, with ties broken by resource id.",
+      "description": "RFC3339 creation timestamp of the row. When present, the data plane can evaluate guardrail chains from oldest to newest. Rows without this timestamp sort after rows that have it. Resource ID resolves ties.",
       "type": [
         "string",
         "null"
       ]
     },
     "direction": {
-      "description": "Attachment direction hint: `input`, `output`, or `both`. Stored for compatibility; current hook selection still follows `hook_point`.",
+      "description": "Attachment direction hint: `input`, `output`, or `both`. Stored for compatibility. Current hook selection still follows `hook_point`.",
       "default": "both",
       "type": "string"
     },
     "enabled": {
-      "description": "When false the chain skips this rule entirely. Lets operators stage a rule (write it, sanity-check it via dry runs, then flip it on) without deleting + recreating.",
+      "description": "When false, the chain skips this rule entirely. Allows operators to stage a rule before enabling it.",
       "default": true,
       "type": "boolean"
     },
@@ -342,7 +342,7 @@
       "type": "string"
     },
     "fail_open": {
-      "description": "Behavior when a remote-API guardrail (today `kind=bedrock`) can't reach its upstream. `true` lets the request through (recorded in `usage_events.guardrail_bypassed_reason`); `false` blocks with 422. No-op for `kind=keyword`. Defaults `true`.",
+      "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. No-op for `kind=keyword`. Defaults to `true`.",
       "default": true,
       "type": "boolean"
     },
@@ -356,12 +356,12 @@
       ]
     },
     "mandatory": {
-      "description": "Whether guardrail evaluation errors should be fatal. Stored for compatibility; current enforcement still follows `fail_open`.",
+      "description": "Whether guardrail evaluation errors should be fatal. Stored for compatibility. Current enforcement still follows `fail_open`.",
       "default": false,
       "type": "boolean"
     },
     "name": {
-      "description": "Operator-facing name; surfaces in metric labels + error reasons.",
+      "description": "Operator-facing name that surfaces in metric labels and error reasons.",
       "type": "string"
     }
   },
@@ -387,7 +387,7 @@
               ]
             },
             "secret_access_key": {
-              "description": "Decrypted by cp-api before kine projection; plaintext in memory only, never logged. The DP feeds it to the AWS SDK's static credentials provider.",
+              "description": "Decrypted before projection. Plaintext is held in memory only and is not logged. The DP passes it to the AWS SDK's static credentials provider.",
               "type": "string"
             }
           }
@@ -395,7 +395,7 @@
       ]
     },
     "BedrockLatencyMode": {
-      "description": "Per-guardrail latency policy for `kind: \"bedrock\"`. `serial` waits unconditionally; `timed` aborts at `timeout_ms` and applies the row-level `fail_open` flag.",
+      "description": "Per-guardrail latency policy for `kind: \"bedrock\"`. `serial` waits unconditionally. `timed` aborts at `timeout_ms` and applies the row-level `fail_open` flag.",
       "oneOf": [
         {
           "type": "object",

@@ -44,13 +44,12 @@ pub enum ExporterKind {
     Datadog(DatadogConfig),
 }
 
-/// `PartialEq` (not `Eq`): `sample_rate` is an `f64` — see [`ExporterKind`].
+/// OTLP/HTTP trace exporter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct OtlpHttpConfig {
-    /// Full URL of the OTLP/HTTP traces endpoint. Must already include
-    /// the `/v1/traces` path the receiver expects — we don't append it
-    /// because some vendors (Honeycomb, Grafana) use a different path.
+    /// Full URL of the OTLP/HTTP traces endpoint. Include the receiver's
+    /// expected path, such as `/v1/traces`.
     pub endpoint: String,
 
     /// Static headers attached to every export request, such as authorization or vendor-specific API-key headers.
@@ -62,7 +61,7 @@ pub struct OtlpHttpConfig {
     #[schemars(range(min = 0.0, max = 1.0))]
     pub sample_rate: Option<f64>,
 
-    /// Controls whether spans include prompt and response content. `metadata_only` omits content; `full` includes content truncated by `content_max_bytes`.
+    /// Controls whether spans include prompt and response content. `metadata_only` omits content. `full` includes content truncated by `content_max_bytes`.
     #[serde(default)]
     pub content_mode: SlsContentMode,
 
@@ -87,10 +86,10 @@ pub struct AliyunSlsConfig {
     /// SLS logstore that receives the request-event logs.
     pub logstore: String,
 
-    /// Credential reference resolved by the data plane at delivery time; the plaintext AccessKey is not stored in this resource.
+    /// Credential reference resolved by the data plane at delivery time. The plaintext AccessKey is not stored in this resource.
     pub credential_ref: String,
 
-    /// Controls whether logs include prompt and response content. `metadata_only` omits content; `full` includes content truncated by `content_max_bytes`.
+    /// Controls whether logs include prompt and response content. `metadata_only` omits content. `full` includes content truncated by `content_max_bytes`.
     #[serde(default)]
     pub content_mode: SlsContentMode,
 
@@ -106,7 +105,7 @@ pub struct AliyunSlsConfig {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum SlsContentMode {
-    /// Operational metadata only — never the prompt or response.
+    /// Operational metadata only. Prompt and response content are omitted.
     #[default]
     MetadataOnly,
     /// Metadata plus the captured request prompt and assembled response.
@@ -125,14 +124,14 @@ pub struct DatadogConfig {
     /// Datadog site, such as `datadoghq.com`, `us3.datadoghq.com`, or `datadoghq.eu`.
     pub site: String,
 
-    /// Credential reference resolved by the data plane at delivery time; the plaintext Datadog API key is not stored in this resource.
+    /// Credential reference resolved by the data plane at delivery time. The plaintext Datadog API key is not stored in this resource.
     pub credential_ref: String,
 
-    /// Datadog `service` reserved attribute — the service name every log from
-    /// this exporter is tagged with in Datadog's Log Explorer.
+    /// Datadog `service` reserved attribute. Every log from this exporter is
+    /// tagged with this service name in Datadog Log Explorer.
     pub service: String,
 
-    /// Datadog `ddsource` reserved attribute — the integration/source name.
+    /// Datadog `ddsource` reserved attribute. Identifies the integration or source.
     /// Defaults to `aisix-ai-gateway`.
     #[serde(default = "default_ddsource")]
     pub ddsource: String,
@@ -143,7 +142,7 @@ pub struct DatadogConfig {
     #[serde(default)]
     pub tags: Vec<String>,
 
-    /// Controls whether logs include prompt and response content. `metadata_only` omits content; `full` includes content truncated by `content_max_bytes`.
+    /// Controls whether logs include prompt and response content. `metadata_only` omits content. `full` includes content truncated by `content_max_bytes`.
     #[serde(default)]
     pub content_mode: SlsContentMode,
 
@@ -177,7 +176,7 @@ pub struct ObjectStoreConfig {
     /// The full key is `<prefix>/org=…/env=…/table=…/dt=…/hh=…/<file>`.
     pub prefix: String,
 
-    /// AWS region for S3 (SigV4 signature scope) — recommended; `object_store`
+    /// AWS region for S3 SigV4 signature scope. Recommended because `object_store`
     /// defaults to `us-east-1` when unset, so a non-default-region bucket
     /// should set it. Ignored for GCS / Azure Blob.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,7 +201,7 @@ pub struct ObjectStoreConfig {
 }
 
 /// Object-storage backend selector. The sink builds one backend client per
-/// variant; everything downstream (batching, key layout, retry) is shared.
+/// variant. Batching, key layout, and retry behavior are shared.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectStoreProvider {
@@ -217,11 +216,11 @@ pub enum ObjectStoreProvider {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectStoreCompression {
-    /// gzip (RFC 1952) — the default; smaller egress, accepted by Snowpipe
-    /// and Auto Loader.
+    /// gzip (RFC 1952). Default compression with smaller egress, accepted by
+    /// Snowpipe and Auto Loader.
     #[default]
     Gzip,
-    /// No compression — raw NDJSON.
+    /// No compression. Emits raw NDJSON.
     None,
 }
 
@@ -242,13 +241,12 @@ pub enum ObjectStoreAuthMode {
 /// Telemetry exporter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct ObservabilityExporter {
-    /// Operator-facing label, surfaced in /logs and the dashboard list.
-    /// Not used for routing — the etcd-key uuid is the identity.
+    /// Operator-facing label, surfaced in logs and dashboard lists. The etcd
+    /// key UUID is the resource identity.
     pub name: String,
 
-    /// Soft kill switch. Disabled exporters stay in the snapshot but
-    /// the fan-out sink skips them. Lets operators pause an exporter
-    /// without losing the row's headers / endpoint.
+    /// Soft disable switch. Disabled exporters stay in the snapshot, but
+    /// the fan-out sink skips them.
     #[serde(default = "default_true")]
     pub enabled: bool,
 
@@ -257,7 +255,7 @@ pub struct ObservabilityExporter {
     #[serde(flatten)]
     pub kind: ExporterKind,
 
-    /// etcd-key uuid; filled by the loader, never in the JSON payload.
+    /// etcd-key uuid. Filled by the loader and never included in the JSON payload.
     #[serde(skip)]
     pub(crate) runtime_id: String,
 }
@@ -272,7 +270,7 @@ impl Resource for ObservabilityExporter {
     }
 
     /// Name doubles as the secondary index for human lookup. Identity
-    /// is the runtime_id (uuid); the name is only used for log /
+    /// is the runtime_id UUID. The name is only used for log /
     /// dashboard display.
     fn name(&self) -> &str {
         &self.name

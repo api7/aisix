@@ -38,7 +38,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
   "info": {
     "title": "AISIX Admin API",
     "version": "dev",
-    "description": "Use the AISIX Admin API to manage self-hosted gateway resources such as models, API keys, provider credentials, guardrails, cache policies, and observability exporters. All `/admin/v1/*` routes require a Bearer admin key configured in `admin.admin_keys`. Error responses use `{\"error_msg\": \"...\"}`.\n\nAISIX Cloud does not expose this listener; managed configuration is handled by the Cloud control plane."
+    "description": "The AISIX Admin API is the self-hosted management interface for configuring the gateway at runtime. Use it when you operate AISIX directly and need to create or update models, caller API keys, provider credentials, guardrails, cache policies, and observability exporters.\n\nAISIX Cloud does not expose this listener. Managed configuration is handled by the Cloud control plane."
   },
   "paths": {
     "/livez": {
@@ -53,7 +53,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "schema": {
               "type": "string"
             },
-            "description": "When present, returns a multi-line text report instead of the terse `ok` body.",
+            "description": "When present, returns a detailed multi-line text report instead of the default `ok` response.",
             "example": "1"
           }
         ],
@@ -532,7 +532,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
     },
     "/admin/v1/apikeys": {
       "get": {
-        "summary": "List API Keys",
+        "summary": "List Caller API Keys",
         "responses": {
           "200": {
             "description": "OK",
@@ -569,12 +569,12 @@ const OPENAPI_JSON_BASE: &str = r##"{
           }
         },
         "tags": [
-          "API Keys"
+          "Caller API Keys"
         ],
         "description": "List caller API keys with plaintext credentials redacted."
       },
       "post": {
-        "summary": "Create API Key",
+        "summary": "Create Caller API Key",
         "description": "Create a caller API key. The gateway validates the payload, rejects duplicate `key_hash` values, and returns the stored resource entry with plaintext credentials redacted.",
         "requestBody": {
           "required": true,
@@ -585,7 +585,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Caller API key configuration. Send the SHA-256 hash of the plaintext key; the Admin API never receives or returns the plaintext except on key rotation."
+          "description": "Caller API key configuration. Send the SHA-256 hash of the plaintext key. The Admin API stores only this hash and returns a plaintext credential only after key rotation."
         },
         "responses": {
           "200": {
@@ -665,7 +665,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           }
         },
         "tags": [
-          "API Keys"
+          "Caller API Keys"
         ]
       }
     },
@@ -683,7 +683,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         }
       ],
       "get": {
-        "summary": "Get API Key by ID",
+        "summary": "Get Caller API Key by ID",
         "responses": {
           "200": {
             "description": "OK",
@@ -727,12 +727,12 @@ const OPENAPI_JSON_BASE: &str = r##"{
           }
         },
         "tags": [
-          "API Keys"
+          "Caller API Keys"
         ],
         "description": "Get a caller API key by ID with plaintext credentials redacted."
       },
       "put": {
-        "summary": "Update API Key by ID",
+        "summary": "Update Caller API Key by ID",
         "requestBody": {
           "required": true,
           "content": {
@@ -742,7 +742,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Caller API key configuration. Send the SHA-256 hash of the plaintext key; the Admin API never receives or returns the plaintext except on key rotation."
+          "description": "Caller API key configuration. Send the SHA-256 hash of the plaintext key. The Admin API stores only this hash and returns a plaintext credential only after key rotation."
         },
         "responses": {
           "200": {
@@ -832,12 +832,12 @@ const OPENAPI_JSON_BASE: &str = r##"{
           }
         },
         "tags": [
-          "API Keys"
+          "Caller API Keys"
         ],
         "description": "Update a caller API key by ID. The gateway validates the payload, rejects duplicate `key_hash` values, preserves the resource ID, and increments the revision."
       },
       "delete": {
-        "summary": "Delete API Key by ID",
+        "summary": "Delete Caller API Key by ID",
         "responses": {
           "200": {
             "description": "OK",
@@ -881,7 +881,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           }
         },
         "tags": [
-          "API Keys"
+          "Caller API Keys"
         ],
         "description": "Delete a caller API key by ID."
       }
@@ -900,7 +900,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         }
       ],
       "post": {
-        "summary": "Rotate API Key by ID",
+        "summary": "Rotate Caller API Key by ID",
         "description": "Rotate a caller API key by ID. The gateway generates a new plaintext key, stores only its SHA-256 hash, and returns the plaintext once.",
         "responses": {
           "200": {
@@ -945,7 +945,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           }
         },
         "tags": [
-          "API Keys"
+          "Caller API Keys"
         ]
       }
     },
@@ -2375,8 +2375,8 @@ const OPENAPI_JSON_BASE: &str = r##"{
     },
     "/admin/v1/health": {
       "get": {
-        "summary": "List Model Health Levels",
-        "description": "Returns model health levels for the Admin API health check.",
+        "summary": "Get Gateway Health",
+        "description": "Get model health levels and configuration-watch freshness for this gateway.",
         "responses": {
           "200": {
             "description": "OK",
@@ -2579,7 +2579,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
       "ProxyBearer": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Proxy ApiKey (`sk-aisix-...`) — only used by `/playground/chat/completions`."
+        "description": "Proxy API key. Used only by `/playground/chat/completions`."
       }
     },
     "schemas": {
@@ -2663,7 +2663,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "direct",
           "routing"
         ],
-        "description": "Model resource kind. `direct` models dispatch to one upstream target; `routing` models select from configured routing targets.",
+        "description": "Model resource kind. `direct` models dispatch to one upstream target. `routing` models select from configured routing targets.",
         "example": "direct"
       },
       "RuntimeStatus": {
@@ -2674,7 +2674,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "cooldown",
           "not_applicable"
         ],
-        "description": "Current availability state used by runtime routing.",
+        "description": "`healthy` indicates that the model can receive traffic. `unhealthy` indicates that recent background checks failed and routing should avoid the model. `cooldown` indicates that recent request-path failures temporarily exclude the model until `cooldown_until`. `not_applicable` is used for routing models because runtime checks apply to their direct targets.",
         "example": "healthy"
       },
       "SystemTime": {
@@ -2805,7 +2805,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           },
           "plaintext": {
             "type": "string",
-            "description": "New plaintext bearer token. The Admin API returns it only once after rotation.",
+            "description": "New plaintext bearer token. Returned only once after rotation.",
             "example": "sk-aisix-6Nf9q4Yt7pR2mK8xD3vL"
           }
         }
@@ -2952,7 +2952,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "type": "integer",
             "minimum": 0,
             "maximum": 2,
-            "description": "Health level for the model.",
+            "description": "Numeric model health level. Lower values indicate healthier states. A value of 0 indicates healthy, 1 indicates degraded, and 2 indicates down.",
             "example": 0
           }
         }
@@ -2992,7 +2992,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "enum": [
               "ok"
             ],
-            "description": "Overall health response status.",
+            "description": "Fixed success marker for this response. Successful responses currently always return `ok`; this field does not summarize model health. Use `models[].health` and `config` for actionable health details.",
             "example": "ok"
           },
           "models": {
@@ -3047,7 +3047,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
   "tags": [
     {
       "name": "Health",
-      "description": "Public liveness and model health endpoints."
+      "description": "Liveness, model health, and configuration-watch freshness endpoints."
     },
     {
       "name": "OpenAPI",
@@ -3055,10 +3055,10 @@ const OPENAPI_JSON_BASE: &str = r##"{
     },
     {
       "name": "Models",
-      "description": "Model aliases and routing models used by proxy requests."
+      "description": "Model aliases used by proxy requests, including direct, routing, and ensemble models."
     },
     {
-      "name": "API Keys",
+      "name": "Caller API Keys",
       "description": "Caller-facing proxy API keys and key rotation."
     },
     {
@@ -3142,7 +3142,7 @@ const RESOURCE_SCHEMAS: &[(&str, &str)] = &[
 
 /// Build the merged OpenAPI document on first call and cache for the
 /// process lifetime. The result is what `GET /admin/openapi.json`
-/// serves; the constants above hold only the input fragments.
+/// serves. The constants above hold only the input fragments.
 ///
 /// `pub(crate)` so [`crate::build_router`] can pre-warm it at startup
 /// — `OnceLock::get_or_init` panics here would otherwise surface only
@@ -3188,14 +3188,146 @@ pub(crate) fn merged_openapi() -> &'static str {
         // everywhere in the merged doc (covers both the top-level
         // resource schemas and the already-hoisted nested ones).
         rewrite_definitions_refs(&mut doc);
+        add_variant_titles(&mut doc);
 
         serde_json::to_string(&doc).expect("merged OpenAPI must serialise")
     })
 }
 
+/// ReDoc uses `title` for `oneOf` and `anyOf` tab labels. Schemars does not
+/// title generated enum variants or nullable branches, so add stable labels
+/// after schema generation and ref rewriting.
+fn add_variant_titles(doc: &mut Value) {
+    for (pointer, titles) in [
+        (
+            "/components/schemas/ApiKey/properties/rate_limit/anyOf",
+            &["Rate limit", "Not configured"][..],
+        ),
+        (
+            "/components/schemas/Model/properties/background_model_check/anyOf",
+            &["Background check", "Not configured"],
+        ),
+        (
+            "/components/schemas/Model/properties/cooldown/anyOf",
+            &["Cooldown", "Not configured"],
+        ),
+        (
+            "/components/schemas/Model/properties/cost/anyOf",
+            &["Cost", "Not configured"],
+        ),
+        (
+            "/components/schemas/Model/properties/ensemble/anyOf",
+            &["Ensemble config", "Not configured"],
+        ),
+        (
+            "/components/schemas/Model/properties/rate_limit/anyOf",
+            &["Rate limit", "Not configured"],
+        ),
+        (
+            "/components/schemas/Model/properties/routing/anyOf",
+            &["Routing config", "Not configured"],
+        ),
+        (
+            "/components/schemas/ProviderKey/properties/adapter/anyOf",
+            &["Adapter", "Not configured"],
+        ),
+        (
+            "/components/schemas/ProviderKey/properties/request/anyOf",
+            &["Request overrides", "Not configured"],
+        ),
+        (
+            "/components/schemas/ProviderKey/properties/response/anyOf",
+            &["Response overrides", "Not configured"],
+        ),
+        (
+            "/components/schemas/RequestOverrides/properties/param_constraints/anyOf",
+            &["Parameter constraints", "Not configured"],
+        ),
+        (
+            "/components/schemas/ResponseOverrides/properties/stream_done_marker/anyOf",
+            &["Stream done marker", "Not configured"],
+        ),
+        (
+            "/components/schemas/Routing/properties/on_all_filtered/anyOf",
+            &["Fallback policy", "Not configured"],
+        ),
+        (
+            "/components/schemas/BedrockAWSCredentials/oneOf",
+            &["Static credentials"],
+        ),
+        (
+            "/components/schemas/BedrockLatencyMode/oneOf",
+            &["Serial", "Timed"],
+        ),
+        (
+            "/components/schemas/Guardrail/oneOf",
+            &[
+                "Keyword",
+                "AWS Bedrock",
+                "Azure AI Content Safety Prompt Shield",
+                "Azure AI Content Safety Text Moderation",
+                "Aliyun Text Moderation",
+            ],
+        ),
+        (
+            "/components/schemas/GuardrailHookPoint/oneOf",
+            &["Input", "Output", "Both"],
+        ),
+        (
+            "/components/schemas/KeywordPattern/oneOf",
+            &["Literal", "Regex"],
+        ),
+        (
+            "/components/schemas/ObjectStoreAuthMode/oneOf",
+            &["Credential reference", "Cloud identity"],
+        ),
+        (
+            "/components/schemas/ObjectStoreCompression/oneOf",
+            &["Gzip", "None"],
+        ),
+        (
+            "/components/schemas/ObservabilityExporter/oneOf",
+            &["OTLP HTTP", "Aliyun SLS", "Object storage", "Datadog"],
+        ),
+        (
+            "/components/schemas/OnAllFilteredPolicy/oneOf",
+            &["Fail", "Original order"],
+        ),
+        (
+            "/components/schemas/RoutingStrategy/oneOf",
+            &["Round robin", "Weighted", "Failover"],
+        ),
+        (
+            "/components/schemas/SlsContentMode/oneOf",
+            &["Metadata only", "Full content"],
+        ),
+        (
+            "/components/schemas/StreamDoneMarker/oneOf",
+            &["Required", "Optional", "None"],
+        ),
+    ] {
+        title_schema_variants(doc, pointer, titles);
+    }
+}
+
+fn title_schema_variants(doc: &mut Value, pointer: &str, titles: &[&str]) {
+    let Some(Value::Array(variants)) = doc.pointer_mut(pointer) else {
+        return;
+    };
+    if variants.len() != titles.len() {
+        return;
+    }
+
+    for (variant, title) in variants.iter_mut().zip(titles) {
+        if let Value::Object(map) = variant {
+            map.insert("title".to_string(), Value::String((*title).to_string()));
+        }
+    }
+}
+
 /// Walk a JSON value, rewriting `{"$ref": "#/definitions/X"}` strings
 /// to `{"$ref": "#/components/schemas/X"}`. `schemars` 0.8 emits the
-/// JSON Schema draft-07 form; OpenAPI 3.1 requires the
+/// JSON Schema draft-07 form. OpenAPI 3.1 requires the
 /// `components/schemas` form for in-document references.
 fn rewrite_definitions_refs(v: &mut Value) {
     match v {
@@ -3582,8 +3714,51 @@ mod tests {
         );
         assert_eq!(
             schemas["HealthResponse"]["properties"]["status"]["description"],
-            "Overall health response status."
+            "Fixed success marker for this response. Successful responses currently always return `ok`; this field does not summarize model health. Use `models[].health` and `config` for actionable health details."
         );
+    }
+
+    #[tokio::test]
+    async fn openapi_titles_schema_variants_for_redoc_tabs() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let mut missing = Vec::new();
+        collect_untitled_schema_variants(&parsed, String::new(), &mut missing);
+
+        assert!(
+            missing.is_empty(),
+            "schema variants missing titles for ReDoc tabs: {missing:#?}"
+        );
+    }
+
+    fn collect_untitled_schema_variants(
+        value: &serde_json::Value,
+        path: String,
+        missing: &mut Vec<String>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for key in ["oneOf", "anyOf"] {
+                    if let Some(serde_json::Value::Array(variants)) = map.get(key) {
+                        for (index, variant) in variants.iter().enumerate() {
+                            if variant["title"].as_str().is_none_or(str::is_empty) {
+                                missing.push(format!("{path}/{key}/{index}"));
+                            }
+                        }
+                    }
+                }
+
+                for (key, child) in map {
+                    collect_untitled_schema_variants(child, format!("{path}/{key}"), missing);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    collect_untitled_schema_variants(child, format!("{path}/{index}"), missing);
+                }
+            }
+            _ => {}
+        }
     }
 
     #[tokio::test]

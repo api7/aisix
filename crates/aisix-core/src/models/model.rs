@@ -89,10 +89,10 @@ pub struct CooldownConfig {
     /// as the cooldown TTL when present. Default: true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub honor_retry_after: Option<bool>,
-    /// Status codes that trigger cooldown. Default:
-    /// `[401, 408, 429, 500, 502, 503, 504]` — auth failures and rate
-    /// limits + transient server errors. `400/403/422` etc. are caller
-    /// mistakes and intentionally excluded.
+    /// Status codes that trigger cooldown. Defaults to
+    /// `[401, 408, 429, 500, 502, 503, 504]`, covering authentication
+    /// failures, rate limits, and transient server errors. Caller-side
+    /// validation errors such as `400`, `403`, and `422` are excluded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_statuses: Option<Vec<u16>>,
     /// Whether request-path timeouts trigger cooldown. Default: true.

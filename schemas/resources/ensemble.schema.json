@@ -93,7 +93,7 @@
           "format": "float"
         },
         "weight": {
-          "description": "Reserved for the future voting/quorum strategy; ignored by the v1 synthesis path. Carried on the wire now so enabling voting later does not require a wire-format change.",
+          "description": "Reserved for the future voting/quorum strategy. Ignored by the v1 synthesis path.",
           "type": [
             "integer",
             "null"
