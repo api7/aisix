@@ -169,7 +169,7 @@ pub struct ObjectStoreConfig {
     /// Which object-storage backend the bucket lives in.
     pub provider: ObjectStoreProvider,
 
-    /// Bucket (S3 / GCS) or container (Azure Blob) that receives the files.
+    /// Bucket for S3 or GCS, or container for Azure Blob, that receives exported files.
     pub bucket: String,
 
     /// Key prefix the partition path is appended to, e.g. `ai-gateway`.
@@ -182,8 +182,7 @@ pub struct ObjectStoreConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
 
-    /// Override the backend host for S3-compatible stores (MinIO, Aliyun
-    /// OSS, Cloudflare R2). Unset = the provider's native endpoint.
+    /// Backend host override for S3-compatible stores such as MinIO, Aliyun OSS, or Cloudflare R2. When omitted, the provider's native endpoint is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
 
@@ -216,8 +215,7 @@ pub enum ObjectStoreProvider {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectStoreCompression {
-    /// gzip (RFC 1952). Default compression with smaller egress, accepted by
-    /// Snowpipe and Auto Loader.
+    /// gzip compression (RFC 1952). This is the default and is accepted by Snowpipe and Auto Loader.
     #[default]
     Gzip,
     /// No compression. Emits raw NDJSON.
@@ -245,8 +243,7 @@ pub struct ObservabilityExporter {
     /// key UUID is the resource identity.
     pub name: String,
 
-    /// Soft disable switch. Disabled exporters stay in the snapshot, but
-    /// the fan-out sink skips them.
+    /// Whether this exporter is active. Disabled exporters remain configured but do not receive telemetry.
     #[serde(default = "default_true")]
     pub enabled: bool,
 

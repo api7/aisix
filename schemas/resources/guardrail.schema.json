@@ -28,7 +28,7 @@
       }
     },
     {
-      "description": "AWS Bedrock managed guardrail. The chain builder constructs a `BedrockGuardrail` that calls AWS `ApplyGuardrail` (real SigV4 dispatch) on input and/or output per the row's hook point.",
+      "description": "AWS Bedrock managed guardrail using `ApplyGuardrail` on input, output, or both.",
       "type": "object",
       "required": [
         "aws_credentials",
@@ -220,7 +220,7 @@
           "minimum": 0.0
         },
         "window_size": {
-          "description": "Sliding-window size in chars for window mode. cp-api caps it at the 10 000-char Azure limit. Default 10 000.",
+          "description": "Sliding-window size in characters for window mode. Default: 10,000.",
           "default": 10000,
           "type": "integer",
           "format": "uint32",
@@ -247,7 +247,7 @@
           "type": "string"
         },
         "endpoint": {
-          "description": "Explicit endpoint override (full URL, no trailing slash). When set it wins over `region`. Used by tests/dev to point at a mock server.",
+          "description": "Explicit endpoint override as a full URL with no trailing slash. When set, it takes precedence over `region`.",
           "default": null,
           "type": [
             "string",
@@ -320,7 +320,7 @@
   ],
   "properties": {
     "created_at": {
-      "description": "RFC3339 creation timestamp of the row. When present, the data plane can evaluate guardrail chains from oldest to newest. Rows without this timestamp sort after rows that have it. Resource ID resolves ties.",
+      "description": "RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.",
       "type": [
         "string",
         "null"
@@ -342,7 +342,7 @@
       "type": "string"
     },
     "fail_open": {
-      "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. No-op for `kind=keyword`. Defaults to `true`.",
+      "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting. Defaults to `true`.",
       "default": true,
       "type": "boolean"
     },
@@ -395,7 +395,7 @@
       ]
     },
     "BedrockLatencyMode": {
-      "description": "Per-guardrail latency policy for `kind: \"bedrock\"`. `serial` waits unconditionally. `timed` aborts at `timeout_ms` and applies the row-level `fail_open` flag.",
+      "description": "Per-guardrail latency policy for `kind: \"bedrock\"`. `serial` waits for the guardrail response. `timed` aborts at `timeout_ms` and applies `fail_open`.",
       "oneOf": [
         {
           "type": "object",
@@ -437,7 +437,7 @@
       "description": "What part of the request lifecycle a guardrail inspects.",
       "oneOf": [
         {
-          "description": "Run on the request payload before bridge dispatch.",
+          "description": "Run on the request payload before the upstream call.",
           "type": "string",
           "enum": [
             "input"

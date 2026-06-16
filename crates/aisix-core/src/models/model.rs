@@ -81,8 +81,7 @@ pub struct CooldownConfig {
     /// `Retry-After` header (or `honor_retry_after=false`). Default: 30.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_seconds: Option<u64>,
-    /// Upper bound on cooldown TTL. Caps a misbehaving upstream that
-    /// returns an unreasonable `Retry-After` value. Default: 600 (10 min).
+    /// Upper bound on cooldown TTL when `Retry-After` is used. Default: 600 seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_seconds: Option<u64>,
     /// Whether to use the upstream's `Retry-After` header (seconds form)
@@ -163,10 +162,7 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_name: Option<String>,
 
-    /// References a `ProviderKey` row by id. The bridge resolves this
-    /// against `AisixSnapshot::provider_keys` at dispatch time to
-    /// fetch the upstream secret + optional `api_base`. None for
-    /// routing models.
+    /// Provider key resource ID used to authenticate upstream requests. `None` for routing and ensemble models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_key_id: Option<String>,
 
@@ -185,14 +181,13 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_cidrs: Option<Vec<String>>,
 
-    /// Virtual-router config. When set, the proxy walks `routing.targets`
-    /// to pick a downstream Model and dispatches against THAT model's
-    /// `provider` / `model_name` / `provider_key_id`. The fields on
-    /// this entity are intentionally absent in that case.
+    /// Virtual routing configuration. When set, the gateway selects a target
+    /// from `routing.targets` and uses that target model's `provider`,
+    /// `model_name`, and `provider_key_id` fields for upstream dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<Routing>,
 
-    /// Ensemble configuration for fan-out panel calls and judge synthesis.
+    /// Ensemble configuration for panel calls and judge synthesis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensemble: Option<EnsembleConfig>,
 
@@ -205,8 +200,7 @@ pub struct Model {
     pub background_model_check: Option<BackgroundModelCheck>,
 
     /// Optional direct-model-only request-path cooldown configuration.
-    /// When absent, default cooldown semantics apply (see
-    /// [`CooldownConfig`] field docs for defaults).
+    /// When omitted, cooldown remains enabled with the defaults documented by each field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown: Option<CooldownConfig>,
 

@@ -13,8 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// One member of an ensemble panel. `model` references another
-/// `Model.display_name` in the snapshot (must be a direct model).
+/// One member of an ensemble panel. `model` references a direct model alias.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PanelMember {
@@ -44,7 +43,7 @@ impl PanelMember {
 }
 
 /// The judge model that synthesizes the panel responses into one answer.
-/// `model` references another `Model.display_name` (must be a direct model).
+/// `model` references a direct model alias.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Judge {

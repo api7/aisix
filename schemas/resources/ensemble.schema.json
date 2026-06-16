@@ -44,7 +44,7 @@
   "additionalProperties": false,
   "definitions": {
     "Judge": {
-      "description": "The judge model that synthesizes the panel responses into one answer. `model` references another `Model.display_name` (must be a direct model).",
+      "description": "The judge model that synthesizes the panel responses into one answer. `model` references a direct model alias.",
       "type": "object",
       "required": [
         "model"
@@ -65,7 +65,7 @@
       "additionalProperties": false
     },
     "PanelMember": {
-      "description": "One member of an ensemble panel. `model` references another `Model.display_name` in the snapshot (must be a direct model).",
+      "description": "One member of an ensemble panel. `model` references a direct model alias.",
       "type": "object",
       "required": [
         "model"

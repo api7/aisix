@@ -31,7 +31,7 @@
       "type": "string"
     },
     "ttl_seconds": {
-      "description": "TTL hint in seconds. Per-policy TTL is honored by the cache backend on each entry. Default 3600 matches the cp-api validator.",
+      "description": "Cache entry TTL in seconds. Default: 3600.",
       "default": 3600,
       "type": "integer",
       "format": "uint32",

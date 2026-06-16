@@ -43,9 +43,7 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_base: Option<String>,
 
-    /// Vendor identity, such as `"deepseek"`, `"openai"`, or a `models.dev`
-    /// catalog id. The gateway uses this value for specialized dispatch and
-    /// base-URL safety checks.
+    /// Upstream provider identifier, such as `"deepseek"`, `"openai"`, or a model catalog ID. The gateway uses this value for provider-specific dispatch and base URL validation.
     #[serde(default)]
     pub provider: String,
 
@@ -235,8 +233,7 @@ pub struct ResponseOverrides {
     pub reasoning_field: Option<String>,
 }
 
-/// Stream `[DONE]` terminator policy for an SSE response. The wire form is the
-/// lowercased variant name: `"required"`, `"optional"`, or `"none"`.
+/// Stream `[DONE]` terminator policy for an SSE response. Values are `"required"`, `"optional"`, or `"none"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum StreamDoneMarker {

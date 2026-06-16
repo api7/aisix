@@ -41,9 +41,7 @@ pub struct CachePolicy {
     #[serde(default)]
     pub backend: CacheBackend,
 
-    /// TTL hint in seconds. Per-policy TTL is honored by the cache
-    /// backend on each entry. Default 3600 matches the cp-api
-    /// validator.
+    /// Cache entry TTL in seconds. Default: 3600.
     #[serde(default = "default_ttl_seconds")]
     pub ttl_seconds: u32,
 

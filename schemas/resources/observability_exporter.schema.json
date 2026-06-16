@@ -128,7 +128,7 @@
           ]
         },
         "bucket": {
-          "description": "Bucket (S3 / GCS) or container (Azure Blob) that receives the files.",
+          "description": "Bucket for S3 or GCS, or container for Azure Blob, that receives exported files.",
           "type": "string"
         },
         "compression": {
@@ -145,7 +145,7 @@
           "type": "string"
         },
         "endpoint": {
-          "description": "Override the backend host for S3-compatible stores (MinIO, Aliyun OSS, Cloudflare R2). Unset = the provider's native endpoint.",
+          "description": "Backend host override for S3-compatible stores such as MinIO, Aliyun OSS, or Cloudflare R2. When omitted, the provider's native endpoint is used.",
           "type": [
             "string",
             "null"
@@ -244,7 +244,7 @@
   ],
   "properties": {
     "enabled": {
-      "description": "Soft disable switch. Disabled exporters stay in the snapshot, but the fan-out sink skips them.",
+      "description": "Whether this exporter is active. Disabled exporters remain configured but do not receive telemetry.",
       "default": true,
       "type": "boolean"
     },
@@ -277,7 +277,7 @@
       "description": "File compression for object-storage uploads.",
       "oneOf": [
         {
-          "description": "gzip (RFC 1952). Default compression with smaller egress, accepted by Snowpipe and Auto Loader.",
+          "description": "gzip compression (RFC 1952). This is the default and is accepted by Snowpipe and Auto Loader.",
           "type": "string",
           "enum": [
             "gzip"

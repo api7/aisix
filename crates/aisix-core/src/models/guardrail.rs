@@ -49,7 +49,7 @@ use crate::resource::Resource;
 )]
 #[serde(rename_all = "lowercase")]
 pub enum GuardrailHookPoint {
-    /// Run on the request payload before bridge dispatch.
+    /// Run on the request payload before the upstream call.
     Input,
     /// Run on the upstream response before the cache write + render.
     Output,
@@ -88,9 +88,7 @@ pub enum BedrockAWSCredentials {
     },
 }
 
-/// Per-guardrail latency policy for `kind: "bedrock"`. `serial` waits
-/// unconditionally. `timed` aborts at `timeout_ms` and applies the row-level
-/// `fail_open` flag.
+/// Per-guardrail latency policy for `kind: "bedrock"`. `serial` waits for the guardrail response. `timed` aborts at `timeout_ms` and applies `fail_open`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BedrockLatencyMode {
@@ -177,8 +175,7 @@ pub struct AzureContentSafetyTextModerationConfig {
     /// for whole-response hold-back.
     #[serde(default = "default_acs_stream_processing_mode")]
     pub stream_processing_mode: String,
-    /// Sliding-window size in chars for window mode. cp-api caps it at the
-    /// 10 000-char Azure limit. Default 10 000.
+    /// Sliding-window size in characters for window mode. Default: 10,000.
     #[serde(default = "default_acs_window_size")]
     pub window_size: u32,
     /// Chars carried between windows so a span split across a boundary is
@@ -259,8 +256,7 @@ pub struct AliyunTextModerationConfig {
     /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The DP
     /// builds the endpoint `https://green-cip.<region>.aliyuncs.com`.
     pub region: String,
-    /// Explicit endpoint override (full URL, no trailing slash). When set
-    /// it wins over `region`. Used by tests/dev to point at a mock server.
+    /// Explicit endpoint override as a full URL with no trailing slash. When set, it takes precedence over `region`.
     #[serde(default)]
     pub endpoint: Option<String>,
     /// Aliyun AccessKey ID.
@@ -341,9 +337,7 @@ pub struct BedrockConfig {
 pub enum GuardrailKind {
     /// In-process literal/regex blocklist. Always available.
     Keyword(KeywordConfig),
-    /// AWS Bedrock managed guardrail. The chain builder constructs a
-    /// `BedrockGuardrail` that calls AWS `ApplyGuardrail` (real SigV4
-    /// dispatch) on input and/or output per the row's hook point.
+    /// AWS Bedrock managed guardrail using `ApplyGuardrail` on input, output, or both.
     Bedrock(BedrockConfig),
     /// Azure AI Content Safety Prompt Shield. Detects jailbreak and
     /// indirect injection attacks via the `/contentsafety/text:shieldPrompt`
@@ -415,7 +409,7 @@ pub struct Guardrail {
     /// Behavior when a remote API guardrail cannot reach its upstream.
     /// `true` allows the request and records the bypass reason in
     /// `usage_events.guardrail_bypassed_reason`. `false` blocks with
-    /// 422. No-op for `kind=keyword`. Defaults to `true`.
+    /// 422. Keyword guardrails do not use this setting. Defaults to `true`.
     #[serde(default = "default_fail_open")]
     pub fail_open: bool,
 
@@ -441,9 +435,7 @@ pub struct Guardrail {
     #[serde(default = "default_direction")]
     pub direction: String,
 
-    /// RFC3339 creation timestamp of the row. When present, the data plane can
-    /// evaluate guardrail chains from oldest to newest. Rows without this
-    /// timestamp sort after rows that have it. Resource ID resolves ties.
+    /// RFC3339 creation timestamp. When present, guardrails are evaluated from oldest to newest. Resources without this timestamp sort after resources that have it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
 

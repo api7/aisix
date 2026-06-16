@@ -30,7 +30,7 @@
       "type": "string"
     },
     "provider": {
-      "description": "Vendor identity, such as `\"deepseek\"`, `\"openai\"`, or a `models.dev` catalog id. The gateway uses this value for specialized dispatch and base-URL safety checks.",
+      "description": "Upstream provider identifier, such as `\"deepseek\"`, `\"openai\"`, or a model catalog ID. The gateway uses this value for provider-specific dispatch and base URL validation.",
       "default": "",
       "type": "string"
     },
@@ -196,7 +196,7 @@
       "additionalProperties": false
     },
     "StreamDoneMarker": {
-      "description": "Stream `[DONE]` terminator policy for an SSE response. The wire form is the lowercased variant name: `\"required\"`, `\"optional\"`, or `\"none\"`.",
+      "description": "Stream `[DONE]` terminator policy for an SSE response. Values are `\"required\"`, `\"optional\"`, or `\"none\"`.",
       "oneOf": [
         {
           "description": "Upstream is expected to emit `data: [DONE]`. Absence is treated as an invalid stream response.",

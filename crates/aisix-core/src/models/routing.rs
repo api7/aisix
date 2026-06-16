@@ -30,8 +30,7 @@ pub enum RoutingStrategy {
     Failover,
 }
 
-/// One destination in a routing config. `model` references another
-/// `Model.name` in the snapshot.
+/// One destination in a routing configuration. `model` references a direct model alias.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingTarget {
@@ -95,8 +94,7 @@ pub struct Routing {
     /// Whether upstream 429 participates in retries and failover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_on_429: Option<bool>,
-    /// Policy for the case where every candidate is filtered out by
-    /// runtime status. See [`OnAllFilteredPolicy`].
+    /// Policy to apply when runtime status filtering removes every candidate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_all_filtered: Option<OnAllFilteredPolicy>,
 }

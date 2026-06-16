@@ -8,7 +8,7 @@
   ],
   "properties": {
     "allowed_models": {
-      "description": "Whitelisted Model identifiers. cp-api stores them as model UUIDs. Self-hosted dev fixtures may still use names because the DP uses string equality. An empty array denies every model.",
+      "description": "Model identifiers this key may use. An empty array denies access to every model.",
       "type": "array",
       "items": {
         "type": "string"

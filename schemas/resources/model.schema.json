@@ -28,7 +28,7 @@
       ]
     },
     "cooldown": {
-      "description": "Optional direct-model-only request-path cooldown configuration. When absent, default cooldown semantics apply (see [`CooldownConfig`] field docs for defaults).",
+      "description": "Optional direct-model-only request-path cooldown configuration. When omitted, cooldown remains enabled with the defaults documented by each field.",
       "anyOf": [
         {
           "$ref": "#/definitions/CooldownConfig"
@@ -54,7 +54,7 @@
       "type": "string"
     },
     "ensemble": {
-      "description": "Ensemble configuration for fan-out panel calls and judge synthesis.",
+      "description": "Ensemble configuration for panel calls and judge synthesis.",
       "anyOf": [
         {
           "$ref": "#/definitions/EnsembleConfig"
@@ -79,7 +79,7 @@
       ]
     },
     "provider_key_id": {
-      "description": "References a `ProviderKey` row by id. The bridge resolves this against `AisixSnapshot::provider_keys` at dispatch time to fetch the upstream secret + optional `api_base`. None for routing models.",
+      "description": "Provider key resource ID used to authenticate upstream requests. `None` for routing and ensemble models.",
       "type": [
         "string",
         "null"
@@ -96,7 +96,7 @@
       ]
     },
     "routing": {
-      "description": "Virtual-router config. When set, the proxy walks `routing.targets` to pick a downstream Model and dispatches against THAT model's `provider` / `model_name` / `provider_key_id`. The fields on this entity are intentionally absent in that case.",
+      "description": "Virtual routing configuration. When set, the gateway selects a target from `routing.targets` and uses that target model's `provider`, `model_name`, and `provider_key_id` fields for upstream dispatch.",
       "anyOf": [
         {
           "$ref": "#/definitions/Routing"
@@ -203,7 +203,7 @@
           ]
         },
         "max_seconds": {
-          "description": "Upper bound on cooldown TTL. Caps a misbehaving upstream that returns an unreasonable `Retry-After` value. Default: 600 (10 min).",
+          "description": "Upper bound on cooldown TTL when `Retry-After` is used. Default: 600 seconds.",
           "type": [
             "integer",
             "null"
@@ -284,7 +284,7 @@
       "additionalProperties": false
     },
     "Judge": {
-      "description": "The judge model that synthesizes the panel responses into one answer. `model` references another `Model.display_name` (must be a direct model).",
+      "description": "The judge model that synthesizes the panel responses into one answer. `model` references a direct model alias.",
       "type": "object",
       "required": [
         "model"
@@ -345,7 +345,7 @@
       ]
     },
     "PanelMember": {
-      "description": "One member of an ensemble panel. `model` references another `Model.display_name` in the snapshot (must be a direct model).",
+      "description": "One member of an ensemble panel. `model` references a direct model alias.",
       "type": "object",
       "required": [
         "model"
@@ -469,7 +469,7 @@
           "minimum": 0.0
         },
         "on_all_filtered": {
-          "description": "Policy for the case where every candidate is filtered out by runtime status. See [`OnAllFilteredPolicy`].",
+          "description": "Policy to apply when runtime status filtering removes every candidate.",
           "anyOf": [
             {
               "$ref": "#/definitions/OnAllFilteredPolicy"
@@ -540,7 +540,7 @@
       ]
     },
     "RoutingTarget": {
-      "description": "One destination in a routing config. `model` references another `Model.name` in the snapshot.",
+      "description": "One destination in a routing configuration. `model` references a direct model alias.",
       "type": "object",
       "required": [
         "model"

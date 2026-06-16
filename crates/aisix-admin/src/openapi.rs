@@ -184,7 +184,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Model configuration to validate and store. The Admin API generates the resource ID."
+          "description": "Model configuration for a direct, routing, or ensemble model."
         },
         "responses": {
           "200": {
@@ -342,7 +342,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Replacement model configuration to validate and store under the existing resource ID."
+          "description": "Replacement model configuration."
         },
         "responses": {
           "200": {
@@ -1003,7 +1003,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Provider key configuration containing the upstream credential and provider routing metadata. The Admin API generates the resource ID."
+          "description": "Provider key configuration containing the upstream credential and provider routing metadata."
         },
         "responses": {
           "200": {
@@ -1161,7 +1161,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Replacement provider key configuration to validate and store under the existing resource ID."
+          "description": "Replacement provider key configuration."
         },
         "responses": {
           "200": {
@@ -1359,7 +1359,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Guardrail configuration to validate and store. The Admin API generates the resource ID."
+          "description": "Guardrail configuration for request or response checks."
         },
         "responses": {
           "200": {
@@ -1517,7 +1517,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Replacement guardrail configuration to validate and store under the existing resource ID."
+          "description": "Replacement guardrail configuration."
         },
         "responses": {
           "200": {
@@ -1715,7 +1715,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Cache policy configuration to validate and store. The Admin API generates the resource ID."
+          "description": "Cache policy configuration for response cache matching and storage behavior."
         },
         "responses": {
           "200": {
@@ -1873,7 +1873,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Replacement cache policy configuration to validate and store under the existing resource ID."
+          "description": "Replacement cache policy configuration."
         },
         "responses": {
           "200": {
@@ -2071,7 +2071,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Observability exporter configuration to validate and store. The Admin API generates the resource ID."
+          "description": "Observability exporter configuration for telemetry export and optional content capture."
         },
         "responses": {
           "200": {
@@ -2229,7 +2229,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Replacement observability exporter configuration to validate and store under the existing resource ID."
+          "description": "Replacement observability exporter configuration."
         },
         "responses": {
           "200": {
@@ -3188,69 +3188,18 @@ pub(crate) fn merged_openapi() -> &'static str {
         // everywhere in the merged doc (covers both the top-level
         // resource schemas and the already-hoisted nested ones).
         rewrite_definitions_refs(&mut doc);
+        collapse_nullable_any_of(&mut doc);
+        collapse_single_ref_all_of(&mut doc);
         add_variant_titles(&mut doc);
 
         serde_json::to_string(&doc).expect("merged OpenAPI must serialise")
     })
 }
 
-/// ReDoc uses `title` for `oneOf` and `anyOf` tab labels. Schemars does not
-/// title generated enum variants or nullable branches, so add stable labels
-/// after schema generation and ref rewriting.
+/// ReDoc uses `title` for `oneOf` tab labels. Schemars does not title generated
+/// enum variants, so add stable labels after schema generation and ref rewriting.
 fn add_variant_titles(doc: &mut Value) {
-    for (pointer, titles) in [
-        (
-            "/components/schemas/ApiKey/properties/rate_limit/anyOf",
-            &["Rate limit", "Not configured"][..],
-        ),
-        (
-            "/components/schemas/Model/properties/background_model_check/anyOf",
-            &["Background check", "Not configured"],
-        ),
-        (
-            "/components/schemas/Model/properties/cooldown/anyOf",
-            &["Cooldown", "Not configured"],
-        ),
-        (
-            "/components/schemas/Model/properties/cost/anyOf",
-            &["Cost", "Not configured"],
-        ),
-        (
-            "/components/schemas/Model/properties/ensemble/anyOf",
-            &["Ensemble config", "Not configured"],
-        ),
-        (
-            "/components/schemas/Model/properties/rate_limit/anyOf",
-            &["Rate limit", "Not configured"],
-        ),
-        (
-            "/components/schemas/Model/properties/routing/anyOf",
-            &["Routing config", "Not configured"],
-        ),
-        (
-            "/components/schemas/ProviderKey/properties/adapter/anyOf",
-            &["Adapter", "Not configured"],
-        ),
-        (
-            "/components/schemas/ProviderKey/properties/request/anyOf",
-            &["Request overrides", "Not configured"],
-        ),
-        (
-            "/components/schemas/ProviderKey/properties/response/anyOf",
-            &["Response overrides", "Not configured"],
-        ),
-        (
-            "/components/schemas/RequestOverrides/properties/param_constraints/anyOf",
-            &["Parameter constraints", "Not configured"],
-        ),
-        (
-            "/components/schemas/ResponseOverrides/properties/stream_done_marker/anyOf",
-            &["Stream done marker", "Not configured"],
-        ),
-        (
-            "/components/schemas/Routing/properties/on_all_filtered/anyOf",
-            &["Fallback policy", "Not configured"],
-        ),
+    let variant_titles: &[(&str, &[&str])] = &[
         (
             "/components/schemas/BedrockAWSCredentials/oneOf",
             &["Static credentials"],
@@ -3305,7 +3254,9 @@ fn add_variant_titles(doc: &mut Value) {
             "/components/schemas/StreamDoneMarker/oneOf",
             &["Required", "Optional", "None"],
         ),
-    ] {
+    ];
+
+    for (pointer, titles) in variant_titles {
         title_schema_variants(doc, pointer, titles);
     }
 }
@@ -3322,6 +3273,86 @@ fn title_schema_variants(doc: &mut Value, pointer: &str, titles: &[&str]) {
         if let Value::Object(map) = variant {
             map.insert("title".to_string(), Value::String((*title).to_string()));
         }
+    }
+}
+
+/// Schemars represents `Option<T>` as `anyOf: [T, null]`. That is accurate
+/// JSON Schema, but ReDoc renders it as a two-tab choice for optional fields.
+/// Collapse that generated nullable shape in the served OpenAPI so optionality
+/// is expressed by the field being absent from `required`, matching the
+/// hand-written API7/AISIX Cloud Admin API style.
+fn collapse_nullable_any_of(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            for child in map.values_mut() {
+                collapse_nullable_any_of(child);
+            }
+
+            let replacement = match map.get("anyOf") {
+                Some(Value::Array(variants)) if variants.len() == 2 => {
+                    let mut non_null = None;
+                    let mut null_count = 0;
+                    for variant in variants {
+                        if variant.get("type") == Some(&Value::String("null".to_string())) {
+                            null_count += 1;
+                        } else {
+                            non_null = Some(variant.clone());
+                        }
+                    }
+                    if null_count == 1 {
+                        non_null
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+
+            if let Some(Value::Object(non_null)) = replacement {
+                map.remove("anyOf");
+                for (key, value) in non_null {
+                    map.entry(key).or_insert(value);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collapse_nullable_any_of(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Schemars emits `allOf: [{"$ref": "..."}]` when a property has both a
+/// description and a referenced schema. ReDoc does not need the wrapper, and
+/// API7 Gateway's reference specs avoid this shape, so flatten it while keeping
+/// the property's local description.
+fn collapse_single_ref_all_of(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            for child in map.values_mut() {
+                collapse_single_ref_all_of(child);
+            }
+
+            let ref_value = match map.get("allOf") {
+                Some(Value::Array(variants)) if variants.len() == 1 => {
+                    variants[0].get("$ref").cloned()
+                }
+                _ => None,
+            };
+
+            if let Some(ref_value) = ref_value {
+                map.remove("allOf");
+                map.entry("$ref".to_string()).or_insert(ref_value);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collapse_single_ref_all_of(item);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3729,6 +3760,74 @@ mod tests {
             missing.is_empty(),
             "schema variants missing titles for ReDoc tabs: {missing:#?}"
         );
+        let background_model_check =
+            &parsed["components"]["schemas"]["Model"]["properties"]["background_model_check"];
+        assert_eq!(
+            background_model_check["$ref"],
+            "#/components/schemas/BackgroundModelCheck"
+        );
+        assert!(
+            background_model_check.get("anyOf").is_none(),
+            "optional object fields should not render as nullable ReDoc tabs"
+        );
+
+        let mut nullable_any_of = Vec::new();
+        collect_nullable_any_of(&parsed, String::new(), &mut nullable_any_of);
+        assert!(
+            nullable_any_of.is_empty(),
+            "nullable anyOf branches should be collapsed before serving ReDoc: {nullable_any_of:#?}"
+        );
+
+        let mut single_ref_all_of = Vec::new();
+        collect_single_ref_all_of(&parsed, String::new(), &mut single_ref_all_of);
+        assert!(
+            single_ref_all_of.is_empty(),
+            "single-ref allOf wrappers should be collapsed before serving ReDoc: {single_ref_all_of:#?}"
+        );
+    }
+
+    fn collect_nullable_any_of(value: &serde_json::Value, path: String, hits: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::Array(variants)) = map.get("anyOf") {
+                    if variants.iter().any(|variant| variant["type"] == "null") {
+                        hits.push(path.clone());
+                    }
+                }
+
+                for (key, child) in map {
+                    collect_nullable_any_of(child, format!("{path}/{key}"), hits);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    collect_nullable_any_of(child, format!("{path}/{index}"), hits);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_single_ref_all_of(value: &serde_json::Value, path: String, hits: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::Array(variants)) = map.get("allOf") {
+                    if variants.len() == 1 && variants[0]["$ref"].is_string() {
+                        hits.push(path.clone());
+                    }
+                }
+
+                for (key, child) in map {
+                    collect_single_ref_all_of(child, format!("{path}/{key}"), hits);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    collect_single_ref_all_of(child, format!("{path}/{index}"), hits);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn collect_untitled_schema_variants(

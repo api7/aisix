@@ -21,9 +21,7 @@ pub struct ApiKey {
     /// incoming bearer tokens before lookup.
     pub key_hash: String,
 
-    /// Whitelisted Model identifiers. cp-api stores them as model
-    /// UUIDs. Self-hosted dev fixtures may still use names because
-    /// the DP uses string equality. An empty array denies every model.
+    /// Model identifiers this key may use. An empty array denies access to every model.
     pub allowed_models: Vec<String>,
 
     /// Optional request, token, and concurrency limits for this key.
