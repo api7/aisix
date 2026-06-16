@@ -40,7 +40,7 @@
       ],
       "properties": {
         "aws_credentials": {
-          "description": "IAM credentials. v1 = static access keys (encrypted).",
+          "description": "IAM credentials for Bedrock requests.",
           "allOf": [
             {
               "$ref": "#/definitions/BedrockAWSCredentials"

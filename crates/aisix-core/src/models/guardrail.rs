@@ -329,7 +329,7 @@ pub struct BedrockConfig {
     pub guardrail_version: String,
     /// AWS region the Bedrock endpoint lives in (e.g. `us-east-1`).
     pub region: String,
-    /// IAM credentials. v1 = static access keys (encrypted).
+    /// IAM credentials for Bedrock requests.
     pub aws_credentials: BedrockAWSCredentials,
     /// `serial` (default) or `timed { timeout_ms }`.
     pub latency_mode: BedrockLatencyMode,

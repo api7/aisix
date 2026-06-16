@@ -20,14 +20,10 @@ use serde::{Deserialize, Serialize};
 pub struct PanelMember {
     /// Model alias for a direct model that receives one panel request.
     pub model: String,
-    /// Sampling temperature for THIS member's call. Overrides the
-    /// request's `temperature`, so a panel of the same model repeated N
-    /// times still produces diverse answers (self-ensemble). Absent =
-    /// leave the request's temperature unchanged.
+    /// Sampling temperature for this panel member. Omit it to keep the request's temperature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
-    /// Optional sampling seed for THIS member's call — pairs with
-    /// `temperature` for reproducible diversity. Absent = no seed override.
+    /// Optional sampling seed for this panel member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
     /// Reserved for the future voting/quorum strategy; ignored by the v1
@@ -56,7 +52,6 @@ pub struct Judge {
     /// Model alias for the direct model that synthesizes panel responses.
     pub model: String,
     /// Optional override for the built-in synthesis prompt template.
-    /// Absent = use the default template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synthesis_prompt: Option<String>,
 }
@@ -83,14 +78,10 @@ pub struct EnsembleConfig {
     pub panel: Vec<PanelMember>,
     /// Direct model that combines successful panel responses.
     pub judge: Judge,
-    /// Minimum successful panel responses required to proceed to
-    /// synthesis. Absent = `min(DEFAULT_MIN_RESPONSES, panel.len())`.
-    /// A value larger than the panel is clamped to the panel size.
+    /// Minimum successful panel responses required before judge synthesis. Defaults to the smaller of 2 and the panel size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_responses: Option<u32>,
-    /// Per-call upstream deadline applied to each panel member and the
-    /// judge call (in addition to each member model's own `timeout`). `0`
-    /// or absent = no ensemble-level per-call deadline.
+    /// Per-call upstream deadline applied to each panel member and the judge. Set `0` or omit it to disable the ensemble-level deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
 }

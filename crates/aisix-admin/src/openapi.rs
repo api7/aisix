@@ -2376,7 +2376,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
     "/admin/v1/health": {
       "get": {
         "summary": "List Model Health Levels",
-        "description": "Returns each Model's health level: 0=Healthy, 1=Degraded (4-7 consecutive upstream failures), 2=Down (8+).",
+        "description": "Returns model health levels for the Admin API health check.",
         "responses": {
           "200": {
             "description": "OK",
@@ -2651,11 +2651,11 @@ const OPENAPI_JSON_BASE: &str = r##"{
           },
           "status_reason": {
             "type": "string",
-            "description": "Machine-readable explanation such as `retryable_failure`, `background_check_failed`, or `ignored_transient_error`.",
+            "description": "Reason for the current runtime status, when available.",
             "example": "retryable_failure"
           }
         },
-        "description": "Per-model runtime routing status. Routing rows always return `kind=routing` and `status=not_applicable`."
+        "description": "Runtime routing status for one model."
       },
       "ModelKind": {
         "type": "string",
@@ -2674,7 +2674,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "cooldown",
           "not_applicable"
         ],
-        "description": "Runtime routing status. `healthy` is selectable, `unhealthy` is excluded after background checks fail, `cooldown` is temporarily excluded after retryable request failures, and `not_applicable` is used for routing models.",
+        "description": "Current availability state used by runtime routing.",
         "example": "healthy"
       },
       "SystemTime": {
@@ -2952,7 +2952,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "type": "integer",
             "minimum": 0,
             "maximum": 2,
-            "description": "Numeric model health level: 0 is healthy, 1 is degraded, and 2 is down.",
+            "description": "Health level for the model.",
             "example": 0
           }
         }
@@ -2992,7 +2992,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "enum": [
               "ok"
             ],
-            "description": "Overall health response status. The endpoint always returns `ok`; inspect each model health level for actionable signal.",
+            "description": "Overall health response status.",
             "example": "ok"
           },
           "models": {
@@ -3582,7 +3582,7 @@ mod tests {
         );
         assert_eq!(
             schemas["HealthResponse"]["properties"]["status"]["description"],
-            "Overall health response status. The endpoint always returns `ok`; inspect each model health level for actionable signal."
+            "Overall health response status."
         );
     }
 

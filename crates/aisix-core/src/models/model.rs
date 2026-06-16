@@ -196,7 +196,7 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensemble: Option<EnsembleConfig>,
 
-    /// Per-token cost for budget tracking. Absent = no cost tracked.
+    /// Per-token cost for budget tracking. Omit it when cost tracking is not needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<ModelCost>,
 

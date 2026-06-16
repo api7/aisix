@@ -16,7 +16,7 @@
       ]
     },
     "min_responses": {
-      "description": "Minimum successful panel responses required to proceed to synthesis. Absent = `min(DEFAULT_MIN_RESPONSES, panel.len())`. A value larger than the panel is clamped to the panel size.",
+      "description": "Minimum successful panel responses required before judge synthesis. Defaults to the smaller of 2 and the panel size.",
       "type": [
         "integer",
         "null"
@@ -32,7 +32,7 @@
       }
     },
     "timeout_ms": {
-      "description": "Per-call upstream deadline applied to each panel member and the judge call (in addition to each member model's own `timeout`). `0` or absent = no ensemble-level per-call deadline.",
+      "description": "Per-call upstream deadline applied to each panel member and the judge. Set `0` or omit it to disable the ensemble-level deadline.",
       "type": [
         "integer",
         "null"
@@ -55,7 +55,7 @@
           "type": "string"
         },
         "synthesis_prompt": {
-          "description": "Optional override for the built-in synthesis prompt template. Absent = use the default template.",
+          "description": "Optional override for the built-in synthesis prompt template.",
           "type": [
             "string",
             "null"
@@ -76,7 +76,7 @@
           "type": "string"
         },
         "seed": {
-          "description": "Optional sampling seed for THIS member's call — pairs with `temperature` for reproducible diversity. Absent = no seed override.",
+          "description": "Optional sampling seed for this panel member.",
           "type": [
             "integer",
             "null"
@@ -85,7 +85,7 @@
           "minimum": 0.0
         },
         "temperature": {
-          "description": "Sampling temperature for THIS member's call. Overrides the request's `temperature`, so a panel of the same model repeated N times still produces diverse answers (self-ensemble). Absent = leave the request's temperature unchanged.",
+          "description": "Sampling temperature for this panel member. Omit it to keep the request's temperature.",
           "type": [
             "number",
             "null"
