@@ -26,7 +26,7 @@ use futures::future::join_all;
 
 use aisix_core::models::{EnsembleConfig, Judge, PanelMember};
 use aisix_core::AisixSnapshot;
-use aisix_gateway::bridge::{BridgeContext, BridgeError, UpstreamWire};
+use aisix_gateway::bridge::{BridgeContext, BridgeError};
 use aisix_gateway::chat::{ChatFormat, ChatMessage, ChatResponse, Role, UsageStats};
 
 use crate::state::ProxyState;
@@ -140,12 +140,8 @@ impl ModelCaller for ProxyModelCaller<'_> {
         // failure. An unlimited member reserves nothing (zero overhead).
         let reservation = crate::quota::reserve_model_only(self.state, target, &entry.id, model)
             .await
-            .map_err(|_| BridgeError::UpstreamStatus {
-                status: 429,
-                message: "rate limit exceeded for an ensemble sub-call".to_string(),
-                parsed: None,
-                wire: UpstreamWire::Unknown,
-                retry_after: None,
+            .map_err(|_| {
+                BridgeError::upstream_status(429, "rate limit exceeded for an ensemble sub-call")
             })?;
 
         // On a bridge error the reservation drops here → concurrency slots

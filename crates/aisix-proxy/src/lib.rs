@@ -5776,6 +5776,91 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(run(app, make_req()).await.status(), StatusCode::OK);
     }
 
+    /// #620: the STREAMING judge bypasses `ProxyModelCaller::call` (it streams
+    /// via `build_sse_stream`), so its own rate limit must be reserved on the
+    /// streaming path too. With the judge capped at `rpm: 1`, the first streamed
+    /// ensemble request consumes the judge's only request slot (200); the second
+    /// finds it exhausted and fails before opening the stream (429).
+    #[tokio::test]
+    async fn ensemble_streaming_judge_rate_limit_enforced() {
+        let upstream = MockServer::start().await;
+        let judge_sse = "\
+data: {\"id\":\"cmpl-judge\",\"model\":\"judge-upstream\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"final\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-judge\",\"model\":\"judge-upstream\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":7,\"total_tokens\":37}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("Answer 1:"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(judge_sse),
+            )
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-panel",
+                "model": "panel-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "a panel candidate answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 11, "total_tokens": 16}
+            })))
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        snap.models
+            .insert(direct_model_entry("m-panel-a", "panel-a", "panel-upstream"));
+        snap.models
+            .insert(direct_model_entry("m-panel-b", "panel-b", "panel-upstream"));
+        // Judge capped at one request per minute.
+        snap.models.insert(direct_model_entry_rl(
+            "m-judge",
+            "judge-m",
+            "judge-upstream",
+            serde_json::json!({ "rpm": 1 }),
+        ));
+        snap.models.insert(ensemble_model_entry(
+            "m-council",
+            "council",
+            &["panel-a", "panel-b"],
+            "judge-m",
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
+        let app = build_router(build_state(snap, hub));
+
+        let make_req = || {
+            let body = serde_json::json!({
+                "model": "council",
+                "messages": [{"role": "user", "content": "what is the best answer?"}],
+                "stream": true
+            });
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        // First streamed request consumes the judge's only rpm slot.
+        assert_eq!(run(app.clone(), make_req()).await.status(), StatusCode::OK);
+        // Second finds the judge rpm exhausted → 429 before the stream opens.
+        assert_eq!(
+            run(app, make_req()).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
     #[tokio::test]
     async fn ensemble_fans_out_to_panel_and_returns_judge_synthesis() {
         let upstream = MockServer::start().await;

@@ -2081,6 +2081,35 @@ async fn dispatch_ensemble(
             judge_ctx = judge_ctx.with_deadline(deadline);
         }
 
+        // #620: enforce the judge's OWN model rate limit for the streamed
+        // synthesis too. The panel was reserved per-member in
+        // `run_ensemble_panel` (via `ProxyModelCaller::call`), and the
+        // non-streaming judge is reserved on that same path — but the streaming
+        // judge is dispatched here via `chat_stream`, bypassing it. Reserve
+        // before opening the stream so a rate-limited judge fails fast (429);
+        // the slot is then held for the stream's lifetime and the judge's own
+        // tokens are added post-stream, mirroring the entry reservation below.
+        let judge_reservation = match crate::quota::reserve_model_only(
+            state,
+            &ensemble_cfg.judge.model,
+            &judge_entry.id,
+            judge_model,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                reservation.commit_tokens(survivor_total(&panel)).await;
+                return Err(emit_panel_then_fail(
+                    &panel,
+                    ProxyError::Bridge(BridgeError::upstream_status(
+                        429,
+                        "rate limit exceeded for the ensemble judge",
+                    )),
+                ));
+            }
+        };
+
         let judge_stream = match judge_bridge.chat_stream(&judge_req, &judge_ctx).await {
             Ok(s) => s,
             // Judge connect failed AFTER the panel round-tripped: bill the
@@ -2168,6 +2197,11 @@ async fn dispatch_ensemble(
         // keys BEFORE consuming the reservation into the owned guard.
         let post_stream_keys = reservation.keys();
         let stream_concurrency_hold = reservation.into_stream_hold();
+        // #620: hold the judge's own concurrency slot for the stream lifetime
+        // and add its tokens post-stream, the same way the entry reservation is
+        // handled (snapshot keys before consuming into the owned guard).
+        let judge_post_stream_keys = judge_reservation.keys();
+        let judge_concurrency_hold = judge_reservation.into_stream_hold();
         let limiter = Arc::clone(&state.limiter);
 
         let sse_stream = build_sse_stream(
@@ -2186,6 +2220,11 @@ async fn dispatch_ensemble(
                 // plus the streamed judge's final total, against every layer.
                 for key in &post_stream_keys {
                     limiter.add_tokens_post_stream(key, panel_total + comp.total_tokens);
+                }
+                // #620: the judge's own model bucket gets only the judge's
+                // streamed tokens (each panel member was billed per-member).
+                for key in &judge_post_stream_keys {
+                    limiter.add_tokens_post_stream(key, comp.total_tokens);
                 }
                 // Telemetry: one event per panel member (attempt_kind "panel",
                 // index 0..N) carrying that member's own buffered usage, then
@@ -2265,6 +2304,7 @@ async fn dispatch_ensemble(
                 // Release the concurrency permit(s) now the stream is done
                 // (or was cancelled) — on_complete fires on both paths (#450).
                 drop(stream_concurrency_hold);
+                drop(judge_concurrency_hold);
             },
         );
         let response =
