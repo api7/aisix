@@ -78,8 +78,6 @@ curl http://localhost:3000/v1/chat/completions \
   AISIX Cloud only when you want the managed control plane.
 - **Production controls built in.** Routing & failover, rate limits, budgets, guardrails,
   caching, and observability ship in the box.
-- **Proven lineage.** Built by [API7](https://api7.ai) — the original creators of
-  [Apache APISIX](https://apisix.apache.org/), a top-level project at the Apache Software Foundation.
 
 ## 🧩 Features — available today
 
