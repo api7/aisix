@@ -168,7 +168,7 @@
           "type": "boolean"
         },
         "error_envelope": {
-          "description": "Error-translation strategy. `\"openai\"` projects upstream errors into the OpenAI-compatible envelope. `\"passthrough\"` returns the upstream body as-is.",
+          "description": "Stored error-envelope preference for compatibility with control-plane configuration. The proxy does not currently apply this field.",
           "type": [
             "string",
             "null"

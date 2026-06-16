@@ -219,9 +219,8 @@ pub struct ResponseOverrides {
     #[serde(default)]
     pub content_list_to_string: bool,
 
-    /// Error-translation strategy. `"openai"` projects upstream errors into the
-    /// OpenAI-compatible envelope. `"passthrough"` returns the upstream body
-    /// as-is.
+    /// Stored error-envelope preference for compatibility with control-plane
+    /// configuration. The proxy does not currently apply this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_envelope: Option<String>,
 
