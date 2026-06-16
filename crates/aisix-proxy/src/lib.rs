@@ -5694,9 +5694,11 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         // Rendered under the requested ensemble model name — never the
         // judge's upstream model id (no provider/model leakage).
         assert_eq!(v["model"], "council");
-        // Client-facing usage is the judge call's own (the executor's
-        // `EnsembleOutcome.response` carries the judge usage).
-        assert_eq!(v["usage"]["total_tokens"], 37);
+        // #614: client-facing usage is the AGGREGATE of every panel member
+        // plus the judge, not the judge's alone — so the caller sees the full
+        // fan-out cost. Here: two panel members at total_tokens=16 each (32)
+        // plus the judge's 37 = 69.
+        assert_eq!(v["usage"]["total_tokens"], 69);
     }
 
     /// Tool-using requests can't be fanned out coherently across a panel,
@@ -5894,6 +5896,121 @@ data: [DONE]\n\n";
         // The judge event carries the streamed terminal-chunk usage.
         assert_eq!(judge_events[0].prompt_tokens, 30);
         assert_eq!(judge_events[0].completion_tokens, 7);
+    }
+
+    /// #614: a STREAMING ensemble's client-facing terminal usage frame (sent
+    /// when the client asked for `stream_options.include_usage`) is the
+    /// panel+judge AGGREGATE, not the judge's alone — matching the
+    /// non-streaming path. Here: two panel members at total_tokens=16 each
+    /// (prompt 5 / completion 11) + the judge's streamed 37 (prompt 30 /
+    /// completion 7) ⇒ total 69, prompt 40, completion 29.
+    #[tokio::test]
+    async fn ensemble_streaming_usage_frame_is_panel_judge_aggregate() {
+        let upstream = MockServer::start().await;
+        let judge_sse = "\
+data: {\"id\":\"cmpl-judge\",\"model\":\"judge-upstream\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"synthesized final answer\"},\"finish_reason\":null}]}\n\n\
+data: {\"id\":\"cmpl-judge\",\"model\":\"judge-upstream\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":7,\"total_tokens\":37}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("Answer 1:"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(judge_sse),
+            )
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "cmpl-panel",
+                "model": "panel-upstream",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "a panel candidate answer"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 11, "total_tokens": 16}
+            })))
+            .with_priority(2)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+        let snap = new_snap(&upstream.uri());
+        snap.models
+            .insert(direct_model_entry("m-panel-a", "panel-a", "panel-upstream"));
+        snap.models
+            .insert(direct_model_entry("m-panel-b", "panel-b", "panel-upstream"));
+        snap.models
+            .insert(direct_model_entry("m-judge", "judge-m", "judge-upstream"));
+        snap.models.insert(ensemble_model_entry(
+            "m-council",
+            "council",
+            &["panel-a", "panel-b"],
+            "judge-m",
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["council"]));
+        let app = build_router(build_state(snap, hub));
+
+        let body = serde_json::json!({
+            "model": "council",
+            "messages": [{"role": "user", "content": "what is the best answer?"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut body_stream = resp.into_body().into_data_stream();
+        let mut decoder = SseDecoder::new();
+        let mut events = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            events.extend(decoder.feed(chunk.unwrap().as_ref()));
+        }
+        // The client asked for usage, so exactly one terminal usage-bearing
+        // frame must reach it — carrying the aggregate, re-stamped under the
+        // ensemble alias (never the judge upstream id).
+        // Collect ALL usage-bearing frames: the client must receive EXACTLY
+        // one (the panel sum is folded once). More than one would mean the
+        // base_usage fold ran per-chunk against a multi-emit judge (#617).
+        let usage_frames: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                SseEvent::Data(s) => serde_json::from_str::<serde_json::Value>(s).ok(),
+                _ => None,
+            })
+            .filter(|v| !v["usage"].is_null())
+            .collect();
+        assert_eq!(
+            usage_frames.len(),
+            1,
+            "client must receive exactly one usage frame (panel sum folded once)"
+        );
+        let usage_frame = &usage_frames[0];
+        assert_eq!(
+            usage_frame["usage"]["total_tokens"], 69,
+            "aggregate total = 2*16 panel + 37 judge"
+        );
+        assert_eq!(
+            usage_frame["usage"]["prompt_tokens"], 40,
+            "aggregate prompt = 5 + 5 + 30"
+        );
+        assert_eq!(
+            usage_frame["usage"]["completion_tokens"], 29,
+            "aggregate completion = 11 + 11 + 7"
+        );
+        assert_eq!(usage_frame["model"], "council");
     }
 
     /// Streaming ensemble, judge connect failure: the panel members all

@@ -8,10 +8,15 @@
   ],
   "properties": {
     "judge": {
-      "$ref": "#/definitions/Judge"
+      "description": "Direct model that combines successful panel responses.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Judge"
+        }
+      ]
     },
     "min_responses": {
-      "description": "Minimum successful panel responses required to proceed to synthesis. Absent = `min(DEFAULT_MIN_RESPONSES, panel.len())`. A value larger than the panel is clamped to the panel size.",
+      "description": "Minimum successful panel responses required before judge synthesis. When omitted, the gateway requires the smaller of 2 and the panel size.",
       "type": [
         "integer",
         "null"
@@ -20,13 +25,14 @@
       "minimum": 0.0
     },
     "panel": {
+      "description": "Direct models called concurrently for each ensemble request.",
       "type": "array",
       "items": {
         "$ref": "#/definitions/PanelMember"
       }
     },
     "timeout_ms": {
-      "description": "Per-call upstream deadline applied to each panel member and the judge call (in addition to each member model's own `timeout`). `0` or absent = no ensemble-level per-call deadline.",
+      "description": "Per-call upstream deadline applied to each panel member and the judge. Set `0` or omit it to disable the ensemble-level deadline.",
       "type": [
         "integer",
         "null"
@@ -38,17 +44,18 @@
   "additionalProperties": false,
   "definitions": {
     "Judge": {
-      "description": "The judge model that synthesizes the panel responses into one answer. `model` references another `Model.display_name` (must be a direct model).",
+      "description": "The judge model that synthesizes the panel responses into one answer. `model` references a direct model alias.",
       "type": "object",
       "required": [
         "model"
       ],
       "properties": {
         "model": {
+          "description": "Model alias for the direct model that synthesizes panel responses.",
           "type": "string"
         },
         "synthesis_prompt": {
-          "description": "Optional override for the built-in synthesis prompt template. Absent = use the default template.",
+          "description": "Override for the built-in synthesis prompt template.",
           "type": [
             "string",
             "null"
@@ -58,17 +65,18 @@
       "additionalProperties": false
     },
     "PanelMember": {
-      "description": "One member of an ensemble panel. `model` references another `Model.display_name` in the snapshot (must be a direct model).",
+      "description": "One member of an ensemble panel. `model` references a direct model alias.",
       "type": "object",
       "required": [
         "model"
       ],
       "properties": {
         "model": {
+          "description": "Model alias for a direct model that receives one panel request.",
           "type": "string"
         },
         "seed": {
-          "description": "Optional sampling seed for THIS member's call — pairs with `temperature` for reproducible diversity. Absent = no seed override.",
+          "description": "Sampling seed for this panel member.",
           "type": [
             "integer",
             "null"
@@ -77,7 +85,7 @@
           "minimum": 0.0
         },
         "temperature": {
-          "description": "Sampling temperature for THIS member's call. Overrides the request's `temperature`, so a panel of the same model repeated N times still produces diverse answers (self-ensemble). Absent = leave the request's temperature unchanged.",
+          "description": "Sampling temperature for this panel member. Omit it to keep the request's temperature.",
           "type": [
             "number",
             "null"
@@ -85,7 +93,7 @@
           "format": "float"
         },
         "weight": {
-          "description": "Reserved for the future voting/quorum strategy; ignored by the v1 synthesis path. Carried on the wire now so enabling voting later does not require a wire-format change.",
+          "description": "Reserved for the future voting/quorum strategy. Ignored by the v1 synthesis path.",
           "type": [
             "integer",
             "null"

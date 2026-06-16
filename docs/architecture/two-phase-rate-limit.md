@@ -100,14 +100,15 @@ key); reads of other keys touch independent `DashMap` shards.
 Every operation under the mutex is O(1) — increment, compare,
 release.
 
-This is deliberately in-process, not Redis. The cost of a
-network round-trip per rate-limit check is roughly the same as
-the upstream's TLS handshake; pushing it onto the hot path
-defeats the purpose of running an in-process gateway. The
-trade-off is documented in [What this design does not
-do](#what-this-design-does-not-do) — counters are per-DP, not
-fleet-wide, and multi-DP deployments lose cap precision
-proportional to the fleet size.
+This `DashMap` is the **default** (`ratelimit.backend: memory`)
+counter store: per-process, one in-memory mutex per key, no
+network on the hot path. It is exact on a single replica, but a
+multi-replica cluster running this backend counts per-replica —
+every cap is effectively multiplied by the replica count. An
+opt-in shared backend (`ratelimit.backend: redis`) eliminates
+that by moving the same counters into Redis; both are described
+in [Counter storage: local vs shared](#counter-storage-local-vs-shared)
+below.
 
 ## The fixed-window counter
 
@@ -412,25 +413,89 @@ math but never increments. A `peek` on a key that has never been
 seen returns `None`, and the handler omits all the headers in
 that case.
 
+## Counter storage: local vs shared
+
+The two-phase logic above is independent of *where* the counters
+live. That is a pluggable backend selected by the
+`ratelimit.backend` bootstrap field (api7/AISIX-Cloud#798):
+
+- **`memory`** (default) — the per-process `DashMap` of
+  `FixedWindowCounter`s described above. No network on the hot
+  path; exact on a single replica; **per-replica** on a cluster,
+  so each cap is effectively multiplied by the replica count.
+- **`redis`** — the same fixed-window math, but the counters
+  live in a shared Redis so every replica enforces **one global
+  window**. Enable it on any multi-replica deployment that needs
+  its configured caps to hold cluster-wide.
+
+Both implement one internal `RateStore` trait, so the proxy
+handlers, the `Reservation` lifecycle, and the wire surface are
+identical regardless of backend — only the storage changes.
+
+### How the Redis backend stays equivalent
+
+The Redis store mirrors `FixedWindowCounter` exactly so swapping
+`memory ↔ redis` does not change observable limits, only whether
+the count is shared:
+
+- **Windowed counters** (RPS/RPM/RPH/RPD, TPM/TPD) are plain
+  `INCR`/`GET` keys named
+  `aisix:rl:{<bucket>}:<dim>:<window_start>`, where
+  `window_start = now - now % window` — the same wall-clock
+  bucket boundary `roll_if_stale` uses — with an `EXPIRE` of the
+  window length plus a small grace. A new window is simply a new
+  key that auto-expires.
+- **Concurrency** is a ZSET (`member → score=now`) acting as a
+  crash-safe distributed semaphore: each acquire prunes entries
+  older than `concurrency_ttl_secs` before counting, so an
+  in-flight slot leaked by a crashed or hung replica is reclaimed
+  within that TTL rather than wedging the cap forever. (This is a
+  deliberate divergence from a plain window-TTL counter — a
+  streaming response can outlive a 60s window, the same reason
+  the [`StreamConcurrencyGuard`](#streaming-the-deferred-phase-2)
+  exists.)
+- **`now` comes from `redis.call('TIME')`** inside every Lua
+  script, so window boundaries are identical across replicas
+  regardless of host clock skew.
+- Per-bucket keys share a Redis Cluster hash tag (`{<bucket>}`)
+  so the per-bucket acquire stays a single atomic Lua call even
+  in Cluster mode.
+
+The acquire is one all-or-nothing Lua per bucket (concurrency
+gate + token check-only + request check-and-increment), which
+replaces the in-memory backend's RPM/RPD compensation dance with
+server-side atomicity.
+
+### Failing open
+
+If Redis becomes unreachable, the Redis store **fails open** to a
+per-process in-memory store (logged once) — requests keep flowing
+with per-replica enforcement during the outage rather than being
+blocked, and global enforcement resumes automatically when Redis
+recovers. This trades strict cluster-wide precision for
+availability during a Redis outage, matching the response cache's
+"Redis error → proceed" stance.
+
 ## Failure modes and observability
 
-### Counters drift on per-DP basis under multi-replica fan-out
+### Counters drift on per-DP basis under multi-replica fan-out (memory backend)
 
-The counters are in-process. A two-DP deployment with a `rpm =
-60` cap can in principle pass 120 requests in a minute if the
-load balancer round-robins. There is no shared store. This is
-the explicit trade-off for in-process latency.
+With the default `memory` backend the counters are in-process. A
+two-DP deployment with a `rpm = 60` cap can in principle pass 120
+requests in a minute if the load balancer round-robins, because
+each replica counts only what it served.
 
-Mitigations available today:
+Options:
+- **Switch to `ratelimit.backend: redis`** so the counters are
+  shared and the configured caps hold cluster-wide — the direct
+  fix, recommended for multi-replica deployments (see
+  [Counter storage](#counter-storage-local-vs-shared)).
 - **Stick to per-DP caps** that are 1/N of the desired global cap
-  when running with N DPs. This is operator policy, not
-  enforced by the gateway.
+  when running N DPs on the memory backend. This is operator
+  policy, not enforced by the gateway.
 - **Use the policy layer** to scope different caps at api_key /
   team / member granularity, which reduces the blast radius of
   the per-DP error.
-- **Future: distributed counter backend** is filed as a roadmap
-  item but is not on the v1 path; per-DP precision has been
-  sufficient for every workload we've seen.
 
 ### Counter eviction under churn
 
@@ -465,12 +530,15 @@ End-to-end isolation across callers is verified in
 
 ## What this design does not do
 
-- **No cross-replica coordination.** Each DP process owns its
-  own counters. Multi-DP deployments must either accept the
-  per-DP-multiplied effective cap or upstream the policy to a
-  shared store outside the proxy. There is no Redis dependency,
-  and adding one is a deliberate non-goal for the latency
-  budget.
+- **No cross-replica coordination on the default backend.** With
+  `ratelimit.backend: memory` (the default) each DP process owns
+  its own counters, so a multi-replica cluster gets a
+  per-DP-multiplied effective cap. Deployments that need
+  cluster-wide caps opt into `ratelimit.backend: redis`, which
+  shares the counters (see
+  [Counter storage](#counter-storage-local-vs-shared)); the
+  memory backend deliberately keeps Redis off the hot path for
+  the latency budget.
 - **No pre-flight token estimation.** Even with a local
   tokeniser, the upstream's count is the only one that matters
   for billing and for matching the provider's own rate limits.

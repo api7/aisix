@@ -349,6 +349,47 @@ impl UsageStats {
             ..Self::default()
         }
     }
+
+    /// Field-wise saturating sum of two usage records. Used to build an
+    /// ensemble's client-facing aggregate usage — the sum of every panel
+    /// member plus the judge (api7/AISIX-Cloud#804) — so a fan-out request
+    /// reports its full multiplicative cost to the caller rather than a
+    /// single sub-call's. The optional provider-native passthrough counters
+    /// (DeepSeek hit/miss, #542) add with `None` treated as 0, staying
+    /// `None` only when neither side carried one.
+    pub fn saturating_add(&self, other: &UsageStats) -> UsageStats {
+        fn add_opt(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+            match (a, b) {
+                (None, None) => None,
+                _ => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+            }
+        }
+        UsageStats {
+            prompt_tokens: self.prompt_tokens.saturating_add(other.prompt_tokens),
+            completion_tokens: self
+                .completion_tokens
+                .saturating_add(other.completion_tokens),
+            total_tokens: self.total_tokens.saturating_add(other.total_tokens),
+            cached_prompt_tokens: self
+                .cached_prompt_tokens
+                .saturating_add(other.cached_prompt_tokens),
+            reasoning_tokens: self.reasoning_tokens.saturating_add(other.reasoning_tokens),
+            cache_creation_tokens: self
+                .cache_creation_tokens
+                .saturating_add(other.cache_creation_tokens),
+            cache_read_tokens: self
+                .cache_read_tokens
+                .saturating_add(other.cache_read_tokens),
+            prompt_cache_hit_tokens: add_opt(
+                self.prompt_cache_hit_tokens,
+                other.prompt_cache_hit_tokens,
+            ),
+            prompt_cache_miss_tokens: add_opt(
+                self.prompt_cache_miss_tokens,
+                other.prompt_cache_miss_tokens,
+            ),
+        }
+    }
 }
 
 /// Full (non-streaming) chat response.
@@ -671,6 +712,56 @@ mod tests {
     fn usage_stats_saturates_total() {
         let u = UsageStats::new(u32::MAX, 10);
         assert_eq!(u.total_tokens, u32::MAX);
+    }
+
+    #[test]
+    fn usage_stats_saturating_add_sums_every_field() {
+        let a = UsageStats {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            cached_prompt_tokens: 2,
+            reasoning_tokens: 3,
+            cache_creation_tokens: 1,
+            cache_read_tokens: 4,
+            prompt_cache_hit_tokens: Some(2),
+            prompt_cache_miss_tokens: None,
+        };
+        let b = UsageStats {
+            prompt_tokens: 20,
+            completion_tokens: 7,
+            total_tokens: 27,
+            cached_prompt_tokens: 1,
+            reasoning_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 6,
+            prompt_cache_hit_tokens: None,
+            prompt_cache_miss_tokens: Some(8),
+        };
+        let sum = a.saturating_add(&b);
+        assert_eq!(sum.prompt_tokens, 30);
+        assert_eq!(sum.completion_tokens, 12);
+        assert_eq!(sum.total_tokens, 42);
+        assert_eq!(sum.cached_prompt_tokens, 3);
+        assert_eq!(sum.reasoning_tokens, 3);
+        assert_eq!(sum.cache_creation_tokens, 1);
+        assert_eq!(sum.cache_read_tokens, 10);
+        // None + Some(8) = Some(8); Some(2) + None = Some(2). None + None stays None.
+        assert_eq!(sum.prompt_cache_hit_tokens, Some(2));
+        assert_eq!(sum.prompt_cache_miss_tokens, Some(8));
+        assert_eq!(
+            UsageStats::default()
+                .saturating_add(&UsageStats::default())
+                .prompt_cache_hit_tokens,
+            None,
+        );
+        // Saturates instead of overflowing.
+        assert_eq!(
+            UsageStats::new(u32::MAX, 0)
+                .saturating_add(&UsageStats::new(10, 0))
+                .prompt_tokens,
+            u32::MAX,
+        );
     }
 
     /// PR #442 audit MEDIUM-4 (forward-compat): an *old-shape*

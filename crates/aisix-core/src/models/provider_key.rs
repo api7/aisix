@@ -34,91 +34,36 @@ pub struct ProviderKey {
     /// resource.
     pub display_name: String,
 
-    /// Upstream provider's API key, stored in plaintext on the
-    /// self-hosted path (the etcd channel is mTLS-only — same trust
-    /// boundary as Guardrail credentials and ObservabilityExporter
-    /// headers). On the AISIX-Cloud path cp-api decrypts the
-    /// envelope-encrypted secret at projection time and writes the
-    /// plaintext here.
+    /// Upstream provider's API key. The data plane receives plaintext so it
+    /// can authenticate to the upstream provider. Protect the configuration
+    /// store and transport accordingly.
     pub secret: String,
 
-    /// Override for the upstream base URL. Empty/None is rejected by
-    /// every family bridge whose canonical-vendor identity doesn't
-    /// match the PK's `provider`: the OpenAI-family bridge refuses
-    /// to fall back to `api.openai.com` for a vendor other than
-    /// `"openai"`, and the Anthropic-family bridge refuses to fall
-    /// back to `api.anthropic.com` for a vendor other than
-    /// `"anthropic"`. See `OpenAiBridge::resolve_base` /
-    /// `AnthropicBridge::resolve_base` for the safety guards. cp-api
-    /// populates this from `adapter_map.yaml`'s `default_base_url` /
-    /// `provider_metadata.api_base_url`.
+    /// Override base URL for the upstream provider. Required for custom or OpenAI-compatible providers that should not use a built-in vendor endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_base: Option<String>,
 
-    /// Vendor identity (e.g. `"deepseek"`, `"openai"`, any models.dev
-    /// catalog id). The primary specialized-dispatch key consumed by
-    /// `Hub::dispatch_two_tier` (specialized lookup tier) and by both
-    /// family bridges' `resolve_base` safety guard (the guard rejects an
-    /// empty `api_base` for any vendor whose identity doesn't match the
-    /// family's canonical vendor). cp-api always writes it; the
-    /// `#[serde(default)]` only covers in-memory test fixtures.
+    /// Upstream provider identifier, such as `"deepseek"`, `"openai"`, or a model catalog ID. The gateway uses this value for provider-specific dispatch and base URL validation.
     #[serde(default)]
     pub provider: String,
 
-    /// Wire-shape adapter (`openai` / `anthropic` / `bedrock` /
-    /// `vertex` / `azure-openai`). The family-fallback dispatch key for
-    /// `Hub::dispatch_two_tier` when the specialized lookup misses;
-    /// long-tail OpenAI-compat vendors (xai, openrouter, groq, …) reach
-    /// the right bridge through this path without a DP code change.
-    /// cp-api always writes it; a `ProviderKey` that resolves to neither
-    /// a specialized `provider` nor a registered `adapter` family is a
-    /// misconfiguration and surfaces as 503.
+    /// Upstream API protocol family used when provider-specific dispatch is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<Adapter>,
 
-    /// Telemetry tags carried alongside the key for metric/log
-    /// emission. Introduced as a skeleton for issue #302 Phase A.
-    /// No metric path consumes these tags yet; the field exists so
-    /// future Phase A sub-PRs can attribute traffic without an
-    /// on-disk schema break. Old payloads that omit `telemetry_tags`
-    /// fall back to the `Default` impl via `#[serde(default)]`.
+    /// Telemetry tags carried alongside the key for metric and log emission.
     #[serde(default)]
     pub telemetry_tags: TelemetryTags,
 
-    /// Per-key request-shape overrides — see issue #302 §5
-    /// `RuntimeConfig.request`. `None` until cp-api ships the block.
-    /// No dispatch path reads it in this PR; #301 already provides
-    /// the primitive apply functions in `aisix-provider-openai` that
-    /// Phase D will call once the wire stage cuts over.
+    /// Per-key request-shape overrides applied by supported provider paths before dispatch to the upstream provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<RequestOverrides>,
 
-    /// Per-key response-shape overrides — see issue #302 §5
-    /// `RuntimeConfig.response`. `None` until cp-api ships the block.
-    /// Same Phase D wiring story as [`Self::request`].
+    /// Per-key response-shape overrides applied by provider bridges that support response transformation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<ResponseOverrides>,
 
-    /// Inbound request headers to strip before forwarding to the
-    /// upstream provider on the passthrough endpoint (#411).
-    ///
-    /// Defaults (when the field is absent on the wire) to the 4
-    /// canonical credential headers: `authorization`, `cookie`,
-    /// `set-cookie`, `x-api-key`. Customers can:
-    ///   - Remove a default entry → that header reaches upstream
-    ///     (the dashboard warns when removing a default).
-    ///   - Add custom entries → extra headers stripped.
-    ///
-    /// Case-insensitive. Compared lowercased against the inbound
-    /// header name. Non-configurable headers (`host`, `content-length`,
-    /// RFC 7230 §6.1 hop-by-hop) are stripped separately by the
-    /// passthrough handler and cannot be removed via this list.
-    ///
-    /// Entries are normalised on deserialize via
-    /// `normalize_strip_headers`: trimmed, lowercased, dedup'd,
-    /// empties dropped. This prevents the "operator typed `' cookie '`,
-    /// the strip set has `' cookie '` but the inbound header is
-    /// `'cookie'` → no match → silent credential leak" footgun.
+    /// Inbound headers removed before passthrough forwarding.
     #[serde(
         default = "default_strip_headers",
         deserialize_with = "deserialize_normalized_strip_headers"
@@ -133,7 +78,7 @@ pub struct ProviderKey {
 /// Default header-strip list for a freshly-created ProviderKey
 /// on the passthrough endpoint, per issue #411. These four headers
 /// are credentials that the upstream LLM provider has no legitimate
-/// use for; stripping by default protects against accidental
+/// use for. Stripping by default protects against accidental
 /// session-token disclosure. Customers can remove entries via the
 /// dashboard (with a warning) if they have a specific audit /
 /// forwarding need.
@@ -149,7 +94,7 @@ pub fn default_strip_headers() -> Vec<String> {
 /// Normalize a single strip-list entry: trim whitespace, lowercase
 /// ASCII. Returns `None` for entries that, post-trim, are empty or
 /// reference-invalid HTTP header names. Non-ASCII chars survive
-/// `to_ascii_lowercase` (no-op for them) but are unusual in practice;
+/// `to_ascii_lowercase` (no-op for them) but are unusual in practice.
 /// the passthrough handler's `to_ascii_lowercase` comparison will
 /// still match correctly.
 fn normalize_strip_entry(raw: &str) -> Option<String> {
@@ -181,67 +126,47 @@ where
     Ok(out)
 }
 
-/// Telemetry attribution tags emitted alongside requests routed
-/// through this `ProviderKey`. Introduced as a skeleton for issue
-/// #302 Phase A — no metric/log path consumes these fields yet.
-///
-/// The `#[serde(default)]` on each field plus `#[derive(Default)]`
-/// means an omitted block or omitted individual key both yield the
-/// zero-value `TelemetryTags`, preserving backward compatibility
-/// with existing `ProviderKey` payloads.
+/// Telemetry attribution tags emitted with requests routed through this provider key.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryTags {
-    /// `"catalog"` for first-party curated providers, `"byo"` for
-    /// bring-your-own. `None` until Phase A wires attribution.
+    /// Provider-key category, such as `"catalog"` for curated providers or
+    /// `"byo"` for bring-your-own providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
 
     /// Whether this provider is surfaced in the featured list.
-    /// Defaults to `false`.
     #[serde(default)]
     pub featured: bool,
 
-    /// Branded provider slug for catalog entries (e.g. `"openai"`,
-    /// `"anthropic"`). `None` for byo or until Phase A wires
-    /// attribution.
+    /// Branded provider slug for catalog entries, such as `"openai"` or
+    /// `"anthropic"`. Bring-your-own providers leave this field unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branded_provider: Option<String>,
 
-    /// Operator-defined label for this provider key (e.g.
-    /// `"production"`, `"shared-test"`). `None` until Phase A wires
-    /// attribution.
+    /// Operator-defined label for this provider key, such as `"production"` or
+    /// `"shared-test"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pk_label: Option<String>,
 
-    /// Operator-defined label for bring-your-own entries (e.g. an
-    /// internal team name). `None` for catalog entries or until
-    /// Phase A wires attribution.
+    /// Operator-defined label for bring-your-own entries, such as an internal
+    /// team name. Catalog entries leave this field unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub byo_label: Option<String>,
 }
 
-/// Per-`ProviderKey` request-shape overrides — see issue #302 §5
-/// `RuntimeConfig.request`. Each field maps 1:1 onto a primitive
-/// apply function in [`aisix-provider-openai`'s `overrides`
-/// module](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-openai/src/overrides.rs):
-///
-/// - `param_renames` → `apply_param_renames`
-/// - `param_constraints` → `apply_param_constraints`
-/// - `default_headers` → `apply_default_headers`
-/// - `default_body_fields` → `apply_default_body_fields`
-///
-/// `f64` in [`ParamConstraints`] is the reason the parent
-/// [`ProviderKey`] derives `PartialEq` rather than `Eq`.
+/// Per-`ProviderKey` request-shape overrides. Use these fields to rename
+/// request body parameters, clamp supported numeric parameters, add fallback
+/// outbound headers, or add fallback outbound body fields.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RequestOverrides {
-    /// `apply_param_renames` input. Top-level body keys named on the
-    /// left are renamed to the right. Empty map is the default.
+    /// `apply_param_renames` input. Top-level body keys named on the left are renamed to the right. Leave empty to preserve request parameter names.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub param_renames: HashMap<String, String>,
 
-    /// `apply_param_constraints` input. `None` means no clamping.
+    /// Parameter constraints applied to the outbound request. If omitted,
+    /// no clamping is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub param_constraints: Option<ParamConstraints>,
 
@@ -259,92 +184,58 @@ pub struct RequestOverrides {
     pub default_body_fields: Map<String, Value>,
 }
 
-/// Numeric range clamps applied to chat-completion request bodies —
-/// the on-disk shape of issue #302 §5 `param_constraints`. Phase A
-/// scope is `temperature` only; `top_p` / `frequency_penalty` are
-/// deferred until a real upstream quirk demands them (YAGNI per
-/// `CLAUDE.md` §2).
-///
-/// `f64` not `Eq`: NaN comparisons make a derived `Eq` unsound.
-/// [`PartialEq`] is enough for the round-trip test.
+/// Numeric range clamps applied to chat-completion request bodies.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ParamConstraints {
     /// Upper bound for `temperature`. Values above this are clamped
-    /// to this value. `None` means "no upper clamp".
+    /// to this value. If omitted, no upper bound is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature_max: Option<f64>,
 
     /// Lower bound for `temperature`. Values below this are clamped
-    /// to this value. `None` means "no lower clamp".
+    /// to this value. If omitted, no lower bound is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature_min: Option<f64>,
 }
 
-/// Per-`ProviderKey` response-shape overrides — see issue #302 §5
-/// `RuntimeConfig.response`. Each field maps onto behavior the
-/// [`aisix-provider-openai`'s `overrides`
-/// module](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-openai/src/overrides.rs)
-/// already implements:
-///
-/// - `stream_done_marker` → `apply_stream_done_marker_policy`
-/// - `content_list_to_string` → `apply_content_list_to_string`
-///   (applied to the *request* body before send when the upstream
-///   only accepts string content)
-/// - `reasoning_field` → `extract_reasoning_field`
-///
-/// `error_envelope` is on-disk only — issue #302 §5 keeps it as a
-/// `"openai" | "passthrough"` string so cp-api can iterate without
-/// a Rust-side enum migration. Phase D pins the closed set.
+/// Per-`ProviderKey` response-shape overrides. Use these fields to describe
+/// stream termination behavior, flatten list-style content when needed, select
+/// an error envelope strategy, or lift provider-specific reasoning content.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseOverrides {
-    /// Stream `[DONE]` terminator expectation. `None` means "no
-    /// opinion" — same effect as [`StreamDoneMarker::Optional`].
+    /// Stream `[DONE]` terminator expectation. If omitted, either presence
+    /// or absence of the terminator is accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_done_marker: Option<StreamDoneMarker>,
 
-    /// When `true`, the request-body `messages[*].content` array of
-    /// text blocks gets flattened to a single string before dispatch.
-    /// Defaults to `false` (no flattening).
+    /// When `true`, the request-body `messages[*].content` array of text blocks gets flattened to a single string before dispatch.
     #[serde(default)]
     pub content_list_to_string: bool,
 
-    /// On-disk discriminator for the error-translation strategy.
-    /// `"openai"` projects upstream errors into the OpenAI envelope;
-    /// `"passthrough"` returns the upstream body as-is. Open string
-    /// in this PR (issue #302 §5 wire shape); Phase D pins the
-    /// closed set in a follow-up.
+    /// Stored error-envelope preference for compatibility with control-plane
+    /// configuration. The proxy does not currently apply this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_envelope: Option<String>,
 
-    /// `extract_reasoning_field` path. Empty / `None` means no lift.
-    /// Example: `"delta.reasoning_content"` (DeepSeek's canonical
-    /// shape, already aligned with the gateway's emit slot).
+    /// Path used to extract reasoning content from the provider response.
+    /// If omitted or empty, no reasoning field is lifted. Example:
+    /// `"delta.reasoning_content"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_field: Option<String>,
 }
 
-/// Stream `[DONE]` terminator policy for an SSE response — the
-/// on-disk shape of issue #302 §5 `stream_done_marker`. The wire
-/// form is the lowercased variant name (`"required"` / `"optional"`
-/// / `"none"`) so cp-api JSON keeps the same set the original spec
-/// drafted.
-///
-/// The runtime apply function lives in `aisix-provider-openai`
-/// (`apply_stream_done_marker_policy`) and consumes this enum
-/// directly via re-export from `aisix-core`.
+/// Stream `[DONE]` terminator policy for an SSE response. Values are `"required"`, `"optional"`, or `"none"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum StreamDoneMarker {
-    /// Upstream must emit `data: [DONE]`. Absence is a wire-shape
-    /// violation. OpenAI proper, DeepSeek, Groq.
+    /// Upstream is expected to emit `data: [DONE]`. Absence is logged as a diagnostic warning.
     Required,
     /// Either presence or absence is acceptable. Used when the
-    /// upstream is OpenAI-compat but does not promise the terminator.
+    /// upstream is OpenAI-compatible but does not require the terminator.
     Optional,
-    /// Upstream is expected to *omit* the marker. Some Azure / Vertex
-    /// flavors terminate cleanly on connection close.
+    /// Upstream is expected to omit the marker and terminate on connection close.
     None,
 }
 

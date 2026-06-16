@@ -15,12 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::resource::Resource;
 
-/// Cache backend choice. The DP selects the cache instance per
-/// matched policy: `Memory` uses the in-process cache (always
-/// available); `Redis` uses the shared redis cache iff the deployment
-/// configured `cache.redis`. A `Redis` policy on a DP without redis
-/// gets NO caching (`cache_status = disabled`) — never a silent
-/// fallback to node-local memory.
+/// Cache backend choice for requests matched by a cache policy. `redis` requires `cache.redis`. Otherwise matching requests are not cached.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]
@@ -31,45 +26,32 @@ pub enum CacheBackend {
     Redis,
 }
 
-/// Top-level `CachePolicy` resource shape. Mirrors what cp-api writes
-/// to kine. `name` is operator-facing; `enabled` flips the policy on
-/// without delete + recreate. `applies_to` is parsed into a typed
-/// matcher (see `parsed_applies_to`).
-///
-/// `deny_unknown_fields` is intentionally NOT set so cp-api can ship
-/// new fields ahead of a DP rollout without a hard reject. New
-/// optional fields land at `#[serde(default)]` here on the next DP
-/// release.
+/// Semantic cache policy for chat requests.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct CachePolicy {
-    /// Operator-facing name; surfaces in metric labels + cache headers.
+    /// Operator-facing name that surfaces in metric labels and cache headers.
     pub name: String,
 
-    /// When false the cache gate skips this policy. Lets operators
-    /// stage a rule (write it, sanity-check it, then flip it on).
+    /// When false, the cache gate skips this policy. Allows operators
+    /// to stage a rule before enabling it.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
-    /// Which cache instance serves requests matched by this policy.
-    /// `memory` always works; `redis` requires the DP to have
-    /// `cache.redis` configured — otherwise matching requests get no
-    /// caching at all (visible as `cache_status = disabled`).
+    /// Cache backend used for matching requests.
     #[serde(default)]
     pub backend: CacheBackend,
 
-    /// TTL hint in seconds. Per-policy TTL is honored by the cache
-    /// backend on each entry. Default 3600 matches the cp-api
-    /// validator.
+    /// Cache entry TTL in seconds.
     #[serde(default = "default_ttl_seconds")]
     pub ttl_seconds: u32,
 
-    /// Free-form scope. v1 understands "all", "model:<name>",
-    /// "api_key:<id>". See `parsed_applies_to`.
+    /// Free-form scope. Supports `"all"`, `"model:<name>"`, and
+    /// `"api_key:<id>"`. See `parsed_applies_to`.
     #[serde(default = "default_applies_to")]
     pub applies_to: String,
 
     /// Set by the loader from the kine path's UUID segment. The DP
-    /// uses this for metric labels + log correlation; not part of
+    /// uses this for metric labels and log correlation. Not part of
     /// the wire shape.
     #[serde(skip)]
     pub(crate) runtime_id: String,

@@ -2,52 +2,41 @@
 //!
 //! All fields are optional; absence means "no limit on that dimension".
 //! Windows per spec §3:
-//! - `rps` — 1s fixed window (request count only — see api7/ai-gateway#396
-//!   for the deferred per-second token-rate counter)
+//! - `rps` — 1s fixed window (request count only)
 //! - `tpm`/`rpm` — 60s fixed window
-//! - `rph` — 3600s fixed window (request count only — see ai-gateway#396)
+//! - `rph` — 3600s fixed window (request count only)
 //! - `tpd`/`rpd` — 86400s fixed window
 //! - `concurrency` — semaphore capacity (not windowed)
 //!
-//! `rps`/`rph` were added in api7/AISIX-Cloud#426 to fix the upscaling
-//! workaround in `policy_to_rate_limit` where `window=second` was
-//! converted to `rpm = max_requests * 60` (allowing 60× bursts) and
-//! `window=hour` was converted to `rpd = max_requests * 24` (same
-//! exploit at 24× scale). Token-rate counters at sub-minute windows
-//! (`tps`/`tph`) intentionally deferred because the existing
-//! post-deduct `FixedWindowCounter::add` racing window roll-over
-//! makes sub-minute token windows unsound; see ai-gateway#396.
+//! Token-rate counters are minute/day only; there is no `tps` or `tph`
+//! field.
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimit {
-    /// Tokens per minute (60s window).
+    /// Tokens per 60-second window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tpm: Option<u64>,
 
-    /// Tokens per day (86400s window).
+    /// Tokens per 86,400-second window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tpd: Option<u64>,
 
-    /// Requests per second (1s window). Added in #426 — see module
-    /// docstring. Per-second tokens (`tps`) intentionally NOT shipped;
-    /// see api7/ai-gateway#396 for the design tracking issue.
+    /// Requests per 1-second window. There is no per-second token limit field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rps: Option<u64>,
 
-    /// Requests per minute (60s window).
+    /// Requests per 60-second window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpm: Option<u64>,
 
-    /// Requests per hour (3600s window). Added in #426 — see module
-    /// docstring. Per-hour tokens (`tph`) intentionally NOT shipped;
-    /// see ai-gateway#396.
+    /// Requests per 3,600-second window. There is no per-hour token limit field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rph: Option<u64>,
 
-    /// Requests per day (86400s window).
+    /// Requests per 86,400-second window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rpd: Option<u64>,
 

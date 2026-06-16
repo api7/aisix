@@ -65,8 +65,9 @@ pub struct ConfigStatus {
 
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
-    /// Overall gateway status — always "ok" at the protocol level; operators
-    /// should look at individual model health levels for actionable signal.
+    /// Fixed success marker for this response. Successful responses currently
+    /// always return "ok"; operators should use individual model health levels
+    /// and configuration freshness for actionable signal.
     pub status: &'static str,
     pub models: Vec<ModelHealth>,
     /// Etcd watch supervisor freshness. Omitted when the supervisor

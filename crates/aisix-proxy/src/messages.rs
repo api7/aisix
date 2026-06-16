@@ -1891,7 +1891,8 @@ fn emit_anthropic_usage_event(
 /// MEDIUM-2). Real Anthropic SSE frames are a few KB at most; this
 /// ceiling only trips on a non-conformant upstream that never emits a
 /// frame terminator, guarding against per-request memory exhaustion.
-const MAX_SSE_FRAME_BUF_BYTES: usize = 1 << 20; // 1 MiB
+/// Shared with the `/v1/responses` streaming usage parser (#808).
+pub(crate) const MAX_SSE_FRAME_BUF_BYTES: usize = 1 << 20; // 1 MiB
 
 /// Accumulated usage observed across an Anthropic SSE stream.
 /// Sourced from `message_start` (input + cache tokens, id, model) and
@@ -2043,7 +2044,8 @@ fn drain_anthropic_sse_frames(
 /// Find the byte index just past the first SSE frame terminator
 /// (`\n\n` or `\r\n\r\n`). Returns the number of bytes to drain
 /// (frame + terminator), or `None` if no complete frame is buffered.
-fn find_frame_end(buf: &[u8]) -> Option<usize> {
+/// Shared with the `/v1/responses` streaming usage parser (#808).
+pub(crate) fn find_frame_end(buf: &[u8]) -> Option<usize> {
     let mut i = 0;
     while i + 1 < buf.len() {
         if buf[i] == b'\n' && buf[i + 1] == b'\n' {
@@ -2066,7 +2068,8 @@ fn find_frame_end(buf: &[u8]) -> Option<usize> {
 /// JSON slice (after `data:` and an optional leading space), or `None`
 /// if the frame has no data line. Only the first data line is read —
 /// Anthropic emits single-line data for the frames we care about.
-fn extract_sse_data_line(frame: &[u8]) -> Option<&[u8]> {
+/// Shared with the `/v1/responses` streaming usage parser (#808).
+pub(crate) fn extract_sse_data_line(frame: &[u8]) -> Option<&[u8]> {
     for line in frame.split(|&b| b == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if let Some(rest) = line.strip_prefix(b"data:") {

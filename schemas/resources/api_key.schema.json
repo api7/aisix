@@ -8,17 +8,18 @@
   ],
   "properties": {
     "allowed_models": {
-      "description": "Whitelisted Model identifiers. cp-api stores them as model UUIDs; self-hosted dev fixtures may still use names — the DP does string equality and doesn't care which. An **empty array** denies every model (spec §3 authz rule).",
+      "description": "Model identifiers this key may use. An empty array denies access to every model.",
       "type": "array",
       "items": {
         "type": "string"
       }
     },
     "key_hash": {
-      "description": "SHA-256 hex of the plaintext bearer. Secondary-indexed for O(1) auth — the proxy hashes incoming bearers before lookup.",
+      "description": "SHA-256 hexadecimal hash of the plaintext bearer. The proxy hashes incoming bearer tokens before lookup.",
       "type": "string"
     },
     "rate_limit": {
+      "description": "Request, token, and concurrency limits for this key.",
       "anyOf": [
         {
           "$ref": "#/definitions/RateLimit"
@@ -58,7 +59,7 @@
           "minimum": 0.0
         },
         "rpd": {
-          "description": "Requests per day (86400s window).",
+          "description": "Requests per 86,400-second window.",
           "type": [
             "integer",
             "null"
@@ -67,7 +68,7 @@
           "minimum": 0.0
         },
         "rph": {
-          "description": "Requests per hour (3600s window). Added in #426 — see module docstring. Per-hour tokens (`tph`) intentionally NOT shipped; see ai-gateway#396.",
+          "description": "Requests per 3,600-second window. There is no per-hour token limit field.",
           "type": [
             "integer",
             "null"
@@ -76,7 +77,7 @@
           "minimum": 0.0
         },
         "rpm": {
-          "description": "Requests per minute (60s window).",
+          "description": "Requests per 60-second window.",
           "type": [
             "integer",
             "null"
@@ -85,7 +86,7 @@
           "minimum": 0.0
         },
         "rps": {
-          "description": "Requests per second (1s window). Added in #426 — see module docstring. Per-second tokens (`tps`) intentionally NOT shipped; see api7/ai-gateway#396 for the design tracking issue.",
+          "description": "Requests per 1-second window. There is no per-second token limit field.",
           "type": [
             "integer",
             "null"
@@ -94,7 +95,7 @@
           "minimum": 0.0
         },
         "tpd": {
-          "description": "Tokens per day (86400s window).",
+          "description": "Tokens per 86,400-second window.",
           "type": [
             "integer",
             "null"
@@ -103,7 +104,7 @@
           "minimum": 0.0
         },
         "tpm": {
-          "description": "Tokens per minute (60s window).",
+          "description": "Tokens per 60-second window.",
           "type": [
             "integer",
             "null"

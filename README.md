@@ -1,165 +1,220 @@
-# aisix — AI Gateway
+<div align="center">
 
-> A single-binary, Rust-native AI gateway. OpenAI-compatible proxy + Admin API.
-> Config lives in etcd. Lock-free reads. First-class streaming. >90% E2E coverage gate.
+# AISIX AI Gateway
 
-`aisix` is a Rust-native AI inference gateway: low cold-start, native streaming, single static binary.
+### The open-source, Rust-native AI gateway for LLMs and AI agents
 
-Documentation lives under [`docs/`](docs/index.md). Start with:
+**One OpenAI-compatible API in front of every model.** Route, govern, secure, cache, and
+observe all your LLM and AI-agent traffic from a single control point — shipped as one
+static binary with low per-request overhead. Self-host for free, forever.
 
-- [`docs/index.md`](docs/index.md)
-- [`docs/quickstart/self-hosted.md`](docs/quickstart/self-hosted.md)
-- [`docs/quickstart/first-model-first-key-first-request.md`](docs/quickstart/first-model-first-key-first-request.md)
+*Built by the original creators of [Apache APISIX](https://apisix.apache.org/).*
 
-It runs in two modes from the same binary:
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Built with Rust](https://img.shields.io/badge/Built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
+[![Docs](https://img.shields.io/badge/docs-read-3aa757.svg)](docs/index.md)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2.svg)](https://discord.gg/dUmRZ7Rvf)
+[![Website](https://img.shields.io/badge/website-api7.ai-1a73e8.svg)](https://api7.ai/ai-gateway)
 
-- **Standalone** — operator drives configuration through the Admin API on `:3001`. Self-hosted; no control plane.
-- **Managed** — runs as a Data Plane (DP) tenant of the [AISIX-Cloud](https://github.com/api7/AISIX-Cloud) control plane (CP). Admin API is unbound; configuration arrives over an mTLS-authenticated etcd watch from cp-api.
+[**Start free**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=ai-gateway) ·
+[**Documentation**](docs/index.md) ·
+[**Quickstart**](docs/quickstart/self-hosted.md) ·
+[**AISIX Cloud**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) ·
+[**Roadmap**](docs/roadmap.md)
 
-## What's shipped today
+<br>
 
-Surfaces and capabilities currently in main:
+<img src="docs/assets/aisix-architecture.svg" alt="AISIX AI Gateway architecture — one OpenAI- or Anthropic-compatible API in front of OpenAI, Anthropic, Gemini/Vertex, Bedrock, Azure OpenAI, and DeepSeek, with API key auth, rate limits and budgets, guardrails, caching, routing and failover, and observability in between" width="100%">
 
-- **Proxy API (`:3000`)** — OpenAI-compatible
-  - Chat completions: `POST /v1/chat/completions` with native SSE streaming
-  - Anthropic-shape: `POST /v1/messages` (Claude SDK works against `base_url`) — works against **any** configured upstream (OpenAI / Gemini / DeepSeek / Anthropic). When the targeted Model points at a non-Anthropic upstream, the gateway translates the Anthropic body → ChatFormat → bridge → response back to Anthropic JSON / SSE.
-  - OpenAI Responses: `POST /v1/responses`
-  - Embeddings: `POST /v1/embeddings`
-  - Rerank: `POST /v1/rerank`
-  - Audio: `POST /v1/audio/transcriptions`, `/translations`, `/speech`
-  - Images: `POST /v1/images/generations`
-  - Listing: `GET /v1/models`
-  - Provider passthrough escape hatch: `ANY /passthrough/:provider/*rest`
+</div>
 
-- **Providers** — OpenAI, Anthropic, Gemini, DeepSeek
+---
 
-- **Admin API (`:3001`)** — CRUD on every routing entity, JSON-Schema validated, OpenAPI 3 + Scalar UI at `/admin/openapi-scalar`
-  - `/admin/v1/models`
-  - `/admin/v1/apikeys` (+ `POST .../rotate`)
-  - `/admin/v1/provider_keys`
-  - `/admin/v1/guardrails`
-  - `/admin/v1/cache_policies`
-  - `/admin/v1/observability_exporters`
-  - `/admin/v1/health` — per-model upstream health (Healthy / Degraded / Down)
-  - `/playground/chat/completions` — in-process forward to the proxy router
+**AISIX AI Gateway** is a Rust-native gateway that puts a single, OpenAI-compatible API in
+front of every LLM provider — OpenAI, Anthropic, Google Gemini, AWS Bedrock, Azure OpenAI,
+DeepSeek, and any OpenAI-compatible endpoint. It gives platform teams one place to route,
+govern, secure, and observe LLM traffic, with first-class SSE streaming and low gateway
+overhead.
 
-- **Config plane** — etcd with watch-driven `ArcSwap` snapshot. Lock-free reads on the hot path. Schema-rejected rows logged + skipped, never fatal.
+It runs as a **single static binary** — low cold-start, lock-free config reads, dynamic
+configuration over etcd with no restarts. Run it **self-hosted and free**, or connect it to
+**[AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
+for a managed control plane with team governance, budgets, audit, and a dashboard.
 
-- **Caching** — moka in-process exact-match cache + cost-saved telemetry (cache_hit_saved_input/output_tokens). Per-policy TTL. `applies_to` matcher on model + api_key scopes (Stage 3). Cache key includes `tools`, `response_format`, `seed`, `stop`. Backends: `memory`, `redis` (via feature flag).
+> **AISIX AI Gateway (this repo)** is the open-source core — the gateway/data plane.
+> **[AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
+> is the managed SaaS that adds the multi-tenant control plane on top. The proxy API is
+> identical in both. **New to AISIX Cloud? [Start free →](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
 
-- **Guardrails** — input + output hooks, fail-open opt-in. `keyword` is the current in-process guardrail path. `bedrock` exists in the resource shape and runtime wiring, but should be treated conservatively until the broader customer-facing runtime boundary is fully documented.
+## ⚡ Quickstart
 
-- **Rate limiting** — fixed-window RPM/RPD + post-deduct TPM/TPD + concurrency semaphore. Two-phase commit so token cost is known before the counter advances. Per-ApiKey scope today.
+AISIX is etcd-backed, so the fastest local run is Docker Compose (gateway + etcd). Grab the
+ready-to-run `docker-compose.yml` and example `config.yaml` from the
+[self-hosted quickstart](docs/quickstart/self-hosted.md), then:
 
-- **Observability** — Prometheus `/metrics`; per-request structured access log; per-env `ObservabilityExporter` (`kind=otlp_http`) fan-out emitting one OTLP/HTTP-JSON GenAI span per chat completion to each enabled exporter (Langfuse, Honeycomb, Grafana Cloud, any OTLP receiver). Platform-level OTLP tracing of internal request-pipeline spans is scaffold ([#49]).
+```bash
+docker compose up          # proxy → :3000, admin API → :3001
+```
 
-- **Telemetry events** — DP-side `UsageEvent` per request with cache_status, reasoning, provider-id detail, guardrail bypass reason, and `inbound_protocol` (`"openai"` / `"anthropic"`) so dashboard logs can disambiguate the client protocol from the upstream `provider` label. Emitted by `/v1/chat/completions` and `/v1/messages`; posted to cp-api in managed mode.
+Configure a model and an API key through the admin API on `:3001`
+([first model, first key, first request](docs/quickstart/first-model-first-key-first-request.md)),
+then call the gateway exactly like OpenAI:
 
-- **Managed-mode bootstrap** — cert-bundle path (no `/dp/register` round-trip): cp-api signs the mTLS leaf at mint time and ships PEMs as env vars at `docker run`. Snapshot persisted to `config_cache.json` so the proxy survives CP outages and restarts (offline resilience per PRD-09 §9.7.2).
+```bash
+curl http://localhost:3000/v1/chat/completions \
+  -H "Authorization: Bearer $AISIX_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"my-model","messages":[{"role":"user","content":"hello"}]}'
+```
 
-- **Per-key budgets** — enforced through the managed cp-api `/dp/budget_check` path with a 5 s LRU on the DP side. Standalone does not provide local budget resources or authoring.
+## ✨ Why AISIX
 
-## Workspace
+- **One API, every model.** Speak the OpenAI *or* Anthropic wire format in; the gateway
+  translates to whichever provider each model points at. Point an OpenAI or Claude SDK at
+  one `base_url` and switch models without changing code.
+- **A real gateway, in Rust.** Single static binary, low cold-start, lock-free config reads
+  on the hot path, native streaming.
+- **Open-source core, free forever.** Apache-2.0, self-hostable end to end. Reach for
+  AISIX Cloud only when you want the managed control plane.
+- **Production controls built in.** Routing & failover, rate limits, budgets, guardrails,
+  caching, and observability ship in the box.
+
+## 🧩 Features — available today
+
+Anchored to the [feature matrix](docs/overview/feature-matrix.md); covered by 90+ E2E tests.
+
+- **OpenAI-compatible proxy** (`:3000`) — `chat/completions`, `responses`, `embeddings`,
+  `rerank`, `images/generations`, `audio/{speech,transcriptions,translations}`,
+  `GET /v1/models`, and a `passthrough/:provider/*` escape hatch. Native SSE streaming,
+  tool/function calling, JSON mode, vision/multimodal input, and reasoning-content support.
+- **Anthropic Messages API** — `POST /v1/messages` as a first-class route, working against
+  **any** configured upstream: requests and responses (including streaming) are translated
+  both ways when a model points at a non-Anthropic provider.
+- **Routing & failover** — virtual/routing models, weighted load balancing, automatic
+  failover, retry budgets, cooldowns, and per-attempt timeouts.
+- **Rate limiting & concurrency** — RPM/RPD + TPM/TPD + concurrency caps, AND-combined
+  across `ApiKey`, `Model`, and policy scopes (`api_key` / `model` / `team` / `member`).
+- **Guardrails** — content-policy enforcement on input and output: keyword/regex
+  (in-process), AWS Bedrock Guardrails, Azure AI Content Safety (Prompt Shield + text
+  moderation), and Aliyun content moderation. A block returns `422 content_filter`.
+- **Caching** — exact-match response cache with per-policy TTL and model/key scope matchers;
+  memory and Redis backends; cost-saved telemetry on every hit.
+- **Observability** — Prometheus `/metrics`, structured per-request access logs, usage
+  events, OTLP/GenAI span export (Langfuse, Honeycomb, Grafana Cloud, or any OTLP receiver),
+  plus dedicated Datadog and Aliyun SLS log exporters and object-storage (S3/GCS/Azure Blob)
+  telemetry.
+- **Admin API** (`:3001`) — JSON-Schema-validated CRUD for every resource, OpenAPI 3 with a
+  Scalar UI at `/admin/openapi-scalar`, per-model upstream health, and a built-in playground.
+
+## 🔌 Supported providers
+
+AISIX dispatches through **five native adapter families** — distinct wire-protocol bridges,
+not one generic relabel. Whatever the upstream protocol, the client-facing API stays
+OpenAI-shaped.
+
+| Adapter family | Reaches | Wire shape · auth |
+|---|---|---|
+| `openai` | OpenAI **+ any OpenAI-compatible vendor** — DeepSeek, Groq, Mistral, Together, Fireworks, Perplexity, vLLM, Ollama, self-hosted | OpenAI chat completions · Bearer |
+| `anthropic` | Anthropic Claude | Anthropic Messages · `x-api-key` |
+| `bedrock` | AWS Bedrock — Anthropic, Meta Llama, Mistral, Cohere, Amazon Titan/Nova, AI21 | Bedrock Converse + `/invoke` · SigV4 |
+| `vertex` | Google Vertex AI (Gemini) | Vertex `:generateContent` · OAuth2 |
+| `azure-openai` | Azure OpenAI | Azure deployments · api-key / Entra ID |
+
+Plus specialized handling for vendor quirks (e.g. DeepSeek reasoning content) and dedicated
+**rerank / embeddings** vendors (Cohere, Jina). Details in
+[adapter protocol families](docs/reference/adapters.md). More providers on the
+[roadmap](docs/roadmap.md).
+
+## ☁️ Self-hosted vs AISIX Cloud
+
+Same gateway binary, same proxy API. **AISIX Cloud** adds the managed control plane on top.
+
+<p align="center">
+  <img src="docs/assets/aisix-cloud-console-tour.gif" alt="AISIX Cloud dashboard tour — overview metrics, multi-provider models, guardrails, budgets with hard-stop spend caps, and observability exporters" width="100%">
+  <br>
+  <em>The AISIX Cloud dashboard — overview metrics, multi-provider models, guardrails, budgets (with hard-stop spend caps), and observability exporters, across all your gateways.</em>
+  <br><br>
+  <a href="https://aisix-demo.api7.ai/"><b>▶ Try the live dashboard demo — aisix-demo.api7.ai</b></a>
+</p>
+
+| | Self-hosted (this repo) | [AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) (managed) |
+|---|---|---|
+| Price | Free · Apache-2.0 · forever | Managed SaaS — [see pricing](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=pricing) |
+| Configuration | Admin API on `:3001` + etcd | Dashboard + API, multi-environment |
+| Tenancy | Single instance / namespace | Org → Team → Member → Environment |
+| Provider keys | Stored in etcd (mTLS channel) | Envelope-encrypted at rest |
+| API keys | Hashed, shown once, rotation | Hashed + masked reveal, rotation, PATs |
+| Budgets | Per-key rate limits; budgets are Cloud-only | Per key / provider / env / org, hard-stop & alerts |
+| RBAC | Admin key = full access | Org roles (owner / admin / member), invites |
+| Audit log | — | Full org-scoped audit with diff viewer |
+| Billing & metering | — | Plans, usage metering, Stripe portal |
+| Surface | OpenAPI + playground | Full dashboard + per-environment playground |
+
+→ **Want the managed control plane, governance, budgets, and dashboard?**
+**[Start free](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud)** or
+**[book a demo](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=demo)**.
+
+## 🏗️ Architecture
+
+A single Cargo workspace; one binary (`aisix-server`) wires the crates together.
 
 ```
 crates/
-├── aisix-core                 Config, Snapshot, ResourceEntry, errors
-├── aisix-etcd                 ConfigProvider, watch supervisor
-├── aisix-gateway              Hub & Bridge, SSE parser, provider trait
-├── aisix-provider-openai      Also serves DeepSeek + Google Gemini via with_name()
-├── aisix-provider-anthropic
-├── aisix-proxy                /v1/* handlers + middleware
-├── aisix-admin                CRUD + playground + OpenAPI
-├── aisix-obs                  tracing, metrics, access log
-├── aisix-ratelimit            fixed-window + semaphore
-├── aisix-cache                in-mem + redis + qdrant
-├── aisix-guardrails           pre/during/post hooks
-└── aisix-server               single binary — bootstrap + CLI
+├── aisix-core           Config, snapshot, resource model, errors
+├── aisix-etcd           Config provider + watch supervisor
+├── aisix-gateway        Hub & bridge, SSE parser, provider trait
+├── aisix-proxy          /v1/* handlers, routing, middleware
+├── aisix-admin          CRUD + playground + OpenAPI
+├── aisix-provider-*     openai · anthropic · azure-openai · bedrock · vertex
+├── aisix-ratelimit      fixed-window + token accounting + concurrency
+├── aisix-cache          memory + redis backends
+├── aisix-guardrails     pre/post content-policy hooks
+├── aisix-obs            tracing, metrics, access log, exporters
+└── aisix-server         single binary — bootstrap + CLI
 ```
 
-## Standalone vs Managed (DP) — what's where
+Deep dives: [protocol translation](docs/architecture/protocol-translation.md) ·
+[snapshot & watch](docs/architecture/snapshot-and-watch.md) ·
+[two-phase rate limiting](docs/architecture/two-phase-rate-limit.md).
 
-The same binary runs both modes; the table is about **which surface owns the feature**, not about whether it works at all in one mode.
+## 🗺️ Roadmap
 
-> A few resources (Budget, Team, Member/Role, Audit Log, Billing) belong to the SaaS control plane and are intentionally **absent** from the standalone DP. Standalone keeps per-key rate limiting; budget policy remains CP-owned.
+Highlights on the [roadmap](docs/roadmap.md); tracked live in
+[issues](https://github.com/api7/ai-gateway/issues):
 
-| Capability | Standalone (DP only) | Managed (DP + AISIX-Cloud CP) |
-|---|---|---|
-| Configuration entry point | `/admin/v1/*` on `:3001`, static `admin_keys` bearer | Dashboard / cp-api `/api/*`, Better Auth session or PAT |
-| Multi-tenant model | None — single instance, single namespace | Org → Team → Member → Environment hierarchy |
-| ProviderKey storage | Plaintext `secret` in etcd (mTLS-only channel) | Master-key envelope-encrypted at rest, decrypted on projection |
-| API key handling | Hash on create, plaintext shown once | Hash + masked / one-time reveal in dashboard, rotation flow |
-| Budget enforcement | No standalone budget resource or hard-stop engine | Per-ApiKey + per-ProviderKey + per-Environment + per-Org budgets, hard-stop / warn-only modes, alerts, audit |
-| Audit log | None | Full org-scoped audit with diff viewer, RBAC-gated views |
-| RBAC / Roles | None — admin key is binary access | Org-scoped roles (owner / admin / developer / viewer), invitations |
-| Auth for proxy clients | Inbound `ApiKey` only | Inbound `ApiKey` only (proxy contract is identical) |
-| Pricing / cost | Per-Model `cost.input_per_1k` / `cost.output_per_1k` | Pricing rows synced from models.dev + per-model overrides |
-| Personal Access Tokens | None | `aisix_pat_*` for CLI / CI |
-| Billing | None | Stripe portal handoff, plan management, metering |
-| Guardrail / cache / exporter CRUD | `/admin/v1/*` direct write | Dashboard CRUD → cp-api validates → projects to env's etcd via outbox |
-| DP cert provisioning | N/A — single-process, no DP/CP split | cp-api `/api/.../gateway_certificates` issues the mTLS bundle; DP boots with PEMs in env vars |
-| etcd-side authz | N/A | env-prefix enforcement (etcdauth interceptor): each DP cert is scoped to `/aisix/<env>/`, can't read another tenant's keyspace |
-| Playground | `POST /playground/chat/completions` (admin API) | Per-env playground in dashboard, audited |
+- 100+ additional provider integrations (Together, Fireworks, Replicate, …)
+- Semantic (embedding-similarity) caching + pgvector backend
+- More guardrails — Lakera, Presidio, OpenAI Moderation, Llama-Guard
+- More observability sinks — Langsmith, Helicone, Slack alerts
+- JWT / OIDC auth for proxy clients (Entra ID, Okta, Google Workspace)
+- Distributed (Redis-backed) rate limiting
+- MCP gateway — registration, transports, auth, cost tracking
 
-The DP container image (`ghcr.io/api7/ai-gateway:dev`) is the same in both modes. The `managed.enabled` flag in config selects the bootstrap path.
+## 🛠️ Development
 
-## Roadmap
-
-Tracked as parent issues on this repo. P0 = pre-1.0 must-have, P1 = first follow-up wave, P2 = long-tail.
-
-**P0 (in flight, blocks 1.0)**
-
-- [#43] Wire guardrail config loading from etcd / YAML across all kinds
-- [#44] AWS Bedrock provider (chat + embeddings + image)
-- [#45] Azure OpenAI provider
-- [#46] 429 from upstream triggers routing fallback
-- [#48] Persist budget tracker (currently resets on restart)
-- [#49] Real OpenTelemetry tracing (currently scaffold-only)
-- [#50] Multimodal content blocks (vision, image input) on chat completions
-- [#51] AWS Bedrock Guardrails as a first-class guardrail kind
-
-**P1 (post-1.0)**
-
-- [#47] Distributed (Redis-backed) rate limiting
-- [#52] Lakera + Presidio + OpenAI Moderation guardrail trio
-- [#53] JWT / OIDC auth for proxy clients (Entra ID / Google Workspace / Okta)
-- [#54] Latency-based + cost-based + tag-based routing strategies
-- [#55] Semantic cache (embedding-similarity matching)
-- [#56] Per-team / per-user rate limits + budgets — depends on the SaaS team model landing in cp-api
-- [#57] Helicone / Langsmith / Datadog logs / Slack alerts as exporter kinds
-- [#58] MCP gateway (registration, transports, auth, access control, cost tracking)
-- [#59] Vertex AI / Google AI Studio native generateContent (today is OpenAI-shape relabel)
-- [#89] Manual cache-purge endpoint per policy
-- [#90] pgvector semantic-cache backend (Stage 4b)
-
-**P2 (long-tail)**
-
-- [#60] ~95 long-tail provider integrations (Together, Fireworks, Replicate, …)
-- [#61] ~25 long-tail guardrail integrations
-- [#62] ~30 long-tail observability sinks
-- [#63] Enterprise-tier features (SCIM, customer portal, prompt management, batch / files / fine-tune passthrough)
-
-The full live tracker: [github.com/api7/ai-gateway/issues](https://github.com/api7/ai-gateway/issues).
-
-## Development
-
-Prerequisites: Rust toolchain (pinned in `rust-toolchain.toml`), Docker (for etcd).
+Prerequisites: the Rust toolchain pinned in `rust-toolchain.toml`, plus Docker (for etcd).
 
 ```bash
-# Rust workspace
 cargo check --workspace
 cargo fmt --check
 cargo clippy --workspace -- -D warnings
 cargo test --workspace
 
-# Coverage (matches CI gate)
-cargo install cargo-llvm-cov
+# Coverage (matches the CI gate)
 cargo llvm-cov --workspace --lcov --output-path lcov.info
 
-# Run (scaffold — full startup arrives in PR #5)
-cargo run -p aisix-server -- --config config.example.yaml
+# Run locally (needs a reachable etcd + a config.yaml — see the quickstart)
+cargo run -p aisix-server --bin aisix -- --config config.yaml
 ```
 
-## License
+## 💬 Community
 
-Apache 2.0 — see [LICENSE](LICENSE).
+- **Discord** — [discord.gg/dUmRZ7Rvf](https://discord.gg/dUmRZ7Rvf)
+- **Issues & discussions** — [github.com/api7/ai-gateway/issues](https://github.com/api7/ai-gateway/issues)
+- **Website** — [api7.ai/ai-gateway](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme)
+
+If AISIX is useful to you, a ⭐ helps other engineers find it.
+
+## 📄 License
+
+[Apache 2.0](LICENSE).

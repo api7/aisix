@@ -17,16 +17,14 @@ use crate::resource::Resource;
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ApiKey {
-    /// SHA-256 hex of the plaintext bearer. Secondary-indexed for
-    /// O(1) auth — the proxy hashes incoming bearers before lookup.
+    /// SHA-256 hexadecimal hash of the plaintext bearer. The proxy hashes
+    /// incoming bearer tokens before lookup.
     pub key_hash: String,
 
-    /// Whitelisted Model identifiers. cp-api stores them as model
-    /// UUIDs; self-hosted dev fixtures may still use names — the DP
-    /// does string equality and doesn't care which. An **empty
-    /// array** denies every model (spec §3 authz rule).
+    /// Model identifiers this key may use. An empty array denies access to every model.
     pub allowed_models: Vec<String>,
 
+    /// Request, token, and concurrency limits for this key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
 
@@ -40,7 +38,7 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
 
-    /// etcd-key uuid; filled by the loader, never in the JSON payload.
+    /// etcd-key uuid. Filled by the loader and never included in the JSON payload.
     #[serde(skip)]
     pub(crate) runtime_id: String,
 }
@@ -103,7 +101,7 @@ impl Resource for ApiKey {
 
     /// Path segment under `/aisix/<env>/`. v3 (prd-09a §9A.7B.2) uses
     /// the underscored form `api_keys` to align with cp-api migration
-    /// 008's table name. v2 used `apikeys` (no underscore); the v3
+    /// 008's table name. v2 used `apikeys` with no underscore. The v3
     /// dp-manager only writes the underscored form.
     fn kind() -> &'static str {
         "api_keys"

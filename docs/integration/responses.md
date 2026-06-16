@@ -28,6 +28,12 @@ For supported models, the gateway:
 
 The gateway is acting as a thin proxy here rather than a cross-provider compatibility layer.
 
+## Usage Accounting
+
+Both non-streaming and streaming requests emit a usage event carrying the upstream-reported token counts (`input_tokens`, `output_tokens`, plus the `reasoning_tokens` and `cached_tokens` sub-counts when present), so Responses-API traffic shows up in the logs and counts toward budget the same way chat completions do.
+
+For a streamed request the counts are read from the terminal `response.completed` event (and from `response.incomplete` / `response.failed` on truncation or cancellation), so the usage event is emitted at end of stream. This matters for clients that always stream — for example the OpenAI Codex CLI — whose successful calls would otherwise be invisible to accounting.
+
 ## Example
 
 ```bash title="Call the Responses API"

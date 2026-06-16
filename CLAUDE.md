@@ -88,6 +88,20 @@ After every `gh pr create` or force-push, spawn a fresh `general-purpose` Agent 
 
 Output HIGH/MEDIUM/LOW per finding with **concrete suggested code**, not vague "consider". **Merge gate:** every HIGH and MEDIUM is either fixed in code or explicitly justified in the PR (e.g. "feature gap, filed as #N, agreed not to block"); silent merge is not enough. For findings that surface gateway/product-behavior gaps, file separate issues and link them. Self-review misses the author's blind spots — an independent agent catches them.
 
+## Generated API Documentation
+
+**Some source comments are rendered into user-facing API references.**
+
+When editing Admin API resource models under `crates/aisix-core/src/models` or OpenAPI assembly in `crates/aisix-admin/src/openapi.rs`:
+
+- Write descriptions as public API reference text, not internal implementation notes.
+- Avoid internal shorthand such as DP, CP, kine row, wire shape, mock server, bridge dispatch, or issue-only context.
+- Avoid excessive inline code. Use it only for exact field names, enum values, routes, headers, environment variables, and literal response values.
+- Do not describe stable defaults only in prose. Expose them as OpenAPI `default` values when the runtime behavior has a fixed default.
+- For computed fallback behavior, describe what happens when the field is omitted instead of calling it a schema default.
+- Regenerate resource schemas with `cargo run -p aisix-core --bin dump-schema` after changing model comments.
+- Preview or inspect the served OpenAPI when changing generated descriptions.
+
 ---
 
 **Working if:** fewer unnecessary diff lines, fewer overcomplication rewrites, and clarifying questions come before implementation rather than after mistakes.

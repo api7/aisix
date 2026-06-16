@@ -20,22 +20,23 @@ use serde::{Deserialize, Serialize};
 )]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingStrategy {
+    /// Cycle through targets in declaration order.
     RoundRobin,
+    /// Pick targets by configured weight. Missing target weights fall back to 1.
     Weighted,
-    /// Failover is the safest default — predictable order, no shared
-    /// state, no surprises on first deploy.
+    /// Always start with the first target and move to later targets only
+    /// after failure.
     #[default]
     Failover,
 }
 
-/// One destination in a routing config. `model` references another
-/// `Model.name` in the snapshot.
+/// One destination in a routing configuration. `model` references a direct model alias.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingTarget {
+    /// Model alias for a direct model that can receive routed traffic.
     pub model: String,
-    /// Only meaningful for `weighted`. Optional everywhere else; falls
-    /// back to 1 when missing.
+    /// Target weight for `weighted` routing. Other strategies ignore this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
 }
@@ -58,56 +59,40 @@ impl RoutingTarget {
     }
 }
 
-/// Behavior when every candidate target is filtered out by the
-/// runtime status layer (all in cooldown or background-unhealthy).
-///
-/// `Fail` is the default because sending traffic to a target we know
-/// is currently bad — just because every other target is also bad —
-/// amplifies cascading outages. Operators that prefer the legacy
-/// behavior (try every candidate regardless of known state) can opt
-/// into `OriginalOrder` per routing model.
+/// Behavior when every routing target is filtered out by runtime health or cooldown state.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum OnAllFilteredPolicy {
-    /// Return 503 with a fixed Retry-After hint (currently 30 seconds —
-    /// see `FALLBACK_ALL_UNHEALTHY_RETRY_AFTER` in
-    /// `crates/aisix-proxy/src/chat.rs`). Default.
-    ///
-    /// The hint is intentionally coarse: by the time the filter
-    /// reaches the all-filtered branch, every candidate is
-    /// background-unhealthy with no live cooldown timer (cooldown
-    /// candidates are returned via the Selected branch one tier up).
-    /// A future version may derive the hint from probe metadata; the
-    /// current contract is a flat fallback.
+    /// Return `503` with a fixed `Retry-After` hint.
     #[default]
     Fail,
-    /// Send to the original candidate list anyway, in declaration
-    /// order. Preserves availability over caller-facing correctness.
-    /// Use only when the operator explicitly accepts the risk of
-    /// sending traffic to a target the gateway just probed as broken.
+    /// Route to the original candidate list in declaration order even
+    /// when all targets were filtered by health or cooldown status. Use
+    /// only when maintaining availability is preferred over avoiding
+    /// recently unhealthy targets.
     OriginalOrder,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Routing {
+    /// Strategy used to select a target for each request.
     #[serde(default)]
     pub strategy: RoutingStrategy,
+    /// Ordered set of direct models available to this routing model.
     pub targets: Vec<RoutingTarget>,
     /// Retry attempts on the current target before failing over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retries: Option<u32>,
-    /// Max number of later targets to attempt after the initial target
-    /// fails permanently. Defaults to all later targets.
+    /// Max number of later targets to attempt after the initial target fails permanently. When omitted, all later targets may be attempted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_fallbacks: Option<u32>,
     /// Whether upstream 429 participates in retries and failover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_on_429: Option<bool>,
-    /// Policy for the case where every candidate is filtered out by
-    /// runtime status. See [`OnAllFilteredPolicy`].
+    /// Policy to apply when runtime status filtering removes every candidate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_all_filtered: Option<OnAllFilteredPolicy>,
 }

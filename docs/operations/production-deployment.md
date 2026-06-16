@@ -44,6 +44,23 @@ The legacy `cache.backend` knob no longer selects a single global cache; `backen
 
 `memory`-backed policies remain the simplest production baseline, making them the lowest-risk default for first rollout.
 
+## Rate-Limit Backend Choice
+
+Rate-limit counters default to per-process memory (`ratelimit.backend: memory`). On a **single replica** this is exact. On **multiple replicas behind a load balancer**, per-process counters mean every configured limit is effectively multiplied by the replica count — a key capped at `rpm: 60` can pass up to `60 × N` per minute across `N` replicas, because each replica only counts the traffic it served.
+
+For any multi-replica deployment where the configured caps must hold cluster-wide, set `ratelimit.backend: redis` and point every replica at the same Redis:
+
+```yaml title="Shared rate limiting"
+ratelimit:
+  backend: "redis"
+  redis:
+    url: "redis://my-redis:6379"
+```
+
+All dimensions (requests, tokens, concurrency) are then enforced against one shared counter. This may be the same Redis used for `cache.redis` (keys are namespaced). If Redis is unreachable the limiter fails open to per-replica counting so traffic keeps flowing. See [Bootstrap Configuration → `ratelimit`](../configuration/bootstrap-config.md) for the full field reference, and [Rate Limits](../configuration/rate-limits.md) for the limit fields themselves.
+
+Single-replica deployments can stay on `memory` — it is exact there and needs no extra infrastructure.
+
 ## Managed Versus Standalone
 
 In standalone mode:
