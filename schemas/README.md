@@ -80,14 +80,13 @@ configured in the repository.
 - `crates/aisix-admin/src/openapi.rs` — DP admin OpenAPI 3.1 document.
   Refactor target: replace inline schema objects with `$ref` into these
   files. (Follow-up PR.)
-- `api7/docs` — consumes the hosted Admin API OpenAPI document for the
-  AISIX AI Gateway Admin API reference.
-- `api7/AISIX-Cloud` cp-api — pulls these files (via submodule or
-  pinned tag) for REST input validation against the same shape DP
-  consumes from etcd.
-- `api7/AISIX-Cloud` dashboard — renders forms straight from these
-  schemas with [RJSF](https://github.com/rjsf-team/react-jsonschema-form)
-  or equivalent, instead of hand-coded validators.
+- Documentation sites can consume the hosted Admin API OpenAPI document
+  for the AISIX AI Gateway Admin API reference.
+- Control-plane services can pin these files for REST input validation
+  against the same shape the data plane consumes from etcd.
+- Dashboards can render forms from these schemas with
+  [RJSF](https://github.com/rjsf-team/react-jsonschema-form) or
+  equivalent, instead of hand-coded validators.
 
 Refs api7/ai-gateway#304 item #1 (canonical JSON Schema as config
 source of truth).

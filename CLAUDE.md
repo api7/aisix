@@ -100,6 +100,7 @@ When editing Admin API resource models under `crates/aisix-core/src/models` or O
 - Do not describe stable defaults only in prose. Expose them as OpenAPI `default` values when the runtime behavior has a fixed default.
 - For computed fallback behavior, describe what happens when the field is omitted instead of calling it a schema default.
 - Regenerate resource schemas with `cargo run -p aisix-core --bin dump-schema` after changing model comments.
+- Verify the generated Admin API OpenAPI with `cargo run -p aisix-admin --bin dump-openapi > /tmp/admin-api.openapi.json` after changing Admin API routes, OpenAPI metadata, or generated descriptions.
 - Preview or inspect the served OpenAPI when changing generated descriptions.
 
 ---
