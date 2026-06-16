@@ -5981,14 +5981,23 @@ data: [DONE]\n\n";
         // The client asked for usage, so exactly one terminal usage-bearing
         // frame must reach it — carrying the aggregate, re-stamped under the
         // ensemble alias (never the judge upstream id).
-        let usage_frame = events
+        // Collect ALL usage-bearing frames: the client must receive EXACTLY
+        // one (the panel sum is folded once). More than one would mean the
+        // base_usage fold ran per-chunk against a multi-emit judge (#617).
+        let usage_frames: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
                 SseEvent::Data(s) => serde_json::from_str::<serde_json::Value>(s).ok(),
                 _ => None,
             })
-            .find(|v| !v["usage"].is_null())
-            .expect("include_usage was requested; a terminal usage frame must be sent");
+            .filter(|v| !v["usage"].is_null())
+            .collect();
+        assert_eq!(
+            usage_frames.len(),
+            1,
+            "client must receive exactly one usage frame (panel sum folded once)"
+        );
+        let usage_frame = &usage_frames[0];
         assert_eq!(
             usage_frame["usage"]["total_tokens"], 69,
             "aggregate total = 2*16 panel + 37 judge"

@@ -3278,10 +3278,18 @@ where
                     {
                         continue;
                     }
-                    // #614: fold any pre-incurred usage (an ensemble's panel)
-                    // into the client-facing usage frame, AFTER `comp` captured
-                    // the stream-only counts above. No-op when `base_usage` is
-                    // zero (every single-upstream caller).
+                    // #614: fold the ensemble panel's usage (`base_usage`) into
+                    // the client-facing usage frame, AFTER `comp` captured the
+                    // stream-only counts above. No-op when `base_usage` is zero
+                    // (every single-upstream caller).
+                    //
+                    // Assumes the judge emits `usage` on a SINGLE terminal frame
+                    // (true for the OpenAI/Anthropic/DeepSeek bridges via the
+                    // injected include_usage, so the panel sum lands exactly
+                    // once). A judge that stamps usage on multiple chunks
+                    // (Gemini/Vertex) would add the panel sum more than once —
+                    // tracked in #617 (fix: synthesize one terminal usage frame
+                    // from `comp + base_usage`).
                     if let Some(u) = chunk.usage.as_mut() {
                         *u = u.saturating_add(&base_usage);
                     }
