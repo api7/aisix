@@ -25,20 +25,7 @@ use crate::resource::Resource;
 // Code paths that need vendor-aware dispatch (rerank, messages
 // cross-provider routing) compare the string directly.
 
-/// Wire-shape adapter used to talk to an upstream. This is the closed
-/// set of upstream protocols the gateway knows how to encode against —
-/// distinct from a vendor identity (which is captured separately on
-/// `ProviderKey.provider` as an open string).
-///
-/// Post-#302 Phase A clean cut, dispatch is two-tier: the Hub looks up
-/// a specialized bridge by the open `ProviderKey.provider` string
-/// first, then falls back to the closed `Adapter` family bridge. Any
-/// new long-tail OpenAI-compat vendor cp-api admits (xai, openrouter,
-/// cerebras, …) routes through the `Adapter::Openai` family bridge
-/// without a DP code change.
-///
-/// Note on serde casing: `Adapter` uses `kebab-case` so the `AzureOpenai`
-/// variant serializes as `"azure-openai"`.
+/// Upstream API protocol family used for provider dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Adapter {
@@ -81,20 +68,7 @@ pub struct BackgroundModelCheck {
     pub stale_after_seconds: u64,
 }
 
-/// Request-path cooldown configuration for a direct model. Controls
-/// which upstream failures temporarily exclude this model from routing
-/// candidate selection, and for how long.
-///
-/// Cooldown is **independent** of request retry semantics — i.e.
-/// `Routing.retry_on_429` governs whether a 429 is retried within the
-/// current request, but `CooldownConfig.trigger_statuses` governs
-/// whether 429 takes the model out of rotation for subsequent
-/// requests. The two layers serve different purposes:
-/// - retry: short-window in-request recovery
-/// - cooldown: medium-window cross-request backpressure
-///
-/// All fields are optional; defaults preserve a safe behavior for any
-/// direct model that doesn't ship a `cooldown` block.
+/// Request-path cooldown settings for a direct model after retryable upstream failures.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct CooldownConfig {
@@ -177,64 +151,15 @@ impl CooldownConfig {
 #[serde(deny_unknown_fields)]
 pub struct Model {
     /// Operator-facing unique label. Surfaces on `/v1/models`,
-    /// `req.model` on chat completions, ApiKey.allowed_models, and
+    /// `req.model` on chat completions, `ApiKey.allowed_models`, and
     /// the dashboard model list. `Resource::name()` returns this.
     pub display_name: String,
 
-    /// Upstream vendor identity, free-form string (e.g. `"openai"`,
-    /// `"xai"`, `"openrouter"`, any models.dev catalog id). Primary
-    /// dispatch reads `ProviderKey.adapter` + `ProviderKey.provider`
-    /// via `Hub::dispatch_two_tier`, so a new long-tail vendor admitted
-    /// by cp-api works without a DP code change. `Model.provider` is
-    /// additionally consumed by:
-    ///
-    /// 1. Anti-misdispatch gates that reject cross-provider routing
-    ///    for endpoints whose wire shape is vendor-specific:
-    ///    - `/v1/messages` (`crates/aisix-proxy/src/messages.rs:290`)
-    ///      — non-anthropic Models go through `cross_provider_dispatch`.
-    ///    - `/v1/responses` (`crates/aisix-proxy/src/responses.rs:117`)
-    ///      — non-openai Models rejected with 400.
-    ///    - `/v1/images/generations`
-    ///      (`crates/aisix-proxy/src/images.rs:124`) — non-openai
-    ///      Models rejected with 400.
-    /// 2. `/v1/rerank` vendor gate + access-log label
-    ///    (`crates/aisix-proxy/src/rerank.rs:125,145`); Cohere/Jina
-    ///    each have a native rerank surface that bypasses the Bridge
-    ///    trait, so this path stays keyed on `Model.provider`.
-    /// 3. Telemetry / access-log labels via
-    ///    `dispatch::require_provider()` on every bridge-dispatching
-    ///    endpoint (chat, completions, embeddings, images, audio,
-    ///    rerank).
-    ///
-    /// Bridge dispatch itself is keyed on the ProviderKey's
-    /// `provider`/`adapter` (`Hub::dispatch_two_tier`), not on this
-    /// field.
-    ///
-    /// `None` for routing models.
-    ///
-    /// Closes the schema-validation half of api7/AISIX-Cloud#417 and
-    /// the dispatch half of api7/AISIX-Cloud#302 Phase A.
+    /// Upstream vendor identity used for dispatch, compatibility checks, telemetry, and access logs. `None` for routing and ensemble models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
 
-    /// Upstream model id sent to the provider — the literal string
-    /// the upstream LLM API expects in its `model` field
-    /// (e.g. `"gpt-4o"`, `"claude-sonnet-4-5"`,
-    /// `"gpt-4o-mini-2024-08-06"`). `None` for routing models.
-    ///
-    /// **NOTE — this field name is a known footgun.** Some other proxy
-    /// gateways define a `model_name` field that holds the
-    /// *customer-facing alias* (the name a client SDK sends), with a
-    /// separate `model` sub-field holding the upstream id. In this
-    /// codebase the convention is reversed: `display_name` (above)
-    /// is the customer-facing alias, and **`model_name` is the
-    /// upstream id**. When reading or writing this struct, do not
-    /// assume the field name alone disambiguates the role — read
-    /// the docs.
-    ///
-    /// Renaming this field to `upstream_id` to remove the ambiguity
-    /// is tracked at api7/AISIX-Cloud#470 but deferred behind a
-    /// coordinated wire-format change across cp-api + dashboard.
+    /// Upstream model identifier sent in provider requests. `None` for routing and ensemble models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_name: Option<String>,
 
@@ -245,39 +170,18 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_key_id: Option<String>,
 
-    /// Non-streaming request timeout in ms — the end-to-end budget for a
-    /// `stream:false` upstream call. `0` or absent = no timeout. On a
-    /// routing model's target, an elapsed timeout fails over to the next
-    /// target (the timeout error is retryable). For `stream:true` requests
-    /// it is also the fallback streaming budget when `stream_timeout` is
-    /// unset (see [`Model::stream_timeout_effective`]).
+    /// End-to-end timeout in milliseconds for non-streaming upstream calls. `0` or absent disables the non-streaming timeout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
 
-    /// Streaming read timeout in ms — the maximum gap the gateway waits
-    /// for the next upstream chunk on a `stream:true` call, applied to the
-    /// first chunk and to every inter-chunk gap. A positive value bounds
-    /// each chunk wait; `0` or absent means "no streaming-specific
-    /// override", so the effective streaming budget falls back to `timeout`
-    /// (see [`Model::stream_timeout_effective`]) — set `timeout` to `0` too
-    /// to disable streaming timeouts entirely. A *first-chunk* timeout
-    /// fails over to the next target (before any bytes reach the client); a
-    /// *mid-stream* timeout terminates the stream like any other upstream
-    /// error.
+    /// Maximum gap in milliseconds between upstream streaming chunks. `0` or absent falls back to `timeout`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_timeout: Option<u64>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
 
-    /// Client-IP allowlist in CIDR notation (IPv4/IPv6). Applies to both
-    /// direct and routing models — the gate binds to whichever model the
-    /// client names, so a Model Group can be IP-restricted too. Absent or
-    /// empty = no restriction (all clients allowed). When non-empty, a request
-    /// whose resolved client IP falls outside every range is rejected with 403
-    /// before the request is dispatched upstream (api7/AISIX-Cloud#557). The
-    /// resolved client IP honours the gateway's `proxy.real_ip` trusted-proxy
-    /// config (X-Forwarded-For), so the check works behind a load balancer.
+    /// Client IP allowlist in CIDR notation. Empty or absent allows all clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_cidrs: Option<Vec<String>>,
 
@@ -288,11 +192,7 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<Routing>,
 
-    /// Ensemble config. When set, the proxy fans the request out to every
-    /// panel member concurrently and synthesizes their responses via the
-    /// judge model, instead of dispatching a single upstream. Mutually
-    /// exclusive with `provider`/`model_name`/`provider_key_id` and
-    /// `routing` (enforced by the runtime schema in `super::schema`).
+    /// Ensemble configuration for fan-out panel calls and judge synthesis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensemble: Option<EnsembleConfig>,
 

@@ -22,7 +22,7 @@
       "minimum": 0.0
     },
     "rph": {
-      "description": "Requests per hour (3600s window). Added in #426 — see module docstring. Per-hour tokens (`tph`) intentionally NOT shipped; see ai-gateway#396.",
+      "description": "Requests per hour (3600s window). There is no per-hour token limit field.",
       "type": [
         "integer",
         "null"
@@ -40,7 +40,7 @@
       "minimum": 0.0
     },
     "rps": {
-      "description": "Requests per second (1s window). Added in #426 — see module docstring. Per-second tokens (`tps`) intentionally NOT shipped; see api7/ai-gateway#396 for the design tracking issue.",
+      "description": "Requests per second (1s window). There is no per-second token limit field.",
       "type": [
         "integer",
         "null"

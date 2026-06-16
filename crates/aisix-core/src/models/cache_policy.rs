@@ -15,12 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::resource::Resource;
 
-/// Cache backend choice. The DP selects the cache instance per
-/// matched policy: `Memory` uses the in-process cache (always
-/// available); `Redis` uses the shared redis cache iff the deployment
-/// configured `cache.redis`. A `Redis` policy on a DP without redis
-/// gets NO caching (`cache_status = disabled`) — never a silent
-/// fallback to node-local memory.
+/// Cache backend choice for requests matched by a cache policy. `redis` requires `cache.redis`; otherwise matching requests are not cached.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]
@@ -31,15 +26,7 @@ pub enum CacheBackend {
     Redis,
 }
 
-/// Top-level `CachePolicy` resource shape. Mirrors what cp-api writes
-/// to kine. `name` is operator-facing; `enabled` flips the policy on
-/// without delete + recreate. `applies_to` is parsed into a typed
-/// matcher (see `parsed_applies_to`).
-///
-/// `deny_unknown_fields` is intentionally NOT set so cp-api can ship
-/// new fields ahead of a DP rollout without a hard reject. New
-/// optional fields land at `#[serde(default)]` here on the next DP
-/// release.
+/// Semantic cache policy for chat requests.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct CachePolicy {
     /// Operator-facing name; surfaces in metric labels + cache headers.
@@ -50,10 +37,7 @@ pub struct CachePolicy {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
-    /// Which cache instance serves requests matched by this policy.
-    /// `memory` always works; `redis` requires the DP to have
-    /// `cache.redis` configured — otherwise matching requests get no
-    /// caching at all (visible as `cache_status = disabled`).
+    /// Cache backend used for matching requests.
     #[serde(default)]
     pub backend: CacheBackend,
 
@@ -63,8 +47,8 @@ pub struct CachePolicy {
     #[serde(default = "default_ttl_seconds")]
     pub ttl_seconds: u32,
 
-    /// Free-form scope. v1 understands "all", "model:<name>",
-    /// "api_key:<id>". See `parsed_applies_to`.
+    /// Free-form scope. Supports `"all"`, `"model:<name>"`, and
+    /// `"api_key:<id>"`. See `parsed_applies_to`.
     #[serde(default = "default_applies_to")]
     pub applies_to: String,
 

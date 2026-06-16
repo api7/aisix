@@ -1,19 +1,19 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "CachePolicy",
-  "description": "Top-level `CachePolicy` resource shape. Mirrors what cp-api writes to kine. `name` is operator-facing; `enabled` flips the policy on without delete + recreate. `applies_to` is parsed into a typed matcher (see `parsed_applies_to`).\n\n`deny_unknown_fields` is intentionally NOT set so cp-api can ship new fields ahead of a DP rollout without a hard reject. New optional fields land at `#[serde(default)]` here on the next DP release.",
+  "description": "Semantic cache policy for chat requests.",
   "type": "object",
   "required": [
     "name"
   ],
   "properties": {
     "applies_to": {
-      "description": "Free-form scope. v1 understands \"all\", \"model:<name>\", \"api_key:<id>\". See `parsed_applies_to`.",
+      "description": "Free-form scope. Supports `\"all\"`, `\"model:<name>\"`, and `\"api_key:<id>\"`. See `parsed_applies_to`.",
       "default": "all",
       "type": "string"
     },
     "backend": {
-      "description": "Which cache instance serves requests matched by this policy. `memory` always works; `redis` requires the DP to have `cache.redis` configured — otherwise matching requests get no caching at all (visible as `cache_status = disabled`).",
+      "description": "Cache backend used for matching requests.",
       "default": "memory",
       "allOf": [
         {
@@ -40,7 +40,7 @@
   },
   "definitions": {
     "CacheBackend": {
-      "description": "Cache backend choice. The DP selects the cache instance per matched policy: `Memory` uses the in-process cache (always available); `Redis` uses the shared redis cache iff the deployment configured `cache.redis`. A `Redis` policy on a DP without redis gets NO caching (`cache_status = disabled`) — never a silent fallback to node-local memory.",
+      "description": "Cache backend choice for requests matched by a cache policy. `redis` requires `cache.redis`; otherwise matching requests are not cached.",
       "type": "string",
       "enum": [
         "memory",

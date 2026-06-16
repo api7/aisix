@@ -58,11 +58,7 @@ pub enum GuardrailHookPoint {
     Both,
 }
 
-/// One pattern in a `keyword`-kind guardrail's blocklist. The DP
-/// translates `Literal` to a case-insensitive substring match and
-/// `Regex` to a compiled `regex::Regex`. Invalid regex at parse
-/// time is loader-rejected (the DP refuses to apply a guardrail it
-/// can't compile, so a typo doesn't silently disarm the policy).
+/// Literal or regular-expression pattern used by a keyword guardrail.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", content = "value", rename_all = "lowercase")]
 pub enum KeywordPattern {
@@ -79,14 +75,7 @@ pub struct KeywordConfig {
     pub patterns: Vec<KeywordPattern>,
 }
 
-/// AWS credentials for `kind: "bedrock"`. Phase 2 supports
-/// `static` (access-key pair); Phase 4 adds `role_arn`
-/// (sts:AssumeRole) under the same tag.
-///
-/// Wire shape on the kine path is plaintext: cp-api decrypts the
-/// envelope-encrypted secret at projection time (same trust
-/// boundary as `provider_keys` — see PRD-09c §6.3). The DP only
-/// ever holds plaintext in memory; it does not need a master key.
+/// AWS credentials for a Bedrock guardrail.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BedrockAWSCredentials {
@@ -99,10 +88,9 @@ pub enum BedrockAWSCredentials {
     },
 }
 
-/// Per-guardrail latency policy for `kind: "bedrock"`. `serial`
-/// waits unconditionally; `timed` aborts at `timeout_ms` and
-/// applies the row-level `fail_open` flag. Range matches cp-api's
-/// validator (100..5000ms) — see PRD-09c §6.6.
+/// Per-guardrail latency policy for `kind: "bedrock"`. `serial` waits
+/// unconditionally; `timed` aborts at `timeout_ms` and applies the row-level
+/// `fail_open` flag.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BedrockLatencyMode {
@@ -112,7 +100,7 @@ pub enum BedrockLatencyMode {
 
 /// Config block for `kind: "azure_content_safety"`. Calls Azure AI
 /// Content Safety Prompt Shield API to detect jailbreak and indirect
-/// injection attacks. PRD-09c §6 P1.
+/// injection attacks.
 ///
 /// The CP (cp-api) decrypts the envelope-encrypted `api_key` at kine-
 /// projection time so the DP always holds plaintext in memory; the
@@ -128,13 +116,7 @@ pub struct AzureContentSafetyConfig {
     /// cp-api before kine projection; plaintext in memory only, never
     /// logged.
     pub api_key: String,
-    /// HTTP call timeout in milliseconds. When elapsed the `fail_open`
-    /// flag governs the verdict. Defaults to 5 000 ms.
-    ///
-    /// **`0` does not mean "no timeout".** `Duration::ZERO` causes
-    /// `tokio::time::timeout` to fire on the first poll, so every call
-    /// immediately maps to a timeout failure. Use `u32::MAX` (≈ 49 days)
-    /// for an effectively unlimited timeout.
+    /// HTTP call timeout in milliseconds. `0` times out immediately; use a large value for an effectively unlimited timeout.
     #[serde(default = "default_acs_timeout_ms")]
     pub timeout_ms: u32,
 }
@@ -144,9 +126,8 @@ fn default_acs_timeout_ms() -> u32 {
 }
 
 /// Config block for `kind: "azure_content_safety_text_moderation"`. Calls
-/// Azure AI Content Safety `text:analyze` for category-severity + blocklist
-/// moderation on input and/or output (including streaming output). P2
-/// (PRD-09c §6 P2, #379).
+/// Azure AI Content Safety `text:analyze` for category-severity and blocklist
+/// moderation on input and/or output, including streaming output.
 ///
 /// Reuses the P1 connection block (endpoint + api_key + timeout_ms). cp-api
 /// projects only operator-set fields (omitempty), so every optional field
@@ -263,7 +244,7 @@ fn default_acs_on_buffer_exceeded() -> String {
 /// content-safety guardrail (`TextModerationPlus`, action version
 /// `2022-03-02`) on the `green-cip.<region>.aliyuncs.com` endpoint for
 /// category-risk moderation on input and/or output (including streaming
-/// output). Issue #603.
+/// output.
 ///
 /// The input hook uses the `llm_query_moderation` service code, the
 /// output hook `llm_response_moderation`. Aliyun grades each call with a
@@ -367,16 +348,15 @@ pub enum GuardrailKind {
     Bedrock(BedrockConfig),
     /// Azure AI Content Safety Prompt Shield. Detects jailbreak and
     /// indirect injection attacks via the `/contentsafety/text:shieldPrompt`
-    /// API. P1 (PRD-09c §6 P1).
+    /// API.
     AzureContentSafety(AzureContentSafetyConfig),
-    /// Azure AI Content Safety Text Moderation. Category-severity +
-    /// blocklist moderation via the `/contentsafety/text:analyze` API,
-    /// on input and/or output (including streaming output). P2
-    /// (PRD-09c §6 P2, #379).
+    /// Azure AI Content Safety Text Moderation. Category-severity and
+    /// blocklist moderation via the `/contentsafety/text:analyze` API, on input
+    /// and/or output, including streaming output.
     AzureContentSafetyTextModeration(AzureContentSafetyTextModerationConfig),
     /// Aliyun content-safety guardrail. Risk-level moderation via the
-    /// `TextModerationPlus` action on `green-cip.<region>.aliyuncs.com`,
-    /// on input and/or output (including streaming output). #603.
+    /// `TextModerationPlus` action on `green-cip.<region>.aliyuncs.com`, on
+    /// input and/or output, including streaming output.
     AliyunTextModeration(AliyunTextModerationConfig),
 }
 
@@ -410,24 +390,15 @@ impl GuardrailHookPoint {
 /// One guardrail that applied to a request, captured at chain-build time:
 /// the guardrail `kind` and the `hook` it's configured for. Carried on the
 /// telemetry UsageEvent so the dashboard can show which guardrails governed a
-/// request (#379 observability). v1 records the attached set (kind + hook),
-/// not per-guardrail verdicts.
+/// request. Records the attached set (`kind` + `hook`), not per-guardrail
+/// verdicts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppliedGuardrail {
     pub kind: String,
     pub hook: String,
 }
 
-/// Top-level `Guardrail` resource shape. Mirrors what cp-api writes
-/// to kine at `/aisix/<env>/guardrails/<uuid>`.
-///
-/// `deny_unknown_fields` is intentionally NOT set here: serde's
-/// `flatten` + `tag = "kind"` interaction can't pass the
-/// "I consumed this field" signal up to the outer struct, so a
-/// `deny_unknown_fields` outer would reject the very `kind` the
-/// inner enum needs. Strict typo-rejection happens earlier in the
-/// JSON Schema (`schema::validate_guardrail`) which the loader
-/// runs before deserialise on every watch event.
+/// Content policy evaluated before or after upstream calls.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 pub struct Guardrail {
     /// Operator-facing name; surfaces in metric labels + error reasons.
@@ -445,9 +416,9 @@ pub struct Guardrail {
 
     /// Behavior when a remote-API guardrail (today `kind=bedrock`)
     /// can't reach its upstream. `true` lets the request through
-    /// (recorded in usage_events.guardrail_bypassed_reason);
+    /// (recorded in `usage_events.guardrail_bypassed_reason`);
     /// `false` blocks with 422. No-op for `kind=keyword`. Defaults
-    /// `true` (matches the PG schema default + PRD-09c §6.4).
+    /// `true`.
     #[serde(default = "default_fail_open")]
     pub fail_open: bool,
 
@@ -461,44 +432,21 @@ pub struct Guardrail {
     //
     // cp-api's marshalGuardrailKV will start emitting these once the P0c
     // CP PR lands. Until then, old kine rows omit them and the defaults apply.
-    /// How the DP behaves when this guardrail fires.
-    /// `"block"` (default) — reject the request.
-    /// `"monitor"` — let the request through and record the event
-    ///   (**not yet implemented**; the DP currently always blocks regardless
-    ///   of this field — do not set `"monitor"` expecting pass-through
-    ///   behavior until a future release wires it into the chain).
+    /// How the data plane behaves when this guardrail fires. `monitor` is stored for compatibility but not yet enforced.
     #[serde(default = "default_enforcement_mode")]
     pub enforcement_mode: String,
 
-    /// When `true`, a runtime error in this guardrail's evaluation
-    /// (e.g. a Bedrock timeout) is treated as fatal: the request is
-    /// blocked regardless of `fail_open`.
-    /// When `false` (default), `fail_open` governs the error path.
-    ///
-    /// **Not yet implemented** — the field is stored and forwarded to
-    /// the CP dashboard but the DP does not yet consult it; `fail_open`
-    /// alone governs error behavior in the current release.
+    /// Whether guardrail evaluation errors should be fatal. Stored for compatibility; current enforcement still follows `fail_open`.
     #[serde(default)]
     pub mandatory: bool,
 
-    /// Which traffic directions this guardrail applies to when resolved
-    /// through an attachment. Values: `"input"`, `"output"`, `"both"` (default).
-    ///
-    /// Stored and forwarded to the CP dashboard. Direction-based filtering
-    /// in `GuardrailIndex::resolve` is not yet implemented; the `hook_point`
-    /// field on the guardrail definition provides equivalent per-hook-point
-    /// control for keyword rules.
+    /// Attachment direction hint: `input`, `output`, or `both`. Stored for compatibility; current hook selection still follows `hook_point`.
     #[serde(default = "default_direction")]
     pub direction: String,
 
-    /// RFC3339 creation timestamp of the row, projected by cp-api so the
-    /// DP can evaluate guardrail chains oldest-first — matching the order
-    /// the dashboard lists them in (#519 B.4a). Optional: cp-api's
-    /// `marshalGuardrailKV` doesn't emit it yet, and admin-API rows may
-    /// omit it; rows without it sort after rows that have it, tied broken
-    /// by id, so chain order stays total and deterministic either way.
-    /// RFC3339 timestamps in a fixed (UTC) offset compare correctly as
-    /// strings, so no parsing is needed.
+    /// RFC3339 creation timestamp of the row. When present, the data plane can
+    /// evaluate guardrail chains oldest-first. Rows without this timestamp sort
+    /// after rows that have it, with ties broken by resource id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
 

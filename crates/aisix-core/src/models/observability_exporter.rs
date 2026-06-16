@@ -34,20 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::resource::Resource;
 
-/// Discriminated union of exporter back-ends. Ships `otlp_http`,
-/// `aliyun_sls`, `object_store` (S3 / GCS / Azure Blob, one variant), and
-/// `datadog` (Datadog native Logs intake); further targets land in
-/// follow-ups, each as a new variant whose serde tag matches the wire-side
-/// `kind` discriminator.
-///
-/// `tag = "kind"` puts the variant tag inline with the inner struct's
-/// fields — same shape as `GuardrailKind` so the kine wire stays
-/// consistent across resource types.
-///
-/// `PartialEq` (not `Eq`) because [`OtlpHttpConfig::sample_rate`] is an
-/// `f64`, whose NaN semantics make a derived `Eq` unsound (same precedent
-/// as `ProviderKey`). Tests compare via `assert_eq!`, which only needs
-/// `PartialEq`.
+/// Exporter backend selected by the `kind` discriminator.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExporterKind {
@@ -66,68 +53,26 @@ pub struct OtlpHttpConfig {
     /// because some vendors (Honeycomb, Grafana) use a different path.
     pub endpoint: String,
 
-    /// Static headers to attach to every export request. Typical use:
-    /// `Authorization: Bearer <api-token>` or vendor-specific keys
-    /// like `x-honeycomb-team`. Values are plaintext at this MVP — the
-    /// kine path is mTLS-only, so the trust boundary matches
-    /// `provider_keys`. Field-level encryption arrives in Phase 2.
+    /// Static headers attached to every export request, such as authorization or vendor-specific API-key headers.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
 
-    /// Fraction of requests whose spans are exported, `0.0`–`1.0`.
-    /// Absent = `1.0` (export everything — the pre-knob behaviour).
-    /// The decision is per REQUEST, made deterministically from the
-    /// `request_id` hash, so every attempt span of one request (initial /
-    /// retries / fallbacks, which share the id) samples consistently —
-    /// a trace is exported whole or not at all. Bounds are enforced by
-    /// the loader's JSON-schema validation
-    /// (`schema::validate_observability_exporter`).
+    /// Fraction of requests exported as traces, from `0.0` to `1.0`. Defaults to `1.0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0.0, max = 1.0))]
     pub sample_rate: Option<f64>,
 
-    /// Whether captured request/response content is delivered on this
-    /// exporter's spans. `metadata_only` (default) ships only operational
-    /// metadata — never a prompt or response. `full` additionally attaches
-    /// the request prompt and the assembled response as span attributes
-    /// (`gen_ai.prompt` / `gen_ai.completion` — the same keys the Datadog
-    /// sink ships the captured content under), each truncated to
-    /// [`content_max_bytes`]. Enabling `full` writes end-user prompt /
-    /// response text into the customer's tracing backend, so the dashboard
-    /// must surface the privacy implication when an operator turns it on.
-    /// Reuses [`SlsContentMode`] — the codebase's existing
-    /// `metadata_only | full` model — so the shared content-capture
-    /// plumbing (`content_record` / `content_capture_cap`) stays
-    /// single-sourced.
-    ///
-    /// [`content_max_bytes`]: OtlpHttpConfig::content_max_bytes
+    /// Controls whether spans include prompt and response content. `metadata_only` omits content; `full` includes content truncated by `content_max_bytes`.
     #[serde(default)]
     pub content_mode: SlsContentMode,
 
-    /// Per-field byte cap for captured content under `content_mode = full`.
-    /// The prompt and the response are each truncated to this many bytes
-    /// (UTF-8-boundary safe), and the span carries an
-    /// `aisix.content_truncated` attribute when either was cut. Ignored
-    /// under `metadata_only`. Defaults to 128 KiB.
-    ///
-    /// `0` is rejected — `full` with a zero cap captures nothing, which is a
-    /// misconfiguration. The `range(min = 1)` keeps the generated JSON schema
-    /// in step with the runtime validator so the CP and DP agree on the floor.
+    /// Maximum bytes per captured prompt or response field when `content_mode` is `full`. Defaults to 128 KiB.
     #[serde(default = "default_content_max_bytes")]
     #[schemars(range(min = 1))]
     pub content_max_bytes: u32,
 }
 
-/// Aliyun SLS (Simple Log Service) PutLogs target. Unlike `otlp_http`,
-/// the AccessKey is **never** part of this config: it would otherwise
-/// sit in plaintext on the kine path, and SLS keys grant broad account
-/// access. Instead the config carries a [`credential_ref`] pointer that
-/// the customer-side DP resolves to the real key locally (env / mounted
-/// secret); API7's control plane stores only the reference. This is what
-/// lets the DP run in the customer's environment without API7 ever
-/// holding the plaintext key.
-///
-/// [`credential_ref`]: AliyunSlsConfig::credential_ref
+/// Aliyun SLS PutLogs exporter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AliyunSlsConfig {
@@ -142,43 +87,20 @@ pub struct AliyunSlsConfig {
     /// SLS logstore that receives the request-event logs.
     pub logstore: String,
 
-    /// Opaque pointer to the AccessKey credential, resolved locally by
-    /// the DP at delivery time. The plaintext AccessKey MUST NOT live in
-    /// etcd/kine — the control plane stores only this reference, never the
-    /// key itself. BYOK variants (customer KMS / uploaded key) resolve the
-    /// same reference through a different unwrap path in a later phase.
+    /// Credential reference resolved by the data plane at delivery time; the plaintext AccessKey is not stored in this resource.
     pub credential_ref: String,
 
-    /// Whether captured request/response content is delivered to this
-    /// logstore. `metadata_only` (default) ships only operational metadata
-    /// — never a prompt or response. `full` additionally captures the
-    /// request prompt and the assembled response, each truncated to
-    /// [`content_max_bytes`]. Enabling `full` writes end-user prompt /
-    /// response text into the customer's SLS, so the dashboard must surface
-    /// the privacy implication when an operator turns it on.
-    ///
-    /// [`content_max_bytes`]: AliyunSlsConfig::content_max_bytes
+    /// Controls whether logs include prompt and response content. `metadata_only` omits content; `full` includes content truncated by `content_max_bytes`.
     #[serde(default)]
     pub content_mode: SlsContentMode,
 
-    /// Per-field byte cap for captured content under `content_mode = full`.
-    /// The prompt and the response are each truncated to this many bytes
-    /// (UTF-8-boundary safe), and the log carries a `content_truncated`
-    /// marker when either was cut. Ignored under `metadata_only`. Defaults
-    /// to 128 KiB.
-    ///
-    /// `0` is rejected — `full` with a zero cap captures nothing, which is a
-    /// misconfiguration. The `range(min = 1)` keeps the generated JSON schema
-    /// in step with the runtime validator so the CP and DP agree on the floor.
+    /// Maximum bytes per captured prompt or response field when `content_mode` is `full`. Defaults to 128 KiB.
     #[serde(default = "default_content_max_bytes")]
     #[schemars(range(min = 1))]
     pub content_max_bytes: u32,
 }
 
-/// Content-capture mode for an SLS / Datadog / OTLP exporter. Defaults to
-/// the privacy-preserving `metadata_only`. (`Hash` so an exporter's
-/// fingerprint can cover its content config; see `fingerprint_datadog` /
-/// `fingerprint_otlp`.)
+/// Content-capture mode for an observability exporter.
 #[derive(
     Debug, Clone, Copy, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Hash,
 )]
@@ -196,34 +118,14 @@ const fn default_content_max_bytes() -> u32 {
     128 * 1024
 }
 
-/// Datadog native **Logs HTTP intake** target. Each request event becomes one
-/// Datadog log object, gzip-compressed and POSTed to
-/// `https://http-intake.logs.<site>/api/v2/logs`. Like `aliyun_sls` (and
-/// unlike `otlp_http`), the Datadog API key is **never** part of this config:
-/// it would otherwise sit in plaintext on the kine path, and a Datadog API key
-/// grants broad org access. Instead the config carries a [`credential_ref`]
-/// pointer that the customer-side DP resolves to the real key locally (env /
-/// mounted secret); API7's control plane stores only the reference. This
-/// deliberately diverges from issue #688's `api_key: SecretRef` draft to stay
-/// consistent with SLS / object_store and avoid the #692 credential-encryption
-/// dependency.
-///
-/// [`credential_ref`]: DatadogConfig::credential_ref
+/// Datadog native Logs HTTP intake exporter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DatadogConfig {
-    /// Datadog site, validated against the allow-list in the loader schema
-    /// (`datadoghq.com`, `us3`/`us5`/`ap1`/`ap2` regions, `datadoghq.eu`,
-    /// `ddog-gov.com`). The intake host is `http-intake.logs.<site>`. A
-    /// scheme-qualified loopback host (the e2e's `http://mock-datadog:*`) is
-    /// admitted only for vetted local mocks, never to redirect real traffic.
+    /// Datadog site, such as `datadoghq.com`, `us3.datadoghq.com`, or `datadoghq.eu`.
     pub site: String,
 
-    /// Opaque pointer to the Datadog API key, resolved locally by the DP at
-    /// delivery time. The plaintext key MUST NOT live in etcd/kine — the
-    /// control plane stores only this reference, never the key itself. The DP
-    /// reads `DD_CRED_<SLUG>_API_KEY` from its own environment, where `<SLUG>`
-    /// upper-cases the reference with non-alphanumerics folded to `_`.
+    /// Credential reference resolved by the data plane at delivery time; the plaintext Datadog API key is not stored in this resource.
     pub credential_ref: String,
 
     /// Datadog `service` reserved attribute — the service name every log from
@@ -241,39 +143,11 @@ pub struct DatadogConfig {
     #[serde(default)]
     pub tags: Vec<String>,
 
-    /// Whether captured request/response content is delivered to Datadog.
-    /// `metadata_only` (default) ships only operational metadata — never a
-    /// prompt or response. `full` additionally captures the request prompt and
-    /// the assembled response, each truncated to [`content_max_bytes`].
-    /// Enabling `full` writes end-user prompt / response text into the
-    /// customer's Datadog org, so the dashboard must surface the privacy
-    /// implication when an operator turns it on. Reuses [`SlsContentMode`] —
-    /// the codebase's existing `metadata_only | full` model — so the shared
-    /// content-capture plumbing (`content_record` / `content_capture_cap`)
-    /// stays single-sourced.
-    ///
-    /// [`content_max_bytes`]: DatadogConfig::content_max_bytes
+    /// Controls whether logs include prompt and response content. `metadata_only` omits content; `full` includes content truncated by `content_max_bytes`.
     #[serde(default)]
     pub content_mode: SlsContentMode,
 
-    /// Per-field byte cap for captured content under `content_mode = full`.
-    /// The prompt and the response are each truncated to this many bytes
-    /// (UTF-8-boundary safe), and the log carries a `content_truncated` marker
-    /// when either was cut. Ignored under `metadata_only`. Defaults to 128 KiB.
-    ///
-    /// This bounds each field *independently*: a single log carries BOTH the
-    /// prompt and the response plus metadata, so the encoded log can reach
-    /// ~2× this cap. Datadog rejects any single log over 1 MB and any request
-    /// over 5 MB / 1000 logs; byte-aware per-log/per-request splitting to those
-    /// limits is not yet enforced (tracked in api7/ai-gateway#556) — until it
-    /// lands, a large cap on a busy `full` exporter risks Datadog rejecting an
-    /// oversized batch (a `Permanent` delivery error surfaced via `last_error`).
-    /// The 128 KiB default keeps a log well under the per-log limit.
-    ///
-    /// `0` is rejected — `full` with a zero cap captures nothing, which is a
-    /// misconfiguration. The `range(min = 1, max = …)` keeps the generated JSON
-    /// schema in step with the runtime validator so the CP and DP agree on the
-    /// bounds.
+    /// Maximum bytes per captured prompt or response field when `content_mode` is `full`. Keep this under Datadog intake limits to avoid delivery errors.
     #[serde(default = "default_dd_content_max_bytes")]
     #[schemars(range(min = 1, max = 1_048_576))]
     pub content_max_bytes: u32,
@@ -289,16 +163,7 @@ const fn default_dd_content_max_bytes() -> u32 {
     128 * 1024
 }
 
-/// Object-storage sink — ONE config covering S3 / GCS / Azure Blob (and
-/// S3-compatible MinIO / Cloudflare R2 via `endpoint`) behind a single
-/// backend, so the sink is written once rather than per provider. Batched
-/// NDJSON files land under a date-partitioned, deterministic key layout that
-/// Snowpipe / Databricks Auto Loader ingest from. Like `aliyun_sls`, cloud
-/// credentials are **never** in this config: a [`credential_ref`] points at
-/// keys the DP resolves locally, so the control plane never holds the secret
-/// on the kine path.
-///
-/// [`credential_ref`]: ObjectStoreConfig::credential_ref
+/// Object-storage exporter configuration for S3, GCS, Azure Blob, and compatible S3 backends.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectStoreConfig {
@@ -331,12 +196,7 @@ pub struct ObjectStoreConfig {
     #[serde(default)]
     pub auth_mode: ObjectStoreAuthMode,
 
-    /// Opaque pointer to the cloud credentials, resolved locally by the DP
-    /// at delivery time. The plaintext key MUST NOT live in etcd/kine — the
-    /// control plane stores only this reference, never the secret itself.
-    /// Required when `auth_mode = credential_ref`; omitted (not empty) when
-    /// `auth_mode = cloud_identity` — `skip_serializing_if` keeps an empty
-    /// reference off the wire so the two encodings never diverge.
+    /// Credential reference resolved by the data plane at delivery time. Required when `auth_mode` is `credential_ref`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub credential_ref: String,
 }
@@ -375,22 +235,11 @@ pub enum ObjectStoreAuthMode {
     /// (`OBJSTORE_CRED_<SLUG>_<FIELD>`). The default.
     #[default]
     CredentialRef,
-    /// Use the DP host's own attached cloud identity — EC2 instance role /
-    /// EKS IRSA / ECS task role (S3), or GKE Workload Identity / GCE metadata
-    /// (GCS) — via the cloud SDK's default credential chain, with no static
-    /// keys anywhere. Supported for S3 and GCS only.
+    /// Use the data plane host's attached cloud identity. Supported for S3 and GCS only.
     CloudIdentity,
 }
 
-/// Top-level `ObservabilityExporter` resource. `deny_unknown_fields`
-/// deliberately NOT set — serde's `flatten` + `tag = "kind"`
-/// interaction makes outer-strict-mode reject the inner discriminator
-/// field. Strict typo rejection happens at the JSON Schema layer
-/// (`schema::validate_observability_exporter`) which the etcd loader
-/// runs before the serde deserialize.
-///
-/// `PartialEq` (not `Eq`): the flattened [`ExporterKind`] carries an `f64`
-/// (`OtlpHttpConfig::sample_rate`) — see [`ExporterKind`].
+/// Telemetry exporter configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct ObservabilityExporter {
     /// Operator-facing label, surfaced in /logs and the dashboard list.

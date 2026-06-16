@@ -59,29 +59,13 @@ impl RoutingTarget {
     }
 }
 
-/// Behavior when every candidate target is filtered out by the
-/// runtime status layer (all in cooldown or background-unhealthy).
-///
-/// `Fail` is the default because sending traffic to a target we know
-/// is currently bad — just because every other target is also bad —
-/// amplifies cascading outages. Operators that prefer the legacy
-/// behavior (try every candidate regardless of known state) can opt
-/// into `OriginalOrder` per routing model.
+/// Behavior when every routing target is filtered out by runtime health or cooldown state.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum OnAllFilteredPolicy {
-    /// Return 503 with a fixed Retry-After hint (currently 30 seconds —
-    /// see `FALLBACK_ALL_UNHEALTHY_RETRY_AFTER` in
-    /// `crates/aisix-proxy/src/chat.rs`). Default.
-    ///
-    /// The hint is intentionally coarse: by the time the filter
-    /// reaches the all-filtered branch, every candidate is
-    /// background-unhealthy with no live cooldown timer (cooldown
-    /// candidates are returned via the Selected branch one tier up).
-    /// A future version may derive the hint from probe metadata; the
-    /// current contract is a flat fallback.
+    /// Return `503` with a fixed `Retry-After` hint. Default.
     #[default]
     Fail,
     /// Send to the original candidate list anyway, in declaration
