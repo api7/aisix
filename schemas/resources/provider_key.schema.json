@@ -35,7 +35,7 @@
       "type": "string"
     },
     "request": {
-      "description": "Per-key request-shape overrides applied before dispatch to the upstream provider.",
+      "description": "Per-key request-shape overrides applied by supported provider paths before dispatch to the upstream provider.",
       "anyOf": [
         {
           "$ref": "#/definitions/RequestOverrides"
@@ -46,7 +46,7 @@
       ]
     },
     "response": {
-      "description": "Per-key response-shape overrides applied to upstream responses.",
+      "description": "Per-key response-shape overrides applied by provider bridges that support response transformation.",
       "anyOf": [
         {
           "$ref": "#/definitions/ResponseOverrides"

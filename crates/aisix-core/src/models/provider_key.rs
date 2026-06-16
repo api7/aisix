@@ -55,11 +55,11 @@ pub struct ProviderKey {
     #[serde(default)]
     pub telemetry_tags: TelemetryTags,
 
-    /// Per-key request-shape overrides applied before dispatch to the upstream provider.
+    /// Per-key request-shape overrides applied by supported provider paths before dispatch to the upstream provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<RequestOverrides>,
 
-    /// Per-key response-shape overrides applied to upstream responses.
+    /// Per-key response-shape overrides applied by provider bridges that support response transformation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<ResponseOverrides>,
 
