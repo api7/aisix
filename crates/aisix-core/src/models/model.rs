@@ -58,13 +58,20 @@ impl ModelCost {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BackgroundModelCheck {
+    /// Whether background health checks are enabled for this model.
     pub enabled: bool,
+    /// Seconds between background health checks. Minimum: 5.
     pub interval_seconds: u64,
+    /// Request timeout in seconds for each background health check. Minimum: 1.
     pub timeout_seconds: u64,
+    /// Prompt sent to the model during each background health check.
     pub prompt: String,
+    /// Maximum completion tokens requested during each background health check.
     pub max_tokens: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Upstream status codes to ignore when evaluating background check failures.
     pub ignore_statuses: Vec<u16>,
+    /// Seconds after which the last completed background check is considered stale.
     pub stale_after_seconds: u64,
 }
 
@@ -154,15 +161,15 @@ pub struct Model {
     /// the dashboard model list. `Resource::name()` returns this.
     pub display_name: String,
 
-    /// Upstream vendor identity used for dispatch, compatibility checks, telemetry, and access logs. `None` for routing and ensemble models.
+    /// Upstream vendor identity used for dispatch, compatibility checks, telemetry, and access logs. Routing and ensemble models leave this field unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
 
-    /// Upstream model identifier sent in provider requests. `None` for routing and ensemble models.
+    /// Upstream model identifier sent in provider requests. Routing and ensemble models leave this field unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_name: Option<String>,
 
-    /// Provider key resource ID used to authenticate upstream requests. `None` for routing and ensemble models.
+    /// Provider key resource ID used to authenticate upstream requests. Routing and ensemble models leave this field unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_key_id: Option<String>,
 
@@ -174,6 +181,7 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_timeout: Option<u64>,
 
+    /// Request, token, and concurrency limits for this model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
 
@@ -195,11 +203,11 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<ModelCost>,
 
-    /// Optional direct-model-only background health-check configuration.
+    /// Direct-model-only background health-check configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_model_check: Option<BackgroundModelCheck>,
 
-    /// Optional direct-model-only request-path cooldown configuration.
+    /// Direct-model-only request-path cooldown configuration.
     /// When omitted, cooldown remains enabled with the defaults documented by each field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown: Option<CooldownConfig>,

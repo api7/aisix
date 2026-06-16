@@ -89,7 +89,7 @@
           "type": "string"
         },
         "endpoint": {
-          "description": "Azure Cognitive Services resource endpoint, e.g. `https://my-resource.cognitiveservices.azure.com`. The DP appends `/contentsafety/text:shieldPrompt?api-version=2024-09-01`.",
+          "description": "Azure Cognitive Services resource endpoint, e.g. `https://my-resource.cognitiveservices.azure.com`. The data plane appends `/contentsafety/text:shieldPrompt?api-version=2024-09-01`.",
           "type": "string"
         },
         "kind": {
@@ -142,7 +142,7 @@
           }
         },
         "endpoint": {
-          "description": "Azure Cognitive Services resource endpoint. The DP appends `/contentsafety/text:analyze?api-version=2024-09-01`.",
+          "description": "Azure Cognitive Services resource endpoint. The data plane appends `/contentsafety/text:analyze?api-version=2024-09-01`.",
           "type": "string"
         },
         "halt_on_blocklist_hit": {
@@ -278,7 +278,7 @@
           "type": "boolean"
         },
         "region": {
-          "description": "Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The DP builds the endpoint `https://green-cip.<region>.aliyuncs.com`.",
+          "description": "Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The data plane builds the endpoint `https://green-cip.<region>.aliyuncs.com`.",
           "type": "string"
         },
         "risk_level_threshold": {
@@ -378,6 +378,7 @@
           ],
           "properties": {
             "access_key_id": {
+              "description": "AWS access key ID for static Bedrock guardrail credentials.",
               "type": "string"
             },
             "kind": {
@@ -387,7 +388,7 @@
               ]
             },
             "secret_access_key": {
-              "description": "Decrypted before projection. Plaintext is held in memory only and is not logged. The DP passes it to the AWS SDK's static credentials provider.",
+              "description": "Decrypted before projection. Plaintext is held in memory only and is not logged. The data plane passes it to the AWS SDK's static credentials provider.",
               "type": "string"
             }
           }
@@ -425,6 +426,7 @@
               ]
             },
             "timeout_ms": {
+              "description": "Maximum time in milliseconds to wait for the Bedrock guardrail response.",
               "type": "integer",
               "format": "uint32",
               "minimum": 0.0
@@ -463,6 +465,7 @@
       "description": "Literal or regular-expression pattern used by a keyword guardrail.",
       "oneOf": [
         {
+          "description": "Literal string to match.",
           "type": "object",
           "required": [
             "kind",
@@ -481,6 +484,7 @@
           }
         },
         {
+          "description": "Regular expression pattern to match.",
           "type": "object",
           "required": [
             "kind",

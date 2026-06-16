@@ -36,8 +36,7 @@ pub enum RoutingStrategy {
 pub struct RoutingTarget {
     /// Model alias for a direct model that can receive routed traffic.
     pub model: String,
-    /// Only meaningful for `weighted`. Optional everywhere else and falls
-    /// back to 1 when missing.
+    /// Target weight for `weighted` routing. Other strategies ignore this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
 }

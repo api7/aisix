@@ -19,7 +19,7 @@
       "type": "string"
     },
     "rate_limit": {
-      "description": "Optional request, token, and concurrency limits for this key.",
+      "description": "Request, token, and concurrency limits for this key.",
       "anyOf": [
         {
           "$ref": "#/definitions/RateLimit"

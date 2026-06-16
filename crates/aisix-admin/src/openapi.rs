@@ -26,7 +26,7 @@ use std::sync::OnceLock;
 
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Response};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Paths + OpenAPI-specific wrapper schemas (`ModelEntry`,
 /// `ApiKeyEntry`, `ModelStatusView`, `AdminError`, etc.). Resource
@@ -2071,7 +2071,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "description": "Observability exporter configuration for telemetry export and optional content capture."
+          "description": "Observability exporter configuration for telemetry export and content capture settings."
         },
         "responses": {
           "200": {
@@ -2574,7 +2574,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
       "AdminBearer": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Admin key from `config.admin.admin_keys`. Required for every `/admin/v1/*` route."
+        "description": "Admin key from `config.admin.admin_keys`."
       },
       "ProxyBearer": {
         "type": "http",
@@ -2762,7 +2762,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
           },
           "rate_limit": {
             "$ref": "#/components/schemas/RateLimit",
-            "description": "Optional request, token, and concurrency limits for this key."
+            "description": "Request, token, and concurrency limits for this key."
           }
         },
         "additionalProperties": false
@@ -2926,7 +2926,8 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "example": true
           },
           "id": {
-            "type": "string"
+            "type": "string",
+            "description": "Resource ID that was deleted."
           }
         }
       },
@@ -2992,7 +2993,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "enum": [
               "ok"
             ],
-            "description": "Fixed success marker for this response. Successful responses currently always return `ok`; this field does not summarize model health. Use `models[].health` and `config` for actionable health details.",
+            "description": "Fixed success marker for this response. Successful responses currently always return `ok`. This field does not summarize model health. Use `models[].health` and `config` for actionable health details.",
             "example": "ok"
           },
           "models": {
@@ -3031,7 +3032,8 @@ const OPENAPI_JSON_BASE: &str = r##"{
             ]
           },
           "rate_limit": {
-            "$ref": "#/components/schemas/RateLimit"
+            "$ref": "#/components/schemas/RateLimit",
+            "description": "Request, token, and concurrency limits for this key."
           }
         },
         "additionalProperties": false,
@@ -3191,6 +3193,8 @@ pub(crate) fn merged_openapi() -> &'static str {
         collapse_nullable_any_of(&mut doc);
         collapse_single_ref_all_of(&mut doc);
         add_variant_titles(&mut doc);
+        add_missing_property_descriptions(&mut doc);
+        wrap_ref_siblings_for_redoc(&mut doc);
 
         serde_json::to_string(&doc).expect("merged OpenAPI must serialise")
     })
@@ -3276,6 +3280,112 @@ fn title_schema_variants(doc: &mut Value, pointer: &str, titles: &[&str]) {
     }
 }
 
+fn add_missing_property_descriptions(doc: &mut Value) {
+    for (pointer, description) in [
+        (
+            "/components/schemas/BedrockAWSCredentials/oneOf/0/properties/kind",
+            "Credential mode. Use `static` for explicitly configured AWS access keys.",
+        ),
+        (
+            "/components/schemas/BedrockLatencyMode/oneOf/0/properties/kind",
+            "Latency mode. Use `serial` to wait for the Bedrock guardrail response.",
+        ),
+        (
+            "/components/schemas/BedrockLatencyMode/oneOf/1/properties/kind",
+            "Latency mode. Use `timed` to stop waiting after `timeout_ms`.",
+        ),
+        (
+            "/components/schemas/Guardrail/oneOf/0/properties/kind",
+            "Guardrail provider type. Use `keyword` for literal and regular expression matching.",
+        ),
+        (
+            "/components/schemas/Guardrail/oneOf/1/properties/kind",
+            "Guardrail provider type. Use `bedrock` for Amazon Bedrock Guardrails.",
+        ),
+        (
+            "/components/schemas/Guardrail/oneOf/2/properties/kind",
+            "Guardrail provider type. Use `azure_content_safety` for Azure Prompt Shield.",
+        ),
+        (
+            "/components/schemas/Guardrail/oneOf/3/properties/kind",
+            "Guardrail provider type. Use `azure_content_safety_text_moderation` for Azure text moderation.",
+        ),
+        (
+            "/components/schemas/Guardrail/oneOf/4/properties/kind",
+            "Guardrail provider type. Use `aliyun_text_moderation` for Aliyun text moderation.",
+        ),
+        (
+            "/components/schemas/KeywordPattern/oneOf/0/properties/kind",
+            "Pattern type. Use `literal` to match the value as plain text.",
+        ),
+        (
+            "/components/schemas/KeywordPattern/oneOf/1/properties/kind",
+            "Pattern type. Use `regex` to match the value as a regular expression.",
+        ),
+        (
+            "/components/schemas/KeywordPattern/oneOf/0/properties/value",
+            "Literal string to match.",
+        ),
+        (
+            "/components/schemas/KeywordPattern/oneOf/1/properties/value",
+            "Regular expression pattern to match.",
+        ),
+        (
+            "/components/schemas/ObservabilityExporter/oneOf/0/properties/kind",
+            "Exporter type. Use `otlp_http` to send telemetry to an OTLP HTTP endpoint.",
+        ),
+        (
+            "/components/schemas/ObservabilityExporter/oneOf/1/properties/kind",
+            "Exporter type. Use `aliyun_sls` to send telemetry to Aliyun SLS.",
+        ),
+        (
+            "/components/schemas/ObservabilityExporter/oneOf/2/properties/kind",
+            "Exporter type. Use `object_store` to write telemetry batches to object storage.",
+        ),
+        (
+            "/components/schemas/ObservabilityExporter/oneOf/3/properties/kind",
+            "Exporter type. Use `datadog` to send telemetry to Datadog Logs intake.",
+        ),
+    ] {
+        if let Some(Value::Object(map)) = doc.pointer_mut(pointer) {
+            map.entry("description".to_string())
+                .or_insert_with(|| Value::String(description.to_string()));
+        }
+    }
+}
+
+/// ReDoc renders field-level metadata more reliably when it lives next to an
+/// `allOf` wrapper than when it is a sibling of a bare `$ref`. OpenAPI 3.1
+/// allows `$ref` siblings, but keep this shape for the generated reference UI.
+fn wrap_ref_siblings_for_redoc(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            for child in map.values_mut() {
+                wrap_ref_siblings_for_redoc(child);
+            }
+
+            if let Some(ref_value) = map.remove("$ref") {
+                if map.is_empty() {
+                    map.insert("$ref".to_string(), ref_value);
+                } else {
+                    let mut ref_map = Map::new();
+                    ref_map.insert("$ref".to_string(), ref_value);
+                    map.insert(
+                        "allOf".to_string(),
+                        Value::Array(vec![Value::Object(ref_map)]),
+                    );
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                wrap_ref_siblings_for_redoc(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Schemars represents `Option<T>` as `anyOf: [T, null]`. That is accurate
 /// JSON Schema, but ReDoc renders it as a two-tab choice for optional fields.
 /// Collapse that generated nullable shape in the served OpenAPI so optionality
@@ -3324,10 +3434,11 @@ fn collapse_nullable_any_of(v: &mut Value) {
     }
 }
 
-/// Schemars emits `allOf: [{"$ref": "..."}]` when a property has both a
-/// description and a referenced schema. ReDoc does not need the wrapper, and
-/// API7 Gateway's reference specs avoid this shape, so flatten it while keeping
-/// the property's local description.
+/// Schemars can emit a pure `allOf: [{"$ref": "..."}]` wrapper around a
+/// referenced schema. Collapse only the redundant pure wrapper. When the
+/// property also carries a local description, default, or example, keep the
+/// `allOf` form because ReDoc renders those sibling fields more reliably there
+/// than next to a bare `$ref`.
 fn collapse_single_ref_all_of(v: &mut Value) {
     match v {
         Value::Object(map) => {
@@ -3342,7 +3453,7 @@ fn collapse_single_ref_all_of(v: &mut Value) {
                 _ => None,
             };
 
-            if let Some(ref_value) = ref_value {
+            if let Some(ref_value) = ref_value.filter(|_| map.len() == 1) {
                 map.remove("allOf");
                 map.entry("$ref".to_string()).or_insert(ref_value);
             }
@@ -3745,7 +3856,7 @@ mod tests {
         );
         assert_eq!(
             schemas["HealthResponse"]["properties"]["status"]["description"],
-            "Fixed success marker for this response. Successful responses currently always return `ok`; this field does not summarize model health. Use `models[].health` and `config` for actionable health details."
+            "Fixed success marker for this response. Successful responses currently always return `ok`. This field does not summarize model health. Use `models[].health` and `config` for actionable health details."
         );
     }
 
@@ -3763,12 +3874,32 @@ mod tests {
         let background_model_check =
             &parsed["components"]["schemas"]["Model"]["properties"]["background_model_check"];
         assert_eq!(
-            background_model_check["$ref"],
+            background_model_check["allOf"][0]["$ref"],
             "#/components/schemas/BackgroundModelCheck"
         );
         assert!(
             background_model_check.get("anyOf").is_none(),
             "optional object fields should not render as nullable ReDoc tabs"
+        );
+
+        let content_mode = &parsed["components"]["schemas"]["ObservabilityExporter"]["oneOf"][0]
+            ["properties"]["content_mode"];
+        assert_eq!(
+            content_mode["allOf"][0]["$ref"],
+            "#/components/schemas/SlsContentMode"
+        );
+        assert!(
+            content_mode["description"]
+                .as_str()
+                .is_some_and(|description| !description.trim().is_empty()),
+            "referenced properties with local descriptions should keep allOf for ReDoc"
+        );
+
+        let mut ref_sibling_metadata = Vec::new();
+        collect_ref_sibling_metadata(&parsed, String::new(), &mut ref_sibling_metadata);
+        assert!(
+            ref_sibling_metadata.is_empty(),
+            "$ref sibling metadata should be wrapped in allOf for ReDoc: {ref_sibling_metadata:#?}"
         );
 
         let mut nullable_any_of = Vec::new();
@@ -3778,12 +3909,100 @@ mod tests {
             "nullable anyOf branches should be collapsed before serving ReDoc: {nullable_any_of:#?}"
         );
 
-        let mut single_ref_all_of = Vec::new();
-        collect_single_ref_all_of(&parsed, String::new(), &mut single_ref_all_of);
-        assert!(
-            single_ref_all_of.is_empty(),
-            "single-ref allOf wrappers should be collapsed before serving ReDoc: {single_ref_all_of:#?}"
+        let mut redundant_single_ref_all_of = Vec::new();
+        collect_redundant_single_ref_all_of(
+            &parsed,
+            String::new(),
+            &mut redundant_single_ref_all_of,
         );
+        assert!(
+            redundant_single_ref_all_of.is_empty(),
+            "pure single-ref allOf wrappers should be collapsed before serving ReDoc: {redundant_single_ref_all_of:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openapi_documents_schema_property_descriptions() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
+        let mut missing = Vec::new();
+        collect_missing_property_descriptions(
+            &parsed["components"]["schemas"],
+            String::new(),
+            &mut missing,
+        );
+
+        assert!(
+            missing.is_empty(),
+            "schema properties missing descriptions: {missing:#?}"
+        );
+    }
+
+    fn collect_missing_property_descriptions(
+        value: &serde_json::Value,
+        path: String,
+        missing: &mut Vec<String>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("type").is_some_and(|kind| kind == "object")
+                    || map.contains_key("properties")
+                {
+                    if let Some(serde_json::Value::Object(properties)) = map.get("properties") {
+                        for (name, property) in properties {
+                            if property.get("description").is_none() {
+                                missing.push(format!("{path}/properties/{name}"));
+                            }
+                        }
+                    }
+                }
+
+                for (key, child) in map {
+                    collect_missing_property_descriptions(child, format!("{path}/{key}"), missing);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    collect_missing_property_descriptions(
+                        child,
+                        format!("{path}/{index}"),
+                        missing,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_ref_sibling_metadata(
+        value: &serde_json::Value,
+        path: String,
+        hits: &mut Vec<String>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("$ref").is_some()
+                    && map.keys().any(|key| {
+                        matches!(
+                            key.as_str(),
+                            "description" | "default" | "example" | "examples" | "title"
+                        )
+                    })
+                {
+                    hits.push(path.clone());
+                }
+
+                for (key, child) in map {
+                    collect_ref_sibling_metadata(child, format!("{path}/{key}"), hits);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    collect_ref_sibling_metadata(child, format!("{path}/{index}"), hits);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn collect_nullable_any_of(value: &serde_json::Value, path: String, hits: &mut Vec<String>) {
@@ -3808,22 +4027,26 @@ mod tests {
         }
     }
 
-    fn collect_single_ref_all_of(value: &serde_json::Value, path: String, hits: &mut Vec<String>) {
+    fn collect_redundant_single_ref_all_of(
+        value: &serde_json::Value,
+        path: String,
+        hits: &mut Vec<String>,
+    ) {
         match value {
             serde_json::Value::Object(map) => {
                 if let Some(serde_json::Value::Array(variants)) = map.get("allOf") {
-                    if variants.len() == 1 && variants[0]["$ref"].is_string() {
+                    if map.len() == 1 && variants.len() == 1 && variants[0]["$ref"].is_string() {
                         hits.push(path.clone());
                     }
                 }
 
                 for (key, child) in map {
-                    collect_single_ref_all_of(child, format!("{path}/{key}"), hits);
+                    collect_redundant_single_ref_all_of(child, format!("{path}/{key}"), hits);
                 }
             }
             serde_json::Value::Array(items) => {
                 for (index, child) in items.iter().enumerate() {
-                    collect_single_ref_all_of(child, format!("{path}/{index}"), hits);
+                    collect_redundant_single_ref_all_of(child, format!("{path}/{index}"), hits);
                 }
             }
             _ => {}

@@ -117,7 +117,7 @@
           "type": "string"
         },
         "weight": {
-          "description": "Only meaningful for `weighted`. Optional everywhere else and falls back to 1 when missing.",
+          "description": "Target weight for `weighted` routing. Other strategies ignore this field.",
           "type": [
             "integer",
             "null"

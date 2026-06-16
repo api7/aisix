@@ -22,7 +22,7 @@ pub struct PanelMember {
     /// Sampling temperature for this panel member. Omit it to keep the request's temperature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
-    /// Optional sampling seed for this panel member.
+    /// Sampling seed for this panel member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
     /// Reserved for the future voting/quorum strategy. Ignored by the v1
@@ -49,7 +49,7 @@ impl PanelMember {
 pub struct Judge {
     /// Model alias for the direct model that synthesizes panel responses.
     pub model: String,
-    /// Optional override for the built-in synthesis prompt template.
+    /// Override for the built-in synthesis prompt template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synthesis_prompt: Option<String>,
 }

@@ -89,7 +89,7 @@
           "type": "string"
         },
         "endpoint": {
-          "description": "SLS region endpoint host with no scheme, e.g. `ap-southeast-3.log.aliyuncs.com`. The request host the DP signs and posts to is `<project>.<endpoint>`.",
+          "description": "SLS region endpoint host with no scheme, e.g. `ap-southeast-3.log.aliyuncs.com`. The signed request host is `<project>.<endpoint>`.",
           "type": "string"
         },
         "kind": {
@@ -119,7 +119,7 @@
       ],
       "properties": {
         "auth_mode": {
-          "description": "How the DP authenticates to the bucket. Default `credential_ref`.",
+          "description": "How the data plane authenticates to the bucket. Default `credential_ref`.",
           "default": "credential_ref",
           "allOf": [
             {
@@ -255,10 +255,10 @@
   },
   "definitions": {
     "ObjectStoreAuthMode": {
-      "description": "How the DP obtains credentials for the object-storage bucket.",
+      "description": "How the data plane obtains credentials for the object-storage bucket.",
       "oneOf": [
         {
-          "description": "Resolve `credential_ref` to static keys from the DP's local env (`OBJSTORE_CRED_<SLUG>_<FIELD>`). The default.",
+          "description": "Resolve `credential_ref` to static keys from the data plane environment (`OBJSTORE_CRED_<SLUG>_<FIELD>`). The default.",
           "type": "string",
           "enum": [
             "credential_ref"

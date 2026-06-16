@@ -35,7 +35,7 @@
       "type": "string"
     },
     "request": {
-      "description": "Optional per-key request-shape overrides applied before dispatch to the upstream provider.",
+      "description": "Per-key request-shape overrides applied before dispatch to the upstream provider.",
       "anyOf": [
         {
           "$ref": "#/definitions/RequestOverrides"
@@ -46,7 +46,7 @@
       ]
     },
     "response": {
-      "description": "Optional per-key response-shape overrides applied to upstream responses.",
+      "description": "Per-key response-shape overrides applied to upstream responses.",
       "anyOf": [
         {
           "$ref": "#/definitions/ResponseOverrides"
@@ -74,7 +74,7 @@
       }
     },
     "telemetry_tags": {
-      "description": "Optional telemetry tags carried alongside the key for metric and log emission. Omitted fields use default empty values.",
+      "description": "Telemetry tags carried alongside the key for metric and log emission. Omitted fields use default empty values.",
       "default": {
         "featured": false
       },
@@ -226,14 +226,14 @@
       "type": "object",
       "properties": {
         "branded_provider": {
-          "description": "Branded provider slug for catalog entries, such as `\"openai\"` or `\"anthropic\"`. `None` for bring-your-own providers.",
+          "description": "Branded provider slug for catalog entries, such as `\"openai\"` or `\"anthropic\"`. Bring-your-own providers leave this field unset.",
           "type": [
             "string",
             "null"
           ]
         },
         "byo_label": {
-          "description": "Operator-defined label for bring-your-own entries, such as an internal team name. `None` for catalog entries.",
+          "description": "Operator-defined label for bring-your-own entries, such as an internal team name. Catalog entries leave this field unset.",
           "type": [
             "string",
             "null"

@@ -55,7 +55,7 @@
           "type": "string"
         },
         "synthesis_prompt": {
-          "description": "Optional override for the built-in synthesis prompt template.",
+          "description": "Override for the built-in synthesis prompt template.",
           "type": [
             "string",
             "null"
@@ -76,7 +76,7 @@
           "type": "string"
         },
         "seed": {
-          "description": "Optional sampling seed for this panel member.",
+          "description": "Sampling seed for this panel member.",
           "type": [
             "integer",
             "null"

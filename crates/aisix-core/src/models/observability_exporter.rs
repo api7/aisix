@@ -76,8 +76,8 @@ pub struct OtlpHttpConfig {
 #[serde(deny_unknown_fields)]
 pub struct AliyunSlsConfig {
     /// SLS region endpoint host with no scheme, e.g.
-    /// `ap-southeast-3.log.aliyuncs.com`. The request host the DP signs
-    /// and posts to is `<project>.<endpoint>`.
+    /// `ap-southeast-3.log.aliyuncs.com`. The signed request host is
+    /// `<project>.<endpoint>`.
     pub endpoint: String,
 
     /// SLS project name (the `<project>` in the request host).
@@ -190,7 +190,7 @@ pub struct ObjectStoreConfig {
     #[serde(default)]
     pub compression: ObjectStoreCompression,
 
-    /// How the DP authenticates to the bucket. Default `credential_ref`.
+    /// How the data plane authenticates to the bucket. Default `credential_ref`.
     #[serde(default)]
     pub auth_mode: ObjectStoreAuthMode,
 
@@ -222,13 +222,13 @@ pub enum ObjectStoreCompression {
     None,
 }
 
-/// How the DP obtains credentials for the object-storage bucket.
+/// How the data plane obtains credentials for the object-storage bucket.
 #[derive(
     Debug, Clone, Copy, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Hash,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectStoreAuthMode {
-    /// Resolve `credential_ref` to static keys from the DP's local env
+    /// Resolve `credential_ref` to static keys from the data plane environment
     /// (`OBJSTORE_CRED_<SLUG>_<FIELD>`). The default.
     #[default]
     CredentialRef,

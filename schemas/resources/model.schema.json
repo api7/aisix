@@ -17,7 +17,7 @@
       }
     },
     "background_model_check": {
-      "description": "Optional direct-model-only background health-check configuration.",
+      "description": "Direct-model-only background health-check configuration.",
       "anyOf": [
         {
           "$ref": "#/definitions/BackgroundModelCheck"
@@ -28,7 +28,7 @@
       ]
     },
     "cooldown": {
-      "description": "Optional direct-model-only request-path cooldown configuration. When omitted, cooldown remains enabled with the defaults documented by each field.",
+      "description": "Direct-model-only request-path cooldown configuration. When omitted, cooldown remains enabled with the defaults documented by each field.",
       "anyOf": [
         {
           "$ref": "#/definitions/CooldownConfig"
@@ -65,27 +65,28 @@
       ]
     },
     "model_name": {
-      "description": "Upstream model identifier sent in provider requests. `None` for routing and ensemble models.",
+      "description": "Upstream model identifier sent in provider requests. Routing and ensemble models leave this field unset.",
       "type": [
         "string",
         "null"
       ]
     },
     "provider": {
-      "description": "Upstream vendor identity used for dispatch, compatibility checks, telemetry, and access logs. `None` for routing and ensemble models.",
+      "description": "Upstream vendor identity used for dispatch, compatibility checks, telemetry, and access logs. Routing and ensemble models leave this field unset.",
       "type": [
         "string",
         "null"
       ]
     },
     "provider_key_id": {
-      "description": "Provider key resource ID used to authenticate upstream requests. `None` for routing and ensemble models.",
+      "description": "Provider key resource ID used to authenticate upstream requests. Routing and ensemble models leave this field unset.",
       "type": [
         "string",
         "null"
       ]
     },
     "rate_limit": {
+      "description": "Request, token, and concurrency limits for this model.",
       "anyOf": [
         {
           "$ref": "#/definitions/RateLimit"
@@ -139,9 +140,11 @@
       ],
       "properties": {
         "enabled": {
+          "description": "Whether background health checks are enabled for this model.",
           "type": "boolean"
         },
         "ignore_statuses": {
+          "description": "Upstream status codes to ignore when evaluating background check failures.",
           "type": "array",
           "items": {
             "type": "integer",
@@ -150,24 +153,29 @@
           }
         },
         "interval_seconds": {
+          "description": "Seconds between background health checks. Minimum: 5.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
         },
         "max_tokens": {
+          "description": "Maximum completion tokens requested during each background health check.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
         },
         "prompt": {
+          "description": "Prompt sent to the model during each background health check.",
           "type": "string"
         },
         "stale_after_seconds": {
+          "description": "Seconds after which the last completed background check is considered stale.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
         },
         "timeout_seconds": {
+          "description": "Request timeout in seconds for each background health check. Minimum: 1.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
@@ -295,7 +303,7 @@
           "type": "string"
         },
         "synthesis_prompt": {
-          "description": "Optional override for the built-in synthesis prompt template.",
+          "description": "Override for the built-in synthesis prompt template.",
           "type": [
             "string",
             "null"
@@ -356,7 +364,7 @@
           "type": "string"
         },
         "seed": {
-          "description": "Optional sampling seed for this panel member.",
+          "description": "Sampling seed for this panel member.",
           "type": [
             "integer",
             "null"
@@ -551,7 +559,7 @@
           "type": "string"
         },
         "weight": {
-          "description": "Only meaningful for `weighted`. Optional everywhere else and falls back to 1 when missing.",
+          "description": "Target weight for `weighted` routing. Other strategies ignore this field.",
           "type": [
             "integer",
             "null"

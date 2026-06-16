@@ -51,17 +51,16 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<Adapter>,
 
-    /// Optional telemetry tags carried alongside the key for metric and log
-    /// emission. Omitted fields use default empty values.
+    /// Telemetry tags carried alongside the key for metric and log emission.
+    /// Omitted fields use default empty values.
     #[serde(default)]
     pub telemetry_tags: TelemetryTags,
 
-    /// Optional per-key request-shape overrides applied before dispatch to the
-    /// upstream provider.
+    /// Per-key request-shape overrides applied before dispatch to the upstream provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<RequestOverrides>,
 
-    /// Optional per-key response-shape overrides applied to upstream responses.
+    /// Per-key response-shape overrides applied to upstream responses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<ResponseOverrides>,
 
@@ -143,7 +142,7 @@ pub struct TelemetryTags {
     pub featured: bool,
 
     /// Branded provider slug for catalog entries, such as `"openai"` or
-    /// `"anthropic"`. `None` for bring-your-own providers.
+    /// `"anthropic"`. Bring-your-own providers leave this field unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branded_provider: Option<String>,
 
@@ -153,7 +152,7 @@ pub struct TelemetryTags {
     pub pk_label: Option<String>,
 
     /// Operator-defined label for bring-your-own entries, such as an internal
-    /// team name. `None` for catalog entries.
+    /// team name. Catalog entries leave this field unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub byo_label: Option<String>,
 }

@@ -62,7 +62,9 @@ pub enum GuardrailHookPoint {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(tag = "kind", content = "value", rename_all = "lowercase")]
 pub enum KeywordPattern {
+    /// Literal string to match.
     Literal(String),
+    /// Regular expression pattern to match.
     Regex(String),
 }
 
@@ -80,9 +82,10 @@ pub struct KeywordConfig {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BedrockAWSCredentials {
     Static {
+        /// AWS access key ID for static Bedrock guardrail credentials.
         access_key_id: String,
         /// Decrypted before projection. Plaintext is held in memory only
-        /// and is not logged. The DP passes it to the
+        /// and is not logged. The data plane passes it to the
         /// AWS SDK's static credentials provider.
         secret_access_key: String,
     },
@@ -93,7 +96,10 @@ pub enum BedrockAWSCredentials {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BedrockLatencyMode {
     Serial,
-    Timed { timeout_ms: u32 },
+    Timed {
+        /// Maximum time in milliseconds to wait for the Bedrock guardrail response.
+        timeout_ms: u32,
+    },
 }
 
 /// Config block for `kind: "azure_content_safety"`. Calls Azure AI
@@ -108,7 +114,7 @@ pub enum BedrockLatencyMode {
 pub struct AzureContentSafetyConfig {
     /// Azure Cognitive Services resource endpoint, e.g.
     /// `https://my-resource.cognitiveservices.azure.com`.
-    /// The DP appends `/contentsafety/text:shieldPrompt?api-version=2024-09-01`.
+    /// The data plane appends `/contentsafety/text:shieldPrompt?api-version=2024-09-01`.
     pub endpoint: String,
     /// Subscription key (`Ocp-Apim-Subscription-Key`). Decrypted before
     /// projection. Plaintext is held in memory only and is not logged.
@@ -134,7 +140,7 @@ fn default_acs_timeout_ms() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AzureContentSafetyTextModerationConfig {
-    /// Azure Cognitive Services resource endpoint. The DP appends
+    /// Azure Cognitive Services resource endpoint. The data plane appends
     /// `/contentsafety/text:analyze?api-version=2024-09-01`.
     pub endpoint: String,
     /// Subscription key (`Ocp-Apim-Subscription-Key`). Plaintext is held in
@@ -253,7 +259,7 @@ fn default_acs_on_buffer_exceeded() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AliyunTextModerationConfig {
-    /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The DP
+    /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The data plane
     /// builds the endpoint `https://green-cip.<region>.aliyuncs.com`.
     pub region: String,
     /// Explicit endpoint override as a full URL with no trailing slash. When set, it takes precedence over `region`.

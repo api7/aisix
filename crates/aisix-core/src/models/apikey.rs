@@ -24,7 +24,7 @@ pub struct ApiKey {
     /// Model identifiers this key may use. An empty array denies access to every model.
     pub allowed_models: Vec<String>,
 
-    /// Optional request, token, and concurrency limits for this key.
+    /// Request, token, and concurrency limits for this key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
 
