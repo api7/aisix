@@ -62,7 +62,7 @@
           ]
         },
         "latency_mode": {
-          "description": "Bedrock guardrail latency policy. Defaults to `serial`. Use `timed` with `timeout_ms` to cap wait time.",
+          "description": "Bedrock guardrail latency policy. Use `timed` with `timeout_ms` to cap wait time.",
           "allOf": [
             {
               "$ref": "#/definitions/BedrockLatencyMode"
@@ -129,7 +129,7 @@
           }
         },
         "categories": {
-          "description": "Categories to analyze. Defaults to all four.",
+          "description": "Categories to analyze.",
           "default": [
             "Hate",
             "Sexual",
@@ -157,19 +157,19 @@
           ]
         },
         "max_buffer_bytes": {
-          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies. Default 262 144.",
+          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.",
           "default": 262144,
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
         },
         "on_buffer_exceeded": {
-          "description": "Buffer-overflow policy. Defaults to `fail_closed`. Use `fail_open` to allow output when the buffer cap is hit.",
+          "description": "Buffer-overflow policy. Use `fail_open` to allow output when the buffer cap is hit.",
           "default": "fail_closed",
           "type": "string"
         },
         "output_fail_open": {
-          "description": "Fail-open policy for the output hook. Defaults to `false`, so an Azure outage does not release unscanned model output.",
+          "description": "Fail-open policy for the output hook. When disabled, an Azure outage does not release unscanned model output.",
           "default": false,
           "type": "boolean"
         },
@@ -201,7 +201,7 @@
           "type": "string"
         },
         "text_source": {
-          "description": "Input-hook text selection. Defaults to `concatenate_user_content`. Use `concatenate_all_content` to include all message content. Ignored on the output hook.",
+          "description": "Input-hook text selection. Use `concatenate_all_content` to include all message content. Ignored on the output hook.",
           "default": "concatenate_user_content",
           "type": "string"
         },
@@ -213,14 +213,14 @@
           "minimum": 0.0
         },
         "window_overlap_size": {
-          "description": "Chars carried between windows so a span split across a boundary is still caught. Default 256.",
+          "description": "Chars carried between windows so a span split across a boundary is still caught.",
           "default": 256,
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
         },
         "window_size": {
-          "description": "Sliding-window size in characters for window mode. Default: 10,000.",
+          "description": "Sliding-window size in characters for window mode.",
           "default": 10000,
           "type": "integer",
           "format": "uint32",
@@ -261,19 +261,19 @@
           ]
         },
         "max_buffer_bytes": {
-          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies. Default 262 144.",
+          "description": "Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.",
           "default": 262144,
           "type": "integer",
           "format": "uint64",
           "minimum": 0.0
         },
         "on_buffer_exceeded": {
-          "description": "Buffer-overflow policy. Defaults to `fail_closed`. Use `fail_open` to allow output when the buffer cap is hit.",
+          "description": "Buffer-overflow policy. Use `fail_open` to allow output when the buffer cap is hit.",
           "default": "fail_closed",
           "type": "string"
         },
         "output_fail_open": {
-          "description": "Fail-open policy for the output hook. Defaults to `false`, so an Aliyun outage does not release unscanned model output.",
+          "description": "Fail-open policy for the output hook. When disabled, an Aliyun outage does not release unscanned model output.",
           "default": false,
           "type": "boolean"
         },
@@ -282,7 +282,7 @@
           "type": "string"
         },
         "risk_level_threshold": {
-          "description": "Minimum risk level that triggers a block: `low`, `medium`, or `high`. Defaults to `high`. A returned level at or above this blocks.",
+          "description": "Minimum risk level that triggers a block: `low`, `medium`, or `high`. A returned level at or above this blocks.",
           "default": "high",
           "type": "string"
         },
@@ -299,14 +299,14 @@
           "minimum": 0.0
         },
         "window_overlap_size": {
-          "description": "Chars carried between windows so a span split across a boundary is still caught. Default 128.",
+          "description": "Chars carried between windows so a span split across a boundary is still caught.",
           "default": 128,
           "type": "integer",
           "format": "uint32",
           "minimum": 0.0
         },
         "window_size": {
-          "description": "Sliding-window size in characters when window mode is used. Defaults to 2,000, which is Aliyun's per-call content limit for `llm_response_moderation`.",
+          "description": "Sliding-window size in characters when window mode is used. Aliyun limits each `llm_response_moderation` call to 2,000 characters.",
           "default": 2000,
           "type": "integer",
           "format": "uint32",
@@ -342,12 +342,12 @@
       "type": "string"
     },
     "fail_open": {
-      "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting. Defaults to `true`.",
+      "description": "Behavior when a remote API guardrail cannot reach its upstream. `true` allows the request and records the bypass reason in `usage_events.guardrail_bypassed_reason`. `false` blocks with 422. Keyword guardrails do not use this setting.",
       "default": true,
       "type": "boolean"
     },
     "hook_point": {
-      "description": "Where in the lifecycle this rule runs. Defaults to `both`.",
+      "description": "Where in the lifecycle this rule runs.",
       "default": "both",
       "allOf": [
         {
@@ -453,7 +453,7 @@
           ]
         },
         {
-          "description": "Run on both. Default for keyword blocklists.",
+          "description": "Run on both input and output.",
           "type": "string",
           "enum": [
             "both"

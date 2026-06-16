@@ -7,7 +7,7 @@
   ],
   "properties": {
     "max_fallbacks": {
-      "description": "Max number of later targets to attempt after the initial target fails permanently. Defaults to all later targets.",
+      "description": "Max number of later targets to attempt after the initial target fails permanently. When omitted, all later targets may be attempted.",
       "type": [
         "integer",
         "null"
@@ -65,7 +65,7 @@
       "description": "Behavior when every routing target is filtered out by runtime health or cooldown state.",
       "oneOf": [
         {
-          "description": "Return `503` with a fixed `Retry-After` hint. Default.",
+          "description": "Return `503` with a fixed `Retry-After` hint.",
           "type": "string",
           "enum": [
             "fail"

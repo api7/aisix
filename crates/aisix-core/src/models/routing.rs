@@ -65,7 +65,7 @@ impl RoutingTarget {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum OnAllFilteredPolicy {
-    /// Return `503` with a fixed `Retry-After` hint. Default.
+    /// Return `503` with a fixed `Retry-After` hint.
     #[default]
     Fail,
     /// Route to the original candidate list in declaration order even
@@ -86,8 +86,7 @@ pub struct Routing {
     /// Retry attempts on the current target before failing over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retries: Option<u32>,
-    /// Max number of later targets to attempt after the initial target
-    /// fails permanently. Defaults to all later targets.
+    /// Max number of later targets to attempt after the initial target fails permanently. When omitted, all later targets may be attempted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_fallbacks: Option<u32>,
     /// Whether upstream 429 participates in retries and failover.

@@ -53,7 +53,7 @@ pub enum GuardrailHookPoint {
     Input,
     /// Run on the upstream response before the cache write + render.
     Output,
-    /// Run on both. Default for keyword blocklists.
+    /// Run on both input and output.
     #[default]
     Both,
 }
@@ -156,7 +156,7 @@ pub struct AzureContentSafetyTextModerationConfig {
     /// Severity scale. Use `FourSeverityLevels` for 0, 2, 4, and 6, or `EightSeverityLevels` for 0 through 7.
     #[serde(default = "default_acs_output_type")]
     pub output_type: String,
-    /// Categories to analyze. Defaults to all four.
+    /// Categories to analyze.
     #[serde(default = "default_acs_categories")]
     pub categories: Vec<String>,
     /// General severity threshold. A category at or above it blocks.
@@ -171,8 +171,7 @@ pub struct AzureContentSafetyTextModerationConfig {
     /// Forwarded to Azure's `haltOnBlocklistHit`.
     #[serde(default)]
     pub halt_on_blocklist_hit: bool,
-    /// Input-hook text selection. Defaults to `concatenate_user_content`.
-    /// Use `concatenate_all_content` to include all message content. Ignored on the output hook.
+    /// Input-hook text selection. Use `concatenate_all_content` to include all message content. Ignored on the output hook.
     #[serde(default = "default_acs_text_source")]
     pub text_source: String,
 
@@ -181,21 +180,19 @@ pub struct AzureContentSafetyTextModerationConfig {
     /// for whole-response hold-back.
     #[serde(default = "default_acs_stream_processing_mode")]
     pub stream_processing_mode: String,
-    /// Sliding-window size in characters for window mode. Default: 10,000.
+    /// Sliding-window size in characters for window mode.
     #[serde(default = "default_acs_window_size")]
     pub window_size: u32,
-    /// Chars carried between windows so a span split across a boundary is
-    /// still caught. Default 256.
+    /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_acs_window_overlap_size")]
     pub window_overlap_size: u32,
-    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded`
-    /// applies. Default 262 144.
+    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
     #[serde(default = "default_acs_max_buffer_bytes")]
     pub max_buffer_bytes: u64,
-    /// Buffer-overflow policy. Defaults to `fail_closed`. Use `fail_open` to allow output when the buffer cap is hit.
+    /// Buffer-overflow policy. Use `fail_open` to allow output when the buffer cap is hit.
     #[serde(default = "default_acs_on_buffer_exceeded")]
     pub on_buffer_exceeded: String,
-    /// Fail-open policy for the output hook. Defaults to `false`, so an Azure outage does not release unscanned model output.
+    /// Fail-open policy for the output hook. When disabled, an Azure outage does not release unscanned model output.
     #[serde(default)]
     pub output_fail_open: bool,
 }
@@ -269,8 +266,7 @@ pub struct AliyunTextModerationConfig {
     /// Aliyun AccessKey secret. Decrypted before projection. Plaintext is held
     /// in memory only and is not logged. Used to sign the request.
     pub access_key_secret: String,
-    /// Minimum risk level that triggers a block: `low`, `medium`, or
-    /// `high`. Defaults to `high`. A returned level at or above this blocks.
+    /// Minimum risk level that triggers a block: `low`, `medium`, or `high`. A returned level at or above this blocks.
     #[serde(default = "default_aliyun_risk_level_threshold")]
     pub risk_level_threshold: String,
     /// HTTP call timeout in milliseconds. `fail_open` and `output_fail_open`
@@ -278,8 +274,7 @@ pub struct AliyunTextModerationConfig {
     /// immediately.
     #[serde(default = "default_acs_timeout_ms")]
     pub timeout_ms: u32,
-    /// Fail-open policy for the output hook. Defaults to `false`, so an Aliyun
-    /// outage does not release unscanned model output.
+    /// Fail-open policy for the output hook. When disabled, an Aliyun outage does not release unscanned model output.
     #[serde(default)]
     pub output_fail_open: bool,
 
@@ -288,19 +283,16 @@ pub struct AliyunTextModerationConfig {
     /// for whole-response hold-back.
     #[serde(default = "default_acs_stream_processing_mode")]
     pub stream_processing_mode: String,
-    /// Sliding-window size in characters when window mode is used. Defaults to
-    /// 2,000, which is Aliyun's per-call content limit for `llm_response_moderation`.
+    /// Sliding-window size in characters when window mode is used. Aliyun limits each `llm_response_moderation` call to 2,000 characters.
     #[serde(default = "default_aliyun_window_size")]
     pub window_size: u32,
-    /// Chars carried between windows so a span split across a boundary is
-    /// still caught. Default 128.
+    /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_aliyun_window_overlap_size")]
     pub window_overlap_size: u32,
-    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded`
-    /// applies. Default 262 144.
+    /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
     #[serde(default = "default_acs_max_buffer_bytes")]
     pub max_buffer_bytes: u64,
-    /// Buffer-overflow policy. Defaults to `fail_closed`. Use `fail_open` to allow output when the buffer cap is hit.
+    /// Buffer-overflow policy. Use `fail_open` to allow output when the buffer cap is hit.
     #[serde(default = "default_acs_on_buffer_exceeded")]
     pub on_buffer_exceeded: String,
 }
@@ -331,7 +323,7 @@ pub struct BedrockConfig {
     pub region: String,
     /// IAM credentials for Bedrock requests.
     pub aws_credentials: BedrockAWSCredentials,
-    /// Bedrock guardrail latency policy. Defaults to `serial`. Use `timed` with `timeout_ms` to cap wait time.
+    /// Bedrock guardrail latency policy. Use `timed` with `timeout_ms` to cap wait time.
     pub latency_mode: BedrockLatencyMode,
 }
 
@@ -407,14 +399,14 @@ pub struct Guardrail {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
-    /// Where in the lifecycle this rule runs. Defaults to `both`.
+    /// Where in the lifecycle this rule runs.
     #[serde(default)]
     pub hook_point: GuardrailHookPoint,
 
     /// Behavior when a remote API guardrail cannot reach its upstream.
     /// `true` allows the request and records the bypass reason in
     /// `usage_events.guardrail_bypassed_reason`. `false` blocks with
-    /// 422. Keyword guardrails do not use this setting. Defaults to `true`.
+    /// 422. Keyword guardrails do not use this setting.
     #[serde(default = "default_fail_open")]
     pub fail_open: bool,
 

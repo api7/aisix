@@ -76,7 +76,7 @@ pub struct EnsembleConfig {
     pub panel: Vec<PanelMember>,
     /// Direct model that combines successful panel responses.
     pub judge: Judge,
-    /// Minimum successful panel responses required before judge synthesis. Defaults to the smaller of 2 and the panel size.
+    /// Minimum successful panel responses required before judge synthesis. When omitted, the gateway requires the smaller of 2 and the panel size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_responses: Option<u32>,
     /// Per-call upstream deadline applied to each panel member and the judge. Set `0` or omit it to disable the ensemble-level deadline.

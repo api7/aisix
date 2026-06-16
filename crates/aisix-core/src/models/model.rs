@@ -79,32 +79,25 @@ pub struct BackgroundModelCheck {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct CooldownConfig {
-    /// Whether cooldown is active for this model. Default: true.
-    /// Set to `false` to keep the model in rotation regardless of upstream failures.
+    /// Whether cooldown is active for this model. Set to `false` to keep the model in rotation regardless of upstream failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
-    /// Cooldown TTL in seconds when the upstream did not supply a `Retry-After`
-    /// header or `honor_retry_after` is `false`. Default: 30.
+    /// Cooldown TTL in seconds when the upstream did not supply a `Retry-After` header or `honor_retry_after` is `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_seconds: Option<u64>,
-    /// Upper bound on cooldown TTL when `Retry-After` is used. Default: 600 seconds.
+    /// Upper bound on cooldown TTL when `Retry-After` is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_seconds: Option<u64>,
-    /// Whether to use the upstream's `Retry-After` header as the cooldown TTL
-    /// when it contains seconds. Default: true.
+    /// Whether to use the upstream's `Retry-After` header as the cooldown TTL when it contains seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub honor_retry_after: Option<bool>,
-    /// Status codes that trigger cooldown. Defaults to
-    /// `[401, 408, 429, 500, 502, 503, 504]`, covering authentication
-    /// failures, rate limits, and transient server errors. Caller-side
-    /// validation errors such as `400`, `403`, and `422` are excluded.
+    /// Status codes that trigger cooldown, covering authentication failures, rate limits, and transient server errors. Caller-side validation errors such as `400`, `403`, and `422` are excluded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_statuses: Option<Vec<u16>>,
-    /// Whether request-path timeouts trigger cooldown. Default: true.
+    /// Whether request-path timeouts trigger cooldown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_on_timeout: Option<bool>,
-    /// Whether transport / decode / stream-abort errors trigger
-    /// cooldown. Default: true.
+    /// Whether transport, decode, or stream-abort errors trigger cooldown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger_on_transport: Option<bool>,
 }
@@ -206,8 +199,7 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_model_check: Option<BackgroundModelCheck>,
 
-    /// Direct-model-only request-path cooldown configuration.
-    /// When omitted, cooldown remains enabled with the defaults documented by each field.
+    /// Direct-model-only request-path cooldown configuration. Omit this field to use the built-in cooldown behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown: Option<CooldownConfig>,
 

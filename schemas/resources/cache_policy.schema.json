@@ -31,7 +31,7 @@
       "type": "string"
     },
     "ttl_seconds": {
-      "description": "Cache entry TTL in seconds. Default: 3600.",
+      "description": "Cache entry TTL in seconds.",
       "default": 3600,
       "type": "integer",
       "format": "uint32",

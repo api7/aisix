@@ -41,7 +41,7 @@ pub struct CachePolicy {
     #[serde(default)]
     pub backend: CacheBackend,
 
-    /// Cache entry TTL in seconds. Default: 3600.
+    /// Cache entry TTL in seconds.
     #[serde(default = "default_ttl_seconds")]
     pub ttl_seconds: u32,
 

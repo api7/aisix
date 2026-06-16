@@ -65,7 +65,7 @@ pub struct OtlpHttpConfig {
     #[serde(default)]
     pub content_mode: SlsContentMode,
 
-    /// Maximum bytes per captured prompt or response field when `content_mode` is `full`. Defaults to 128 KiB.
+    /// Maximum bytes per captured prompt or response field when `content_mode` is `full`.
     #[serde(default = "default_content_max_bytes")]
     #[schemars(range(min = 1))]
     pub content_max_bytes: u32,
@@ -92,7 +92,7 @@ pub struct AliyunSlsConfig {
     #[serde(default)]
     pub content_mode: SlsContentMode,
 
-    /// Maximum bytes per captured prompt or response field when `content_mode` is `full`. Defaults to 128 KiB.
+    /// Maximum bytes per captured prompt or response field when `content_mode` is `full`.
     #[serde(default = "default_content_max_bytes")]
     #[schemars(range(min = 1))]
     pub content_max_bytes: u32,
@@ -131,13 +131,12 @@ pub struct DatadogConfig {
     pub service: String,
 
     /// Datadog `ddsource` reserved attribute. Identifies the integration or source.
-    /// Defaults to `aisix-ai-gateway`.
     #[serde(default = "default_ddsource")]
     pub ddsource: String,
 
     /// Operator-defined tags rendered into Datadog's comma-joined `ddtags`
     /// reserved attribute. For example, `["team:platform", "tier:prod"]`
-    /// becomes `team:platform,tier:prod`. Empty by default.
+    /// becomes `team:platform,tier:prod`. Leave empty when no tags should be sent.
     #[serde(default)]
     pub tags: Vec<String>,
 
@@ -175,9 +174,7 @@ pub struct ObjectStoreConfig {
     /// The full key is `<prefix>/org=…/env=…/table=…/dt=…/hh=…/<file>`.
     pub prefix: String,
 
-    /// AWS region for S3 SigV4 signature scope. Recommended because `object_store`
-    /// defaults to `us-east-1` when unset, so a non-default-region bucket
-    /// should set it. Ignored for GCS / Azure Blob.
+    /// AWS region for S3 SigV4 signature scope. Set this for S3 buckets outside `us-east-1`. Ignored for GCS and Azure Blob.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,
 
@@ -185,11 +182,11 @@ pub struct ObjectStoreConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
 
-    /// Compression applied to each NDJSON file before upload. Default gzip.
+    /// Compression applied to each NDJSON file before upload.
     #[serde(default)]
     pub compression: ObjectStoreCompression,
 
-    /// How the data plane authenticates to the bucket. Default `credential_ref`.
+    /// How the data plane authenticates to the bucket.
     #[serde(default)]
     pub auth_mode: ObjectStoreAuthMode,
 
@@ -214,7 +211,7 @@ pub enum ObjectStoreProvider {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectStoreCompression {
-    /// gzip compression as defined by RFC 1952. This is the default and is accepted by Snowpipe and Auto Loader.
+    /// gzip compression as defined by RFC 1952. Accepted by Snowpipe and Auto Loader.
     #[default]
     Gzip,
     /// No compression. Emits raw NDJSON.
@@ -228,7 +225,7 @@ pub enum ObjectStoreCompression {
 #[serde(rename_all = "snake_case")]
 pub enum ObjectStoreAuthMode {
     /// Resolve `credential_ref` to static keys from data plane environment
-    /// variables named `OBJSTORE_CRED_<SLUG>_<FIELD>`. The default.
+    /// variables named `OBJSTORE_CRED_<SLUG>_<FIELD>`.
     #[default]
     CredentialRef,
     /// Use the data plane host's attached cloud identity. Supported for S3 and GCS only.

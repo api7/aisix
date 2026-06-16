@@ -28,7 +28,7 @@
       ]
     },
     "cooldown": {
-      "description": "Direct-model-only request-path cooldown configuration. When omitted, cooldown remains enabled with the defaults documented by each field.",
+      "description": "Direct-model-only request-path cooldown configuration. Omit this field to use the built-in cooldown behavior.",
       "anyOf": [
         {
           "$ref": "#/definitions/CooldownConfig"
@@ -188,7 +188,7 @@
       "type": "object",
       "properties": {
         "default_seconds": {
-          "description": "Cooldown TTL in seconds when the upstream did not supply a `Retry-After` header or `honor_retry_after` is `false`. Default: 30.",
+          "description": "Cooldown TTL in seconds when the upstream did not supply a `Retry-After` header or `honor_retry_after` is `false`.",
           "type": [
             "integer",
             "null"
@@ -197,21 +197,21 @@
           "minimum": 0.0
         },
         "enabled": {
-          "description": "Whether cooldown is active for this model. Default: true. Set to `false` to keep the model in rotation regardless of upstream failures.",
+          "description": "Whether cooldown is active for this model. Set to `false` to keep the model in rotation regardless of upstream failures.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "honor_retry_after": {
-          "description": "Whether to use the upstream's `Retry-After` header as the cooldown TTL when it contains seconds. Default: true.",
+          "description": "Whether to use the upstream's `Retry-After` header as the cooldown TTL when it contains seconds.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "max_seconds": {
-          "description": "Upper bound on cooldown TTL when `Retry-After` is used. Default: 600 seconds.",
+          "description": "Upper bound on cooldown TTL when `Retry-After` is used.",
           "type": [
             "integer",
             "null"
@@ -220,21 +220,21 @@
           "minimum": 0.0
         },
         "trigger_on_timeout": {
-          "description": "Whether request-path timeouts trigger cooldown. Default: true.",
+          "description": "Whether request-path timeouts trigger cooldown.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "trigger_on_transport": {
-          "description": "Whether transport / decode / stream-abort errors trigger cooldown. Default: true.",
+          "description": "Whether transport, decode, or stream-abort errors trigger cooldown.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "trigger_statuses": {
-          "description": "Status codes that trigger cooldown. Defaults to `[401, 408, 429, 500, 502, 503, 504]`, covering authentication failures, rate limits, and transient server errors. Caller-side validation errors such as `400`, `403`, and `422` are excluded.",
+          "description": "Status codes that trigger cooldown, covering authentication failures, rate limits, and transient server errors. Caller-side validation errors such as `400`, `403`, and `422` are excluded.",
           "type": [
             "array",
             "null"
@@ -264,7 +264,7 @@
           ]
         },
         "min_responses": {
-          "description": "Minimum successful panel responses required before judge synthesis. Defaults to the smaller of 2 and the panel size.",
+          "description": "Minimum successful panel responses required before judge synthesis. When omitted, the gateway requires the smaller of 2 and the panel size.",
           "type": [
             "integer",
             "null"
@@ -337,7 +337,7 @@
       "description": "Behavior when every routing target is filtered out by runtime health or cooldown state.",
       "oneOf": [
         {
-          "description": "Return `503` with a fixed `Retry-After` hint. Default.",
+          "description": "Return `503` with a fixed `Retry-After` hint.",
           "type": "string",
           "enum": [
             "fail"
@@ -468,7 +468,7 @@
       ],
       "properties": {
         "max_fallbacks": {
-          "description": "Max number of later targets to attempt after the initial target fails permanently. Defaults to all later targets.",
+          "description": "Max number of later targets to attempt after the initial target fails permanently. When omitted, all later targets may be attempted.",
           "type": [
             "integer",
             "null"

@@ -53,7 +53,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "schema": {
               "type": "string"
             },
-            "description": "When present, returns a detailed multi-line text report instead of the default `ok` response.",
+            "description": "When present, returns a detailed multi-line text report instead of the short `ok` response.",
             "example": "1"
           }
         ],
@@ -3356,10 +3356,48 @@ fn add_missing_property_descriptions(doc: &mut Value) {
 }
 
 fn add_schema_defaults(doc: &mut Value) {
-    for (pointer, default_value) in [(
-        "/components/schemas/ObservabilityExporter/oneOf/0/properties/sample_rate",
-        serde_json::json!(1.0),
-    )] {
+    for (pointer, default_value) in [
+        (
+            "/components/schemas/CooldownConfig/properties/default_seconds",
+            serde_json::json!(30),
+        ),
+        (
+            "/components/schemas/CooldownConfig/properties/enabled",
+            serde_json::json!(true),
+        ),
+        (
+            "/components/schemas/CooldownConfig/properties/honor_retry_after",
+            serde_json::json!(true),
+        ),
+        (
+            "/components/schemas/CooldownConfig/properties/max_seconds",
+            serde_json::json!(600),
+        ),
+        (
+            "/components/schemas/CooldownConfig/properties/trigger_on_timeout",
+            serde_json::json!(true),
+        ),
+        (
+            "/components/schemas/CooldownConfig/properties/trigger_on_transport",
+            serde_json::json!(true),
+        ),
+        (
+            "/components/schemas/CooldownConfig/properties/trigger_statuses",
+            serde_json::json!([401, 408, 429, 500, 502, 503, 504]),
+        ),
+        (
+            "/components/schemas/ObservabilityExporter/oneOf/0/properties/sample_rate",
+            serde_json::json!(1.0),
+        ),
+        (
+            "/components/schemas/RequestOverrides/properties/param_renames",
+            serde_json::json!({}),
+        ),
+        (
+            "/components/schemas/Routing/properties/on_all_filtered",
+            serde_json::json!("fail"),
+        ),
+    ] {
         if let Some(Value::Object(map)) = doc.pointer_mut(pointer) {
             map.entry("default".to_string()).or_insert(default_value);
         }
@@ -3874,6 +3912,16 @@ mod tests {
             schemas["ObservabilityExporter"]["oneOf"][0]["properties"]["sample_rate"]["default"],
             serde_json::json!(1.0),
             "runtime default for OTLP sampling should be visible in OpenAPI"
+        );
+        assert_eq!(
+            schemas["CooldownConfig"]["properties"]["trigger_statuses"]["default"],
+            serde_json::json!([401, 408, 429, 500, 502, 503, 504]),
+            "runtime default cooldown trigger statuses should be visible in OpenAPI"
+        );
+        assert_eq!(
+            schemas["Routing"]["properties"]["on_all_filtered"]["default"],
+            serde_json::json!("fail"),
+            "runtime default routing policy should be visible in OpenAPI"
         );
     }
 

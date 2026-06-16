@@ -52,7 +52,6 @@ pub struct ProviderKey {
     pub adapter: Option<Adapter>,
 
     /// Telemetry tags carried alongside the key for metric and log emission.
-    /// Omitted fields use default empty values.
     #[serde(default)]
     pub telemetry_tags: TelemetryTags,
 
@@ -64,7 +63,7 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<ResponseOverrides>,
 
-    /// Inbound headers removed before passthrough forwarding. Defaults to credential-bearing headers: `authorization`, `cookie`, `set-cookie`, and `x-api-key`.
+    /// Inbound headers removed before passthrough forwarding.
     #[serde(
         default = "default_strip_headers",
         deserialize_with = "deserialize_normalized_strip_headers"
@@ -137,7 +136,6 @@ pub struct TelemetryTags {
     pub kind: Option<String>,
 
     /// Whether this provider is surfaced in the featured list.
-    /// Defaults to `false`.
     #[serde(default)]
     pub featured: bool,
 
@@ -158,13 +156,12 @@ pub struct TelemetryTags {
 }
 
 /// Per-`ProviderKey` request-shape overrides. Use these fields to rename
-/// request body parameters, clamp supported numeric parameters, add default
-/// outbound headers, or add default outbound body fields.
+/// request body parameters, clamp supported numeric parameters, add fallback
+/// outbound headers, or add fallback outbound body fields.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RequestOverrides {
-    /// `apply_param_renames` input. Top-level body keys named on the
-    /// left are renamed to the right. Empty map is the default.
+    /// `apply_param_renames` input. Top-level body keys named on the left are renamed to the right. Leave empty to preserve request parameter names.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub param_renames: HashMap<String, String>,
 
@@ -215,7 +212,7 @@ pub struct ResponseOverrides {
 
     /// When `true`, the request-body `messages[*].content` array of
     /// text blocks gets flattened to a single string before dispatch.
-    /// Defaults to `false`, so no flattening is applied.
+    /// Set to `true` to flatten list-style text content before dispatch.
     #[serde(default)]
     pub content_list_to_string: bool,
 

@@ -16,7 +16,7 @@
       ]
     },
     "min_responses": {
-      "description": "Minimum successful panel responses required before judge synthesis. Defaults to the smaller of 2 and the panel size.",
+      "description": "Minimum successful panel responses required before judge synthesis. When omitted, the gateway requires the smaller of 2 and the panel size.",
       "type": [
         "integer",
         "null"

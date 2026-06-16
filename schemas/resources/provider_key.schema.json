@@ -61,7 +61,7 @@
       "type": "string"
     },
     "strip_headers": {
-      "description": "Inbound headers removed before passthrough forwarding. Defaults to credential-bearing headers: `authorization`, `cookie`, `set-cookie`, and `x-api-key`.",
+      "description": "Inbound headers removed before passthrough forwarding.",
       "default": [
         "authorization",
         "cookie",
@@ -74,7 +74,7 @@
       }
     },
     "telemetry_tags": {
-      "description": "Telemetry tags carried alongside the key for metric and log emission. Omitted fields use default empty values.",
+      "description": "Telemetry tags carried alongside the key for metric and log emission.",
       "default": {
         "featured": false
       },
@@ -122,7 +122,7 @@
       "additionalProperties": false
     },
     "RequestOverrides": {
-      "description": "Per-`ProviderKey` request-shape overrides. Use these fields to rename request body parameters, clamp supported numeric parameters, add default outbound headers, or add default outbound body fields.",
+      "description": "Per-`ProviderKey` request-shape overrides. Use these fields to rename request body parameters, clamp supported numeric parameters, add fallback outbound headers, or add fallback outbound body fields.",
       "type": "object",
       "properties": {
         "default_body_fields": {
@@ -149,7 +149,7 @@
           ]
         },
         "param_renames": {
-          "description": "`apply_param_renames` input. Top-level body keys named on the left are renamed to the right. Empty map is the default.",
+          "description": "`apply_param_renames` input. Top-level body keys named on the left are renamed to the right. Leave empty to preserve request parameter names.",
           "type": "object",
           "additionalProperties": {
             "type": "string"
@@ -163,7 +163,7 @@
       "type": "object",
       "properties": {
         "content_list_to_string": {
-          "description": "When `true`, the request-body `messages[*].content` array of text blocks gets flattened to a single string before dispatch. Defaults to `false`, so no flattening is applied.",
+          "description": "When `true`, the request-body `messages[*].content` array of text blocks gets flattened to a single string before dispatch. Set to `true` to flatten list-style text content before dispatch.",
           "default": false,
           "type": "boolean"
         },
@@ -240,7 +240,7 @@
           ]
         },
         "featured": {
-          "description": "Whether this provider is surfaced in the featured list. Defaults to `false`.",
+          "description": "Whether this provider is surfaced in the featured list.",
           "default": false,
           "type": "boolean"
         },
