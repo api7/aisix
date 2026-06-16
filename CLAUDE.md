@@ -56,6 +56,20 @@ Behavioral guidelines to reduce common LLM coding mistakes. Bias toward caution 
 - If docs and source don't answer it, say so and ask — don't invent an answer.
 - Cite the specific doc URL, file path, or commit/version for any claim about third-party behavior.
 
+## Admin API OpenAPI Docs
+
+**Model doc comments are user-facing when they render into OpenAPI.**
+
+When editing structs under `crates/aisix-core/src/models` or OpenAPI assembly in `crates/aisix-admin/src/openapi.rs`:
+
+- Write descriptions as public API reference text, not internal implementation notes.
+- Avoid internal shorthand such as DP, CP, kine row, wire shape, mock server, bridge dispatch, or issue-only context.
+- Avoid excessive inline code. Use it only for exact field names, enum values, routes, headers, environment variables, and literal response values.
+- Do not describe stable defaults only in prose. Expose them as OpenAPI `default` values when the runtime behavior has a fixed default.
+- For computed fallback behavior, describe what happens when the field is omitted instead of calling it a schema default.
+- Regenerate resource schemas with `cargo run -p aisix-core --bin dump-schema` after changing model comments.
+- Preview or inspect the served OpenAPI when changing generated descriptions.
+
 ## 7. Reference Implementations Before Building
 
 **Before implementing any feature, study how the established players did it — don't drift from the ecosystem.**
