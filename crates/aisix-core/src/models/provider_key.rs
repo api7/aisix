@@ -210,9 +210,7 @@ pub struct ResponseOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_done_marker: Option<StreamDoneMarker>,
 
-    /// When `true`, the request-body `messages[*].content` array of
-    /// text blocks gets flattened to a single string before dispatch.
-    /// Set to `true` to flatten list-style text content before dispatch.
+    /// When `true`, the request-body `messages[*].content` array of text blocks gets flattened to a single string before dispatch.
     #[serde(default)]
     pub content_list_to_string: bool,
 
@@ -232,8 +230,7 @@ pub struct ResponseOverrides {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum StreamDoneMarker {
-    /// Upstream is expected to emit `data: [DONE]`. Absence is treated as
-    /// an invalid stream response.
+    /// Upstream is expected to emit `data: [DONE]`. Absence is logged as a diagnostic warning.
     Required,
     /// Either presence or absence is acceptable. Used when the
     /// upstream is OpenAI-compatible but does not require the terminator.
