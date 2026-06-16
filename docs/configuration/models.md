@@ -1,6 +1,6 @@
 ---
 title: Models
-description: Configure direct models and virtual routing models in AISIX AI Gateway.
+description: Configure direct models, routing models, and ensemble models in AISIX AI Gateway.
 sidebar_position: 32
 ---
 
@@ -8,10 +8,11 @@ Models define what callers can ask the gateway to run.
 
 This is the most important dynamic resource in the system because it defines the caller-visible contract.
 
-A model can be one of two shapes:
+A model can be one of three shapes:
 
 - a **direct model** that maps one caller-visible alias to one upstream provider model
 - a **routing model** that maps one caller-visible alias to a routing strategy over multiple direct models
+- an **ensemble model** that maps one caller-visible alias to a panel of direct models plus a judge that synthesizes their answers into one response
 
 ## Direct Models
 
@@ -202,6 +203,32 @@ curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
   }'
 ```
 
+## Ensemble Models
+
+Use an ensemble model when you want one caller-visible alias to call a **panel** of direct models in parallel and have a **judge** model synthesize their answers into one response. Unlike a routing model — which picks one target — an ensemble calls every panel member and combines the output.
+
+For an ensemble model, `ensemble` is required and the direct upstream fields (`provider`, `model_name`, `provider_key_id`) and `routing` must be omitted.
+
+```bash title="Create an ensemble model"
+curl -sS -X POST http://127.0.0.1:3001/admin/v1/models \
+  -H "Authorization: Bearer YOUR_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "display_name": "council-of-three",
+    "ensemble": {
+      "panel": [
+        {"model": "kimi-k2", "temperature": 0.7},
+        {"model": "deepseek-v3", "temperature": 0.7},
+        {"model": "gemini-flash", "temperature": 0.9}
+      ],
+      "judge": {"model": "deepseek-v3"},
+      "min_responses": 2
+    }
+  }'
+```
+
+Ensembles are chat-only and reject tool use in v1. See [Model Ensembles](ensemble-models.md) for the full configuration reference, synthesis behavior, streaming, aggregate usage, and constraints.
+
 ## Field Notes
 
 - `display_name` is the alias clients send in proxy requests, and the value `response.model` echoes back. It is **not** the upstream model id.
@@ -240,7 +267,7 @@ These fields are the main operator knobs for balancing resilience versus extra u
 
 ## What `/v1/models` Exposes
 
-Only non-routing models are currently listed on `GET /v1/models`.
+Only non-routing models — direct and ensemble — are currently listed on `GET /v1/models`.
 
 Routing aliases are intentionally hidden from that list today, even though callers can still target them directly if they know the alias.
 
