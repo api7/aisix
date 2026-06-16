@@ -88,11 +88,11 @@ After every `gh pr create` or force-push, spawn a fresh `general-purpose` Agent 
 
 Output HIGH/MEDIUM/LOW per finding with **concrete suggested code**, not vague "consider". **Merge gate:** every HIGH and MEDIUM is either fixed in code or explicitly justified in the PR (e.g. "feature gap, filed as #N, agreed not to block"); silent merge is not enough. For findings that surface gateway/product-behavior gaps, file separate issues and link them. Self-review misses the author's blind spots — an independent agent catches them.
 
-## Admin API OpenAPI Docs
+## Generated API Documentation
 
-**Model doc comments are user-facing when they render into OpenAPI.**
+**Some source comments are rendered into user-facing API references.**
 
-When editing structs under `crates/aisix-core/src/models` or OpenAPI assembly in `crates/aisix-admin/src/openapi.rs`:
+When editing Admin API resource models under `crates/aisix-core/src/models` or OpenAPI assembly in `crates/aisix-admin/src/openapi.rs`:
 
 - Write descriptions as public API reference text, not internal implementation notes.
 - Avoid internal shorthand such as DP, CP, kine row, wire shape, mock server, bridge dispatch, or issue-only context.
