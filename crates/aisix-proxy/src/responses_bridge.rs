@@ -892,6 +892,12 @@ pub struct ResponsesStreamCompletion {
     pub cache_read_tokens: u32,
     pub finish_reason: String,
     pub ttft_ms: u32,
+    /// Set when an output guardrail blocked the streamed response (a content
+    /// block or a fail-closed buffer overflow). The upstream still billed, so
+    /// the usage event carries the tokens but is marked blocked — matching
+    /// the non-streaming path so the dashboard's Blocked tab + budget ledger
+    /// see it.
+    pub guardrail_blocked: bool,
 }
 
 struct CompleteOnDrop<F: FnOnce(ResponsesStreamCompletion)> {
@@ -1031,6 +1037,7 @@ pub fn build_responses_bridge_stream(
                 max_buffer_bytes,
                 "streaming /v1/responses (cross-provider) output exceeded buffer cap; failing closed",
             );
+            guard.comp().guardrail_blocked = true;
             yield Ok(bytes::Bytes::from(guardrail_error_frame(None)));
             return;
         }
@@ -1060,6 +1067,7 @@ pub fn build_responses_bridge_stream(
                     reason = %reason,
                     "guardrail blocked streaming /v1/responses (cross-provider) response",
                 );
+                guard.comp().guardrail_blocked = true;
                 yield Ok(bytes::Bytes::from(guardrail_error_frame(guardrail_name.as_deref())));
                 return;
             }

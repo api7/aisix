@@ -1104,7 +1104,6 @@ async fn responses_cross_provider_to_target(
             max_buffer_bytes,
             requested_model.to_string(),
             move |comp| {
-                // Streams that reach here are committed 200s.
                 let usage = ResponseUsage {
                     prompt_tokens: comp.prompt_tokens,
                     completion_tokens: comp.completion_tokens,
@@ -1113,18 +1112,23 @@ async fn responses_cross_provider_to_target(
                     cache_creation_tokens: comp.cache_creation_tokens,
                     cache_read_tokens: comp.cache_read_tokens,
                 };
+                // A clean stream is a committed 200; an output-guardrail block
+                // (or fail-closed overflow) bills the upstream tokens but is
+                // recorded as a 422 marked guardrail_blocked, matching the
+                // non-streaming path so the Blocked tab + ledger see it.
+                let status = if comp.guardrail_blocked { 422 } else { 200 };
                 emit_usage_event(
                     &state_c,
                     &request_id_c,
                     &model_id_c,
                     &requested_model_c,
                     &api_key_id_c,
-                    200,
+                    status,
                     started.elapsed(),
                     &usage,
                     &client_c,
                     attempt_c,
-                    /* guardrail_blocked */ false,
+                    comp.guardrail_blocked,
                 );
             },
         );
@@ -2362,6 +2366,65 @@ mod tests {
             "clean body withheld: {body}"
         );
         assert!(body.contains("response.completed"));
+    }
+
+    /// #825: a blocked cross-provider STREAM still bills the upstream tokens
+    /// but the emitted UsageEvent is marked guardrail_blocked (status 422) —
+    /// matching the non-streaming path — so the dashboard's Blocked tab and
+    /// the budget ledger see it rather than recording it as clean usage.
+    #[tokio::test]
+    async fn streaming_cross_provider_block_emits_guardrail_blocked_usage_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(anthropic_text_sse("sure: BLOCKME")),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_anthropic_at(&upstream.uri());
+        snap.models.insert(anthropic_model("claude-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_output_guardrail("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(
+                serde_json::json!({"model":"claude-resp","input":"hi","stream":true}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Drain the body so the stream's Drop guard fires the usage event.
+        let bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("BLOCKME"));
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("usage event must be emitted")
+            .expect("usage_sink sender dropped");
+        assert!(
+            event.guardrail_blocked,
+            "a blocked stream must mark guardrail_blocked"
+        );
+        assert_eq!(event.status_code, 422);
+        // The upstream-billed tokens are still recorded.
+        assert_eq!(event.prompt_tokens, 5);
+        assert_eq!(event.completion_tokens, 3);
     }
 
     /// #719 (audit HIGH-1): the streaming hold-back buffer is capped so a
