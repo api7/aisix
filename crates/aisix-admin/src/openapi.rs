@@ -82,7 +82,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "Health"
         ],
-        "description": "Get the liveness status of the admin process. Add the `verbose` query parameter to return detailed shutdown and readiness information."
+        "description": "Get the liveness status of the admin process."
       }
     },
     "/admin/openapi.json": {
