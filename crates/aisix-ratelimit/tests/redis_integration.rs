@@ -8,11 +8,42 @@
 
 use std::time::Duration;
 
-use aisix_core::{RateLimit, RateLimitScope};
+use aisix_core::{RateLimit, RateLimitScope, RedisConnConfig, RedisMode};
 use aisix_ratelimit::{RateStore, RedisStore};
 
 fn redis_url() -> Option<String> {
     std::env::var("RATELIMIT_TEST_REDIS_URL").ok()
+}
+
+fn single(url: &str) -> RedisConnConfig {
+    RedisConnConfig {
+        mode: RedisMode::Single,
+        url: Some(url.to_string()),
+        ..Default::default()
+    }
+}
+
+/// Cluster seed nodes, e.g. `RATELIMIT_TEST_REDIS_CLUSTER_NODES=redis://127.0.0.1:7000,redis://127.0.0.1:7001`.
+fn cluster_cfg() -> Option<RedisConnConfig> {
+    let nodes = std::env::var("RATELIMIT_TEST_REDIS_CLUSTER_NODES").ok()?;
+    Some(RedisConnConfig {
+        mode: RedisMode::Cluster,
+        nodes: nodes.split(',').map(|s| s.trim().to_string()).collect(),
+        ..Default::default()
+    })
+}
+
+/// Sentinel topology, e.g. `RATELIMIT_TEST_REDIS_SENTINELS=redis://127.0.0.1:26379`
+/// plus `RATELIMIT_TEST_REDIS_MASTER=mymaster`.
+fn sentinel_cfg() -> Option<RedisConnConfig> {
+    let sentinels = std::env::var("RATELIMIT_TEST_REDIS_SENTINELS").ok()?;
+    let master = std::env::var("RATELIMIT_TEST_REDIS_MASTER").ok()?;
+    Some(RedisConnConfig {
+        mode: RedisMode::Sentinel,
+        sentinels: sentinels.split(',').map(|s| s.trim().to_string()).collect(),
+        master_name: Some(master),
+        ..Default::default()
+    })
 }
 
 /// Unique bucket key per test so they don't clobber each other (the store
@@ -31,7 +62,9 @@ fn rl() -> RateLimit {
 }
 
 async fn store(url: &str) -> RedisStore {
-    RedisStore::connect(url).await.expect("redis connect")
+    RedisStore::connect(&single(url))
+        .await
+        .expect("redis connect")
 }
 
 #[tokio::test]
@@ -201,4 +234,85 @@ async fn stale_concurrency_slot_is_reclaimed_after_ttl() {
     b.acquire(&key, &limits, "b-2")
         .await
         .expect("stale slot reclaimed after conc_ttl");
+}
+
+/// Redis Cluster: the multi-key acquire/commit Lua must route to the slot
+/// owning the `{bucket}` hash tag and enforce one shared window. A wrong
+/// (or missing) routing key would surface as a CROSSSLOT/MOVED error here.
+#[tokio::test]
+async fn cluster_shared_counter_routes_multi_key_lua() {
+    let Some(cfg) = cluster_cfg() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_CLUSTER_NODES not set");
+        return;
+    };
+    let a = RedisStore::connect(&cfg).await.expect("cluster connect");
+    let b = RedisStore::connect(&cfg).await.expect("cluster connect");
+    let key = unique_key("cluster-rpm");
+    let limits = RateLimit {
+        rpm: Some(1),
+        tpm: Some(1_000),
+        concurrency: Some(5),
+        ..rl()
+    };
+
+    // First acquire (touches conc ZSET + rpm + tpm keys, all hash-tagged
+    // to one slot) must succeed — proves the EVAL routed correctly.
+    a.acquire(&key, &limits, "a-1")
+        .await
+        .expect("first allowed on cluster");
+    // commit also runs a multi-key script on the same slot.
+    a.commit(&key, 10, "a-1").await;
+    // Second replica is rejected by the shared rpm counter — assert the
+    // specific rejection, not just any error (which would also pass on a
+    // routing/connection failure and mask a real cluster regression).
+    let err = b
+        .acquire(&key, &limits, "b-1")
+        .await
+        .expect_err("second replica must be rejected by the shared rpm counter");
+    assert!(
+        matches!(
+            err,
+            aisix_ratelimit::RateLimitError::Requests {
+                scope: RateLimitScope::Requests,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+}
+
+/// Redis Sentinel: connect resolves the master through the sentinels, and
+/// the shared-counter semantics work end-to-end against the discovered
+/// master.
+#[tokio::test]
+async fn sentinel_shared_counter_round_trips() {
+    let Some(cfg) = sentinel_cfg() else {
+        eprintln!("skipping: RATELIMIT_TEST_REDIS_SENTINELS / _MASTER not set");
+        return;
+    };
+    let a = RedisStore::connect(&cfg).await.expect("sentinel connect");
+    let b = RedisStore::connect(&cfg).await.expect("sentinel connect");
+    let key = unique_key("sentinel-rpm");
+    let limits = RateLimit {
+        rpm: Some(1),
+        ..rl()
+    };
+
+    a.acquire(&key, &limits, "a-1")
+        .await
+        .expect("first allowed via sentinel master");
+    let err = b
+        .acquire(&key, &limits, "b-1")
+        .await
+        .expect_err("second replica must be rejected by the shared rpm counter");
+    assert!(
+        matches!(
+            err,
+            aisix_ratelimit::RateLimitError::Requests {
+                scope: RateLimitScope::Requests,
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
 }

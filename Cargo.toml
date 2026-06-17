@@ -14,6 +14,7 @@ members = [
     "crates/aisix-obs",
     "crates/aisix-ratelimit",
     "crates/aisix-cache",
+    "crates/aisix-redis",
     "crates/aisix-guardrails",
     "crates/aisix-server",
 ]
@@ -103,7 +104,7 @@ hex = "0.4"
 
 # Caching / storage backends
 moka = { version = "0.12", features = ["future"] }
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "cluster-async"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "cluster-async", "sentinel"] }
 
 # Object-storage observability sink (aisix-obs): ONE crate covering S3 / GCS /
 # Azure Blob (+ S3-compatible MinIO/R2) behind a single `ObjectStore` trait, so

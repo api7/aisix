@@ -532,7 +532,7 @@ impl Default for OtlpTracingConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct CacheConfig {
     pub backend: CacheBackend,
-    pub redis: Option<RedisCacheConfig>,
+    pub redis: Option<RedisConnConfig>,
 }
 
 impl Default for CacheConfig {
@@ -551,17 +551,92 @@ pub enum CacheBackend {
     Redis,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RedisCacheConfig {
-    pub url: String,
-    #[serde(default = "RedisCacheConfig::default_mode")]
-    pub mode: String,
+/// Connection topology for a shared Redis backend (cache + rate-limit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RedisMode {
+    /// One Redis endpoint (`url`). The historical default.
+    #[default]
+    Single,
+    /// Redis Cluster — seeded from `nodes`, topology discovered at connect.
+    Cluster,
+    /// Redis Sentinel — the master is discovered (and re-discovered after
+    /// failover) via `sentinels` for the group named `master_name`.
+    Sentinel,
 }
 
-impl RedisCacheConfig {
-    fn default_mode() -> String {
-        "single".into()
+/// Shared connection shape for the Redis-backed response cache and the
+/// shared rate-limit counter store. `mode` selects the topology; the
+/// fields each mode needs are validated at boot ([`Self::validate`]):
+///
+/// - `single`   → `url` (e.g. `redis://host:6379`)
+/// - `cluster`  → `nodes` (one or more seed node URLs)
+/// - `sentinel` → `sentinels` (sentinel node URLs) + `master_name`
+///
+/// In `single` mode all credentials and TLS (`rediss://`) travel inside
+/// `url`. In `cluster`/`sentinel` mode they can travel in the node /
+/// sentinel URLs the same way, but the **data node** (cluster nodes, or
+/// the Sentinel-discovered master) can also be authenticated explicitly
+/// with `username` + `password` (Redis ACL) and, for sentinel, a
+/// `database` — useful because the Sentinel-discovered master has no URL
+/// of its own. Sentinel-node auth still travels in the `sentinels` URLs,
+/// so Sentinel and master credentials may differ.
+///
+/// To keep secrets out of the config file, supply `password` via the
+/// matching env var instead, e.g. `AISIX_RATELIMIT__REDIS__PASSWORD`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct RedisConnConfig {
+    pub mode: RedisMode,
+    /// Single-node URL. Required when `mode = single`.
+    pub url: Option<String>,
+    /// Cluster seed node URLs. Required (≥1) when `mode = cluster`.
+    pub nodes: Vec<String>,
+    /// Sentinel node URLs. Required (≥1) when `mode = sentinel`.
+    pub sentinels: Vec<String>,
+    /// Monitored master group name. Required when `mode = sentinel`.
+    pub master_name: Option<String>,
+    /// ACL username for the data node (cluster nodes / sentinel master).
+    pub username: Option<String>,
+    /// Password for the data node (cluster nodes / sentinel master).
+    pub password: Option<String>,
+    /// Database index for the Sentinel-discovered master (default 0).
+    /// Not applicable to `cluster` (Redis Cluster only has DB 0).
+    pub database: Option<i64>,
+}
+
+impl RedisConnConfig {
+    /// Fail-fast check that the fields the selected `mode` needs are
+    /// present. `ctx` labels the offending block (e.g. `cache.redis`).
+    pub fn validate(&self, ctx: &str) -> Result<(), String> {
+        let non_empty = |v: &[String]| v.iter().any(|s| !s.trim().is_empty());
+        match self.mode {
+            RedisMode::Single => {
+                if self.url.as_deref().unwrap_or("").trim().is_empty() {
+                    return Err(format!("{ctx}.url is required when mode = single"));
+                }
+            }
+            RedisMode::Cluster => {
+                if !non_empty(&self.nodes) {
+                    return Err(format!(
+                        "{ctx}.nodes must list at least one node when mode = cluster"
+                    ));
+                }
+            }
+            RedisMode::Sentinel => {
+                if !non_empty(&self.sentinels) {
+                    return Err(format!(
+                        "{ctx}.sentinels must list at least one sentinel when mode = sentinel"
+                    ));
+                }
+                if self.master_name.as_deref().unwrap_or("").trim().is_empty() {
+                    return Err(format!(
+                        "{ctx}.master_name is required when mode = sentinel"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -571,14 +646,15 @@ impl RedisCacheConfig {
 /// N-replica cluster enforces N× the configured limit. `Redis` shares
 /// the counters across replicas via a single Redis so the whole cluster
 /// enforces one global window. The `redis` block is required iff
-/// `backend = redis` (validated at boot). Reuses [`RedisCacheConfig`]
-/// for the connection shape; may point at the same Redis as `cache`
-/// (keys are namespaced `aisix:rl:`).
+/// `backend = redis` (validated at boot). Reuses [`RedisConnConfig`]
+/// for the connection shape, so it supports `single`/`cluster`/`sentinel`
+/// modes too; may point at the same Redis as `cache` (keys are namespaced
+/// `aisix:rl:`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RateLimitConfig {
     pub backend: RateLimitBackend,
-    pub redis: Option<RedisCacheConfig>,
+    pub redis: Option<RedisConnConfig>,
     /// Seconds after which an unreleased concurrency slot is reclaimed
     /// (crashed replica / hung upstream). Generous enough for a long
     /// streaming response. Redis backend only.
@@ -702,10 +778,15 @@ impl Config {
             )));
         }
         if self.ratelimit.backend == RateLimitBackend::Redis {
-            if self.ratelimit.redis.is_none() {
-                return Err(BootstrapError::Config(
-                    "ratelimit.backend = redis requires a ratelimit.redis block".into(),
-                ));
+            match &self.ratelimit.redis {
+                None => {
+                    return Err(BootstrapError::Config(
+                        "ratelimit.backend = redis requires a ratelimit.redis block".into(),
+                    ));
+                }
+                Some(redis) => redis
+                    .validate("ratelimit.redis")
+                    .map_err(BootstrapError::Config)?,
             }
             // A zero concurrency TTL would prune a slot in the same second
             // it was taken, silently disabling concurrency limiting.
@@ -714,6 +795,13 @@ impl Config {
                     "ratelimit.concurrency_ttl_secs must be > 0 for the redis backend".into(),
                 ));
             }
+        }
+        // A `cache.redis` block, when present, is built regardless of the
+        // legacy `cache.backend` knob, so validate its mode fields too.
+        if let Some(redis) = &self.cache.redis {
+            redis
+                .validate("cache.redis")
+                .map_err(BootstrapError::Config)?;
         }
         Ok(())
     }
@@ -901,6 +989,88 @@ ratelimit:
         assert!(err.to_string().contains("concurrency_ttl_secs"));
     }
 
+    fn redis_backend_yaml(redis_block: &str) -> tempfile::NamedTempFile {
+        write_yaml(&format!(
+            r#"
+etcd:
+  endpoints: ["http://localhost:2379"]
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+ratelimit:
+  backend: "redis"
+  redis:
+{redis_block}
+"#
+        ))
+    }
+
+    #[test]
+    fn redis_mode_defaults_to_single() {
+        let f = redis_backend_yaml("    url: \"redis://127.0.0.1:6379\"");
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        let redis = cfg.ratelimit.redis.unwrap();
+        assert_eq!(redis.mode, RedisMode::Single);
+        assert_eq!(redis.url.as_deref(), Some("redis://127.0.0.1:6379"));
+    }
+
+    #[test]
+    fn redis_single_mode_requires_url() {
+        let f = redis_backend_yaml("    mode: \"single\"");
+        let err = Config::load_from_path(Some(f.path())).unwrap_err();
+        assert!(err.to_string().contains("ratelimit.redis.url"));
+    }
+
+    #[test]
+    fn redis_cluster_mode_parses_and_requires_nodes() {
+        let ok = redis_backend_yaml(
+            "    mode: \"cluster\"\n    nodes: [\"redis://n1:6379\", \"redis://n2:6379\"]",
+        );
+        let cfg = Config::load_from_path(Some(ok.path())).unwrap();
+        let redis = cfg.ratelimit.redis.unwrap();
+        assert_eq!(redis.mode, RedisMode::Cluster);
+        assert_eq!(redis.nodes.len(), 2);
+
+        let bad = redis_backend_yaml("    mode: \"cluster\"");
+        let err = Config::load_from_path(Some(bad.path())).unwrap_err();
+        assert!(err.to_string().contains("ratelimit.redis.nodes"));
+    }
+
+    #[test]
+    fn redis_sentinel_mode_parses_and_requires_master_name() {
+        let ok = redis_backend_yaml(
+            "    mode: \"sentinel\"\n    sentinels: [\"redis://s1:26379\"]\n    master_name: \"mymaster\"",
+        );
+        let cfg = Config::load_from_path(Some(ok.path())).unwrap();
+        let redis = cfg.ratelimit.redis.unwrap();
+        assert_eq!(redis.mode, RedisMode::Sentinel);
+        assert_eq!(redis.master_name.as_deref(), Some("mymaster"));
+
+        // ACL username/password + database for the discovered master parse.
+        let acl = redis_backend_yaml(
+            "    mode: \"sentinel\"\n    sentinels: [\"redis://s1:26379\"]\n    master_name: \"m\"\n    username: \"default\"\n    password: \"s3cret\"\n    database: 2",
+        );
+        let redis = Config::load_from_path(Some(acl.path()))
+            .unwrap()
+            .ratelimit
+            .redis
+            .unwrap();
+        assert_eq!(redis.username.as_deref(), Some("default"));
+        assert_eq!(redis.password.as_deref(), Some("s3cret"));
+        assert_eq!(redis.database, Some(2));
+
+        let no_master =
+            redis_backend_yaml("    mode: \"sentinel\"\n    sentinels: [\"redis://s1:26379\"]");
+        let err = Config::load_from_path(Some(no_master.path())).unwrap_err();
+        assert!(err.to_string().contains("ratelimit.redis.master_name"));
+
+        let no_sentinels = redis_backend_yaml("    mode: \"sentinel\"\n    master_name: \"m\"");
+        let err = Config::load_from_path(Some(no_sentinels.path())).unwrap_err();
+        assert!(err.to_string().contains("ratelimit.redis.sentinels"));
+    }
+
     #[test]
     fn loads_ratelimit_redis_config() {
         let f = write_yaml(
@@ -922,8 +1092,8 @@ ratelimit:
         let cfg = Config::load_from_path(Some(f.path())).unwrap();
         assert_eq!(cfg.ratelimit.backend, RateLimitBackend::Redis);
         assert_eq!(
-            cfg.ratelimit.redis.as_ref().unwrap().url,
-            "redis://127.0.0.1:6379"
+            cfg.ratelimit.redis.as_ref().unwrap().url.as_deref(),
+            Some("redis://127.0.0.1:6379")
         );
         assert_eq!(cfg.ratelimit.concurrency_ttl_secs, 120);
     }

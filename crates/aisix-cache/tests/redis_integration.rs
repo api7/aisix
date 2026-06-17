@@ -10,10 +10,39 @@
 use std::time::Duration;
 
 use aisix_cache::{Cache, RedisCache};
+use aisix_core::{RedisConnConfig, RedisMode};
 use aisix_gateway::{ChatMessage, ChatResponse, FinishReason, UsageStats};
 
 fn redis_url() -> Option<String> {
     std::env::var("CACHE_TEST_REDIS_URL").ok()
+}
+
+fn single(url: &str) -> RedisConnConfig {
+    RedisConnConfig {
+        mode: RedisMode::Single,
+        url: Some(url.to_string()),
+        ..Default::default()
+    }
+}
+
+fn cluster_cfg() -> Option<RedisConnConfig> {
+    let nodes = std::env::var("CACHE_TEST_REDIS_CLUSTER_NODES").ok()?;
+    Some(RedisConnConfig {
+        mode: RedisMode::Cluster,
+        nodes: nodes.split(',').map(|s| s.trim().to_string()).collect(),
+        ..Default::default()
+    })
+}
+
+fn sentinel_cfg() -> Option<RedisConnConfig> {
+    let sentinels = std::env::var("CACHE_TEST_REDIS_SENTINELS").ok()?;
+    let master = std::env::var("CACHE_TEST_REDIS_MASTER").ok()?;
+    Some(RedisConnConfig {
+        mode: RedisMode::Sentinel,
+        sentinels: sentinels.split(',').map(|s| s.trim().to_string()).collect(),
+        master_name: Some(master),
+        ..Default::default()
+    })
 }
 
 fn sample(content: &str) -> ChatResponse {
@@ -33,7 +62,7 @@ async fn put_then_get_round_trips_against_real_redis() {
         return;
     };
 
-    let cache = RedisCache::connect(&url)
+    let cache = RedisCache::connect(&single(&url))
         .await
         .expect("redis connect")
         .with_prefix(format!("aisix:test:{}", uuid_like()));
@@ -57,7 +86,7 @@ async fn put_then_get_preserves_null_content_through_cache() {
         return;
     };
 
-    let cache = RedisCache::connect(&url)
+    let cache = RedisCache::connect(&single(&url))
         .await
         .expect("redis connect")
         .with_prefix(format!("aisix:test:{}", uuid_like()));
@@ -89,7 +118,7 @@ async fn ttl_eviction_drops_entry_after_window() {
         return;
     };
 
-    let cache = RedisCache::connect(&url)
+    let cache = RedisCache::connect(&single(&url))
         .await
         .expect("redis connect")
         .with_prefix(format!("aisix:test:{}", uuid_like()))
@@ -117,7 +146,7 @@ async fn put_with_ttl_honors_per_entry_window_over_global() {
         return;
     };
 
-    let cache = RedisCache::connect(&url)
+    let cache = RedisCache::connect(&single(&url))
         .await
         .expect("redis connect")
         .with_prefix(format!("aisix:test:{}", uuid_like()))
@@ -152,12 +181,47 @@ async fn missing_key_returns_none() {
         return;
     };
 
-    let cache = RedisCache::connect(&url)
+    let cache = RedisCache::connect(&single(&url))
         .await
         .expect("redis connect")
         .with_prefix(format!("aisix:test:{}", uuid_like()));
 
     assert!(cache.get("does-not-exist").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn put_then_get_round_trips_against_cluster() {
+    let Some(cfg) = cluster_cfg() else {
+        eprintln!("skipping: CACHE_TEST_REDIS_CLUSTER_NODES not set");
+        return;
+    };
+    let cache = RedisCache::connect(&cfg)
+        .await
+        .expect("cluster connect")
+        .with_prefix(format!("aisix:test:{}", uuid_like()));
+
+    cache.put("cluster-key", sample("clustered")).await.unwrap();
+    let got = cache.get("cluster-key").await.unwrap().expect("hit");
+    assert_eq!(got.message.content_str(), "clustered");
+}
+
+#[tokio::test]
+async fn put_then_get_round_trips_against_sentinel() {
+    let Some(cfg) = sentinel_cfg() else {
+        eprintln!("skipping: CACHE_TEST_REDIS_SENTINELS / _MASTER not set");
+        return;
+    };
+    let cache = RedisCache::connect(&cfg)
+        .await
+        .expect("sentinel connect")
+        .with_prefix(format!("aisix:test:{}", uuid_like()));
+
+    cache
+        .put("sentinel-key", sample("via-master"))
+        .await
+        .unwrap();
+    let got = cache.get("sentinel-key").await.unwrap().expect("hit");
+    assert_eq!(got.message.content_str(), "via-master");
 }
 
 /// Cheap unique-ish suffix to keep tests from clobbering each other.

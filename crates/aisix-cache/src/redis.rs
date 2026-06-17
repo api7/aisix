@@ -1,9 +1,10 @@
 //! Redis-backed exact-match response cache.
 //!
-//! Implements [`Cache`] against a Redis instance via the `redis` crate's
-//! async ConnectionManager (single-node) — Cluster and Sentinel modes
-//! drop in under the same connection-manager pattern in a follow-up
-//! when the operator config exposes them.
+//! Implements [`Cache`] against Redis through the shared
+//! [`aisix_redis::RedisConn`], so the operator's `cache.redis.mode`
+//! (`single` / `cluster` / `sentinel`) is honored transparently — `GET`
+//! and `SET` route by their key on cluster, and sentinel failovers are
+//! recovered via [`aisix_redis::RedisConn::note_error`].
 //!
 //! Storage shape: each entry is JSON-encoded `ChatResponse` stored under
 //! key `<prefix>:<fingerprint>` with a TTL set on insert (`SET ... EX ttl`).
@@ -13,9 +14,10 @@
 
 use std::time::Duration;
 
+use aisix_core::RedisConnConfig;
 use aisix_gateway::ChatResponse;
+use aisix_redis::RedisConn;
 use async_trait::async_trait;
-use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 
 use crate::cache::{Cache, CacheError};
@@ -29,7 +31,7 @@ pub const DEFAULT_PREFIX: &str = "aisix:cache";
 
 #[derive(Clone)]
 pub struct RedisCache {
-    conn: ConnectionManager,
+    conn: RedisConn,
     ttl_secs: u64,
     prefix: String,
 }
@@ -44,13 +46,11 @@ impl std::fmt::Debug for RedisCache {
 }
 
 impl RedisCache {
-    /// Connect to Redis using a single-node URL like `redis://host:port/`.
-    /// Uses [`ConnectionManager`] which transparently reconnects on
-    /// dropped connections — no per-request handshake cost.
-    pub async fn connect(url: &str) -> Result<Self, CacheError> {
-        let client = redis::Client::open(url)
-            .map_err(|e| CacheError::Backend(format!("redis client open: {e}")))?;
-        let conn = ConnectionManager::new(client)
+    /// Connect using the operator's `cache.redis` config. The topology
+    /// (`single` / `cluster` / `sentinel`) is selected by `mode`; see
+    /// [`aisix_redis::connect`].
+    pub async fn connect(cfg: &RedisConnConfig) -> Result<Self, CacheError> {
+        let conn = aisix_redis::connect(cfg)
             .await
             .map_err(|e| CacheError::Backend(format!("redis connect: {e}")))?;
         Ok(Self {
@@ -84,12 +84,19 @@ impl RedisCache {
 #[async_trait]
 impl Cache for RedisCache {
     async fn get(&self, key: &str) -> Result<Option<ChatResponse>, CacheError> {
-        let mut conn = self.conn.clone();
-        let full = self.full_key(key);
-        let raw: Option<String> = conn
-            .get(&full)
+        let mut conn = self
+            .conn
+            .acquire()
             .await
-            .map_err(|e| CacheError::Backend(format!("redis GET: {e}")))?;
+            .map_err(|e| CacheError::Backend(format!("redis acquire: {e}")))?;
+        let full = self.full_key(key);
+        let raw: Option<String> = match conn.get(&full).await {
+            Ok(v) => v,
+            Err(e) => {
+                self.conn.note_error().await;
+                return Err(CacheError::Backend(format!("redis GET: {e}")));
+            }
+        };
         match raw {
             None => Ok(None),
             Some(json) => serde_json::from_str::<ChatResponse>(&json)
@@ -117,13 +124,17 @@ impl Cache for RedisCache {
     ) -> Result<(), CacheError> {
         let json = serde_json::to_string(&value)
             .map_err(|e| CacheError::Backend(format!("redis encode: {e}")))?;
-        let mut conn = self.conn.clone();
+        let mut conn = self
+            .conn
+            .acquire()
+            .await
+            .map_err(|e| CacheError::Backend(format!("redis acquire: {e}")))?;
         let full = self.full_key(key);
         let secs = ttl.as_secs().max(1);
-        let _: () = conn
-            .set_ex(&full, json, secs)
-            .await
-            .map_err(|e| CacheError::Backend(format!("redis SET EX: {e}")))?;
+        if let Err(e) = conn.set_ex::<_, _, ()>(&full, json, secs).await {
+            self.conn.note_error().await;
+            return Err(CacheError::Backend(format!("redis SET EX: {e}")));
+        }
         Ok(())
     }
 }
@@ -161,7 +172,12 @@ mod tests {
 
     #[tokio::test]
     async fn connect_to_invalid_url_errors() {
-        let err = RedisCache::connect("not-a-url").await.unwrap_err();
+        let cfg = aisix_core::RedisConnConfig {
+            mode: aisix_core::RedisMode::Single,
+            url: Some("not-a-url".into()),
+            ..Default::default()
+        };
+        let err = RedisCache::connect(&cfg).await.unwrap_err();
         let CacheError::Backend(msg) = err;
         assert!(msg.contains("redis"));
     }

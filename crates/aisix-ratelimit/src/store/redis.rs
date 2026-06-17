@@ -27,13 +27,21 @@
 //! enforcement during an outage instead of being blocked. Counts may
 //! diverge from Redis until it recovers — availability over strict global
 //! enforcement, matching the cache's "Redis error → proceed" stance.
+//!
+//! The connection is the shared [`aisix_redis::RedisConn`], so `single`,
+//! `cluster`, and `sentinel` topologies all work. Because every script
+//! touches several keys, each `EVAL` declares the bucket key (carrying the
+//! `{<bucket>}` hash tag) so Redis Cluster routes it to the slot that owns
+//! every key the script reads/writes; on single/sentinel the declared key
+//! is simply ignored by the script body, which still reads the prefix from
+//! `ARGV[1]`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use aisix_core::RateLimit;
+use aisix_core::{RateLimit, RedisConnConfig};
+use aisix_redis::RedisConn;
 use async_trait::async_trait;
-use redis::aio::ConnectionManager;
 use redis::Script;
 
 use super::{local::LocalStore, token_dims, Dim, RateStore};
@@ -187,7 +195,7 @@ return {rpm, tpm, inflight, 60 - (now % 60)}
 "#;
 
 pub struct RedisStore {
-    conn: ConnectionManager,
+    conn: RedisConn,
     prefix: String,
     conc_ttl: u64,
     grace: u64,
@@ -208,11 +216,11 @@ impl std::fmt::Debug for RedisStore {
 }
 
 impl RedisStore {
-    /// Connect to Redis via [`ConnectionManager`] (transparent reconnect,
-    /// no per-request handshake). Single-node URL like `redis://host:port/`.
-    pub async fn connect(url: &str) -> Result<Self, redis::RedisError> {
-        let client = redis::Client::open(url)?;
-        let conn = ConnectionManager::new(client).await?;
+    /// Connect using the operator's `ratelimit.redis` config. The topology
+    /// (`single` / `cluster` / `sentinel`) is selected by `mode`; see
+    /// [`aisix_redis::connect`].
+    pub async fn connect(cfg: &RedisConnConfig) -> Result<Self, redis::RedisError> {
+        let conn = aisix_redis::connect(cfg).await?;
         Ok(Self {
             conn,
             prefix: DEFAULT_PREFIX.into(),
@@ -284,10 +292,19 @@ impl RateStore for RedisStore {
 
         let script = Script::new(ACQUIRE_LUA);
         let mut invocation = script.prepare_invoke();
+        // KEYS[1] carries the {bucket} hash tag for Redis Cluster routing;
+        // args[0] is the same prefix the script reads from ARGV[1].
+        invocation.key(&args[0]);
         for a in &args {
             invocation.arg(a);
         }
-        let mut conn = self.conn.clone();
+        let mut conn = match self.conn.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                self.warn_degraded("acquire", &e);
+                return self.local.acquire(key, limits, member).await;
+            }
+        };
         match invocation.invoke_async::<Vec<i64>>(&mut conn).await {
             Ok(reply) => {
                 self.mark_ok();
@@ -309,6 +326,7 @@ impl RateStore for RedisStore {
             }
             Err(e) => {
                 self.warn_degraded("acquire", &e);
+                self.conn.note_error().await;
                 self.local.acquire(key, limits, member).await
             }
         }
@@ -316,8 +334,15 @@ impl RateStore for RedisStore {
 
     async fn commit(&self, key: &str, tokens: u64, member: &str) {
         let prefix = self.bucket_prefix(key);
-        let mut conn = self.conn.clone();
+        let mut conn = match self.conn.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                self.warn_degraded("commit", &e);
+                return self.local.commit(key, tokens, member).await;
+            }
+        };
         let res: Result<i64, redis::RedisError> = Script::new(COMMIT_LUA)
+            .key(&prefix)
             .arg(&prefix)
             .arg(member)
             .arg(tokens)
@@ -328,6 +353,7 @@ impl RateStore for RedisStore {
             Ok(_) => self.mark_ok(),
             Err(e) => {
                 self.warn_degraded("commit", &e);
+                self.conn.note_error().await;
                 self.local.commit(key, tokens, member).await;
             }
         }
@@ -338,15 +364,22 @@ impl RateStore for RedisStore {
         // never acquired locally); covers the degraded-acquire case.
         self.local.release(key, member);
         let conc_key = format!("{}:conc", self.bucket_prefix(key));
-        let mut conn = self.conn.clone();
+        let conn = self.conn.clone();
         let member = member.to_string();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let _: Result<(), redis::RedisError> = redis::cmd("ZREM")
+                // ZREM's first arg is the key, so Redis Cluster routes it.
+                let Ok(mut c) = conn.acquire().await else {
+                    return;
+                };
+                let res: Result<(), redis::RedisError> = redis::cmd("ZREM")
                     .arg(&conc_key)
                     .arg(&member)
-                    .query_async(&mut conn)
+                    .query_async(&mut c)
                     .await;
+                if res.is_err() {
+                    conn.note_error().await;
+                }
             });
         }
     }
@@ -360,15 +393,22 @@ impl RateStore for RedisStore {
         self.local.add_tokens(key, tokens);
         let prefix = self.bucket_prefix(key);
         let grace = self.grace;
-        let mut conn = self.conn.clone();
+        let conn = self.conn.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let _: Result<i64, redis::RedisError> = Script::new(ADD_TOKENS_LUA)
+                let Ok(mut c) = conn.acquire().await else {
+                    return;
+                };
+                let res: Result<i64, redis::RedisError> = Script::new(ADD_TOKENS_LUA)
+                    .key(&prefix)
                     .arg(&prefix)
                     .arg(tokens)
                     .arg(grace)
-                    .invoke_async(&mut conn)
+                    .invoke_async(&mut c)
                     .await;
+                if res.is_err() {
+                    conn.note_error().await;
+                }
             });
         }
     }
@@ -378,8 +418,15 @@ impl RateStore for RedisStore {
             return None;
         }
         let prefix = self.bucket_prefix(key);
-        let mut conn = self.conn.clone();
+        let mut conn = match self.conn.acquire().await {
+            Ok(c) => c,
+            Err(e) => {
+                self.warn_degraded("peek", &e);
+                return self.local.peek(key, limits).await;
+            }
+        };
         let reply: Result<Vec<i64>, redis::RedisError> = Script::new(PEEK_LUA)
+            .key(&prefix)
             .arg(&prefix)
             .arg(self.conc_ttl)
             .invoke_async(&mut conn)
@@ -400,6 +447,7 @@ impl RateStore for RedisStore {
             }
             Err(e) => {
                 self.warn_degraded("peek", &e);
+                self.conn.note_error().await;
                 self.local.peek(key, limits).await
             }
         }
