@@ -166,7 +166,10 @@ jobs:
           docker run -d --name redis-sentinel --network host -v /tmp/sentinel.conf:/data/sentinel.conf \
             redis:7-alpine redis-sentinel /data/sentinel.conf
           sleep 2
-          docker exec redis-sentinel redis-cli -p 26379 sentinel get-master-addr-by-name mymaster | tr -d '\r' | grep -qE '127\.0\.0\.1' \
+          # get-master-addr-by-name prints host and port on separate lines;
+          # join them so the IP+port match isn't defeated by grep's per-line
+          # matching.
+          docker exec redis-sentinel redis-cli -p 26379 sentinel get-master-addr-by-name mymaster | tr -d '\r' | tr '\n' ' ' | grep -qE '127\.0\.0\.1 +6379' \
             || { echo "::error::Sentinel 26379 did not resolve mymaster"; exit 1; }
           # Failover topology: master (6381) + replica (6382) + sentinel
           # (26380) monitoring `myfo`, so the failover/reconnect test can
@@ -181,7 +184,7 @@ jobs:
           docker run -d --name redis-fo-sentinel --network host -v /tmp/sentinel-fo:/data \
             redis:7-alpine redis-sentinel /data/sentinel.conf
           sleep 2
-          docker exec redis-fo-sentinel redis-cli -p 26380 sentinel get-master-addr-by-name myfo | tr -d '\r' | grep -qE '127\.0\.0\.1[[:space:]]+6381' \
+          docker exec redis-fo-sentinel redis-cli -p 26380 sentinel get-master-addr-by-name myfo | tr -d '\r' | tr '\n' ' ' | grep -qE '127\.0\.0\.1 +6381' \
             || { echo "::error::Failover sentinel 26380 did not resolve myfo to the master"; exit 1; }
       - name: unit tests with coverage
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov-unit.info
