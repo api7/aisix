@@ -364,6 +364,9 @@ impl<P: ConfigProvider> Supervisor<P> {
             for e in tiny.guardrails.entries() {
                 new.guardrails.insert(clone_entry(&e));
             }
+            for e in tiny.guardrail_attachments.entries() {
+                new.guardrail_attachments.insert(clone_entry(&e));
+            }
             for e in tiny.cache_policies.entries() {
                 new.cache_policies.insert(clone_entry(&e));
             }
@@ -421,6 +424,7 @@ impl<P: ConfigProvider> Supervisor<P> {
             "api_keys" => snap.apikeys.get_by_id(parsed.id).is_some(),
             "provider_keys" => snap.provider_keys.get_by_id(parsed.id).is_some(),
             "guardrails" => snap.guardrails.get_by_id(parsed.id).is_some(),
+            "guardrail_attachments" => snap.guardrail_attachments.get_by_id(parsed.id).is_some(),
             "cache_policies" => snap.cache_policies.get_by_id(parsed.id).is_some(),
             "observability_exporters" => {
                 snap.observability_exporters.get_by_id(parsed.id).is_some()
@@ -458,6 +462,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                 }
                 "guardrails" => {
                     new.guardrails.remove(parsed.id);
+                }
+                "guardrail_attachments" => {
+                    new.guardrail_attachments.remove(parsed.id);
                 }
                 "cache_policies" => {
                     new.cache_policies.remove(parsed.id);
@@ -689,6 +696,9 @@ fn clone_snapshot(src: &AisixSnapshot) -> AisixSnapshot {
     for e in src.guardrails.entries() {
         out.guardrails.insert(clone_entry(&e));
     }
+    for e in src.guardrail_attachments.entries() {
+        out.guardrail_attachments.insert(clone_entry(&e));
+    }
     for e in src.cache_policies.entries() {
         out.cache_policies.insert(clone_entry(&e));
     }
@@ -824,6 +834,17 @@ mod tests {
             "kind": "otlp_http",
             "endpoint": "https://otel.example.com/v1/traces"
         }"#;
+        // A guardrail attachment created mid-run (the #826 model-scope
+        // path). Before the fix this kind was missing from apply_put's
+        // merge loop, so the row was parsed but dropped — the proxy then
+        // fell back to implicit-env scope and enforced the guardrail on
+        // EVERY model instead of the scoped one.
+        const VALID_GUARDRAIL_ATTACHMENT: &[u8] = br#"{
+            "guardrail_id": "g-1",
+            "scope_type": "model",
+            "scope_id": "m-1",
+            "priority": 100
+        }"#;
 
         let provider = Arc::new(FakeProvider::new(vec![], 0));
         let sup = Supervisor::new(provider, "/aisix");
@@ -832,6 +853,11 @@ mod tests {
         for (key, body, _kind) in [
             ("/aisix/provider_keys/pk-1", VALID_PROVIDER_KEY, "PK"),
             ("/aisix/guardrails/g-1", VALID_GUARDRAIL, "Guardrail"),
+            (
+                "/aisix/guardrail_attachments/ga-1",
+                VALID_GUARDRAIL_ATTACHMENT,
+                "GuardrailAttachment",
+            ),
             (
                 "/aisix/cache_policies/cp-1",
                 VALID_CACHE_POLICY,
@@ -852,6 +878,11 @@ mod tests {
         let snap = sup.handle().load();
         assert_eq!(snap.provider_keys.len(), 1, "ProviderKey not merged");
         assert_eq!(snap.guardrails.len(), 1, "Guardrail not merged");
+        assert_eq!(
+            snap.guardrail_attachments.len(),
+            1,
+            "GuardrailAttachment not merged"
+        );
         assert_eq!(snap.cache_policies.len(), 1, "CachePolicy not merged");
         assert_eq!(
             snap.observability_exporters.len(),
@@ -863,18 +894,31 @@ mod tests {
     #[tokio::test]
     async fn apply_delete_removes_every_resource_kind() {
         let provider = Arc::new(FakeProvider::new(
-            vec![entry(
-                "/aisix/provider_keys/pk-1",
-                br#"{"display_name":"x","secret":"y"}"#,
-                1,
-            )],
+            vec![
+                entry(
+                    "/aisix/provider_keys/pk-1",
+                    br#"{"display_name":"x","secret":"y"}"#,
+                    1,
+                ),
+                // #826: a watch delete for a guardrail attachment must
+                // also reach the snapshot, or detaching a model-scope
+                // never takes effect on the proxy.
+                entry(
+                    "/aisix/guardrail_attachments/ga-1",
+                    br#"{"guardrail_id":"g-1","scope_type":"model","scope_id":"m-1","priority":100}"#,
+                    1,
+                ),
+            ],
             1,
         ));
         let sup = Supervisor::new(provider, "/aisix");
         sup.load_once().await.unwrap();
         assert_eq!(sup.handle().load().provider_keys.len(), 1);
+        assert_eq!(sup.handle().load().guardrail_attachments.len(), 1);
         assert!(sup.apply_delete("/aisix/provider_keys/pk-1"));
         assert!(sup.handle().load().provider_keys.is_empty());
+        assert!(sup.apply_delete("/aisix/guardrail_attachments/ga-1"));
+        assert!(sup.handle().load().guardrail_attachments.is_empty());
     }
 
     #[tokio::test]
