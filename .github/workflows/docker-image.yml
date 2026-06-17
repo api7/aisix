@@ -34,13 +34,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  # Pinned, NOT ${{ github.repository }}: the published image must stay
-  # ghcr.io/api7/ai-gateway — an api7-org, public package already linked to
-  # this repo (GITHUB_TOKEN can write it) and already consumed downstream as
-  # :dev (api7/AISIX-Cloud, etc.). The api7/ai-gateway -> api7/aisix repo
-  # rename would otherwise retarget the push to a different, private
-  # ghcr.io/api7/aisix package (owned by api7/aisix-archived) and 403.
-  IMAGE_NAME: api7/ai-gateway
+  IMAGE_NAME: api7/aisix
 
 permissions:
   contents: read
