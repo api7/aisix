@@ -158,7 +158,17 @@ pub async fn connect(cfg: &RedisConnConfig) -> RedisResult<RedisConn> {
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
                 .collect();
-            let client = ClusterClient::new(nodes)?;
+            // ACL creds for the nodes can travel in the node URLs, or be
+            // set explicitly here (applied to every node). Cluster has no
+            // DB index, so `database` is ignored in this mode.
+            let mut builder = ClusterClient::builder(nodes);
+            if let Some(u) = &cfg.username {
+                builder = builder.username(u.clone());
+            }
+            if let Some(p) = &cfg.password {
+                builder = builder.password(p.clone());
+            }
+            let client = builder.build()?;
             let conn = client.get_async_connection().await?;
             tracing::info!(
                 target: "aisix::redis",
@@ -184,12 +194,23 @@ pub async fn connect(cfg: &RedisConnConfig) -> RedisResult<RedisConn> {
                 .first()
                 .filter(|u| u.starts_with("rediss://"))
                 .map(|_| redis::TlsMode::Secure);
+            // Auth/DB for the discovered master. It has no URL of its own,
+            // so ACL username/password and the DB index are configured
+            // here; this is independent of the sentinels' own auth.
+            let redis_connection_info =
+                if cfg.username.is_some() || cfg.password.is_some() || cfg.database.is_some() {
+                    Some(redis::RedisConnectionInfo {
+                        db: cfg.database.unwrap_or(0),
+                        username: cfg.username.clone(),
+                        password: cfg.password.clone(),
+                        ..Default::default()
+                    })
+                } else {
+                    None
+                };
             let node_info = SentinelNodeConnectionInfo {
                 tls_mode,
-                redis_connection_info: cfg.password.clone().map(|p| redis::RedisConnectionInfo {
-                    password: Some(p),
-                    ..Default::default()
-                }),
+                redis_connection_info,
             };
             let mut client = SentinelClient::build(
                 sentinels,

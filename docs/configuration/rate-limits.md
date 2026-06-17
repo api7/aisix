@@ -183,10 +183,16 @@ ratelimit:
       - "redis://10.0.0.1:26379"
       - "redis://10.0.0.2:26379"
     master_name: "mymaster"      # the monitored master group
-    # password: "s3cret"         # optional: password for the data node (master)
+    # ACL auth for the data node (the master Sentinel discovers — it has
+    # no URL of its own); independent of the sentinels' own auth above:
+    # username: "default"
+    # password: "s3cret"
+    # database: 0
 ```
 
-In **cluster** mode each rate-limit bucket's keys share one hash slot (the `{bucket}` hash tag), so the per-bucket counter update stays atomic. In **sentinel** mode the gateway resolves the current master through the sentinels and transparently re-resolves it after a failover.
+In **cluster** mode each rate-limit bucket's keys share one hash slot (the `{bucket}` hash tag), so the per-bucket counter update stays atomic. ACL `username`/`password` apply to every node (or put credentials in the node URLs). In **sentinel** mode the gateway resolves the current master through the sentinels and transparently re-resolves it after a failover.
+
+**Sentinel vs master credentials.** The sentinels and the Redis master can have different auth. Sentinel-node credentials travel inside the `sentinels` URLs (`redis://:sentinelpass@host:26379`); the master is authenticated with the block-level `username` / `password` (Redis ACL) plus `database`, because Sentinel hands back a host:port for the master with no URL. TLS (`rediss://`) on the sentinels propagates to the master connection. To keep the master password out of the config file, supply it via `AISIX_RATELIMIT__REDIS__PASSWORD` instead. Sentinel discovery/connection failures are logged (mode + master name, never credentials) and the limiter fails open until Redis recovers.
 
 Enable the backend via config, or via env on a managed/containerized deployment (`__` nests, list indices are appended):
 

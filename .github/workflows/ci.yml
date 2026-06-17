@@ -119,6 +119,11 @@ jobs:
       CACHE_TEST_REDIS_CLUSTER_NODES: redis://127.0.0.1:7000,redis://127.0.0.1:7001,redis://127.0.0.1:7002
       CACHE_TEST_REDIS_SENTINELS: redis://127.0.0.1:26379
       CACHE_TEST_REDIS_MASTER: mymaster
+      # Picked up by crates/aisix-redis/tests/sentinel_failover.rs — the
+      # master+replica+sentinel(26380) topology the setup step brings up,
+      # so the failover/reconnect test forces a real promotion in CI.
+      REDIS_FAILOVER_SENTINELS: redis://127.0.0.1:26380
+      REDIS_FAILOVER_MASTER: myfo
       # Picked up by crates/aisix-admin/tests/etcd_integration.rs.
       # Same skip-if-unset pattern as the Redis case above.
       ADMIN_TEST_ETCD_URL: http://127.0.0.1:2379
@@ -160,6 +165,20 @@ jobs:
             redis:7-alpine redis-sentinel /data/sentinel.conf
           sleep 2
           docker exec redis-sentinel redis-cli -p 26379 sentinel get-master-addr-by-name mymaster
+          # Failover topology: master (6381) + replica (6382) + sentinel
+          # (26380) monitoring `myfo`, so the failover/reconnect test can
+          # force a real promotion. The sentinel conf dir is mounted (not a
+          # single file) so sentinel can rewrite it on failover.
+          docker run -d --name redis-fo-master --network host redis:7-alpine redis-server --port 6381
+          docker run -d --name redis-fo-replica --network host redis:7-alpine \
+            redis-server --port 6382 --replicaof 127.0.0.1 6381 --replica-announce-ip 127.0.0.1
+          sleep 2
+          mkdir -p /tmp/sentinel-fo
+          printf 'port 26380\nsentinel monitor myfo 127.0.0.1 6381 1\nsentinel down-after-milliseconds myfo 5000\nsentinel failover-timeout myfo 10000\nsentinel parallel-syncs myfo 1\n' > /tmp/sentinel-fo/sentinel.conf
+          docker run -d --name redis-fo-sentinel --network host -v /tmp/sentinel-fo:/data \
+            redis:7-alpine redis-sentinel /data/sentinel.conf
+          sleep 2
+          docker exec redis-fo-sentinel redis-cli -p 26380 sentinel get-master-addr-by-name myfo
       - name: unit tests with coverage
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov-unit.info
       - uses: actions/upload-artifact@v7

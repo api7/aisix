@@ -98,9 +98,12 @@ cache:
     # mode: "sentinel"                    # sentinels + master group:
     # sentinels: ["redis://10.0.0.1:26379"]
     # master_name: "mymaster"
+    # username: "default"                 # ACL auth for the data node
+    # password: "s3cret"                  # (or AISIX_CACHE__REDIS__PASSWORD)
+    # database: 0
 ```
 
-Cache reads/writes are single-key (`GET`/`SET`), so Redis Cluster routes them automatically; in sentinel mode the master is resolved through the sentinels and re-resolved after a failover.
+Cache reads/writes are single-key (`GET`/`SET`), so Redis Cluster routes them automatically; in sentinel mode the master is resolved through the sentinels and re-resolved after a failover. ACL `username`/`password` and the sentinel-vs-master credential split work exactly as for the rate-limiter — see [Sentinel vs master credentials](rate-limits.md#redis-connection-modes).
 
 ## Operator Guidance
 

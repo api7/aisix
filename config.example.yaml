@@ -95,11 +95,16 @@ cache:
   #   url: "redis://127.0.0.1:6379"
   #   # mode: cluster → one or more seed node URLs:
   #   # nodes: ["redis://10.0.0.1:6379", "redis://10.0.0.2:6379"]
-  #   # mode: sentinel → sentinel node URLs + the monitored master name
-  #   # (password, if set, is for the data node reached via Sentinel):
+  #   # mode: sentinel → sentinel node URLs + the monitored master name.
+  #   # Sentinel auth goes in the sentinels URLs; username/password/database
+  #   # below authenticate the data node (master) Sentinel discovers — it
+  #   # has no URL of its own. Supply `password` via the matching env var
+  #   # (AISIX_CACHE__REDIS__PASSWORD) to keep it out of this file.
   #   # sentinels: ["redis://10.0.0.1:26379", "redis://10.0.0.2:26379"]
   #   # master_name: "mymaster"
+  #   # username: "default"      # Redis ACL user (cluster nodes / sentinel master)
   #   # password: "s3cret"
+  #   # database: 0              # DB index for the sentinel master (not used by cluster)
 
 # Rate-limit counter backend (api7/AISIX-Cloud#798).
 #

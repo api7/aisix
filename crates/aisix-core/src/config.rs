@@ -573,9 +573,17 @@ pub enum RedisMode {
 /// - `cluster`  → `nodes` (one or more seed node URLs)
 /// - `sentinel` → `sentinels` (sentinel node URLs) + `master_name`
 ///
-/// Credentials and TLS (`rediss://`) travel inside the URLs, matching the
-/// single-node convention; `password` additionally sets the password for
-/// the data node (master) discovered through Sentinel.
+/// In `single` mode all credentials and TLS (`rediss://`) travel inside
+/// `url`. In `cluster`/`sentinel` mode they can travel in the node /
+/// sentinel URLs the same way, but the **data node** (cluster nodes, or
+/// the Sentinel-discovered master) can also be authenticated explicitly
+/// with `username` + `password` (Redis ACL) and, for sentinel, a
+/// `database` — useful because the Sentinel-discovered master has no URL
+/// of its own. Sentinel-node auth still travels in the `sentinels` URLs,
+/// so Sentinel and master credentials may differ.
+///
+/// To keep secrets out of the config file, supply `password` via the
+/// matching env var instead, e.g. `AISIX_RATELIMIT__REDIS__PASSWORD`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct RedisConnConfig {
@@ -588,9 +596,13 @@ pub struct RedisConnConfig {
     pub sentinels: Vec<String>,
     /// Monitored master group name. Required when `mode = sentinel`.
     pub master_name: Option<String>,
-    /// Password for the data node (master) reached via Sentinel. Sentinel
-    /// node auth travels in the `sentinels` URLs instead.
+    /// ACL username for the data node (cluster nodes / sentinel master).
+    pub username: Option<String>,
+    /// Password for the data node (cluster nodes / sentinel master).
     pub password: Option<String>,
+    /// Database index for the Sentinel-discovered master (default 0).
+    /// Not applicable to `cluster` (Redis Cluster only has DB 0).
+    pub database: Option<i64>,
 }
 
 impl RedisConnConfig {
@@ -1035,6 +1047,19 @@ ratelimit:
         let redis = cfg.ratelimit.redis.unwrap();
         assert_eq!(redis.mode, RedisMode::Sentinel);
         assert_eq!(redis.master_name.as_deref(), Some("mymaster"));
+
+        // ACL username/password + database for the discovered master parse.
+        let acl = redis_backend_yaml(
+            "    mode: \"sentinel\"\n    sentinels: [\"redis://s1:26379\"]\n    master_name: \"m\"\n    username: \"default\"\n    password: \"s3cret\"\n    database: 2",
+        );
+        let redis = Config::load_from_path(Some(acl.path()))
+            .unwrap()
+            .ratelimit
+            .redis
+            .unwrap();
+        assert_eq!(redis.username.as_deref(), Some("default"));
+        assert_eq!(redis.password.as_deref(), Some("s3cret"));
+        assert_eq!(redis.database, Some(2));
 
         let no_master =
             redis_backend_yaml("    mode: \"sentinel\"\n    sentinels: [\"redis://s1:26379\"]");
