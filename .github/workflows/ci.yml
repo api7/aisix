@@ -109,6 +109,16 @@ jobs:
       # (shared cluster-level counters, #798). Same skip-if-unset /
       # no-AISIX_-prefix rules as CACHE_TEST_REDIS_URL above.
       RATELIMIT_TEST_REDIS_URL: redis://127.0.0.1:6379
+      # Redis Cluster + Sentinel topologies started by the "Start Redis
+      # Cluster + Sentinel" step below — exercise the `mode: cluster` /
+      # `mode: sentinel` connection paths in both cache + ratelimit
+      # integration tests. Same skip-if-unset / no-AISIX_-prefix rules.
+      RATELIMIT_TEST_REDIS_CLUSTER_NODES: redis://127.0.0.1:7000,redis://127.0.0.1:7001,redis://127.0.0.1:7002
+      RATELIMIT_TEST_REDIS_SENTINELS: redis://127.0.0.1:26379
+      RATELIMIT_TEST_REDIS_MASTER: mymaster
+      CACHE_TEST_REDIS_CLUSTER_NODES: redis://127.0.0.1:7000,redis://127.0.0.1:7001,redis://127.0.0.1:7002
+      CACHE_TEST_REDIS_SENTINELS: redis://127.0.0.1:26379
+      CACHE_TEST_REDIS_MASTER: mymaster
       # Picked up by crates/aisix-admin/tests/etcd_integration.rs.
       # Same skip-if-unset pattern as the Redis case above.
       ADMIN_TEST_ETCD_URL: http://127.0.0.1:2379
@@ -123,6 +133,33 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Start Redis Cluster + Sentinel
+        # The `redis` service above covers single-node. Here we bring up a
+        # 3-node cluster (7000-7002) and a sentinel (26379) monitoring the
+        # 6379 service as `mymaster`, so the cache + ratelimit integration
+        # tests exercise the cluster/sentinel connection modes. Host
+        # networking + announce-ip keep the advertised addresses reachable
+        # from the test process.
+        run: |
+          for p in 7000 7001 7002; do
+            docker run -d --name rediscl-$p --network host redis:7-alpine \
+              redis-server --port $p --cluster-enabled yes --cluster-config-file nodes.conf \
+              --cluster-node-timeout 5000 --cluster-announce-ip 127.0.0.1 --appendonly no
+          done
+          sleep 2
+          docker exec rediscl-7000 redis-cli --cluster create \
+            127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 --cluster-replicas 0 --cluster-yes
+          for i in $(seq 1 30); do
+            state=$(docker exec rediscl-7000 redis-cli -p 7000 cluster info | tr -d '\r' | grep -oP 'cluster_state:\K\w+')
+            [ "$state" = "ok" ] && break
+            sleep 1
+          done
+          docker exec rediscl-7000 redis-cli -p 7000 cluster info | grep cluster_state
+          printf 'port 26379\nsentinel monitor mymaster 127.0.0.1 6379 1\nsentinel down-after-milliseconds mymaster 5000\nsentinel failover-timeout mymaster 10000\n' > /tmp/sentinel.conf
+          docker run -d --name redis-sentinel --network host -v /tmp/sentinel.conf:/data/sentinel.conf \
+            redis:7-alpine redis-sentinel /data/sentinel.conf
+          sleep 2
+          docker exec redis-sentinel redis-cli -p 26379 sentinel get-master-addr-by-name mymaster
       - name: unit tests with coverage
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov-unit.info
       - uses: actions/upload-artifact@v7

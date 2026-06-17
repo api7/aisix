@@ -144,19 +144,58 @@ Every limit above is enforced against a counter. Where that counter lives is set
 ratelimit:
   backend: "memory"   # memory | redis
   # redis:
+  #   mode: "single"   # single | cluster | sentinel
   #   url: "redis://127.0.0.1:6379"
-  #   mode: "single"
   # concurrency_ttl_secs: 300
 ```
 
 - `memory` (default) — counters live in each gateway process. With a single replica this is exact. With **N replicas behind a load balancer, every limit is effectively multiplied by N**: a key capped at `rpm: 60` gets up to `60 × N` per minute, because each replica counts only the traffic it personally served.
 - `redis` — counters are shared across every replica through one Redis, so the whole cluster enforces **one global window** regardless of replica count. Enable this on any multi-replica deployment. The Redis may be the same instance used for the response cache; rate-limit keys are namespaced `aisix:rl:` and hash-tagged per bucket. All dimensions are shared — requests, tokens, and `concurrency` (tracked as a crash-safe distributed semaphore; a slot held by a crashed replica is reclaimed after `concurrency_ttl_secs`, default 300s).
 
-Enable it via config, or via env on a managed/containerized deployment:
+### Redis connection modes
+
+`redis.mode` selects how the gateway connects, so the same backend works against a standalone Redis, a Redis Cluster, or a Sentinel-managed HA pair. Credentials and TLS (`rediss://`) travel inside the URLs in every mode.
+
+```yaml title="single (default)"
+ratelimit:
+  backend: "redis"
+  redis:
+    mode: "single"
+    url: "redis://127.0.0.1:6379"
+```
+
+```yaml title="cluster"
+ratelimit:
+  backend: "redis"
+  redis:
+    mode: "cluster"
+    nodes:                       # one or more seed nodes; the rest are discovered
+      - "redis://10.0.0.1:6379"
+      - "redis://10.0.0.2:6379"
+```
+
+```yaml title="sentinel"
+ratelimit:
+  backend: "redis"
+  redis:
+    mode: "sentinel"
+    sentinels:                   # sentinel node URLs (their own auth goes in the URL)
+      - "redis://10.0.0.1:26379"
+      - "redis://10.0.0.2:26379"
+    master_name: "mymaster"      # the monitored master group
+    # password: "s3cret"         # optional: password for the data node (master)
+```
+
+In **cluster** mode each rate-limit bucket's keys share one hash slot (the `{bucket}` hash tag), so the per-bucket counter update stays atomic. In **sentinel** mode the gateway resolves the current master through the sentinels and transparently re-resolves it after a failover.
+
+Enable the backend via config, or via env on a managed/containerized deployment (`__` nests, list indices are appended):
 
 ```bash
 AISIX_RATELIMIT__BACKEND=redis
+AISIX_RATELIMIT__REDIS__MODE=single
 AISIX_RATELIMIT__REDIS__URL=redis://my-redis:6379
+# cluster:  AISIX_RATELIMIT__REDIS__MODE=cluster  AISIX_RATELIMIT__REDIS__NODES__0=redis://node-1:6379
+# sentinel: AISIX_RATELIMIT__REDIS__MODE=sentinel AISIX_RATELIMIT__REDIS__SENTINELS__0=redis://s-1:26379 AISIX_RATELIMIT__REDIS__MASTER_NAME=mymaster
 ```
 
 If Redis becomes unreachable, the limiter **fails open** to per-replica in-memory counting (logged once) so requests keep flowing; cluster-wide limits are not enforced for the duration of the outage and resume automatically when Redis recovers.

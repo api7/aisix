@@ -1,0 +1,15 @@
+[package]
+name = "aisix-redis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix: shared Redis connection layer (single / cluster / sentinel) for cache + rate-limit stores"
+
+[dependencies]
+aisix-core = { path = "../aisix-core" }
+redis.workspace = true
+tokio.workspace = true
+tracing.workspace = true

@@ -83,6 +83,25 @@ The proxy selects the cache instance per request from the matched policy's `back
 
 A `redis` policy on a process without `cache.redis` gets no caching for its requests: responses carry no `x-aisix-cache` header, telemetry reports `cache_status = disabled`, and the gateway logs a warning once per policy. There is no silent fallback to the in-process memory cache — a memory stand-in would serve per-node answers while the policy claims shared-cache semantics.
 
+### `cache.redis` connection modes
+
+The `cache.redis` block accepts the same `mode` field as the rate-limiter — `single` (default), `cluster`, or `sentinel` — so the shared cache can target a standalone Redis, a Redis Cluster, or a Sentinel-managed master. The field shapes are identical to the rate-limit backend; see [Redis connection modes](rate-limits.md#redis-connection-modes).
+
+```yaml title="cache.redis examples"
+cache:
+  backend: "redis"
+  redis:
+    mode: "single"                       # one endpoint
+    url: "redis://127.0.0.1:6379"
+    # mode: "cluster"                     # seed nodes:
+    # nodes: ["redis://10.0.0.1:6379", "redis://10.0.0.2:6379"]
+    # mode: "sentinel"                    # sentinels + master group:
+    # sentinels: ["redis://10.0.0.1:26379"]
+    # master_name: "mymaster"
+```
+
+Cache reads/writes are single-key (`GET`/`SET`), so Redis Cluster routes them automatically; in sentinel mode the master is resolved through the sentinels and re-resolved after a failover.
+
 ## Operator Guidance
 
 - start with `memory` plus a narrowly scoped policy

@@ -88,8 +88,18 @@ cache:
   # `redis` block below (validated at boot).
   backend: "memory"   # memory | redis
   # redis:
-  #   url: "redis://127.0.0.1:6379"
+  #   # mode picks the topology. Credentials and TLS (rediss://) travel
+  #   # inside the URLs, as in single mode.
   #   mode: "single"   # single | cluster | sentinel
+  #   # mode: single  → one endpoint:
+  #   url: "redis://127.0.0.1:6379"
+  #   # mode: cluster → one or more seed node URLs:
+  #   # nodes: ["redis://10.0.0.1:6379", "redis://10.0.0.2:6379"]
+  #   # mode: sentinel → sentinel node URLs + the monitored master name
+  #   # (password, if set, is for the data node reached via Sentinel):
+  #   # sentinels: ["redis://10.0.0.1:26379", "redis://10.0.0.2:26379"]
+  #   # master_name: "mymaster"
+  #   # password: "s3cret"
 
 # Rate-limit counter backend (api7/AISIX-Cloud#798).
 #
@@ -103,8 +113,12 @@ cache:
 ratelimit:
   backend: "memory"   # memory | redis
   # redis:
-  #   url: "redis://127.0.0.1:6379"
+  #   # Same shape as cache.redis above — single / cluster / sentinel.
   #   mode: "single"   # single | cluster | sentinel
+  #   url: "redis://127.0.0.1:6379"            # mode: single
+  #   # nodes: ["redis://10.0.0.1:6379"]        # mode: cluster
+  #   # sentinels: ["redis://10.0.0.1:26379"]   # mode: sentinel
+  #   # master_name: "mymaster"                  # mode: sentinel
   # Seconds before an unreleased concurrency slot (crashed replica /
   # hung upstream) is reclaimed. Redis backend only.
   # concurrency_ttl_secs: 300

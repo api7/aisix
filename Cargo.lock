@@ -61,7 +61,9 @@ dependencies = [
 name = "aisix-cache"
 version = "0.1.0"
 dependencies = [
+ "aisix-core",
  "aisix-gateway",
+ "aisix-redis",
  "async-trait",
  "moka",
  "redis",
@@ -322,6 +324,7 @@ name = "aisix-ratelimit"
 version = "0.1.0"
 dependencies = [
  "aisix-core",
+ "aisix-redis",
  "async-trait",
  "dashmap",
  "parking_lot",
@@ -330,6 +333,16 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "aisix-redis"
+version = "0.1.0"
+dependencies = [
+ "aisix-core",
+ "redis",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
