@@ -134,30 +134,22 @@ Same gateway binary, same proxy API. **AISIX Cloud** adds the managed control pl
     <td width="50%" valign="top">
       <img src="docs/assets/console-overview.png" alt="AISIX Cloud overview — requests, latency p50/p99, error rate and cost today, with a 7-day request-and-cost trend and data-plane health" width="100%"><br>
       <sub><b>Overview</b> — traffic, latency, error rate &amp; spend at a glance</sub>
+      <br><br>
+      <img src="docs/assets/console-models.png" alt="AISIX Cloud models — alias an upstream LLM per provider (OpenAI, Anthropic, AWS Bedrock, DeepSeek) with model IDs and per-model rate limits" width="100%"><br>
+      <sub><b>Models</b> — one alias per upstream: OpenAI, Anthropic, Bedrock, DeepSeek…</sub>
+      <br><br>
+      <img src="docs/assets/console-guardrails.png" alt="AISIX Cloud guardrails — pre-input and post-output content policies (keyword blocklist, Azure Content Safety, AWS Bedrock) that block on violation" width="100%"><br>
+      <sub><b>Guardrails</b> — pre-input &amp; post-output policies, block on violation</sub>
     </td>
     <td width="50%" valign="top">
       <img src="docs/assets/console-playground.png" alt="AISIX Cloud playground — pick a model, set system and user prompts, run, and read the response with live token and cost metering" width="100%"><br>
       <sub><b>Playground</b> — test any model with live token &amp; cost metering</sub>
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top">
-      <img src="docs/assets/console-models.png" alt="AISIX Cloud models — alias an upstream LLM per provider (OpenAI, Anthropic, AWS Bedrock, DeepSeek) with model IDs and per-model rate limits" width="100%"><br>
-      <sub><b>Models</b> — one alias per upstream: OpenAI, Anthropic, Bedrock, DeepSeek…</sub>
-    </td>
-    <td width="50%" valign="top">
+      <br><br>
       <img src="docs/assets/console-observability.png" alt="AISIX Cloud observability exporters — fan out chat-completion telemetry to OTLP, Datadog and object storage, with per-target delivery health" width="100%"><br>
       <sub><b>Observability</b> — fan out traces &amp; logs to OTLP, Datadog, object storage</sub>
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top">
+      <br><br>
       <img src="docs/assets/console-budgets.png" alt="AISIX Cloud budgets — organization and per-environment spend caps with progress bars, hard-stop versus warn-only, including an over-budget policy" width="100%"><br>
       <sub><b>Budgets</b> — hard-stop spend caps with warn-only tiers</sub>
-    </td>
-    <td width="50%" valign="top">
-      <img src="docs/assets/console-guardrails.png" alt="AISIX Cloud guardrails — pre-input and post-output content policies (keyword blocklist, Azure Content Safety, AWS Bedrock) that block on violation" width="100%"><br>
-      <sub><b>Guardrails</b> — pre-input &amp; post-output policies, block on violation</sub>
     </td>
   </tr>
 </table>
