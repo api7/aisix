@@ -99,7 +99,14 @@ async fn sentinel_reresolves_master_after_failover() {
     // accept writes after role change.
     let mut wrote = false;
     for _ in 0..40 {
-        let mut handle = conn.acquire().await.expect("acquire after failover");
+        // acquire itself can fail transiently right after a failover (the
+        // sentinel master lookup may briefly error); retry rather than
+        // abort, since absorbing that instability is the loop's whole job.
+        let Ok(mut handle) = conn.acquire().await else {
+            conn.note_error().await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        };
         if handle
             .set::<_, _, ()>("aisix:failover:probe", "after")
             .await

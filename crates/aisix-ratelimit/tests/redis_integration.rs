@@ -262,10 +262,22 @@ async fn cluster_shared_counter_routes_multi_key_lua() {
         .expect("first allowed on cluster");
     // commit also runs a multi-key script on the same slot.
     a.commit(&key, 10, "a-1").await;
-    // Second replica is rejected by the shared rpm counter.
+    // Second replica is rejected by the shared rpm counter — assert the
+    // specific rejection, not just any error (which would also pass on a
+    // routing/connection failure and mask a real cluster regression).
+    let err = b
+        .acquire(&key, &limits, "b-1")
+        .await
+        .expect_err("second replica must be rejected by the shared rpm counter");
     assert!(
-        b.acquire(&key, &limits, "b-1").await.is_err(),
-        "rpm counter must be shared cluster-wide"
+        matches!(
+            err,
+            aisix_ratelimit::RateLimitError::Requests {
+                scope: RateLimitScope::Requests,
+                ..
+            }
+        ),
+        "got {err:?}"
     );
 }
 
@@ -289,8 +301,18 @@ async fn sentinel_shared_counter_round_trips() {
     a.acquire(&key, &limits, "a-1")
         .await
         .expect("first allowed via sentinel master");
+    let err = b
+        .acquire(&key, &limits, "b-1")
+        .await
+        .expect_err("second replica must be rejected by the shared rpm counter");
     assert!(
-        b.acquire(&key, &limits, "b-1").await.is_err(),
-        "rpm counter shared via the sentinel-resolved master"
+        matches!(
+            err,
+            aisix_ratelimit::RateLimitError::Requests {
+                scope: RateLimitScope::Requests,
+                ..
+            }
+        ),
+        "got {err:?}"
     );
 }

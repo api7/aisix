@@ -159,12 +159,15 @@ jobs:
             [ "$state" = "ok" ] && break
             sleep 1
           done
-          docker exec rediscl-7000 redis-cli -p 7000 cluster info | grep cluster_state
+          # Fail fast if the cluster never formed, instead of letting the
+          # integration tests surface it later as confusing connection errors.
+          [ "$state" = "ok" ] || { echo "::error::Redis cluster did not become ready"; exit 1; }
           printf 'port 26379\nsentinel monitor mymaster 127.0.0.1 6379 1\nsentinel down-after-milliseconds mymaster 5000\nsentinel failover-timeout mymaster 10000\n' > /tmp/sentinel.conf
           docker run -d --name redis-sentinel --network host -v /tmp/sentinel.conf:/data/sentinel.conf \
             redis:7-alpine redis-sentinel /data/sentinel.conf
           sleep 2
-          docker exec redis-sentinel redis-cli -p 26379 sentinel get-master-addr-by-name mymaster
+          docker exec redis-sentinel redis-cli -p 26379 sentinel get-master-addr-by-name mymaster | tr -d '\r' | grep -qE '127\.0\.0\.1' \
+            || { echo "::error::Sentinel 26379 did not resolve mymaster"; exit 1; }
           # Failover topology: master (6381) + replica (6382) + sentinel
           # (26380) monitoring `myfo`, so the failover/reconnect test can
           # force a real promotion. The sentinel conf dir is mounted (not a
@@ -178,7 +181,8 @@ jobs:
           docker run -d --name redis-fo-sentinel --network host -v /tmp/sentinel-fo:/data \
             redis:7-alpine redis-sentinel /data/sentinel.conf
           sleep 2
-          docker exec redis-fo-sentinel redis-cli -p 26380 sentinel get-master-addr-by-name myfo
+          docker exec redis-fo-sentinel redis-cli -p 26380 sentinel get-master-addr-by-name myfo | tr -d '\r' | grep -qE '127\.0\.0\.1[[:space:]]+6381' \
+            || { echo "::error::Failover sentinel 26380 did not resolve myfo to the master"; exit 1; }
       - name: unit tests with coverage
         run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov-unit.info
       - uses: actions/upload-artifact@v7
