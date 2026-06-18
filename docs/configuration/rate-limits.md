@@ -202,7 +202,7 @@ AISIX_RATELIMIT__REDIS__MODE=single
 AISIX_RATELIMIT__REDIS__URL=redis://my-redis:6379
 ```
 
-For cluster and Sentinel mode, configure the Redis node lists in the configuration file. Environment overrides are supported for scalar fields such as `mode`, `url`, `master_name`, `username`, `password`, and `database`.
+For cluster and Sentinel modes, configure the Redis node lists in the configuration file. Environment overrides are supported for scalar fields such as `mode`, `url`, `master_name`, `username`, `password`, and `database`.
 
 If Redis becomes unreachable, the limiter **fails open** to per-replica in-memory counting (logged once) so requests keep flowing; cluster-wide limits are not enforced for the duration of the outage and resume automatically when Redis recovers.
 
