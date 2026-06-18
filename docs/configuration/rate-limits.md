@@ -194,15 +194,15 @@ In **cluster** mode each rate-limit bucket's keys share one hash slot (the `{buc
 
 **Sentinel vs master credentials.** The sentinels and the Redis master can have different auth. Sentinel-node credentials travel inside the `sentinels` URLs (`redis://:sentinelpass@host:26379`); the master is authenticated with the block-level `username` / `password` (Redis ACL) plus `database`, because Sentinel hands back a host:port for the master with no URL. TLS (`rediss://`) on the sentinels propagates to the master connection. To keep the master password out of the config file, supply it via `AISIX_RATELIMIT__REDIS__PASSWORD` instead. Sentinel discovery/connection failures are logged (mode + master name, never credentials) and the limiter fails open until Redis recovers.
 
-Enable the backend via config, or via env on a managed/containerized deployment (`__` nests, list indices are appended):
+Enable the backend via config, or override scalar settings through environment variables on a managed/containerized deployment:
 
 ```bash
 AISIX_RATELIMIT__BACKEND=redis
 AISIX_RATELIMIT__REDIS__MODE=single
 AISIX_RATELIMIT__REDIS__URL=redis://my-redis:6379
-# cluster:  AISIX_RATELIMIT__REDIS__MODE=cluster  AISIX_RATELIMIT__REDIS__NODES__0=redis://node-1:6379
-# sentinel: AISIX_RATELIMIT__REDIS__MODE=sentinel AISIX_RATELIMIT__REDIS__SENTINELS__0=redis://s-1:26379 AISIX_RATELIMIT__REDIS__MASTER_NAME=mymaster
 ```
+
+For cluster and Sentinel mode, configure the Redis node lists in the configuration file. Environment overrides are supported for scalar fields such as `mode`, `url`, `master_name`, `username`, `password`, and `database`.
 
 If Redis becomes unreachable, the limiter **fails open** to per-replica in-memory counting (logged once) so requests keep flowing; cluster-wide limits are not enforced for the duration of the outage and resume automatically when Redis recovers.
 
