@@ -114,7 +114,7 @@ services:
       - "2379:2379"
 
   aisix:
-    image: ghcr.io/api7/aisix:dev
+    image: ghcr.io/api7/aisix:0.1.0
     command: ["--config", "/etc/aisix/config.yaml"]
     volumes:
       - ./config.yaml:/etc/aisix/config.yaml:ro
@@ -130,7 +130,7 @@ docker compose up -d
 ```
 
 :::note
-`ghcr.io/api7/aisix:dev` tracks the `main` branch. For a reproducible deployment, pin a released version tag (for example `ghcr.io/api7/aisix:v1.2.3`) once one is available.
+Use a released image tag for reproducible deployments. The `dev` tag tracks the `main` branch and is intended for testing unreleased changes.
 :::
 
 The proxy listener is now on `http://127.0.0.1:3000` and the admin listener on `http://127.0.0.1:3001`, the same as the local build, so the verification below applies unchanged. To stop the stack, run `docker compose down`.
