@@ -41,7 +41,7 @@ impl Schemas {
                 .build(&model_root_schema())
                 .expect("model schema is well-formed"),
             apikey: jsonschema::options()
-                .build(&apikey_schema())
+                .build(&apikey_root_schema())
                 .expect("apikey schema is well-formed"),
             provider_key: jsonschema::options()
                 .build(&provider_key_schema())
@@ -53,7 +53,7 @@ impl Schemas {
                 .build(&guardrail_attachment_schema())
                 .expect("guardrail_attachment schema is well-formed"),
             cache_policy: jsonschema::options()
-                .build(&cache_policy_schema())
+                .build(&cache_policy_root_schema())
                 .expect("cache_policy schema is well-formed"),
             observability_exporter: jsonschema::options()
                 .build(&observability_exporter_schema())
@@ -117,27 +117,37 @@ pub fn validate_guardrail_attachment(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.guardrail_attachment, value)
 }
 
-/// Canonical JSON Schema for the `model` resource.
+/// Build a resource's canonical JSON Schema from its struct via `schemars`,
+/// the single source of field shapes and per-field constraints.
 ///
-/// Derived from the [`Model`](crate::models::Model) struct via `schemars`
-/// (the single source of field shapes and per-field constraints) plus the one
-/// cross-field invariant `schemars` cannot express
-/// ([`super::model::model_one_of`]). Both the runtime validator above and the
-/// `dump-schema` binary that emits `schemas/resources/model.schema.json` call
-/// this function, so the published schema and the enforced schema are the same
-/// object by construction — no hand-maintained second copy to drift.
+/// `nullable_options` controls schemars' `Option<T>` representation: `false`
+/// keeps optional fields plain-but-absent (`type: string`), matching the wire
+/// shape of resources that never receive an explicit `null` (cp-api omits
+/// unset fields); `true` keeps the default nullable form (`type: [string,
+/// null]`) for resources whose schema deliberately accepts `null` (e.g.
+/// ApiKey `team_id`/`user_id`).
 ///
-/// `option_add_null_type = false` keeps optional fields plain-but-absent
-/// rather than nullable, matching the resource's on-the-wire shape: cp-api
-/// omits unset fields and never sends an explicit `null`.
-pub fn model_root_schema() -> Value {
+/// Both the runtime validators in [`Schemas::compile`] and the `dump-schema`
+/// binary that emits `schemas/resources/*.json` build from these producers, so
+/// the published schema and the enforced schema are the same object by
+/// construction — no hand-maintained second copy to drift.
+fn struct_root_schema<T: schemars::JsonSchema>(nullable_options: bool) -> Value {
     use schemars::gen::{SchemaGenerator, SchemaSettings};
 
     let settings = SchemaSettings::draft07().with(|s| {
-        s.option_add_null_type = false;
+        s.option_add_null_type = nullable_options;
     });
-    let root = SchemaGenerator::new(settings).into_root_schema_for::<crate::models::Model>();
-    let mut schema = serde_json::to_value(root).expect("model schema serializes to JSON");
+    let root = SchemaGenerator::new(settings).into_root_schema_for::<T>();
+    serde_json::to_value(root).expect("resource schema serializes to JSON")
+}
+
+/// Canonical JSON Schema for the `model` resource: the [`Model`] struct plus
+/// the one cross-field invariant `schemars` cannot express
+/// ([`super::model::model_one_of`] — the direct/routing/ensemble XOR).
+///
+/// [`Model`]: crate::models::Model
+pub fn model_root_schema() -> Value {
+    let mut schema = struct_root_schema::<crate::models::Model>(false);
     schema
         .as_object_mut()
         .expect("model root schema is a JSON object")
@@ -145,48 +155,13 @@ pub fn model_root_schema() -> Value {
     schema
 }
 
-fn apikey_schema() -> Value {
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["key_hash", "allowed_models"],
-        "additionalProperties": false,
-        "properties": {
-            "key_hash": { "type": "string", "minLength": 1 },
-            "allowed_models": {
-                "type": "array",
-                "items": { "type": "string" }
-            },
-            "rate_limit": { "$ref": "#/$defs/rate_limit" },
-            "team_id": {
-                "anyOf": [
-                    { "type": "string", "minLength": 1 },
-                    { "type": "null" }
-                ]
-            },
-            "user_id": {
-                "anyOf": [
-                    { "type": "string", "minLength": 1 },
-                    { "type": "null" }
-                ]
-            }
-        },
-        "$defs": {
-            "rate_limit": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "tpm":         { "type": "integer", "minimum": 0 },
-                    "tpd":         { "type": "integer", "minimum": 0 },
-                    "rps":         { "type": "integer", "minimum": 0 },
-                    "rpm":         { "type": "integer", "minimum": 0 },
-                    "rph":         { "type": "integer", "minimum": 0 },
-                    "rpd":         { "type": "integer", "minimum": 0 },
-                    "concurrency": { "type": "integer", "minimum": 0 }
-                }
-            }
-        }
-    })
+/// Canonical JSON Schema for the `api_key` resource, derived from the
+/// [`ApiKey`](crate::models::ApiKey) struct. Uses the default nullable
+/// `Option` representation so `team_id`/`user_id` keep accepting an explicit
+/// `null` (cp-api sends `null` to clear team/owner), matching the resource's
+/// wire contract.
+pub fn apikey_root_schema() -> Value {
+    struct_root_schema::<crate::models::ApiKey>(true)
 }
 
 fn provider_key_schema() -> Value {
@@ -457,24 +432,12 @@ fn guardrail_schema() -> Value {
 // at parse time. `additionalProperties: true` keeps the schema
 // forward-compatible: cp-api can ship new optional fields ahead of a DP
 // rollout without locking the gateway out.
-fn cache_policy_schema() -> Value {
-    // Backends: memory + redis. Semantic backends were removed
-    // pending DP-side wiring — see ai-gateway issue #116. The schema
-    // stays `additionalProperties: true` so a newer cp-api can ship
-    // forward-compat fields without locking out an older DP.
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["name"],
-        "additionalProperties": true,
-        "properties": {
-            "name":        { "type": "string", "minLength": 1, "maxLength": 120 },
-            "enabled":     { "type": "boolean" },
-            "backend":     { "enum": ["memory", "redis"] },
-            "ttl_seconds": { "type": "integer", "minimum": 1, "maximum": 604800 },
-            "applies_to":  { "type": "string", "minLength": 1, "maxLength": 255 }
-        }
-    })
+/// Canonical JSON Schema for the `cache_policy` resource, derived from the
+/// [`CachePolicy`](crate::models::CachePolicy) struct. The struct intentionally
+/// has no `deny_unknown_fields`, so the schema omits `additionalProperties`
+/// (i.e. `true`) — forward-compat fields from a newer cp-api are tolerated.
+pub fn cache_policy_root_schema() -> Value {
+    struct_root_schema::<crate::models::CachePolicy>(false)
 }
 
 fn observability_exporter_schema() -> Value {

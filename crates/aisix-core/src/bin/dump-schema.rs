@@ -30,27 +30,26 @@ use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
 
+use aisix_core::models::schema;
 use aisix_core::models::{
-    ApiKey, CachePolicy, EnsembleConfig, Guardrail, ObservabilityExporter, ProviderKey, RateLimit,
-    RateLimitPolicy, Routing,
+    EnsembleConfig, Guardrail, ObservabilityExporter, ProviderKey, RateLimit, RateLimitPolicy,
+    Routing,
 };
 
 fn main() {
     let out_dir = workspace_root().join("schemas").join("resources");
     fs::create_dir_all(&out_dir).expect("create schemas/resources dir");
 
-    dump::<ApiKey>(&out_dir, "api_key");
-    dump::<CachePolicy>(&out_dir, "cache_policy");
+    // Resources whose runtime validator is derived from the struct go through
+    // the SAME `*_root_schema()` producer the validator uses, so the published
+    // schema == the enforced schema. Resources still on a hand-written
+    // validator use the bare `schema_for!` dump below.
+    dump_value(&out_dir, "api_key", schema::apikey_root_schema());
+    dump_value(&out_dir, "cache_policy", schema::cache_policy_root_schema());
+    dump_value(&out_dir, "model", schema::model_root_schema());
+
     dump::<EnsembleConfig>(&out_dir, "ensemble");
     dump::<Guardrail>(&out_dir, "guardrail");
-    // `model` is assembled by a dedicated producer that derives from the
-    // `Model` struct and injects the cross-field `oneOf` — the same function
-    // the runtime validator uses, so published == enforced.
-    dump_value(
-        &out_dir,
-        "model",
-        aisix_core::models::schema::model_root_schema(),
-    );
     dump::<ObservabilityExporter>(&out_dir, "observability_exporter");
     dump::<ProviderKey>(&out_dir, "provider_key");
     dump::<RateLimit>(&out_dir, "rate_limit");

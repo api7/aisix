@@ -1,51 +1,56 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "CachePolicy",
+  "definitions": {
+    "CacheBackend": {
+      "description": "Cache backend choice for requests matched by a cache policy. `redis` requires `cache.redis`. Otherwise matching requests are not cached.",
+      "enum": [
+        "memory",
+        "redis"
+      ],
+      "type": "string"
+    }
+  },
   "description": "Semantic cache policy for chat requests.",
-  "type": "object",
-  "required": [
-    "name"
-  ],
   "properties": {
     "applies_to": {
-      "description": "Free-form scope. Supports `\"all\"`, `\"model:<name>\"`, and `\"api_key:<id>\"`. See `parsed_applies_to`.",
       "default": "all",
+      "description": "Free-form scope. Supports `\"all\"`, `\"model:<name>\"`, and `\"api_key:<id>\"`. See `parsed_applies_to`.",
+      "maxLength": 255,
+      "minLength": 1,
       "type": "string"
     },
     "backend": {
-      "description": "Cache backend used for matching requests.",
-      "default": "memory",
       "allOf": [
         {
           "$ref": "#/definitions/CacheBackend"
         }
-      ]
+      ],
+      "default": "memory",
+      "description": "Cache backend used for matching requests."
     },
     "enabled": {
-      "description": "When false, the cache gate skips this policy. Allows operators to stage a rule before enabling it.",
       "default": true,
+      "description": "When false, the cache gate skips this policy. Allows operators to stage a rule before enabling it.",
       "type": "boolean"
     },
     "name": {
       "description": "Operator-facing name that surfaces in metric labels and cache headers.",
+      "maxLength": 120,
+      "minLength": 1,
       "type": "string"
     },
     "ttl_seconds": {
-      "description": "Cache entry TTL in seconds.",
       "default": 3600,
-      "type": "integer",
+      "description": "Cache entry TTL in seconds.",
       "format": "uint32",
-      "minimum": 0.0
+      "maximum": 604800.0,
+      "minimum": 1.0,
+      "type": "integer"
     }
   },
-  "definitions": {
-    "CacheBackend": {
-      "description": "Cache backend choice for requests matched by a cache policy. `redis` requires `cache.redis`. Otherwise matching requests are not cached.",
-      "type": "string",
-      "enum": [
-        "memory",
-        "redis"
-      ]
-    }
-  }
+  "required": [
+    "name"
+  ],
+  "title": "CachePolicy",
+  "type": "object"
 }

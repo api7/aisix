@@ -1,25 +1,91 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "ApiKey",
-  "type": "object",
-  "required": [
-    "allowed_models",
-    "key_hash"
-  ],
+  "additionalProperties": false,
+  "definitions": {
+    "RateLimit": {
+      "additionalProperties": false,
+      "properties": {
+        "concurrency": {
+          "description": "Max concurrent in-flight requests.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rpd": {
+          "description": "Requests per 86,400-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rph": {
+          "description": "Requests per 3,600-second window. There is no per-hour token limit field.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rpm": {
+          "description": "Requests per 60-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rps": {
+          "description": "Requests per 1-second window. There is no per-second token limit field.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tpd": {
+          "description": "Tokens per 86,400-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tpm": {
+          "description": "Tokens per 60-second window.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
   "properties": {
     "allowed_models": {
       "description": "Model identifiers this key may use. An empty array denies access to every model.",
-      "type": "array",
       "items": {
         "type": "string"
-      }
+      },
+      "type": "array"
     },
     "key_hash": {
       "description": "SHA-256 hexadecimal hash of the plaintext bearer. The proxy hashes incoming bearer tokens before lookup.",
+      "minLength": 1,
       "type": "string"
     },
     "rate_limit": {
-      "description": "Request, token, and concurrency limits for this key.",
       "anyOf": [
         {
           "$ref": "#/definitions/RateLimit"
@@ -27,10 +93,12 @@
         {
           "type": "null"
         }
-      ]
+      ],
+      "description": "Request, token, and concurrency limits for this key."
     },
     "team_id": {
       "description": "Team this API key belongs to. Used for matching team-scope rate limit policies.",
+      "minLength": 1,
       "type": [
         "string",
         "null"
@@ -38,82 +106,17 @@
     },
     "user_id": {
       "description": "Org member who owns this key. Used for matching member-scope rate limit policies.",
+      "minLength": 1,
       "type": [
         "string",
         "null"
       ]
     }
   },
-  "additionalProperties": false,
-  "definitions": {
-    "RateLimit": {
-      "type": "object",
-      "properties": {
-        "concurrency": {
-          "description": "Max concurrent in-flight requests.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "rpd": {
-          "description": "Requests per 86,400-second window.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0.0
-        },
-        "rph": {
-          "description": "Requests per 3,600-second window. There is no per-hour token limit field.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0.0
-        },
-        "rpm": {
-          "description": "Requests per 60-second window.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0.0
-        },
-        "rps": {
-          "description": "Requests per 1-second window. There is no per-second token limit field.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0.0
-        },
-        "tpd": {
-          "description": "Tokens per 86,400-second window.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0.0
-        },
-        "tpm": {
-          "description": "Tokens per 60-second window.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0.0
-        }
-      },
-      "additionalProperties": false
-    }
-  }
+  "required": [
+    "allowed_models",
+    "key_hash"
+  ],
+  "title": "ApiKey",
+  "type": "object"
 }
