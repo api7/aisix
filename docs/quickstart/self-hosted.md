@@ -129,10 +129,6 @@ services:
 docker compose up -d
 ```
 
-:::note
-Use a released image tag for reproducible deployments. The `dev` tag tracks the `main` branch and is intended for testing unreleased changes.
-:::
-
 The proxy listener is now on `http://127.0.0.1:3000` and the admin listener on `http://127.0.0.1:3001`, the same as the local build, so the verification below applies unchanged. To stop the stack, run `docker compose down`.
 
 ## Step 4: Verify the listeners
