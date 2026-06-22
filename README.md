@@ -24,7 +24,7 @@ static binary with low per-request overhead. Self-host for free, forever.
 
 <br>
 
-<img src="docs/assets/aisix-architecture.svg" alt="AISIX AI Gateway architecture — one OpenAI- or Anthropic-compatible API in front of OpenAI, Anthropic, Gemini/Vertex, Bedrock, Azure OpenAI, and DeepSeek, with API key auth, rate limits and budgets, guardrails, caching, routing and failover, and observability in between" width="100%">
+<img src="assets/aisix-architecture.svg" alt="AISIX AI Gateway architecture — one OpenAI- or Anthropic-compatible API in front of OpenAI, Anthropic, Gemini/Vertex, Bedrock, Azure OpenAI, and DeepSeek, with API key auth, rate limits and budgets, guardrails, caching, routing and failover, and observability in between" width="100%">
 
 </div>
 
@@ -132,23 +132,23 @@ Same gateway binary, same proxy API. **AISIX Cloud** adds the managed control pl
 <table>
   <tr>
     <td width="50%" valign="top">
-      <img src="docs/assets/console-overview.png" alt="AISIX Cloud overview — requests, latency p50/p99, error rate and cost today, with a 7-day request-and-cost trend and data-plane health" width="100%"><br>
+      <img src="assets/console-overview.png" alt="AISIX Cloud overview — requests, latency p50/p99, error rate and cost today, with a 7-day request-and-cost trend and data-plane health" width="100%"><br>
       <sub><b>Overview</b> — traffic, latency, error rate &amp; spend at a glance</sub>
       <br><br>
-      <img src="docs/assets/console-models.png" alt="AISIX Cloud models — alias an upstream LLM per provider (OpenAI, Anthropic, AWS Bedrock, DeepSeek) with model IDs and per-model rate limits" width="100%"><br>
+      <img src="assets/console-models.png" alt="AISIX Cloud models — alias an upstream LLM per provider (OpenAI, Anthropic, AWS Bedrock, DeepSeek) with model IDs and per-model rate limits" width="100%"><br>
       <sub><b>Models</b> — one alias per upstream: OpenAI, Anthropic, Bedrock, DeepSeek…</sub>
       <br><br>
-      <img src="docs/assets/console-guardrails.png" alt="AISIX Cloud guardrails — pre-input and post-output content policies (keyword blocklist, Azure Content Safety, AWS Bedrock) that block on violation" width="100%"><br>
+      <img src="assets/console-guardrails.png" alt="AISIX Cloud guardrails — pre-input and post-output content policies (keyword blocklist, Azure Content Safety, AWS Bedrock) that block on violation" width="100%"><br>
       <sub><b>Guardrails</b> — pre-input &amp; post-output policies, block on violation</sub>
     </td>
     <td width="50%" valign="top">
-      <img src="docs/assets/console-playground.png" alt="AISIX Cloud playground — pick a model, set system and user prompts, run, and read the response with live token and cost metering" width="100%"><br>
+      <img src="assets/console-playground.png" alt="AISIX Cloud playground — pick a model, set system and user prompts, run, and read the response with live token and cost metering" width="100%"><br>
       <sub><b>Playground</b> — test any model with live token &amp; cost metering</sub>
       <br><br>
-      <img src="docs/assets/console-observability.png" alt="AISIX Cloud observability exporters — fan out chat-completion telemetry to OTLP, Datadog and object storage, with per-target delivery health" width="100%"><br>
+      <img src="assets/console-observability.png" alt="AISIX Cloud observability exporters — fan out chat-completion telemetry to OTLP, Datadog and object storage, with per-target delivery health" width="100%"><br>
       <sub><b>Observability</b> — fan out traces &amp; logs to OTLP, Datadog, object storage</sub>
       <br><br>
-      <img src="docs/assets/console-budgets.png" alt="AISIX Cloud budgets — organization and per-environment spend caps with progress bars, hard-stop versus warn-only, including an over-budget policy" width="100%"><br>
+      <img src="assets/console-budgets.png" alt="AISIX Cloud budgets — organization and per-environment spend caps with progress bars, hard-stop versus warn-only, including an over-budget policy" width="100%"><br>
       <sub><b>Budgets</b> — hard-stop spend caps with warn-only tiers</sub>
     </td>
   </tr>
@@ -195,10 +195,6 @@ crates/
 ├── aisix-obs            tracing, metrics, access log, exporters
 └── aisix-server         single binary — bootstrap + CLI
 ```
-
-Deep dives: [protocol translation](docs/architecture/protocol-translation.md) ·
-[snapshot & watch](docs/architecture/snapshot-and-watch.md) ·
-[two-phase rate limiting](docs/architecture/two-phase-rate-limit.md).
 
 ## 🗺️ Roadmap
 
