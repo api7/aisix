@@ -1,135 +1,54 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "Model",
-  "type": "object",
-  "required": [
-    "display_name"
-  ],
-  "properties": {
-    "allowed_cidrs": {
-      "description": "Client IP allowlist in CIDR notation. Empty or absent allows all clients.",
-      "type": [
-        "array",
-        "null"
-      ],
-      "items": {
-        "type": "string"
-      }
-    },
-    "background_model_check": {
-      "description": "Direct-model-only background health-check configuration.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/BackgroundModelCheck"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "cooldown": {
-      "description": "Direct-model-only request-path cooldown configuration. Omit this field to use the built-in cooldown behavior.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/CooldownConfig"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "cost": {
-      "description": "Per-token cost for budget tracking. Omit it when cost tracking is not needed.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/ModelCost"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "display_name": {
-      "description": "Operator-facing unique label. Surfaces on `/v1/models`, `req.model` on chat completions, `ApiKey.allowed_models`, and the dashboard model list. `Resource::name()` returns this.",
-      "type": "string"
-    },
-    "ensemble": {
-      "description": "Ensemble configuration for panel calls and judge synthesis.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/EnsembleConfig"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "model_name": {
-      "description": "Upstream model identifier sent in provider requests. Routing and ensemble models leave this field unset.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "provider": {
-      "description": "Upstream vendor identity used for dispatch, compatibility checks, telemetry, and access logs. Routing and ensemble models leave this field unset.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "provider_key_id": {
-      "description": "Provider key resource ID used to authenticate upstream requests. Routing and ensemble models leave this field unset.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "rate_limit": {
-      "description": "Request, token, and concurrency limits for this model.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/RateLimit"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "routing": {
-      "description": "Virtual routing configuration. When set, the gateway selects a target from `routing.targets` and uses that target model's `provider`, `model_name`, and `provider_key_id` fields for upstream dispatch.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/Routing"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "stream_timeout": {
-      "description": "Maximum gap in milliseconds between upstream streaming chunks. `0` or absent falls back to `timeout`.",
-      "type": [
-        "integer",
-        "null"
-      ],
-      "format": "uint64",
-      "minimum": 0.0
-    },
-    "timeout": {
-      "description": "End-to-end timeout in milliseconds for non-streaming upstream calls. `0` or absent disables the non-streaming timeout.",
-      "type": [
-        "integer",
-        "null"
-      ],
-      "format": "uint64",
-      "minimum": 0.0
-    }
-  },
   "additionalProperties": false,
   "definitions": {
     "BackgroundModelCheck": {
-      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "description": "Whether background health checks are enabled for this model.",
+          "type": "boolean"
+        },
+        "ignore_statuses": {
+          "description": "Upstream status codes to ignore when evaluating background check failures.",
+          "items": {
+            "format": "uint16",
+            "maximum": 599.0,
+            "minimum": 100.0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "interval_seconds": {
+          "description": "Seconds between background health checks. Minimum: 5.",
+          "format": "uint64",
+          "minimum": 5.0,
+          "type": "integer"
+        },
+        "max_tokens": {
+          "description": "Maximum completion tokens requested during each background health check.",
+          "format": "uint32",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "prompt": {
+          "description": "Prompt sent to the model during each background health check.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "stale_after_seconds": {
+          "description": "Seconds after which the last completed background check is considered stale.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "timeout_seconds": {
+          "description": "Request timeout in seconds for each background health check. Minimum: 1.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
       "required": [
         "enabled",
         "interval_seconds",
@@ -138,437 +57,527 @@
         "stale_after_seconds",
         "timeout_seconds"
       ],
-      "properties": {
-        "enabled": {
-          "description": "Whether background health checks are enabled for this model.",
-          "type": "boolean"
-        },
-        "ignore_statuses": {
-          "description": "Upstream status codes to ignore when evaluating background check failures.",
-          "type": "array",
-          "items": {
-            "type": "integer",
-            "format": "uint16",
-            "minimum": 0.0
-          }
-        },
-        "interval_seconds": {
-          "description": "Seconds between background health checks. Minimum: 5.",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0.0
-        },
-        "max_tokens": {
-          "description": "Maximum completion tokens requested during each background health check.",
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 0.0
-        },
-        "prompt": {
-          "description": "Prompt sent to the model during each background health check.",
-          "type": "string"
-        },
-        "stale_after_seconds": {
-          "description": "Seconds after which the last completed background check is considered stale.",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0.0
-        },
-        "timeout_seconds": {
-          "description": "Request timeout in seconds for each background health check. Minimum: 1.",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0.0
-        }
-      },
-      "additionalProperties": false
+      "type": "object"
     },
     "CooldownConfig": {
+      "additionalProperties": false,
       "description": "Request-path cooldown settings for a direct model after retryable upstream failures.",
-      "type": "object",
       "properties": {
         "default_seconds": {
           "description": "Cooldown TTL in seconds when the upstream did not supply a `Retry-After` header or `honor_retry_after` is `false`.",
-          "type": [
-            "integer",
-            "null"
-          ],
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         },
         "enabled": {
           "description": "Whether cooldown is active for this model. Set to `false` to keep the model in rotation regardless of upstream failures.",
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": "boolean"
         },
         "honor_retry_after": {
           "description": "Whether to use the upstream's `Retry-After` header as the cooldown TTL when it contains seconds.",
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": "boolean"
         },
         "max_seconds": {
           "description": "Upper bound on cooldown TTL when `Retry-After` is used.",
-          "type": [
-            "integer",
-            "null"
-          ],
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 1.0,
+          "type": "integer"
         },
         "trigger_on_timeout": {
           "description": "Whether request-path timeouts trigger cooldown.",
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": "boolean"
         },
         "trigger_on_transport": {
           "description": "Whether transport, decode, or stream-abort errors trigger cooldown.",
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": "boolean"
         },
         "trigger_statuses": {
           "description": "Status codes that trigger cooldown, covering authentication failures, rate limits, and transient server errors. Caller-side validation errors such as `400`, `403`, and `422` are excluded.",
-          "type": [
-            "array",
-            "null"
-          ],
           "items": {
-            "type": "integer",
             "format": "uint16",
-            "minimum": 0.0
-          }
+            "maximum": 599.0,
+            "minimum": 100.0,
+            "type": "integer"
+          },
+          "type": "array"
         }
       },
-      "additionalProperties": false
+      "type": "object"
     },
     "EnsembleConfig": {
-      "type": "object",
-      "required": [
-        "judge",
-        "panel"
-      ],
+      "additionalProperties": false,
       "properties": {
         "judge": {
-          "description": "Direct model that combines successful panel responses.",
           "allOf": [
             {
               "$ref": "#/definitions/Judge"
             }
-          ]
+          ],
+          "description": "Direct model that combines successful panel responses."
         },
         "min_responses": {
           "description": "Minimum successful panel responses required before judge synthesis. When omitted, the gateway requires the smaller of 2 and the panel size.",
-          "type": [
-            "integer",
-            "null"
-          ],
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 1.0,
+          "type": "integer"
         },
         "panel": {
           "description": "Direct models called concurrently for each ensemble request.",
-          "type": "array",
           "items": {
             "$ref": "#/definitions/PanelMember"
-          }
+          },
+          "minItems": 1,
+          "type": "array"
         },
         "timeout_ms": {
           "description": "Per-call upstream deadline applied to each panel member and the judge. Set `0` or omit it to disable the ensemble-level deadline.",
-          "type": [
-            "integer",
-            "null"
-          ],
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         }
       },
-      "additionalProperties": false
+      "required": [
+        "judge",
+        "panel"
+      ],
+      "type": "object"
     },
     "Judge": {
+      "additionalProperties": false,
       "description": "The judge model that synthesizes the panel responses into one answer. `model` references a direct model alias.",
-      "type": "object",
-      "required": [
-        "model"
-      ],
       "properties": {
         "model": {
           "description": "Model alias for the direct model that synthesizes panel responses.",
+          "minLength": 1,
           "type": "string"
         },
         "synthesis_prompt": {
           "description": "Override for the built-in synthesis prompt template.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "minLength": 1,
+          "type": "string"
         }
       },
-      "additionalProperties": false
+      "required": [
+        "model"
+      ],
+      "type": "object"
     },
     "ModelCost": {
+      "additionalProperties": false,
       "description": "Per-token cost for budget tracking. Both values are in USD per 1,000 tokens.",
-      "type": "object",
+      "properties": {
+        "input_per_1k": {
+          "description": "Prompt token cost in USD per 1,000 tokens.",
+          "format": "double",
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "output_per_1k": {
+          "description": "Completion token cost in USD per 1,000 tokens.",
+          "format": "double",
+          "minimum": 0.0,
+          "type": "number"
+        }
+      },
       "required": [
         "input_per_1k",
         "output_per_1k"
       ],
-      "properties": {
-        "input_per_1k": {
-          "description": "Prompt token cost in USD per 1,000 tokens.",
-          "type": "number",
-          "format": "double"
-        },
-        "output_per_1k": {
-          "description": "Completion token cost in USD per 1,000 tokens.",
-          "type": "number",
-          "format": "double"
-        }
-      },
-      "additionalProperties": false
+      "type": "object"
     },
     "OnAllFilteredPolicy": {
       "description": "Behavior when every routing target is filtered out by runtime health or cooldown state.",
       "oneOf": [
         {
           "description": "Return `503` with a fixed `Retry-After` hint.",
-          "type": "string",
           "enum": [
             "fail"
-          ]
+          ],
+          "type": "string"
         },
         {
           "description": "Route to the original candidate list in declaration order even when all targets were filtered by health or cooldown status. Use only when maintaining availability is preferred over avoiding recently unhealthy targets.",
-          "type": "string",
           "enum": [
             "original_order"
-          ]
+          ],
+          "type": "string"
         }
       ]
     },
     "PanelMember": {
+      "additionalProperties": false,
       "description": "One member of an ensemble panel. `model` references a direct model alias.",
-      "type": "object",
-      "required": [
-        "model"
-      ],
       "properties": {
         "model": {
           "description": "Model alias for a direct model that receives one panel request.",
+          "minLength": 1,
           "type": "string"
         },
         "seed": {
           "description": "Sampling seed for this panel member.",
-          "type": [
-            "integer",
-            "null"
-          ],
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         },
         "temperature": {
           "description": "Sampling temperature for this panel member. Omit it to keep the request's temperature.",
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "float"
+          "format": "float",
+          "minimum": 0.0,
+          "type": "number"
         },
         "weight": {
           "description": "Reserved for the future voting/quorum strategy. Ignored by the v1 synthesis path.",
-          "type": [
-            "integer",
-            "null"
-          ],
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         }
       },
-      "additionalProperties": false
+      "required": [
+        "model"
+      ],
+      "type": "object"
     },
     "RateLimit": {
-      "type": "object",
+      "additionalProperties": false,
       "properties": {
         "concurrency": {
           "description": "Max concurrent in-flight requests.",
-          "type": [
-            "integer",
-            "null"
-          ],
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         },
         "rpd": {
           "description": "Requests per 86,400-second window.",
-          "type": [
-            "integer",
-            "null"
-          ],
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         },
         "rph": {
           "description": "Requests per 3,600-second window. There is no per-hour token limit field.",
-          "type": [
-            "integer",
-            "null"
-          ],
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         },
         "rpm": {
           "description": "Requests per 60-second window.",
-          "type": [
-            "integer",
-            "null"
-          ],
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         },
         "rps": {
           "description": "Requests per 1-second window. There is no per-second token limit field.",
-          "type": [
-            "integer",
-            "null"
-          ],
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         },
         "tpd": {
           "description": "Tokens per 86,400-second window.",
-          "type": [
-            "integer",
-            "null"
-          ],
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         },
         "tpm": {
           "description": "Tokens per 60-second window.",
-          "type": [
-            "integer",
-            "null"
-          ],
           "format": "uint64",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         }
       },
-      "additionalProperties": false
+      "type": "object"
     },
     "Routing": {
-      "type": "object",
-      "required": [
-        "targets"
-      ],
+      "additionalProperties": false,
       "properties": {
         "max_fallbacks": {
           "description": "Max number of later targets to attempt after the initial target fails permanently. When omitted, all later targets may be attempted.",
-          "type": [
-            "integer",
-            "null"
-          ],
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         },
         "on_all_filtered": {
-          "description": "Policy to apply when runtime status filtering removes every candidate.",
-          "anyOf": [
+          "allOf": [
             {
               "$ref": "#/definitions/OnAllFilteredPolicy"
-            },
-            {
-              "type": "null"
             }
-          ]
+          ],
+          "description": "Policy to apply when runtime status filtering removes every candidate."
         },
         "retries": {
           "description": "Retry attempts on the current target before failing over.",
-          "type": [
-            "integer",
-            "null"
-          ],
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         },
         "retry_on_429": {
           "description": "Whether upstream 429 participates in retries and failover.",
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": "boolean"
         },
         "strategy": {
-          "description": "Strategy used to select a target for each request.",
-          "default": "failover",
           "allOf": [
             {
               "$ref": "#/definitions/RoutingStrategy"
             }
-          ]
+          ],
+          "default": "failover",
+          "description": "Strategy used to select a target for each request."
         },
         "targets": {
           "description": "Ordered set of direct models available to this routing model.",
-          "type": "array",
           "items": {
             "$ref": "#/definitions/RoutingTarget"
-          }
+          },
+          "minItems": 1,
+          "type": "array"
         }
       },
-      "additionalProperties": false
+      "required": [
+        "targets"
+      ],
+      "type": "object"
     },
     "RoutingStrategy": {
       "oneOf": [
         {
           "description": "Cycle through targets in declaration order.",
-          "type": "string",
           "enum": [
             "round_robin"
-          ]
+          ],
+          "type": "string"
         },
         {
           "description": "Pick targets by configured weight. Missing target weights fall back to 1.",
-          "type": "string",
           "enum": [
             "weighted"
-          ]
+          ],
+          "type": "string"
         },
         {
           "description": "Always start with the first target and move to later targets only after failure.",
-          "type": "string",
           "enum": [
             "failover"
-          ]
+          ],
+          "type": "string"
         }
       ]
     },
     "RoutingTarget": {
+      "additionalProperties": false,
       "description": "One destination in a routing configuration. `model` references a direct model alias.",
-      "type": "object",
-      "required": [
-        "model"
-      ],
       "properties": {
         "model": {
           "description": "Model alias for a direct model that can receive routed traffic.",
+          "minLength": 1,
           "type": "string"
         },
         "weight": {
           "description": "Target weight for `weighted` routing. Other strategies ignore this field.",
-          "type": [
-            "integer",
-            "null"
-          ],
           "format": "uint32",
-          "minimum": 0.0
+          "minimum": 0.0,
+          "type": "integer"
         }
       },
-      "additionalProperties": false
+      "required": [
+        "model"
+      ],
+      "type": "object"
     }
-  }
+  },
+  "oneOf": [
+    {
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "provider"
+            ]
+          },
+          {
+            "required": [
+              "model_name"
+            ]
+          },
+          {
+            "required": [
+              "provider_key_id"
+            ]
+          },
+          {
+            "required": [
+              "background_model_check"
+            ]
+          },
+          {
+            "required": [
+              "cooldown"
+            ]
+          },
+          {
+            "required": [
+              "ensemble"
+            ]
+          }
+        ]
+      },
+      "required": [
+        "routing"
+      ]
+    },
+    {
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "routing"
+            ]
+          },
+          {
+            "required": [
+              "ensemble"
+            ]
+          }
+        ]
+      },
+      "required": [
+        "provider",
+        "model_name",
+        "provider_key_id"
+      ]
+    },
+    {
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "provider"
+            ]
+          },
+          {
+            "required": [
+              "model_name"
+            ]
+          },
+          {
+            "required": [
+              "provider_key_id"
+            ]
+          },
+          {
+            "required": [
+              "routing"
+            ]
+          },
+          {
+            "required": [
+              "background_model_check"
+            ]
+          },
+          {
+            "required": [
+              "cooldown"
+            ]
+          }
+        ]
+      },
+      "required": [
+        "ensemble"
+      ]
+    }
+  ],
+  "properties": {
+    "allowed_cidrs": {
+      "description": "Client IP allowlist in CIDR notation. Empty or absent allows all clients.",
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "background_model_check": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/BackgroundModelCheck"
+        }
+      ],
+      "description": "Direct-model-only background health-check configuration."
+    },
+    "cooldown": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/CooldownConfig"
+        }
+      ],
+      "description": "Direct-model-only request-path cooldown configuration. Omit this field to use the built-in cooldown behavior."
+    },
+    "cost": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ModelCost"
+        }
+      ],
+      "description": "Per-token cost for budget tracking. Omit it when cost tracking is not needed."
+    },
+    "display_name": {
+      "description": "Operator-facing unique label. Surfaces on `/v1/models`, `req.model` on chat completions, `ApiKey.allowed_models`, and the dashboard model list. `Resource::name()` returns this.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "ensemble": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/EnsembleConfig"
+        }
+      ],
+      "description": "Ensemble configuration for panel calls and judge synthesis."
+    },
+    "model_name": {
+      "description": "Upstream model identifier sent in provider requests. Routing and ensemble models leave this field unset.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "provider": {
+      "description": "Upstream vendor identity used for dispatch, compatibility checks, telemetry, and access logs. Routing and ensemble models leave this field unset.",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[a-z0-9][a-z0-9._-]*$",
+      "type": "string"
+    },
+    "provider_key_id": {
+      "description": "Provider key resource ID used to authenticate upstream requests. Routing and ensemble models leave this field unset.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "rate_limit": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RateLimit"
+        }
+      ],
+      "description": "Request, token, and concurrency limits for this model."
+    },
+    "routing": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/Routing"
+        }
+      ],
+      "description": "Virtual routing configuration. When set, the gateway selects a target from `routing.targets` and uses that target model's `provider`, `model_name`, and `provider_key_id` fields for upstream dispatch."
+    },
+    "stream_timeout": {
+      "description": "Maximum gap in milliseconds between upstream streaming chunks. `0` or absent falls back to `timeout`.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "timeout": {
+      "description": "End-to-end timeout in milliseconds for non-streaming upstream calls. `0` or absent disables the non-streaming timeout.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "display_name"
+  ],
+  "title": "Model",
+  "type": "object"
 }

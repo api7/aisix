@@ -38,7 +38,7 @@ impl Schemas {
     fn compile() -> Self {
         Self {
             model: jsonschema::options()
-                .build(&model_schema())
+                .build(&model_root_schema())
                 .expect("model schema is well-formed"),
             apikey: jsonschema::options()
                 .build(&apikey_schema())
@@ -117,197 +117,32 @@ pub fn validate_guardrail_attachment(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.guardrail_attachment, value)
 }
 
-fn model_schema() -> Value {
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["display_name"],
-        "additionalProperties": false,
-        "properties": {
-            "display_name":    { "type": "string", "minLength": 1 },
-            // `provider` is the open vendor identity (models.dev catalog id
-            // — e.g. `openai`, `xai`, `wafer.ai`). The pattern accepts the
-            // dot character because at least one real models.dev id
-            // (`wafer.ai`) contains it; rejecting `.` would re-create the
-            // #417 bug class for that vendor.
-            "provider":        { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9._-]*$" },
-            "model_name":      { "type": "string", "minLength": 1 },
-            "provider_key_id": { "type": "string", "minLength": 1 },
-            "timeout":         { "type": "integer", "minimum": 0 },
-            "stream_timeout":  { "type": "integer", "minimum": 0 },
-            // Client-IP allowlist (#557). Permitted on both direct and
-            // routing models — the gate binds to whichever model the client
-            // names, so a Model Group can be IP-restricted too. CIDR format
-            // is validated by cp-api on write; the DP skips malformed entries.
-            "allowed_cidrs":   { "type": "array", "items": { "type": "string", "minLength": 1 } },
-            "rate_limit":      { "$ref": "#/$defs/rate_limit" },
-            "routing": {
-                "type": "object",
-                "required": ["targets"],
-                "additionalProperties": false,
-                "properties": {
-                    "strategy": {
-                        "type": "string",
-                        "enum": ["round_robin", "weighted", "failover"]
-                    },
-                    "targets": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": {
-                            "type": "object",
-                            "required": ["model"],
-                            "additionalProperties": false,
-                            "properties": {
-                                "model":  { "type": "string", "minLength": 1 },
-                                "weight": { "type": "integer", "minimum": 0 }
-                            }
-                        }
-                    },
-                    "retries": { "type": "integer", "minimum": 0 },
-                    "max_fallbacks": { "type": "integer", "minimum": 0 },
-                    "retry_on_429": { "type": "boolean" },
-                    "on_all_filtered": {
-                        "type": "string",
-                        "enum": ["fail", "original_order"]
-                    }
-                }
-            },
-            "cost": {
-                "type": "object",
-                "required": ["input_per_1k", "output_per_1k"],
-                "additionalProperties": false,
-                "properties": {
-                    "input_per_1k":  { "type": "number", "minimum": 0 },
-                    "output_per_1k": { "type": "number", "minimum": 0 }
-                }
-            },
-            "background_model_check": {
-                "type": "object",
-                "required": [
-                    "enabled",
-                    "interval_seconds",
-                    "timeout_seconds",
-                    "prompt",
-                    "max_tokens",
-                    "stale_after_seconds"
-                ],
-                "additionalProperties": false,
-                "properties": {
-                    "enabled": { "type": "boolean" },
-                    // Minimum 5s guards against misconfiguration. Setting
-                    // interval_seconds=1 with multiple direct models would
-                    // burn provider quota and money very quickly.
-                    "interval_seconds": { "type": "integer", "minimum": 5 },
-                    "timeout_seconds": { "type": "integer", "minimum": 1 },
-                    "prompt": { "type": "string", "minLength": 1 },
-                    "max_tokens": { "type": "integer", "minimum": 1 },
-                    "ignore_statuses": {
-                        "type": "array",
-                        "items": { "type": "integer", "minimum": 100, "maximum": 599 }
-                    },
-                    "stale_after_seconds": { "type": "integer", "minimum": 1 }
-                }
-            },
-            "cooldown": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "enabled":              { "type": "boolean" },
-                    "default_seconds":      { "type": "integer", "minimum": 0 },
-                    "max_seconds":          { "type": "integer", "minimum": 1 },
-                    "honor_retry_after":    { "type": "boolean" },
-                    "trigger_statuses": {
-                        "type": "array",
-                        "items": { "type": "integer", "minimum": 100, "maximum": 599 }
-                    },
-                    "trigger_on_timeout":   { "type": "boolean" },
-                    "trigger_on_transport": { "type": "boolean" }
-                }
-            },
-            "ensemble": {
-                "type": "object",
-                "required": ["panel", "judge"],
-                "additionalProperties": false,
-                "properties": {
-                    "panel": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": {
-                            "type": "object",
-                            "required": ["model"],
-                            "additionalProperties": false,
-                            "properties": {
-                                "model":       { "type": "string", "minLength": 1 },
-                                "temperature": { "type": "number", "minimum": 0 },
-                                "seed":        { "type": "integer", "minimum": 0 },
-                                "weight":      { "type": "integer", "minimum": 0 }
-                            }
-                        }
-                    },
-                    "judge": {
-                        "type": "object",
-                        "required": ["model"],
-                        "additionalProperties": false,
-                        "properties": {
-                            "model":            { "type": "string", "minLength": 1 },
-                            "synthesis_prompt": { "type": "string", "minLength": 1 }
-                        }
-                    },
-                    "min_responses": { "type": "integer", "minimum": 1 },
-                    "timeout_ms":    { "type": "integer", "minimum": 0 }
-                }
-            }
-        },
-        // Direct vs routing vs ensemble model: a model ships EXACTLY one
-        // of — a `routing` block (virtual router), an `ensemble` block
-        // (panel + judge fan-out), or the three direct upstream fields
-        // (provider/model_name/provider_key_id) together. The three
-        // shapes are mutually exclusive.
-        "oneOf": [
-            {
-                "required": ["routing"],
-                "not": { "anyOf": [
-                    { "required": ["provider"] },
-                    { "required": ["model_name"] },
-                    { "required": ["provider_key_id"] },
-                    { "required": ["background_model_check"] },
-                    { "required": ["cooldown"] },
-                    { "required": ["ensemble"] }
-                ]}
-            },
-            {
-                "required": ["provider", "model_name", "provider_key_id"],
-                "not": { "anyOf": [
-                    { "required": ["routing"] },
-                    { "required": ["ensemble"] }
-                ]}
-            },
-            {
-                "required": ["ensemble"],
-                "not": { "anyOf": [
-                    { "required": ["provider"] },
-                    { "required": ["model_name"] },
-                    { "required": ["provider_key_id"] },
-                    { "required": ["routing"] },
-                    { "required": ["background_model_check"] },
-                    { "required": ["cooldown"] }
-                ]}
-            }
-        ],
-        "$defs": {
-            "rate_limit": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "tpm":         { "type": "integer", "minimum": 0 },
-                    "tpd":         { "type": "integer", "minimum": 0 },
-                    "rpm":         { "type": "integer", "minimum": 0 },
-                    "rpd":         { "type": "integer", "minimum": 0 },
-                    "concurrency": { "type": "integer", "minimum": 0 }
-                }
-            }
-        }
-    })
+/// Canonical JSON Schema for the `model` resource.
+///
+/// Derived from the [`Model`](crate::models::Model) struct via `schemars`
+/// (the single source of field shapes and per-field constraints) plus the one
+/// cross-field invariant `schemars` cannot express
+/// ([`super::model::model_one_of`]). Both the runtime validator above and the
+/// `dump-schema` binary that emits `schemas/resources/model.schema.json` call
+/// this function, so the published schema and the enforced schema are the same
+/// object by construction — no hand-maintained second copy to drift.
+///
+/// `option_add_null_type = false` keeps optional fields plain-but-absent
+/// rather than nullable, matching the resource's on-the-wire shape: cp-api
+/// omits unset fields and never sends an explicit `null`.
+pub fn model_root_schema() -> Value {
+    use schemars::gen::{SchemaGenerator, SchemaSettings};
+
+    let settings = SchemaSettings::draft07().with(|s| {
+        s.option_add_null_type = false;
+    });
+    let root = SchemaGenerator::new(settings).into_root_schema_for::<crate::models::Model>();
+    let mut schema = serde_json::to_value(root).expect("model schema serializes to JSON");
+    schema
+        .as_object_mut()
+        .expect("model root schema is a JSON object")
+        .insert("oneOf".to_string(), super::model::model_one_of());
+    schema
 }
 
 fn apikey_schema() -> Value {
@@ -343,7 +178,9 @@ fn apikey_schema() -> Value {
                 "properties": {
                     "tpm":         { "type": "integer", "minimum": 0 },
                     "tpd":         { "type": "integer", "minimum": 0 },
+                    "rps":         { "type": "integer", "minimum": 0 },
                     "rpm":         { "type": "integer", "minimum": 0 },
+                    "rph":         { "type": "integer", "minimum": 0 },
                     "rpd":         { "type": "integer", "minimum": 0 },
                     "concurrency": { "type": "integer", "minimum": 0 }
                 }

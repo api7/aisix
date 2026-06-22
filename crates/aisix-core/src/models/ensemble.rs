@@ -18,9 +18,11 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct PanelMember {
     /// Model alias for a direct model that receives one panel request.
+    #[schemars(length(min = 1))]
     pub model: String,
     /// Sampling temperature for this panel member. Omit it to keep the request's temperature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0.0))]
     pub temperature: Option<f32>,
     /// Sampling seed for this panel member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,9 +50,11 @@ impl PanelMember {
 #[serde(deny_unknown_fields)]
 pub struct Judge {
     /// Model alias for the direct model that synthesizes panel responses.
+    #[schemars(length(min = 1))]
     pub model: String,
     /// Override for the built-in synthesis prompt template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub synthesis_prompt: Option<String>,
 }
 
@@ -73,11 +77,13 @@ const DEFAULT_MIN_RESPONSES: usize = 2;
 #[serde(deny_unknown_fields)]
 pub struct EnsembleConfig {
     /// Direct models called concurrently for each ensemble request.
+    #[schemars(length(min = 1))]
     pub panel: Vec<PanelMember>,
     /// Direct model that combines successful panel responses.
     pub judge: Judge,
     /// Minimum successful panel responses required before judge synthesis. When omitted, the gateway requires the smaller of 2 and the panel size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub min_responses: Option<u32>,
     /// Per-call upstream deadline applied to each panel member and the judge. Set `0` or omit it to disable the ensemble-level deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]

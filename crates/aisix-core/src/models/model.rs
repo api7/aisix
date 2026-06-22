@@ -13,6 +13,7 @@
 //! etcd path: `{prefix}/models/{uuid}`. Secondary index on `display_name`.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use super::ensemble::EnsembleConfig;
 use super::rate_limit::RateLimit;
@@ -41,8 +42,10 @@ pub enum Adapter {
 #[serde(deny_unknown_fields)]
 pub struct ModelCost {
     /// Prompt token cost in USD per 1,000 tokens.
+    #[schemars(range(min = 0.0))]
     pub input_per_1k: f64,
     /// Completion token cost in USD per 1,000 tokens.
+    #[schemars(range(min = 0.0))]
     pub output_per_1k: f64,
 }
 
@@ -61,17 +64,23 @@ pub struct BackgroundModelCheck {
     /// Whether background health checks are enabled for this model.
     pub enabled: bool,
     /// Seconds between background health checks. Minimum: 5.
+    #[schemars(range(min = 5))]
     pub interval_seconds: u64,
     /// Request timeout in seconds for each background health check. Minimum: 1.
+    #[schemars(range(min = 1))]
     pub timeout_seconds: u64,
     /// Prompt sent to the model during each background health check.
+    #[schemars(length(min = 1))]
     pub prompt: String,
     /// Maximum completion tokens requested during each background health check.
+    #[schemars(range(min = 1))]
     pub max_tokens: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(inner(range(min = 100, max = 599)))]
     /// Upstream status codes to ignore when evaluating background check failures.
     pub ignore_statuses: Vec<u16>,
     /// Seconds after which the last completed background check is considered stale.
+    #[schemars(range(min = 1))]
     pub stale_after_seconds: u64,
 }
 
@@ -87,12 +96,14 @@ pub struct CooldownConfig {
     pub default_seconds: Option<u64>,
     /// Upper bound on cooldown TTL when `Retry-After` is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub max_seconds: Option<u64>,
     /// Whether to use the upstream's `Retry-After` header as the cooldown TTL when it contains seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub honor_retry_after: Option<bool>,
     /// Status codes that trigger cooldown, covering authentication failures, rate limits, and transient server errors. Caller-side validation errors such as `400`, `403`, and `422` are excluded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(inner(range(min = 100, max = 599)))]
     pub trigger_statuses: Option<Vec<u16>>,
     /// Whether request-path timeouts trigger cooldown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,18 +162,27 @@ pub struct Model {
     /// Operator-facing unique label. Surfaces on `/v1/models`,
     /// `req.model` on chat completions, `ApiKey.allowed_models`, and
     /// the dashboard model list. `Resource::name()` returns this.
+    #[schemars(length(min = 1))]
     pub display_name: String,
 
     /// Upstream vendor identity used for dispatch, compatibility checks, telemetry, and access logs. Routing and ensemble models leave this field unset.
+    //
+    // `provider` is the open vendor identity (models.dev catalog id —
+    // e.g. `openai`, `xai`, `wafer.ai`). The pattern accepts the dot
+    // character because at least one real models.dev id (`wafer.ai`)
+    // contains it; rejecting `.` would re-create the #417 bug class.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = "^[a-z0-9][a-z0-9._-]*$"), length(min = 1, max = 64))]
     pub provider: Option<String>,
 
     /// Upstream model identifier sent in provider requests. Routing and ensemble models leave this field unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub model_name: Option<String>,
 
     /// Provider key resource ID used to authenticate upstream requests. Routing and ensemble models leave this field unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub provider_key_id: Option<String>,
 
     /// End-to-end timeout in milliseconds for non-streaming upstream calls. `0` or absent disables the non-streaming timeout.
@@ -179,6 +199,7 @@ pub struct Model {
 
     /// Client IP allowlist in CIDR notation. Empty or absent allows all clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(inner(length(min = 1)))]
     pub allowed_cidrs: Option<Vec<String>>,
 
     /// Virtual routing configuration. When set, the gateway selects a target
@@ -282,6 +303,47 @@ impl Model {
             .filter_map(|cidr| cidr.parse::<ipnet::IpNet>().ok())
             .any(|net| net.contains(&ip))
     }
+}
+
+/// The one cross-field invariant the runtime schema enforces that
+/// `schemars` cannot derive from the flat struct: a Model ships EXACTLY
+/// one shape — a `routing` block, an `ensemble` block, or the three direct
+/// upstream fields (`provider`/`model_name`/`provider_key_id`) together.
+/// [`crate::models::schema::model_root_schema`] injects this as a top-level
+/// `oneOf` into the generated schema, so the published schema and the
+/// runtime validator share this single definition.
+pub fn model_one_of() -> Value {
+    json!([
+        {
+            "required": ["routing"],
+            "not": { "anyOf": [
+                { "required": ["provider"] },
+                { "required": ["model_name"] },
+                { "required": ["provider_key_id"] },
+                { "required": ["background_model_check"] },
+                { "required": ["cooldown"] },
+                { "required": ["ensemble"] }
+            ]}
+        },
+        {
+            "required": ["provider", "model_name", "provider_key_id"],
+            "not": { "anyOf": [
+                { "required": ["routing"] },
+                { "required": ["ensemble"] }
+            ]}
+        },
+        {
+            "required": ["ensemble"],
+            "not": { "anyOf": [
+                { "required": ["provider"] },
+                { "required": ["model_name"] },
+                { "required": ["provider_key_id"] },
+                { "required": ["routing"] },
+                { "required": ["background_model_check"] },
+                { "required": ["cooldown"] }
+            ]}
+        }
+    ])
 }
 
 impl Resource for Model {

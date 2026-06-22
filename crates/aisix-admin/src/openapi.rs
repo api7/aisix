@@ -3232,6 +3232,13 @@ fn add_variant_titles(doc: &mut Value) {
             &["Literal", "Regex"],
         ),
         (
+            // Model's top-level direct/routing/ensemble mutual-exclusion
+            // `oneOf` (injected by `aisix_core::models::schema::model_root_schema`).
+            // Order must match `aisix_core::models::model::model_one_of`.
+            "/components/schemas/Model/oneOf",
+            &["Routing model", "Direct model", "Ensemble model"],
+        ),
+        (
             "/components/schemas/ObjectStoreAuthMode/oneOf",
             &["Credential reference", "Cloud identity"],
         ),
@@ -4136,6 +4143,12 @@ mod tests {
                 }
 
                 for (key, child) in map {
+                    // `not` subschemas are negative constraints (e.g. Model's
+                    // direct/routing/ensemble mutual exclusion), never rendered
+                    // as ReDoc tabs, so their inner variants need no titles.
+                    if key == "not" {
+                        continue;
+                    }
                     collect_untitled_schema_variants(child, format!("{path}/{key}"), missing);
                 }
             }

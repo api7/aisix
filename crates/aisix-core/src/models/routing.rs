@@ -35,6 +35,7 @@ pub enum RoutingStrategy {
 #[serde(deny_unknown_fields)]
 pub struct RoutingTarget {
     /// Model alias for a direct model that can receive routed traffic.
+    #[schemars(length(min = 1))]
     pub model: String,
     /// Target weight for `weighted` routing. Other strategies ignore this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,6 +83,7 @@ pub struct Routing {
     #[serde(default)]
     pub strategy: RoutingStrategy,
     /// Ordered set of direct models available to this routing model.
+    #[schemars(length(min = 1))]
     pub targets: Vec<RoutingTarget>,
     /// Retry attempts on the current target before failing over.
     #[serde(default, skip_serializing_if = "Option::is_none")]

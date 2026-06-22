@@ -1,17 +1,15 @@
 //! Characterization (golden-corpus) test for the `model` resource validator.
 //!
-//! This pins the EXACT accept/reject behavior of `validate_model` so that the
-//! single-source-of-truth refactor (deriving the runtime validator from the
-//! `Model` struct + schemars instead of a hand-written `json!` schema) can
-//! prove it did not silently widen or narrow the config contract.
+//! This pins the EXACT accept/reject behavior of `validate_model`. It was
+//! written against the old hand-written `model_schema()` to lock its behavior,
+//! then kept green through the single-source-of-truth refactor (the runtime
+//! validator is now derived from the `Model` struct + schemars), proving the
+//! refactor did not silently widen or narrow the config contract.
 //!
-//! Every case below is a constraint that the hand-written `model_schema()`
-//! enforces today. After the refactor, this corpus must stay green — with one
-//! deliberate, documented exception: the `rate_limit.rps` / `rate_limit.rph`
-//! cases (see `INTENTIONALLY_FLIPPED` below), which the hand-written validator
-//! wrongly rejects even though the `RateLimit` struct and the dispatch path
-//! support them. The refactor flips those to ACCEPT and the assertions move
-//! accordingly, surfacing the behavior change as a visible diff.
+//! The only intended behavior change is the `rate_limit.rps` / `rate_limit.rph`
+//! pair (see the "FLIPPED by the single-source refactor" section): the old
+//! validator wrongly rejected them even though the `RateLimit` struct and the
+//! rate limiter support them, so they now ACCEPT — the deliberate bug fix.
 
 use aisix_core::models::schema::validate_model;
 use serde_json::{json, Value};
@@ -287,7 +285,10 @@ fn reject_empty_allowed_cidr_entry() {
 
 #[test]
 fn reject_no_shape_at_all() {
-    reject("display_name only — no direct/routing/ensemble", json!({"display_name": "m"}));
+    reject(
+        "display_name only — no direct/routing/ensemble",
+        json!({"display_name": "m"}),
+    );
 }
 
 #[test]
@@ -481,28 +482,40 @@ fn reject_cooldown_unknown_field() {
 }
 
 // ---------------------------------------------------------------------------
-// INTENTIONALLY FLIPPED by the single-source refactor.
+// FLIPPED by the single-source refactor (the deliberate bug fix).
 //
-// The hand-written validator's `$defs/rate_limit` lists only 5 fields
+// The old hand-written `$defs/rate_limit` listed only 5 fields
 // (tpm/tpd/rpm/rpd/concurrency) with `additionalProperties: false`, so it
-// rejects `rps`/`rph` — even though the `RateLimit` struct declares them and
-// the rate limiter honors per-second / per-hour windows (#426). These two
-// assertions encode TODAY's (buggy) behavior; the refactor commit flips them
-// to `accept(...)` and adds an E2E proving the limiter enforces them.
+// rejected `rps`/`rph` — even though the `RateLimit` struct declares them and
+// the rate limiter honors per-second / per-hour windows (#426). A model with
+// `rate_limit.rps` was therefore silently dropped at the DP loader. Now that
+// the validator is derived from the struct, both fields are accepted, matching
+// what the published schema always advertised and what dispatch enforces.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn reject_rate_limit_rps_today() {
-    reject(
-        "rate_limit.rps (flips to ACCEPT in the refactor)",
+fn accept_rate_limit_rps() {
+    accept(
+        "rate_limit.rps",
         json!({"display_name": "m", "provider": "openai", "model_name": "g", "provider_key_id": "pk-1", "rate_limit": {"rps": 10}}),
     );
 }
 
 #[test]
-fn reject_rate_limit_rph_today() {
-    reject(
-        "rate_limit.rph (flips to ACCEPT in the refactor)",
+fn accept_rate_limit_rph() {
+    accept(
+        "rate_limit.rph",
         json!({"display_name": "m", "provider": "openai", "model_name": "g", "provider_key_id": "pk-1", "rate_limit": {"rph": 10}}),
+    );
+}
+
+/// Unknown rate-limit dimensions are still rejected — the struct's
+/// `deny_unknown_fields` becomes `additionalProperties: false` in the derived
+/// schema, so the flip widened the contract by exactly `rps`/`rph`, no more.
+#[test]
+fn reject_rate_limit_unknown_field() {
+    reject(
+        "rate_limit unknown dimension",
+        json!({"display_name": "m", "provider": "openai", "model_name": "g", "provider_key_id": "pk-1", "rate_limit": {"tps": 10}}),
     );
 }

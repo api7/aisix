@@ -31,8 +31,8 @@ use std::path::{Path, PathBuf};
 use schemars::JsonSchema;
 
 use aisix_core::models::{
-    ApiKey, CachePolicy, EnsembleConfig, Guardrail, Model, ObservabilityExporter, ProviderKey,
-    RateLimit, RateLimitPolicy, Routing,
+    ApiKey, CachePolicy, EnsembleConfig, Guardrail, ObservabilityExporter, ProviderKey, RateLimit,
+    RateLimitPolicy, Routing,
 };
 
 fn main() {
@@ -43,7 +43,14 @@ fn main() {
     dump::<CachePolicy>(&out_dir, "cache_policy");
     dump::<EnsembleConfig>(&out_dir, "ensemble");
     dump::<Guardrail>(&out_dir, "guardrail");
-    dump::<Model>(&out_dir, "model");
+    // `model` is assembled by a dedicated producer that derives from the
+    // `Model` struct and injects the cross-field `oneOf` — the same function
+    // the runtime validator uses, so published == enforced.
+    dump_value(
+        &out_dir,
+        "model",
+        aisix_core::models::schema::model_root_schema(),
+    );
     dump::<ObservabilityExporter>(&out_dir, "observability_exporter");
     dump::<ProviderKey>(&out_dir, "provider_key");
     dump::<RateLimit>(&out_dir, "rate_limit");
@@ -52,7 +59,20 @@ fn main() {
 }
 
 fn dump<T: JsonSchema>(out_dir: &Path, name: &str) {
-    let schema = schemars::schema_for!(T);
+    // Serialize the `RootSchema` directly to preserve schemars' native key
+    // ordering. (Routing through `serde_json::Value` would re-sort keys.)
+    let mut json =
+        serde_json::to_string_pretty(&schemars::schema_for!(T)).expect("serialize schema");
+    json.push('\n');
+    let path = out_dir.join(format!("{name}.schema.json"));
+    fs::write(&path, json).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    println!("wrote {}", path.display());
+}
+
+/// Write a pre-assembled schema `Value`. Used for resources whose canonical
+/// schema is built by a dedicated producer rather than a bare `schema_for!`
+/// (e.g. `model`, which injects the cross-field `oneOf`).
+fn dump_value(out_dir: &Path, name: &str, schema: serde_json::Value) {
     let mut json = serde_json::to_string_pretty(&schema).expect("serialize schema");
     json.push('\n');
     let path = out_dir.join(format!("{name}.schema.json"));
