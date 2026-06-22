@@ -6,9 +6,9 @@ Use this roadmap to understand direction. Use the [official documentation](https
 
 ## Principles
 
-- Main documentation pages describe current, verified behavior.
+- Official documentation describes current, verified behavior.
 - This roadmap collects planned or incomplete capabilities.
-- Presence on this page is not a delivery commitment.
+- Presence in this roadmap is not a delivery commitment.
 
 ## Now
 
@@ -86,9 +86,9 @@ Planned outcome:
 Applies to:
 - `AISIX AI Gateway`
 
-## Out Of Scope For Current Docs
+## Not Current Product Behavior
 
-These areas should not be described as current product behavior unless implementation status changes:
+These areas are not current product behavior unless implementation status changes:
 
 - planned-only MCP or agent-gateway features
 - planned-only control-plane governance features not yet backed by code
