@@ -10,6 +10,8 @@ Use this roadmap to understand direction. Use the [official documentation](https
 - This roadmap collects planned or incomplete capabilities.
 - Presence on this page is not a delivery commitment.
 
+## Now
+
 ### Provider Compatibility Expansion
 
 Current status:
