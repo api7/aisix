@@ -54,10 +54,10 @@ flowchart LR
 ```
 
 The entry handler
-([`crates/aisix-proxy/src/messages.rs:45-136`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L45))
+([`crates/aisix-proxy/src/messages.rs:45-136`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L45))
 parses the body, resolves the model, runs auth and quota, and
 hits the branch at
-[`messages.rs:290`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L290):
+[`messages.rs:290`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L290):
 
 ```rust
 if model.provider.as_deref() != Some("anthropic") {
@@ -85,10 +85,10 @@ fields that Anthropic-only customers actually use:
 So we deliberately keep this path "dumb":
 
 1. **Rewrite only the `model` field** to the upstream id
-   ([`messages.rs:193-196`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L193))
+   ([`messages.rs:193-196`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L193))
    — every other body field flows through unchanged.
 2. **Inject Anthropic-specific headers**
-   ([`messages.rs:212-218`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L212)):
+   ([`messages.rs:212-218`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L212)):
 
    ```rust
    .header("x-api-key", api_key)
@@ -101,12 +101,12 @@ So we deliberately keep this path "dumb":
    Anthropic's auth scheme is non-OAuth and an SDK that sends
    the wrong header gets a 401 on the very first request. The
    constant `ANTHROPIC_VERSION = "2023-06-01"`
-   ([`messages.rs:43`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L43))
+   ([`messages.rs:43`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L43))
    matches the value Anthropic's own SDKs emit; pinning the
    version centrally lets the gateway upgrade everyone at once.
 
 3. **Stream bytes verbatim**
-   ([`messages.rs:273-281`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L273)):
+   ([`messages.rs:273-281`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L273)):
 
    ```rust
    if is_stream {
@@ -125,10 +125,10 @@ So we deliberately keep this path "dumb":
 
 The trade-off is honest: usage metrics for the Anthropic
 passthrough are best-effort — see
-[`messages.rs:303-309`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L303)
+[`messages.rs:303-309`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L303)
 for the deferred-work comment about extracting tokens from the
 streaming bytes. For non-streaming, `anthropic_metrics_from_response_json`
-([`messages.rs:352-391`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L352))
+([`messages.rs:352-391`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L352))
 inspects the parsed JSON for `usage.input_tokens` /
 `usage.output_tokens` / `cache_creation_input_tokens` /
 `cache_read_input_tokens`.
@@ -149,31 +149,31 @@ becomes a protocol translator. Four steps:
 ### Inbound parse
 
 `parse_inbound_request`
-([`crates/aisix-provider-anthropic/src/wire.rs:665-766`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L665))
+([`crates/aisix-provider-anthropic/src/wire.rs:665-766`](https://github.com/api7/aisix/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L665))
 collapses an Anthropic Messages body into the internal
 `ChatFormat`. Three pieces of structural work:
 
 - **System messages fold up**
-  ([`wire.rs:131-175`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L131))
+  ([`wire.rs:131-175`](https://github.com/api7/aisix/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L131))
   — Anthropic's `system` field is a separate top-level array;
   OpenAI / Gemini / DeepSeek expect a `messages[0]` of role
   `system`. The helper merges leading system arrays into one
   message and appends any out-of-order system entries as user
   turns rather than dropping them.
 - **Tool-use blocks → OpenAI tool_calls**
-  ([`wire.rs:306-331`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L306))
+  ([`wire.rs:306-331`](https://github.com/api7/aisix/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L306))
   — Anthropic's `tools` array has a different schema from
   OpenAI's `functions` / `tools.function` — same intent, mostly
   isomorphic, but the JSON Schema lives at different paths.
 - **Tool-choice translation**
-  ([`wire.rs:343-360`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L343))
+  ([`wire.rs:343-360`](https://github.com/api7/aisix/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L343))
   — `{"type":"auto"}` → `"auto"`; `{"type":"any"}` → `"required"`;
   named tool selection passes through.
 
 ### Dispatch through Bridge
 
 The cross-provider path
-([`messages.rs:405-529`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L405))
+([`messages.rs:405-529`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L405))
 calls into the `Hub` to look up the provider's `Bridge`, then
 invokes either `chat()` or `chat_stream()` depending on the
 inbound `stream` flag. Every Bridge speaks `ChatFormat` — that
@@ -185,7 +185,7 @@ back.
 ### Non-streaming encode
 
 `chat_response_into_anthropic_json`
-([`wire.rs:777-850`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L777))
+([`wire.rs:777-850`](https://github.com/api7/aisix/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L777))
 turns a `ChatResponse` into the Anthropic Messages JSON
 envelope:
 
@@ -194,9 +194,9 @@ envelope:
 - Extract any `extra["tool_calls"]` from the message and translate
   them to `{"type":"tool_use", "id", "name", "input"}` content
   blocks
-  ([`wire.rs:798-831`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L798)).
+  ([`wire.rs:798-831`](https://github.com/api7/aisix/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L798)).
 - Map `finish_reason` to `stop_reason` via `map_stop_reason`
-  ([`wire.rs:505-512`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L505)):
+  ([`wire.rs:505-512`](https://github.com/api7/aisix/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L505)):
   `"stop"` → `"end_turn"`, `"length"` → `"max_tokens"`,
   `"tool_calls"` → `"tool_use"`. The Anthropic SDK switches on
   this string; an unmapped value breaks the client.
@@ -218,10 +218,10 @@ arrive as deltas indexed by `index`, and the terminal chunk is
 inferred from `finish_reason`.
 
 `AnthropicSseEncoder`
-([`wire.rs:896-934`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L896))
+([`wire.rs:896-934`](https://github.com/api7/aisix/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L896))
 is the state machine that bridges these two worlds. Its
 contract, verbatim from
-[`wire.rs:855-866`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L855):
+[`wire.rs:855-866`](https://github.com/api7/aisix/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L855):
 
 > 1. First chunk that carries content or a finish_reason → emit
 >    `message_start`. If it carries content, also emit
@@ -248,29 +248,29 @@ typically don't:
 
 - **One `content_block_index` per block**. Text and tool_use
   blocks share the same sequential index space
-  ([`wire.rs:907-910`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L907)).
+  ([`wire.rs:907-910`](https://github.com/api7/aisix/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L907)).
   An Anthropic SDK that sees `content_block_delta` with
   `index = 1` must have seen `content_block_start` with the
   same index first.
 - **Tool calls accumulate across deltas**. OpenAI emits a
   tool-call argument string in pieces, indexed by OpenAI's
   per-tool delta index. The encoder tracks each via
-  `ToolCallState` ([`wire.rs:888-894`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L888))
+  `ToolCallState` ([`wire.rs:888-894`](https://github.com/api7/aisix/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L888))
   and only emits the `content_block_start` once the id + name
   pair is known, then streams argument fragments as
   `input_json_delta` events
-  ([`wire.rs:985-1051`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L985)).
+  ([`wire.rs:985-1051`](https://github.com/api7/aisix/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L985)).
 - **Terminal sequence is atomic**. The chunk that carries
   `finish_reason` triggers `content_block_stop` for every
   open block, then exactly one `message_delta` carrying
   `stop_reason` + `usage.output_tokens`, then exactly one
   `message_stop`
-  ([`wire.rs:1054-1095`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L1054)).
+  ([`wire.rs:1054-1095`](https://github.com/api7/aisix/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L1054)).
 - **`finished` is a latch**. Once set, every further chunk is
   ignored. Some upstreams send a stray empty chunk after their
   terminal usage frame; the encoder drops it silently rather
   than emitting an event past `message_stop`.
-- **`force_finish`** ([`wire.rs:1108-1142`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L1108))
+- **`force_finish`** ([`wire.rs:1108-1142`](https://github.com/api7/aisix/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L1108))
   closes a stream that the upstream dropped without a
   `finish_reason` — synthesises `end_turn` so SDK clients
   observing the SSE never get a half-open content block.
@@ -278,7 +278,7 @@ typically don't:
 ### Wire framing
 
 `AnthropicSseEvent::to_sse_string`
-([`wire.rs:876-884`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L876))
+([`wire.rs:876-884`](https://github.com/api7/aisix/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L876))
 is the only place that formats the wire bytes:
 
 ```rust
@@ -292,7 +292,7 @@ pub fn to_sse_string(&self) -> String {
 ```
 
 `build_anthropic_sse_stream`
-([`messages.rs:531-573`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L531))
+([`messages.rs:531-573`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L531))
 is the futures stream that pumps chunks through the encoder and
 writes the resulting strings as the response body.
 
@@ -304,7 +304,7 @@ we've already emitted `message_start`, returning a regular JSON
 error response is no longer an option — the client is in
 streaming mode, the connection is reused. The cross-provider
 stream emits a proper error event
-([`messages.rs:555-563`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L555-L563)):
+([`messages.rs:555-563`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L555-L563)):
 
 ```rust
 let frame = format!(
@@ -341,12 +341,12 @@ consequences:
   cross-provider today.** The encoder handles text blocks +
   tool_use deltas; image content and `thinking` blocks are
   documented follow-ups
-  ([`messages.rs:18-20`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L18)).
+  ([`messages.rs:18-20`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L18)).
 - **`map_stop_reason` is bidirectional.** When the upstream is
   Anthropic and the gateway needs to fill `ChatResponse.finish_reason`,
   the same function maps the inbound `stop_reason` back to the
   IR's enum
-  ([`wire.rs:500`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L500)).
+  ([`wire.rs:500`](https://github.com/api7/aisix/blob/main/crates/aisix-provider-anthropic/src/wire.rs#L500)).
 
 ## Header policy
 
@@ -366,14 +366,14 @@ of upstream 401s.
 
 **Inbound (upstream Anthropic → client):**
 
-- *Streaming path* ([`messages.rs:283-301`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L283-L301)):
+- *Streaming path* ([`messages.rs:283-301`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L283-L301)):
   - `content-type` — copied from upstream (typically
     `text/event-stream`)
   - `cache-control: no-cache` — set explicitly so intermediaries
     cannot serve a stale streaming response
   - `x-aisix-request-id` — set on the outbound response so
     customers can correlate
-- *Non-streaming path* ([`messages.rs:344-348`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L344-L348)):
+- *Non-streaming path* ([`messages.rs:344-348`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L344-L348)):
   the response is rebuilt via `Json(...).into_response()`, which
   produces a fresh response with `content-type: application/json`
   and **no** upstream headers attached.
@@ -384,7 +384,7 @@ and `request-id` are **not** propagated to the client on either
 path today. The Anthropic SDK reads these for back-pressure /
 correlation, so this is an observable gap, not a deliberate
 omission; forwarding them on both paths is tracked in
-[issue #318](https://github.com/api7/ai-gateway/issues/318).
+[issue #318](https://github.com/api7/aisix/issues/318).
 
 ## Test coverage
 
@@ -392,29 +392,29 @@ Three nested layers of tests pin this design down. All in
 `crates/aisix-proxy/src/messages.rs`:
 
 - **Anthropic non-streaming passthrough** at
-  [`messages.rs:790-846`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L790)
+  [`messages.rs:790-846`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L790)
   — verify body echo, model rewrite (display_name in response,
   upstream id at the wire), `x-api-key` header on the outbound,
   `anthropic-version` header on the outbound.
 - **Anthropic streaming passthrough** at
-  [`messages.rs:1234-1272`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L1234)
+  [`messages.rs:1234-1272`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L1234)
   — verify the typed events (`message_start`,
   `content_block_delta`, `message_stop`) come through
   byte-identical; no re-encoding.
 - **Cross-provider matrix.** For OpenAI, Gemini, DeepSeek the
   test suite covers both non-streaming
-  ([`messages.rs:904-964`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L904),
-  [`messages.rs:1130-1180`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L1130),
-  [`messages.rs:1183-1227`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L1183))
+  ([`messages.rs:904-964`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L904),
+  [`messages.rs:1130-1180`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L1130),
+  [`messages.rs:1183-1227`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L1183))
   and streaming
-  ([`messages.rs:969-1030`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L969),
-  [`messages.rs:1351-1362`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L1351),
-  [`messages.rs:1364-1374`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L1364)).
+  ([`messages.rs:969-1030`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L969),
+  [`messages.rs:1351-1362`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L1351),
+  [`messages.rs:1364-1374`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L1364)).
   Inbound is always Anthropic-shape; upstream is mocked at the
   upstream's native shape; outbound assertions are
   Anthropic-shape again.
 - **Event-ordering invariants** in
-  [`wire.rs`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-provider-anthropic/src/wire.rs)
+  [`wire.rs`](https://github.com/api7/aisix/blob/main/crates/aisix-provider-anthropic/src/wire.rs)
   's own test module — every state-machine branch (first chunk
   carries content vs. doesn't, tool call interleaved with text,
   upstream drops without `finish_reason`, etc.) has at least
@@ -428,7 +428,7 @@ Three nested layers of tests pin this design down. All in
   path yet.** Text + tool_use is the current support boundary;
   image and `thinking` follow-ups are tracked but ship under a
   flag rather than blocking core protocol translation
-  ([`messages.rs:18-20`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/messages.rs#L18)).
+  ([`messages.rs:18-20`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/messages.rs#L18)).
 - **No reverse path.** A client speaking OpenAI's
   `/v1/chat/completions` against an Anthropic model goes through
   `chat.rs` and the OpenAI-shape encoder; `/v1/messages` is

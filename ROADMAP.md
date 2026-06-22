@@ -1,32 +1,14 @@
----
-title: Roadmap
-description: Planned and not-yet-fully-available capabilities for AISIX AI Gateway and AISIX Cloud.
-sidebar_position: 2
----
+# Roadmap
 
-This page tracks planned capabilities and areas that are not yet ready to document as generally available product behavior.
+This roadmap tracks planned capabilities and areas that are not yet ready to document as generally available product behavior.
 
-Use this page to understand direction. Use the rest of the documentation set to understand what is available today.
+Use this roadmap to understand direction. Use the [official documentation](https://docs.api7.ai/ai-gateway/) to understand what is available today.
 
 ## Principles
 
 - Main documentation pages describe current, verified behavior.
 - This roadmap collects planned or incomplete capabilities.
 - Presence on this page is not a delivery commitment.
-
-## Now
-
-### Gateway Documentation Rebuild
-
-Current status:
-- The old flat docs set is being replaced with a new customer-facing structure organized around overview, quickstart, integration, configuration, Cloud, operations, reference, and tutorials.
-
-Planned outcome:
-- A full official docs set for platform engineers and AI agent developers.
-
-Applies to:
-- `AISIX AI Gateway`
-- `AISIX Cloud`
 
 ### Provider Compatibility Expansion
 
@@ -69,7 +51,7 @@ Applies to:
 ### First-Party Data-Warehouse Sinks
 
 Current status:
-- The `object_store` observability exporter writes batched NDJSON telemetry to Amazon S3, Google Cloud Storage, or Azure Blob today. Loading that telemetry into a warehouse such as Snowflake or Databricks is a customer-run step — for example, Snowflake's Snowpipe auto-ingesting from the bucket, as covered in [Load AI gateway logs into Snowflake](tutorials/load-gateway-logs-into-snowflake.md).
+- The `object_store` observability exporter writes batched NDJSON telemetry to Amazon S3, Google Cloud Storage, or Azure Blob today. Loading that telemetry into a warehouse such as Snowflake or Databricks is a customer-run step.
 - A first-party sink that manages the pipe, the schema, and exactly-once streaming directly to the warehouse is not yet available.
 
 Planned outcome:
@@ -112,6 +94,6 @@ These areas should not be described as current product behavior unless implement
 
 ## Related Pages
 
-- [Feature Matrix](overview/feature-matrix.md)
-- [What Is AISIX AI Gateway](overview/what-is-aisix-ai-gateway.md)
-- [Deployment Modes](overview/deployment-modes.md)
+- [AISIX AI Gateway documentation](https://docs.api7.ai/ai-gateway/)
+- [AISIX AI Gateway quickstart](https://docs.api7.ai/ai-gateway/quickstart/)
+- [AISIX Cloud](https://api7.ai/ai-gateway)

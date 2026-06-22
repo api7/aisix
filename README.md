@@ -12,15 +12,15 @@ static binary with low per-request overhead. Self-host for free, forever.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/Built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
-[![Docs](https://img.shields.io/badge/docs-read-3aa757.svg)](docs/index.md)
+[![Docs](https://img.shields.io/badge/docs-read-3aa757.svg)](https://docs.api7.ai/ai-gateway/)
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2.svg)](https://discord.gg/dUmRZ7Rvf)
 [![Website](https://img.shields.io/badge/website-api7.ai-1a73e8.svg)](https://api7.ai/ai-gateway)
 
 [**Start free**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=ai-gateway) ·
-[**Documentation**](docs/index.md) ·
-[**Quickstart**](docs/quickstart/self-hosted.md) ·
+[**Documentation**](https://docs.api7.ai/ai-gateway/) ·
+[**Quickstart**](https://docs.api7.ai/ai-gateway/quickstart/) ·
 [**AISIX Cloud**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) ·
-[**Roadmap**](docs/roadmap.md)
+[**Roadmap**](ROADMAP.md)
 
 <br>
 
@@ -50,14 +50,14 @@ for a managed control plane with team governance, budgets, audit, and a dashboar
 
 AISIX is etcd-backed, so the fastest local run is Docker Compose (gateway + etcd). Grab the
 ready-to-run `docker-compose.yml` and example `config.yaml` from the
-[self-hosted quickstart](docs/quickstart/self-hosted.md), then:
+[self-hosted quickstart](https://docs.api7.ai/ai-gateway/quickstart/), then:
 
 ```bash
 docker compose up          # proxy → :3000, admin API → :3001
 ```
 
 Configure a model and an API key through the admin API on `:3001`
-([first model, first key, first request](docs/quickstart/first-model-first-key-first-request.md)),
+([quickstart](https://docs.api7.ai/ai-gateway/quickstart/)),
 then call the gateway exactly like OpenAI:
 
 ```bash
@@ -81,7 +81,7 @@ curl http://localhost:3000/v1/chat/completions \
 
 ## 🧩 Features — available today
 
-Anchored to the [feature matrix](docs/overview/feature-matrix.md); covered by 90+ E2E tests.
+Covered by 90+ E2E tests.
 
 - **OpenAI-compatible proxy** (`:3000`) — `chat/completions`, `responses`, `embeddings`,
   `rerank`, `images/generations`, `audio/{speech,transcriptions,translations}`,
@@ -122,8 +122,8 @@ OpenAI-shaped.
 
 Plus specialized handling for vendor quirks (e.g. DeepSeek reasoning content) and dedicated
 **rerank / embeddings** vendors (Cohere, Jina). Details in
-[adapter protocol families](docs/reference/adapters.md). More providers on the
-[roadmap](docs/roadmap.md).
+[adapter protocol families](https://docs.api7.ai/ai-gateway/reference/adapters). More providers on the
+[roadmap](ROADMAP.md).
 
 ## ☁️ Self-hosted vs AISIX Cloud
 
@@ -202,8 +202,8 @@ Deep dives: [protocol translation](docs/architecture/protocol-translation.md) ·
 
 ## 🗺️ Roadmap
 
-Highlights on the [roadmap](docs/roadmap.md); tracked live in
-[issues](https://github.com/api7/ai-gateway/issues):
+Highlights on the [roadmap](ROADMAP.md); tracked live in
+[issues](https://github.com/api7/aisix/issues):
 
 - 100+ additional provider integrations (Together, Fireworks, Replicate, …)
 - Semantic (embedding-similarity) caching + pgvector backend
@@ -226,14 +226,14 @@ cargo test --workspace
 # Coverage (matches the CI gate)
 cargo llvm-cov --workspace --lcov --output-path lcov.info
 
-# Run locally (needs a reachable etcd + a config.yaml — see the quickstart)
+# Run locally (needs a reachable etcd + a config.yaml — see the docs quickstart)
 cargo run -p aisix-server --bin aisix -- --config config.yaml
 ```
 
 ## 💬 Community
 
 - **Discord** — [discord.gg/dUmRZ7Rvf](https://discord.gg/dUmRZ7Rvf)
-- **Issues & discussions** — [github.com/api7/ai-gateway/issues](https://github.com/api7/ai-gateway/issues)
+- **Issues & discussions** — [github.com/api7/aisix/issues](https://github.com/api7/aisix/issues)
 - **Website** — [api7.ai/ai-gateway](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme)
 
 If AISIX is useful to you, a ⭐ helps other engineers find it.

@@ -37,14 +37,14 @@ flowchart LR
 
 Three components, in order of who owns the data:
 
-- **[`aisix_etcd::Supervisor`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs)**
+- **[`aisix_etcd::Supervisor`](https://github.com/api7/aisix/blob/main/crates/aisix-etcd/src/supervisor.rs)**
   — the single long-running tokio task that owns the etcd watch
   stream. Drains events, builds new snapshots, and atomically
   publishes them.
-- **[`aisix_core::SnapshotHandle<S>`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-core/src/snapshot.rs)**
+- **[`aisix_core::SnapshotHandle<S>`](https://github.com/api7/aisix/blob/main/crates/aisix-core/src/snapshot.rs)**
   — the lock-free handle every consumer reads from. Cheap to clone
   (just clones an `Arc`), atomic to load.
-- **[`aisix_core::ResourceTable<T>`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-core/src/snapshot.rs)**
+- **[`aisix_core::ResourceTable<T>`](https://github.com/api7/aisix/blob/main/crates/aisix-core/src/snapshot.rs)**
   — per-kind table inside `AisixSnapshot`. Two `DashMap` indices
   (id and name) sharing one `Arc<ResourceEntry<T>>`.
 
@@ -58,7 +58,7 @@ talks to etcd; nothing else takes a lock.
 The hot path is the chat-completions handler. The model lookup at
 the top of the request is the canonical shape every other
 snapshot-using handler follows
-([`crates/aisix-proxy/src/chat.rs:387`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/chat.rs#L387)):
+([`crates/aisix-proxy/src/chat.rs:387`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/chat.rs#L387)):
 
 ```rust
 let snapshot = state.snapshot.load();
@@ -73,7 +73,7 @@ let virtual_entry = snapshot
 ```
 
 `load()` returns a fresh `Arc<S>` without taking any lock
-([`snapshot.rs:145`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-core/src/snapshot.rs#L145)
+([`snapshot.rs:145`](https://github.com/api7/aisix/blob/main/crates/aisix-core/src/snapshot.rs#L145)
 delegates to [`ArcSwap::load_full`](https://docs.rs/arc-swap/latest/arc_swap/struct.ArcSwapAny.html#method.load_full),
 which uses a hybrid hazard-pointer scheme to publish the read
 without blocking writers or other readers).
@@ -110,7 +110,7 @@ up the old snapshot whenever the last reader finishes with it.
 ## Write path: etcd watch → loader → RCU swap
 
 The supervisor is the only writer
-([`crates/aisix-etcd/src/supervisor.rs:548`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs#L548)).
+([`crates/aisix-etcd/src/supervisor.rs:548`](https://github.com/api7/aisix/blob/main/crates/aisix-etcd/src/supervisor.rs#L548)).
 Its lifecycle:
 
 ```mermaid
@@ -159,17 +159,17 @@ sequenceDiagram
 
 Three apply paths, all going through the same `SnapshotHandle`:
 
-- **`apply_put`** ([`supervisor.rs:322`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs#L322))
+- **`apply_put`** ([`supervisor.rs:322`](https://github.com/api7/aisix/blob/main/crates/aisix-etcd/src/supervisor.rs#L322))
   — builds a tiny one-entry snapshot via the loader (which runs the
   same schema + parse the bootstrap path uses), then merges into a
   fresh clone of the current snapshot. Schema-rejected entries
   never reach the live snapshot; they surface as
-  [`rejected_resources`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-server/src/heartbeat.rs#L181)
+  [`rejected_resources`](https://github.com/api7/aisix/blob/main/crates/aisix-server/src/heartbeat.rs#L181)
   on the next heartbeat so cp-api can show them in the dashboard.
-- **`apply_delete`** ([`supervisor.rs:399`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs#L399))
+- **`apply_delete`** ([`supervisor.rs:399`](https://github.com/api7/aisix/blob/main/crates/aisix-etcd/src/supervisor.rs#L399))
   — clones the current snapshot, removes the entry from the right
   `ResourceTable`, publishes.
-- **`apply_resync`** ([`supervisor.rs:485`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs#L485))
+- **`apply_resync`** ([`supervisor.rs:485`](https://github.com/api7/aisix/blob/main/crates/aisix-etcd/src/supervisor.rs#L485))
   — wholesale replacement. Triggered on initial load and on etcd
   compaction (when the watch revision is older than etcd's
   minimum). Uses `store()` (full replace) rather than `rcu()`.
@@ -209,9 +209,9 @@ handle.store(new);                // publishes at T1 — but what if a
 
 Two `apply_put`s racing this way silently drop one of the events —
 both load the same `cur`, both publish their respective `new`, and
-only the last `store()` wins (see [issue #112](https://github.com/api7/ai-gateway/issues/112)).
+only the last `store()` wins (see [issue #112](https://github.com/api7/aisix/issues/112)).
 The current code uses ArcSwap's `rcu()`
-([`snapshot.rs:176`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-core/src/snapshot.rs#L176)):
+([`snapshot.rs:176`](https://github.com/api7/aisix/blob/main/crates/aisix-core/src/snapshot.rs#L176)):
 
 ```rust
 self.handle.rcu(|current| {
@@ -237,12 +237,12 @@ amplification is invisible.
 
 ### One subtle correctness invariant
 
-The "merge tiny into new" loop ([`supervisor.rs:352-372`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs#L352))
+The "merge tiny into new" loop ([`supervisor.rs:352-372`](https://github.com/api7/aisix/blob/main/crates/aisix-etcd/src/supervisor.rs#L352))
 must cover **every** `ResourceTable` on `AisixSnapshot`. A missing
 kind here means the watch path silently drops events of that kind
 even though the loader and the proxy both know about them. The
 test `all_three_tables_are_independent`
-([`models/snapshot.rs:88`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-core/src/models/snapshot.rs#L88))
+([`models/snapshot.rs:88`](https://github.com/api7/aisix/blob/main/crates/aisix-core/src/models/snapshot.rs#L88))
 gives a sanity check that the three foundational tables (models,
 api_keys, provider_keys) stay shard-independent; it does **not**
 cover the newer tables (guardrails, cache_policies,
@@ -265,7 +265,7 @@ human-friendly label):
 - `ProviderKey.display_name` — admin / dashboard surface
 
 `ResourceTable<T>` keeps two `DashMap` indices
-([`snapshot.rs:29`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-core/src/snapshot.rs#L29)):
+([`snapshot.rs:29`](https://github.com/api7/aisix/blob/main/crates/aisix-core/src/snapshot.rs#L29)):
 
 ```rust
 pub struct ResourceTable<T: Resource> {
@@ -276,7 +276,7 @@ pub struct ResourceTable<T: Resource> {
 
 The secondary index stores ids, not entries. Insert / remove /
 rename keep both indices coherent
-([`snapshot.rs:60`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-core/src/snapshot.rs#L60)).
+([`snapshot.rs:60`](https://github.com/api7/aisix/blob/main/crates/aisix-core/src/snapshot.rs#L60)).
 A rename (`insert` with same id, different name) walks both maps:
 remove the old name → id, insert new name → id, replace the entry
 under id.
@@ -287,7 +287,7 @@ Crucially, `DashMap` reads do not take a global lock; the shard
 lock is per-key. Reading entry A and entry B uses two independent
 shards.
 
-`name_conflicts()` ([`snapshot.rs:96`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-core/src/snapshot.rs#L96))
+`name_conflicts()` ([`snapshot.rs:96`](https://github.com/api7/aisix/blob/main/crates/aisix-core/src/snapshot.rs#L96))
 exposes duplicate-name detection to the admin API so a `POST
 /admin/v1/models` returns `409 DUPLICATE_NAME` instead of silently
 overwriting.
@@ -298,10 +298,10 @@ overwriting.
 
 The supervisor's watch stream stays open; events stop arriving.
 The DP keeps serving from the last published snapshot. `WatchStatus`
-([`supervisor.rs:46`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs#L46))
+([`supervisor.rs:46`](https://github.com/api7/aisix/blob/main/crates/aisix-etcd/src/supervisor.rs#L46))
 exposes the apply age (serialised as `snapshot_age_seconds` on the
 wire — see
-[`health_handler.rs:63`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-admin/src/health_handler.rs#L63))
+[`health_handler.rs:63`](https://github.com/api7/aisix/blob/main/crates/aisix-admin/src/health_handler.rs#L63))
 to `/admin/v1/health`, so operators see the freshness gap. The
 cache file on disk is the same data the in-memory snapshot
 reflects, so even a DP restart during partition boots into the
@@ -312,15 +312,15 @@ cached state and keeps serving.
 If the supervisor reconnects after being away long enough for etcd
 to compact the watch revision, the watch returns a `Compacted`
 event. The supervisor responds by restarting its cycle — calling
-`load_all` ([`supervisor.rs:593`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs#L593))
-and then `apply_resync` ([`supervisor.rs:485`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs#L485))
+`load_all` ([`supervisor.rs:593`](https://github.com/api7/aisix/blob/main/crates/aisix-etcd/src/supervisor.rs#L593))
+and then `apply_resync` ([`supervisor.rs:485`](https://github.com/api7/aisix/blob/main/crates/aisix-etcd/src/supervisor.rs#L485))
 to wholesale-replace the snapshot via `store()`. The revision
 counter resets to the new etcd revision.
 
 ### Transport failure / reconnect
 
 Watch stream errors trigger exponential backoff
-([`crates/aisix-etcd/src/backoff.rs`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/backoff.rs))
+([`crates/aisix-etcd/src/backoff.rs`](https://github.com/api7/aisix/blob/main/crates/aisix-etcd/src/backoff.rs))
 — 1s, 2s, 4s, … up to a 60s ceiling. Each retry is a fresh
 `load_all` + `watch` pair. The DP keeps the previous snapshot live
 during the backoff window.
@@ -328,7 +328,7 @@ during the backoff window.
 ### Cache corruption
 
 The snapshot cache file uses an atomic rename strategy
-([`crates/aisix-etcd/src/snapshot_cache.rs`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/snapshot_cache.rs)):
+([`crates/aisix-etcd/src/snapshot_cache.rs`](https://github.com/api7/aisix/blob/main/crates/aisix-etcd/src/snapshot_cache.rs)):
 write to `<path>.tmp`, fsync, rename over `<path>`. A torn write
 never corrupts the committed file. On boot, a malformed cache
 parses to `None` and the supervisor proceeds without an offline
@@ -363,7 +363,7 @@ Three things to look at when the DP seems stale:
 
 1. **`/admin/v1/health`** surfaces `snapshot_age_seconds` derived
    from `WatchStatus::snapshot()`
-   ([`supervisor.rs:93`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-etcd/src/supervisor.rs#L93)).
+   ([`supervisor.rs:93`](https://github.com/api7/aisix/blob/main/crates/aisix-etcd/src/supervisor.rs#L93)).
    A non-trivial age (minutes) means the supervisor isn't getting
    events.
 2. **`/admin/openapi.json`** does *not* include this; it's a
@@ -397,7 +397,7 @@ event apply at info level when `access_log` is enabled.
   schema fails ⇒ entry rejected ⇒ never enters the snapshot. The
   proxy never sees a half-valid Model with a missing field. The
   rejected entry surfaces through the
-  [`rejected_resources`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-server/src/heartbeat.rs#L181)
+  [`rejected_resources`](https://github.com/api7/aisix/blob/main/crates/aisix-server/src/heartbeat.rs#L181)
   field of the heartbeat payload to cp-api.
 
 ## Further reading

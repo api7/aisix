@@ -69,9 +69,9 @@ sequenceDiagram
 ```
 
 The module-level comment in
-[`crates/aisix-ratelimit/src/limiter.rs:1-16`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/limiter.rs#L1-L16)
+[`crates/aisix-ratelimit/src/limiter.rs:1-16`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/limiter.rs#L1-L16)
 states the contract verbatim, and the `Reservation` type
-([`limiter.rs:249-253`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/limiter.rs#L249))
+([`limiter.rs:249-253`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/limiter.rs#L249))
 makes the link between the two phases explicit at the type level
 — a phase-1 success returns one of these handles, and the handle
 is the only way to reach phase 2.
@@ -80,7 +80,7 @@ is the only way to reach phase 2.
 
 Each rate-limit key (an API-key id, a `model:<name>` bucket, or a
 policy-scope tuple) owns one `KeyState`
-([`limiter.rs:32-50`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/limiter.rs#L32)):
+([`limiter.rs:32-50`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/limiter.rs#L32)):
 
 ```rust
 // Source has bare fields; the trailing comments are this page's gloss.
@@ -94,7 +94,7 @@ struct KeyState {
 ```
 
 States live in a `DashMap<String, Arc<Mutex<KeyState>>>` on the
-`Limiter` ([`limiter.rs:77-100`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/limiter.rs#L77)).
+`Limiter` ([`limiter.rs:77-100`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/limiter.rs#L77)).
 The hot path locks **one** mutex per request (the one for that
 key); reads of other keys touch independent `DashMap` shards.
 Every operation under the mutex is O(1) — increment, compare,
@@ -112,7 +112,7 @@ below.
 
 ## The fixed-window counter
 
-`FixedWindowCounter` ([`crates/aisix-ratelimit/src/window.rs:18-23`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/window.rs#L18))
+`FixedWindowCounter` ([`crates/aisix-ratelimit/src/window.rs:18-23`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/window.rs#L18))
 is the workhorse:
 
 ```rust
@@ -124,7 +124,7 @@ pub struct FixedWindowCounter {
 ```
 
 `roll_if_stale`
-([`window.rs:39-45`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/window.rs#L39))
+([`window.rs:39-45`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/window.rs#L39))
 snaps the window to the nearest `window_secs` boundary on every
 touch; if the bucket has changed, count goes to zero. This is
 classic fixed-window, not sliding — we accept the 2× burst
@@ -134,19 +134,19 @@ Three operations:
 
 | Method | Used by | Semantics |
 |---|---|---|
-| [`check_and_increment`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/window.rs#L50) | RPM, RPD | atomic check + increment; returns `Full { retry_after_secs }` on overflow |
-| [`add`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/window.rs#L68) | TPM, TPD (phase 2) | unconditional increment; the usage is already paid for |
-| [`is_exceeded`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/window.rs#L97) | TPM, TPD (phase 1) | check-only; current window already over cap? reject |
+| [`check_and_increment`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/window.rs#L50) | RPM, RPD | atomic check + increment; returns `Full { retry_after_secs }` on overflow |
+| [`add`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/window.rs#L68) | TPM, TPD (phase 2) | unconditional increment; the usage is already paid for |
+| [`is_exceeded`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/window.rs#L97) | TPM, TPD (phase 1) | check-only; current window already over cap? reject |
 
 The retry-after hint
-([`window.rs:54-58`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/window.rs#L54))
+([`window.rs:54-58`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/window.rs#L54))
 is `window_end - now`, clamped to at least 1 second so a client
 that retries on a `Retry-After: 0` doesn't spin.
 
 ## Phase 1: pre-commit
 
 `Limiter::pre_commit`
-([`limiter.rs:171-243`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/limiter.rs#L171))
+([`limiter.rs:171-243`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/limiter.rs#L171))
 runs every check under one mutex lock. The check order matters:
 
 1. **Concurrency** — cheapest, never consumes a window slot. If
@@ -163,14 +163,14 @@ runs every check under one mutex lock. The check order matters:
    by decrementing RPM**, then return.
 
 The RPD compensation
-([`limiter.rs:215-233`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/limiter.rs#L215))
+([`limiter.rs:215-233`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/limiter.rs#L215))
 is subtle enough to warrant its own section.
 
 ### Why RPD rejection must decrement RPM, not reset it
 
 The first version of this code reset the RPM counter on RPD
 rejection — and that was a hard rate-limit bypass
-([issue #109](https://github.com/api7/ai-gateway/issues/109)).
+([issue #109](https://github.com/api7/aisix/issues/109)).
 Scenario: two concurrent requests on the same key, both pass
 RPM, both attempt RPD. One commits; the other hits RPD and
 "compensates" by re-initialising the entire RPM counter to zero.
@@ -179,7 +179,7 @@ attacker has earned back a full RPM window by tripping RPD.
 
 The current code decrements RPM by exactly **1** — the increment
 the current request just added — and `FixedWindowCounter::decrement`
-([`window.rs:81-86`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/window.rs#L81))
+([`window.rs:81-86`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/window.rs#L81))
 is window-aware: it only subtracts when `now` falls in the same
 window as `window_start`. If the window has already rolled
 between the increment and the compensation, the decrement is a
@@ -188,15 +188,15 @@ counts.
 
 Two regression tests pin this behaviour:
 `decrement_reduces_current_window_count_only`
-([`window.rs:175-190`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/window.rs#L175))
+([`window.rs:175-190`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/window.rs#L175))
 and `decrement_is_noop_after_window_rollover`
-([`window.rs:193-206`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/window.rs#L193)).
+([`window.rs:193-206`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/window.rs#L193)).
 
 ## Phase 2: post-deduct
 
 When the upstream returns successfully, the handler calls
 `reservation.commit_tokens(total)`
-([`limiter.rs:267-275`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/limiter.rs#L267)):
+([`limiter.rs:267-275`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/limiter.rs#L267)):
 
 ```rust
 pub fn commit_tokens(mut self, tokens: u64) {
@@ -216,7 +216,7 @@ Three things happen atomically under the per-key mutex:
 - `committed = true` so the `Drop` impl doesn't double-release.
 
 The non-streaming chat handler calls this directly
-([`crates/aisix-proxy/src/chat.rs:906`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/chat.rs#L906))
+([`crates/aisix-proxy/src/chat.rs:906`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/chat.rs#L906))
 with the upstream's reported `total_tokens`. The streaming path
 is different — it's the subject of [the next section](#streaming-the-deferred-phase-2).
 
@@ -226,7 +226,7 @@ If the request fails between `pre_commit` and `commit_tokens` —
 upstream timeout, network reset, panic in a downstream task — the
 `Reservation` is simply dropped without calling
 `commit_tokens`. The `Drop` impl
-([`limiter.rs:278-287`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/limiter.rs#L278))
+([`limiter.rs:278-287`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/limiter.rs#L278))
 releases the concurrency permit:
 
 ```rust
@@ -266,12 +266,12 @@ seconds after pre-commit. Holding the concurrency permit for that
 long would let a few slow streams permanently lock out the cap.
 
 The streaming handler
-([`chat.rs:519-581`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/chat.rs#L519))
+([`chat.rs:519-581`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/chat.rs#L519))
 splits phase 2 into two halves:
 
 1. **Immediately after upstream `chat_stream` succeeds**, capture
    the layer keys and **drop** the reservation
-   ([`chat.rs:536-537`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/chat.rs#L536-L537)):
+   ([`chat.rs:536-537`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/chat.rs#L536-L537)):
 
    ```rust
    let post_stream_keys = reservation.keys();
@@ -284,7 +284,7 @@ splits phase 2 into two halves:
 2. **When the SSE stream terminates upstream** — i.e. the
    completion callback fires with the parsed usage block — the
    handler retroactively accounts for the tokens
-   ([`chat.rs:577-579`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/chat.rs#L577-L579)):
+   ([`chat.rs:577-579`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/chat.rs#L577-L579)):
 
    ```rust
    for key in &post_stream_keys {
@@ -293,7 +293,7 @@ splits phase 2 into two halves:
    ```
 
    `add_tokens_post_stream`
-   ([`limiter.rs:147-156`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/limiter.rs#L147))
+   ([`limiter.rs:147-156`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/limiter.rs#L147))
    is a tokens-only update that lazily initialises the per-key
    state if it has not been seen yet (e.g. first request after a
    restart), and is a no-op when `tokens == 0` (an empty stream
@@ -304,7 +304,7 @@ splits phase 2 into two halves:
 Before this fix, the streaming handler called
 `reservation.commit_tokens(0)` immediately after dispatching the
 stream — TPM was effectively disabled for all streaming traffic
-([issue #108](https://github.com/api7/ai-gateway/issues/108)).
+([issue #108](https://github.com/api7/aisix/issues/108)).
 Since streaming is the majority of production LLM traffic, this
 silently disabled the TPM cap for the dominant path.
 
@@ -326,11 +326,11 @@ limit:
 | Policy (api_key / model / team / member scope) | `policy:<scope>:<scope_ref>:<entry_id>` | `rate_limit_policies` table on the snapshot |
 
 `quota::reserve_layers`
-([`crates/aisix-proxy/src/quota.rs:69-125`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/quota.rs#L69))
+([`crates/aisix-proxy/src/quota.rs:69-125`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/quota.rs#L69))
 walks all three layers, calling `pre_commit` for each that
 applies, and packages the resulting reservations into a
 `MultiReservation`
-([`limiter.rs:289-312`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/limiter.rs#L289)).
+([`limiter.rs:289-312`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/limiter.rs#L289)).
 All layers use **AND** logic — any one rejection 429s the
 request.
 
@@ -338,11 +338,11 @@ The wrapper is a thin guard: `commit_tokens(total)` walks every
 layer and commits the same token count; `Drop` releases every
 permit. The chat handler calls it via
 `enforce_rate_limit`
-([`quota.rs:148-154`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/quota.rs#L148)).
+([`quota.rs:148-154`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/quota.rs#L148)).
 
 Policy windows are translated to RPM/RPD on the fly by
 `policy_to_rate_limit`
-([`quota.rs:48-66`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/quota.rs#L48)):
+([`quota.rs:48-66`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/quota.rs#L48)):
 `second` scales by 60 to populate `rpm`; `minute` is direct;
 `hour` scales by 24 to populate `rpd`. The KeyState struct
 itself only stores minute and day counters — finer granularities
@@ -354,19 +354,19 @@ are an interpolation on top.
 
 A rate-limit rejection produces HTTP 429 via
 `ProxyError::RateLimit`
-([`crates/aisix-proxy/src/error.rs:106`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/error.rs#L106))
+([`crates/aisix-proxy/src/error.rs:106`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/error.rs#L106))
 mapping to `StatusCode::TOO_MANY_REQUESTS`
-([`error.rs:123`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/error.rs#L123)).
+([`error.rs:123`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/error.rs#L123)).
 The body is a JSON envelope with `error.type =
 "rate_limit_exceeded"`
-([`error.rs:141`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/error.rs#L141))
+([`error.rs:141`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/error.rs#L141))
 so clients can disambiguate from a 429 produced by an upstream
 provider.
 
 The `Retry-After` header is set
-([`error.rs:166-179`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/error.rs#L166))
+([`error.rs:166-179`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/error.rs#L166))
 when `RateLimitError::retry_after_secs`
-([`crates/aisix-ratelimit/src/error.rs:33-43`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/error.rs#L33))
+([`crates/aisix-ratelimit/src/error.rs:33-43`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/error.rs#L33))
 returns `Some` — that is, for `Requests` and `Tokens` errors but
 not for `Concurrency`, which is bursty and doesn't roll over a
 calendar boundary.
@@ -375,9 +375,9 @@ calendar boundary.
 
 Every successful chat response gets `x-ratelimit-*` headers
 populated by `inject_ratelimit_headers`
-([`crates/aisix-proxy/src/render.rs:145-192`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/render.rs#L145-L192)),
+([`crates/aisix-proxy/src/render.rs:145-192`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/render.rs#L145-L192)),
 called from the handler
-([`chat.rs:144-146`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/chat.rs#L144-L146))
+([`chat.rs:144-146`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/chat.rs#L144-L146))
 *after* `commit_tokens` so the counters reflect the just-completed
 request:
 
@@ -401,13 +401,13 @@ header — added so the same SDK code path that watches the request
 budget can also see in-flight slots. The reset values carry an
 `s` suffix on the wire (`"47s"`, not `"47"`); the `format!("{}s",
 …)` is in
-[`render.rs:169`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-proxy/src/render.rs#L169).
+[`render.rs:169`](https://github.com/api7/aisix/blob/main/crates/aisix-proxy/src/render.rs#L169).
 Only headers whose corresponding limit is configured (non-`None`)
 are emitted; unconfigured limits stay absent rather than emitting
 an `Inf` sentinel.
 
 `Limiter::peek`
-([`limiter.rs:107-131`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/limiter.rs#L107))
+([`limiter.rs:107-131`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/limiter.rs#L107))
 is read-only — it rolls the windows for accurate "remaining"
 math but never increments. A `peek` on a key that has never been
 seen returns `None`, and the handler omits all the headers in
@@ -509,12 +509,12 @@ revisiting if we ever need long-running stable processes.
 ### Clock injection for tests
 
 `SystemClock`
-([`crates/aisix-ratelimit/src/clock.rs:19-25`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/clock.rs#L19))
+([`crates/aisix-ratelimit/src/clock.rs:19-25`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/clock.rs#L19))
 is the production clock. Tests use `TestClock`
-([`clock.rs:31-48`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/clock.rs#L31))
+([`clock.rs:31-48`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/clock.rs#L31))
 which exposes `advance` / `set` on an `AtomicU64`. The clock is
 injected via `Limiter::with_clock`
-([`limiter.rs:95-100`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/limiter.rs#L95))
+([`limiter.rs:95-100`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/limiter.rs#L95))
 so window-boundary behaviour can be tested deterministically
 without `sleep`.
 
@@ -522,11 +522,11 @@ without `sleep`.
 
 The two regression issues #108 (streaming TPM bypass) and #109
 (RPD rejection RPM bypass) both have regression tests in
-[`limiter.rs:322-735`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/limiter.rs#L322).
+[`limiter.rs:322-735`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/limiter.rs#L322).
 The window-arithmetic edge cases are covered in
-[`window.rs:110-218`](https://github.com/api7/ai-gateway/blob/main/crates/aisix-ratelimit/src/window.rs#L110).
+[`window.rs:110-218`](https://github.com/api7/aisix/blob/main/crates/aisix-ratelimit/src/window.rs#L110).
 End-to-end isolation across callers is verified in
-[`tests/e2e/src/cases/concurrency-e2e.test.ts`](https://github.com/api7/ai-gateway/blob/main/tests/e2e/src/cases/concurrency-e2e.test.ts).
+[`tests/e2e/src/cases/concurrency-e2e.test.ts`](https://github.com/api7/aisix/blob/main/tests/e2e/src/cases/concurrency-e2e.test.ts).
 
 ## What this design does not do
 
