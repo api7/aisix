@@ -1,6 +1,7 @@
 //! Pre-provisioned mTLS bundle bootstrap path (api7ee parity).
 //!
-//! Counterpart to `register.rs`. When the operator mints a cert via
+//! This is the only bootstrap path — it replaces the removed legacy
+//! `/dp/register` round-trip. When the operator mints a cert via
 //! the dashboard's `CertIssueCard` (see AISIX-Cloud cp-api's
 //! `POST /api/environments/:env_id/gateway_certificates`), the
 //! resulting cert + key + CA PEM trio is inlined into the DP's

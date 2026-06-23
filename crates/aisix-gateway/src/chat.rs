@@ -52,7 +52,10 @@ pub enum Role {
 ///     blocks. For non-array shapes this is the original string (or
 ///     `""` for `null`). Bridges that don't speak content blocks
 ///     (Anthropic / Gemini cross-provider translation today) read this
-///     and silently skip non-text blocks per docs §4.5.
+///     and silently skip non-text blocks (images/audio): a cross-provider
+///     request keeps only the text. Documented for users under
+///     "Cross-Provider Content Limitations" in the provider-compatibility
+///     reference.
 ///   * [`Self::content_blocks`] holds the **raw array** verbatim when
 ///     the caller sent the typed-block form. Bridges that DO support
 ///     content blocks (the OpenAI-compat bridge) forward this verbatim
@@ -76,9 +79,9 @@ pub struct ChatMessage {
     /// `null` content shapes. Bridges that support content blocks
     /// (the OpenAI-compat bridge) forward this verbatim to upstream;
     /// bridges that don't (Anthropic / Gemini cross-provider
-    /// translation today) consult only `content` (concatenated text)
-    /// per docs §4.5 ("skip non-text blocks silently on the inbound
-    /// parse").
+    /// translation today) consult only `content` (concatenated text) and
+    /// silently skip the non-text blocks on the inbound parse, so a
+    /// cross-provider request drops images/audio.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_blocks: Option<Vec<Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

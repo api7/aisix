@@ -30,11 +30,12 @@ import {
 // content-block array would break every multimodal caller.
 //
 // Cross-provider vision translation (caller's image_url →
-// Anthropic image content block) is documented as a known gap in
-// `docs/api-proxy.md` §4.5 ("image blocks ... skip non-text blocks
-// silently on the inbound parse") and is out of scope for this
-// PR — the OpenAI-native path is the most-used vision path and a
-// regression there breaks the largest callers.
+// Anthropic image content block) is a known gap: the translation path
+// keeps only the text and silently skips non-text blocks. It is
+// documented for users under "Cross-Provider Content Limitations" in the
+// provider-compatibility reference, and is out of scope for this test —
+// the OpenAI-native path is the most-used vision path and a regression
+// there breaks the largest callers.
 //
 // References:
 // - OpenAI Vision guide
