@@ -32,11 +32,13 @@ pub struct ProviderKey {
     /// Operator-facing label, unique within the gateway. Surfaces in
     /// the Admin API list view and in dashboard UIs that wrap this
     /// resource.
+    #[schemars(length(min = 1))]
     pub display_name: String,
 
     /// Upstream provider's API key. The data plane receives plaintext so it
     /// can authenticate to the upstream provider. Protect the configuration
     /// store and transport accordingly.
+    #[schemars(length(min = 1))]
     pub secret: String,
 
     /// Override base URL for the upstream provider. Required for custom or OpenAI-compatible providers that should not use a built-in vendor endpoint.
@@ -126,6 +128,24 @@ where
     Ok(out)
 }
 
+/// Provider-key category: `catalog` for curated providers, `byo` for
+/// bring-your-own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum TelemetryKind {
+    Catalog,
+    Byo,
+}
+
+impl TelemetryKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Catalog => "catalog",
+            Self::Byo => "byo",
+        }
+    }
+}
+
 /// Telemetry attribution tags emitted with requests routed through this provider key.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -133,7 +153,7 @@ pub struct TelemetryTags {
     /// Provider-key category, such as `"catalog"` for curated providers or
     /// `"byo"` for bring-your-own providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
+    pub kind: Option<TelemetryKind>,
 
     /// Whether this provider is surfaced in the featured list.
     #[serde(default)]
@@ -330,7 +350,7 @@ mod tests {
         .unwrap();
         assert_eq!(p.provider, "deepseek");
         assert_eq!(p.adapter, Some(Adapter::Openai));
-        assert_eq!(p.telemetry_tags.kind.as_deref(), Some("catalog"));
+        assert_eq!(p.telemetry_tags.kind, Some(TelemetryKind::Catalog));
         assert!(p.telemetry_tags.featured);
         assert_eq!(
             p.telemetry_tags.branded_provider.as_deref(),
@@ -356,7 +376,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(p.telemetry_tags.kind.as_deref(), Some("byo"));
+        assert_eq!(p.telemetry_tags.kind, Some(TelemetryKind::Byo));
         assert!(!p.telemetry_tags.featured);
         assert_eq!(p.telemetry_tags.branded_provider, None);
         assert_eq!(p.telemetry_tags.byo_label.as_deref(), Some("platform-team"));

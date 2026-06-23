@@ -46,7 +46,7 @@ pub use observability_exporter::{
 };
 pub use provider_key::{
     ParamConstraints, ProviderKey, RequestOverrides, ResponseOverrides, StreamDoneMarker,
-    TelemetryTags,
+    TelemetryKind, TelemetryTags,
 };
 pub use rate_limit::RateLimit;
 pub use rate_limit_policy::{PolicyScope, PolicyWindow, RateLimitPolicy};

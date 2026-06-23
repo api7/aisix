@@ -1819,7 +1819,7 @@ fn emit_anthropic_usage_event(
         attempt_model: attempt.model,
         error_class: attempt.error_class,
         error_message: attempt.error_message,
-        provider_kind: sanitize_tag(tags.kind.unwrap_or_default()),
+        provider_kind: sanitize_tag(tags.kind.map(|k| k.as_str().to_owned()).unwrap_or_default()),
         provider_featured: tags.featured,
         branded_provider: sanitize_tag(tags.branded_provider.unwrap_or_default()),
         pk_label: sanitize_tag(tags.pk_label.unwrap_or_default()),

@@ -1,144 +1,58 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "ProviderKey",
-  "type": "object",
-  "required": [
-    "display_name",
-    "secret"
-  ],
-  "properties": {
-    "adapter": {
-      "description": "Upstream API protocol family used when provider-specific dispatch is unavailable.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/Adapter"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "api_base": {
-      "description": "Override base URL for the upstream provider. Required for custom or OpenAI-compatible providers that should not use a built-in vendor endpoint.",
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "display_name": {
-      "description": "Operator-facing label, unique within the gateway. Surfaces in the Admin API list view and in dashboard UIs that wrap this resource.",
-      "type": "string"
-    },
-    "provider": {
-      "description": "Upstream provider identifier, such as `\"deepseek\"`, `\"openai\"`, or a model catalog ID. The gateway uses this value for provider-specific dispatch and base URL validation.",
-      "default": "",
-      "type": "string"
-    },
-    "request": {
-      "description": "Per-key request-shape overrides applied by supported provider paths before dispatch to the upstream provider.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/RequestOverrides"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "response": {
-      "description": "Per-key response-shape overrides applied by provider bridges that support response transformation.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/ResponseOverrides"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "secret": {
-      "description": "Upstream provider's API key. The data plane receives plaintext so it can authenticate to the upstream provider. Protect the configuration store and transport accordingly.",
-      "type": "string"
-    },
-    "strip_headers": {
-      "description": "Inbound headers removed before passthrough forwarding.",
-      "default": [
-        "authorization",
-        "cookie",
-        "set-cookie",
-        "x-api-key"
-      ],
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "telemetry_tags": {
-      "description": "Telemetry tags carried alongside the key for metric and log emission.",
-      "default": {
-        "featured": false
-      },
-      "allOf": [
-        {
-          "$ref": "#/definitions/TelemetryTags"
-        }
-      ]
-    }
-  },
   "additionalProperties": false,
   "definitions": {
     "Adapter": {
       "description": "Upstream API protocol family used for provider dispatch.",
-      "type": "string",
       "enum": [
         "openai",
         "anthropic",
         "bedrock",
         "vertex",
         "azure-openai"
-      ]
+      ],
+      "type": "string"
     },
     "ParamConstraints": {
+      "additionalProperties": false,
       "description": "Numeric range clamps applied to chat-completion request bodies.",
-      "type": "object",
       "properties": {
         "temperature_max": {
           "description": "Upper bound for `temperature`. Values above this are clamped to this value. If omitted, no upper bound is applied.",
+          "format": "double",
           "type": [
             "number",
             "null"
-          ],
-          "format": "double"
+          ]
         },
         "temperature_min": {
           "description": "Lower bound for `temperature`. Values below this are clamped to this value. If omitted, no lower bound is applied.",
+          "format": "double",
           "type": [
             "number",
             "null"
-          ],
-          "format": "double"
+          ]
         }
       },
-      "additionalProperties": false
+      "type": "object"
     },
     "RequestOverrides": {
+      "additionalProperties": false,
       "description": "Per-`ProviderKey` request-shape overrides. Use these fields to rename request body parameters, clamp supported numeric parameters, add fallback outbound headers, or add fallback outbound body fields.",
-      "type": "object",
       "properties": {
         "default_body_fields": {
+          "additionalProperties": true,
           "description": "`apply_default_body_fields` input. Top-level body fields added when the caller did not set them. `serde_json::Map` preserves insertion order on serialize, matching the etcd round-trip.",
-          "type": "object",
-          "additionalProperties": true
+          "type": "object"
         },
         "default_headers": {
-          "description": "`apply_default_headers` input. Top-level headers added to the outbound request when the caller did not set them. Reserved auth headers are dropped by `apply_default_headers` as defense-in-depth.",
-          "type": "object",
           "additionalProperties": {
             "type": "string"
-          }
+          },
+          "description": "`apply_default_headers` input. Top-level headers added to the outbound request when the caller did not set them. Reserved auth headers are dropped by `apply_default_headers` as defense-in-depth.",
+          "type": "object"
         },
         "param_constraints": {
-          "description": "Parameter constraints applied to the outbound request. If omitted, no clamping is applied.",
           "anyOf": [
             {
               "$ref": "#/definitions/ParamConstraints"
@@ -146,25 +60,26 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Parameter constraints applied to the outbound request. If omitted, no clamping is applied."
         },
         "param_renames": {
-          "description": "`apply_param_renames` input. Top-level body keys named on the left are renamed to the right. Leave empty to preserve request parameter names.",
-          "type": "object",
           "additionalProperties": {
             "type": "string"
-          }
+          },
+          "description": "`apply_param_renames` input. Top-level body keys named on the left are renamed to the right. Leave empty to preserve request parameter names.",
+          "type": "object"
         }
       },
-      "additionalProperties": false
+      "type": "object"
     },
     "ResponseOverrides": {
+      "additionalProperties": false,
       "description": "Per-`ProviderKey` response-shape overrides. Use these fields to describe stream termination behavior, flatten list-style content when needed, select an error envelope strategy, or lift provider-specific reasoning content.",
-      "type": "object",
       "properties": {
         "content_list_to_string": {
-          "description": "When `true`, the request-body `messages[*].content` array of text blocks gets flattened to a single string before dispatch.",
           "default": false,
+          "description": "When `true`, the request-body `messages[*].content` array of text blocks gets flattened to a single string before dispatch.",
           "type": "boolean"
         },
         "error_envelope": {
@@ -182,7 +97,6 @@
           ]
         },
         "stream_done_marker": {
-          "description": "Stream `[DONE]` terminator expectation. If omitted, either presence or absence of the terminator is accepted.",
           "anyOf": [
             {
               "$ref": "#/definitions/StreamDoneMarker"
@@ -190,40 +104,49 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Stream `[DONE]` terminator expectation. If omitted, either presence or absence of the terminator is accepted."
         }
       },
-      "additionalProperties": false
+      "type": "object"
     },
     "StreamDoneMarker": {
       "description": "Stream `[DONE]` terminator policy for an SSE response. Values are `\"required\"`, `\"optional\"`, or `\"none\"`.",
       "oneOf": [
         {
           "description": "Upstream is expected to emit `data: [DONE]`. Absence is logged as a diagnostic warning.",
-          "type": "string",
           "enum": [
             "required"
-          ]
+          ],
+          "type": "string"
         },
         {
           "description": "Either presence or absence is acceptable. Used when the upstream is OpenAI-compatible but does not require the terminator.",
-          "type": "string",
           "enum": [
             "optional"
-          ]
+          ],
+          "type": "string"
         },
         {
           "description": "Upstream is expected to omit the marker and terminate on connection close.",
-          "type": "string",
           "enum": [
             "none"
-          ]
+          ],
+          "type": "string"
         }
       ]
     },
+    "TelemetryKind": {
+      "description": "Provider-key category: `catalog` for curated providers, `byo` for bring-your-own.",
+      "enum": [
+        "catalog",
+        "byo"
+      ],
+      "type": "string"
+    },
     "TelemetryTags": {
+      "additionalProperties": false,
       "description": "Telemetry attribution tags emitted with requests routed through this provider key.",
-      "type": "object",
       "properties": {
         "branded_provider": {
           "description": "Branded provider slug for catalog entries, such as `\"openai\"` or `\"anthropic\"`. Bring-your-own providers leave this field unset.",
@@ -240,16 +163,20 @@
           ]
         },
         "featured": {
-          "description": "Whether this provider is surfaced in the featured list.",
           "default": false,
+          "description": "Whether this provider is surfaced in the featured list.",
           "type": "boolean"
         },
         "kind": {
-          "description": "Provider-key category, such as `\"catalog\"` for curated providers or `\"byo\"` for bring-your-own providers.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TelemetryKind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Provider-key category, such as `\"catalog\"` for curated providers or `\"byo\"` for bring-your-own providers."
         },
         "pk_label": {
           "description": "Operator-defined label for this provider key, such as `\"production\"` or `\"shared-test\"`.",
@@ -259,7 +186,94 @@
           ]
         }
       },
-      "additionalProperties": false
+      "type": "object"
     }
-  }
+  },
+  "properties": {
+    "adapter": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Adapter"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Upstream API protocol family used when provider-specific dispatch is unavailable."
+    },
+    "api_base": {
+      "description": "Override base URL for the upstream provider. Required for custom or OpenAI-compatible providers that should not use a built-in vendor endpoint.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "display_name": {
+      "description": "Operator-facing label, unique within the gateway. Surfaces in the Admin API list view and in dashboard UIs that wrap this resource.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "provider": {
+      "default": "",
+      "description": "Upstream provider identifier, such as `\"deepseek\"`, `\"openai\"`, or a model catalog ID. The gateway uses this value for provider-specific dispatch and base URL validation.",
+      "type": "string"
+    },
+    "request": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RequestOverrides"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Per-key request-shape overrides applied by supported provider paths before dispatch to the upstream provider."
+    },
+    "response": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ResponseOverrides"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Per-key response-shape overrides applied by provider bridges that support response transformation."
+    },
+    "secret": {
+      "description": "Upstream provider's API key. The data plane receives plaintext so it can authenticate to the upstream provider. Protect the configuration store and transport accordingly.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "strip_headers": {
+      "default": [
+        "authorization",
+        "cookie",
+        "set-cookie",
+        "x-api-key"
+      ],
+      "description": "Inbound headers removed before passthrough forwarding.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "telemetry_tags": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/TelemetryTags"
+        }
+      ],
+      "default": {
+        "featured": false
+      },
+      "description": "Telemetry tags carried alongside the key for metric and log emission."
+    }
+  },
+  "required": [
+    "display_name",
+    "secret"
+  ],
+  "title": "ProviderKey",
+  "type": "object"
 }

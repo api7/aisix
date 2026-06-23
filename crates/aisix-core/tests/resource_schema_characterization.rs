@@ -8,7 +8,7 @@
 //! case is obvious. New resources append their own table as they migrate.
 
 use aisix_core::models::schema::{
-    validate_apikey, validate_cache_policy, validate_rate_limit_policy,
+    validate_apikey, validate_cache_policy, validate_provider_key, validate_rate_limit_policy,
 };
 use serde_json::{json, Value};
 
@@ -265,6 +265,134 @@ fn rate_limit_policy_corpus() {
                 "negative max_requests",
                 false,
                 json!({"name": "q", "scope": "team", "scope_ref": "t1", "window": "minute", "max_requests": -1}),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn provider_key_corpus() {
+    check(
+        validate_provider_key,
+        &[
+            (
+                "minimal",
+                true,
+                json!({"display_name": "openai-prod", "secret": "sk-x"}),
+            ),
+            (
+                "with api_base + provider",
+                true,
+                json!({"display_name": "p", "secret": "sk-x", "api_base": "https://api.openai.com/v1", "provider": "deepseek"}),
+            ),
+            ("missing display_name", false, json!({"secret": "sk-x"})),
+            ("missing secret", false, json!({"display_name": "x"})),
+            (
+                "unknown top-level field",
+                false,
+                json!({"display_name": "x", "secret": "k", "rogue": 1}),
+            ),
+            (
+                "empty display_name",
+                false,
+                json!({"display_name": "", "secret": "k"}),
+            ),
+            (
+                "empty secret",
+                false,
+                json!({"display_name": "x", "secret": ""}),
+            ),
+            (
+                "adapter azure-openai",
+                true,
+                json!({"display_name": "x", "secret": "k", "adapter": "azure-openai"}),
+            ),
+            (
+                "adapter invalid",
+                false,
+                json!({"display_name": "x", "secret": "k", "adapter": "not-a-real-adapter"}),
+            ),
+            // option_add_null_type=true: optional fields accept explicit null.
+            (
+                "adapter null",
+                true,
+                json!({"display_name": "x", "secret": "k", "adapter": null}),
+            ),
+            (
+                "telemetry catalog",
+                true,
+                json!({"display_name": "x", "secret": "k", "telemetry_tags": {"kind": "catalog", "featured": true, "branded_provider": "deepseek", "pk_label": "prod"}}),
+            ),
+            (
+                "telemetry byo, branded omitted",
+                true,
+                json!({"display_name": "x", "secret": "k", "telemetry_tags": {"kind": "byo", "byo_label": "platform-team"}}),
+            ),
+            // The load-bearing nullable case: cp-api sends branded_provider:null.
+            (
+                "telemetry branded_provider null",
+                true,
+                json!({"display_name": "x", "secret": "k", "telemetry_tags": {"branded_provider": null}}),
+            ),
+            (
+                "telemetry unknown tag",
+                false,
+                json!({"display_name": "x", "secret": "k", "telemetry_tags": {"unknown_tag": "v"}}),
+            ),
+            (
+                "telemetry kind invalid (closed enum)",
+                false,
+                json!({"display_name": "x", "secret": "k", "telemetry_tags": {"kind": "third-party"}}),
+            ),
+            (
+                "request empty",
+                true,
+                json!({"display_name": "x", "secret": "k", "request": {}}),
+            ),
+            (
+                "request full",
+                true,
+                json!({"display_name": "x", "secret": "k", "request": {"param_renames": {"max_completion_tokens": "max_tokens"}, "param_constraints": {"temperature_max": 1.0}, "default_headers": {"X-Foo": "bar"}, "default_body_fields": {"safe_prompt": true}}}),
+            ),
+            (
+                "request typo field",
+                false,
+                json!({"display_name": "x", "secret": "k", "request": {"param_rename": {}}}),
+            ),
+            (
+                "param_constraints unknown field",
+                false,
+                json!({"display_name": "x", "secret": "k", "request": {"param_constraints": {"top_p_max": 0.9}}}),
+            ),
+            (
+                "response full",
+                true,
+                json!({"display_name": "x", "secret": "k", "response": {"stream_done_marker": "none", "content_list_to_string": false, "error_envelope": "openai", "reasoning_field": "delta.reasoning_content"}}),
+            ),
+            (
+                "response bad stream_done_marker",
+                false,
+                json!({"display_name": "x", "secret": "k", "response": {"stream_done_marker": "maybe"}}),
+            ),
+            (
+                "response stream_done_marker case-sensitive",
+                false,
+                json!({"display_name": "x", "secret": "k", "response": {"stream_done_marker": "Required"}}),
+            ),
+            (
+                "response typo field",
+                false,
+                json!({"display_name": "x", "secret": "k", "response": {"reasoning_fields": "x"}}),
+            ),
+            (
+                "strip_headers empty",
+                true,
+                json!({"display_name": "x", "secret": "k", "strip_headers": []}),
+            ),
+            (
+                "strip_headers non-string item",
+                false,
+                json!({"display_name": "x", "secret": "k", "strip_headers": [1, 2]}),
             ),
         ],
     );

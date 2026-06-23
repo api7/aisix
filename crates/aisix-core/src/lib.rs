@@ -37,7 +37,7 @@ pub use models::{
     GuardrailHookPoint, GuardrailKind, KeywordConfig, KeywordPattern, Model, ObservabilityExporter,
     OnAllFilteredPolicy, ParamConstraints, PolicyScope, PolicyWindow, ProviderKey, RateLimit,
     RateLimitPolicy, RequestOverrides, ResponseOverrides, Routing, RoutingStrategy, RoutingTarget,
-    SchemaError, StreamDoneMarker, TelemetryTags, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+    SchemaError, StreamDoneMarker, TelemetryKind, TelemetryTags, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use resource::{Resource, ResourceEntry};
 pub use snapshot::{ResourceTable, SnapshotHandle};

@@ -44,7 +44,7 @@ impl Schemas {
                 .build(&apikey_root_schema())
                 .expect("apikey schema is well-formed"),
             provider_key: jsonschema::options()
-                .build(&provider_key_schema())
+                .build(&provider_key_root_schema())
                 .expect("provider_key schema is well-formed"),
             guardrail: jsonschema::options()
                 .build(&guardrail_schema())
@@ -164,102 +164,13 @@ pub fn apikey_root_schema() -> Value {
     struct_root_schema::<crate::models::ApiKey>(true)
 }
 
-fn provider_key_schema() -> Value {
-    // `provider`, `adapter`, and `telemetry_tags` were added as a
-    // skeleton for issue #302 Phase A (PR #298). `request` and
-    // `response` were added in Phase A2.5 to land the on-disk shape
-    // for the `RuntimeConfig.request` / `RuntimeConfig.response`
-    // blocks from issue #302 §5. All Phase A fields are optional on
-    // the wire (matching `#[serde(default)]` on the Rust side) so
-    // existing ProviderKey payloads without these fields keep
-    // validating. No dispatch path reads them in this PR.
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["display_name", "secret"],
-        "additionalProperties": false,
-        "properties": {
-            "display_name": { "type": "string", "minLength": 1 },
-            "secret":       { "type": "string", "minLength": 1 },
-            "api_base":     { "type": "string" },
-            // Phase A skeleton — vendor identity, free-form string.
-            // Closed-set validation is deferred to a follow-up Phase A
-            // PR that wires dispatch onto `provider`.
-            "provider":     { "type": "string" },
-            // Phase A skeleton — wire-shape adapter. Pinned to the
-            // closed Adapter enum.
-            "adapter":      { "type": "string", "enum": ["openai", "anthropic", "bedrock", "vertex", "azure-openai"] },
-            "telemetry_tags": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "kind":             { "type": "string", "enum": ["catalog", "byo"] },
-                    "featured":         { "type": "boolean" },
-                    "branded_provider": { "type": ["string", "null"] },
-                    "pk_label":         { "type": ["string", "null"] },
-                    "byo_label":        { "type": ["string", "null"] }
-                }
-            },
-            // Phase A2.5 — RuntimeConfig.request, see issue #302 §5.
-            // Each sub-field is the input to a primitive apply
-            // function in aisix-provider-openai's overrides module.
-            "request": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "param_renames": {
-                        "type": "object",
-                        "additionalProperties": { "type": "string" }
-                    },
-                    "param_constraints": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "properties": {
-                            "temperature_max": { "type": "number" },
-                            "temperature_min": { "type": "number" }
-                        }
-                    },
-                    "default_headers": {
-                        "type": "object",
-                        "additionalProperties": { "type": "string" }
-                    },
-                    // Free-form on purpose — the cp-api spec lets
-                    // operators set any default top-level body field
-                    // (`safe_prompt`, `transforms`, etc.); the apply
-                    // path only adds keys when the caller did not
-                    // set them.
-                    "default_body_fields": {
-                        "type": "object"
-                    }
-                }
-            },
-            // Phase A2.5 — RuntimeConfig.response, see issue #302 §5.
-            "response": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "stream_done_marker":     { "type": "string", "enum": ["required", "optional", "none"] },
-                    "content_list_to_string": { "type": "boolean" },
-                    // Open string in Phase A2.5 — matches the Rust
-                    // `Option<String>`. Phase D pins the closed
-                    // ("openai" | "passthrough") set.
-                    "error_envelope":         { "type": "string" },
-                    "reasoning_field":        { "type": "string" }
-                }
-            },
-            // Issue #411 — per-PK passthrough header strip list.
-            // Optional (defaults applied DP-side via
-            // `#[serde(default = "default_strip_headers")]`); when
-            // present, must be an array of strings. Entries are
-            // normalised (trim/lowercase/dedup/drop-empties) on
-            // deserialize so this validator doesn't enforce
-            // formatting beyond the type shape.
-            "strip_headers": {
-                "type": "array",
-                "items": { "type": "string" }
-            }
-        }
-    })
+/// Canonical JSON Schema for the `provider_key` resource, derived from the
+/// [`ProviderKey`](crate::models::ProviderKey) struct. Uses the nullable
+/// `Option` representation (`true`): `TelemetryTags` carries fields cp-api
+/// sends as explicit `null` (`branded_provider`/`pk_label`/`byo_label`), and
+/// keeping all optionals nullable matches the resource's wire contract.
+pub fn provider_key_root_schema() -> Value {
+    struct_root_schema::<crate::models::ProviderKey>(true)
 }
 
 fn guardrail_schema() -> Value {
