@@ -63,9 +63,9 @@ pub enum GuardrailHookPoint {
 #[serde(tag = "kind", content = "value", rename_all = "lowercase")]
 pub enum KeywordPattern {
     /// Literal string to match.
-    Literal(String),
+    Literal(#[schemars(length(min = 1))] String),
     /// Regular expression pattern to match.
-    Regex(String),
+    Regex(#[schemars(length(min = 1))] String),
 }
 
 /// Config block for `kind: "keyword"`.
@@ -83,10 +83,12 @@ pub struct KeywordConfig {
 pub enum BedrockAWSCredentials {
     Static {
         /// AWS access key ID for static Bedrock guardrail credentials.
+        #[schemars(length(min = 1))]
         access_key_id: String,
         /// Decrypted before projection. Plaintext is held in memory only
         /// and is not logged. The data plane passes it to the
         /// AWS SDK's static credentials provider.
+        #[schemars(length(min = 1))]
         secret_access_key: String,
     },
 }
@@ -98,6 +100,7 @@ pub enum BedrockLatencyMode {
     Serial,
     Timed {
         /// Maximum time in milliseconds to wait for the Bedrock guardrail response.
+        #[schemars(range(min = 100, max = 5000))]
         timeout_ms: u32,
     },
 }
@@ -115,12 +118,15 @@ pub struct AzureContentSafetyConfig {
     /// Azure Cognitive Services resource endpoint, e.g.
     /// `https://my-resource.cognitiveservices.azure.com`.
     /// The data plane appends `/contentsafety/text:shieldPrompt?api-version=2024-09-01`.
+    #[schemars(length(min = 1))]
     pub endpoint: String,
     /// Azure subscription key sent with the `Ocp-Apim-Subscription-Key` header. Decrypted before
     /// projection. Plaintext is held in memory only and is not logged.
+    #[schemars(length(min = 1))]
     pub api_key: String,
     /// HTTP call timeout in milliseconds. A value of `0` triggers the timeout immediately.
     #[serde(default = "default_acs_timeout_ms")]
+    #[schemars(range(max = 4_294_967_295u32))]
     pub timeout_ms: u32,
 }
 
@@ -142,14 +148,17 @@ fn default_acs_timeout_ms() -> u32 {
 pub struct AzureContentSafetyTextModerationConfig {
     /// Azure Cognitive Services resource endpoint. The data plane appends
     /// `/contentsafety/text:analyze?api-version=2024-09-01`.
+    #[schemars(length(min = 1))]
     pub endpoint: String,
     /// Azure subscription key sent with the `Ocp-Apim-Subscription-Key` header. Plaintext is held in
     /// memory only and is not logged.
+    #[schemars(length(min = 1))]
     pub api_key: String,
     /// HTTP call timeout in milliseconds. `fail_open` and `output_fail_open`
     /// govern the verdict when it elapses. A value of `0` triggers the timeout
     /// immediately.
     #[serde(default = "default_acs_timeout_ms")]
+    #[schemars(range(max = 4_294_967_295u32))]
     pub timeout_ms: u32,
 
     // --- moderation parameters ---
@@ -161,6 +170,7 @@ pub struct AzureContentSafetyTextModerationConfig {
     pub categories: Vec<String>,
     /// General severity threshold. A category at or above it blocks.
     #[serde(default = "default_acs_severity_threshold")]
+    #[schemars(range(max = 7))]
     pub severity_threshold: u8,
     /// Per-category threshold overrides. These take precedence over the general threshold.
     #[serde(default)]
@@ -182,12 +192,14 @@ pub struct AzureContentSafetyTextModerationConfig {
     pub stream_processing_mode: String,
     /// Sliding-window size in characters for window mode.
     #[serde(default = "default_acs_window_size")]
+    #[schemars(range(min = 1, max = 10_000))]
     pub window_size: u32,
     /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_acs_window_overlap_size")]
     pub window_overlap_size: u32,
     /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
     #[serde(default = "default_acs_max_buffer_bytes")]
+    #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
     /// Buffer-overflow policy. Use `fail_open` to allow output when the buffer cap is hit.
     #[serde(default = "default_acs_on_buffer_exceeded")]
@@ -257,14 +269,18 @@ fn default_acs_on_buffer_exceeded() -> String {
 pub struct AliyunTextModerationConfig {
     /// Aliyun region the guardrail lives in, e.g. `cn-shanghai`. The data plane
     /// builds the endpoint `https://green-cip.<region>.aliyuncs.com`.
+    #[schemars(length(min = 1))]
     pub region: String,
     /// Explicit endpoint override as a full URL with no trailing slash. When set, it takes precedence over `region`.
     #[serde(default)]
+    #[schemars(length(min = 1))]
     pub endpoint: Option<String>,
     /// Aliyun AccessKey ID.
+    #[schemars(length(min = 1))]
     pub access_key_id: String,
     /// Aliyun AccessKey secret. Decrypted before projection. Plaintext is held
     /// in memory only and is not logged. Used to sign the request.
+    #[schemars(length(min = 1))]
     pub access_key_secret: String,
     /// Minimum risk level that triggers a block: `low`, `medium`, or `high`. A returned level at or above this blocks.
     #[serde(default = "default_aliyun_risk_level_threshold")]
@@ -273,6 +289,7 @@ pub struct AliyunTextModerationConfig {
     /// govern the verdict when it elapses. A value of `0` triggers the timeout
     /// immediately.
     #[serde(default = "default_acs_timeout_ms")]
+    #[schemars(range(max = 4_294_967_295u32))]
     pub timeout_ms: u32,
     /// Fail-open policy for the output hook. When disabled, an Aliyun outage does not release unscanned model output.
     #[serde(default)]
@@ -285,12 +302,14 @@ pub struct AliyunTextModerationConfig {
     pub stream_processing_mode: String,
     /// Sliding-window size in characters when window mode is used. Aliyun limits each `llm_response_moderation` call to 2,000 characters.
     #[serde(default = "default_aliyun_window_size")]
+    #[schemars(range(min = 1, max = 2_000))]
     pub window_size: u32,
     /// Chars carried between windows so a span split across a boundary is still caught.
     #[serde(default = "default_aliyun_window_overlap_size")]
     pub window_overlap_size: u32,
     /// Max bytes buffered in `buffer_full` mode before `on_buffer_exceeded` applies.
     #[serde(default = "default_acs_max_buffer_bytes")]
+    #[schemars(range(min = 1))]
     pub max_buffer_bytes: u64,
     /// Buffer-overflow policy. Use `fail_open` to allow output when the buffer cap is hit.
     #[serde(default = "default_acs_on_buffer_exceeded")]
@@ -316,10 +335,13 @@ fn default_aliyun_window_overlap_size() -> u32 {
 #[serde(deny_unknown_fields)]
 pub struct BedrockConfig {
     /// Guardrail identifier issued by the AWS console.
+    #[schemars(length(min = 1, max = 64))]
     pub guardrail_id: String,
     /// Version label: `DRAFT`, `1`, `2`, ...
+    #[schemars(length(min = 1, max = 16))]
     pub guardrail_version: String,
     /// AWS region for the Bedrock endpoint, such as `us-east-1`.
+    #[schemars(length(min = 1))]
     pub region: String,
     /// IAM credentials for Bedrock requests.
     pub aws_credentials: BedrockAWSCredentials,
@@ -392,6 +414,7 @@ pub struct AppliedGuardrail {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 pub struct Guardrail {
     /// Operator-facing name that surfaces in metric labels and error reasons.
+    #[schemars(length(min = 1))]
     pub name: String,
 
     /// When false, the chain skips this rule entirely. Allows operators
@@ -499,6 +522,7 @@ pub enum GuardrailScopeType {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 pub struct GuardrailAttachment {
     /// UUID of the guardrail definition this attachment points to.
+    #[schemars(length(min = 1))]
     pub guardrail_id: String,
 
     /// What dimension of the request this attachment is scoped to.

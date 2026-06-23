@@ -1,0 +1,55 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "GuardrailScopeType": {
+      "description": "Which dimension of the request a guardrail attachment is scoped to.\n\n`Env` applies to every request in the environment (the pre-P0c behaviour). The narrower scopes let operators attach a guardrail to just the models, API keys, or teams that need it.",
+      "enum": [
+        "env",
+        "model",
+        "api_key",
+        "team"
+      ],
+      "type": "string"
+    }
+  },
+  "description": "One attachment row — written by cp-api to `/aisix/<env>/guardrail_attachments/<uuid>`.\n\nThe DP loads these alongside the guardrail definitions and builds a `GuardrailIndex` that resolves the applicable chain per request via `scope_type` + `scope_id` matching.\n\n`deny_unknown_fields` is intentionally NOT set: cp-api includes `env_id` in the payload (for its own idempotency checks) which the DP doesn't need.",
+  "properties": {
+    "enabled": {
+      "default": true,
+      "description": "When `false`, `GuardrailIndex::resolve` skips this attachment entirely (same as the row not existing).",
+      "type": "boolean"
+    },
+    "guardrail_id": {
+      "description": "UUID of the guardrail definition this attachment points to.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "priority": {
+      "description": "Higher number = higher precedence. When the same guardrail appears via multiple matching scopes, the highest-priority attachment wins and duplicates are dropped.",
+      "format": "int32",
+      "type": "integer"
+    },
+    "scope_id": {
+      "description": "The UUID of the specific resource (model / api_key / team). `None` when `scope_type` is `Env` (applies to all requests).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "scope_type": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/GuardrailScopeType"
+        }
+      ],
+      "description": "What dimension of the request this attachment is scoped to."
+    }
+  },
+  "required": [
+    "guardrail_id",
+    "priority",
+    "scope_type"
+  ],
+  "title": "GuardrailAttachment",
+  "type": "object"
+}

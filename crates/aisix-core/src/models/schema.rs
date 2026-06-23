@@ -47,10 +47,10 @@ impl Schemas {
                 .build(&provider_key_root_schema())
                 .expect("provider_key schema is well-formed"),
             guardrail: jsonschema::options()
-                .build(&guardrail_schema())
+                .build(&guardrail_root_schema())
                 .expect("guardrail schema is well-formed"),
             guardrail_attachment: jsonschema::options()
-                .build(&guardrail_attachment_schema())
+                .build(&guardrail_attachment_root_schema())
                 .expect("guardrail_attachment schema is well-formed"),
             cache_policy: jsonschema::options()
                 .build(&cache_policy_root_schema())
@@ -173,176 +173,128 @@ pub fn provider_key_root_schema() -> Value {
     struct_root_schema::<crate::models::ProviderKey>(true)
 }
 
-fn guardrail_schema() -> Value {
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["name", "kind"],
-        // Each kind variant adds its own keys; the per-kind oneOf
-        // below pins them. Top-level stays open so future kinds
-        // (lakera, protect_ai) only edit the oneOf branch.
-        "additionalProperties": true,
-        "properties": {
-            "name":       { "type": "string", "minLength": 1 },
-            "enabled":    { "type": "boolean" },
-            "hook_point": { "enum": ["input", "output", "both"] },
-            "fail_open":  { "type": "boolean" },
-            "created_at": { "type": "string", "format": "date-time" },
-            "kind":       { "enum": ["keyword", "bedrock", "azure_content_safety", "azure_content_safety_text_moderation", "aliyun_text_moderation"] }
-        },
-        "oneOf": [
+/// Canonical JSON Schema for the `guardrail` resource, derived from the
+/// [`Guardrail`](crate::models::Guardrail) struct. `schemars` renders the
+/// internally-tagged `GuardrailKind` as a native top-level `oneOf`; the
+/// top-level object and its branches are intentionally open (matching the
+/// hand-written schema — unknown inner fields are caught by serde at
+/// deserialize). Three things need fixing up:
+///
+/// 1. The tagged sub-enums (`KeywordPattern`/`BedrockAWSCredentials`/
+///    `BedrockLatencyMode`) lose `deny_unknown_fields` in their `oneOf`
+///    branches, so each is re-closed with `additionalProperties: false`.
+/// 2. The stringly-typed moderation fields carry closed sets the hand-written
+///    schema enforced via `enum`. They stay `String` on the struct (their
+///    values flow through `aisix-guardrails` as strings; converting them to
+///    Rust enums would churn that crate's processing), so the closed set is
+///    injected here into the relevant kind branch.
+/// 3. `created_at` republishes its `date-time` format (annotation-only).
+pub fn guardrail_root_schema() -> Value {
+    let mut schema = struct_root_schema::<crate::models::Guardrail>(false);
+    let obj = schema
+        .as_object_mut()
+        .expect("guardrail root schema is a JSON object");
+
+    if let Some(Value::Object(defs)) = obj.get_mut("definitions") {
+        for name in [
+            "KeywordPattern",
+            "BedrockAWSCredentials",
+            "BedrockLatencyMode",
+        ] {
+            if let Some(Value::Array(branches)) =
+                defs.get_mut(name).and_then(|d| d.get_mut("oneOf"))
             {
-                "type": "object",
-                "required": ["kind", "patterns"],
-                "properties": {
-                    "kind":     { "const": "keyword" },
-                    "patterns": {
-                        "type": "array",
-                        "items": { "$ref": "#/$defs/keyword_pattern" }
+                for branch in branches.iter_mut() {
+                    if let Some(b) = branch.as_object_mut() {
+                        b.insert("additionalProperties".to_string(), json!(false));
                     }
                 }
-            },
-            {
-                "type": "object",
-                "required": [
-                    "kind", "guardrail_id", "guardrail_version",
-                    "region", "aws_credentials", "latency_mode"
-                ],
-                "properties": {
-                    "kind":               { "const": "bedrock" },
-                    "guardrail_id":       { "type": "string", "minLength": 1, "maxLength": 64 },
-                    "guardrail_version":  { "type": "string", "minLength": 1, "maxLength": 16 },
-                    "region":             { "type": "string", "minLength": 1 },
-                    "aws_credentials":    { "$ref": "#/$defs/bedrock_aws_credentials" },
-                    "latency_mode":       { "$ref": "#/$defs/bedrock_latency_mode" }
-                }
-            },
-            {
-                // kind=azure_content_safety — Azure AI Content Safety
-                // Prompt Shield. Mirrors AzureContentSafetyConfig in
-                // guardrail.rs: endpoint + api_key required, timeout_ms
-                // optional (u32, defaults to 5000 on the struct).
-                "type": "object",
-                "required": ["kind", "endpoint", "api_key"],
-                "properties": {
-                    "kind":       { "const": "azure_content_safety" },
-                    "endpoint":   { "type": "string", "minLength": 1 },
-                    "api_key":    { "type": "string", "minLength": 1 },
-                    "timeout_ms": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295u64 }
-                }
-            },
-            {
-                // kind=azure_content_safety_text_moderation — text:analyze
-                // category-severity + blocklist moderation. P2 (#379).
-                // Connection block matches azure_content_safety; the
-                // moderation + streaming params are optional (cp-api applies
-                // defaults + strict validation on write).
-                "type": "object",
-                "required": ["kind", "endpoint", "api_key"],
-                "properties": {
-                    "kind":       { "const": "azure_content_safety_text_moderation" },
-                    "endpoint":   { "type": "string", "minLength": 1 },
-                    "api_key":    { "type": "string", "minLength": 1 },
-                    "timeout_ms": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295u64 },
-                    "output_type": { "enum": ["FourSeverityLevels", "EightSeverityLevels"] },
-                    "categories": {
-                        "type": "array",
-                        "items": { "enum": ["Hate", "Sexual", "SelfHarm", "Violence"] }
-                    },
-                    "severity_threshold": { "type": "integer", "minimum": 0, "maximum": 7 },
-                    "severity_threshold_by_category": { "type": "object" },
-                    "blocklist_names": { "type": "array", "items": { "type": "string" } },
-                    "halt_on_blocklist_hit": { "type": "boolean" },
-                    "text_source": { "enum": ["concatenate_user_content", "concatenate_all_content"] },
-                    "stream_processing_mode": { "enum": ["window", "buffer_full"] },
-                    "window_size": { "type": "integer", "minimum": 1, "maximum": 10_000 },
-                    "window_overlap_size": { "type": "integer", "minimum": 0 },
-                    "max_buffer_bytes": { "type": "integer", "minimum": 1 },
-                    "on_buffer_exceeded": { "enum": ["fail_closed", "fail_open"] },
-                    "output_fail_open": { "type": "boolean" }
-                }
-            },
-            {
-                // kind=aliyun_text_moderation — Aliyun content-safety
-                // guardrail (TextModerationPlus). Mirrors
-                // AliyunTextModerationConfig in guardrail.rs: region +
-                // access keys required, endpoint override + threshold +
-                // streaming params optional (cp-api applies defaults +
-                // strict validation on write). #603.
-                "type": "object",
-                "required": ["kind", "region", "access_key_id", "access_key_secret"],
-                "properties": {
-                    "kind":              { "const": "aliyun_text_moderation" },
-                    "region":            { "type": "string", "minLength": 1 },
-                    "endpoint":          { "type": "string", "minLength": 1 },
-                    "access_key_id":     { "type": "string", "minLength": 1 },
-                    "access_key_secret": { "type": "string", "minLength": 1 },
-                    "risk_level_threshold": { "enum": ["low", "medium", "high"] },
-                    "timeout_ms":        { "type": "integer", "minimum": 0, "maximum": 4_294_967_295u64 },
-                    "output_fail_open":  { "type": "boolean" },
-                    "stream_processing_mode": { "enum": ["window", "buffer_full"] },
-                    "window_size":       { "type": "integer", "minimum": 1, "maximum": 2_000 },
-                    "window_overlap_size": { "type": "integer", "minimum": 0 },
-                    "max_buffer_bytes":  { "type": "integer", "minimum": 1 },
-                    "on_buffer_exceeded": { "enum": ["fail_closed", "fail_open"] }
-                }
-            }
-        ],
-        "$defs": {
-            "keyword_pattern": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["kind", "value"],
-                "properties": {
-                    "kind":  { "enum": ["literal", "regex"] },
-                    "value": { "type": "string", "minLength": 1 }
-                }
-            },
-            "bedrock_aws_credentials": {
-                "type": "object",
-                // v1 ships kind=static (plaintext access keys on the
-                // kine wire — cp-api decrypts the envelope-encrypted
-                // secret at projection time, see PRD-09c §6.3).
-                // Phase 4 adds kind=role_arn (sts:AssumeRole) under
-                // the same `kind` discriminator.
-                "required": ["kind", "access_key_id", "secret_access_key"],
-                "properties": {
-                    "kind":              { "const": "static" },
-                    "access_key_id":     { "type": "string", "minLength": 1 },
-                    "secret_access_key": { "type": "string", "minLength": 1 }
-                },
-                "additionalProperties": false
-            },
-            "bedrock_latency_mode": {
-                "oneOf": [
-                    {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["kind"],
-                        "properties": { "kind": { "const": "serial" } }
-                    },
-                    {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["kind", "timeout_ms"],
-                        "properties": {
-                            "kind":       { "const": "timed" },
-                            "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 5000 }
-                        }
-                    }
-                ]
             }
         }
-    })
+    }
+
+    if let Some(Value::Array(branches)) = obj.get_mut("oneOf") {
+        for branch in branches.iter_mut() {
+            let Some(b) = branch.as_object_mut() else {
+                continue;
+            };
+            match branch_kind(b) {
+                Some("azure_content_safety_text_moderation") => {
+                    set_property_enum(
+                        b,
+                        "output_type",
+                        json!(["FourSeverityLevels", "EightSeverityLevels"]),
+                    );
+                    set_property_enum(
+                        b,
+                        "text_source",
+                        json!(["concatenate_user_content", "concatenate_all_content"]),
+                    );
+                    set_property_enum(
+                        b,
+                        "stream_processing_mode",
+                        json!(["window", "buffer_full"]),
+                    );
+                    set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
+                    set_property_items_enum(
+                        b,
+                        "categories",
+                        json!(["Hate", "Sexual", "SelfHarm", "Violence"]),
+                    );
+                }
+                Some("aliyun_text_moderation") => {
+                    set_property_enum(b, "risk_level_threshold", json!(["low", "medium", "high"]));
+                    set_property_enum(
+                        b,
+                        "stream_processing_mode",
+                        json!(["window", "buffer_full"]),
+                    );
+                    set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(created_at) = obj
+        .get_mut("properties")
+        .and_then(|p| p.get_mut("created_at"))
+        .and_then(Value::as_object_mut)
+    {
+        created_at.insert("format".to_string(), json!("date-time"));
+    }
+
+    schema
 }
 
-// Mirrors cp-api's cache_policies validation rules (validateCachePolicyShape
-// in internal/cpapi/resources/cache_policies.go). The DP is the second
-// line of defence — cp-api rejects malformed payloads on write, but kine
-// can still surface stale or hand-edited rows on watch, so we re-validate
-// at parse time. `additionalProperties: true` keeps the schema
-// forward-compatible: cp-api can ship new optional fields ahead of a DP
-// rollout without locking the gateway out.
+/// Set a closed `enum` on a oneOf branch's property (for stringly-typed fields
+/// whose closed set lives only in the schema, not the Rust type).
+fn set_property_enum(branch: &mut serde_json::Map<String, Value>, field: &str, values: Value) {
+    if let Some(prop) = branch
+        .get_mut("properties")
+        .and_then(|p| p.get_mut(field))
+        .and_then(Value::as_object_mut)
+    {
+        prop.insert("enum".to_string(), values);
+    }
+}
+
+/// Like [`set_property_enum`] but for the `items` of an array property.
+fn set_property_items_enum(
+    branch: &mut serde_json::Map<String, Value>,
+    field: &str,
+    values: Value,
+) {
+    if let Some(items) = branch
+        .get_mut("properties")
+        .and_then(|p| p.get_mut(field))
+        .and_then(|f| f.get_mut("items"))
+        .and_then(Value::as_object_mut)
+    {
+        items.insert("enum".to_string(), values);
+    }
+}
+
 /// Canonical JSON Schema for the `cache_policy` resource, derived from the
 /// [`CachePolicy`](crate::models::CachePolicy) struct. The struct intentionally
 /// has no `deny_unknown_fields`, so the schema omits `additionalProperties`
@@ -449,26 +401,13 @@ pub fn rate_limit_policy_root_schema() -> Value {
     schema
 }
 
-fn guardrail_attachment_schema() -> Value {
-    // `additionalProperties` is NOT set to false: cp-api includes `env_id`
-    // in the kine payload (for its own idempotency logic) which the DP
-    // doesn't need. Allowing extra keys here keeps the schema forward-
-    // compatible if cp-api adds more metadata fields later.
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["guardrail_id", "scope_type", "priority"],
-        "properties": {
-            "guardrail_id": { "type": "string", "minLength": 1 },
-            "scope_type":   {
-                "type": "string",
-                "enum": ["env", "model", "api_key", "team"]
-            },
-            "scope_id":     { "type": ["string", "null"] },
-            "priority":     { "type": "integer" },
-            "enabled":      { "type": "boolean" }
-        }
-    })
+/// Canonical JSON Schema for the `guardrail_attachment` resource, derived from
+/// the [`GuardrailAttachment`](crate::models::GuardrailAttachment) struct. Uses
+/// the nullable `Option` representation (`scope_id` is `null` for `env`-scoped
+/// attachments) and stays open (no `deny_unknown_fields`): cp-api includes an
+/// `env_id` the DP ignores.
+pub fn guardrail_attachment_root_schema() -> Value {
+    struct_root_schema::<crate::models::GuardrailAttachment>(true)
 }
 
 #[cfg(test)]

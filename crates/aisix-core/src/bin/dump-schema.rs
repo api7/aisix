@@ -31,16 +31,17 @@ use std::path::{Path, PathBuf};
 use schemars::JsonSchema;
 
 use aisix_core::models::schema;
-use aisix_core::models::{EnsembleConfig, Guardrail, RateLimit, Routing};
+use aisix_core::models::{EnsembleConfig, RateLimit, Routing};
 
 fn main() {
     let out_dir = workspace_root().join("schemas").join("resources");
     fs::create_dir_all(&out_dir).expect("create schemas/resources dir");
 
-    // Resources whose runtime validator is derived from the struct go through
-    // the SAME `*_root_schema()` producer the validator uses, so the published
-    // schema == the enforced schema. Resources still on a hand-written
-    // validator use the bare `schema_for!` dump below.
+    // Every resource with a runtime validator goes through the SAME
+    // `*_root_schema()` producer the validator uses, so the published schema ==
+    // the enforced schema by construction. `ensemble`/`rate_limit`/`routing`
+    // have no standalone validator (they are nested struct types) so they dump
+    // straight from the struct via `schema_for!`.
     dump_value(&out_dir, "api_key", schema::apikey_root_schema());
     dump_value(&out_dir, "cache_policy", schema::cache_policy_root_schema());
     dump_value(&out_dir, "model", schema::model_root_schema());
@@ -49,16 +50,20 @@ fn main() {
         "rate_limit_policy",
         schema::rate_limit_policy_root_schema(),
     );
-
     dump_value(&out_dir, "provider_key", schema::provider_key_root_schema());
     dump_value(
         &out_dir,
         "observability_exporter",
         schema::observability_exporter_root_schema(),
     );
+    dump_value(&out_dir, "guardrail", schema::guardrail_root_schema());
+    dump_value(
+        &out_dir,
+        "guardrail_attachment",
+        schema::guardrail_attachment_root_schema(),
+    );
 
     dump::<EnsembleConfig>(&out_dir, "ensemble");
-    dump::<Guardrail>(&out_dir, "guardrail");
     dump::<RateLimit>(&out_dir, "rate_limit");
     dump::<Routing>(&out_dir, "routing");
 }

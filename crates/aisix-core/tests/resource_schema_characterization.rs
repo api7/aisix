@@ -8,8 +8,8 @@
 //! case is obvious. New resources append their own table as they migrate.
 
 use aisix_core::models::schema::{
-    validate_apikey, validate_cache_policy, validate_observability_exporter, validate_provider_key,
-    validate_rate_limit_policy,
+    validate_apikey, validate_cache_policy, validate_guardrail, validate_guardrail_attachment,
+    validate_observability_exporter, validate_provider_key, validate_rate_limit_policy,
 };
 use serde_json::{json, Value};
 
@@ -534,6 +534,236 @@ fn observability_exporter_corpus() {
                 "name too long (>120)",
                 false,
                 json!({"name": "a".repeat(121), "kind": "otlp_http", "endpoint": "https://x"}),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn guardrail_corpus() {
+    check(
+        validate_guardrail,
+        &[
+            // keyword
+            (
+                "keyword empty patterns",
+                true,
+                json!({"name": "k", "kind": "keyword", "patterns": []}),
+            ),
+            (
+                "keyword literal + regex",
+                true,
+                json!({"name": "k", "kind": "keyword", "patterns": [{"kind": "literal", "value": "AKIA"}, {"kind": "regex", "value": "\\d{3}"}]}),
+            ),
+            (
+                "keyword missing patterns",
+                false,
+                json!({"name": "k", "kind": "keyword"}),
+            ),
+            (
+                "empty name",
+                false,
+                json!({"name": "", "kind": "keyword", "patterns": []}),
+            ),
+            (
+                "keyword pattern empty value",
+                false,
+                json!({"name": "k", "kind": "keyword", "patterns": [{"kind": "literal", "value": ""}]}),
+            ),
+            (
+                "keyword pattern bad kind",
+                false,
+                json!({"name": "k", "kind": "keyword", "patterns": [{"kind": "glob", "value": "x"}]}),
+            ),
+            (
+                "keyword pattern extra field",
+                false,
+                json!({"name": "k", "kind": "keyword", "patterns": [{"kind": "literal", "value": "x", "extra": 1}]}),
+            ),
+            // top-level / kind discriminator
+            (
+                "missing name",
+                false,
+                json!({"kind": "keyword", "patterns": []}),
+            ),
+            (
+                "unknown kind",
+                false,
+                json!({"name": "k", "kind": "lakera", "patterns": []}),
+            ),
+            ("missing kind", false, json!({"name": "k"})),
+            (
+                "hook_point + p0c fields",
+                true,
+                json!({"name": "k", "kind": "keyword", "patterns": [], "hook_point": "input", "enforcement_mode": "monitor", "created_at": "2026-01-01T00:00:00Z"}),
+            ),
+            (
+                "bad hook_point",
+                false,
+                json!({"name": "k", "kind": "keyword", "patterns": [], "hook_point": "sideways"}),
+            ),
+            // bedrock
+            (
+                "bedrock serial",
+                true,
+                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "DRAFT", "region": "us-east-1", "aws_credentials": {"kind": "static", "access_key_id": "AKIA", "secret_access_key": "s"}, "latency_mode": {"kind": "serial"}}),
+            ),
+            (
+                "bedrock timed",
+                true,
+                json!({"name": "b", "kind": "bedrock", "guardrail_id": "gid", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "static", "access_key_id": "AKIA", "secret_access_key": "s"}, "latency_mode": {"kind": "timed", "timeout_ms": 500}}),
+            ),
+            (
+                "bedrock missing guardrail_id",
+                false,
+                json!({"name": "b", "kind": "bedrock", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "static", "access_key_id": "a", "secret_access_key": "s"}, "latency_mode": {"kind": "serial"}}),
+            ),
+            (
+                "bedrock timed timeout < 100",
+                false,
+                json!({"name": "b", "kind": "bedrock", "guardrail_id": "g", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "static", "access_key_id": "a", "secret_access_key": "s"}, "latency_mode": {"kind": "timed", "timeout_ms": 50}}),
+            ),
+            (
+                "bedrock latency_mode extra field",
+                false,
+                json!({"name": "b", "kind": "bedrock", "guardrail_id": "g", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "static", "access_key_id": "a", "secret_access_key": "s"}, "latency_mode": {"kind": "timed", "timeout_ms": 500, "extra": 1}}),
+            ),
+            (
+                "bedrock aws_credentials extra field",
+                false,
+                json!({"name": "b", "kind": "bedrock", "guardrail_id": "g", "guardrail_version": "1", "region": "us-east-1", "aws_credentials": {"kind": "static", "access_key_id": "a", "secret_access_key": "s", "junk": 1}, "latency_mode": {"kind": "serial"}}),
+            ),
+            // azure_content_safety
+            (
+                "azure cs minimal",
+                true,
+                json!({"name": "a", "kind": "azure_content_safety", "endpoint": "https://x.cognitiveservices.azure.com", "api_key": "k"}),
+            ),
+            (
+                "azure cs missing endpoint",
+                false,
+                json!({"name": "a", "kind": "azure_content_safety", "api_key": "k"}),
+            ),
+            (
+                "azure cs timeout overflow (u32)",
+                false,
+                json!({"name": "a", "kind": "azure_content_safety", "endpoint": "https://x", "api_key": "k", "timeout_ms": 4_294_967_296u64}),
+            ),
+            // azure_content_safety_text_moderation
+            (
+                "azure tm minimal",
+                true,
+                json!({"name": "m", "kind": "azure_content_safety_text_moderation", "endpoint": "https://x", "api_key": "k"}),
+            ),
+            (
+                "azure tm full",
+                true,
+                json!({"name": "m", "kind": "azure_content_safety_text_moderation", "endpoint": "https://x", "api_key": "k", "output_type": "EightSeverityLevels", "categories": ["Hate", "Violence"], "severity_threshold": 0, "stream_processing_mode": "buffer_full", "window_size": 5000, "on_buffer_exceeded": "fail_open"}),
+            ),
+            (
+                "azure tm severity > 7",
+                false,
+                json!({"name": "m", "kind": "azure_content_safety_text_moderation", "endpoint": "https://x", "api_key": "k", "severity_threshold": 8}),
+            ),
+            (
+                "azure tm window_size > 10000",
+                false,
+                json!({"name": "m", "kind": "azure_content_safety_text_moderation", "endpoint": "https://x", "api_key": "k", "window_size": 20000}),
+            ),
+            (
+                "azure tm output_type enum (injected)",
+                false,
+                json!({"name": "m", "kind": "azure_content_safety_text_moderation", "endpoint": "https://x", "api_key": "k", "output_type": "Twelve"}),
+            ),
+            (
+                "azure tm categories item enum (injected)",
+                false,
+                json!({"name": "m", "kind": "azure_content_safety_text_moderation", "endpoint": "https://x", "api_key": "k", "categories": ["Nope"]}),
+            ),
+            // aliyun_text_moderation
+            (
+                "aliyun minimal",
+                true,
+                json!({"name": "al", "kind": "aliyun_text_moderation", "region": "cn-shanghai", "access_key_id": "LTAI", "access_key_secret": "s"}),
+            ),
+            (
+                "aliyun missing region",
+                false,
+                json!({"name": "al", "kind": "aliyun_text_moderation", "access_key_id": "id", "access_key_secret": "s"}),
+            ),
+            (
+                "aliyun risk_level enum (injected)",
+                false,
+                json!({"name": "al", "kind": "aliyun_text_moderation", "region": "cn", "access_key_id": "id", "access_key_secret": "s", "risk_level_threshold": "critical"}),
+            ),
+            (
+                "aliyun window_size > 2000",
+                false,
+                json!({"name": "al", "kind": "aliyun_text_moderation", "region": "cn", "access_key_id": "id", "access_key_secret": "s", "window_size": 3000}),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn guardrail_attachment_corpus() {
+    check(
+        validate_guardrail_attachment,
+        &[
+            (
+                "env scope null scope_id",
+                true,
+                json!({"guardrail_id": "gid", "scope_type": "env", "scope_id": null, "priority": 0}),
+            ),
+            (
+                "model scope",
+                true,
+                json!({"guardrail_id": "gid", "scope_type": "model", "scope_id": "mid", "priority": 10, "enabled": false}),
+            ),
+            (
+                "team scope negative priority",
+                true,
+                json!({"guardrail_id": "gid", "scope_type": "team", "scope_id": "tid", "priority": -5}),
+            ),
+            (
+                "api_key scope_id omitted",
+                true,
+                json!({"guardrail_id": "gid", "scope_type": "api_key", "priority": 1}),
+            ),
+            (
+                "extra field tolerated (open)",
+                true,
+                json!({"guardrail_id": "gid", "scope_type": "env", "priority": 1, "env_id": "e1"}),
+            ),
+            (
+                "missing guardrail_id",
+                false,
+                json!({"scope_type": "env", "priority": 1}),
+            ),
+            (
+                "empty guardrail_id",
+                false,
+                json!({"guardrail_id": "", "scope_type": "env", "priority": 1}),
+            ),
+            (
+                "bad scope_type enum",
+                false,
+                json!({"guardrail_id": "gid", "scope_type": "org", "priority": 1}),
+            ),
+            (
+                "missing scope_type",
+                false,
+                json!({"guardrail_id": "gid", "priority": 1}),
+            ),
+            (
+                "missing priority",
+                false,
+                json!({"guardrail_id": "gid", "scope_type": "env"}),
+            ),
+            (
+                "priority not integer",
+                false,
+                json!({"guardrail_id": "gid", "scope_type": "env", "priority": "high"}),
             ),
         ],
     );
