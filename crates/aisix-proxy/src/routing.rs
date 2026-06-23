@@ -56,6 +56,38 @@ pub fn is_retryable(err: &BridgeError, retry_on_429: bool) -> bool {
     }
 }
 
+/// Base delay before the first same-target retry. Each subsequent retry
+/// doubles it, capped at [`RETRY_BACKOFF_MAX_MS`].
+const RETRY_BACKOFF_BASE_MS: u64 = 250;
+/// Ceiling for the exponential term — bounds the worst-case added latency.
+const RETRY_BACKOFF_MAX_MS: u64 = 2_000;
+/// Additive jitter ceiling, sampled uniformly in `[0, this]` and added on
+/// top of the exponential term.
+const RETRY_BACKOFF_JITTER_MS: u64 = 250;
+
+/// Backoff before retrying the **same** target, for 1-based retry number
+/// `retry` (`retry == 0` → no wait). Exponential term `base * 2^(retry-1)`
+/// capped at [`RETRY_BACKOFF_MAX_MS`], plus uniform additive jitter in
+/// `[0, RETRY_BACKOFF_JITTER_MS]`.
+///
+/// Same strategy as LiteLLM's router (`_calculate_retry_after`: capped
+/// exponential floor + additive jitter — not full-jitter-to-zero, so a
+/// struggling upstream always gets a real pause), with bounds tightened
+/// from LiteLLM's library defaults (0.5s base / 8s cap) to suit an inline
+/// proxy where the retry runs inside a single request's latency budget.
+/// Cross-target fallover is deliberately NOT backed off — a different,
+/// presumably healthy target should be tried immediately (LiteLLM's
+/// healthy-deployment fast-path).
+pub fn retry_backoff(retry: u32) -> Duration {
+    if retry == 0 {
+        return Duration::ZERO;
+    }
+    let exp = RETRY_BACKOFF_BASE_MS.saturating_mul(1u64 << (retry - 1).min(20));
+    let base = exp.min(RETRY_BACKOFF_MAX_MS);
+    let jitter = rand::thread_rng().gen_range(0..=RETRY_BACKOFF_JITTER_MS);
+    Duration::from_millis(base + jitter)
+}
+
 #[derive(Default)]
 pub struct RoutingRegistry {
     // virtual model name → atomic round-robin cursor
@@ -600,6 +632,41 @@ mod tests {
             &BridgeError::InvalidUpstreamConfig("no api_base".into()),
             false
         ));
+    }
+
+    // ── retry_backoff ─────────────────────────────────────────────
+    #[test]
+    fn retry_backoff_zero_is_no_wait() {
+        assert_eq!(retry_backoff(0), Duration::ZERO);
+    }
+
+    #[test]
+    fn retry_backoff_grows_exponentially_and_caps() {
+        // The exponential FLOOR (delay minus the additive jitter) must be
+        // base*2^(retry-1), capped. Sample many times: the minimum observed
+        // delay tracks the floor and never exceeds floor + jitter ceiling.
+        let cases = [
+            (1u32, 250u64), // 250 * 2^0
+            (2, 500),       // 250 * 2^1
+            (3, 1000),      // 250 * 2^2
+            (4, 2000),      // 250 * 2^3 = 2000 (== cap)
+            (5, 2000),      // capped
+            (50, 2000),     // capped, no overflow
+        ];
+        for (retry, floor) in cases {
+            let mut min = u64::MAX;
+            let mut max = 0u64;
+            for _ in 0..2000 {
+                let ms = retry_backoff(retry).as_millis() as u64;
+                min = min.min(ms);
+                max = max.max(ms);
+            }
+            assert!(min >= floor, "retry {retry}: min {min} < floor {floor}");
+            assert!(
+                max <= floor + 250,
+                "retry {retry}: max {max} > floor {floor} + jitter 250",
+            );
+        }
     }
 
     // ── filter_attempt_models ─────────────────────────────────────

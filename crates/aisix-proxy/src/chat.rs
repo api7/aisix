@@ -1653,6 +1653,18 @@ async fn dispatch(
                     if attempt_idx == retries {
                         break;
                     }
+                    // #788 P2: exponential backoff + jitter before retrying
+                    // the SAME target, so a transiently-failing upstream gets
+                    // a pause instead of being hammered. Cross-target fallover
+                    // (the outer loop) stays immediate.
+                    let backoff = crate::routing::retry_backoff((attempt_idx + 1) as u32);
+                    tracing::debug!(
+                        target_model = %model.display_name,
+                        next_attempt = attempt_idx + 2,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "backing off before same-target retry",
+                    );
+                    tokio::time::sleep(backoff).await;
                 }
             }
         }
