@@ -7,7 +7,11 @@
 //! so this module only handles plaintext credentials. We never log
 //! the secret.
 //!
-//! Behavior matrix (failure modes):
+//! Behavior matrix (failure modes). The effective `fail_open` is the
+//! outer `Guardrail::fail_open` on the INPUT hook and the independent
+//! `BedrockConfig::output_fail_open` (default fail-closed) on the OUTPUT
+//! hook, so a Bedrock outage can't release unscanned model output by
+//! default:
 //!
 //! | Bedrock response                | `fail_open` | Verdict                        |
 //! |---------------------------------|-------------|--------------------------------|
@@ -56,7 +60,12 @@ pub struct BedrockGuardrail {
     pub guardrail_version: String,
     pub hook_point: GuardrailHookPoint,
     pub latency_mode: BedrockLatencyMode,
+    /// Fail-open policy for the INPUT hook (the outer `Guardrail::fail_open`).
     pub fail_open: bool,
+    /// Fail-open policy for the OUTPUT hook (`BedrockConfig::output_fail_open`,
+    /// default fail-closed). Kept separate so a Bedrock outage can't release
+    /// unscanned model output by default.
+    pub output_fail_open: bool,
     /// AWS SDK client, pre-configured with the row's region and
     /// static credentials. Wrapped in `Arc` so swapping snapshots
     /// doesn't drop a client mid-request.
@@ -149,7 +158,18 @@ impl BedrockGuardrail {
             hook_point,
             latency_mode: cfg.latency_mode.clone(),
             fail_open,
+            output_fail_open: cfg.output_fail_open,
             client: Arc::new(client),
+        }
+    }
+
+    /// Fail-open policy that governs `source`. The input hook follows the
+    /// outer `fail_open`; the output hook follows `output_fail_open` (default
+    /// fail-closed) so a Bedrock outage can't release unscanned model output.
+    fn fail_open_for(&self, source: &GuardrailContentSource) -> bool {
+        match source {
+            GuardrailContentSource::Output => self.output_fail_open,
+            _ => self.fail_open,
         }
     }
 
@@ -157,6 +177,7 @@ impl BedrockGuardrail {
     /// SDK call with `latency_mode` enforcement and translates the
     /// response/error into a `GuardrailVerdict` per §Behavior matrix.
     async fn apply(&self, source: GuardrailContentSource, text: String) -> GuardrailVerdict {
+        let fail_open = self.fail_open_for(&source);
         let req = self
             .client
             .apply_guardrail()
@@ -203,11 +224,11 @@ impl BedrockGuardrail {
                     GuardrailVerdict::Allow
                 }
             },
-            Err(failure) => self.handle_failure(failure),
+            Err(failure) => self.handle_failure(failure, fail_open),
         }
     }
 
-    fn handle_failure(&self, failure: BedrockFailure) -> GuardrailVerdict {
+    fn handle_failure(&self, failure: BedrockFailure, fail_open: bool) -> GuardrailVerdict {
         let (reason, error_detail, error_source) = failure.log_fields();
         tracing::warn!(
             row = %self.row_name,
@@ -215,10 +236,10 @@ impl BedrockGuardrail {
             failure_tag = reason,
             error = error_detail,
             source = error_source,
-            fail_open = self.fail_open,
+            fail_open = fail_open,
             "bedrock ApplyGuardrail call failed",
         );
-        if self.fail_open {
+        if fail_open {
             GuardrailVerdict::Bypass {
                 reason: reason.into(),
             }
@@ -369,6 +390,8 @@ mod tests {
                 secret_access_key: "TEST".into(),
             },
             latency_mode: BedrockLatencyMode::Serial,
+            // Default fail-closed output (cp-api omits the field when unset).
+            output_fail_open: false,
         }
     }
 
@@ -419,7 +442,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_with_fail_open_true_returns_bypass() {
         let g = build_test(true);
-        let v = g.handle_failure(BedrockFailure::Timeout);
+        let v = g.handle_failure(BedrockFailure::Timeout, g.fail_open);
         match v {
             GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "bedrock_timeout"),
             other => panic!("expected Bypass, got {other:?}"),
@@ -429,14 +452,14 @@ mod tests {
     #[tokio::test]
     async fn timeout_with_fail_open_false_returns_block() {
         let g = build_test(false);
-        let v = g.handle_failure(BedrockFailure::Timeout);
+        let v = g.handle_failure(BedrockFailure::Timeout, g.fail_open);
         assert!(v.is_block(), "expected Block, got {v:?}");
     }
 
     #[tokio::test]
     async fn throttle_with_fail_open_true_tags_throttled() {
         let g = build_test(true);
-        let v = g.handle_failure(BedrockFailure::Throttled);
+        let v = g.handle_failure(BedrockFailure::Throttled, g.fail_open);
         match v {
             GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "bedrock_throttled"),
             other => panic!("expected Bypass, got {other:?}"),
@@ -446,14 +469,60 @@ mod tests {
     #[tokio::test]
     async fn other_5xx_with_fail_open_true_tags_5xx() {
         let g = build_test(true);
-        let v = g.handle_failure(BedrockFailure::Other {
-            detail: "AccessDeniedException(...)".into(),
-            source: None,
-        });
+        let v = g.handle_failure(
+            BedrockFailure::Other {
+                detail: "AccessDeniedException(...)".into(),
+                source: None,
+            },
+            g.fail_open,
+        );
         match v {
             GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "bedrock_5xx"),
             other => panic!("expected Bypass, got {other:?}"),
         }
+    }
+
+    /// The OUTPUT hook follows `output_fail_open`, which defaults to
+    /// fail-closed even when the input-side `fail_open` is true. A Bedrock
+    /// outage on the output side must therefore Block, not release unscanned
+    /// model output. This is the P1-3 fix: the single `fail_open` no longer
+    /// governs both hooks.
+    #[tokio::test]
+    async fn output_hook_defaults_fail_closed_even_when_input_fail_open() {
+        // build_test sets input fail_open=true; cfg() leaves output_fail_open
+        // at its serde default (false).
+        let g = build_test(true);
+        assert!(g.fail_open, "input fail_open is true in this fixture");
+        assert!(!g.output_fail_open, "output must default fail-closed");
+        // Input side bypasses (fail_open=true)...
+        assert!(g
+            .handle_failure(
+                BedrockFailure::Timeout,
+                g.fail_open_for(&GuardrailContentSource::Input)
+            )
+            .is_bypass());
+        // ...output side blocks (output_fail_open=false).
+        assert!(g
+            .handle_failure(
+                BedrockFailure::Timeout,
+                g.fail_open_for(&GuardrailContentSource::Output),
+            )
+            .is_block());
+    }
+
+    /// Operators can still opt the output hook back into fail-open by setting
+    /// `output_fail_open: true` — then an outage bypasses on output too.
+    #[tokio::test]
+    async fn output_fail_open_true_bypasses_on_output() {
+        let mut c = cfg();
+        c.output_fail_open = true;
+        let g = BedrockGuardrail::new("row", &c, GuardrailHookPoint::Both, true, None);
+        assert!(g
+            .handle_failure(
+                BedrockFailure::Timeout,
+                g.fail_open_for(&GuardrailContentSource::Output),
+            )
+            .is_bypass());
     }
 
     /// Hook-point gating: an Output-only row must allow input checks

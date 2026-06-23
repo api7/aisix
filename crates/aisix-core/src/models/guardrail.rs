@@ -128,6 +128,12 @@ pub struct AzureContentSafetyConfig {
     #[serde(default = "default_acs_timeout_ms")]
     #[schemars(range(max = 4_294_967_295u32))]
     pub timeout_ms: u32,
+    /// Fail-open policy for the output hook. When disabled (the default), an
+    /// Azure outage does not release unscanned model output; the input hook
+    /// keeps following the outer `fail_open`. Mirrors the independent output
+    /// policy the Azure/Aliyun text-moderation guardrails already use.
+    #[serde(default)]
+    pub output_fail_open: bool,
 }
 
 fn default_acs_timeout_ms() -> u32 {
@@ -347,6 +353,12 @@ pub struct BedrockConfig {
     pub aws_credentials: BedrockAWSCredentials,
     /// Bedrock guardrail latency policy. Use `timed` with `timeout_ms` to cap wait time.
     pub latency_mode: BedrockLatencyMode,
+    /// Fail-open policy for the output hook. When disabled (the default), a
+    /// Bedrock outage does not release unscanned model output; the input hook
+    /// keeps following the outer `fail_open`. Mirrors the independent output
+    /// policy the Azure/Aliyun text-moderation guardrails already use.
+    #[serde(default)]
+    pub output_fail_open: bool,
 }
 
 /// Provider discriminator. The kind drives which `*_config` block is

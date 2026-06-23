@@ -212,6 +212,11 @@
           ],
           "description": "Bedrock guardrail latency policy. Use `timed` with `timeout_ms` to cap wait time."
         },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled (the default), a Bedrock outage does not release unscanned model output; the input hook keeps following the outer `fail_open`. Mirrors the independent output policy the Azure/Aliyun text-moderation guardrails already use.",
+          "type": "boolean"
+        },
         "region": {
           "description": "AWS region for the Bedrock endpoint, such as `us-east-1`.",
           "minLength": 1,
@@ -246,6 +251,11 @@
             "azure_content_safety"
           ],
           "type": "string"
+        },
+        "output_fail_open": {
+          "default": false,
+          "description": "Fail-open policy for the output hook. When disabled (the default), an Azure outage does not release unscanned model output; the input hook keeps following the outer `fail_open`. Mirrors the independent output policy the Azure/Aliyun text-moderation guardrails already use.",
+          "type": "boolean"
         },
         "timeout_ms": {
           "default": 5000,

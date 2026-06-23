@@ -124,19 +124,40 @@ fn applied_for(row: &DomainGuardrail) -> AppliedGuardrail {
     }
 }
 
+/// Build the runtime guardrail for a row, applying its `enforcement_mode`.
+/// `block` (the default) returns the guardrail as-is; `monitor` wraps it in
+/// [`MonitorGuardrail`] so it observes violations without blocking. An
+/// unrecognised mode is treated as `block` (fail-safe) with a warning.
 fn build_one(
     row: &DomainGuardrail,
     bedrock_endpoint_url: Option<&str>,
 ) -> Result<Option<Arc<dyn Guardrail>>, BuildError> {
-    // enforcement_mode is not yet implemented: warn so operators don't silently
-    // assume "monitor" means pass-through. See doc comment on the field.
-    if row.enforcement_mode != "block" {
-        tracing::warn!(
-            guardrail_name = %row.name,
-            enforcement_mode = %row.enforcement_mode,
-            "enforcement_mode is not yet implemented; DP will block regardless of this setting",
-        );
+    Ok(build_one_inner(row, bedrock_endpoint_url)?.map(|g| apply_enforcement_mode(row, g)))
+}
+
+/// Wrap `inner` per the row's `enforcement_mode`. See [`build_one`].
+fn apply_enforcement_mode(row: &DomainGuardrail, inner: Arc<dyn Guardrail>) -> Arc<dyn Guardrail> {
+    match row.enforcement_mode.as_str() {
+        "block" => inner,
+        "monitor" => Arc::new(MonitorGuardrail {
+            row_name: row.name.clone(),
+            inner,
+        }),
+        other => {
+            tracing::warn!(
+                guardrail_name = %row.name,
+                enforcement_mode = %other,
+                "unknown enforcement_mode; treating as 'block'",
+            );
+            inner
+        }
     }
+}
+
+fn build_one_inner(
+    row: &DomainGuardrail,
+    bedrock_endpoint_url: Option<&str>,
+) -> Result<Option<Arc<dyn Guardrail>>, BuildError> {
     match &row.config {
         GuardrailKind::Keyword(cfg) => {
             if cfg.patterns.is_empty() {
@@ -266,6 +287,67 @@ enum BuildError {
     #[allow(dead_code)]
     #[error("guardrail kind {0:?} not compiled into this build; treating row as disabled")]
     FeatureDisabled(&'static str),
+}
+
+/// `enforcement_mode: monitor` decorator. Runs the wrapped guardrail exactly
+/// as configured but never blocks: a `Block` verdict is logged (the operator's
+/// audit signal — "this rule WOULD have blocked") and downgraded to `Allow`.
+/// `Allow` and `Bypass` pass through unchanged.
+///
+/// `runs_on_output` delegates to the inner guardrail so a monitor-mode output
+/// rule still gets its `check_output` called and can record what it observed.
+/// `stream_output_policy` is forced to `EndOfStreamCheck`, though: a guardrail
+/// that can never block must not make the streamed response hold back —
+/// monitor mode observes at end-of-stream without adding hold-back latency,
+/// and it can never weaken a *blocking* peer's hold-back (the chain folds to
+/// the strictest member).
+struct MonitorGuardrail {
+    row_name: String,
+    inner: Arc<dyn Guardrail>,
+}
+
+impl MonitorGuardrail {
+    fn observe(&self, hook: &'static str, verdict: GuardrailVerdict) -> GuardrailVerdict {
+        match verdict {
+            GuardrailVerdict::Block { reason, .. } => {
+                tracing::info!(
+                    guardrail_name = %self.row_name,
+                    hook,
+                    reason = %reason,
+                    "guardrail in monitor mode observed a violation; not blocking (enforcement_mode=monitor)",
+                );
+                GuardrailVerdict::Allow
+            }
+            other => other,
+        }
+    }
+}
+
+#[async_trait]
+impl Guardrail for MonitorGuardrail {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    async fn check_input(&self, req: &ChatFormat) -> GuardrailVerdict {
+        self.observe("input", self.inner.check_input(req).await)
+    }
+
+    async fn check_output(&self, resp: &ChatResponse) -> GuardrailVerdict {
+        self.observe("output", self.inner.check_output(resp).await)
+    }
+
+    fn stream_output_policy(&self) -> StreamOutputPolicy {
+        StreamOutputPolicy::EndOfStreamCheck
+    }
+
+    fn runs_on_output(&self) -> bool {
+        self.inner.runs_on_output()
+    }
 }
 
 /// Adapter that wraps a snapshot handle and rebuilds the runtime
@@ -659,6 +741,95 @@ mod tests {
         assert_eq!(chain.len(), 1);
         let v = chain.check_input(&req("here is AKIAEXAMPLE")).await;
         assert!(v.is_block());
+    }
+
+    /// P1-3: `enforcement_mode: monitor` observes but never blocks. The same
+    /// keyword rule that blocks under the default `block` mode must Allow the
+    /// matching input when the row is in monitor mode — operators get the
+    /// audit log without the request being rejected.
+    #[tokio::test]
+    async fn monitor_mode_observes_but_does_not_block() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "watch-secrets",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "watch-secrets",
+                    "enforcement_mode": "monitor",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None);
+        assert_eq!(chain.len(), 1, "monitor-mode row still materialises");
+        // Would block under `block` mode; monitor downgrades to Allow.
+        let v = chain.check_input(&req("here is AKIAEXAMPLE")).await;
+        assert!(!v.is_block(), "monitor mode must not block, got {v:?}",);
+        assert_eq!(v, GuardrailVerdict::Allow);
+        // Output hook is monitored the same way.
+        let resp = ChatResponse {
+            id: "r".into(),
+            model: "m".into(),
+            message: ChatMessage::assistant("leaking AKIAEXAMPLE"),
+            finish_reason: aisix_gateway::FinishReason::Stop,
+            usage: aisix_gateway::UsageStats::new(0, 0),
+        };
+        assert!(!chain.check_output(&resp).await.is_block());
+    }
+
+    /// A monitor-mode guardrail must not force streamed output to hold back —
+    /// it can never block, so hold-back would be pure latency. It folds to the
+    /// no-hold-back policy (and, in a mixed chain, can't weaken a blocking
+    /// peer because the chain keeps the strictest member's policy).
+    #[tokio::test]
+    async fn monitor_mode_does_not_force_stream_holdback() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "watch-out",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "watch-out",
+                    "enforcement_mode": "monitor",
+                    "kind": "keyword",
+                    "hook_point": "output",
+                    "patterns": [{ "kind": "literal", "value": "secret" }]
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None);
+        assert!(
+            !chain.stream_output_policy().holds_back(),
+            "monitor-mode output rule must not hold the stream back",
+        );
+    }
+
+    /// An unrecognised enforcement_mode is treated as `block` (fail-safe).
+    #[tokio::test]
+    async fn unknown_enforcement_mode_falls_back_to_block() {
+        let table: ResourceTable<DomainGuardrail> = ResourceTable::default();
+        table.insert(entry(
+            "g",
+            "g-1",
+            parse(
+                r#"{
+                    "name": "g",
+                    "enforcement_mode": "audit-only-typo",
+                    "kind": "keyword",
+                    "patterns": [{ "kind": "literal", "value": "AKIA" }]
+                }"#,
+            ),
+        ));
+        let chain = build_chain_from_snapshot(&table, None);
+        assert!(
+            chain
+                .check_input(&req("here is AKIAEXAMPLE"))
+                .await
+                .is_block(),
+            "unknown mode must default to block, not silently pass through",
+        );
     }
 
     #[tokio::test]

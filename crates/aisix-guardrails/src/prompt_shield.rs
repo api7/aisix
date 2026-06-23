@@ -23,7 +23,11 @@
 //! The cp-api decrypts the envelope-encrypted `api_key` at kine-projection
 //! time so this module only handles plaintext keys. The key is never logged.
 //!
-//! Behavior matrix (failure modes):
+//! Behavior matrix (failure modes). The effective `fail_open` is the outer
+//! `Guardrail::fail_open` on the INPUT hook and the independent
+//! `AzureContentSafetyConfig::output_fail_open` (default fail-closed) on the
+//! OUTPUT hook, so an Azure outage can't release unscanned model output by
+//! default:
 //!
 //! | API response                    | `fail_open` | Verdict                               |
 //! |---------------------------------|-------------|---------------------------------------|
@@ -69,7 +73,12 @@ pub struct PromptShieldGuardrail {
     /// Plaintext subscription key (decrypted by cp-api before kine write).
     api_key: String,
     pub(crate) hook_point: GuardrailHookPoint,
+    /// Fail-open policy for the INPUT hook (the outer `Guardrail::fail_open`).
     fail_open: bool,
+    /// Fail-open policy for the OUTPUT hook (`AzureContentSafetyConfig::
+    /// output_fail_open`, default fail-closed). Kept separate so an Azure
+    /// outage can't release unscanned model output by default.
+    output_fail_open: bool,
     /// Call timeout. 0 ms in config → `Duration::ZERO` here, which
     /// `tokio::time::timeout` treats as "already elapsed"; callers that
     /// want no timeout should pass a very large value instead.
@@ -103,6 +112,7 @@ impl PromptShieldGuardrail {
             api_key: cfg.api_key.clone(),
             hook_point,
             fail_open,
+            output_fail_open: cfg.output_fail_open,
             timeout: Duration::from_millis(cfg.timeout_ms as u64),
             client: Arc::new(client),
         }
@@ -111,7 +121,7 @@ impl PromptShieldGuardrail {
     /// Check `text` against Prompt Shield, splitting it into ≤10 000-char
     /// chunks. Returns `Block` on the first chunk where
     /// `attackDetected=true`; returns `Allow` when all chunks pass.
-    async fn shield(&self, text: &str) -> GuardrailVerdict {
+    async fn shield(&self, text: &str, fail_open: bool) -> GuardrailVerdict {
         for chunk in chunk_text(text, MAX_PROMPT_CHARS) {
             match self.call_api(&chunk).await {
                 Ok(true) => {
@@ -121,7 +131,7 @@ impl PromptShieldGuardrail {
                     ));
                 }
                 Ok(false) => {} // clean — continue to next chunk
-                Err(failure) => return self.handle_failure(failure),
+                Err(failure) => return self.handle_failure(failure, fail_open),
             }
         }
         GuardrailVerdict::Allow
@@ -178,7 +188,7 @@ impl PromptShieldGuardrail {
         Ok(attacked)
     }
 
-    fn handle_failure(&self, failure: AcsFailure) -> GuardrailVerdict {
+    fn handle_failure(&self, failure: AcsFailure, fail_open: bool) -> GuardrailVerdict {
         let tag = failure.bypass_tag();
         // ConfigError is already logged at error level in call_api(); skip
         // the generic warn here so operators see exactly one log line per
@@ -187,11 +197,11 @@ impl PromptShieldGuardrail {
             tracing::warn!(
                 row = %self.row_name,
                 failure = ?failure,
-                fail_open = self.fail_open,
+                fail_open = fail_open,
                 "azure content safety call failed",
             );
         }
-        if self.fail_open {
+        if fail_open {
             GuardrailVerdict::Bypass { reason: tag.into() }
         } else {
             GuardrailVerdict::block(format!("azure content safety unavailable ({tag})"))
@@ -283,7 +293,7 @@ impl Guardrail for PromptShieldGuardrail {
         if text.is_empty() {
             return GuardrailVerdict::Allow;
         }
-        self.shield(&text).await
+        self.shield(&text, self.fail_open).await
     }
 
     async fn check_output(&self, resp: &ChatResponse) -> GuardrailVerdict {
@@ -297,7 +307,9 @@ impl Guardrail for PromptShieldGuardrail {
         if text.is_empty() {
             return GuardrailVerdict::Allow;
         }
-        self.shield(&text).await
+        // Output hook follows its own fail policy (default fail-closed) so an
+        // Azure outage can't release unscanned model output.
+        self.shield(&text, self.output_fail_open).await
     }
 }
 
@@ -382,6 +394,8 @@ mod tests {
             endpoint: endpoint.to_owned(),
             api_key: "test-key-abc".to_owned(),
             timeout_ms: 5_000,
+            // Default fail-closed output (cp-api omits the field when unset).
+            output_fail_open: false,
         }
     }
 
@@ -499,7 +513,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_fail_open_true_returns_bypass() {
         let g = build("http://unused", true);
-        let v = g.handle_failure(AcsFailure::Timeout);
+        let v = g.handle_failure(AcsFailure::Timeout, g.fail_open);
         match v {
             GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "azure_cs_timeout"),
             other => panic!("expected Bypass, got {other:?}"),
@@ -509,18 +523,65 @@ mod tests {
     #[tokio::test]
     async fn timeout_fail_open_false_returns_block() {
         let g = build("http://unused", false);
-        let v = g.handle_failure(AcsFailure::Timeout);
+        let v = g.handle_failure(AcsFailure::Timeout, g.fail_open);
         assert!(v.is_block(), "expected Block, got {v:?}");
     }
 
     #[tokio::test]
     async fn throttled_fail_open_true_returns_bypass_throttled() {
         let g = build("http://unused", true);
-        let v = g.handle_failure(AcsFailure::Throttled);
+        let v = g.handle_failure(AcsFailure::Throttled, g.fail_open);
         match v {
             GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "azure_cs_throttled"),
             other => panic!("expected Bypass, got {other:?}"),
         }
+    }
+
+    /// P1-3: the OUTPUT hook follows `output_fail_open`, which defaults to
+    /// fail-closed even when the input-side `fail_open` is true. An Azure
+    /// outage on the output side must Block, not release unscanned output.
+    #[tokio::test]
+    async fn output_defaults_fail_closed_even_when_input_fail_open() {
+        let g = build("http://unused", true);
+        assert!(g.fail_open, "input fail_open is true in this fixture");
+        assert!(!g.output_fail_open, "output must default fail-closed");
+        // Input policy bypasses, output policy blocks.
+        assert!(g
+            .handle_failure(AcsFailure::Timeout, g.fail_open)
+            .is_bypass());
+        assert!(g
+            .handle_failure(AcsFailure::Timeout, g.output_fail_open)
+            .is_block());
+    }
+
+    /// A 5xx on the output hook fails closed by default — exercised through
+    /// the real HTTP path so the wiring (check_output → shield →
+    /// handle_failure) is covered end-to-end, not just the mapping fn.
+    #[tokio::test]
+    async fn output_5xx_fails_closed_by_default() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/contentsafety/text:shieldPrompt"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        // input fail_open=true; output_fail_open defaults false.
+        let g = build(&server.uri(), true);
+        assert!(
+            g.check_output(&resp("model output")).await.is_block(),
+            "output hook must fail closed on Azure 5xx by default",
+        );
+    }
+
+    /// Operators can opt the output hook back into fail-open.
+    #[tokio::test]
+    async fn output_fail_open_true_bypasses_on_output() {
+        let mut c = cfg("http://unused");
+        c.output_fail_open = true;
+        let g = PromptShieldGuardrail::new("row", &c, GuardrailHookPoint::Both, true);
+        assert!(g
+            .handle_failure(AcsFailure::Timeout, g.output_fail_open)
+            .is_bypass());
     }
 
     // -----------------------------------------------------------------------
