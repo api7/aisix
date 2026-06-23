@@ -8,7 +8,8 @@
 //! case is obvious. New resources append their own table as they migrate.
 
 use aisix_core::models::schema::{
-    validate_apikey, validate_cache_policy, validate_provider_key, validate_rate_limit_policy,
+    validate_apikey, validate_cache_policy, validate_observability_exporter, validate_provider_key,
+    validate_rate_limit_policy,
 };
 use serde_json::{json, Value};
 
@@ -393,6 +394,146 @@ fn provider_key_corpus() {
                 "strip_headers non-string item",
                 false,
                 json!({"display_name": "x", "secret": "k", "strip_headers": [1, 2]}),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn observability_exporter_corpus() {
+    check(
+        validate_observability_exporter,
+        &[
+            // otlp_http
+            (
+                "otlp minimal",
+                true,
+                json!({"name": "hc", "kind": "otlp_http", "endpoint": "https://api.honeycomb.io/v1/traces"}),
+            ),
+            (
+                "otlp loopback http",
+                true,
+                json!({"name": "e2e", "kind": "otlp_http", "endpoint": "http://mock-otlp:4318/v1/traces"}),
+            ),
+            (
+                "otlp plain http non-loopback (pattern)",
+                false,
+                json!({"name": "x", "kind": "otlp_http", "endpoint": "http://api.honeycomb.io/v1/traces"}),
+            ),
+            (
+                "otlp sample_rate > 1",
+                false,
+                json!({"name": "x", "kind": "otlp_http", "endpoint": "https://x", "sample_rate": 1.1}),
+            ),
+            (
+                "otlp missing endpoint",
+                false,
+                json!({"name": "x", "kind": "otlp_http"}),
+            ),
+            (
+                "otlp content_mode unknown",
+                false,
+                json!({"name": "x", "kind": "otlp_http", "endpoint": "https://x", "content_mode": "verbose"}),
+            ),
+            (
+                "otlp content_max_bytes 0",
+                false,
+                json!({"name": "x", "kind": "otlp_http", "endpoint": "https://x", "content_max_bytes": 0}),
+            ),
+            (
+                "otlp content_max_bytes > 1MiB (cap preserved)",
+                false,
+                json!({"name": "x", "kind": "otlp_http", "endpoint": "https://x", "content_max_bytes": 2000000}),
+            ),
+            // aliyun_sls
+            (
+                "sls full",
+                true,
+                json!({"name": "sls", "kind": "aliyun_sls", "endpoint": "ap-southeast-3.log.aliyuncs.com", "project": "p", "logstore": "l", "credential_ref": "r"}),
+            ),
+            (
+                "sls missing logstore",
+                false,
+                json!({"name": "x", "kind": "aliyun_sls", "endpoint": "ap-southeast-3.log.aliyuncs.com", "project": "p", "credential_ref": "r"}),
+            ),
+            (
+                "sls bad endpoint host (pattern)",
+                false,
+                json!({"name": "x", "kind": "aliyun_sls", "endpoint": "https://evil.example.com", "project": "p", "logstore": "l", "credential_ref": "r"}),
+            ),
+            (
+                "sls plaintext secret (additionalProperties:false)",
+                false,
+                json!({"name": "x", "kind": "aliyun_sls", "endpoint": "ap-southeast-3.log.aliyuncs.com", "project": "p", "logstore": "l", "credential_ref": "r", "access_key_secret": "AKIA"}),
+            ),
+            // object_store
+            (
+                "s3 credential_ref mode",
+                true,
+                json!({"name": "s3", "kind": "object_store", "provider": "s3", "bucket": "b", "prefix": "p", "credential_ref": "r"}),
+            ),
+            (
+                "s3 cloud_identity (no credential_ref)",
+                true,
+                json!({"name": "x", "kind": "object_store", "provider": "s3", "bucket": "b", "prefix": "p", "auth_mode": "cloud_identity"}),
+            ),
+            (
+                "azure_blob + cloud_identity (cross-field)",
+                false,
+                json!({"name": "x", "kind": "object_store", "provider": "azure_blob", "bucket": "c", "prefix": "p", "auth_mode": "cloud_identity"}),
+            ),
+            (
+                "credential_ref mode missing credential_ref (else)",
+                false,
+                json!({"name": "x", "kind": "object_store", "provider": "s3", "bucket": "b", "prefix": "p"}),
+            ),
+            (
+                "bad provider enum",
+                false,
+                json!({"name": "x", "kind": "object_store", "provider": "wasabi", "bucket": "b", "prefix": "p", "credential_ref": "r"}),
+            ),
+            (
+                "loopback minio endpoint",
+                true,
+                json!({"name": "x", "kind": "object_store", "provider": "s3", "bucket": "b", "prefix": "p", "endpoint": "http://minio:9000", "credential_ref": "r"}),
+            ),
+            // datadog
+            (
+                "datadog allow-list site",
+                true,
+                json!({"name": "dd", "kind": "datadog", "site": "datadoghq.eu", "credential_ref": "r", "service": "s"}),
+            ),
+            (
+                "datadog non-allow-list site (pattern)",
+                false,
+                json!({"name": "x", "kind": "datadog", "site": "datadoghq.org", "credential_ref": "r", "service": "s"}),
+            ),
+            (
+                "datadog content_max_bytes > 1MiB",
+                false,
+                json!({"name": "x", "kind": "datadog", "site": "datadoghq.com", "credential_ref": "r", "service": "s", "content_max_bytes": 1048577}),
+            ),
+            // Cross-kind field leakage now rejected (per-branch additionalProperties:false).
+            (
+                "datadog carrying otlp/sls field",
+                false,
+                json!({"name": "x", "kind": "datadog", "site": "datadoghq.com", "credential_ref": "r", "service": "s", "project": "leaked"}),
+            ),
+            // shared / discriminator
+            (
+                "unknown kind",
+                false,
+                json!({"name": "x", "kind": "splunk_hec", "endpoint": "https://x"}),
+            ),
+            (
+                "missing name",
+                false,
+                json!({"kind": "otlp_http", "endpoint": "https://x"}),
+            ),
+            (
+                "name too long (>120)",
+                false,
+                json!({"name": "a".repeat(121), "kind": "otlp_http", "endpoint": "https://x"}),
             ),
         ],
     );

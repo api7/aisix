@@ -50,6 +50,9 @@ pub enum ExporterKind {
 pub struct OtlpHttpConfig {
     /// Full URL of the OTLP/HTTP traces endpoint. Include the receiver's
     /// expected path, such as `/v1/traces`.
+    #[schemars(regex(
+        pattern = r"^https://.+|^http://(mock-otlp|otel-collector|127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$"
+    ))]
     pub endpoint: String,
 
     /// Static headers attached to every export request, such as authorization or vendor-specific API-key headers.
@@ -67,7 +70,7 @@ pub struct OtlpHttpConfig {
 
     /// Maximum bytes per captured prompt or response field when `content_mode` is `full`.
     #[serde(default = "default_content_max_bytes")]
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 1_048_576))]
     pub content_max_bytes: u32,
 }
 
@@ -77,15 +80,21 @@ pub struct OtlpHttpConfig {
 pub struct AliyunSlsConfig {
     /// SLS regional endpoint host without a scheme, such as `ap-southeast-3.log.aliyuncs.com`.
     /// Signed requests are sent to this endpoint with the SLS project as the host prefix.
+    #[schemars(regex(
+        pattern = r"^[a-z0-9][a-z0-9.-]*\.aliyuncs\.com$|^http://(mock-sls|127\.0\.0\.1|localhost)(:[0-9]+)?$"
+    ))]
     pub endpoint: String,
 
     /// SLS project that prefixes the regional endpoint in signed requests.
+    #[schemars(length(min = 1))]
     pub project: String,
 
     /// SLS logstore that receives the request-event logs.
+    #[schemars(length(min = 1))]
     pub logstore: String,
 
     /// Credential reference resolved by the data plane at delivery time. The plaintext AccessKey is not stored in this resource.
+    #[schemars(length(min = 1))]
     pub credential_ref: String,
 
     /// Controls whether logs include prompt and response content. `metadata_only` omits content. `full` includes content truncated by `content_max_bytes`.
@@ -94,7 +103,7 @@ pub struct AliyunSlsConfig {
 
     /// Maximum bytes per captured prompt or response field when `content_mode` is `full`.
     #[serde(default = "default_content_max_bytes")]
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 1, max = 1_048_576))]
     pub content_max_bytes: u32,
 }
 
@@ -121,17 +130,23 @@ const fn default_content_max_bytes() -> u32 {
 #[serde(deny_unknown_fields)]
 pub struct DatadogConfig {
     /// Datadog site, such as `datadoghq.com`, `us3.datadoghq.com`, or `datadoghq.eu`.
+    #[schemars(regex(
+        pattern = r"^(datadoghq\.com|us3\.datadoghq\.com|us5\.datadoghq\.com|datadoghq\.eu|ap1\.datadoghq\.com|ap2\.datadoghq\.com|ddog-gov\.com)$|^(mock-datadog|127\.0\.0\.1|localhost)(:[0-9]+)?$"
+    ))]
     pub site: String,
 
     /// Credential reference resolved by the data plane at delivery time. The plaintext Datadog API key is not stored in this resource.
+    #[schemars(length(min = 1))]
     pub credential_ref: String,
 
     /// Datadog `service` reserved attribute. Every log from this exporter is
     /// tagged with this service name in Datadog Log Explorer.
+    #[schemars(length(min = 1))]
     pub service: String,
 
     /// Datadog `ddsource` reserved attribute. Identifies the integration or source.
     #[serde(default = "default_ddsource")]
+    #[schemars(length(min = 1))]
     pub ddsource: String,
 
     /// Operator-defined tags rendered into Datadog's comma-joined `ddtags`
@@ -168,18 +183,24 @@ pub struct ObjectStoreConfig {
     pub provider: ObjectStoreProvider,
 
     /// Bucket for S3 or GCS, or container for Azure Blob, that receives exported files.
+    #[schemars(length(min = 1))]
     pub bucket: String,
 
     /// Key prefix the partition path is appended to, e.g. `ai-gateway`.
     /// The full key is `<prefix>/org=…/env=…/table=…/dt=…/hh=…/<file>`.
+    #[schemars(length(min = 1))]
     pub prefix: String,
 
     /// AWS region for S3 SigV4 signature scope. Set this for S3 buckets outside `us-east-1`. Ignored for GCS and Azure Blob.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub region: Option<String>,
 
     /// Backend host override for S3-compatible stores such as MinIO, Aliyun OSS, or Cloudflare R2. When omitted, the provider's native endpoint is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(
+        pattern = r"^https://.+|^http://(minio|azurite|fake-gcs-server|fake-gcs|127\.0\.0\.1|localhost)(:[0-9]+)?(/.*)?$"
+    ))]
     pub endpoint: Option<String>,
 
     /// Compression applied to each NDJSON file before upload.
@@ -237,6 +258,7 @@ pub enum ObjectStoreAuthMode {
 pub struct ObservabilityExporter {
     /// Operator-facing label, surfaced in logs and dashboard lists. The etcd
     /// key UUID is the resource identity.
+    #[schemars(length(min = 1, max = 120))]
     pub name: String,
 
     /// Whether this exporter is active. Disabled exporters remain configured but do not receive telemetry.

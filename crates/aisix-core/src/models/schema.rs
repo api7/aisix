@@ -56,7 +56,7 @@ impl Schemas {
                 .build(&cache_policy_root_schema())
                 .expect("cache_policy schema is well-formed"),
             observability_exporter: jsonschema::options()
-                .build(&observability_exporter_schema())
+                .build(&observability_exporter_root_schema())
                 .expect("observability_exporter schema is well-formed"),
             rate_limit_policy: jsonschema::options()
                 .build(&rate_limit_policy_root_schema())
@@ -351,163 +351,84 @@ pub fn cache_policy_root_schema() -> Value {
     struct_root_schema::<crate::models::CachePolicy>(false)
 }
 
-fn observability_exporter_schema() -> Value {
-    // Discriminated by `kind`; each branch's fields land flat at the top
-    // level (matches the Guardrail wire shape — see
-    // `models/observability_exporter.rs`). `additionalProperties` only
-    // considers THIS object's `properties` (not those inside `allOf`/`then`),
-    // so every kind's fields are listed at the top level as the union;
-    // per-kind required-fields and the endpoint pattern live in the
-    // `if`/`then` branches. Further kinds (`s3_ndjson`, …) land the same way.
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["name", "kind"],
-        "additionalProperties": false,
-        "properties": {
-            "name":    { "type": "string", "minLength": 1, "maxLength": 120 },
-            "enabled": { "type": "boolean" },
-            "kind":    { "type": "string", "enum": ["otlp_http", "aliyun_sls", "object_store", "datadog"] },
-            // Shared field; the per-kind pattern is enforced in the branches.
-            "endpoint": { "type": "string" },
-            // otlp_http field.
-            "headers": {
-                "type": "object",
-                "additionalProperties": { "type": "string" }
-            },
-            // aliyun_sls fields. The AccessKey is NEVER here — only a
-            // `credential_ref` the DP resolves locally (no plaintext key on
-            // the kine path).
-            "project":        { "type": "string", "minLength": 1 },
-            "logstore":       { "type": "string", "minLength": 1 },
-            "credential_ref": { "type": "string", "minLength": 1 },
-            // Content capture (opt-in), shared by aliyun_sls + datadog +
-            // otlp_http. `full` writes captured prompt / response to the sink;
-            // `content_max_bytes` truncates each FIELD. It is not a per-log
-            // bound — a datadog log carries both prompt and response, so
-            // byte-aware splitting to Datadog's 1 MB-per-log / 5 MB-per-request
-            // intake limits is tracked separately (api7/ai-gateway#556), not
-            // enforced by this cap.
-            "content_mode":      { "type": "string", "enum": ["metadata_only", "full"] },
-            "content_max_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
-            // otlp_http per-request sampling (#519 B.2). Absent = 1.0 (export
-            // everything). serde's `deny_unknown_fields` keeps it off the
-            // other kinds; this is the bounds check the loader runs before
-            // deserialize, so an out-of-range rate never reaches the sink.
-            "sample_rate": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
-            // object_store fields (S3 / GCS / Azure Blob, one variant). Cloud
-            // credentials are NEVER here — only the shared `credential_ref`.
-            "provider":    { "type": "string", "enum": ["s3", "gcs", "azure_blob"] },
-            "bucket":      { "type": "string", "minLength": 1 },
-            "prefix":      { "type": "string", "minLength": 1 },
-            "region":      { "type": "string", "minLength": 1 },
-            "compression": { "type": "string", "enum": ["gzip", "none"] },
-            // object_store auth mode: how the DP reaches the bucket.
-            "auth_mode":   { "type": "string", "enum": ["credential_ref", "cloud_identity"] },
-            // datadog fields. The Datadog API key is NEVER here — only the
-            // shared `credential_ref` the DP resolves locally. `site` is
-            // constrained to the allow-list in the per-kind branch below.
-            "site":    { "type": "string", "minLength": 1 },
-            "service": { "type": "string", "minLength": 1 },
-            "ddsource": { "type": "string", "minLength": 1 },
-            "tags": {
-                "type": "array",
-                "items": { "type": "string" }
-            }
-        },
-        "allOf": [
-            {
-                "if":   { "properties": { "kind": { "const": "otlp_http" } } },
-                "then": {
-                    "required": ["endpoint"],
-                    "properties": {
-                        // Reject http:// and any non-URL by anchoring on
-                        // https://. Loopback bypass for e2e: allow
-                        // http://mock-otlp:* / otel-collector / 127.0.0.1 /
-                        // localhost so the compose test can wire a fake
-                        // receiver without TLS.
-                        "endpoint": {
-                            "pattern": "^https://.+|^http://(mock-otlp|otel-collector|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$"
-                        }
-                    }
-                }
-            },
-            {
-                "if":   { "properties": { "kind": { "const": "aliyun_sls" } } },
-                "then": {
-                    "required": ["endpoint", "project", "logstore", "credential_ref"],
-                    "properties": {
-                        // A bare SLS region host (the sink prepends
-                        // https://<project>.). Loopback bypass for e2e: a
-                        // scheme-qualified mock-sls / 127.0.0.1 / localhost
-                        // the sink posts to directly.
-                        "endpoint": {
-                            "pattern": "^[a-z0-9][a-z0-9.-]*\\.aliyuncs\\.com$|^http://(mock-sls|127\\.0\\.0\\.1|localhost)(:[0-9]+)?$"
-                        }
-                    }
-                }
-            },
-            {
-                "if":   { "properties": { "kind": { "const": "object_store" } } },
-                "then": {
-                    "required": ["provider", "bucket", "prefix"],
-                    "properties": {
-                        // `endpoint` is optional — set only for S3-compatible
-                        // stores (MinIO / OSS / R2). When present: https, or a
-                        // loopback emulator host (MinIO / Azurite /
-                        // fake-gcs-server) for the compose e2e — never a way to
-                        // redirect real traffic to an arbitrary plaintext host.
-                        "endpoint": {
-                            "pattern": "^https://.+|^http://(minio|azurite|fake-gcs-server|fake-gcs|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$"
-                        }
-                    },
-                    "allOf": [
-                        {
-                            // cloud_identity: the DP authenticates with its own
-                            // attached cloud identity — S3 / GCS only (Azure
-                            // managed identity needs a non-secret account name
-                            // the keyless config does not carry), and no
-                            // credential_ref. Otherwise (the default
-                            // credential_ref mode) credential_ref is required.
-                            "if": {
-                                "required": ["auth_mode"],
-                                "properties": { "auth_mode": { "const": "cloud_identity" } }
-                            },
-                            "then": {
-                                "properties": { "provider": { "enum": ["s3", "gcs"] } }
-                            },
-                            "else": {
-                                "required": ["credential_ref"]
-                            }
-                        }
-                    ]
-                }
-            },
-            {
-                "if":   { "properties": { "kind": { "const": "datadog" } } },
-                "then": {
-                    "required": ["site", "credential_ref", "service"],
-                    "properties": {
-                        // The Datadog site, constrained to the supported intake
-                        // sites; the sink posts to `https://http-intake.logs.<site>`.
-                        // Loopback bypass for e2e: a bare mock-datadog / 127.0.0.1
-                        // / localhost host, OPTIONALLY with a `:port`, which the
-                        // sink posts to over http:// directly (a local mock intake
-                        // needs no TLS) — never a way to redirect real traffic to
-                        // an arbitrary host. The `:port` is allowed ONLY on the
-                        // loopback hosts (the e2e harness binds a free port); the
-                        // real sites match exactly, no port. Mirrors the
-                        // aliyun_sls / object_store loopback patterns — the prior
-                        // exact-enum rejected the harness's free-port host while
-                        // the sink's `is_loopback_site` accepted it (#548).
-                        "site": {
-                            "pattern": "^(datadoghq\\.com|us3\\.datadoghq\\.com|us5\\.datadoghq\\.com|datadoghq\\.eu|ap1\\.datadoghq\\.com|ap2\\.datadoghq\\.com|ddog-gov\\.com)$|^(mock-datadog|127\\.0\\.0\\.1|localhost)(:[0-9]+)?$"
-                        }
+/// Canonical JSON Schema for the `observability_exporter` resource, derived
+/// from the [`ObservabilityExporter`](crate::models::ObservabilityExporter)
+/// struct. `schemars` renders the internally-tagged `ExporterKind` as a native
+/// top-level `oneOf`, but two things need fixing up by hand:
+///
+/// 1. `schemars` drops `deny_unknown_fields` inside tagged-enum branches, and
+///    serde does not enforce it there either, so each branch is re-closed with
+///    `additionalProperties: false` (rejecting a smuggled plaintext secret).
+///    Because a closed branch only lists its own kind's fields, the shared
+///    top-level `name`/`enabled` are copied into every branch.
+/// 2. The `object_store` cloud-identity cross-field rule (cloud_identity ⇒
+///    provider ∈ {s3,gcs} and no credential_ref; otherwise credential_ref
+///    required) is injected as an `allOf`/`if`/`then`/`else` — `schemars` can't
+///    derive cross-field constraints.
+///
+/// Re-closing each branch also rejects cross-kind field leakage (e.g. a
+/// `datadog` exporter carrying an otlp `project`) that the previous
+/// single-union-object validator silently accepted; no valid config mixes kinds.
+pub fn observability_exporter_root_schema() -> Value {
+    let mut schema = struct_root_schema::<crate::models::ObservabilityExporter>(false);
+    let obj = schema
+        .as_object_mut()
+        .expect("observability_exporter root schema is a JSON object");
+
+    let top_props = obj
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(Value::Array(branches)) = obj.get_mut("oneOf") {
+        for branch in branches.iter_mut() {
+            let Some(branch_obj) = branch.as_object_mut() else {
+                continue;
+            };
+            let is_object_store = branch_kind(branch_obj) == Some("object_store");
+
+            let props = branch_obj
+                .entry("properties".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(props_obj) = props.as_object_mut() {
+                for key in ["name", "enabled"] {
+                    if let Some(v) = top_props.get(key) {
+                        props_obj
+                            .entry(key.to_string())
+                            .or_insert_with(|| v.clone());
                     }
                 }
             }
-        ]
-    })
+
+            if is_object_store {
+                branch_obj.insert(
+                    "allOf".to_string(),
+                    json!([{
+                        "if": {
+                            "required": ["auth_mode"],
+                            "properties": { "auth_mode": { "const": "cloud_identity" } }
+                        },
+                        "then": { "properties": { "provider": { "enum": ["s3", "gcs"] } } },
+                        "else": { "required": ["credential_ref"] }
+                    }]),
+                );
+            }
+
+            branch_obj.insert("additionalProperties".to_string(), json!(false));
+        }
+    }
+    schema
+}
+
+/// The `kind` discriminator value of a schemars-generated tagged-enum `oneOf`
+/// branch, whether rendered as a `const` or a single-element `enum`.
+fn branch_kind(branch: &serde_json::Map<String, Value>) -> Option<&str> {
+    let kind = branch.get("properties")?.get("kind")?;
+    if let Some(c) = kind.get("const").and_then(Value::as_str) {
+        return Some(c);
+    }
+    kind.get("enum")?.as_array()?.first()?.as_str()
 }
 
 /// Canonical JSON Schema for the `rate_limit_policy` resource, derived from the

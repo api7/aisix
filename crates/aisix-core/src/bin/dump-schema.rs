@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use schemars::JsonSchema;
 
 use aisix_core::models::schema;
-use aisix_core::models::{EnsembleConfig, Guardrail, ObservabilityExporter, RateLimit, Routing};
+use aisix_core::models::{EnsembleConfig, Guardrail, RateLimit, Routing};
 
 fn main() {
     let out_dir = workspace_root().join("schemas").join("resources");
@@ -51,10 +51,14 @@ fn main() {
     );
 
     dump_value(&out_dir, "provider_key", schema::provider_key_root_schema());
+    dump_value(
+        &out_dir,
+        "observability_exporter",
+        schema::observability_exporter_root_schema(),
+    );
 
     dump::<EnsembleConfig>(&out_dir, "ensemble");
     dump::<Guardrail>(&out_dir, "guardrail");
-    dump::<ObservabilityExporter>(&out_dir, "observability_exporter");
     dump::<RateLimit>(&out_dir, "rate_limit");
     dump::<Routing>(&out_dir, "routing");
 }

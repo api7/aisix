@@ -4030,6 +4030,13 @@ mod tests {
                 }
 
                 for (key, child) in map {
+                    // `if`/`then`/`else` are cross-field constraint subschemas
+                    // (e.g. object_store's cloud-identity rule), not ReDoc-
+                    // rendered property definitions, so their inner properties
+                    // need no descriptions.
+                    if matches!(key.as_str(), "if" | "then" | "else") {
+                        continue;
+                    }
                     collect_missing_property_descriptions(child, format!("{path}/{key}"), missing);
                 }
             }
