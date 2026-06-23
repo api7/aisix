@@ -2717,7 +2717,7 @@ fn emit_usage_event(
         // as defence-in-depth against log/JSON injection downstream
         // (PR #382 audit MEDIUM-3; admission-side cap tracked
         // separately).
-        provider_kind: sanitize_tag(tags.kind.unwrap_or_default()),
+        provider_kind: sanitize_tag(tags.kind.map(|k| k.as_str().to_owned()).unwrap_or_default()),
         provider_featured: tags.featured,
         branded_provider: sanitize_tag(tags.branded_provider.unwrap_or_default()),
         pk_label: sanitize_tag(tags.pk_label.unwrap_or_default()),

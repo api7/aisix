@@ -22,14 +22,15 @@
         "null"
       ],
       "format": "uint32",
-      "minimum": 0.0
+      "minimum": 1.0
     },
     "panel": {
       "description": "Direct models called concurrently for each ensemble request.",
       "type": "array",
       "items": {
         "$ref": "#/definitions/PanelMember"
-      }
+      },
+      "minItems": 1
     },
     "timeout_ms": {
       "description": "Per-call upstream deadline applied to each panel member and the judge. Set `0` or omit it to disable the ensemble-level deadline.",
@@ -52,14 +53,16 @@
       "properties": {
         "model": {
           "description": "Model alias for the direct model that synthesizes panel responses.",
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "synthesis_prompt": {
           "description": "Override for the built-in synthesis prompt template.",
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "minLength": 1
         }
       },
       "additionalProperties": false
@@ -73,7 +76,8 @@
       "properties": {
         "model": {
           "description": "Model alias for a direct model that receives one panel request.",
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "seed": {
           "description": "Sampling seed for this panel member.",
@@ -90,7 +94,8 @@
             "number",
             "null"
           ],
-          "format": "float"
+          "format": "float",
+          "minimum": 0.0
         },
         "weight": {
           "description": "Reserved for the future voting/quorum strategy. Ignored by the v1 synthesis path.",

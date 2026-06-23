@@ -1,275 +1,22 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "ObservabilityExporter",
-  "description": "Telemetry exporter configuration.",
-  "type": "object",
-  "oneOf": [
-    {
-      "description": "OTLP/HTTP trace exporter configuration.",
-      "type": "object",
-      "required": [
-        "endpoint",
-        "kind"
-      ],
-      "properties": {
-        "content_max_bytes": {
-          "description": "Maximum bytes per captured prompt or response field when `content_mode` is `full`.",
-          "default": 131072,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 1.0
-        },
-        "content_mode": {
-          "description": "Controls whether spans include prompt and response content. `metadata_only` omits content. `full` includes content truncated by `content_max_bytes`.",
-          "default": "metadata_only",
-          "allOf": [
-            {
-              "$ref": "#/definitions/SlsContentMode"
-            }
-          ]
-        },
-        "endpoint": {
-          "description": "Full URL of the OTLP/HTTP traces endpoint. Include the receiver's expected path, such as `/v1/traces`.",
-          "type": "string"
-        },
-        "headers": {
-          "description": "Static headers attached to every export request, such as authorization or vendor-specific API-key headers.",
-          "type": "object",
-          "additionalProperties": {
-            "type": "string"
-          }
-        },
-        "kind": {
-          "type": "string",
-          "enum": [
-            "otlp_http"
-          ]
-        },
-        "sample_rate": {
-          "description": "Fraction of requests exported as traces, from `0.0` to `1.0`.",
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double",
-          "maximum": 1.0,
-          "minimum": 0.0
-        }
-      }
-    },
-    {
-      "description": "Aliyun SLS PutLogs exporter configuration.",
-      "type": "object",
-      "required": [
-        "credential_ref",
-        "endpoint",
-        "kind",
-        "logstore",
-        "project"
-      ],
-      "properties": {
-        "content_max_bytes": {
-          "description": "Maximum bytes per captured prompt or response field when `content_mode` is `full`.",
-          "default": 131072,
-          "type": "integer",
-          "format": "uint32",
-          "minimum": 1.0
-        },
-        "content_mode": {
-          "description": "Controls whether logs include prompt and response content. `metadata_only` omits content. `full` includes content truncated by `content_max_bytes`.",
-          "default": "metadata_only",
-          "allOf": [
-            {
-              "$ref": "#/definitions/SlsContentMode"
-            }
-          ]
-        },
-        "credential_ref": {
-          "description": "Credential reference resolved by the data plane at delivery time. The plaintext AccessKey is not stored in this resource.",
-          "type": "string"
-        },
-        "endpoint": {
-          "description": "SLS regional endpoint host without a scheme, such as `ap-southeast-3.log.aliyuncs.com`. Signed requests are sent to this endpoint with the SLS project as the host prefix.",
-          "type": "string"
-        },
-        "kind": {
-          "type": "string",
-          "enum": [
-            "aliyun_sls"
-          ]
-        },
-        "logstore": {
-          "description": "SLS logstore that receives the request-event logs.",
-          "type": "string"
-        },
-        "project": {
-          "description": "SLS project that prefixes the regional endpoint in signed requests.",
-          "type": "string"
-        }
-      }
-    },
-    {
-      "description": "Object-storage exporter configuration for S3, GCS, Azure Blob, and compatible S3 backends.",
-      "type": "object",
-      "required": [
-        "bucket",
-        "kind",
-        "prefix",
-        "provider"
-      ],
-      "properties": {
-        "auth_mode": {
-          "description": "How the data plane authenticates to the bucket.",
-          "default": "credential_ref",
-          "allOf": [
-            {
-              "$ref": "#/definitions/ObjectStoreAuthMode"
-            }
-          ]
-        },
-        "bucket": {
-          "description": "Bucket for S3 or GCS, or container for Azure Blob, that receives exported files.",
-          "type": "string"
-        },
-        "compression": {
-          "description": "Compression applied to each NDJSON file before upload.",
-          "default": "gzip",
-          "allOf": [
-            {
-              "$ref": "#/definitions/ObjectStoreCompression"
-            }
-          ]
-        },
-        "credential_ref": {
-          "description": "Credential reference resolved by the data plane at delivery time. Required when `auth_mode` is `credential_ref`.",
-          "type": "string"
-        },
-        "endpoint": {
-          "description": "Backend host override for S3-compatible stores such as MinIO, Aliyun OSS, or Cloudflare R2. When omitted, the provider's native endpoint is used.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "kind": {
-          "type": "string",
-          "enum": [
-            "object_store"
-          ]
-        },
-        "prefix": {
-          "description": "Key prefix the partition path is appended to, e.g. `ai-gateway`. The full key is `<prefix>/org=…/env=…/table=…/dt=…/hh=…/<file>`.",
-          "type": "string"
-        },
-        "provider": {
-          "description": "Which object-storage backend the bucket lives in.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/ObjectStoreProvider"
-            }
-          ]
-        },
-        "region": {
-          "description": "AWS region for S3 SigV4 signature scope. Set this for S3 buckets outside `us-east-1`. Ignored for GCS and Azure Blob.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      }
-    },
-    {
-      "description": "Datadog native Logs HTTP intake exporter configuration.",
-      "type": "object",
-      "required": [
-        "credential_ref",
-        "kind",
-        "service",
-        "site"
-      ],
-      "properties": {
-        "content_max_bytes": {
-          "description": "Maximum bytes per captured prompt or response field when `content_mode` is `full`. Keep this under Datadog intake limits to avoid delivery errors.",
-          "default": 131072,
-          "type": "integer",
-          "format": "uint32",
-          "maximum": 1048576.0,
-          "minimum": 1.0
-        },
-        "content_mode": {
-          "description": "Controls whether logs include prompt and response content. `metadata_only` omits content. `full` includes content truncated by `content_max_bytes`.",
-          "default": "metadata_only",
-          "allOf": [
-            {
-              "$ref": "#/definitions/SlsContentMode"
-            }
-          ]
-        },
-        "credential_ref": {
-          "description": "Credential reference resolved by the data plane at delivery time. The plaintext Datadog API key is not stored in this resource.",
-          "type": "string"
-        },
-        "ddsource": {
-          "description": "Datadog `ddsource` reserved attribute. Identifies the integration or source.",
-          "default": "aisix-ai-gateway",
-          "type": "string"
-        },
-        "kind": {
-          "type": "string",
-          "enum": [
-            "datadog"
-          ]
-        },
-        "service": {
-          "description": "Datadog `service` reserved attribute. Every log from this exporter is tagged with this service name in Datadog Log Explorer.",
-          "type": "string"
-        },
-        "site": {
-          "description": "Datadog site, such as `datadoghq.com`, `us3.datadoghq.com`, or `datadoghq.eu`.",
-          "type": "string"
-        },
-        "tags": {
-          "description": "Operator-defined tags rendered into Datadog's comma-joined `ddtags` reserved attribute. For example, `[\"team:platform\", \"tier:prod\"]` becomes `team:platform,tier:prod`. Leave empty when no tags should be sent.",
-          "default": [],
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
-      }
-    }
-  ],
-  "required": [
-    "name"
-  ],
-  "properties": {
-    "enabled": {
-      "description": "Whether this exporter is active. Disabled exporters remain configured but do not receive telemetry.",
-      "default": true,
-      "type": "boolean"
-    },
-    "name": {
-      "description": "Operator-facing label, surfaced in logs and dashboard lists. The etcd key UUID is the resource identity.",
-      "type": "string"
-    }
-  },
   "definitions": {
     "ObjectStoreAuthMode": {
       "description": "How the data plane obtains credentials for the object-storage bucket.",
       "oneOf": [
         {
           "description": "Resolve `credential_ref` to static keys from data plane environment variables named `OBJSTORE_CRED_<SLUG>_<FIELD>`.",
-          "type": "string",
           "enum": [
             "credential_ref"
-          ]
+          ],
+          "type": "string"
         },
         {
           "description": "Use the data plane host's attached cloud identity. Supported for S3 and GCS only.",
-          "type": "string",
           "enum": [
             "cloud_identity"
-          ]
+          ],
+          "type": "string"
         }
       ]
     },
@@ -278,47 +25,386 @@
       "oneOf": [
         {
           "description": "gzip compression as defined by RFC 1952. Accepted by Snowpipe and Auto Loader.",
-          "type": "string",
           "enum": [
             "gzip"
-          ]
+          ],
+          "type": "string"
         },
         {
           "description": "No compression. Emits raw NDJSON.",
-          "type": "string",
           "enum": [
             "none"
-          ]
+          ],
+          "type": "string"
         }
       ]
     },
     "ObjectStoreProvider": {
       "description": "Object-storage backend selector. The sink builds one backend client per variant. Batching, key layout, and retry behavior are shared.",
-      "type": "string",
       "enum": [
         "s3",
         "gcs",
         "azure_blob"
-      ]
+      ],
+      "type": "string"
     },
     "SlsContentMode": {
       "description": "Content-capture mode for an observability exporter.",
       "oneOf": [
         {
           "description": "Operational metadata only. Prompt and response content are omitted.",
-          "type": "string",
           "enum": [
             "metadata_only"
-          ]
+          ],
+          "type": "string"
         },
         {
           "description": "Metadata plus the captured request prompt and assembled response.",
-          "type": "string",
           "enum": [
             "full"
-          ]
+          ],
+          "type": "string"
         }
       ]
     }
-  }
+  },
+  "description": "Telemetry exporter configuration.",
+  "oneOf": [
+    {
+      "additionalProperties": false,
+      "description": "OTLP/HTTP trace exporter configuration.",
+      "properties": {
+        "content_max_bytes": {
+          "default": 131072,
+          "description": "Maximum bytes per captured prompt or response field when `content_mode` is `full`.",
+          "format": "uint32",
+          "maximum": 1048576.0,
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "content_mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SlsContentMode"
+            }
+          ],
+          "default": "metadata_only",
+          "description": "Controls whether spans include prompt and response content. `metadata_only` omits content. `full` includes content truncated by `content_max_bytes`."
+        },
+        "enabled": {
+          "default": true,
+          "description": "Whether this exporter is active. Disabled exporters remain configured but do not receive telemetry.",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "description": "Full URL of the OTLP/HTTP traces endpoint. Include the receiver's expected path, such as `/v1/traces`.",
+          "pattern": "^https://.+|^http://(mock-otlp|otel-collector|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$",
+          "type": "string"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Static headers attached to every export request, such as authorization or vendor-specific API-key headers.",
+          "type": "object"
+        },
+        "kind": {
+          "enum": [
+            "otlp_http"
+          ],
+          "type": "string"
+        },
+        "name": {
+          "description": "Operator-facing label, surfaced in logs and dashboard lists. The etcd key UUID is the resource identity.",
+          "maxLength": 120,
+          "minLength": 1,
+          "type": "string"
+        },
+        "sample_rate": {
+          "description": "Fraction of requests exported as traces, from `0.0` to `1.0`.",
+          "format": "double",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "endpoint",
+        "kind"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "description": "Aliyun SLS PutLogs exporter configuration.",
+      "properties": {
+        "content_max_bytes": {
+          "default": 131072,
+          "description": "Maximum bytes per captured prompt or response field when `content_mode` is `full`.",
+          "format": "uint32",
+          "maximum": 1048576.0,
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "content_mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SlsContentMode"
+            }
+          ],
+          "default": "metadata_only",
+          "description": "Controls whether logs include prompt and response content. `metadata_only` omits content. `full` includes content truncated by `content_max_bytes`."
+        },
+        "credential_ref": {
+          "description": "Credential reference resolved by the data plane at delivery time. The plaintext AccessKey is not stored in this resource.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Whether this exporter is active. Disabled exporters remain configured but do not receive telemetry.",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "description": "SLS regional endpoint host without a scheme, such as `ap-southeast-3.log.aliyuncs.com`. Signed requests are sent to this endpoint with the SLS project as the host prefix.",
+          "pattern": "^[a-z0-9][a-z0-9.-]*\\.aliyuncs\\.com$|^http://(mock-sls|127\\.0\\.0\\.1|localhost)(:[0-9]+)?$",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "aliyun_sls"
+          ],
+          "type": "string"
+        },
+        "logstore": {
+          "description": "SLS logstore that receives the request-event logs.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "name": {
+          "description": "Operator-facing label, surfaced in logs and dashboard lists. The etcd key UUID is the resource identity.",
+          "maxLength": 120,
+          "minLength": 1,
+          "type": "string"
+        },
+        "project": {
+          "description": "SLS project that prefixes the regional endpoint in signed requests.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "credential_ref",
+        "endpoint",
+        "kind",
+        "logstore",
+        "project"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "else": {
+            "required": [
+              "credential_ref"
+            ]
+          },
+          "if": {
+            "properties": {
+              "auth_mode": {
+                "const": "cloud_identity"
+              }
+            },
+            "required": [
+              "auth_mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "provider": {
+                "enum": [
+                  "s3",
+                  "gcs"
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "description": "Object-storage exporter configuration for S3, GCS, Azure Blob, and compatible S3 backends.",
+      "properties": {
+        "auth_mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ObjectStoreAuthMode"
+            }
+          ],
+          "default": "credential_ref",
+          "description": "How the data plane authenticates to the bucket."
+        },
+        "bucket": {
+          "description": "Bucket for S3 or GCS, or container for Azure Blob, that receives exported files.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "compression": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ObjectStoreCompression"
+            }
+          ],
+          "default": "gzip",
+          "description": "Compression applied to each NDJSON file before upload."
+        },
+        "credential_ref": {
+          "description": "Credential reference resolved by the data plane at delivery time. Required when `auth_mode` is `credential_ref`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Whether this exporter is active. Disabled exporters remain configured but do not receive telemetry.",
+          "type": "boolean"
+        },
+        "endpoint": {
+          "description": "Backend host override for S3-compatible stores such as MinIO, Aliyun OSS, or Cloudflare R2. When omitted, the provider's native endpoint is used.",
+          "pattern": "^https://.+|^http://(minio|azurite|fake-gcs-server|fake-gcs|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "object_store"
+          ],
+          "type": "string"
+        },
+        "name": {
+          "description": "Operator-facing label, surfaced in logs and dashboard lists. The etcd key UUID is the resource identity.",
+          "maxLength": 120,
+          "minLength": 1,
+          "type": "string"
+        },
+        "prefix": {
+          "description": "Key prefix the partition path is appended to, e.g. `ai-gateway`. The full key is `<prefix>/org=…/env=…/table=…/dt=…/hh=…/<file>`.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "provider": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ObjectStoreProvider"
+            }
+          ],
+          "description": "Which object-storage backend the bucket lives in."
+        },
+        "region": {
+          "description": "AWS region for S3 SigV4 signature scope. Set this for S3 buckets outside `us-east-1`. Ignored for GCS and Azure Blob.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "bucket",
+        "kind",
+        "prefix",
+        "provider"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "description": "Datadog native Logs HTTP intake exporter configuration.",
+      "properties": {
+        "content_max_bytes": {
+          "default": 131072,
+          "description": "Maximum bytes per captured prompt or response field when `content_mode` is `full`. Keep this under Datadog intake limits to avoid delivery errors.",
+          "format": "uint32",
+          "maximum": 1048576.0,
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "content_mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SlsContentMode"
+            }
+          ],
+          "default": "metadata_only",
+          "description": "Controls whether logs include prompt and response content. `metadata_only` omits content. `full` includes content truncated by `content_max_bytes`."
+        },
+        "credential_ref": {
+          "description": "Credential reference resolved by the data plane at delivery time. The plaintext Datadog API key is not stored in this resource.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "ddsource": {
+          "default": "aisix-ai-gateway",
+          "description": "Datadog `ddsource` reserved attribute. Identifies the integration or source.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "description": "Whether this exporter is active. Disabled exporters remain configured but do not receive telemetry.",
+          "type": "boolean"
+        },
+        "kind": {
+          "enum": [
+            "datadog"
+          ],
+          "type": "string"
+        },
+        "name": {
+          "description": "Operator-facing label, surfaced in logs and dashboard lists. The etcd key UUID is the resource identity.",
+          "maxLength": 120,
+          "minLength": 1,
+          "type": "string"
+        },
+        "service": {
+          "description": "Datadog `service` reserved attribute. Every log from this exporter is tagged with this service name in Datadog Log Explorer.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "site": {
+          "description": "Datadog site, such as `datadoghq.com`, `us3.datadoghq.com`, or `datadoghq.eu`.",
+          "pattern": "^(datadoghq\\.com|us3\\.datadoghq\\.com|us5\\.datadoghq\\.com|datadoghq\\.eu|ap1\\.datadoghq\\.com|ap2\\.datadoghq\\.com|ddog-gov\\.com)$|^(mock-datadog|127\\.0\\.0\\.1|localhost)(:[0-9]+)?$",
+          "type": "string"
+        },
+        "tags": {
+          "default": [],
+          "description": "Operator-defined tags rendered into Datadog's comma-joined `ddtags` reserved attribute. For example, `[\"team:platform\", \"tier:prod\"]` becomes `team:platform,tier:prod`. Leave empty when no tags should be sent.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "credential_ref",
+        "kind",
+        "service",
+        "site"
+      ],
+      "type": "object"
+    }
+  ],
+  "properties": {
+    "enabled": {
+      "default": true,
+      "description": "Whether this exporter is active. Disabled exporters remain configured but do not receive telemetry.",
+      "type": "boolean"
+    },
+    "name": {
+      "description": "Operator-facing label, surfaced in logs and dashboard lists. The etcd key UUID is the resource identity.",
+      "maxLength": 120,
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "name"
+  ],
+  "title": "ObservabilityExporter",
+  "type": "object"
 }

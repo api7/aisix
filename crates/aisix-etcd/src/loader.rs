@@ -561,7 +561,7 @@ mod tests {
         assert_eq!(snap.rate_limit_policies.len(), 1);
         let entry = snap.rate_limit_policies.get_by_id("rlp-1").unwrap();
         assert_eq!(entry.value.name, "team-quota");
-        assert_eq!(entry.value.scope, "team");
+        assert_eq!(entry.value.scope, aisix_core::models::PolicyScope::Team);
         assert_eq!(entry.value.scope_ref, "team-uuid-1");
         assert_eq!(entry.value.max_requests, Some(100));
     }

@@ -30,6 +30,7 @@ pub enum CacheBackend {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq)]
 pub struct CachePolicy {
     /// Operator-facing name that surfaces in metric labels and cache headers.
+    #[schemars(length(min = 1, max = 120))]
     pub name: String,
 
     /// When false, the cache gate skips this policy. Allows operators
@@ -43,11 +44,13 @@ pub struct CachePolicy {
 
     /// Cache entry TTL in seconds.
     #[serde(default = "default_ttl_seconds")]
+    #[schemars(range(min = 1, max = 604800))]
     pub ttl_seconds: u32,
 
     /// Free-form scope. Supports `"all"`, `"model:<name>"`, and
     /// `"api_key:<id>"`. See `parsed_applies_to`.
     #[serde(default = "default_applies_to")]
+    #[schemars(length(min = 1, max = 255))]
     pub applies_to: String,
 
     /// Set by the loader from the kine path's UUID segment. The DP

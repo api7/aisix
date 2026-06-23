@@ -1,42 +1,72 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "RateLimitPolicy",
-  "type": "object",
+  "additionalProperties": false,
+  "anyOf": [
+    {
+      "required": [
+        "max_requests"
+      ]
+    },
+    {
+      "required": [
+        "max_tokens"
+      ]
+    }
+  ],
+  "definitions": {
+    "PolicyScope": {
+      "description": "Subject a [`RateLimitPolicy`] targets, paired with `scope_ref`.",
+      "enum": [
+        "api_key",
+        "model",
+        "team",
+        "member",
+        "team_member"
+      ],
+      "type": "string"
+    },
+    "PolicyWindow": {
+      "description": "Fixed-window length a [`RateLimitPolicy`] applies its limits over.",
+      "enum": [
+        "second",
+        "minute",
+        "hour"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "max_requests": {
+      "format": "uint64",
+      "minimum": 1.0,
+      "type": "integer"
+    },
+    "max_tokens": {
+      "format": "uint64",
+      "minimum": 1.0,
+      "type": "integer"
+    },
+    "name": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "scope": {
+      "$ref": "#/definitions/PolicyScope"
+    },
+    "scope_ref": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "window": {
+      "$ref": "#/definitions/PolicyWindow"
+    }
+  },
   "required": [
     "name",
     "scope",
     "scope_ref",
     "window"
   ],
-  "properties": {
-    "max_requests": {
-      "type": [
-        "integer",
-        "null"
-      ],
-      "format": "uint64",
-      "minimum": 0.0
-    },
-    "max_tokens": {
-      "type": [
-        "integer",
-        "null"
-      ],
-      "format": "uint64",
-      "minimum": 0.0
-    },
-    "name": {
-      "type": "string"
-    },
-    "scope": {
-      "type": "string"
-    },
-    "scope_ref": {
-      "type": "string"
-    },
-    "window": {
-      "type": "string"
-    }
-  },
-  "additionalProperties": false
+  "title": "RateLimitPolicy",
+  "type": "object"
 }

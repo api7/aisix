@@ -30,29 +30,59 @@ use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
 
-use aisix_core::models::{
-    ApiKey, CachePolicy, EnsembleConfig, Guardrail, Model, ObservabilityExporter, ProviderKey,
-    RateLimit, RateLimitPolicy, Routing,
-};
+use aisix_core::models::schema;
+use aisix_core::models::{EnsembleConfig, RateLimit, Routing};
 
 fn main() {
     let out_dir = workspace_root().join("schemas").join("resources");
     fs::create_dir_all(&out_dir).expect("create schemas/resources dir");
 
-    dump::<ApiKey>(&out_dir, "api_key");
-    dump::<CachePolicy>(&out_dir, "cache_policy");
+    // Every resource with a runtime validator goes through the SAME
+    // `*_root_schema()` producer the validator uses, so the published schema ==
+    // the enforced schema by construction. `ensemble`/`rate_limit`/`routing`
+    // have no standalone validator (they are nested struct types) so they dump
+    // straight from the struct via `schema_for!`.
+    dump_value(&out_dir, "api_key", schema::apikey_root_schema());
+    dump_value(&out_dir, "cache_policy", schema::cache_policy_root_schema());
+    dump_value(&out_dir, "model", schema::model_root_schema());
+    dump_value(
+        &out_dir,
+        "rate_limit_policy",
+        schema::rate_limit_policy_root_schema(),
+    );
+    dump_value(&out_dir, "provider_key", schema::provider_key_root_schema());
+    dump_value(
+        &out_dir,
+        "observability_exporter",
+        schema::observability_exporter_root_schema(),
+    );
+    dump_value(&out_dir, "guardrail", schema::guardrail_root_schema());
+    dump_value(
+        &out_dir,
+        "guardrail_attachment",
+        schema::guardrail_attachment_root_schema(),
+    );
+
     dump::<EnsembleConfig>(&out_dir, "ensemble");
-    dump::<Guardrail>(&out_dir, "guardrail");
-    dump::<Model>(&out_dir, "model");
-    dump::<ObservabilityExporter>(&out_dir, "observability_exporter");
-    dump::<ProviderKey>(&out_dir, "provider_key");
     dump::<RateLimit>(&out_dir, "rate_limit");
-    dump::<RateLimitPolicy>(&out_dir, "rate_limit_policy");
     dump::<Routing>(&out_dir, "routing");
 }
 
 fn dump<T: JsonSchema>(out_dir: &Path, name: &str) {
-    let schema = schemars::schema_for!(T);
+    // Serialize the `RootSchema` directly to preserve schemars' native key
+    // ordering. (Routing through `serde_json::Value` would re-sort keys.)
+    let mut json =
+        serde_json::to_string_pretty(&schemars::schema_for!(T)).expect("serialize schema");
+    json.push('\n');
+    let path = out_dir.join(format!("{name}.schema.json"));
+    fs::write(&path, json).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    println!("wrote {}", path.display());
+}
+
+/// Write a pre-assembled schema `Value`. Used for resources whose canonical
+/// schema is built by a dedicated producer rather than a bare `schema_for!`
+/// (e.g. `model`, which injects the cross-field `oneOf`).
+fn dump_value(out_dir: &Path, name: &str, schema: serde_json::Value) {
     let mut json = serde_json::to_string_pretty(&schema).expect("serialize schema");
     json.push('\n');
     let path = out_dir.join(format!("{name}.schema.json"));

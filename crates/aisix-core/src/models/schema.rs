@@ -38,28 +38,28 @@ impl Schemas {
     fn compile() -> Self {
         Self {
             model: jsonschema::options()
-                .build(&model_schema())
+                .build(&model_root_schema())
                 .expect("model schema is well-formed"),
             apikey: jsonschema::options()
-                .build(&apikey_schema())
+                .build(&apikey_root_schema())
                 .expect("apikey schema is well-formed"),
             provider_key: jsonschema::options()
-                .build(&provider_key_schema())
+                .build(&provider_key_root_schema())
                 .expect("provider_key schema is well-formed"),
             guardrail: jsonschema::options()
-                .build(&guardrail_schema())
+                .build(&guardrail_root_schema())
                 .expect("guardrail schema is well-formed"),
             guardrail_attachment: jsonschema::options()
-                .build(&guardrail_attachment_schema())
+                .build(&guardrail_attachment_root_schema())
                 .expect("guardrail_attachment schema is well-formed"),
             cache_policy: jsonschema::options()
-                .build(&cache_policy_schema())
+                .build(&cache_policy_root_schema())
                 .expect("cache_policy schema is well-formed"),
             observability_exporter: jsonschema::options()
-                .build(&observability_exporter_schema())
+                .build(&observability_exporter_root_schema())
                 .expect("observability_exporter schema is well-formed"),
             rate_limit_policy: jsonschema::options()
-                .build(&rate_limit_policy_schema())
+                .build(&rate_limit_policy_root_schema())
                 .expect("rate_limit_policy schema is well-formed"),
         }
     }
@@ -117,729 +117,297 @@ pub fn validate_guardrail_attachment(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.guardrail_attachment, value)
 }
 
-fn model_schema() -> Value {
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["display_name"],
-        "additionalProperties": false,
-        "properties": {
-            "display_name":    { "type": "string", "minLength": 1 },
-            // `provider` is the open vendor identity (models.dev catalog id
-            // — e.g. `openai`, `xai`, `wafer.ai`). The pattern accepts the
-            // dot character because at least one real models.dev id
-            // (`wafer.ai`) contains it; rejecting `.` would re-create the
-            // #417 bug class for that vendor.
-            "provider":        { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9][a-z0-9._-]*$" },
-            "model_name":      { "type": "string", "minLength": 1 },
-            "provider_key_id": { "type": "string", "minLength": 1 },
-            "timeout":         { "type": "integer", "minimum": 0 },
-            "stream_timeout":  { "type": "integer", "minimum": 0 },
-            // Client-IP allowlist (#557). Permitted on both direct and
-            // routing models — the gate binds to whichever model the client
-            // names, so a Model Group can be IP-restricted too. CIDR format
-            // is validated by cp-api on write; the DP skips malformed entries.
-            "allowed_cidrs":   { "type": "array", "items": { "type": "string", "minLength": 1 } },
-            "rate_limit":      { "$ref": "#/$defs/rate_limit" },
-            "routing": {
-                "type": "object",
-                "required": ["targets"],
-                "additionalProperties": false,
-                "properties": {
-                    "strategy": {
-                        "type": "string",
-                        "enum": ["round_robin", "weighted", "failover"]
-                    },
-                    "targets": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": {
-                            "type": "object",
-                            "required": ["model"],
-                            "additionalProperties": false,
-                            "properties": {
-                                "model":  { "type": "string", "minLength": 1 },
-                                "weight": { "type": "integer", "minimum": 0 }
-                            }
-                        }
-                    },
-                    "retries": { "type": "integer", "minimum": 0 },
-                    "max_fallbacks": { "type": "integer", "minimum": 0 },
-                    "retry_on_429": { "type": "boolean" },
-                    "on_all_filtered": {
-                        "type": "string",
-                        "enum": ["fail", "original_order"]
+/// Build a resource's canonical JSON Schema from its struct via `schemars`,
+/// the single source of field shapes and per-field constraints.
+///
+/// `nullable_options` controls schemars' `Option<T>` representation: `false`
+/// keeps optional fields plain-but-absent (`type: string`), matching the wire
+/// shape of resources that never receive an explicit `null` (cp-api omits
+/// unset fields); `true` keeps the default nullable form (`type: [string,
+/// null]`) for resources whose schema deliberately accepts `null` (e.g.
+/// ApiKey `team_id`/`user_id`).
+///
+/// Both the runtime validators in [`Schemas::compile`] and the `dump-schema`
+/// binary that emits `schemas/resources/*.json` build from these producers, so
+/// the published schema and the enforced schema are the same object by
+/// construction — no hand-maintained second copy to drift.
+fn struct_root_schema<T: schemars::JsonSchema>(nullable_options: bool) -> Value {
+    use schemars::gen::{SchemaGenerator, SchemaSettings};
+
+    let settings = SchemaSettings::draft07().with(|s| {
+        s.option_add_null_type = nullable_options;
+    });
+    let root = SchemaGenerator::new(settings).into_root_schema_for::<T>();
+    serde_json::to_value(root).expect("resource schema serializes to JSON")
+}
+
+/// Canonical JSON Schema for the `model` resource: the [`Model`] struct plus
+/// the one cross-field invariant `schemars` cannot express
+/// ([`super::model::model_one_of`] — the direct/routing/ensemble XOR).
+///
+/// [`Model`]: crate::models::Model
+pub fn model_root_schema() -> Value {
+    let mut schema = struct_root_schema::<crate::models::Model>(false);
+    schema
+        .as_object_mut()
+        .expect("model root schema is a JSON object")
+        .insert("oneOf".to_string(), super::model::model_one_of());
+    schema
+}
+
+/// Canonical JSON Schema for the `api_key` resource, derived from the
+/// [`ApiKey`](crate::models::ApiKey) struct. Uses the default nullable
+/// `Option` representation so `team_id`/`user_id` keep accepting an explicit
+/// `null` (cp-api sends `null` to clear team/owner), matching the resource's
+/// wire contract.
+pub fn apikey_root_schema() -> Value {
+    struct_root_schema::<crate::models::ApiKey>(true)
+}
+
+/// Canonical JSON Schema for the `provider_key` resource, derived from the
+/// [`ProviderKey`](crate::models::ProviderKey) struct. Uses the nullable
+/// `Option` representation (`true`): `TelemetryTags` carries fields cp-api
+/// sends as explicit `null` (`branded_provider`/`pk_label`/`byo_label`), and
+/// keeping all optionals nullable matches the resource's wire contract.
+pub fn provider_key_root_schema() -> Value {
+    struct_root_schema::<crate::models::ProviderKey>(true)
+}
+
+/// Canonical JSON Schema for the `guardrail` resource, derived from the
+/// [`Guardrail`](crate::models::Guardrail) struct. `schemars` renders the
+/// internally-tagged `GuardrailKind` as a native top-level `oneOf`; the
+/// top-level object and its branches are intentionally open (matching the
+/// hand-written schema — unknown inner fields are caught by serde at
+/// deserialize). Three things need fixing up:
+///
+/// 1. The tagged sub-enums (`KeywordPattern`/`BedrockAWSCredentials`/
+///    `BedrockLatencyMode`) lose `deny_unknown_fields` in their `oneOf`
+///    branches, so each is re-closed with `additionalProperties: false`.
+/// 2. The stringly-typed moderation fields carry closed sets the hand-written
+///    schema enforced via `enum`. They stay `String` on the struct (their
+///    values flow through `aisix-guardrails` as strings; converting them to
+///    Rust enums would churn that crate's processing), so the closed set is
+///    injected here into the relevant kind branch.
+/// 3. `created_at` republishes its `date-time` format (annotation-only).
+pub fn guardrail_root_schema() -> Value {
+    let mut schema = struct_root_schema::<crate::models::Guardrail>(false);
+    let obj = schema
+        .as_object_mut()
+        .expect("guardrail root schema is a JSON object");
+
+    if let Some(Value::Object(defs)) = obj.get_mut("definitions") {
+        for name in [
+            "KeywordPattern",
+            "BedrockAWSCredentials",
+            "BedrockLatencyMode",
+        ] {
+            if let Some(Value::Array(branches)) =
+                defs.get_mut(name).and_then(|d| d.get_mut("oneOf"))
+            {
+                for branch in branches.iter_mut() {
+                    if let Some(b) = branch.as_object_mut() {
+                        b.insert("additionalProperties".to_string(), json!(false));
                     }
-                }
-            },
-            "cost": {
-                "type": "object",
-                "required": ["input_per_1k", "output_per_1k"],
-                "additionalProperties": false,
-                "properties": {
-                    "input_per_1k":  { "type": "number", "minimum": 0 },
-                    "output_per_1k": { "type": "number", "minimum": 0 }
-                }
-            },
-            "background_model_check": {
-                "type": "object",
-                "required": [
-                    "enabled",
-                    "interval_seconds",
-                    "timeout_seconds",
-                    "prompt",
-                    "max_tokens",
-                    "stale_after_seconds"
-                ],
-                "additionalProperties": false,
-                "properties": {
-                    "enabled": { "type": "boolean" },
-                    // Minimum 5s guards against misconfiguration. Setting
-                    // interval_seconds=1 with multiple direct models would
-                    // burn provider quota and money very quickly.
-                    "interval_seconds": { "type": "integer", "minimum": 5 },
-                    "timeout_seconds": { "type": "integer", "minimum": 1 },
-                    "prompt": { "type": "string", "minLength": 1 },
-                    "max_tokens": { "type": "integer", "minimum": 1 },
-                    "ignore_statuses": {
-                        "type": "array",
-                        "items": { "type": "integer", "minimum": 100, "maximum": 599 }
-                    },
-                    "stale_after_seconds": { "type": "integer", "minimum": 1 }
-                }
-            },
-            "cooldown": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "enabled":              { "type": "boolean" },
-                    "default_seconds":      { "type": "integer", "minimum": 0 },
-                    "max_seconds":          { "type": "integer", "minimum": 1 },
-                    "honor_retry_after":    { "type": "boolean" },
-                    "trigger_statuses": {
-                        "type": "array",
-                        "items": { "type": "integer", "minimum": 100, "maximum": 599 }
-                    },
-                    "trigger_on_timeout":   { "type": "boolean" },
-                    "trigger_on_transport": { "type": "boolean" }
-                }
-            },
-            "ensemble": {
-                "type": "object",
-                "required": ["panel", "judge"],
-                "additionalProperties": false,
-                "properties": {
-                    "panel": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": {
-                            "type": "object",
-                            "required": ["model"],
-                            "additionalProperties": false,
-                            "properties": {
-                                "model":       { "type": "string", "minLength": 1 },
-                                "temperature": { "type": "number", "minimum": 0 },
-                                "seed":        { "type": "integer", "minimum": 0 },
-                                "weight":      { "type": "integer", "minimum": 0 }
-                            }
-                        }
-                    },
-                    "judge": {
-                        "type": "object",
-                        "required": ["model"],
-                        "additionalProperties": false,
-                        "properties": {
-                            "model":            { "type": "string", "minLength": 1 },
-                            "synthesis_prompt": { "type": "string", "minLength": 1 }
-                        }
-                    },
-                    "min_responses": { "type": "integer", "minimum": 1 },
-                    "timeout_ms":    { "type": "integer", "minimum": 0 }
-                }
-            }
-        },
-        // Direct vs routing vs ensemble model: a model ships EXACTLY one
-        // of — a `routing` block (virtual router), an `ensemble` block
-        // (panel + judge fan-out), or the three direct upstream fields
-        // (provider/model_name/provider_key_id) together. The three
-        // shapes are mutually exclusive.
-        "oneOf": [
-            {
-                "required": ["routing"],
-                "not": { "anyOf": [
-                    { "required": ["provider"] },
-                    { "required": ["model_name"] },
-                    { "required": ["provider_key_id"] },
-                    { "required": ["background_model_check"] },
-                    { "required": ["cooldown"] },
-                    { "required": ["ensemble"] }
-                ]}
-            },
-            {
-                "required": ["provider", "model_name", "provider_key_id"],
-                "not": { "anyOf": [
-                    { "required": ["routing"] },
-                    { "required": ["ensemble"] }
-                ]}
-            },
-            {
-                "required": ["ensemble"],
-                "not": { "anyOf": [
-                    { "required": ["provider"] },
-                    { "required": ["model_name"] },
-                    { "required": ["provider_key_id"] },
-                    { "required": ["routing"] },
-                    { "required": ["background_model_check"] },
-                    { "required": ["cooldown"] }
-                ]}
-            }
-        ],
-        "$defs": {
-            "rate_limit": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "tpm":         { "type": "integer", "minimum": 0 },
-                    "tpd":         { "type": "integer", "minimum": 0 },
-                    "rpm":         { "type": "integer", "minimum": 0 },
-                    "rpd":         { "type": "integer", "minimum": 0 },
-                    "concurrency": { "type": "integer", "minimum": 0 }
                 }
             }
         }
-    })
-}
+    }
 
-fn apikey_schema() -> Value {
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["key_hash", "allowed_models"],
-        "additionalProperties": false,
-        "properties": {
-            "key_hash": { "type": "string", "minLength": 1 },
-            "allowed_models": {
-                "type": "array",
-                "items": { "type": "string" }
-            },
-            "rate_limit": { "$ref": "#/$defs/rate_limit" },
-            "team_id": {
-                "anyOf": [
-                    { "type": "string", "minLength": 1 },
-                    { "type": "null" }
-                ]
-            },
-            "user_id": {
-                "anyOf": [
-                    { "type": "string", "minLength": 1 },
-                    { "type": "null" }
-                ]
-            }
-        },
-        "$defs": {
-            "rate_limit": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "tpm":         { "type": "integer", "minimum": 0 },
-                    "tpd":         { "type": "integer", "minimum": 0 },
-                    "rpm":         { "type": "integer", "minimum": 0 },
-                    "rpd":         { "type": "integer", "minimum": 0 },
-                    "concurrency": { "type": "integer", "minimum": 0 }
+    if let Some(Value::Array(branches)) = obj.get_mut("oneOf") {
+        for branch in branches.iter_mut() {
+            let Some(b) = branch.as_object_mut() else {
+                continue;
+            };
+            match branch_kind(b) {
+                Some("azure_content_safety_text_moderation") => {
+                    set_property_enum(
+                        b,
+                        "output_type",
+                        json!(["FourSeverityLevels", "EightSeverityLevels"]),
+                    );
+                    set_property_enum(
+                        b,
+                        "text_source",
+                        json!(["concatenate_user_content", "concatenate_all_content"]),
+                    );
+                    set_property_enum(
+                        b,
+                        "stream_processing_mode",
+                        json!(["window", "buffer_full"]),
+                    );
+                    set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
+                    set_property_items_enum(
+                        b,
+                        "categories",
+                        json!(["Hate", "Sexual", "SelfHarm", "Violence"]),
+                    );
                 }
-            }
-        }
-    })
-}
-
-fn provider_key_schema() -> Value {
-    // `provider`, `adapter`, and `telemetry_tags` were added as a
-    // skeleton for issue #302 Phase A (PR #298). `request` and
-    // `response` were added in Phase A2.5 to land the on-disk shape
-    // for the `RuntimeConfig.request` / `RuntimeConfig.response`
-    // blocks from issue #302 §5. All Phase A fields are optional on
-    // the wire (matching `#[serde(default)]` on the Rust side) so
-    // existing ProviderKey payloads without these fields keep
-    // validating. No dispatch path reads them in this PR.
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["display_name", "secret"],
-        "additionalProperties": false,
-        "properties": {
-            "display_name": { "type": "string", "minLength": 1 },
-            "secret":       { "type": "string", "minLength": 1 },
-            "api_base":     { "type": "string" },
-            // Phase A skeleton — vendor identity, free-form string.
-            // Closed-set validation is deferred to a follow-up Phase A
-            // PR that wires dispatch onto `provider`.
-            "provider":     { "type": "string" },
-            // Phase A skeleton — wire-shape adapter. Pinned to the
-            // closed Adapter enum.
-            "adapter":      { "type": "string", "enum": ["openai", "anthropic", "bedrock", "vertex", "azure-openai"] },
-            "telemetry_tags": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "kind":             { "type": "string", "enum": ["catalog", "byo"] },
-                    "featured":         { "type": "boolean" },
-                    "branded_provider": { "type": ["string", "null"] },
-                    "pk_label":         { "type": ["string", "null"] },
-                    "byo_label":        { "type": ["string", "null"] }
+                Some("aliyun_text_moderation") => {
+                    set_property_enum(b, "risk_level_threshold", json!(["low", "medium", "high"]));
+                    set_property_enum(
+                        b,
+                        "stream_processing_mode",
+                        json!(["window", "buffer_full"]),
+                    );
+                    set_property_enum(b, "on_buffer_exceeded", json!(["fail_closed", "fail_open"]));
                 }
-            },
-            // Phase A2.5 — RuntimeConfig.request, see issue #302 §5.
-            // Each sub-field is the input to a primitive apply
-            // function in aisix-provider-openai's overrides module.
-            "request": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "param_renames": {
-                        "type": "object",
-                        "additionalProperties": { "type": "string" }
-                    },
-                    "param_constraints": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "properties": {
-                            "temperature_max": { "type": "number" },
-                            "temperature_min": { "type": "number" }
-                        }
-                    },
-                    "default_headers": {
-                        "type": "object",
-                        "additionalProperties": { "type": "string" }
-                    },
-                    // Free-form on purpose — the cp-api spec lets
-                    // operators set any default top-level body field
-                    // (`safe_prompt`, `transforms`, etc.); the apply
-                    // path only adds keys when the caller did not
-                    // set them.
-                    "default_body_fields": {
-                        "type": "object"
-                    }
-                }
-            },
-            // Phase A2.5 — RuntimeConfig.response, see issue #302 §5.
-            "response": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "stream_done_marker":     { "type": "string", "enum": ["required", "optional", "none"] },
-                    "content_list_to_string": { "type": "boolean" },
-                    // Open string in Phase A2.5 — matches the Rust
-                    // `Option<String>`. Phase D pins the closed
-                    // ("openai" | "passthrough") set.
-                    "error_envelope":         { "type": "string" },
-                    "reasoning_field":        { "type": "string" }
-                }
-            },
-            // Issue #411 — per-PK passthrough header strip list.
-            // Optional (defaults applied DP-side via
-            // `#[serde(default = "default_strip_headers")]`); when
-            // present, must be an array of strings. Entries are
-            // normalised (trim/lowercase/dedup/drop-empties) on
-            // deserialize so this validator doesn't enforce
-            // formatting beyond the type shape.
-            "strip_headers": {
-                "type": "array",
-                "items": { "type": "string" }
+                _ => {}
             }
         }
-    })
+    }
+
+    if let Some(created_at) = obj
+        .get_mut("properties")
+        .and_then(|p| p.get_mut("created_at"))
+        .and_then(Value::as_object_mut)
+    {
+        created_at.insert("format".to_string(), json!("date-time"));
+    }
+
+    schema
 }
 
-fn guardrail_schema() -> Value {
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["name", "kind"],
-        // Each kind variant adds its own keys; the per-kind oneOf
-        // below pins them. Top-level stays open so future kinds
-        // (lakera, protect_ai) only edit the oneOf branch.
-        "additionalProperties": true,
-        "properties": {
-            "name":       { "type": "string", "minLength": 1 },
-            "enabled":    { "type": "boolean" },
-            "hook_point": { "enum": ["input", "output", "both"] },
-            "fail_open":  { "type": "boolean" },
-            "created_at": { "type": "string", "format": "date-time" },
-            "kind":       { "enum": ["keyword", "bedrock", "azure_content_safety", "azure_content_safety_text_moderation", "aliyun_text_moderation"] }
-        },
-        "oneOf": [
-            {
-                "type": "object",
-                "required": ["kind", "patterns"],
-                "properties": {
-                    "kind":     { "const": "keyword" },
-                    "patterns": {
-                        "type": "array",
-                        "items": { "$ref": "#/$defs/keyword_pattern" }
+/// Set a closed `enum` on a oneOf branch's property (for stringly-typed fields
+/// whose closed set lives only in the schema, not the Rust type).
+fn set_property_enum(branch: &mut serde_json::Map<String, Value>, field: &str, values: Value) {
+    if let Some(prop) = branch
+        .get_mut("properties")
+        .and_then(|p| p.get_mut(field))
+        .and_then(Value::as_object_mut)
+    {
+        prop.insert("enum".to_string(), values);
+    }
+}
+
+/// Like [`set_property_enum`] but for the `items` of an array property.
+fn set_property_items_enum(
+    branch: &mut serde_json::Map<String, Value>,
+    field: &str,
+    values: Value,
+) {
+    if let Some(items) = branch
+        .get_mut("properties")
+        .and_then(|p| p.get_mut(field))
+        .and_then(|f| f.get_mut("items"))
+        .and_then(Value::as_object_mut)
+    {
+        items.insert("enum".to_string(), values);
+    }
+}
+
+/// Canonical JSON Schema for the `cache_policy` resource, derived from the
+/// [`CachePolicy`](crate::models::CachePolicy) struct. The struct intentionally
+/// has no `deny_unknown_fields`, so the schema omits `additionalProperties`
+/// (i.e. `true`) — forward-compat fields from a newer cp-api are tolerated.
+pub fn cache_policy_root_schema() -> Value {
+    struct_root_schema::<crate::models::CachePolicy>(false)
+}
+
+/// Canonical JSON Schema for the `observability_exporter` resource, derived
+/// from the [`ObservabilityExporter`](crate::models::ObservabilityExporter)
+/// struct. `schemars` renders the internally-tagged `ExporterKind` as a native
+/// top-level `oneOf`, but two things need fixing up by hand:
+///
+/// 1. `schemars` drops `deny_unknown_fields` inside tagged-enum branches, and
+///    serde does not enforce it there either, so each branch is re-closed with
+///    `additionalProperties: false` (rejecting a smuggled plaintext secret).
+///    Because a closed branch only lists its own kind's fields, the shared
+///    top-level `name`/`enabled` are copied into every branch.
+/// 2. The `object_store` cloud-identity cross-field rule (cloud_identity ⇒
+///    provider ∈ {s3,gcs} and no credential_ref; otherwise credential_ref
+///    required) is injected as an `allOf`/`if`/`then`/`else` — `schemars` can't
+///    derive cross-field constraints.
+///
+/// Re-closing each branch also rejects cross-kind field leakage (e.g. a
+/// `datadog` exporter carrying an otlp `project`) that the previous
+/// single-union-object validator silently accepted; no valid config mixes kinds.
+pub fn observability_exporter_root_schema() -> Value {
+    let mut schema = struct_root_schema::<crate::models::ObservabilityExporter>(false);
+    let obj = schema
+        .as_object_mut()
+        .expect("observability_exporter root schema is a JSON object");
+
+    let top_props = obj
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(Value::Array(branches)) = obj.get_mut("oneOf") {
+        for branch in branches.iter_mut() {
+            let Some(branch_obj) = branch.as_object_mut() else {
+                continue;
+            };
+            let is_object_store = branch_kind(branch_obj) == Some("object_store");
+
+            let props = branch_obj
+                .entry("properties".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(props_obj) = props.as_object_mut() {
+                for key in ["name", "enabled"] {
+                    if let Some(v) = top_props.get(key) {
+                        props_obj
+                            .entry(key.to_string())
+                            .or_insert_with(|| v.clone());
                     }
                 }
-            },
-            {
-                "type": "object",
-                "required": [
-                    "kind", "guardrail_id", "guardrail_version",
-                    "region", "aws_credentials", "latency_mode"
-                ],
-                "properties": {
-                    "kind":               { "const": "bedrock" },
-                    "guardrail_id":       { "type": "string", "minLength": 1, "maxLength": 64 },
-                    "guardrail_version":  { "type": "string", "minLength": 1, "maxLength": 16 },
-                    "region":             { "type": "string", "minLength": 1 },
-                    "aws_credentials":    { "$ref": "#/$defs/bedrock_aws_credentials" },
-                    "latency_mode":       { "$ref": "#/$defs/bedrock_latency_mode" }
-                }
-            },
-            {
-                // kind=azure_content_safety — Azure AI Content Safety
-                // Prompt Shield. Mirrors AzureContentSafetyConfig in
-                // guardrail.rs: endpoint + api_key required, timeout_ms
-                // optional (u32, defaults to 5000 on the struct).
-                "type": "object",
-                "required": ["kind", "endpoint", "api_key"],
-                "properties": {
-                    "kind":       { "const": "azure_content_safety" },
-                    "endpoint":   { "type": "string", "minLength": 1 },
-                    "api_key":    { "type": "string", "minLength": 1 },
-                    "timeout_ms": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295u64 }
-                }
-            },
-            {
-                // kind=azure_content_safety_text_moderation — text:analyze
-                // category-severity + blocklist moderation. P2 (#379).
-                // Connection block matches azure_content_safety; the
-                // moderation + streaming params are optional (cp-api applies
-                // defaults + strict validation on write).
-                "type": "object",
-                "required": ["kind", "endpoint", "api_key"],
-                "properties": {
-                    "kind":       { "const": "azure_content_safety_text_moderation" },
-                    "endpoint":   { "type": "string", "minLength": 1 },
-                    "api_key":    { "type": "string", "minLength": 1 },
-                    "timeout_ms": { "type": "integer", "minimum": 0, "maximum": 4_294_967_295u64 },
-                    "output_type": { "enum": ["FourSeverityLevels", "EightSeverityLevels"] },
-                    "categories": {
-                        "type": "array",
-                        "items": { "enum": ["Hate", "Sexual", "SelfHarm", "Violence"] }
-                    },
-                    "severity_threshold": { "type": "integer", "minimum": 0, "maximum": 7 },
-                    "severity_threshold_by_category": { "type": "object" },
-                    "blocklist_names": { "type": "array", "items": { "type": "string" } },
-                    "halt_on_blocklist_hit": { "type": "boolean" },
-                    "text_source": { "enum": ["concatenate_user_content", "concatenate_all_content"] },
-                    "stream_processing_mode": { "enum": ["window", "buffer_full"] },
-                    "window_size": { "type": "integer", "minimum": 1, "maximum": 10_000 },
-                    "window_overlap_size": { "type": "integer", "minimum": 0 },
-                    "max_buffer_bytes": { "type": "integer", "minimum": 1 },
-                    "on_buffer_exceeded": { "enum": ["fail_closed", "fail_open"] },
-                    "output_fail_open": { "type": "boolean" }
-                }
-            },
-            {
-                // kind=aliyun_text_moderation — Aliyun content-safety
-                // guardrail (TextModerationPlus). Mirrors
-                // AliyunTextModerationConfig in guardrail.rs: region +
-                // access keys required, endpoint override + threshold +
-                // streaming params optional (cp-api applies defaults +
-                // strict validation on write). #603.
-                "type": "object",
-                "required": ["kind", "region", "access_key_id", "access_key_secret"],
-                "properties": {
-                    "kind":              { "const": "aliyun_text_moderation" },
-                    "region":            { "type": "string", "minLength": 1 },
-                    "endpoint":          { "type": "string", "minLength": 1 },
-                    "access_key_id":     { "type": "string", "minLength": 1 },
-                    "access_key_secret": { "type": "string", "minLength": 1 },
-                    "risk_level_threshold": { "enum": ["low", "medium", "high"] },
-                    "timeout_ms":        { "type": "integer", "minimum": 0, "maximum": 4_294_967_295u64 },
-                    "output_fail_open":  { "type": "boolean" },
-                    "stream_processing_mode": { "enum": ["window", "buffer_full"] },
-                    "window_size":       { "type": "integer", "minimum": 1, "maximum": 2_000 },
-                    "window_overlap_size": { "type": "integer", "minimum": 0 },
-                    "max_buffer_bytes":  { "type": "integer", "minimum": 1 },
-                    "on_buffer_exceeded": { "enum": ["fail_closed", "fail_open"] }
-                }
             }
-        ],
-        "$defs": {
-            "keyword_pattern": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["kind", "value"],
-                "properties": {
-                    "kind":  { "enum": ["literal", "regex"] },
-                    "value": { "type": "string", "minLength": 1 }
-                }
-            },
-            "bedrock_aws_credentials": {
-                "type": "object",
-                // v1 ships kind=static (plaintext access keys on the
-                // kine wire — cp-api decrypts the envelope-encrypted
-                // secret at projection time, see PRD-09c §6.3).
-                // Phase 4 adds kind=role_arn (sts:AssumeRole) under
-                // the same `kind` discriminator.
-                "required": ["kind", "access_key_id", "secret_access_key"],
-                "properties": {
-                    "kind":              { "const": "static" },
-                    "access_key_id":     { "type": "string", "minLength": 1 },
-                    "secret_access_key": { "type": "string", "minLength": 1 }
-                },
-                "additionalProperties": false
-            },
-            "bedrock_latency_mode": {
-                "oneOf": [
-                    {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["kind"],
-                        "properties": { "kind": { "const": "serial" } }
-                    },
-                    {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["kind", "timeout_ms"],
-                        "properties": {
-                            "kind":       { "const": "timed" },
-                            "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 5000 }
-                        }
-                    }
-                ]
+
+            if is_object_store {
+                branch_obj.insert(
+                    "allOf".to_string(),
+                    json!([{
+                        "if": {
+                            "required": ["auth_mode"],
+                            "properties": { "auth_mode": { "const": "cloud_identity" } }
+                        },
+                        "then": { "properties": { "provider": { "enum": ["s3", "gcs"] } } },
+                        "else": { "required": ["credential_ref"] }
+                    }]),
+                );
             }
+
+            branch_obj.insert("additionalProperties".to_string(), json!(false));
         }
-    })
+    }
+    schema
 }
 
-// Mirrors cp-api's cache_policies validation rules (validateCachePolicyShape
-// in internal/cpapi/resources/cache_policies.go). The DP is the second
-// line of defence — cp-api rejects malformed payloads on write, but kine
-// can still surface stale or hand-edited rows on watch, so we re-validate
-// at parse time. `additionalProperties: true` keeps the schema
-// forward-compatible: cp-api can ship new optional fields ahead of a DP
-// rollout without locking the gateway out.
-fn cache_policy_schema() -> Value {
-    // Backends: memory + redis. Semantic backends were removed
-    // pending DP-side wiring — see ai-gateway issue #116. The schema
-    // stays `additionalProperties: true` so a newer cp-api can ship
-    // forward-compat fields without locking out an older DP.
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["name"],
-        "additionalProperties": true,
-        "properties": {
-            "name":        { "type": "string", "minLength": 1, "maxLength": 120 },
-            "enabled":     { "type": "boolean" },
-            "backend":     { "enum": ["memory", "redis"] },
-            "ttl_seconds": { "type": "integer", "minimum": 1, "maximum": 604800 },
-            "applies_to":  { "type": "string", "minLength": 1, "maxLength": 255 }
-        }
-    })
+/// The `kind` discriminator value of a schemars-generated tagged-enum `oneOf`
+/// branch, whether rendered as a `const` or a single-element `enum`.
+fn branch_kind(branch: &serde_json::Map<String, Value>) -> Option<&str> {
+    let kind = branch.get("properties")?.get("kind")?;
+    if let Some(c) = kind.get("const").and_then(Value::as_str) {
+        return Some(c);
+    }
+    kind.get("enum")?.as_array()?.first()?.as_str()
 }
 
-fn observability_exporter_schema() -> Value {
-    // Discriminated by `kind`; each branch's fields land flat at the top
-    // level (matches the Guardrail wire shape — see
-    // `models/observability_exporter.rs`). `additionalProperties` only
-    // considers THIS object's `properties` (not those inside `allOf`/`then`),
-    // so every kind's fields are listed at the top level as the union;
-    // per-kind required-fields and the endpoint pattern live in the
-    // `if`/`then` branches. Further kinds (`s3_ndjson`, …) land the same way.
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["name", "kind"],
-        "additionalProperties": false,
-        "properties": {
-            "name":    { "type": "string", "minLength": 1, "maxLength": 120 },
-            "enabled": { "type": "boolean" },
-            "kind":    { "type": "string", "enum": ["otlp_http", "aliyun_sls", "object_store", "datadog"] },
-            // Shared field; the per-kind pattern is enforced in the branches.
-            "endpoint": { "type": "string" },
-            // otlp_http field.
-            "headers": {
-                "type": "object",
-                "additionalProperties": { "type": "string" }
-            },
-            // aliyun_sls fields. The AccessKey is NEVER here — only a
-            // `credential_ref` the DP resolves locally (no plaintext key on
-            // the kine path).
-            "project":        { "type": "string", "minLength": 1 },
-            "logstore":       { "type": "string", "minLength": 1 },
-            "credential_ref": { "type": "string", "minLength": 1 },
-            // Content capture (opt-in), shared by aliyun_sls + datadog +
-            // otlp_http. `full` writes captured prompt / response to the sink;
-            // `content_max_bytes` truncates each FIELD. It is not a per-log
-            // bound — a datadog log carries both prompt and response, so
-            // byte-aware splitting to Datadog's 1 MB-per-log / 5 MB-per-request
-            // intake limits is tracked separately (api7/ai-gateway#556), not
-            // enforced by this cap.
-            "content_mode":      { "type": "string", "enum": ["metadata_only", "full"] },
-            "content_max_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
-            // otlp_http per-request sampling (#519 B.2). Absent = 1.0 (export
-            // everything). serde's `deny_unknown_fields` keeps it off the
-            // other kinds; this is the bounds check the loader runs before
-            // deserialize, so an out-of-range rate never reaches the sink.
-            "sample_rate": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
-            // object_store fields (S3 / GCS / Azure Blob, one variant). Cloud
-            // credentials are NEVER here — only the shared `credential_ref`.
-            "provider":    { "type": "string", "enum": ["s3", "gcs", "azure_blob"] },
-            "bucket":      { "type": "string", "minLength": 1 },
-            "prefix":      { "type": "string", "minLength": 1 },
-            "region":      { "type": "string", "minLength": 1 },
-            "compression": { "type": "string", "enum": ["gzip", "none"] },
-            // object_store auth mode: how the DP reaches the bucket.
-            "auth_mode":   { "type": "string", "enum": ["credential_ref", "cloud_identity"] },
-            // datadog fields. The Datadog API key is NEVER here — only the
-            // shared `credential_ref` the DP resolves locally. `site` is
-            // constrained to the allow-list in the per-kind branch below.
-            "site":    { "type": "string", "minLength": 1 },
-            "service": { "type": "string", "minLength": 1 },
-            "ddsource": { "type": "string", "minLength": 1 },
-            "tags": {
-                "type": "array",
-                "items": { "type": "string" }
-            }
-        },
-        "allOf": [
-            {
-                "if":   { "properties": { "kind": { "const": "otlp_http" } } },
-                "then": {
-                    "required": ["endpoint"],
-                    "properties": {
-                        // Reject http:// and any non-URL by anchoring on
-                        // https://. Loopback bypass for e2e: allow
-                        // http://mock-otlp:* / otel-collector / 127.0.0.1 /
-                        // localhost so the compose test can wire a fake
-                        // receiver without TLS.
-                        "endpoint": {
-                            "pattern": "^https://.+|^http://(mock-otlp|otel-collector|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$"
-                        }
-                    }
-                }
-            },
-            {
-                "if":   { "properties": { "kind": { "const": "aliyun_sls" } } },
-                "then": {
-                    "required": ["endpoint", "project", "logstore", "credential_ref"],
-                    "properties": {
-                        // A bare SLS region host (the sink prepends
-                        // https://<project>.). Loopback bypass for e2e: a
-                        // scheme-qualified mock-sls / 127.0.0.1 / localhost
-                        // the sink posts to directly.
-                        "endpoint": {
-                            "pattern": "^[a-z0-9][a-z0-9.-]*\\.aliyuncs\\.com$|^http://(mock-sls|127\\.0\\.0\\.1|localhost)(:[0-9]+)?$"
-                        }
-                    }
-                }
-            },
-            {
-                "if":   { "properties": { "kind": { "const": "object_store" } } },
-                "then": {
-                    "required": ["provider", "bucket", "prefix"],
-                    "properties": {
-                        // `endpoint` is optional — set only for S3-compatible
-                        // stores (MinIO / OSS / R2). When present: https, or a
-                        // loopback emulator host (MinIO / Azurite /
-                        // fake-gcs-server) for the compose e2e — never a way to
-                        // redirect real traffic to an arbitrary plaintext host.
-                        "endpoint": {
-                            "pattern": "^https://.+|^http://(minio|azurite|fake-gcs-server|fake-gcs|127\\.0\\.0\\.1|localhost)(:[0-9]+)?(/.*)?$"
-                        }
-                    },
-                    "allOf": [
-                        {
-                            // cloud_identity: the DP authenticates with its own
-                            // attached cloud identity — S3 / GCS only (Azure
-                            // managed identity needs a non-secret account name
-                            // the keyless config does not carry), and no
-                            // credential_ref. Otherwise (the default
-                            // credential_ref mode) credential_ref is required.
-                            "if": {
-                                "required": ["auth_mode"],
-                                "properties": { "auth_mode": { "const": "cloud_identity" } }
-                            },
-                            "then": {
-                                "properties": { "provider": { "enum": ["s3", "gcs"] } }
-                            },
-                            "else": {
-                                "required": ["credential_ref"]
-                            }
-                        }
-                    ]
-                }
-            },
-            {
-                "if":   { "properties": { "kind": { "const": "datadog" } } },
-                "then": {
-                    "required": ["site", "credential_ref", "service"],
-                    "properties": {
-                        // The Datadog site, constrained to the supported intake
-                        // sites; the sink posts to `https://http-intake.logs.<site>`.
-                        // Loopback bypass for e2e: a bare mock-datadog / 127.0.0.1
-                        // / localhost host, OPTIONALLY with a `:port`, which the
-                        // sink posts to over http:// directly (a local mock intake
-                        // needs no TLS) — never a way to redirect real traffic to
-                        // an arbitrary host. The `:port` is allowed ONLY on the
-                        // loopback hosts (the e2e harness binds a free port); the
-                        // real sites match exactly, no port. Mirrors the
-                        // aliyun_sls / object_store loopback patterns — the prior
-                        // exact-enum rejected the harness's free-port host while
-                        // the sink's `is_loopback_site` accepted it (#548).
-                        "site": {
-                            "pattern": "^(datadoghq\\.com|us3\\.datadoghq\\.com|us5\\.datadoghq\\.com|datadoghq\\.eu|ap1\\.datadoghq\\.com|ap2\\.datadoghq\\.com|ddog-gov\\.com)$|^(mock-datadog|127\\.0\\.0\\.1|localhost)(:[0-9]+)?$"
-                        }
-                    }
-                }
-            }
-        ]
-    })
+/// Canonical JSON Schema for the `rate_limit_policy` resource, derived from the
+/// [`RateLimitPolicy`](crate::models::RateLimitPolicy) struct (the `scope`/
+/// `window` closed sets come from the `PolicyScope`/`PolicyWindow` enums) plus
+/// the one cross-field invariant `schemars` can't express: at least one of
+/// `max_requests`/`max_tokens` must be set
+/// ([`super::rate_limit_policy::rate_limit_policy_any_of`]).
+pub fn rate_limit_policy_root_schema() -> Value {
+    let mut schema = struct_root_schema::<crate::models::RateLimitPolicy>(false);
+    schema
+        .as_object_mut()
+        .expect("rate_limit_policy root schema is a JSON object")
+        .insert(
+            "anyOf".to_string(),
+            super::rate_limit_policy::rate_limit_policy_any_of(),
+        );
+    schema
 }
 
-fn rate_limit_policy_schema() -> Value {
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["name", "scope", "scope_ref", "window"],
-        "additionalProperties": false,
-        "properties": {
-            "name":         { "type": "string", "minLength": 1 },
-            "scope":        { "type": "string", "enum": ["api_key", "model", "team", "member", "team_member"] },
-            "scope_ref":    { "type": "string", "minLength": 1 },
-            "window":       { "type": "string", "enum": ["second", "minute", "hour"] },
-            "max_requests": { "type": "integer", "minimum": 1 },
-            "max_tokens":   { "type": "integer", "minimum": 1 }
-        },
-        "anyOf": [
-            { "required": ["max_requests"] },
-            { "required": ["max_tokens"] }
-        ]
-    })
-}
-
-fn guardrail_attachment_schema() -> Value {
-    // `additionalProperties` is NOT set to false: cp-api includes `env_id`
-    // in the kine payload (for its own idempotency logic) which the DP
-    // doesn't need. Allowing extra keys here keeps the schema forward-
-    // compatible if cp-api adds more metadata fields later.
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["guardrail_id", "scope_type", "priority"],
-        "properties": {
-            "guardrail_id": { "type": "string", "minLength": 1 },
-            "scope_type":   {
-                "type": "string",
-                "enum": ["env", "model", "api_key", "team"]
-            },
-            "scope_id":     { "type": ["string", "null"] },
-            "priority":     { "type": "integer" },
-            "enabled":      { "type": "boolean" }
-        }
-    })
+/// Canonical JSON Schema for the `guardrail_attachment` resource, derived from
+/// the [`GuardrailAttachment`](crate::models::GuardrailAttachment) struct. Uses
+/// the nullable `Option` representation (`scope_id` is `null` for `env`-scoped
+/// attachments) and stays open (no `deny_unknown_fields`): cp-api includes an
+/// `env_id` the DP ignores.
+pub fn guardrail_attachment_root_schema() -> Value {
+    struct_root_schema::<crate::models::GuardrailAttachment>(true)
 }
 
 #[cfg(test)]

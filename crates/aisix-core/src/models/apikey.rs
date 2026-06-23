@@ -19,6 +19,7 @@ use crate::resource::Resource;
 pub struct ApiKey {
     /// SHA-256 hexadecimal hash of the plaintext bearer. The proxy hashes
     /// incoming bearer tokens before lookup.
+    #[schemars(length(min = 1))]
     pub key_hash: String,
 
     /// Model identifiers this key may use. An empty array denies access to every model.
@@ -31,11 +32,13 @@ pub struct ApiKey {
     /// Team this API key belongs to. Used for matching team-scope
     /// rate limit policies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub team_id: Option<String>,
 
     /// Org member who owns this key. Used for matching member-scope
     /// rate limit policies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1))]
     pub user_id: Option<String>,
 
     /// etcd-key uuid. Filled by the loader and never included in the JSON payload.

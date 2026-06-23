@@ -15,7 +15,7 @@
 //! 429. The returned [`MultiReservation`] commits token usage to all
 //! layers and releases all concurrency permits on drop.
 
-use aisix_core::models::RateLimitPolicy;
+use aisix_core::models::{PolicyScope, PolicyWindow, RateLimitPolicy};
 use aisix_core::RateLimit;
 use aisix_ratelimit::MultiReservation;
 
@@ -51,8 +51,8 @@ impl ModelRateLimit {
 
 fn policy_to_rate_limit(policy: &RateLimitPolicy) -> RateLimit {
     let mut rl = RateLimit::default();
-    match policy.window.as_str() {
-        "second" => {
+    match policy.window {
+        PolicyWindow::Second => {
             // Pre-fix (api7/AISIX-Cloud#426): `rl.rpm = max * 60` — a
             // 5/second policy was upscaled to 300/minute, allowing
             // 60× bursts past the operator-declared cap inside any
@@ -77,11 +77,11 @@ fn policy_to_rate_limit(policy: &RateLimitPolicy) -> RateLimit {
                 );
             }
         }
-        "minute" => {
+        PolicyWindow::Minute => {
             rl.rpm = policy.max_requests;
             rl.tpm = policy.max_tokens;
         }
-        "hour" => {
+        PolicyWindow::Hour => {
             // Pre-fix (api7/AISIX-Cloud#426): `rl.rpd = max * 24` —
             // a 1000/hour policy was upscaled to 24000/day, allowing
             // the entire hourly cap to be burned in any single hour
@@ -100,7 +100,6 @@ fn policy_to_rate_limit(policy: &RateLimitPolicy) -> RateLimit {
                 );
             }
         }
-        _ => {}
     }
     rl
 }
@@ -112,7 +111,7 @@ fn policy_to_rate_limit(policy: &RateLimitPolicy) -> RateLimit {
 /// (LiteLLM's `{team_id}:{user_id}` shape).
 fn policy_bucket_key(policy: &RateLimitPolicy, entry_id: &str, auth: &AuthenticatedKey) -> String {
     let base = format!("policy:{}:{}:{}", policy.scope, policy.scope_ref, entry_id);
-    if policy.scope == "team_member" {
+    if policy.scope == PolicyScope::TeamMember {
         if let Some(user_id) = auth.key().user_id.as_deref() {
             return format!("{base}:{user_id}");
         }
@@ -156,19 +155,18 @@ async fn reserve_layers(
     let snap = state.snapshot.load();
     for entry in snap.rate_limit_policies.entries() {
         let policy = &entry.value;
-        let applies = match policy.scope.as_str() {
-            "api_key" => policy.scope_ref == auth.entry.id,
-            "model" => model_rl.is_some_and(|m| policy.scope_ref == m.entry_id),
-            "team" => auth.key().team_id.as_deref() == Some(policy.scope_ref.as_str()),
-            "member" => auth.key().user_id.as_deref() == Some(policy.scope_ref.as_str()),
+        let applies = match policy.scope {
+            PolicyScope::ApiKey => policy.scope_ref == auth.entry.id,
+            PolicyScope::Model => model_rl.is_some_and(|m| policy.scope_ref == m.entry_id),
+            PolicyScope::Team => auth.key().team_id.as_deref() == Some(policy.scope_ref.as_str()),
+            PolicyScope::Member => auth.key().user_id.as_deref() == Some(policy.scope_ref.as_str()),
             // Per-member default for a team: matches every key whose
             // team_id == scope_ref, but only when the key carries a
             // user_id (the bucket is keyed per member below).
-            "team_member" => {
+            PolicyScope::TeamMember => {
                 auth.key().team_id.as_deref() == Some(policy.scope_ref.as_str())
                     && auth.key().user_id.is_some()
             }
-            _ => false,
         };
         if !applies {
             continue;
@@ -276,7 +274,7 @@ pub(crate) async fn reserve_model_only(
     let snap = state.snapshot.load();
     for entry in snap.rate_limit_policies.entries() {
         let policy = &entry.value;
-        if policy.scope != "model" || policy.scope_ref != model_entry_id {
+        if policy.scope != PolicyScope::Model || policy.scope_ref != model_entry_id {
             continue;
         }
         let rl = policy_to_rate_limit(policy);
@@ -433,9 +431,17 @@ mod tests {
     }
 
     #[test]
-    fn unknown_window_produces_unrestricted() {
-        let rl = policy_to_rate_limit(&make_policy("week", Some(100), Some(100)));
-        assert!(rl.is_unrestricted());
+    fn unknown_window_is_rejected_at_deserialize() {
+        // `PolicyWindow` is a closed enum, so an unknown window is rejected at
+        // deserialize rather than silently producing an unrestricted limit.
+        let r: Result<RateLimitPolicy, _> = serde_json::from_value(serde_json::json!({
+            "name": "test",
+            "scope": "team",
+            "scope_ref": "ref",
+            "window": "week",
+            "max_requests": 100,
+        }));
+        assert!(r.is_err());
     }
 
     #[test]

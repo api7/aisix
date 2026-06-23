@@ -16,23 +16,92 @@
 //! member's `user_id` appended for the `team_member` scope.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::resource::Resource;
+
+/// Subject a [`RateLimitPolicy`] targets, paired with `scope_ref`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyScope {
+    ApiKey,
+    Model,
+    Team,
+    Member,
+    TeamMember,
+}
+
+impl PolicyScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ApiKey => "api_key",
+            Self::Model => "model",
+            Self::Team => "team",
+            Self::Member => "member",
+            Self::TeamMember => "team_member",
+        }
+    }
+}
+
+impl std::fmt::Display for PolicyScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Fixed-window length a [`RateLimitPolicy`] applies its limits over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyWindow {
+    Second,
+    Minute,
+    Hour,
+}
+
+impl PolicyWindow {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Second => "second",
+            Self::Minute => "minute",
+            Self::Hour => "hour",
+        }
+    }
+}
+
+impl std::fmt::Display for PolicyWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitPolicy {
+    #[schemars(length(min = 1))]
     pub name: String,
-    pub scope: String,
+    pub scope: PolicyScope,
+    #[schemars(length(min = 1))]
     pub scope_ref: String,
-    pub window: String,
+    pub window: PolicyWindow,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub max_requests: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub max_tokens: Option<u64>,
 
     #[serde(skip)]
     pub(crate) runtime_id: String,
+}
+
+/// The one cross-field invariant `schemars` can't derive: a policy must cap at
+/// least one of `max_requests` / `max_tokens`. Injected as a top-level `anyOf`
+/// by [`crate::models::schema::rate_limit_policy_root_schema`].
+pub fn rate_limit_policy_any_of() -> Value {
+    json!([
+        { "required": ["max_requests"] },
+        { "required": ["max_tokens"] }
+    ])
 }
 
 impl Resource for RateLimitPolicy {
@@ -68,9 +137,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.name, "team-quota");
-        assert_eq!(p.scope, "team");
+        assert_eq!(p.scope, PolicyScope::Team);
         assert_eq!(p.scope_ref, "team-uuid-1");
-        assert_eq!(p.window, "minute");
+        assert_eq!(p.window, PolicyWindow::Minute);
         assert_eq!(p.max_requests, Some(100));
         assert_eq!(p.max_tokens, Some(50000));
     }

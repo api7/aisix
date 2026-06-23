@@ -56,7 +56,8 @@
       "type": "array",
       "items": {
         "$ref": "#/definitions/RoutingTarget"
-      }
+      },
+      "minItems": 1
     }
   },
   "additionalProperties": false,
@@ -114,7 +115,8 @@
       "properties": {
         "model": {
           "description": "Model alias for a direct model that can receive routed traffic.",
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "weight": {
           "description": "Target weight for `weighted` routing. Other strategies ignore this field.",
