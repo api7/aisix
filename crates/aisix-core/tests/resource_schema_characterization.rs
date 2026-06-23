@@ -7,7 +7,9 @@
 //! One table per resource; the label is printed on failure so the offending
 //! case is obvious. New resources append their own table as they migrate.
 
-use aisix_core::models::schema::{validate_apikey, validate_cache_policy};
+use aisix_core::models::schema::{
+    validate_apikey, validate_cache_policy, validate_rate_limit_policy,
+};
 use serde_json::{json, Value};
 
 /// Run a corpus of `(label, expect_accept, payload)` against `validate`.
@@ -184,6 +186,85 @@ fn apikey_corpus() {
                 "rate_limit rps/rph accepted",
                 true,
                 json!({"key_hash": "h", "allowed_models": ["a"], "rate_limit": {"rps": 5, "rph": 100}}),
+            ),
+        ],
+    );
+}
+
+#[test]
+fn rate_limit_policy_corpus() {
+    check(
+        validate_rate_limit_policy,
+        &[
+            (
+                "full",
+                true,
+                json!({"name": "q", "scope": "team", "scope_ref": "t1", "window": "minute", "max_requests": 100, "max_tokens": 50000}),
+            ),
+            (
+                "only max_requests (anyOf)",
+                true,
+                json!({"name": "q", "scope": "api_key", "scope_ref": "k1", "window": "minute", "max_requests": 60}),
+            ),
+            (
+                "only max_tokens (anyOf)",
+                true,
+                json!({"name": "q", "scope": "member", "scope_ref": "m1", "window": "hour", "max_tokens": 1000000}),
+            ),
+            (
+                "team_member + second window",
+                true,
+                json!({"name": "q", "scope": "team_member", "scope_ref": "t1", "window": "second", "max_requests": 10}),
+            ),
+            (
+                "neither cap present (anyOf)",
+                false,
+                json!({"name": "q", "scope": "team", "scope_ref": "t1", "window": "minute"}),
+            ),
+            (
+                "missing name",
+                false,
+                json!({"scope": "team", "scope_ref": "t1", "window": "minute", "max_requests": 1}),
+            ),
+            (
+                "unknown scope enum",
+                false,
+                json!({"name": "q", "scope": "region", "scope_ref": "t1", "window": "minute", "max_requests": 1}),
+            ),
+            (
+                "unknown window enum",
+                false,
+                json!({"name": "q", "scope": "team", "scope_ref": "t1", "window": "day", "max_requests": 1}),
+            ),
+            (
+                "max_requests below minimum (0)",
+                false,
+                json!({"name": "q", "scope": "team", "scope_ref": "t1", "window": "minute", "max_requests": 0}),
+            ),
+            (
+                "max_tokens below minimum (0)",
+                false,
+                json!({"name": "q", "scope": "team", "scope_ref": "t1", "window": "minute", "max_tokens": 0}),
+            ),
+            (
+                "empty name",
+                false,
+                json!({"name": "", "scope": "team", "scope_ref": "t1", "window": "minute", "max_requests": 1}),
+            ),
+            (
+                "empty scope_ref",
+                false,
+                json!({"name": "q", "scope": "team", "scope_ref": "", "window": "minute", "max_requests": 1}),
+            ),
+            (
+                "unknown field",
+                false,
+                json!({"name": "q", "scope": "team", "scope_ref": "t1", "window": "minute", "max_requests": 1, "extra": true}),
+            ),
+            (
+                "negative max_requests",
+                false,
+                json!({"name": "q", "scope": "team", "scope_ref": "t1", "window": "minute", "max_requests": -1}),
             ),
         ],
     );

@@ -59,7 +59,7 @@ impl Schemas {
                 .build(&observability_exporter_schema())
                 .expect("observability_exporter schema is well-formed"),
             rate_limit_policy: jsonschema::options()
-                .build(&rate_limit_policy_schema())
+                .build(&rate_limit_policy_root_schema())
                 .expect("rate_limit_policy schema is well-formed"),
         }
     }
@@ -599,25 +599,22 @@ fn observability_exporter_schema() -> Value {
     })
 }
 
-fn rate_limit_policy_schema() -> Value {
-    json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "required": ["name", "scope", "scope_ref", "window"],
-        "additionalProperties": false,
-        "properties": {
-            "name":         { "type": "string", "minLength": 1 },
-            "scope":        { "type": "string", "enum": ["api_key", "model", "team", "member", "team_member"] },
-            "scope_ref":    { "type": "string", "minLength": 1 },
-            "window":       { "type": "string", "enum": ["second", "minute", "hour"] },
-            "max_requests": { "type": "integer", "minimum": 1 },
-            "max_tokens":   { "type": "integer", "minimum": 1 }
-        },
-        "anyOf": [
-            { "required": ["max_requests"] },
-            { "required": ["max_tokens"] }
-        ]
-    })
+/// Canonical JSON Schema for the `rate_limit_policy` resource, derived from the
+/// [`RateLimitPolicy`](crate::models::RateLimitPolicy) struct (the `scope`/
+/// `window` closed sets come from the `PolicyScope`/`PolicyWindow` enums) plus
+/// the one cross-field invariant `schemars` can't express: at least one of
+/// `max_requests`/`max_tokens` must be set
+/// ([`super::rate_limit_policy::rate_limit_policy_any_of`]).
+pub fn rate_limit_policy_root_schema() -> Value {
+    let mut schema = struct_root_schema::<crate::models::RateLimitPolicy>(false);
+    schema
+        .as_object_mut()
+        .expect("rate_limit_policy root schema is a JSON object")
+        .insert(
+            "anyOf".to_string(),
+            super::rate_limit_policy::rate_limit_policy_any_of(),
+        );
+    schema
 }
 
 fn guardrail_attachment_schema() -> Value {

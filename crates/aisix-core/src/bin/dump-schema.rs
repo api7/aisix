@@ -32,8 +32,7 @@ use schemars::JsonSchema;
 
 use aisix_core::models::schema;
 use aisix_core::models::{
-    EnsembleConfig, Guardrail, ObservabilityExporter, ProviderKey, RateLimit, RateLimitPolicy,
-    Routing,
+    EnsembleConfig, Guardrail, ObservabilityExporter, ProviderKey, RateLimit, Routing,
 };
 
 fn main() {
@@ -47,13 +46,17 @@ fn main() {
     dump_value(&out_dir, "api_key", schema::apikey_root_schema());
     dump_value(&out_dir, "cache_policy", schema::cache_policy_root_schema());
     dump_value(&out_dir, "model", schema::model_root_schema());
+    dump_value(
+        &out_dir,
+        "rate_limit_policy",
+        schema::rate_limit_policy_root_schema(),
+    );
 
     dump::<EnsembleConfig>(&out_dir, "ensemble");
     dump::<Guardrail>(&out_dir, "guardrail");
     dump::<ObservabilityExporter>(&out_dir, "observability_exporter");
     dump::<ProviderKey>(&out_dir, "provider_key");
     dump::<RateLimit>(&out_dir, "rate_limit");
-    dump::<RateLimitPolicy>(&out_dir, "rate_limit_policy");
     dump::<Routing>(&out_dir, "routing");
 }
 

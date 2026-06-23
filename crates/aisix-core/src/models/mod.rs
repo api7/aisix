@@ -49,7 +49,7 @@ pub use provider_key::{
     TelemetryTags,
 };
 pub use rate_limit::RateLimit;
-pub use rate_limit_policy::RateLimitPolicy;
+pub use rate_limit_policy::{PolicyScope, PolicyWindow, RateLimitPolicy};
 pub use routing::{OnAllFilteredPolicy, Routing, RoutingStrategy, RoutingTarget};
 pub use schema::{
     validate_apikey, validate_cache_policy, validate_guardrail, validate_guardrail_attachment,
