@@ -213,6 +213,7 @@ pub struct ObjectStoreConfig {
 
     /// Credential reference resolved by the data plane at delivery time. Required when `auth_mode` is `credential_ref`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[schemars(length(min = 1))]
     pub credential_ref: String,
 }
 

@@ -497,6 +497,11 @@ fn observability_exporter_corpus() {
                 true,
                 json!({"name": "x", "kind": "object_store", "provider": "s3", "bucket": "b", "prefix": "p", "endpoint": "http://minio:9000", "credential_ref": "r"}),
             ),
+            (
+                "object_store empty credential_ref",
+                false,
+                json!({"name": "x", "kind": "object_store", "provider": "s3", "bucket": "b", "prefix": "p", "credential_ref": ""}),
+            ),
             // datadog
             (
                 "datadog allow-list site",
@@ -596,6 +601,13 @@ fn guardrail_corpus() {
                 "hook_point + p0c fields",
                 true,
                 json!({"name": "k", "kind": "keyword", "patterns": [], "hook_point": "input", "enforcement_mode": "monitor", "created_at": "2026-01-01T00:00:00Z"}),
+            ),
+            // created_at is a non-null string (the runtime validator always
+            // enforced this; cp-api omits it when absent, never sends null).
+            (
+                "created_at null",
+                false,
+                json!({"name": "k", "kind": "keyword", "patterns": [], "created_at": null}),
             ),
             (
                 "bad hook_point",
@@ -719,6 +731,14 @@ fn guardrail_attachment_corpus() {
                 "model scope",
                 true,
                 json!({"guardrail_id": "gid", "scope_type": "model", "scope_id": "mid", "priority": 10, "enabled": false}),
+            ),
+            // Non-`env` scope with null/absent scope_id is accepted — the
+            // original validator never conditionally required scope_id, and the
+            // runtime resolver tolerates None. Pinned to keep that contract.
+            (
+                "model scope null scope_id",
+                true,
+                json!({"guardrail_id": "gid", "scope_type": "model", "scope_id": null, "priority": 1}),
             ),
             (
                 "team scope negative priority",

@@ -260,6 +260,7 @@
         },
         "credential_ref": {
           "description": "Credential reference resolved by the data plane at delivery time. Required when `auth_mode` is `credential_ref`.",
+          "minLength": 1,
           "type": "string"
         },
         "enabled": {
