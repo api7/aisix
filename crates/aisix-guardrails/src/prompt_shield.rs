@@ -556,13 +556,17 @@ mod tests {
 
     /// A 5xx on the output hook fails closed by default — exercised through
     /// the real HTTP path so the wiring (check_output → shield →
-    /// handle_failure) is covered end-to-end, not just the mapping fn.
+    /// handle_failure) is covered end-to-end, not just the mapping fn. The
+    /// matcher pins the shield path + version and `expect(1)`, so the verdict
+    /// can't come from an unmatched-route 404 (which would also block).
     #[tokio::test]
     async fn output_5xx_fails_closed_by_default() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/contentsafety/text:shieldPrompt"))
+            .and(query_param("api-version", "2024-09-01"))
             .respond_with(ResponseTemplate::new(500))
+            .expect(1)
             .mount(&server)
             .await;
         // input fail_open=true; output_fail_open defaults false.
@@ -573,15 +577,27 @@ mod tests {
         );
     }
 
-    /// Operators can opt the output hook back into fail-open.
+    /// Operators can opt the output hook back into fail-open. Driven through
+    /// the real HTTP path with the input policy set the OPPOSITE way
+    /// (`fail_open=false`), so a Bypass proves the output hook follows
+    /// `output_fail_open`, not the input policy.
     #[tokio::test]
     async fn output_fail_open_true_bypasses_on_output() {
-        let mut c = cfg("http://unused");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/contentsafety/text:shieldPrompt"))
+            .and(query_param("api-version", "2024-09-01"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut c = cfg(&server.uri());
         c.output_fail_open = true;
-        let g = PromptShieldGuardrail::new("row", &c, GuardrailHookPoint::Both, true);
-        assert!(g
-            .handle_failure(AcsFailure::Timeout, g.output_fail_open)
-            .is_bypass());
+        let g = PromptShieldGuardrail::new("row", &c, GuardrailHookPoint::Both, false);
+        match g.check_output(&resp("model output")).await {
+            GuardrailVerdict::Bypass { reason } => assert_eq!(reason, "azure_cs_5xx"),
+            other => panic!("expected Bypass(azure_cs_5xx), got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------

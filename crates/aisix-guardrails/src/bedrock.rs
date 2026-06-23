@@ -511,18 +511,28 @@ mod tests {
     }
 
     /// Operators can still opt the output hook back into fail-open by setting
-    /// `output_fail_open: true` — then an outage bypasses on output too.
+    /// `output_fail_open: true` — then an outage bypasses on output too. The
+    /// input policy here is the opposite (`fail_open=false`) so the test
+    /// proves the output hook uses its OWN policy, not the input one.
     #[tokio::test]
     async fn output_fail_open_true_bypasses_on_output() {
         let mut c = cfg();
         c.output_fail_open = true;
-        let g = BedrockGuardrail::new("row", &c, GuardrailHookPoint::Both, true, None);
+        let g = BedrockGuardrail::new("row", &c, GuardrailHookPoint::Both, false, None);
+        // Output opted into fail-open → bypass.
         assert!(g
             .handle_failure(
                 BedrockFailure::Timeout,
                 g.fail_open_for(&GuardrailContentSource::Output),
             )
             .is_bypass());
+        // Input still fails closed → block (proves the two policies are split).
+        assert!(g
+            .handle_failure(
+                BedrockFailure::Timeout,
+                g.fail_open_for(&GuardrailContentSource::Input),
+            )
+            .is_block());
     }
 
     /// Hook-point gating: an Output-only row must allow input checks

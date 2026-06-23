@@ -129,9 +129,8 @@ pub struct AzureContentSafetyConfig {
     #[schemars(range(max = 4_294_967_295u32))]
     pub timeout_ms: u32,
     /// Fail-open policy for the output hook. When disabled (the default), an
-    /// Azure outage does not release unscanned model output; the input hook
-    /// keeps following the outer `fail_open`. Mirrors the independent output
-    /// policy the Azure/Aliyun text-moderation guardrails already use.
+    /// Azure outage blocks model output instead of releasing unscanned content.
+    /// The input hook continues to use the top-level `fail_open` policy.
     #[serde(default)]
     pub output_fail_open: bool,
 }
@@ -354,9 +353,8 @@ pub struct BedrockConfig {
     /// Bedrock guardrail latency policy. Use `timed` with `timeout_ms` to cap wait time.
     pub latency_mode: BedrockLatencyMode,
     /// Fail-open policy for the output hook. When disabled (the default), a
-    /// Bedrock outage does not release unscanned model output; the input hook
-    /// keeps following the outer `fail_open`. Mirrors the independent output
-    /// policy the Azure/Aliyun text-moderation guardrails already use.
+    /// Bedrock outage blocks model output instead of releasing unscanned content.
+    /// The input hook continues to use the top-level `fail_open` policy.
     #[serde(default)]
     pub output_fail_open: bool,
 }

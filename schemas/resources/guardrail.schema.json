@@ -214,7 +214,7 @@
         },
         "output_fail_open": {
           "default": false,
-          "description": "Fail-open policy for the output hook. When disabled (the default), a Bedrock outage does not release unscanned model output; the input hook keeps following the outer `fail_open`. Mirrors the independent output policy the Azure/Aliyun text-moderation guardrails already use.",
+          "description": "Fail-open policy for the output hook. When disabled (the default), a Bedrock outage blocks model output instead of releasing unscanned content. The input hook continues to use the top-level `fail_open` policy.",
           "type": "boolean"
         },
         "region": {
@@ -254,7 +254,7 @@
         },
         "output_fail_open": {
           "default": false,
-          "description": "Fail-open policy for the output hook. When disabled (the default), an Azure outage does not release unscanned model output; the input hook keeps following the outer `fail_open`. Mirrors the independent output policy the Azure/Aliyun text-moderation guardrails already use.",
+          "description": "Fail-open policy for the output hook. When disabled (the default), an Azure outage blocks model output instead of releasing unscanned content. The input hook continues to use the top-level `fail_open` policy.",
           "type": "boolean"
         },
         "timeout_ms": {
