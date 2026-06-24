@@ -3232,11 +3232,27 @@ fn add_variant_titles(doc: &mut Value) {
             &["Literal", "Regex"],
         ),
         (
-            // Model's top-level direct/routing/ensemble mutual-exclusion
-            // `oneOf` (injected by `aisix_core::models::schema::model_root_schema`).
-            // Order must match `aisix_core::models::model::model_one_of`.
+            // Model's top-level direct/routing/ensemble/semantic
+            // mutual-exclusion `oneOf` (injected by
+            // `aisix_core::models::schema::model_root_schema`). Order must
+            // match `aisix_core::models::model::model_one_of`.
             "/components/schemas/Model/oneOf",
-            &["Routing model", "Direct model", "Ensemble model"],
+            &[
+                "Routing model",
+                "Direct model",
+                "Ensemble model",
+                "Semantic router",
+            ],
+        ),
+        ("/components/schemas/DistanceMetric/oneOf", &["Cosine"]),
+        ("/components/schemas/Aggregation/oneOf", &["Max"]),
+        (
+            "/components/schemas/EmbeddingFailureMode/oneOf",
+            &["Default", "Fail"],
+        ),
+        (
+            "/components/schemas/OnEmbeddingFailure/anyOf",
+            &["Default or fail policy", "Target model"],
         ),
         (
             "/components/schemas/ObjectStoreAuthMode/oneOf",

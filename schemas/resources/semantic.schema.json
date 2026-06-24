@@ -118,6 +118,7 @@
           ],
           "properties": {
             "target": {
+              "description": "Direct-model alias to route to when embedding fails.",
               "type": "string",
               "minLength": 1
             }

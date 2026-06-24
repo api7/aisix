@@ -121,6 +121,7 @@ pub enum OnEmbeddingFailure {
     Mode(EmbeddingFailureMode),
     /// `{ "target": "<direct alias>" }` — route to a specific safe model.
     Target {
+        /// Direct-model alias to route to when embedding fails.
         #[schemars(length(min = 1))]
         target: String,
     },

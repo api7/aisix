@@ -282,6 +282,7 @@
           "description": "`{ \"target\": \"<direct alias>\" }` — route to a specific safe model.",
           "properties": {
             "target": {
+              "description": "Direct-model alias to route to when embedding fails.",
               "minLength": 1,
               "type": "string"
             }
