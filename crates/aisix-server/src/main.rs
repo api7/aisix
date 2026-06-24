@@ -197,7 +197,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             Some(heartbeat::HeartbeatConfig::sanitised(
                 format!("{}/dp/heartbeat", cp_base.trim_end_matches('/')),
                 p.dp_id,
-                std::time::Duration::from_secs(15),
+                std::time::Duration::from_secs(cfg.managed.heartbeat_interval_secs),
                 heartbeat::MtlsBundle {
                     ca_cert_path: p.ca_cert_path,
                     client_cert_path: p.client_cert_path,
@@ -874,7 +874,7 @@ fn load_heartbeat_config_from_disk(
     Ok(heartbeat::HeartbeatConfig::sanitised(
         url,
         dp_id,
-        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(managed.heartbeat_interval_secs),
         heartbeat::MtlsBundle {
             ca_cert_path: managed_bundle::ca_cert_path(&managed.mtls_dir),
             client_cert_path: managed_bundle::client_cert_path(&managed.mtls_dir),

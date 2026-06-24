@@ -239,6 +239,15 @@ pub struct ManagedConfig {
     /// runs where you don't want a stale cache to mask a real failure.
     #[serde(default = "ManagedConfig::default_snapshot_cache_path")]
     pub snapshot_cache_path: String,
+
+    /// Heartbeat interval, in seconds. The DP POSTs a heartbeat to
+    /// dp-manager every `heartbeat_interval_secs`; CP surfaces a DP as
+    /// "connected" on its first heartbeat. Clamped to [5, 300] by
+    /// [`crate`]-external `HeartbeatConfig::sanitised`. Default 15s in
+    /// production; e2e/dev can lower it (min 5s) so connect-detection
+    /// tests aren't bound by the interval.
+    #[serde(default = "ManagedConfig::default_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
 }
 
 impl ManagedConfig {
@@ -272,6 +281,9 @@ impl ManagedConfig {
     }
     fn default_snapshot_cache_path() -> String {
         "/var/lib/aisix/config_cache.json".into()
+    }
+    const fn default_heartbeat_interval_secs() -> u64 {
+        15
     }
 }
 
@@ -845,6 +857,33 @@ admin:
         assert!(!cfg.proxy.real_ip.recursive);
         assert_eq!(cfg.proxy.real_ip.header, "x-forwarded-for");
         assert!(cfg.proxy.real_ip.parse_trusted().unwrap().is_empty());
+    }
+
+    #[test]
+    fn managed_heartbeat_interval_defaults_to_15_and_can_be_lowered() {
+        let base = r#"
+etcd:
+  endpoints: ["http://127.0.0.1:2379"]
+  prefix: "/aisix"
+proxy:
+  addr: "0.0.0.0:3000"
+admin:
+  addr: "127.0.0.1:3001"
+  admin_keys: ["k1"]
+managed:
+  enabled: true
+  cp_base_url: "https://cp.example"
+"#;
+        // Omitted → production default 15s.
+        let f = write_yaml(base);
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.managed.heartbeat_interval_secs, 15);
+
+        // Explicit → e2e/dev can lower it (the 5s floor is enforced later
+        // by HeartbeatConfig::sanitised, not here).
+        let f = write_yaml(&format!("{base}  heartbeat_interval_secs: 5\n"));
+        let cfg = Config::load_from_path(Some(f.path())).unwrap();
+        assert_eq!(cfg.managed.heartbeat_interval_secs, 5);
     }
 
     #[test]
