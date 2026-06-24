@@ -54,13 +54,13 @@ pub use provider_key::{
 pub use rate_limit::RateLimit;
 pub use rate_limit_policy::{PolicyScope, PolicyWindow, RateLimitPolicy};
 pub use routing::{OnAllFilteredPolicy, Routing, RoutingStrategy, RoutingTarget};
-pub use semantic::{
-    Aggregation, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticMatch,
-    SemanticRoute,
-};
 pub use schema::{
     validate_apikey, validate_cache_policy, validate_guardrail, validate_guardrail_attachment,
     validate_model, validate_observability_exporter, validate_provider_key,
     validate_rate_limit_policy, SchemaError,
+};
+pub use semantic::{
+    Aggregation, DistanceMetric, EmbeddingFailureMode, OnEmbeddingFailure, Semantic, SemanticMatch,
+    SemanticRoute,
 };
 pub use snapshot::AisixSnapshot;

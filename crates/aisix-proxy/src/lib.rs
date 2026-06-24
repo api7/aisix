@@ -52,6 +52,7 @@ mod rerank;
 mod responses;
 mod responses_bridge;
 mod routing;
+mod semantic;
 mod state;
 mod stream_timeout;
 mod util;

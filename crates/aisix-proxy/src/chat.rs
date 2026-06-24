@@ -289,6 +289,26 @@ pub async fn chat_completions(
                     }
                 }
             }
+            // `x-aisix-route` exposes which semantic route matched (#641).
+            // Only present for a semantic router that resolved to a route;
+            // absent on a fall-through to `default` and on non-semantic
+            // requests. Same RFC 7230 header-value guard as above.
+            if let Some(route) = success.served_by_route.as_deref() {
+                match axum::http::HeaderValue::try_from(route) {
+                    Ok(v) => {
+                        success.response.headers_mut().insert("x-aisix-route", v);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            route_name = %route,
+                            error = %err,
+                            "semantic route name is not a valid HTTP header value; \
+                             omitting x-aisix-route — rename the route to use only \
+                             visible ASCII (no CR/LF, no non-ASCII characters)"
+                        );
+                    }
+                }
+            }
             success.response
         }
         Err(failure) => {
@@ -528,6 +548,11 @@ struct Success {
     /// mid-stream, but the header remains useful because callers asked for
     /// the routing group's display name.
     served_by_target: Option<String>,
+    /// Name of the semantic route that matched this request (#641).
+    /// Surfaces in the `x-aisix-route` response header so callers can see
+    /// which intent the router resolved to. `None` for non-semantic
+    /// requests and for a semantic request that fell through to `default`.
+    served_by_route: Option<String>,
     routing: RoutingTelemetry,
     /// Captured request/response content for the observability fan-out, built
     /// (gated on the snapshot's content-capturing exporters) where the request
@@ -563,6 +588,19 @@ impl CacheStatus {
             CacheStatus::Hit => "hit",
         }
     }
+}
+
+/// Text of the latest user turn, used as the semantic-routing query.
+/// Walks `messages` in reverse and returns the first `role: "user"`
+/// message's text. `ChatMessage::content` already carries the
+/// concatenated text of multimodal content blocks, so this also covers
+/// vision/array-shaped messages (non-text blocks are skipped upstream).
+fn last_user_message_text(req: &ChatFormat) -> Option<String> {
+    req.messages
+        .iter()
+        .rev()
+        .find(|m| m.role == aisix_gateway::Role::User)
+        .and_then(|m| m.content.clone())
 }
 
 /// Compute the value of [`Success::served_by_target`] for a request.
@@ -802,18 +840,33 @@ async fn dispatch(
         ))));
     }
 
-    // Resolve the attempt-list of underlying Model entries. For a
-    // routing model we walk targets per the configured strategy; for a
-    // single-provider Model we just dispatch to it directly.
-    let attempt_models: Vec<AttemptModel> = resolve_attempt_models(
-        &state.routing,
-        &state.runtime_status,
-        &snapshot,
-        &req.model,
-        &virtual_entry.id,
-        &virtual_entry.value,
-    )
-    .map_err(&with_model)?;
+    // Resolve the attempt-list of underlying Model entries. A semantic
+    // router embeds the request and scores it against route examples to
+    // pick its single target; a routing group walks targets per strategy;
+    // a direct model dispatches to itself. Either way the dispatch loop
+    // below drives the resulting attempt list, so semantic routing reuses
+    // the full streaming / failover / telemetry machinery and only adds
+    // the "which target + which route" decision. `semantic_route` carries
+    // the matched route name (None on a fall-through to `default` or a
+    // non-semantic request) for the `x-aisix-route` response header.
+    let (attempt_models, semantic_route): (Vec<AttemptModel>, Option<String>) =
+        if virtual_entry.value.is_semantic() {
+            let prompt = last_user_message_text(req).unwrap_or_default();
+            crate::semantic::resolve(state, &snapshot, &virtual_entry, &prompt, request_id)
+                .await
+                .map_err(&with_model)?
+        } else {
+            let attempts = resolve_attempt_models(
+                &state.routing,
+                &state.runtime_status,
+                &snapshot,
+                &req.model,
+                &virtual_entry.id,
+                &virtual_entry.value,
+            )
+            .map_err(&with_model)?;
+            (attempts, None)
+        };
 
     // For non-routing requests, surface a misconfigured bridge as a
     // proper 503 rather than burying it inside a generic Bridge error.
@@ -892,7 +945,8 @@ async fn dispatch(
             .as_ref()
             .map(|r| r.retry_on_429_or_default())
             .unwrap_or(false);
-        let is_routing_request = virtual_entry.value.routing.is_some();
+        let is_routing_request =
+            virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic();
         let mut stream_routing = RoutingTelemetry::default();
         let mut last_err: Option<BridgeError> = None;
 
@@ -1312,6 +1366,7 @@ async fn dispatch(
                 is_routing_request,
                 Some(model.display_name.clone()),
             ),
+            served_by_route: semantic_route.clone(),
             routing: stream_routing,
             // Streaming content capture lands in C3b.
             captured_content: None,
@@ -1496,6 +1551,7 @@ async fn dispatch(
                     // target produced it on the original miss. See the
                     // `served_by_target` field docs on `Success`.
                     served_by_target: None,
+                    served_by_route: None,
                     routing: RoutingTelemetry::default(),
                     captured_content,
                 });
@@ -1855,6 +1911,7 @@ async fn dispatch(
         cache_hit_saved_output_tokens: 0,
         telemetry_handled_by_stream: false,
         served_by_target,
+        served_by_route: semantic_route.clone(),
         routing,
         captured_content,
     })
@@ -2351,6 +2408,7 @@ async fn dispatch_ensemble(
             telemetry_handled_by_stream: true,
             // Not a routing request — no `x-aisix-served-by` header.
             served_by_target: None,
+            served_by_route: None,
             routing: RoutingTelemetry::default(),
             captured_content: None,
         });
@@ -2551,6 +2609,7 @@ async fn dispatch_ensemble(
         telemetry_handled_by_stream: true,
         // Not a routing request — no `x-aisix-served-by` header.
         served_by_target: None,
+        served_by_route: None,
         routing: RoutingTelemetry::default(),
         captured_content: None,
     })

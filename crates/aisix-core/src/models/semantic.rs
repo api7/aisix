@@ -228,10 +228,15 @@ mod tests {
         // falls back to it.
         assert_eq!(s.route_threshold(&s.routes[0]), 0.8);
         assert_eq!(s.route_threshold(&s.routes[1]), 0.75);
-        assert_eq!(s.embedding_timeout(), Some(std::time::Duration::from_millis(500)));
+        assert_eq!(
+            s.embedding_timeout(),
+            Some(std::time::Duration::from_millis(500))
+        );
         assert_eq!(
             s.on_embedding_failure,
-            OnEmbeddingFailure::Target { target: "gpt-4o-mini".into() }
+            OnEmbeddingFailure::Target {
+                target: "gpt-4o-mini".into()
+            }
         );
     }
 
@@ -305,9 +310,14 @@ mod tests {
     fn on_embedding_failure_serializes_to_proposal_wire_shape() {
         // Bare-string mode round-trips as a string.
         let mode = OnEmbeddingFailure::Mode(EmbeddingFailureMode::Fail);
-        assert_eq!(serde_json::to_value(&mode).unwrap(), serde_json::json!("fail"));
+        assert_eq!(
+            serde_json::to_value(&mode).unwrap(),
+            serde_json::json!("fail")
+        );
         // Target round-trips as { "target": "alias" }, not a nested object.
-        let target = OnEmbeddingFailure::Target { target: "safe".into() };
+        let target = OnEmbeddingFailure::Target {
+            target: "safe".into(),
+        };
         assert_eq!(
             serde_json::to_value(&target).unwrap(),
             serde_json::json!({"target": "safe"})

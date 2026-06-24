@@ -101,6 +101,10 @@ pub struct ProxyState {
     pub metrics: Arc<Metrics>,
     pub cache: Option<CacheBackends>,
     pub routing: Arc<RoutingRegistry>,
+    /// Per-instance cache of semantic-router example embeddings, populated
+    /// lazily on first use and reused across requests so semantic routing
+    /// costs one embedding call (the prompt) in steady state.
+    pub semantic_cache: Arc<crate::semantic::SemanticVectorCache>,
     /// Per-request guardrail index. Resolves the applicable chain from
     /// attachment scope + priority on each request. Rebuilds lazily
     /// when the snapshot version changes. Default is an empty index
@@ -146,6 +150,7 @@ impl ProxyState {
             metrics: Arc::new(Metrics::new(false)),
             cache: Some(CacheBackends::memory_only()),
             routing: Arc::new(RoutingRegistry::new()),
+            semantic_cache: Arc::new(crate::semantic::SemanticVectorCache::default()),
             guardrail_index,
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
@@ -174,6 +179,7 @@ impl ProxyState {
             metrics: Arc::new(Metrics::new(false)),
             cache: Some(CacheBackends::memory_only()),
             routing: Arc::new(RoutingRegistry::new()),
+            semantic_cache: Arc::new(crate::semantic::SemanticVectorCache::default()),
             guardrail_index,
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
@@ -205,6 +211,7 @@ impl ProxyState {
             metrics,
             cache,
             routing: Arc::new(RoutingRegistry::new()),
+            semantic_cache: Arc::new(crate::semantic::SemanticVectorCache::default()),
             guardrail_index,
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
