@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use schemars::JsonSchema;
 
 use aisix_core::models::schema;
-use aisix_core::models::{EnsembleConfig, RateLimit, Routing};
+use aisix_core::models::{EmbeddingConfig, EnsembleConfig, RateLimit, Routing, Semantic};
 
 fn main() {
     let out_dir = workspace_root().join("schemas").join("resources");
@@ -66,6 +66,8 @@ fn main() {
     dump::<EnsembleConfig>(&out_dir, "ensemble");
     dump::<RateLimit>(&out_dir, "rate_limit");
     dump::<Routing>(&out_dir, "routing");
+    dump::<Semantic>(&out_dir, "semantic");
+    dump::<EmbeddingConfig>(&out_dir, "embedding");
 }
 
 fn dump<T: JsonSchema>(out_dir: &Path, name: &str) {

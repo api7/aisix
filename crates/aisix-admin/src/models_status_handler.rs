@@ -16,6 +16,8 @@ use crate::state::AdminState;
 pub enum ModelKind {
     Direct,
     Routing,
+    Ensemble,
+    Semantic,
 }
 
 #[derive(Debug, Serialize)]
@@ -37,11 +39,23 @@ pub async fn get_models_status(
     let models = all_models
         .into_iter()
         .map(|entry| {
-            if entry.value.is_routing() {
+            // Virtual routers (routing / ensemble / semantic) have no
+            // upstream of their own, so runtime health is not applicable —
+            // it lives on the direct Models they dispatch to.
+            let virtual_kind = if entry.value.is_routing() {
+                Some(ModelKind::Routing)
+            } else if entry.value.is_ensemble() {
+                Some(ModelKind::Ensemble)
+            } else if entry.value.is_semantic() {
+                Some(ModelKind::Semantic)
+            } else {
+                None
+            };
+            if let Some(kind) = virtual_kind {
                 ModelStatusView {
                     id: entry.id,
                     display_name: entry.value.display_name,
-                    kind: ModelKind::Routing,
+                    kind,
                     details: RuntimeStatusSnapshot {
                         status: RuntimeStatus::NotApplicable,
                         ..RuntimeStatusSnapshot::default()

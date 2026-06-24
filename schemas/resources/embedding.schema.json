@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EmbeddingConfig",
+  "description": "Embedding-modality metadata for a direct Model.",
+  "type": "object",
+  "required": [
+    "dimensions"
+  ],
+  "properties": {
+    "dimensions": {
+      "description": "Output vector dimensionality. Used to validate vectors, key the example-vector cache, and (for endpoints that support it) request a reduced output size.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 1.0
+    },
+    "normalize": {
+      "description": "Whether the endpoint already returns L2-normalized vectors. When `false`, the gateway normalizes before computing cosine similarity. Defaults to `true`.",
+      "default": true,
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false
+}

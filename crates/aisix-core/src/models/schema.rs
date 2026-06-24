@@ -537,6 +537,224 @@ mod tests {
         assert!(validate_model(&v).is_err());
     }
 
+    // ---- semantic-routing + embedding-modality schema tests (#641) ----
+
+    #[test]
+    fn model_semantic_form_passes() {
+        let v = json!({
+            "display_name": "prod-chat",
+            "semantic": {
+                "embedding_model": "bge-m3",
+                "routes": [
+                    {
+                        "name": "legal",
+                        "target": "claude-opus",
+                        "description": "Contract & legal risk analysis",
+                        "examples": ["分析这份合同里的潜在风险", "Review this NDA"],
+                        "threshold": 0.8
+                    },
+                    {"name": "translate", "target": "gpt-4o-mini", "examples": ["帮我翻译这句话"]}
+                ],
+                "default": "gpt-4o",
+                "match": {"distance_metric": "cosine", "aggregation": "max", "threshold": 0.75},
+                "embedding_timeout_ms": 500,
+                "on_embedding_failure": {"target": "gpt-4o-mini"}
+            }
+        });
+        validate_model(&v).unwrap();
+    }
+
+    #[test]
+    fn model_semantic_minimal_form_passes() {
+        let v = json!({
+            "display_name": "prod-chat",
+            "semantic": {
+                "embedding_model": "bge-m3",
+                "routes": [{"name": "a", "target": "m", "examples": ["hi"]}],
+                "default": "gpt-4o",
+                "match": {"threshold": 0.5}
+            }
+        });
+        validate_model(&v).unwrap();
+    }
+
+    #[test]
+    fn model_semantic_can_be_ip_restricted_and_rate_limited() {
+        // Top-level gates apply to the semantic router entry too.
+        let v = json!({
+            "display_name": "prod-chat",
+            "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
+                "default": "d",
+                "match": {"threshold": 0.5}
+            },
+            "allowed_cidrs": ["10.0.0.0/8"],
+            "rate_limit": {"rpm": 60}
+        });
+        validate_model(&v).unwrap();
+    }
+
+    #[test]
+    fn model_semantic_on_embedding_failure_accepts_bare_modes() {
+        for mode in ["default", "fail"] {
+            let v = json!({
+                "display_name": "prod-chat",
+                "semantic": {
+                    "embedding_model": "e",
+                    "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
+                    "default": "d",
+                    "match": {"threshold": 0.5},
+                    "on_embedding_failure": mode
+                }
+            });
+            validate_model(&v).unwrap_or_else(|e| panic!("mode {mode:?} must validate: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn model_semantic_with_direct_fields_fails() {
+        // semantic is mutually exclusive with the direct upstream triple.
+        let v = json!({
+            "display_name": "x",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk-1",
+            "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
+                "default": "d",
+                "match": {"threshold": 0.5}
+            }
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn model_semantic_with_routing_fails() {
+        let v = json!({
+            "display_name": "x",
+            "routing": {"targets": [{"model": "a"}]},
+            "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
+                "default": "d",
+                "match": {"threshold": 0.5}
+            }
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn model_semantic_missing_required_fields_fails() {
+        // Missing `default`.
+        let v = json!({
+            "display_name": "x",
+            "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
+                "match": {"threshold": 0.5}
+            }
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn model_semantic_empty_routes_fails() {
+        let v = json!({
+            "display_name": "x",
+            "semantic": {
+                "embedding_model": "e",
+                "routes": [],
+                "default": "d",
+                "match": {"threshold": 0.5}
+            }
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn model_semantic_route_without_examples_fails() {
+        // examples-only matching: a route needs at least one example.
+        let v = json!({
+            "display_name": "x",
+            "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "a", "target": "m", "examples": []}],
+                "default": "d",
+                "match": {"threshold": 0.5}
+            }
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn model_semantic_threshold_out_of_range_fails() {
+        let v = json!({
+            "display_name": "x",
+            "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
+                "default": "d",
+                "match": {"threshold": 1.5}
+            }
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn model_embedding_modality_on_direct_passes() {
+        // An embedding model is a direct model that also carries the
+        // embedding-modality block.
+        let v = json!({
+            "display_name": "bge-m3",
+            "provider": "openai",
+            "model_name": "bge-m3",
+            "provider_key_id": "pk-1",
+            "embedding": {"dimensions": 1024, "normalize": false}
+        });
+        validate_model(&v).unwrap();
+    }
+
+    #[test]
+    fn model_embedding_without_dimensions_fails() {
+        let v = json!({
+            "display_name": "bge-m3",
+            "provider": "openai",
+            "model_name": "bge-m3",
+            "provider_key_id": "pk-1",
+            "embedding": {"normalize": true}
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn model_embedding_on_routing_fails() {
+        // The embedding block is modality metadata on a direct model — it
+        // has no meaning on a virtual router.
+        let v = json!({
+            "display_name": "x",
+            "routing": {"targets": [{"model": "a"}]},
+            "embedding": {"dimensions": 1024}
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
+    #[test]
+    fn model_embedding_on_semantic_fails() {
+        let v = json!({
+            "display_name": "x",
+            "semantic": {
+                "embedding_model": "e",
+                "routes": [{"name": "a", "target": "m", "examples": ["x"]}],
+                "default": "d",
+                "match": {"threshold": 0.5}
+            },
+            "embedding": {"dimensions": 1024}
+        });
+        assert!(validate_model(&v).is_err());
+    }
+
     #[test]
     fn model_allowed_cidrs_passes_on_direct_and_routing() {
         // Direct model with an IP allowlist (#557).

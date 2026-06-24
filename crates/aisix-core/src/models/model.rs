@@ -15,9 +15,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::embedding::EmbeddingConfig;
 use super::ensemble::EnsembleConfig;
 use super::rate_limit::RateLimit;
 use super::routing::Routing;
+use super::semantic::Semantic;
 use crate::resource::Resource;
 
 // `Provider` enum removed as part of #302 Phase A clean cut. Vendor
@@ -212,6 +214,18 @@ pub struct Model {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensemble: Option<EnsembleConfig>,
 
+    /// Semantic-routing configuration. When set, the gateway embeds the
+    /// request and dispatches to the route whose examples it matches best,
+    /// using that route's target Model for upstream dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<Semantic>,
+
+    /// Embedding-modality metadata. Present on direct Models that serve an
+    /// OpenAI-compatible `/v1/embeddings` endpoint (and can be referenced
+    /// by a semantic router's `embedding_model`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<EmbeddingConfig>,
+
     /// Per-token cost for budget tracking. Omit it when cost tracking is not needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<ModelCost>,
@@ -242,6 +256,18 @@ impl Model {
     /// instead of dispatching a single upstream).
     pub fn is_ensemble(&self) -> bool {
         self.ensemble.is_some()
+    }
+
+    /// Whether this Model is a semantic router (picks a target by the
+    /// meaning of the request instead of dispatching its own upstream).
+    pub fn is_semantic(&self) -> bool {
+        self.semantic.is_some()
+    }
+
+    /// Whether this Model is an embedding-modality model (a direct model
+    /// that also carries embedding metadata).
+    pub fn is_embedding(&self) -> bool {
+        self.embedding.is_some()
     }
 
     /// Convenience: borrow the upstream model id if this Model is a
@@ -307,8 +333,11 @@ impl Model {
 
 /// The one cross-field invariant the runtime schema enforces that
 /// `schemars` cannot derive from the flat struct: a Model ships EXACTLY
-/// one shape — a `routing` block, an `ensemble` block, or the three direct
-/// upstream fields (`provider`/`model_name`/`provider_key_id`) together.
+/// one dispatch shape — a `routing` block, an `ensemble` block, a
+/// `semantic` block, or the three direct upstream fields
+/// (`provider`/`model_name`/`provider_key_id`) together. The `embedding`
+/// block is modality metadata on the direct shape, so it is permitted only
+/// alongside the direct triple, never on a virtual router.
 /// [`crate::models::schema::model_root_schema`] injects this as a top-level
 /// `oneOf` into the generated schema, so the published schema and the
 /// runtime validator share this single definition.
@@ -322,14 +351,17 @@ pub fn model_one_of() -> Value {
                 { "required": ["provider_key_id"] },
                 { "required": ["background_model_check"] },
                 { "required": ["cooldown"] },
-                { "required": ["ensemble"] }
+                { "required": ["ensemble"] },
+                { "required": ["semantic"] },
+                { "required": ["embedding"] }
             ]}
         },
         {
             "required": ["provider", "model_name", "provider_key_id"],
             "not": { "anyOf": [
                 { "required": ["routing"] },
-                { "required": ["ensemble"] }
+                { "required": ["ensemble"] },
+                { "required": ["semantic"] }
             ]}
         },
         {
@@ -340,7 +372,22 @@ pub fn model_one_of() -> Value {
                 { "required": ["provider_key_id"] },
                 { "required": ["routing"] },
                 { "required": ["background_model_check"] },
-                { "required": ["cooldown"] }
+                { "required": ["cooldown"] },
+                { "required": ["semantic"] },
+                { "required": ["embedding"] }
+            ]}
+        },
+        {
+            "required": ["semantic"],
+            "not": { "anyOf": [
+                { "required": ["provider"] },
+                { "required": ["model_name"] },
+                { "required": ["provider_key_id"] },
+                { "required": ["routing"] },
+                { "required": ["ensemble"] },
+                { "required": ["background_model_check"] },
+                { "required": ["cooldown"] },
+                { "required": ["embedding"] }
             ]}
         }
     ])
