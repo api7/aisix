@@ -11,13 +11,15 @@ schemas/
 └── resources/
     ├── api_key.schema.json
     ├── cache_policy.schema.json
+    ├── embedding.schema.json
     ├── guardrail.schema.json
     ├── model.schema.json
     ├── observability_exporter.schema.json
     ├── provider_key.schema.json
     ├── rate_limit.schema.json
     ├── rate_limit_policy.schema.json
-    └── routing.schema.json
+    ├── routing.schema.json
+    └── semantic.schema.json
 ```
 
 Each file is a self-contained JSON Schema draft-07 document. Nested
