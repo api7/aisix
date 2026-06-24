@@ -150,6 +150,13 @@ pub(crate) async fn resolve(
         .as_ref()
         .expect("resolve called on a non-semantic model");
 
+    // No user text to classify (e.g. a system-only or tool-only request):
+    // route to `default` without an embedding call rather than embedding an
+    // empty string, which could spuriously match a route.
+    if prompt.trim().is_empty() {
+        return Ok((vec![attempt_for_target(snapshot, &semantic.default)?], None));
+    }
+
     // Resolve the embedding model + its modality metadata. A dangling or
     // wrong-kind reference is a config error; degrade via the failure
     // policy rather than 500.
@@ -321,10 +328,24 @@ async fn embed_texts(
     let resp = bridge.embed(&req, &ctx).await.map_err(ProxyError::Bridge)?;
     let mut data = resp.data;
     data.sort_by_key(|d| d.index);
+    let expected_dims = dimensions.map(|d| d as usize);
     let mut out = Vec::with_capacity(data.len());
     for obj in data {
         match obj.embedding {
-            EmbeddingVector::Float(v) => out.push(v),
+            EmbeddingVector::Float(v) => {
+                // Surface a wrong-dimension response explicitly instead of
+                // letting cosine_similarity fold the length mismatch into
+                // 0.0 (which would silently route every request to default).
+                if let Some(expected) = expected_dims {
+                    if v.len() != expected {
+                        return Err(ProxyError::InvalidRequest(format!(
+                            "embedding endpoint returned a {}-dim vector; expected {expected}",
+                            v.len(),
+                        )));
+                    }
+                }
+                out.push(v);
+            }
             EmbeddingVector::Base64(_) => {
                 return Err(ProxyError::InvalidRequest(
                     "embedding endpoint returned base64 vectors; semantic routing needs \

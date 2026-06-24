@@ -11,7 +11,7 @@ It is a fourth virtual-model shape alongside direct models, routing groups
 (load balancing), and ensembles. Like those, it is just a `Model` with a
 config block — here, a `semantic` block.
 
-```
+```text
 caller sends  model: "prod-chat"
    │
    ├─ embed the latest user message  (via the configured embedding model)

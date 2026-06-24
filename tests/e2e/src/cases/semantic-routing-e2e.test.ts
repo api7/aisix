@@ -71,7 +71,15 @@ async function startEmbeddingMock(opts: { fail?: boolean } = {}): Promise<Embedd
         res.end(JSON.stringify({ error: { message: "embedding upstream down" } }));
         return;
       }
-      const body = JSON.parse(raw || "{}") as { input?: string | string[] };
+      let body: { input?: string | string[] };
+      try {
+        body = JSON.parse(raw || "{}") as { input?: string | string[] };
+      } catch {
+        res.statusCode = 400;
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ error: { message: "invalid JSON payload" } }));
+        return;
+      }
       const inputs = Array.isArray(body.input)
         ? body.input
         : [body.input ?? ""];
@@ -140,6 +148,43 @@ describe("semantic routing e2e", () => {
     await admin.createApiKey({
       key_hash: CALLER_KEY_HASH,
       allowed_models: ["*"],
+    });
+
+    // Shared `prod-chat` fixture for the matched + default-fallthrough
+    // tests, so neither depends on the other's execution order.
+    const embed = await startEmbeddingMock();
+    const legal = await chatUpstreamReplying("served-by-legal");
+    const fallback = await chatUpstreamReplying("served-by-default");
+    embedMocks.push(embed);
+    upstreams.push(legal, fallback);
+
+    await createEmbeddingModel("bge-mock", embed);
+    await createDirectModel("legal-model", legal);
+    await createDirectModel("default-model", fallback);
+    await admin.createModel({
+      display_name: "prod-chat",
+      semantic: {
+        embedding_model: "bge-mock",
+        routes: [
+          {
+            name: "legal",
+            target: "legal-model",
+            examples: ["analyze this contract for legal risk"],
+            threshold: 0.5,
+          },
+        ],
+        default: "default-model",
+        match: { threshold: 0.5 },
+      },
+    });
+
+    await waitConfigPropagation(async () => {
+      try {
+        const r = await chat("prod-chat", "review the nda contract clauses");
+        return r.status === 200 && r.content === "served-by-legal";
+      } catch {
+        return false;
+      }
     });
   });
 
@@ -227,40 +272,7 @@ describe("semantic routing e2e", () => {
       ctx.skip();
       return;
     }
-    const embed = await startEmbeddingMock();
-    const legal = await chatUpstreamReplying("served-by-legal");
-    const fallback = await chatUpstreamReplying("served-by-default");
-    embedMocks.push(embed);
-    upstreams.push(legal, fallback);
-
-    await createEmbeddingModel("bge-mock", embed);
-    await createDirectModel("legal-model", legal);
-    await createDirectModel("default-model", fallback);
-    await admin.createModel({
-      display_name: "prod-chat",
-      semantic: {
-        embedding_model: "bge-mock",
-        routes: [
-          {
-            name: "legal",
-            target: "legal-model",
-            examples: ["analyze this contract for legal risk"],
-            threshold: 0.5,
-          },
-        ],
-        default: "default-model",
-        match: { threshold: 0.5 },
-      },
-    });
-
-    await waitConfigPropagation(async () => {
-      try {
-        const r = await chat("prod-chat", "review the nda contract clauses");
-        return r.status === 200 && r.content === "served-by-legal";
-      } catch {
-        return false;
-      }
-    });
+    // `prod-chat` is provisioned in beforeAll (shared, order-independent).
 
     const r = await chat("prod-chat", "please review the contract for risk");
     expect(r.status).toBe(200);

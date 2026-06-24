@@ -1587,7 +1587,8 @@ async fn dispatch(
         .as_ref()
         .map(|routing| routing.retry_on_429_or_default())
         .unwrap_or(false);
-    let is_routing_request = virtual_entry.value.routing.is_some();
+    let is_routing_request =
+        virtual_entry.value.routing.is_some() || virtual_entry.value.is_semantic();
     let mut routing = RoutingTelemetry::default();
 
     for attempt in &attempt_models {
