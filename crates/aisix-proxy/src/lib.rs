@@ -4111,6 +4111,151 @@ data: [DONE]\n\n";
         assert_eq!(events[1].completion_tokens, 1);
     }
 
+    /// #641 parity: `/v1/messages` must honor `routing.retries` — re-hitting
+    /// the SAME target before failing over, like chat.rs. A single-target group
+    /// with `retries=1` and an always-502 target makes TWO attempts (initial +
+    /// one same-target retry), classified `initial` then `retry`. Before the fix
+    /// `/v1/messages` ignored `retries` and made only one attempt (so the
+    /// upstream `.expect(2)` and the second event would never arrive).
+    #[tokio::test]
+    async fn messages_routing_honors_same_target_retries() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
+            .expect(2)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-bad", &upstream.uri()));
+        snap.models
+            .insert(model_entry_with_id("m-bad", "primary", "pk-bad"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary"],
+            Some(1),
+            None,
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+        let body = serde_json::json!({
+            "model": "smart",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            let ev = tokio::time::timeout(std::time::Duration::from_millis(3000), rx.recv())
+                .await
+                .expect("two attempts (initial + retry) must each emit an event")
+                .expect("sender dropped");
+            events.push(ev);
+        }
+        events.sort_by_key(|e| e.attempt_index);
+        assert_eq!(events[0].attempt_kind, "initial");
+        assert_eq!(
+            events[1].attempt_kind, "retry",
+            "the same-target second attempt must be classified as a retry"
+        );
+        assert!(
+            events.iter().all(|e| e.attempt_model == "primary"),
+            "both attempts hit the SAME target (retry, not fallover)"
+        );
+        assert!(events.iter().all(|e| e.model_id == "m-bad"));
+        assert!(events.iter().all(|e| e.status_code == 502));
+        // upstream `.expect(2)` asserts exactly two upstream calls on Drop.
+    }
+
+    /// #641 parity for `/v1/responses` (Codex): same-target `routing.retries`
+    /// before fail-over. Single-target group, `retries=1`, always-502 →
+    /// initial + one retry, both hitting the same target.
+    #[tokio::test]
+    async fn responses_routing_honors_same_target_retries() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(502).set_body_string("upstream down"))
+            .expect(2)
+            .mount(&upstream)
+            .await;
+
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(openai_test_bridge()));
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(pk_entry_with_id("pk-bad", &upstream.uri()));
+        snap.models
+            .insert(model_entry_with_id("m-bad", "primary", "pk-bad"));
+        snap.models.insert(routing_entry(
+            "smart",
+            "failover",
+            &["primary"],
+            Some(1),
+            None,
+            None,
+        ));
+        snap.apikeys.insert(apikey_entry("sk-caller", &["smart"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_router(build_state(snap, hub).with_usage_sink(UsageSink::new(tx)));
+        let body = serde_json::json!({"model": "smart", "input": "hi"});
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = run(app, req).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            let ev = tokio::time::timeout(std::time::Duration::from_millis(3000), rx.recv())
+                .await
+                .expect("two attempts (initial + retry) must each emit an event")
+                .expect("sender dropped");
+            events.push(ev);
+        }
+        events.sort_by_key(|e| e.attempt_index);
+        assert_eq!(events[0].attempt_kind, "initial");
+        assert_eq!(
+            events[1].attempt_kind, "retry",
+            "the same-target second attempt must be classified as a retry"
+        );
+        assert!(
+            events.iter().all(|e| e.attempt_model == "primary"),
+            "both attempts hit the SAME target (retry, not fallover)"
+        );
+        assert!(events.iter().all(|e| e.status_code == 502));
+    }
+
     /// AISIX-Cloud#790: a plain direct-model request (no routing group)
     /// records the client-sent name in `requested_model` and keeps the
     /// direct model's own id in `model_id` — on both the OpenAI and the

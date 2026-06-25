@@ -367,6 +367,15 @@ async fn dispatch(
         .unwrap_or(false);
     let is_routing_request = model_entry.value.routing.is_some();
     let mut routing = RoutingTelemetry::default();
+    // `routing.retries` — same-target retries (with backoff) before failing
+    // over, honoured exactly like chat.rs / messages.rs (#641). 0 (default)
+    // keeps fail-over-only; /v1/responses previously ignored it entirely.
+    let retries = model_entry
+        .value
+        .routing
+        .as_ref()
+        .map(|r| r.retries_or_default())
+        .unwrap_or(0);
 
     // Walk the targets, failing over on a retryable failure. Streaming and
     // non-streaming share this loop: the per-target dispatch branches
@@ -374,99 +383,112 @@ async fn dispatch(
     // has arrived under `stream_timeout` (#554) — so the 200 is committed to
     // exactly one target and a slow first chunk fails over.
     let mut last_err: Option<ProxyError> = None;
-    for target in &attempt_models {
-        let (idx, kind) = routing.begin_attempt(&target.model.display_name);
-        let target_model = if is_routing_request {
-            target.model.display_name.clone()
-        } else {
-            String::new()
-        };
-        let attempt_started = Instant::now();
+    'targets: for target in &attempt_models {
         // Resolved ProviderKey UUID for this target — feeds the per-PK
         // telemetry attribution tags on the emitted UsageEvent
         // (AISIX-Cloud#867). Recorded on the AttemptRecord (success + failure)
         // so both the winner and each failed-attempt event can attribute it.
         let pk_id = target.model.provider_key_id.clone().unwrap_or_default();
-        // Winning-attempt classification (#655) for the streaming path's
-        // end-of-stream UsageEvent. The non-streaming / buffered paths emit
-        // from the handler and ignore it.
-        let attempt = AttemptInfo {
-            index: idx,
-            kind: kind.to_string(),
-            model: target_model.clone(),
-            ..Default::default()
-        };
-        let result = if target.model.provider.as_deref() == Some("openai") {
-            responses_to_target(
-                state,
-                &snapshot,
-                body,
-                &target.model,
-                &target.id,
-                request_id,
-                resolved_chain.as_ref(),
-                started,
-                &model_name,
-                &auth.entry.id,
-                client,
-                attempt,
-            )
-            .await
-        } else {
-            responses_cross_provider_to_target(
-                state,
-                &snapshot,
-                body,
-                &target.model,
-                &target.id,
-                request_id,
-                resolved_chain.clone(),
-                started,
-                &model_name,
-                &auth.entry.id,
-                client,
-                attempt,
-            )
-            .await
-        };
-        match result {
-            Ok(mut success) => {
-                routing.attempts.push(AttemptRecord {
-                    index: idx,
-                    kind,
-                    target_model,
-                    target_model_id: target.id.clone(),
-                    provider_key_id: pk_id,
-                    status: success.response.status().as_u16(),
-                    success: true,
-                    error_class: String::new(),
-                    error_message: String::new(),
-                    latency_ms: ms_since(attempt_started),
-                });
-                success.routing = routing;
-                return Ok(success);
+        for attempt_idx in 0..=retries {
+            // Exponential backoff + jitter before re-hitting the SAME target
+            // (#641); cross-target fall-over (the outer loop) stays immediate.
+            if attempt_idx > 0 {
+                tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32)).await;
             }
-            Err(e) => {
-                let retryable = matches!(
-                    &e,
-                    ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429)
-                );
-                let (error_class, error_message) = attempt_error_from_proxy(&e);
-                routing.attempts.push(AttemptRecord {
-                    index: idx,
-                    kind,
-                    target_model,
-                    target_model_id: target.id.clone(),
-                    provider_key_id: pk_id,
-                    status: e.status().as_u16(),
-                    success: false,
-                    error_class,
-                    error_message,
-                    latency_ms: ms_since(attempt_started),
-                });
-                last_err = Some(e);
-                if !retryable {
-                    break;
+            let (idx, kind) = routing.begin_attempt(&target.model.display_name);
+            let target_model = if is_routing_request {
+                target.model.display_name.clone()
+            } else {
+                String::new()
+            };
+            let attempt_started = Instant::now();
+            // Winning-attempt classification (#655) for the streaming path's
+            // end-of-stream UsageEvent. The non-streaming / buffered paths emit
+            // from the handler and ignore it.
+            let attempt = AttemptInfo {
+                index: idx,
+                kind: kind.to_string(),
+                model: target_model.clone(),
+                ..Default::default()
+            };
+            let result = if target.model.provider.as_deref() == Some("openai") {
+                responses_to_target(
+                    state,
+                    &snapshot,
+                    body,
+                    &target.model,
+                    &target.id,
+                    request_id,
+                    resolved_chain.as_ref(),
+                    started,
+                    &model_name,
+                    &auth.entry.id,
+                    client,
+                    attempt,
+                )
+                .await
+            } else {
+                responses_cross_provider_to_target(
+                    state,
+                    &snapshot,
+                    body,
+                    &target.model,
+                    &target.id,
+                    request_id,
+                    resolved_chain.clone(),
+                    started,
+                    &model_name,
+                    &auth.entry.id,
+                    client,
+                    attempt,
+                )
+                .await
+            };
+            match result {
+                Ok(mut success) => {
+                    routing.attempts.push(AttemptRecord {
+                        index: idx,
+                        kind,
+                        target_model,
+                        target_model_id: target.id.clone(),
+                        provider_key_id: pk_id.clone(),
+                        status: success.response.status().as_u16(),
+                        success: true,
+                        error_class: String::new(),
+                        error_message: String::new(),
+                        latency_ms: ms_since(attempt_started),
+                    });
+                    success.routing = routing;
+                    return Ok(success);
+                }
+                Err(e) => {
+                    let retryable = matches!(
+                        &e,
+                        ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429)
+                    );
+                    let (error_class, error_message) = attempt_error_from_proxy(&e);
+                    routing.attempts.push(AttemptRecord {
+                        index: idx,
+                        kind,
+                        target_model,
+                        target_model_id: target.id.clone(),
+                        provider_key_id: pk_id.clone(),
+                        status: e.status().as_u16(),
+                        success: false,
+                        error_class,
+                        error_message,
+                        latency_ms: ms_since(attempt_started),
+                    });
+                    last_err = Some(e);
+                    // Non-retryable → stop entirely. Retryable → re-hit the
+                    // same target until `retries` is exhausted, then fall over
+                    // to the next target (the outer loop advances).
+                    if !retryable {
+                        break 'targets;
+                    }
+                    if attempt_idx == retries {
+                        break;
+                    }
                 }
             }
         }

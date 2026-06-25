@@ -460,86 +460,115 @@ async fn dispatch(
     let is_routing_request = model_entry.value.routing.is_some();
     let mut routing = RoutingTelemetry::default();
 
+    // `routing.retries` — how many times to re-hit the SAME target (with
+    // backoff) on a retryable failure before failing over to the next target.
+    // Honoured here exactly like chat.rs (#641); 0 (the default) keeps the
+    // fail-over-only behaviour. /v1/messages previously ignored it entirely.
+    let retries = model_entry
+        .value
+        .routing
+        .as_ref()
+        .map(|r| r.retries_or_default())
+        .unwrap_or(0);
+
     // Walk targets, failing over to the next only on a retryable upstream
     // failure. A 4xx / config error is returned as-is — retrying other
     // targets won't help. Streaming and non-streaming share this loop:
     // `dispatch_to_target` branches internally and, for streaming, only
     // returns Ok once the first chunk has arrived under `stream_timeout`
     // (#554) — so the 200 is committed to exactly one target and a slow
-    // first chunk fails over like any other retryable error. Each target
-    // attempt becomes its own per-attempt record (#655).
+    // first chunk fails over like any other retryable error. Each attempt
+    // (initial / same-target retry / fallover) becomes its own per-attempt
+    // record (#655).
     let n = attempt_models.len();
     let mut last_err: Option<ProxyError> = None;
-    for (i, target) in attempt_models.iter().enumerate() {
-        let (idx, kind) = routing.begin_attempt(&target.model.display_name);
-        let target_model = if is_routing_request {
-            target.model.display_name.clone()
-        } else {
-            String::new()
-        };
+    'targets: for (i, target) in attempt_models.iter().enumerate() {
         let pk_id = crate::dispatch::resolve_provider_key(&snapshot, &target.model)
             .map(|e| e.id.clone())
             .unwrap_or_default();
-        let attempt_started = Instant::now();
-        match dispatch_to_target(
-            state,
-            &snapshot,
-            body,
-            target,
-            &model_name,
-            request_id,
-            started,
-            &auth.entry.id,
-            auth.key().team_id.clone(),
-            auth.key().user_id.clone(),
-            resolved_chain.clone(),
-            client,
-            AttemptInfo {
-                index: idx,
-                kind: kind.to_string(),
-                model: target_model.clone(),
-                ..Default::default()
-            },
-        )
-        .await
-        {
-            Ok(mut outcome) => {
-                routing.attempts.push(AttemptRecord {
-                    index: idx,
-                    kind,
-                    target_model,
-                    target_model_id: target.id.clone(),
-                    provider_key_id: outcome.provider_key_id.clone(),
-                    status: 200,
-                    success: true,
-                    error_class: String::new(),
-                    error_message: String::new(),
-                    latency_ms: ms_since(attempt_started),
-                });
-                outcome.routing = routing;
-                return Ok(outcome);
+        for attempt_idx in 0..=retries {
+            // Exponential backoff + jitter before re-hitting the SAME target
+            // (#641); cross-target fall-over (the outer loop) stays immediate.
+            if attempt_idx > 0 {
+                tokio::time::sleep(crate::routing::retry_backoff(attempt_idx as u32)).await;
             }
-            Err(e) => {
-                let retryable = matches!(
-                    &e,
-                    ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429)
-                );
-                let (error_class, error_message) = attempt_error_from_proxy(&e);
-                routing.attempts.push(AttemptRecord {
+            let (idx, kind) = routing.begin_attempt(&target.model.display_name);
+            let target_model = if is_routing_request {
+                target.model.display_name.clone()
+            } else {
+                String::new()
+            };
+            let attempt_started = Instant::now();
+            match dispatch_to_target(
+                state,
+                &snapshot,
+                body,
+                target,
+                &model_name,
+                request_id,
+                started,
+                &auth.entry.id,
+                auth.key().team_id.clone(),
+                auth.key().user_id.clone(),
+                resolved_chain.clone(),
+                client,
+                AttemptInfo {
                     index: idx,
-                    kind,
-                    target_model,
-                    target_model_id: target.id.clone(),
-                    provider_key_id: pk_id,
-                    status: e.status().as_u16(),
-                    success: false,
-                    error_class,
-                    error_message,
-                    latency_ms: ms_since(attempt_started),
-                });
-                last_err = Some(e);
-                if !(retryable && i + 1 < n) {
-                    break;
+                    kind: kind.to_string(),
+                    model: target_model.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                Ok(mut outcome) => {
+                    routing.attempts.push(AttemptRecord {
+                        index: idx,
+                        kind,
+                        target_model,
+                        target_model_id: target.id.clone(),
+                        provider_key_id: outcome.provider_key_id.clone(),
+                        status: 200,
+                        success: true,
+                        error_class: String::new(),
+                        error_message: String::new(),
+                        latency_ms: ms_since(attempt_started),
+                    });
+                    outcome.routing = routing;
+                    return Ok(outcome);
+                }
+                Err(e) => {
+                    let retryable = matches!(
+                        &e,
+                        ProxyError::Bridge(be) if crate::routing::is_retryable(be, retry_on_429)
+                    );
+                    let (error_class, error_message) = attempt_error_from_proxy(&e);
+                    routing.attempts.push(AttemptRecord {
+                        index: idx,
+                        kind,
+                        target_model,
+                        target_model_id: target.id.clone(),
+                        provider_key_id: pk_id.clone(),
+                        status: e.status().as_u16(),
+                        success: false,
+                        error_class,
+                        error_message,
+                        latency_ms: ms_since(attempt_started),
+                    });
+                    last_err = Some(e);
+                    // Non-retryable → stop entirely (retrying or failing over
+                    // won't help). Retryable → re-hit the same target until
+                    // `retries` is exhausted, then fall over to the next target
+                    // if there is one.
+                    if !retryable {
+                        break 'targets;
+                    }
+                    if attempt_idx == retries {
+                        if i + 1 >= n {
+                            break 'targets;
+                        }
+                        break;
+                    }
                 }
             }
         }
