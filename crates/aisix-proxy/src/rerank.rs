@@ -275,6 +275,18 @@ async fn dispatch(
         *m = Value::String(upstream_model.clone());
     }
 
+    // Apply the PK's `request.*` body overrides, matching the OpenAI bridge's
+    // chat() path and /v1/messages passthrough (AISIX-Cloud#867 follow-up). The
+    // /v1/rerank path builds the request directly, so without this the override
+    // pipeline silently no-ops here. No-op when the PK carries none.
+    if let Some(r) = pk_entry.value.request.as_ref() {
+        aisix_provider_openai::overrides::apply_param_renames(body, &r.param_renames);
+        if let Some(constraints) = &r.param_constraints {
+            aisix_provider_openai::overrides::apply_param_constraints(body, constraints);
+        }
+        aisix_provider_openai::overrides::apply_default_body_fields(body, &r.default_body_fields);
+    }
+
     // Build upstream URL. build_v1_url tolerates either base form —
     // `https://api.cohere.com` (bare host) and `https://api.openai.com/v1`
     // (OpenAI-SDK convention, with /v1) both end up at `…/v1/rerank`
@@ -295,13 +307,34 @@ async fn dispatch(
     };
     let url = crate::dispatch::build_v1_url(&base, "/rerank");
 
+    // Build headers explicitly so the PK's `request.default_headers` can inject
+    // operator headers (reserved auth headers are protected by the apply step).
+    let mut headers = axum::http::HeaderMap::new();
+    let auth_hv = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
+        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+            "api key contains invalid header chars: {e}"
+        )))
+    })?;
+    headers.insert(axum::http::header::AUTHORIZATION, auth_hv);
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let rid_hv = HeaderValue::from_str(request_id).map_err(|e| {
+        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+            "request_id contains invalid header chars: {e}"
+        )))
+    })?;
+    headers.insert(
+        axum::http::header::HeaderName::from_static("x-aisix-request-id"),
+        rid_hv,
+    );
+    if let Some(r) = pk_entry.value.request.as_ref() {
+        aisix_provider_openai::overrides::apply_default_headers(&mut headers, &r.default_headers);
+    }
+
     let client = crate::http_client::client();
-    let mut req = client
-        .post(&url)
-        .header("authorization", format!("Bearer {api_key}"))
-        .header("content-type", "application/json")
-        .header("x-aisix-request-id", request_id)
-        .json(body);
+    let mut req = client.post(&url).headers(headers).json(body);
     // #554: rerank is non-streaming; apply the E2E request timeout.
     if let Some(d) = model.request_timeout() {
         req = req.timeout(d);
@@ -629,6 +662,26 @@ mod tests {
         let snap = AisixSnapshot::new();
         snap.provider_keys
             .insert(provider_key_entry_tagged(api_base));
+        snap
+    }
+
+    /// AISIX-Cloud#867: an OpenAI PK that carries `request.*` overrides
+    /// (`default_body_fields` + `default_headers`). Clones the plain openai PK
+    /// JSON and appends a `request` block; reuses `PK_ID` so the rerank model
+    /// fixtures still reference it. Used to prove the resolved PK's request
+    /// overrides reach the rerank upstream body + headers.
+    fn provider_key_entry_overrides(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}","provider":"openai","adapter":"openai","request":{{"default_body_fields":{{"safe_flag":true}},"default_headers":{{"x-custom":"trace-on"}}}}}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
+    fn new_snap_overrides(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry_overrides(api_base));
         snap
     }
 
@@ -1423,5 +1476,50 @@ mod tests {
             ev.pk_label, "prod-rerank-key",
             "pk_label must mirror telemetry_tags.pk_label",
         );
+    }
+
+    /// AISIX-Cloud#867: the resolved ProviderKey's `request.*` overrides
+    /// (`default_body_fields` + `default_headers`) must be applied to the
+    /// outbound /v1/rerank request — exactly like the other proxy passthrough
+    /// endpoints. The mock matcher ONLY accepts the request when BOTH the
+    /// injected body field (`safe_flag:true`) and the injected header
+    /// (`x-custom: trace-on`) are present, so a 200 proves the overrides were
+    /// applied. Pre-fix the rerank handler dropped them → mock unmatched →
+    /// non-200.
+    #[tokio::test]
+    async fn applies_pk_request_overrides_issue_867() {
+        use wiremock::matchers::{body_partial_json, header};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .and(body_partial_json(serde_json::json!({"safe_flag": true})))
+            .and(header("x-custom", "trace-on"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "rerank-1",
+                "results": [{"index": 0, "relevance_score": 0.9}],
+                "model": "rerank-multilingual-v3.0",
+                "usage": {"prompt_tokens": 31, "total_tokens": 31}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_overrides(&upstream.uri());
+        snap.models.insert(openai_model("rerank-openai"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "rerank-openai",
+                "query": "what is the capital of France?",
+                "documents": ["Paris", "London", "Berlin"]
+            })))
+            .await
+            .unwrap();
+
+        // The mock only matches when both the injected body field and header
+        // are present — a 200 proves the PK request overrides were applied.
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

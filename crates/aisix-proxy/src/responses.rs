@@ -610,6 +610,23 @@ async fn responses_to_target(
         *m = Value::String(upstream_model.clone());
     }
 
+    // Apply the PK's `request.*` overrides to the outbound body, matching the
+    // OpenAI bridge's chat() path and the /v1/messages passthrough. The
+    // verbatim /v1/responses path builds the request directly (bypassing the
+    // Hub), so without this the override pipeline silently no-ops for Codex
+    // traffic (AISIX-Cloud#867 follow-up). Apply order: renames → constraints
+    // → defaults; each is a no-op when its configured map is empty.
+    if let Some(r) = pk_entry.value.request.as_ref() {
+        aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
+        if let Some(constraints) = &r.param_constraints {
+            aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
+        }
+        aisix_provider_openai::overrides::apply_default_body_fields(
+            &mut body,
+            &r.default_body_fields,
+        );
+    }
+
     let base = crate::dispatch::resolve_base_url(&pk_entry.value)?;
     // build_v1_url tolerates both `https://api.openai.com` (provider
     // default) and `https://api.openai.com/v1` (the OpenAI-SDK form
@@ -623,13 +640,33 @@ async fn responses_to_target(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Build headers explicitly so the PK's `request.default_headers` can inject
+    // operator headers. Bridge-owned headers go in FIRST; `apply_default_headers`
+    // skips already-present keys + the reserved auth blacklist, so an operator
+    // header can never clobber auth.
+    let mut headers = axum::http::HeaderMap::new();
+    let auth_hv = HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
+        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+            "api key contains invalid header chars: {e}"
+        )))
+    })?;
+    headers.insert(axum::http::header::AUTHORIZATION, auth_hv);
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let rid_hv = HeaderValue::from_str(request_id).map_err(|e| {
+        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+            "request_id contains invalid header chars: {e}"
+        )))
+    })?;
+    headers.insert(HeaderName::from_static("x-aisix-request-id"), rid_hv);
+    if let Some(r) = pk_entry.value.request.as_ref() {
+        aisix_provider_openai::overrides::apply_default_headers(&mut headers, &r.default_headers);
+    }
+
     let client = crate::http_client::client();
-    let mut req = client
-        .post(&url)
-        .header("authorization", format!("Bearer {api_key}"))
-        .header("content-type", "application/json")
-        .header("x-aisix-request-id", request_id)
-        .json(&body);
+    let mut req = client.post(&url).headers(headers).json(&body);
     // #554: non-streaming gets the E2E request timeout via reqwest's
     // request-level timeout. Streaming must NOT use it (it would cap the
     // whole stream); the streaming branch below enforces the per-chunk
@@ -1799,7 +1836,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use tower::ServiceExt;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn cfg() -> ProxyConfig {
@@ -1833,6 +1870,18 @@ mod tests {
     fn openai_pk(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
             r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(OPENAI_PK_ID, pk, 1)
+    }
+
+    /// An OpenAI PK carrying per-PK `request.*` overrides (AISIX-Cloud#867):
+    /// a `default_body_fields` injection and a `default_headers` injection,
+    /// so the verbatim Responses path can be asserted to apply both to the
+    /// outbound upstream call.
+    fn openai_pk_with_overrides(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}","provider":"openai","adapter":"openai","request":{{"default_body_fields":{{"safe_flag":true}},"default_headers":{{"x-custom":"trace-on"}}}}}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(OPENAI_PK_ID, pk, 1)
@@ -3101,6 +3150,48 @@ mod tests {
         assert_eq!(event.inbound_protocol, "openai");
         assert!(!event.request_id.is_empty());
         assert!(!event.occurred_at.is_empty());
+    }
+
+    /// AISIX-Cloud#867: the verbatim-OpenAI /v1/responses path must apply the
+    /// resolved ProviderKey's `request.*` overrides to the outbound call —
+    /// both the `default_body_fields` injection (body) and the
+    /// `default_headers` injection (header) must reach the upstream. The mock
+    /// only matches (200) when BOTH the injected body field AND header are
+    /// present, so a 200 proves the overrides were applied. Before the fix the
+    /// outbound body/headers carried neither → mock wouldn't match → wiremock
+    /// 404 → non-200.
+    #[tokio::test]
+    async fn responses_verbatim_applies_pk_request_overrides_issue_867() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(body_partial_json(serde_json::json!({"safe_flag": true})))
+            .and(header("x-custom", "trace-on"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp-1",
+                "object": "response",
+                "output": [],
+                "usage": {"input_tokens": 3, "output_tokens": 1}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(openai_pk_with_overrides(&upstream.uri()));
+        snap.models.insert(openai_model("gpt-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        let app = build_app(snap);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-resp",
+                "input": "hi"
+            })))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// #543: an OUTPUT-blocked /v1/responses still records the billed
