@@ -413,11 +413,35 @@ async fn multipart_dispatch(
         form = form.part(name, part);
     }
 
+    // Build headers explicitly so the PK's `request.default_headers` can inject
+    // operator headers (AISIX-Cloud#867 follow-up). The body is a multipart
+    // form, so the JSON body-field overrides don't apply here — only headers do.
+    // Content-Type is left to `.multipart()` (it sets the boundary). Reserved
+    // auth headers are protected by `apply_default_headers`.
+    let mut headers = axum::http::HeaderMap::new();
+    let auth_hv = header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
+        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+            "api key contains invalid header chars: {e}"
+        )))
+    })?;
+    headers.insert(header::AUTHORIZATION, auth_hv);
+    let rid_hv = header::HeaderValue::from_str(request_id).map_err(|e| {
+        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+            "request_id contains invalid header chars: {e}"
+        )))
+    })?;
+    headers.insert(
+        header::HeaderName::from_static("x-aisix-request-id"),
+        rid_hv,
+    );
+    if let Some(r) = pk_entry.value.request.as_ref() {
+        aisix_provider_openai::overrides::apply_default_headers(&mut headers, &r.default_headers);
+    }
+
     let client = crate::http_client::client();
     let resp = client
         .post(&url)
-        .header(header::AUTHORIZATION, format!("Bearer {api_key}"))
-        .header("x-aisix-request-id", request_id)
+        .headers(headers)
         .multipart(form)
         .send()
         .await
@@ -579,12 +603,48 @@ async fn speech_dispatch(
         *m = Value::String(upstream_model);
     }
 
+    // Apply the PK's `request.*` overrides (body + headers) like the OpenAI
+    // bridge's chat() path — /v1/audio/speech is a JSON passthrough that builds
+    // the request directly (AISIX-Cloud#867 follow-up). No-op when none set.
+    if let Some(r) = pk_entry.value.request.as_ref() {
+        aisix_provider_openai::overrides::apply_param_renames(&mut body, &r.param_renames);
+        if let Some(constraints) = &r.param_constraints {
+            aisix_provider_openai::overrides::apply_param_constraints(&mut body, constraints);
+        }
+        aisix_provider_openai::overrides::apply_default_body_fields(
+            &mut body,
+            &r.default_body_fields,
+        );
+    }
+
+    let mut headers = axum::http::HeaderMap::new();
+    let auth_hv = header::HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
+        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+            "api key contains invalid header chars: {e}"
+        )))
+    })?;
+    headers.insert(header::AUTHORIZATION, auth_hv);
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
+    );
+    let rid_hv = header::HeaderValue::from_str(request_id).map_err(|e| {
+        ProxyError::Bridge(aisix_gateway::BridgeError::Config(format!(
+            "request_id contains invalid header chars: {e}"
+        )))
+    })?;
+    headers.insert(
+        header::HeaderName::from_static("x-aisix-request-id"),
+        rid_hv,
+    );
+    if let Some(r) = pk_entry.value.request.as_ref() {
+        aisix_provider_openai::overrides::apply_default_headers(&mut headers, &r.default_headers);
+    }
+
     let client = crate::http_client::client();
     let resp = client
         .post(crate::dispatch::build_v1_url(&base, "/audio/speech"))
-        .header(header::AUTHORIZATION, format!("Bearer {api_key}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .header("x-aisix-request-id", request_id)
+        .headers(headers)
         .json(&body)
         .send()
         .await
@@ -784,7 +844,7 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
     use std::sync::Arc;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn cfg() -> ProxyConfig {
@@ -852,6 +912,24 @@ mod tests {
         let snap = AisixSnapshot::new();
         snap.provider_keys
             .insert(provider_key_entry_tagged(api_base));
+        snap
+    }
+
+    /// A PK carrying `request.*` operator overrides (AISIX-Cloud#867):
+    /// a default body field + a default header that the audio handlers
+    /// must apply to the upstream request.
+    fn provider_key_entry_overrides(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","request":{{"default_body_fields":{{"safe_flag":true}},"default_headers":{{"x-custom":"trace-on"}}}}}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
+    fn new_snap_overrides(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry_overrides(api_base));
         snap
     }
 
@@ -1327,5 +1405,73 @@ mod tests {
             rx.try_recv().is_err(),
             "exactly one event per failed request"
         );
+    }
+
+    /// AISIX-Cloud#867: `/v1/audio/speech` (JSON body) must apply the PK's
+    /// `request.*` overrides to BOTH the request body
+    /// (`default_body_fields`) and the request headers (`default_headers`).
+    /// The Mock matches only when the upstream request carries the injected
+    /// body field AND header, so a 200 proves both were applied.
+    #[tokio::test]
+    async fn speech_applies_pk_request_overrides_issue_867() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .and(body_partial_json(serde_json::json!({"safe_flag": true})))
+            .and(header("x-custom", "trace-on"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"AUDIO".to_vec()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_overrides(&upstream.uri());
+        snap.models.insert(tts_model("my-tts"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/speech")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"model":"my-tts","input":"hi","voice":"alloy"}"#,
+            ))
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// AISIX-Cloud#867: `/v1/audio/transcriptions` (multipart body) must
+    /// apply the PK's `request.default_headers` to the upstream request.
+    /// Body `request.*` overrides do NOT apply (the body is a multipart
+    /// form, not JSON). The Mock matches only on the injected header, so a
+    /// 200 proves the operator header was applied.
+    #[tokio::test]
+    async fn transcriptions_applies_default_headers_issue_867() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .and(header("x-custom", "trace-on"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "hi"})),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_overrides(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let app = build_app(snap);
+        let (ct, body) = transcription_multipart("my-transcribe");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
