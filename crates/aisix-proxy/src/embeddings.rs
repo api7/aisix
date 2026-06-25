@@ -14,6 +14,7 @@
 //! Providers that don't implement embeddings return a 501 with
 //! `"type": "not_implemented"`.
 
+use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeContext, BridgeError, ChatFormat, ChatMessage, EmbeddingRequest};
 use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::extract::State;
@@ -166,6 +167,7 @@ pub async fn embeddings(
                     &model_name,
                     &api_key_id,
                     &success.provider_key_id,
+                    &success.applied_guardrails,
                     status,
                     elapsed,
                     success.prompt_tokens,
@@ -222,6 +224,9 @@ struct EmbedDispatchSuccess {
     /// Resolved ProviderKey UUID — feeds the per-PK telemetry attribution
     /// tags on the emitted UsageEvent (AISIX-Cloud#867 parity).
     provider_key_id: String,
+    /// The `{kind, hook}` set of guardrails that governed this request (#379
+    /// parity) — surfaced on the emitted UsageEvent.
+    applied_guardrails: Vec<AppliedGuardrail>,
     prompt_tokens: u32,
     /// `true` when the dispatch produced a real 200 from the upstream
     /// (we have authoritative usage data to attribute). `false` for the
@@ -280,6 +285,10 @@ async fn dispatch(
         team_id: auth.key().team_id.as_deref(),
     };
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    // Record which guardrails govern this request (#379 parity) so the emitted
+    // UsageEvent surfaces them in Logs, like chat / messages. Empty when no
+    // guardrail is attached.
+    let applied_guardrails = resolved_chain.applied().to_vec();
     if !resolved_chain.is_empty() {
         let chat = embeddings_input_to_chat(&body.model, &body.input);
         if let aisix_guardrails::GuardrailVerdict::Block {
@@ -350,6 +359,7 @@ async fn dispatch(
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
+                applied_guardrails: applied_guardrails.clone(),
                 prompt_tokens,
                 upstream_called: true,
             })
@@ -368,6 +378,7 @@ async fn dispatch(
                 provider: provider.to_ascii_lowercase(),
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
+                applied_guardrails: applied_guardrails.clone(),
                 prompt_tokens: 0,
                 // No upstream call happened — the handler reads this
                 // and skips UsageEvent emission. Distinguished from
@@ -443,6 +454,7 @@ fn emit_usage_event(
     requested_model: &str,
     api_key_id: &str,
     provider_key_id: &str,
+    applied_guardrails: &[AppliedGuardrail],
     status_code: u16,
     elapsed: Duration,
     prompt_tokens: u32,
@@ -485,6 +497,7 @@ fn emit_usage_event(
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
+        applied_guardrails: applied_guardrails.to_vec(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
@@ -620,6 +633,59 @@ mod tests {
         );
         let g: aisix_core::Guardrail = serde_json::from_str(&json).unwrap();
         ResourceEntry::new("g-1", g, 1)
+    }
+
+    /// #379 parity: a successful /v1/embeddings request whose input passes an
+    /// attached input guardrail records that guardrail's `{kind, hook}` in the
+    /// emitted UsageEvent's `applied_guardrails`. Before the fix the field was
+    /// left empty on the non-chat handlers.
+    #[tokio::test]
+    async fn applied_guardrails_recorded_on_usage_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.1_f32]}],
+                "model": "text-embedding-3-small",
+                "usage": {"prompt_tokens": 3, "total_tokens": 3}
+            })))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        // Benign input (does not contain "BLOCKME") → passes the guardrail.
+        let body = serde_json::json!({"model": "my-embed", "input": "hello world"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert!(
+            !ev.applied_guardrails.is_empty(),
+            "the attached input guardrail must be recorded"
+        );
+        assert_eq!(ev.applied_guardrails[0].kind, "keyword");
+        assert_eq!(ev.applied_guardrails[0].hook, "input");
     }
 
     /// #719: /v1/embeddings explicitly bypassed all guardrails, so a content

@@ -9,6 +9,7 @@
 //! be configured with a `base_url` pointing to their rerank endpoint root.
 //! The gateway appends `/v1/rerank`.
 
+use aisix_core::AppliedGuardrail;
 use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::extract::State;
 use axum::http::HeaderValue;
@@ -35,6 +36,9 @@ struct RerankDispatchSuccess {
     /// Resolved ProviderKey UUID — feeds per-PK telemetry attribution
     /// (AISIX-Cloud#867 parity).
     provider_key_id: String,
+    /// The `{kind, hook}` set of guardrails that governed this request (#379
+    /// parity) — surfaced on the emitted UsageEvent.
+    applied_guardrails: Vec<AppliedGuardrail>,
     /// Upstream-reported token count. `None` on a 200 with no
     /// recognisable usage field (provider returned malformed body,
     /// or a wire shape this gateway doesn't yet support). Handler
@@ -105,6 +109,7 @@ pub async fn rerank(
                     &model_name,
                     &api_key_id,
                     &success.provider_key_id,
+                    &success.applied_guardrails,
                     status,
                     elapsed,
                     &usage,
@@ -212,6 +217,10 @@ async fn dispatch(
         team_id: auth.key().team_id.as_deref(),
     };
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    // Record which guardrails govern this request (#379 parity) so the emitted
+    // UsageEvent surfaces them in Logs, like chat / messages. Empty when no
+    // guardrail is attached.
+    let applied_guardrails = resolved_chain.applied().to_vec();
     if !resolved_chain.is_empty() {
         let chat = rerank_input_to_chat(&model_name, &*body);
         if let aisix_guardrails::GuardrailVerdict::Block {
@@ -445,6 +454,7 @@ async fn dispatch(
         provider: provider_label,
         model_id: model_entry.id.to_string(),
         provider_key_id: pk_entry.id.to_string(),
+        applied_guardrails: applied_guardrails.clone(),
         usage,
     })
 }
@@ -501,6 +511,7 @@ fn emit_usage_event(
     requested_model: &str,
     api_key_id: &str,
     provider_key_id: &str,
+    applied_guardrails: &[AppliedGuardrail],
     status_code: u16,
     elapsed: Duration,
     usage: &RerankUsage,
@@ -517,6 +528,7 @@ fn emit_usage_event(
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
+        applied_guardrails: applied_guardrails.to_vec(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
@@ -1198,6 +1210,72 @@ mod tests {
         assert_eq!(event.inbound_protocol, "openai");
         assert!(!event.request_id.is_empty());
         assert!(!event.occurred_at.is_empty());
+    }
+
+    /// #379 parity: a successful /v1/rerank 200 whose request was governed by a
+    /// configured guardrail must surface that guardrail's `{kind, hook}` on the
+    /// emitted UsageEvent — exactly like /v1/embeddings. An env-scoped keyword
+    /// guardrail (literal the benign request never matches) is attached so the
+    /// request passes (200) but the applied set is non-empty. Pre-fix the rerank
+    /// handler left `applied_guardrails` at Default (empty), so Logs couldn't
+    /// show which guardrails ran on rerank traffic.
+    #[tokio::test]
+    async fn applied_guardrails_recorded_on_usage_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // OpenAI-compat rerank: `usage.prompt_tokens` so the handler reaches
+        // the emit path (emission is gated on a recognisable usage field).
+        let upstream_body = serde_json::json!({
+            "id": "rerank-guarded",
+            "results": [{"index": 0, "relevance_score": 0.9}],
+            "model": "rerank-multilingual-v3.0",
+            "usage": {"prompt_tokens": 23, "total_tokens": 23}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(openai_model("rerank-openai"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        // ALLOW guardrail: a literal the benign request below never matches, so
+        // it governs the request (non-empty applied set) without blocking it.
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({
+            "model": "rerank-openai",
+            "query": "a perfectly fine query",
+            "documents": ["Paris", "London", "Berlin"]
+        });
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for /v1/rerank 200")
+            .expect("usage_sink sender dropped");
+        assert!(
+            !ev.applied_guardrails.is_empty(),
+            "the configured guardrail must surface on the UsageEvent's applied set",
+        );
+        assert_eq!(
+            ev.applied_guardrails[0].kind, "keyword",
+            "applied entry kind must mirror the configured guardrail's kind",
+        );
     }
 
     /// Issue #405 audit MEDIUM: Jina's wire shape only puts

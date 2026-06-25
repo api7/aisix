@@ -17,6 +17,7 @@
 //! Auth and model authorisation follow the same rules as every other
 //! proxy endpoint.
 
+use aisix_core::AppliedGuardrail;
 use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::body::Bytes;
 use axum::extract::{Multipart, State};
@@ -243,7 +244,7 @@ pub async fn speech(
         .to_string();
 
     match speech_dispatch(&state, &auth, body, &request_id, &client.source_ip).await {
-        Ok((resp, provider, model_id, provider_key_id)) => {
+        Ok((resp, provider, model_id, provider_key_id, applied_guardrails)) => {
             let elapsed = started.elapsed();
             emit_access_log(
                 "POST",
@@ -274,6 +275,7 @@ pub async fn speech(
                 &model_name,
                 &api_key_id,
                 &provider_key_id,
+                &applied_guardrails,
                 200,
                 elapsed,
                 0,
@@ -533,7 +535,7 @@ async fn speech_dispatch(
     mut body: Value,
     request_id: &str,
     source_ip: &str,
-) -> Result<(Response, String, String, String), ProxyError> {
+) -> Result<(Response, String, String, String, Vec<AppliedGuardrail>), ProxyError> {
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -565,6 +567,9 @@ async fn speech_dispatch(
         team_id: auth.key().team_id.as_deref(),
     };
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    // Record which guardrails govern this request (#379 parity) for the emitted
+    // UsageEvent. Empty when none attached.
+    let applied_guardrails = resolved_chain.applied().to_vec();
     if !resolved_chain.is_empty() {
         let chat = speech_input_to_chat(&model_name, &body);
         if let aisix_guardrails::GuardrailVerdict::Block {
@@ -701,6 +706,7 @@ async fn speech_dispatch(
         provider_label,
         model_entry.id.to_string(),
         pk_entry.id.to_string(),
+        applied_guardrails,
     ))
 }
 
@@ -732,6 +738,8 @@ fn emit_audio_usage(
     client: &ClientContext,
 ) {
     let (prompt_tokens, completion_tokens) = success.usage.unwrap_or((0, 0));
+    // Transcriptions/translations (multipart) don't run input guardrails — the
+    // audio bytes aren't scannable text — so no applied set to record here.
     emit_usage_event(
         state,
         request_id,
@@ -739,6 +747,7 @@ fn emit_audio_usage(
         &success.model_name,
         api_key_id,
         &success.provider_key_id,
+        &[],
         200,
         elapsed,
         prompt_tokens,
@@ -762,6 +771,7 @@ fn emit_usage_event(
     requested_model: &str,
     api_key_id: &str,
     provider_key_id: &str,
+    applied_guardrails: &[AppliedGuardrail],
     status_code: u16,
     elapsed: Duration,
     prompt_tokens: u32,
@@ -780,6 +790,7 @@ fn emit_usage_event(
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
+        applied_guardrails: applied_guardrails.to_vec(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
@@ -965,6 +976,42 @@ mod tests {
             .header("content-type", "application/json")
             .body(axum::body::Body::from(body.to_string()))
             .unwrap()
+    }
+
+    /// #379 parity: a successful /v1/audio/speech whose input passes an attached
+    /// input guardrail records that guardrail's `{kind, hook}` in the emitted
+    /// UsageEvent's `applied_guardrails`.
+    #[tokio::test]
+    async fn speech_applied_guardrails_recorded_on_usage_event() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"AUDIO".to_vec()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(tts_model("my-tts"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        // Benign input (no "BLOCKME") → passes the guardrail.
+        let req = speech_req(r#"{"model":"my-tts","input":"hello","voice":"alloy"}"#);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted")
+            .expect("usage_sink sender dropped");
+        assert!(
+            !ev.applied_guardrails.is_empty(),
+            "the attached input guardrail must be recorded"
+        );
+        assert_eq!(ev.applied_guardrails[0].kind, "keyword");
+        assert_eq!(ev.applied_guardrails[0].hook, "input");
     }
 
     /// #545: a configured input guardrail must fire on /v1/audio/speech — a

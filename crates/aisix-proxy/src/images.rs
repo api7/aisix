@@ -10,6 +10,7 @@
 //! 7. Call `bridge.generate_image(body, ctx)` → JSON response.
 //! 8. Providers that don't support image generation return 501.
 
+use aisix_core::AppliedGuardrail;
 use aisix_gateway::{BridgeContext, BridgeError};
 use aisix_obs::{AccessLog, RequestOutcome, UsageEvent};
 use axum::extract::State;
@@ -37,6 +38,9 @@ struct ImageDispatchSuccess {
     /// Resolved ProviderKey UUID — feeds per-PK telemetry attribution
     /// (AISIX-Cloud#867 parity).
     provider_key_id: String,
+    /// The `{kind, hook}` set of guardrails that governed this request (#379
+    /// parity) — surfaced on the emitted UsageEvent.
+    applied_guardrails: Vec<AppliedGuardrail>,
     /// `(prompt_tokens, completion_tokens)` from the upstream `usage`
     /// block when the model returns one (gpt-image-1). `None` for
     /// models that don't (dall-e-3) — those still emit a zero-token
@@ -100,6 +104,7 @@ pub async fn image_generations(
                     &model_name,
                     &api_key_id,
                     &success.provider_key_id,
+                    &success.applied_guardrails,
                     200,
                     elapsed,
                     prompt_tokens,
@@ -193,6 +198,10 @@ async fn dispatch(
         team_id: auth.key().team_id.as_deref(),
     };
     let resolved_chain = state.guardrail_index.resolve(&guardrail_ctx);
+    // Record which guardrails govern this request (#379 parity) so the emitted
+    // UsageEvent surfaces them in Logs, like chat / messages. Empty when no
+    // guardrail is attached.
+    let applied_guardrails = resolved_chain.applied().to_vec();
     if !resolved_chain.is_empty() {
         let chat = images_input_to_chat(model_name, &body);
         if let aisix_guardrails::GuardrailVerdict::Block {
@@ -264,6 +273,7 @@ async fn dispatch(
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
+                applied_guardrails: applied_guardrails.clone(),
                 usage,
                 upstream_called: true,
             })
@@ -275,6 +285,7 @@ async fn dispatch(
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
                 provider_key_id: pk_entry.id.to_string(),
+                applied_guardrails: applied_guardrails.clone(),
                 usage: None,
                 // No upstream call happened → handler skips emit.
                 upstream_called: false,
@@ -319,6 +330,7 @@ fn emit_usage_event(
     requested_model: &str,
     api_key_id: &str,
     provider_key_id: &str,
+    applied_guardrails: &[AppliedGuardrail],
     status_code: u16,
     elapsed: Duration,
     prompt_tokens: u32,
@@ -337,6 +349,7 @@ fn emit_usage_event(
         latency_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
         status_code,
         inbound_protocol: "openai".to_string(),
+        applied_guardrails: applied_guardrails.to_vec(),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
@@ -921,6 +934,53 @@ mod tests {
         assert_eq!(
             ev.pk_label, "prod-images-key",
             "pk_label must mirror telemetry_tags.pk_label"
+        );
+    }
+
+    /// #379 parity: a successful /v1/images/generations 200 governed by a
+    /// configured input guardrail must surface the applied `{kind, hook}` set
+    /// on the emitted UsageEvent — exactly like chat / messages / embeddings.
+    /// A benign prompt that does NOT match the keyword guardrail passes through
+    /// (200), and the event records the guardrail that governed the request.
+    #[tokio::test]
+    async fn applied_guardrails_recorded_on_usage_event() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images/generations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("dall-e"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+        snap.guardrails.insert(keyword_input_guardrail("BLOCKME"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        // Benign prompt — does not contain the blocked literal, so it passes
+        // the guardrail and reaches the upstream.
+        let req = serde_json::json!({"model": "dall-e", "prompt": "a serene landscape", "n": 1});
+        let resp = tower::ServiceExt::oneshot(app, make_req(req))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for /v1/images/generations 200")
+            .expect("usage_sink sender dropped");
+        assert!(
+            !ev.applied_guardrails.is_empty(),
+            "the configured guardrail must be recorded on the UsageEvent"
+        );
+        assert_eq!(
+            ev.applied_guardrails[0].kind, "keyword",
+            "applied guardrail kind must mirror the configured guardrail"
+        );
+        assert_eq!(
+            ev.applied_guardrails[0].hook, "input",
+            "applied guardrail hook must mirror the configured hook_point"
         );
     }
 
