@@ -432,17 +432,28 @@ impl Bridge for OpenAiBridge {
         let key = api_key(ctx)?;
         let upstream = upstream_model(ctx)?;
 
-        let body = embed_request_body(req, upstream);
+        // Apply the PK's request overrides (param_renames / param_constraints /
+        // default_body_fields / default_headers) just like `chat()` — operators
+        // expect them on every endpoint that key serves, not chat only (#867
+        // consistency follow-up). No-op when the PK carries no overrides.
+        let body = prepare_outbound_body(
+            &embed_request_body(req, upstream),
+            ctx.provider_key.request.as_ref(),
+            ctx.provider_key.response.as_ref(),
+        )?;
+        let headers = build_request_headers(
+            key,
+            &ctx.request_id,
+            false,
+            ctx.provider_key.request.as_ref(),
+        )?;
         let url = format!("{base}/embeddings");
         let client = self.client.clone();
         let started = Instant::now();
-        let request_id = ctx.request_id.clone();
         with_deadline(ctx.deadline, started, async move {
             let resp = client
                 .post(&url)
-                .header(header::AUTHORIZATION, format!("Bearer {key}"))
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("x-aisix-request-id", &request_id)
+                .headers(headers)
                 .json(&body)
                 .send()
                 .await
@@ -479,17 +490,27 @@ impl Bridge for OpenAiBridge {
                 serde_json::Value::String(upstream.to_string()),
             );
         }
+        // Apply the PK's request overrides like `chat()` (#867 consistency
+        // follow-up); no-op when none are configured.
+        let outbound = prepare_outbound_body(
+            &outbound,
+            ctx.provider_key.request.as_ref(),
+            ctx.provider_key.response.as_ref(),
+        )?;
+        let headers = build_request_headers(
+            key,
+            &ctx.request_id,
+            false,
+            ctx.provider_key.request.as_ref(),
+        )?;
 
         let url = format!("{base}/completions");
         let client = self.client.clone();
         let started = Instant::now();
-        let request_id = ctx.request_id.clone();
         with_deadline(ctx.deadline, started, async move {
             let resp = client
                 .post(&url)
-                .header(header::AUTHORIZATION, format!("Bearer {key}"))
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("x-aisix-request-id", &request_id)
+                .headers(headers)
                 .json(&outbound)
                 .send()
                 .await
@@ -524,17 +545,27 @@ impl Bridge for OpenAiBridge {
                 serde_json::Value::String(upstream.to_string()),
             );
         }
+        // Apply the PK's request overrides like `chat()` (#867 consistency
+        // follow-up); no-op when none are configured.
+        let outbound = prepare_outbound_body(
+            &outbound,
+            ctx.provider_key.request.as_ref(),
+            ctx.provider_key.response.as_ref(),
+        )?;
+        let headers = build_request_headers(
+            key,
+            &ctx.request_id,
+            false,
+            ctx.provider_key.request.as_ref(),
+        )?;
 
         let url = format!("{base}/images/generations");
         let client = self.client.clone();
         let started = Instant::now();
-        let request_id = ctx.request_id.clone();
         with_deadline(ctx.deadline, started, async move {
             let resp = client
                 .post(&url)
-                .header(header::AUTHORIZATION, format!("Bearer {key}"))
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("x-aisix-request-id", &request_id)
+                .headers(headers)
                 .json(&outbound)
                 .send()
                 .await
@@ -1482,6 +1513,104 @@ data: [DONE]\n\n";
             .chat(&req(), &ctx)
             .await
             .expect("auth was kept as-is");
+    }
+
+    /// AISIX-Cloud#867 follow-up: per-PK request overrides must apply on
+    /// `embed()`, not just `chat()`. Configure both a `default_body_fields` and
+    /// a `default_headers` override; the outbound /embeddings request must carry
+    /// both. Fails before the fix (overrides dropped → mock unmatched → Err).
+    #[tokio::test]
+    async fn embed_applies_request_overrides_like_chat() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .and(body_partial_json(serde_json::json!({"safe_flag": true})))
+            .and(header("x-custom", "trace-on"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.1]}],
+                "model": "text-embedding-3-small",
+                "usage": {"prompt_tokens": 1, "total_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let pk = pk_with_overrides(
+            &server.uri(),
+            r#""request": {"default_body_fields": {"safe_flag": true}, "default_headers": {"x-custom": "trace-on"}}"#,
+        );
+        let ctx = BridgeContext::new("req-1", sample_model(), pk);
+        let request = EmbeddingRequest {
+            model: "my-embed".into(),
+            input: vec!["hi".into()],
+            input_was_single: true,
+            encoding_format: None,
+            dimensions: None,
+        };
+        bridge
+            .embed(&request, &ctx)
+            .await
+            .expect("PK request overrides must apply to /embeddings");
+    }
+
+    /// Same parity check for `complete()` (/v1/completions).
+    #[tokio::test]
+    async fn complete_applies_request_overrides_like_chat() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .and(body_partial_json(serde_json::json!({"safe_flag": true})))
+            .and(header("x-custom", "trace-on"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "c", "choices": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let pk = pk_with_overrides(
+            &server.uri(),
+            r#""request": {"default_body_fields": {"safe_flag": true}, "default_headers": {"x-custom": "trace-on"}}"#,
+        );
+        let ctx = BridgeContext::new("req-1", sample_model(), pk);
+        let body = serde_json::json!({"model": "my-gpt4", "prompt": "hi"});
+        bridge
+            .complete(&body, &ctx)
+            .await
+            .expect("PK request overrides must apply to /completions");
+    }
+
+    /// Same parity check for `generate_image()` (/v1/images/generations).
+    #[tokio::test]
+    async fn generate_image_applies_request_overrides_like_chat() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images/generations"))
+            .and(body_partial_json(serde_json::json!({"safe_flag": true})))
+            .and(header("x-custom", "trace-on"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"created": 1, "data": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let pk = pk_with_overrides(
+            &server.uri(),
+            r#""request": {"default_body_fields": {"safe_flag": true}, "default_headers": {"x-custom": "trace-on"}}"#,
+        );
+        let ctx = BridgeContext::new("req-1", sample_model(), pk);
+        let body = serde_json::json!({"model": "my-gpt4", "prompt": "a cat"});
+        bridge
+            .generate_image(&body, &ctx)
+            .await
+            .expect("PK request overrides must apply to /images/generations");
     }
 
     // ----------- issue #302 §5 wire-in: ResponseOverrides ----------
