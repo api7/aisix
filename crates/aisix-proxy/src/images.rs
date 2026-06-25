@@ -127,6 +127,18 @@ pub async fn image_generations(
                 RequestOutcome::from_status(status),
                 elapsed,
             );
+            // Per #655 parity: surface the failed request in Logs with a
+            // zero-token event (status + error class), instead of dropping it.
+            crate::usage_attr::emit_error_usage_event(
+                &state,
+                "images",
+                &request_id,
+                &model_name,
+                &api_key_id,
+                status,
+                err.kind(),
+                &client,
+            );
             err.into_response()
         }
     }
@@ -909,6 +921,49 @@ mod tests {
         assert_eq!(
             ev.pk_label, "prod-images-key",
             "pk_label must mirror telemetry_tags.pk_label"
+        );
+    }
+
+    /// #655 parity: an upstream 5xx on /v1/images/generations now emits ONE
+    /// zero-token UsageEvent so the failed request is visible in Logs (status +
+    /// error class) and attributed to the api_key — instead of being dropped.
+    /// Mirrors `completions.rs::upstream_5xx_emits_zero_token_error_event`.
+    #[tokio::test]
+    async fn upstream_5xx_emits_zero_token_error_event() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images/generations"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("dall-e"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let req = serde_json::json!({"model": "dall-e", "prompt": "a cat", "n": 1});
+        let resp = tower::ServiceExt::oneshot(app, make_req(req))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a failed /v1/images/generations must emit a zero-token UsageEvent")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.status_code, 502, "upstream 5xx maps to 502");
+        assert_eq!(ev.prompt_tokens, 0);
+        assert_eq!(ev.api_key_id, "k-1");
+        assert_eq!(ev.requested_model, "dall-e");
+        assert!(
+            !ev.error_class.is_empty(),
+            "error_class must classify the failure"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one event per failed request"
         );
     }
 }

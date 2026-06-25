@@ -131,6 +131,18 @@ pub async fn rerank(
                 RequestOutcome::from_status(status),
                 elapsed,
             );
+            // Per #655 parity: surface the failed request in Logs with a
+            // zero-token event (status + error class), instead of dropping it.
+            crate::usage_attr::emit_error_usage_event(
+                &state,
+                "rerank",
+                &request_id,
+                &model_name,
+                &api_key_id,
+                status,
+                err.kind(),
+                &client,
+            );
             err.into_response()
         }
     }
@@ -1309,10 +1321,12 @@ mod tests {
         }
     }
 
-    /// Issue #405 negative pinning: upstream 5xx must NOT emit
-    /// a UsageEvent (same discipline as #425 audit MEDIUM-2).
+    /// Per #655 parity (was #405 negative pinning): an upstream 5xx now emits
+    /// ONE zero-token UsageEvent so the failed /v1/rerank request is visible in
+    /// Logs (status + error class), instead of being dropped. The 200-without-
+    /// usage-fields case (test above) still emits nothing.
     #[tokio::test]
-    async fn upstream_5xx_does_not_emit_usage_event() {
+    async fn upstream_5xx_emits_zero_token_error_event() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -1345,13 +1359,22 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "5xx must not emit UsageEvent, got status_code={}",
-                ev.status_code,
-            );
-        }
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a failed /v1/rerank must emit a zero-token UsageEvent")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.status_code, 502, "upstream 5xx maps to 502");
+        assert_eq!(ev.prompt_tokens, 0);
+        assert_eq!(ev.requested_model, "rerank-openai");
+        assert_eq!(ev.api_key_id, "k-1");
+        assert!(
+            !ev.error_class.is_empty(),
+            "error_class must classify the failure"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one event per failed request"
+        );
     }
 
     /// AISIX-Cloud#867 parity: a successful /v1/rerank 200 must stamp the

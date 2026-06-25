@@ -120,6 +120,19 @@ pub async fn transcriptions(
                 RequestOutcome::from_status(status),
                 elapsed,
             );
+            // Per #655 parity: surface the failed request in Logs. The model
+            // isn't extracted from the multipart form on this error path, so
+            // requested_model is empty; status + error class still identify it.
+            crate::usage_attr::emit_error_usage_event(
+                &state,
+                "audio",
+                &request_id,
+                "",
+                &api_key_id,
+                status,
+                err.kind(),
+                &client,
+            );
             err.into_response()
         }
     }
@@ -192,6 +205,18 @@ pub async fn translations(
                 status,
                 RequestOutcome::from_status(status),
                 elapsed,
+            );
+            // Per #655 parity: surface the failed request in Logs (model not
+            // extracted on the multipart error path → empty requested_model).
+            crate::usage_attr::emit_error_usage_event(
+                &state,
+                "audio",
+                &request_id,
+                "",
+                &api_key_id,
+                status,
+                err.kind(),
+                &client,
             );
             err.into_response()
         }
@@ -276,6 +301,18 @@ pub async fn speech(
                 status,
                 RequestOutcome::from_status(status),
                 elapsed,
+            );
+            // Per #655 parity: surface the failed request in Logs with a
+            // zero-token event (status + error class).
+            crate::usage_attr::emit_error_usage_event(
+                &state,
+                "audio",
+                &request_id,
+                &model_name,
+                &api_key_id,
+                status,
+                err.kind(),
+                &client,
             );
             err.into_response()
         }
@@ -1249,5 +1286,46 @@ mod tests {
             "usage": {"type": "duration", "seconds": 42.7}
         });
         assert_eq!(super::extract_token_usage(&v), None);
+    }
+
+    /// #655 parity: an upstream 5xx on /v1/audio/speech now emits ONE zero-token
+    /// UsageEvent so the failed request is visible in Logs (status + error
+    /// class) and attributed to the api_key — instead of being dropped. Mirrors
+    /// `completions.rs::upstream_5xx_emits_zero_token_error_event`.
+    #[tokio::test]
+    async fn speech_5xx_emits_zero_token_error_event() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/speech"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(tts_model("my-tts"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let req = speech_req(r#"{"model":"my-tts","input":"hi","voice":"alloy"}"#);
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a failed /v1/audio/speech must emit a zero-token UsageEvent")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.status_code, 502, "upstream 5xx maps to 502");
+        assert_eq!(ev.prompt_tokens, 0);
+        assert_eq!(ev.api_key_id, "k-1");
+        assert_eq!(ev.requested_model, "my-tts");
+        assert!(
+            !ev.error_class.is_empty(),
+            "error_class must classify the failure"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one event per failed request"
+        );
     }
 }

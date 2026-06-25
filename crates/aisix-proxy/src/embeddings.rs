@@ -192,6 +192,18 @@ pub async fn embeddings(
                 RequestOutcome::from_status(status),
                 elapsed,
             );
+            // Per #655 parity: surface the failed request in Logs with a
+            // zero-token event (status + error class), instead of dropping it.
+            crate::usage_attr::emit_error_usage_event(
+                &state,
+                "embeddings",
+                &request_id,
+                &model_name,
+                &api_key_id,
+                status,
+                err.kind(),
+                &client,
+            );
             err.into_response()
         }
     }
@@ -1343,6 +1355,59 @@ mod tests {
         assert_eq!(
             v["error"]["type"], "invalid_request_error",
             "envelope must be OpenAI-shape invalid_request_error — #401",
+        );
+    }
+
+    /// #655 parity: an upstream 5xx on /v1/embeddings now emits ONE zero-token
+    /// UsageEvent so the failed request is visible in Logs (status + error
+    /// class) and attributed to the api_key — instead of being dropped, as the
+    /// non-chat handlers used to do. Mirrors
+    /// `completions.rs::upstream_5xx_emits_zero_token_error_event`.
+    #[tokio::test]
+    async fn upstream_5xx_emits_zero_token_error_event() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal"))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({"model": "my-embed", "input": "hi"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a failed /v1/embeddings must emit a zero-token UsageEvent")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.status_code, 502, "upstream 5xx maps to 502");
+        assert_eq!(ev.prompt_tokens, 0);
+        assert_eq!(ev.api_key_id, "k-1");
+        assert_eq!(ev.requested_model, "my-embed");
+        assert!(
+            !ev.error_class.is_empty(),
+            "error_class must classify the failure"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one event per failed request"
         );
     }
 

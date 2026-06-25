@@ -143,6 +143,18 @@ pub async fn completions(
                 RequestOutcome::from_status(status),
                 elapsed,
             );
+            // Per #655 parity: surface the failed request in Logs with a
+            // zero-token event (status + error class), instead of dropping it.
+            crate::usage_attr::emit_error_usage_event(
+                &state,
+                "completions",
+                &request_id,
+                &model_name,
+                &api_key_id,
+                status,
+                err.kind(),
+                &client,
+            );
             err.into_response()
         }
     }
@@ -830,13 +842,13 @@ mod tests {
         );
     }
 
-    /// Issue #403 negative pinning: 4xx / 5xx responses must NOT
-    /// emit a UsageEvent. Audit MEDIUM-2 on PR #425 — a future
-    /// regression that moved `emit_usage_event` into the error
-    /// branch would silently ship without this kind of negative
-    /// assertion.
+    /// Per #655 parity (was #403 negative pinning): an upstream 5xx now emits
+    /// ONE zero-token UsageEvent so the failed request is visible in Logs
+    /// (status + error class) and attributed to the api_key — instead of being
+    /// dropped, as the non-chat handlers used to do. The 501 NotImplemented
+    /// path still emits nothing (no upstream call); see the test below.
     #[tokio::test]
-    async fn upstream_5xx_does_not_emit_usage_event() {
+    async fn upstream_5xx_emits_zero_token_error_event() {
         use aisix_obs::UsageSink;
 
         let upstream = MockServer::start().await;
@@ -865,13 +877,23 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 
-        let recv = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
-        if let Ok(Some(ev)) = recv {
-            panic!(
-                "5xx must not emit UsageEvent, got status_code={}",
-                ev.status_code,
-            );
-        }
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("a failed /v1/completions must emit a zero-token UsageEvent")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.status_code, 502, "upstream 5xx maps to 502");
+        assert_eq!(ev.prompt_tokens, 0);
+        assert_eq!(ev.completion_tokens, 0);
+        assert_eq!(ev.api_key_id, "k-1");
+        assert_eq!(ev.requested_model, "instruct");
+        assert!(
+            !ev.error_class.is_empty(),
+            "error_class must classify the failure"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one event per failed request"
+        );
     }
 
     /// Issue #403 audit MEDIUM-3: the 501 NotImplemented path
