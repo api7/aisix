@@ -55,6 +55,7 @@ mod routing;
 mod semantic;
 mod state;
 mod stream_timeout;
+mod usage_attr;
 mod util;
 
 pub use auth::AuthenticatedKey;

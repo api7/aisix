@@ -165,6 +165,7 @@ pub async fn embeddings(
                     &success.model_id,
                     &model_name,
                     &api_key_id,
+                    &success.provider_key_id,
                     status,
                     elapsed,
                     success.prompt_tokens,
@@ -206,6 +207,9 @@ struct EmbedDispatchSuccess {
     response: Response,
     provider: String,
     model_id: String,
+    /// Resolved ProviderKey UUID — feeds the per-PK telemetry attribution
+    /// tags on the emitted UsageEvent (AISIX-Cloud#867 parity).
+    provider_key_id: String,
     prompt_tokens: u32,
     /// `true` when the dispatch produced a real 200 from the upstream
     /// (we have authoritative usage data to attribute). `false` for the
@@ -333,6 +337,7 @@ async fn dispatch(
                 response: Json(embed_resp).into_response(),
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
+                provider_key_id: pk_entry.id.to_string(),
                 prompt_tokens,
                 upstream_called: true,
             })
@@ -350,6 +355,7 @@ async fn dispatch(
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
                 provider: provider.to_ascii_lowercase(),
                 model_id: model_entry.id.to_string(),
+                provider_key_id: pk_entry.id.to_string(),
                 prompt_tokens: 0,
                 // No upstream call happened — the handler reads this
                 // and skips UsageEvent emission. Distinguished from
@@ -424,6 +430,7 @@ fn emit_usage_event(
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
+    provider_key_id: &str,
     status_code: u16,
     elapsed: Duration,
     prompt_tokens: u32,
@@ -448,11 +455,13 @@ fn emit_usage_event(
     //   - cache_status / cache_hit_saved_* — no caching on embeddings
     //   - ttft_ms — embeddings are not streamed
     //   - served_by_model / routing_* — embeddings don't run routing
-    //   - provider_kind / provider_featured / branded_provider /
-    //     pk_label / byo_label — per-PK telemetry attribution is wired
-    //     for chat completions only; tracked as a follow-up for the
-    //     non-chat handlers (see #226 follow-up issues).
-    let event = UsageEvent {
+    //
+    // The per-PK attribution tags (provider_kind / provider_featured /
+    // branded_provider / pk_label / byo_label) ARE populated — same lookup as
+    // chat / messages / responses (AISIX-Cloud#867 parity) via
+    // `usage_attr::apply_pk_telemetry` below.
+    let snap = state.snapshot.load();
+    let mut event = UsageEvent {
         request_id: request_id.to_string(),
         // RFC 3339 UTC. cp-api parses with time.Parse(time.RFC3339, ...);
         // chrono's `to_rfc3339_opts(Secs, true)` emits the trailing Z.
@@ -468,12 +477,12 @@ fn emit_usage_event(
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
+    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
     // Handler label "embeddings" — bucketed prometheus counter (#408).
     state.usage_sink.try_emit("embeddings", event.clone());
     // Per-env OTLP/HTTP fan-out — same shape as chat.rs:1334. The
     // snapshot's exporter table is empty for envs that haven't
     // configured any, so this is a cheap no-op on the common path.
-    let snap = state.snapshot.load();
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
@@ -529,6 +538,24 @@ mod tests {
     fn new_snap(api_base: &str) -> AisixSnapshot {
         let snap = AisixSnapshot::new();
         snap.provider_keys.insert(provider_key_entry(api_base));
+        snap
+    }
+
+    /// A PK carrying per-PK telemetry attribution tags (AISIX-Cloud#867
+    /// parity) so emitted UsageEvents can be asserted to surface the upstream
+    /// vendor + PK label the dashboard's Logs detail shows.
+    fn provider_key_entry_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-embeddings-key"}}}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
+    fn new_snap_tagged(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry_tagged(api_base));
         snap
     }
 
@@ -1073,6 +1100,57 @@ mod tests {
             !event.occurred_at.is_empty(),
             "occurred_at must be set (RFC 3339 UTC)"
         );
+    }
+
+    /// AISIX-Cloud#867 parity: a successful /v1/embeddings 200 must carry the
+    /// resolved ProviderKey's telemetry attribution tags (provider_kind /
+    /// provider_featured / branded_provider / pk_label) — same lookup as
+    /// chat / messages / responses. Fails before the fix (empty tags), passes
+    /// after.
+    #[tokio::test]
+    async fn emits_provider_telemetry_tags_issue_867() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let upstream_body = serde_json::json!({
+            "object": "list",
+            "data": [{"object": "embedding", "index": 0, "embedding": [0.1_f32]}],
+            "model": "text-embedding-3-small",
+            "usage": {"prompt_tokens": 7, "total_tokens": 7}
+        });
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_tagged(&upstream.uri());
+        snap.models.insert(model_entry("my-embed"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({"model": "my-embed", "input": "hello"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for /v1/embeddings 200")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.provider_kind, "catalog");
+        assert!(event.provider_featured);
+        assert_eq!(event.branded_provider, "openai");
+        assert_eq!(event.pk_label, "prod-embeddings-key");
     }
 
     /// Issue #456 (#226 family): the 501 NotImplemented path (provider

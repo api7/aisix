@@ -42,6 +42,9 @@ struct CompletionDispatchSuccess {
     /// happened); the emit gate is `usage.is_some()`, not this
     /// field. Audit MEDIUM-1 on PR #426 clarified.
     model_id: String,
+    /// Resolved ProviderKey UUID — feeds per-PK telemetry attribution
+    /// (AISIX-Cloud#867 parity).
+    provider_key_id: String,
     /// Upstream-reported token counts. `None` on the 501
     /// NotImplemented path (provider doesn't support completions)
     /// or on a 200 with no `usage` block (rare edge). Handler
@@ -113,6 +116,7 @@ pub async fn completions(
                     &success.model_id,
                     &model_name,
                     &api_key_id,
+                    &success.provider_key_id,
                     status,
                     elapsed,
                     &usage,
@@ -254,6 +258,7 @@ async fn dispatch(
                 response: Json(resp_json).into_response(),
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
+                provider_key_id: pk_entry.id.to_string(),
                 usage,
             })
         }
@@ -263,6 +268,7 @@ async fn dispatch(
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
+                provider_key_id: pk_entry.id.to_string(),
                 // No upstream call → no usage to attribute. Handler
                 // gates emission on `usage.is_some()` so 501 stays
                 // out of /logs noise (same convention as #402).
@@ -310,11 +316,11 @@ fn extract_completion_usage(body: &Value) -> Option<CompletionUsage> {
 /// (#404); the legacy /v1/completions endpoint has both prompt and
 /// completion sides but no streaming / reasoning tokens.
 ///
-/// `inbound_protocol = "openai"` per chat.rs convention. Per-PK
-/// telemetry attribution (`provider_kind` / `branded_provider` /
-/// `pk_label` / `byo_label`) intentionally deferred — wired for
-/// chat only today; non-chat handlers gain it via the same
-/// follow-up that covers #403-#407.
+/// `inbound_protocol = "openai"` per chat.rs convention. The per-PK
+/// attribution tags (`provider_kind` / `provider_featured` /
+/// `branded_provider` / `pk_label` / `byo_label`) ARE populated — same
+/// lookup as chat / messages / responses / embeddings (AISIX-Cloud#867
+/// parity) via `usage_attr::apply_pk_telemetry` below.
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
@@ -322,12 +328,14 @@ fn emit_usage_event(
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
+    provider_key_id: &str,
     status_code: u16,
     elapsed: Duration,
     usage: &CompletionUsage,
     client: &ClientContext,
 ) {
-    let event = UsageEvent {
+    let snap = state.snapshot.load();
+    let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
@@ -342,8 +350,8 @@ fn emit_usage_event(
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
+    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
     state.usage_sink.try_emit("completions", event.clone());
-    let snap = state.snapshot.load();
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
@@ -422,6 +430,17 @@ mod tests {
     fn provider_key_entry(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
         let json = format!(
             r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai"}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
+    /// Same PK as `provider_key_entry` (reuses `PK_ID` so existing model
+    /// fixtures resolve to it) but carries `telemetry_tags` so the emitted
+    /// UsageEvent picks up the per-PK attribution fields (AISIX-Cloud#867).
+    fn provider_key_entry_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-completions-key"}}}}"#
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(PK_ID, pk, 1)
@@ -967,5 +986,60 @@ mod tests {
                 ev.prompt_tokens,
             );
         }
+    }
+
+    /// AISIX-Cloud#867 parity: a successful /v1/completions 200 must stamp
+    /// the five per-PK telemetry attribution fields (provider_kind /
+    /// provider_featured / branded_provider / pk_label / byo_label) onto the
+    /// emitted UsageEvent, sourced from the resolved ProviderKey's
+    /// `telemetry_tags` — exactly like `/v1/responses` and `/v1/embeddings`.
+    /// Pre-fix the completions emitter left these at Default (wire NULL).
+    #[tokio::test]
+    async fn emits_provider_telemetry_tags_issue_867() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let upstream_body = serde_json::json!({
+            "id": "cmpl-up-1",
+            "object": "text_completion",
+            "model": "gpt-3.5-turbo-instruct",
+            "choices": [{"text": "hi", "index": 0, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+        });
+        Mock::given(method("POST"))
+            .and(path("/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry_tagged(&upstream.uri()));
+        snap.models.insert(model_entry("instruct"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({"model": "instruct", "prompt": "hello"});
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for /v1/completions 200")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.provider_kind, "catalog");
+        assert!(ev.provider_featured);
+        assert_eq!(ev.branded_provider, "openai");
+        assert_eq!(ev.pk_label, "prod-completions-key");
     }
 }

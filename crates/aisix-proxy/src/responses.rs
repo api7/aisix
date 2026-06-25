@@ -33,6 +33,7 @@ use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::request_id::new_request_id;
 use crate::state::ProxyState;
+use crate::usage_attr::provider_telemetry_tags;
 
 /// Per-request payload from a successful dispatch — carries the
 /// response + provider label + the bits of usage data needed for
@@ -1586,24 +1587,6 @@ fn apply_passthrough_headers(
             .headers_mut()
             .insert(HeaderName::from_static("x-aisix-request-id"), hv);
     }
-}
-
-/// Resolve the per-PK telemetry attribution tags for an emitted event from
-/// the live snapshot (AISIX-Cloud#867). Mirrors the `/v1/messages` /
-/// `/v1/chat/completions` lookup: an empty `provider_key_id` (pre-dispatch
-/// error path) or an unknown id yields the default (all-empty) tags, which
-/// serialise to wire NULL.
-fn provider_telemetry_tags(
-    snap: &aisix_core::AisixSnapshot,
-    provider_key_id: &str,
-) -> aisix_core::TelemetryTags {
-    if provider_key_id.is_empty() {
-        return Default::default();
-    }
-    snap.provider_keys
-        .get_by_id(provider_key_id)
-        .map(|e| e.value.telemetry_tags.clone())
-        .unwrap_or_default()
 }
 
 /// Issue #404: push one `UsageEvent` onto cp-api's telemetry sink

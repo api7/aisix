@@ -34,6 +34,9 @@ struct ImageDispatchSuccess {
     /// UUID of the resolved Model row — required for UsageEvent
     /// `model_id`. Always present on success.
     model_id: String,
+    /// Resolved ProviderKey UUID — feeds per-PK telemetry attribution
+    /// (AISIX-Cloud#867 parity).
+    provider_key_id: String,
     /// `(prompt_tokens, completion_tokens)` from the upstream `usage`
     /// block when the model returns one (gpt-image-1). `None` for
     /// models that don't (dall-e-3) — those still emit a zero-token
@@ -96,6 +99,7 @@ pub async fn image_generations(
                     &success.model_id,
                     &model_name,
                     &api_key_id,
+                    &success.provider_key_id,
                     200,
                     elapsed,
                     prompt_tokens,
@@ -247,6 +251,7 @@ async fn dispatch(
                 response: Json(resp_json).into_response(),
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
+                provider_key_id: pk_entry.id.to_string(),
                 usage,
                 upstream_called: true,
             })
@@ -257,6 +262,7 @@ async fn dispatch(
                 response: (StatusCode::NOT_IMPLEMENTED, Json(env)).into_response(),
                 provider: provider_label,
                 model_id: model_entry.id.to_string(),
+                provider_key_id: pk_entry.id.to_string(),
                 usage: None,
                 // No upstream call happened → handler skips emit.
                 upstream_called: false,
@@ -288,6 +294,11 @@ fn extract_token_usage(body: &Value) -> Option<(u32, u32)> {
 /// upstream returned a `usage` block (gpt-image-1); zero otherwise —
 /// the per-image cost basis (n × size × quality) is a cross-repo
 /// follow-up needing a UsageEvent wire extension + cp-api pricing.
+///
+/// The per-PK attribution tags (provider_kind / provider_featured /
+/// branded_provider / pk_label / byo_label) are populated from the
+/// resolved ProviderKey — same lookup as chat / messages / responses /
+/// embeddings (AISIX-Cloud#867 parity) via `usage_attr::apply_pk_telemetry`.
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
@@ -295,13 +306,15 @@ fn emit_usage_event(
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
+    provider_key_id: &str,
     status_code: u16,
     elapsed: Duration,
     prompt_tokens: u32,
     completion_tokens: u32,
     client: &ClientContext,
 ) {
-    let event = UsageEvent {
+    let snap = state.snapshot.load();
+    let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
@@ -316,9 +329,9 @@ fn emit_usage_event(
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
+    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
     // Handler label "images" — bucketed prometheus counter (#408).
     state.usage_sink.try_emit("images", event.clone());
-    let snap = state.snapshot.load();
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
@@ -412,9 +425,27 @@ mod tests {
         ResourceEntry::new(PK_ID, pk, 1)
     }
 
+    /// AISIX-Cloud#867: same openai PK as `provider_key_entry` but carrying
+    /// `telemetry_tags`, so the emitted UsageEvent gets the per-PK
+    /// attribution fields stamped via `usage_attr::apply_pk_telemetry`.
+    fn provider_key_entry_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-images-key"}}}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
     fn new_snap(api_base: &str) -> AisixSnapshot {
         let snap = AisixSnapshot::new();
         snap.provider_keys.insert(provider_key_entry(api_base));
+        snap
+    }
+
+    fn new_snap_tagged(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry_tagged(api_base));
         snap
     }
 
@@ -829,5 +860,55 @@ mod tests {
                 ev.prompt_tokens, ev.status_code,
             );
         }
+    }
+
+    /// AISIX-Cloud#867 parity: a successful /v1/images/generations 200 must
+    /// stamp the per-PK telemetry attribution fields (provider_kind /
+    /// provider_featured / branded_provider / pk_label) on the emitted
+    /// UsageEvent, sourced from the resolved ProviderKey's `telemetry_tags`
+    /// — exactly like /v1/chat/completions, /v1/messages, /v1/responses, and
+    /// /v1/embeddings. Pre-fix these five fields were left at Default, so
+    /// image-generation spend showed up unattributed in cp-api analytics.
+    #[tokio::test]
+    async fn emits_provider_telemetry_tags_issue_867() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/images/generations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_response()))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_tagged(&upstream.uri());
+        snap.models.insert(model_entry("dall-e"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let req = serde_json::json!({"model": "dall-e", "prompt": "a cat", "n": 1});
+        let resp = tower::ServiceExt::oneshot(app, make_req(req))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for /v1/images/generations 200")
+            .expect("usage_sink sender dropped");
+        assert_eq!(
+            ev.provider_kind, "catalog",
+            "provider_kind must mirror the resolved PK's telemetry_tags.kind"
+        );
+        assert!(
+            ev.provider_featured,
+            "provider_featured must mirror telemetry_tags.featured"
+        );
+        assert_eq!(
+            ev.branded_provider, "openai",
+            "branded_provider must mirror telemetry_tags.branded_provider"
+        );
+        assert_eq!(
+            ev.pk_label, "prod-images-key",
+            "pk_label must mirror telemetry_tags.pk_label"
+        );
     }
 }

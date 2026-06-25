@@ -42,6 +42,9 @@ struct AudioDispatchSuccess {
     model_name: String,
     provider: String,
     model_id: String,
+    /// Resolved ProviderKey UUID — feeds the per-PK telemetry attribution
+    /// tags on the emitted UsageEvent (AISIX-Cloud#867 parity).
+    provider_key_id: String,
     /// `(prompt_tokens, completion_tokens)` from the upstream `usage`
     /// block when the model returns one (gpt-4o-transcribe). `None` for
     /// whisper-1 (no usage block) — those still emit a zero-token event
@@ -215,7 +218,7 @@ pub async fn speech(
         .to_string();
 
     match speech_dispatch(&state, &auth, body, &request_id, &client.source_ip).await {
-        Ok((resp, provider, model_id)) => {
+        Ok((resp, provider, model_id, provider_key_id)) => {
             let elapsed = started.elapsed();
             emit_access_log(
                 "POST",
@@ -245,6 +248,7 @@ pub async fn speech(
                 &model_id,
                 &model_name,
                 &api_key_id,
+                &provider_key_id,
                 200,
                 elapsed,
                 0,
@@ -444,6 +448,7 @@ async fn multipart_dispatch(
         model_name,
         provider: provider_label,
         model_id: model_entry.id.to_string(),
+        provider_key_id: pk_entry.id.to_string(),
         usage,
     })
 }
@@ -467,7 +472,7 @@ async fn speech_dispatch(
     mut body: Value,
     request_id: &str,
     source_ip: &str,
-) -> Result<(Response, String, String), ProxyError> {
+) -> Result<(Response, String, String, String), ProxyError> {
     let model_name = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -594,7 +599,12 @@ async fn speech_dispatch(
 
     let mut out = axum::response::Response::new(axum::body::Body::from(body_bytes));
     copy_response_header(&upstream_headers, &mut out, header::CONTENT_TYPE);
-    Ok((out, provider_label, model_entry.id.to_string()))
+    Ok((
+        out,
+        provider_label,
+        model_entry.id.to_string(),
+        pk_entry.id.to_string(),
+    ))
 }
 
 /// Pull `(prompt_tokens, completion_tokens)` from an audio response
@@ -631,6 +641,7 @@ fn emit_audio_usage(
         &success.model_id,
         &success.model_name,
         api_key_id,
+        &success.provider_key_id,
         200,
         elapsed,
         prompt_tokens,
@@ -653,13 +664,15 @@ fn emit_usage_event(
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
+    provider_key_id: &str,
     status_code: u16,
     elapsed: Duration,
     prompt_tokens: u32,
     completion_tokens: u32,
     client: &ClientContext,
 ) {
-    let event = UsageEvent {
+    let snap = state.snapshot.load();
+    let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
@@ -674,9 +687,11 @@ fn emit_usage_event(
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
+    // Per-PK telemetry attribution, same lookup as chat / messages /
+    // responses (AISIX-Cloud#867 parity).
+    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
     // Handler label "audio" — bucketed prometheus counter (#408).
     state.usage_sink.try_emit("audio", event.clone());
-    let snap = state.snapshot.load();
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
@@ -783,6 +798,23 @@ mod tests {
     fn new_snap(api_base: &str) -> AisixSnapshot {
         let snap = AisixSnapshot::new();
         snap.provider_keys.insert(provider_key_entry(api_base));
+        snap
+    }
+
+    /// A PK carrying per-PK telemetry attribution tags (AISIX-Cloud#867
+    /// parity) for asserting they land on the emitted UsageEvent.
+    fn provider_key_entry_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-up","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-audio-key"}}}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
+    fn new_snap_tagged(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry_tagged(api_base));
         snap
     }
 
@@ -1070,6 +1102,50 @@ mod tests {
         assert_eq!(event.api_key_id, "k-1");
         assert_eq!(event.model_id, "m-1");
         assert_eq!(event.inbound_protocol, "openai");
+    }
+
+    /// AISIX-Cloud#867 parity: a successful audio request must carry the
+    /// resolved ProviderKey's telemetry attribution tags (provider_kind /
+    /// provider_featured / branded_provider / pk_label) — same lookup as
+    /// chat / messages / responses. Fails before the fix (empty tags).
+    #[tokio::test]
+    async fn emits_provider_telemetry_tags_issue_867() {
+        let upstream = MockServer::start().await;
+        let body = serde_json::json!({
+            "text": "hello world",
+            "usage": {"type": "tokens", "input_tokens": 9, "output_tokens": 2, "total_tokens": 11}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_tagged(&upstream.uri());
+        snap.models.insert(whisper_model("my-transcribe"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let app = build_app_with_sink(snap, tx);
+        let (ct, body) = transcription_multipart("my-transcribe");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/audio/transcriptions")
+            .header("authorization", "Bearer sk-caller")
+            .header("content-type", ct)
+            .body(body)
+            .unwrap();
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for /v1/audio/transcriptions 200")
+            .expect("usage_sink sender dropped");
+        assert_eq!(event.provider_kind, "catalog");
+        assert!(event.provider_featured);
+        assert_eq!(event.branded_provider, "openai");
+        assert_eq!(event.pk_label, "prod-audio-key");
     }
 
     /// Issue #406: whisper-1 `{"text":"..."}` has no `usage` block —

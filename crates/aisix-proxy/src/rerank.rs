@@ -32,6 +32,9 @@ struct RerankDispatchSuccess {
     /// UUID of the resolved Model row — required for UsageEvent
     /// `model_id`. Always present on success.
     model_id: String,
+    /// Resolved ProviderKey UUID — feeds per-PK telemetry attribution
+    /// (AISIX-Cloud#867 parity).
+    provider_key_id: String,
     /// Upstream-reported token count. `None` on a 200 with no
     /// recognisable usage field (provider returned malformed body,
     /// or a wire shape this gateway doesn't yet support). Handler
@@ -101,6 +104,7 @@ pub async fn rerank(
                     &success.model_id,
                     &model_name,
                     &api_key_id,
+                    &success.provider_key_id,
                     status,
                     elapsed,
                     &usage,
@@ -395,6 +399,7 @@ async fn dispatch(
         response: resp,
         provider: provider_label,
         model_id: model_entry.id.to_string(),
+        provider_key_id: pk_entry.id.to_string(),
         usage,
     })
 }
@@ -450,12 +455,14 @@ fn emit_usage_event(
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
+    provider_key_id: &str,
     status_code: u16,
     elapsed: Duration,
     usage: &RerankUsage,
     client: &ClientContext,
 ) {
-    let event = UsageEvent {
+    let snap = state.snapshot.load();
+    let mut event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         model_id: model_id.to_string(),
@@ -469,8 +476,11 @@ fn emit_usage_event(
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
+    // Per-PK attribution tags (provider_kind / provider_featured /
+    // branded_provider / pk_label / byo_label) ARE populated — same lookup as
+    // chat / messages / responses / embeddings (AISIX-Cloud#867 parity).
+    crate::usage_attr::apply_pk_telemetry(&mut event, &snap, provider_key_id);
     state.usage_sink.try_emit("rerank", event.clone());
-    let snap = state.snapshot.load();
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
@@ -600,6 +610,25 @@ mod tests {
     fn new_snap(api_base: &str) -> AisixSnapshot {
         let snap = AisixSnapshot::new();
         snap.provider_keys.insert(provider_key_entry(api_base));
+        snap
+    }
+
+    /// An OpenAI PK carrying per-PK telemetry attribution tags
+    /// (AISIX-Cloud#867) so an emitted /v1/rerank UsageEvent can be asserted
+    /// to surface the upstream vendor + PK label the dashboard's Logs detail
+    /// shows. Reuses `PK_ID` so the rerank model fixtures still reference it.
+    fn provider_key_entry_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-rerank-key"}}}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(PK_ID, pk, 1)
+    }
+
+    fn new_snap_tagged(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry_tagged(api_base));
         snap
     }
 
@@ -1323,5 +1352,76 @@ mod tests {
                 ev.status_code,
             );
         }
+    }
+
+    /// AISIX-Cloud#867 parity: a successful /v1/rerank 200 must stamp the
+    /// five per-PK telemetry attribution fields (provider_kind /
+    /// provider_featured / branded_provider / pk_label) from the resolved
+    /// ProviderKey's `telemetry_tags` — exactly like /v1/chat/completions,
+    /// /v1/messages, /v1/responses, and /v1/embeddings. Pre-fix the rerank
+    /// handler left these at Default (wire NULL), so the dashboard's Logs
+    /// detail couldn't show the upstream vendor + PK label for rerank spend.
+    #[tokio::test]
+    async fn emits_provider_telemetry_tags_issue_867() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        // OpenAI-compat rerank: `usage.prompt_tokens` so the handler reaches
+        // the emit path (emission is gated on a recognisable usage field).
+        let upstream_body = serde_json::json!({
+            "id": "rerank-tagged",
+            "results": [{"index": 0, "relevance_score": 0.9}],
+            "model": "rerank-multilingual-v3.0",
+            "usage": {"prompt_tokens": 12, "total_tokens": 12}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/rerank"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_tagged(&upstream.uri());
+        snap.models.insert(openai_model("rerank-openai"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let body = serde_json::json!({
+            "model": "rerank-openai",
+            "query": "what is the capital of France?",
+            "documents": ["Paris", "London", "Berlin"]
+        });
+        let resp = tower::ServiceExt::oneshot(app, make_req(body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for /v1/rerank 200")
+            .expect("usage_sink sender dropped");
+        assert_eq!(
+            ev.provider_kind, "catalog",
+            "provider_kind must mirror the resolved PK's telemetry_tags.kind",
+        );
+        assert!(
+            ev.provider_featured,
+            "provider_featured must mirror telemetry_tags.featured",
+        );
+        assert_eq!(
+            ev.branded_provider, "openai",
+            "branded_provider must mirror telemetry_tags.branded_provider",
+        );
+        assert_eq!(
+            ev.pk_label, "prod-rerank-key",
+            "pk_label must mirror telemetry_tags.pk_label",
+        );
     }
 }
