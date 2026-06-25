@@ -28,6 +28,7 @@ use crate::attempt::{
     attempt_error_from_proxy, ms_since, AttemptInfo, AttemptRecord, RoutingTelemetry,
 };
 use crate::auth::AuthenticatedKey;
+use crate::chat::sanitize_tag;
 use crate::client_ip::ClientContext;
 use crate::error::ProxyError;
 use crate::request_id::new_request_id;
@@ -50,6 +51,11 @@ struct ResponseDispatchSuccess {
     /// UUID of the resolved Model row — needed for UsageEvent
     /// `model_id` field. Always present on success.
     model_id: String,
+    /// UUID of the resolved ProviderKey for the winning target — feeds the
+    /// per-PK telemetry attribution tags (provider_kind / branded_provider /
+    /// pk_label / …) on the emitted UsageEvent (AISIX-Cloud#867). Empty when
+    /// the target carried no provider_key_id.
+    provider_key_id: String,
     /// Per-attempt routing telemetry (#655): the failed attempts that
     /// preceded the winner plus the winning attempt itself.
     routing: RoutingTelemetry,
@@ -187,6 +193,7 @@ pub async fn responses(
                         &success.model_id,
                         &model_name,
                         &api_key_id,
+                        &success.provider_key_id,
                         status,
                         elapsed,
                         &usage,
@@ -238,6 +245,8 @@ pub async fn responses(
                     "",
                     &model_name,
                     &api_key_id,
+                    // Pre-dispatch failure resolved no provider key → wire NULL.
+                    "",
                     status,
                     elapsed,
                     &client,
@@ -372,6 +381,11 @@ async fn dispatch(
             String::new()
         };
         let attempt_started = Instant::now();
+        // Resolved ProviderKey UUID for this target — feeds the per-PK
+        // telemetry attribution tags on the emitted UsageEvent
+        // (AISIX-Cloud#867). Recorded on the AttemptRecord (success + failure)
+        // so both the winner and each failed-attempt event can attribute it.
+        let pk_id = target.model.provider_key_id.clone().unwrap_or_default();
         // Winning-attempt classification (#655) for the streaming path's
         // end-of-stream UsageEvent. The non-streaming / buffered paths emit
         // from the handler and ignore it.
@@ -421,7 +435,7 @@ async fn dispatch(
                     kind,
                     target_model,
                     target_model_id: target.id.clone(),
-                    provider_key_id: String::new(),
+                    provider_key_id: pk_id,
                     status: success.response.status().as_u16(),
                     success: true,
                     error_class: String::new(),
@@ -442,7 +456,7 @@ async fn dispatch(
                     kind,
                     target_model,
                     target_model_id: target.id.clone(),
-                    provider_key_id: String::new(),
+                    provider_key_id: pk_id,
                     status: e.status().as_u16(),
                     success: false,
                     error_class,
@@ -584,6 +598,9 @@ async fn responses_to_target(
 ) -> Result<ResponseDispatchSuccess, ProxyError> {
     let mut body = body.clone();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
+    // Resolved PK id for per-PK telemetry attribution on the emitted
+    // UsageEvent (AISIX-Cloud#867).
+    let provider_key_id = pk_entry.id.clone();
     let api_key = crate::dispatch::require_secret(&pk_entry.value, model)?.to_string();
     let upstream_model = crate::dispatch::require_upstream_model(model)?.to_string();
 
@@ -795,6 +812,7 @@ async fn responses_to_target(
                 provider: provider_label,
                 usage,
                 model_id: model_id.to_string(),
+                provider_key_id: provider_key_id.clone(),
                 routing: RoutingTelemetry::default(),
                 guardrail_blocked: false,
                 usage_handled_by_stream: false,
@@ -861,6 +879,7 @@ async fn responses_to_target(
         let model_id_c = model_id.to_string();
         let requested_model_c = requested_model.to_string();
         let api_key_id_c = api_key_id.to_string();
+        let provider_key_id_c = provider_key_id.clone();
         let client_c = client_ctx.clone();
         let parsed_stream = build_responses_passthrough_stream(body_stream, move |usage| {
             // Streams that reach here are committed 200s — the
@@ -871,6 +890,7 @@ async fn responses_to_target(
                 &model_id_c,
                 &requested_model_c,
                 &api_key_id_c,
+                &provider_key_id_c,
                 200,
                 started.elapsed(),
                 &usage,
@@ -889,6 +909,7 @@ async fn responses_to_target(
             // The Drop guard owns the emit; the handler must not double-emit.
             usage: None,
             model_id: model_id.to_string(),
+            provider_key_id,
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
             usage_handled_by_stream: true,
@@ -945,6 +966,7 @@ async fn responses_to_target(
                     provider: provider_label,
                     usage,
                     model_id: model_id.to_string(),
+                    provider_key_id: provider_key_id.clone(),
                     routing: RoutingTelemetry::default(),
                     guardrail_blocked: true,
                     usage_handled_by_stream: false,
@@ -957,6 +979,7 @@ async fn responses_to_target(
             provider: provider_label,
             usage,
             model_id: model_id.to_string(),
+            provider_key_id,
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
             usage_handled_by_stream: false,
@@ -995,6 +1018,9 @@ async fn responses_cross_provider_to_target(
         })?
         .to_string();
     let pk_entry = crate::dispatch::resolve_provider_key(snapshot, model)?;
+    // Resolved PK id for per-PK telemetry attribution on the emitted
+    // UsageEvent (AISIX-Cloud#867).
+    let provider_key_id = pk_entry.id.clone();
     let bridge: Arc<dyn Bridge> = crate::dispatch::resolve_bridge(&state.hub, &pk_entry.value)
         .ok_or(ProxyError::ProviderUnavailable)?;
 
@@ -1094,6 +1120,7 @@ async fn responses_cross_provider_to_target(
         let model_id_c = model_id.to_string();
         let requested_model_c = requested_model.to_string();
         let api_key_id_c = api_key_id.to_string();
+        let provider_key_id_c = provider_key_id.clone();
         let client_c = client_ctx.clone();
         let attempt_c = attempt.clone();
         let sse_body = crate::responses_bridge::build_responses_bridge_stream(
@@ -1123,6 +1150,7 @@ async fn responses_cross_provider_to_target(
                     &model_id_c,
                     &requested_model_c,
                     &api_key_id_c,
+                    &provider_key_id_c,
                     status,
                     started.elapsed(),
                     &usage,
@@ -1151,6 +1179,7 @@ async fn responses_cross_provider_to_target(
             provider: provider_label,
             usage: None,
             model_id: model_id.to_string(),
+            provider_key_id,
             routing: RoutingTelemetry::default(),
             guardrail_blocked: false,
             usage_handled_by_stream: true,
@@ -1204,6 +1233,7 @@ async fn responses_cross_provider_to_target(
                 provider: provider_label,
                 usage: Some(usage),
                 model_id: model_id.to_string(),
+                provider_key_id: provider_key_id.clone(),
                 routing: RoutingTelemetry::default(),
                 guardrail_blocked: true,
                 usage_handled_by_stream: false,
@@ -1228,6 +1258,7 @@ async fn responses_cross_provider_to_target(
         provider: provider_label,
         usage: Some(usage),
         model_id: model_id.to_string(),
+        provider_key_id,
         routing: RoutingTelemetry::default(),
         guardrail_blocked: false,
         usage_handled_by_stream: false,
@@ -1557,6 +1588,24 @@ fn apply_passthrough_headers(
     }
 }
 
+/// Resolve the per-PK telemetry attribution tags for an emitted event from
+/// the live snapshot (AISIX-Cloud#867). Mirrors the `/v1/messages` /
+/// `/v1/chat/completions` lookup: an empty `provider_key_id` (pre-dispatch
+/// error path) or an unknown id yields the default (all-empty) tags, which
+/// serialise to wire NULL.
+fn provider_telemetry_tags(
+    snap: &aisix_core::AisixSnapshot,
+    provider_key_id: &str,
+) -> aisix_core::TelemetryTags {
+    if provider_key_id.is_empty() {
+        return Default::default();
+    }
+    snap.provider_keys
+        .get_by_id(provider_key_id)
+        .map(|e| e.value.telemetry_tags.clone())
+        .unwrap_or_default()
+}
+
 /// Issue #404: push one `UsageEvent` onto cp-api's telemetry sink
 /// and fan it out to per-env OTLP exporters. Mirrors the shape of
 /// `embeddings::emit_usage_event` (#402) for the fields that matter
@@ -1574,9 +1623,13 @@ fn apply_passthrough_headers(
 ///   - cache_status / cache_hit_* / ttft_ms — no caching/streaming
 ///     surface on Responses API non-streaming
 ///   - served_by_model / routing_* — Responses doesn't run routing
-///   - provider_kind / provider_featured / branded_provider /
-///     pk_label / byo_label — per-PK telemetry attribution wired
-///     for chat only today (same deferred gap as #402)
+///
+/// `provider_kind` / `provider_featured` / `branded_provider` / `pk_label` /
+/// `byo_label` are populated from the resolved target's ProviderKey
+/// `telemetry_tags` (AISIX-Cloud#867) — same lookup as `/v1/messages` and
+/// `/v1/chat/completions`, so Codex (`/v1/responses`) logs carry the upstream
+/// vendor + PK label the dashboard's Logs detail shows. Empty `provider_key_id`
+/// (pre-dispatch error) bypasses the lookup → wire NULL.
 #[allow(clippy::too_many_arguments)]
 fn emit_usage_event(
     state: &ProxyState,
@@ -1584,6 +1637,7 @@ fn emit_usage_event(
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
+    provider_key_id: &str,
     status_code: u16,
     elapsed: Duration,
     usage: &ResponseUsage,
@@ -1591,6 +1645,8 @@ fn emit_usage_event(
     attempt: AttemptInfo,
     guardrail_blocked: bool,
 ) {
+    let snap = state.snapshot.load();
+    let tags = provider_telemetry_tags(&snap, provider_key_id);
     let event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -1613,13 +1669,17 @@ fn emit_usage_event(
         attempt_model: attempt.model,
         error_class: attempt.error_class,
         error_message: attempt.error_message,
+        provider_kind: sanitize_tag(tags.kind.map(|k| k.as_str().to_owned()).unwrap_or_default()),
+        provider_featured: tags.featured,
+        branded_provider: sanitize_tag(tags.branded_provider.unwrap_or_default()),
+        pk_label: sanitize_tag(tags.pk_label.unwrap_or_default()),
+        byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         guardrail_blocked,
         ..Default::default()
     };
     state.usage_sink.try_emit("responses", event.clone());
-    let snap = state.snapshot.load();
     let exporters = snap.observability_exporters.entries();
     state
         .otlp_fan_out
@@ -1635,11 +1695,14 @@ fn emit_zero_token_event(
     model_id: &str,
     requested_model: &str,
     api_key_id: &str,
+    provider_key_id: &str,
     status_code: u16,
     elapsed: Duration,
     client: &ClientContext,
     attempt: AttemptInfo,
 ) {
+    let snap = state.snapshot.load();
+    let tags = provider_telemetry_tags(&snap, provider_key_id);
     let event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -1654,12 +1717,16 @@ fn emit_zero_token_event(
         attempt_model: attempt.model,
         error_class: attempt.error_class,
         error_message: attempt.error_message,
+        provider_kind: sanitize_tag(tags.kind.map(|k| k.as_str().to_owned()).unwrap_or_default()),
+        provider_featured: tags.featured,
+        branded_provider: sanitize_tag(tags.branded_provider.unwrap_or_default()),
+        pk_label: sanitize_tag(tags.pk_label.unwrap_or_default()),
+        byo_label: sanitize_tag(tags.byo_label.unwrap_or_default()),
         client_source_ip: client.source_ip.clone(),
         client_user_agent: client.user_agent.clone(),
         ..Default::default()
     };
     state.usage_sink.try_emit("responses", event.clone());
-    let snap = state.snapshot.load();
     let exporters = snap.observability_exporters.entries();
     state.otlp_fan_out.fan_out(
         &event,
@@ -1687,6 +1754,7 @@ fn emit_failed_attempts(
             &rec.target_model_id,
             requested_model,
             api_key_id,
+            &rec.provider_key_id,
             rec.status,
             Duration::from_millis(u64::from(rec.latency_ms)),
             client,
@@ -1785,6 +1853,23 @@ mod tests {
         );
         let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
         ResourceEntry::new(OPENAI_PK_ID, pk, 1)
+    }
+
+    /// An OpenAI PK carrying per-PK telemetry attribution tags
+    /// (AISIX-Cloud#867) so emitted UsageEvents can be asserted to surface the
+    /// upstream vendor + PK label the dashboard's Logs detail shows.
+    fn openai_pk_tagged(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
+        let json = format!(
+            r#"{{"display_name":"openai-up","secret":"sk-test","api_base":"{api_base}","provider":"openai","adapter":"openai","telemetry_tags":{{"kind":"catalog","featured":true,"branded_provider":"openai","pk_label":"prod-codex-key"}}}}"#
+        );
+        let pk: aisix_core::ProviderKey = serde_json::from_str(&json).unwrap();
+        ResourceEntry::new(OPENAI_PK_ID, pk, 1)
+    }
+
+    fn new_snap_openai_tagged(api_base: &str) -> AisixSnapshot {
+        let snap = AisixSnapshot::new();
+        snap.provider_keys.insert(openai_pk_tagged(api_base));
+        snap
     }
 
     fn anthropic_pk_at(api_base: &str) -> ResourceEntry<aisix_core::ProviderKey> {
@@ -3237,6 +3322,133 @@ data: [DONE]\n\n";
             rx.try_recv().is_err(),
             "exactly one UsageEvent for a single streamed request",
         );
+    }
+
+    /// AISIX-Cloud#867: a streaming `/v1/responses` 200 (every Codex request,
+    /// which always streams) MUST carry the resolved ProviderKey's telemetry
+    /// attribution tags — provider_kind / provider_featured / branded_provider
+    /// / pk_label — exactly like `/v1/messages` and `/v1/chat/completions`.
+    /// Pre-fix the responses handler left these at default, so Codex logs were
+    /// missing the upstream vendor + PK label that Claude-Code (Anthropic SDK)
+    /// logs show. Fails before the fix (empty tags), passes after.
+    #[tokio::test]
+    async fn streaming_path_emits_provider_telemetry_tags_issue_867() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let sse_body = "\
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":11,\"output_tokens\":7}}}\n\n\
+data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai_tagged(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hi",
+                "stream": true
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = to_bytes(resp.into_body(), 65536).await.unwrap();
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for a streaming 200")
+            .expect("usage event sender dropped");
+        assert_eq!(ev.status_code, 200);
+        assert_eq!(
+            ev.provider_kind, "catalog",
+            "provider_kind must mirror the resolved PK's telemetry_tags.kind",
+        );
+        assert!(
+            ev.provider_featured,
+            "provider_featured must mirror telemetry_tags.featured",
+        );
+        assert_eq!(
+            ev.branded_provider, "openai",
+            "branded_provider must mirror telemetry_tags.branded_provider",
+        );
+        assert_eq!(
+            ev.pk_label, "prod-codex-key",
+            "pk_label must mirror telemetry_tags.pk_label",
+        );
+    }
+
+    /// AISIX-Cloud#867 (non-streaming sibling): the same per-PK telemetry
+    /// attribution must land on a non-streaming `/v1/responses` 200, which
+    /// emits from the handler via `ResponseDispatchSuccess.provider_key_id`
+    /// (a different threading path than the streaming Drop guard above).
+    #[tokio::test]
+    async fn non_streaming_emits_provider_telemetry_tags_issue_867() {
+        use aisix_obs::UsageSink;
+
+        let upstream = MockServer::start().await;
+        let upstream_body = serde_json::json!({
+            "id": "resp-abc",
+            "object": "response",
+            "output": [{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}],
+            "usage": {"input_tokens": 17, "output_tokens": 23}
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upstream_body))
+            .mount(&upstream)
+            .await;
+
+        let snap = new_snap_openai_tagged(&upstream.uri());
+        snap.models.insert(openai_model("gpt-4o-resp"));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let handle = SnapshotHandle::new(snap);
+        let state = crate::ProxyState::new(handle, hub, &cfg())
+            .without_cache()
+            .with_usage_sink(UsageSink::new(tx));
+        let app = crate::build_router(state);
+
+        let resp = app
+            .oneshot(make_req(serde_json::json!({
+                "model": "gpt-4o-resp",
+                "input": "hello"
+            })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("UsageEvent must be emitted for /v1/responses 200")
+            .expect("usage_sink sender dropped");
+        assert_eq!(ev.provider_kind, "catalog");
+        assert!(ev.provider_featured);
+        assert_eq!(ev.branded_provider, "openai");
+        assert_eq!(ev.pk_label, "prod-codex-key");
     }
 
     /// Per #655: a 5xx upstream now emits ONE zero-token UsageEvent for the
