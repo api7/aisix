@@ -65,15 +65,48 @@ pub struct ConfigStatus {
 
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
-    /// Fixed success marker for this response. Successful responses currently
-    /// always return "ok"; operators should use individual model health levels
-    /// and configuration freshness for actionable signal.
+    /// Aggregate health summary — `"ok"`, `"degraded"`, or `"unhealthy"`,
+    /// derived from per-model health (`models[].health`) and config
+    /// freshness (`config`). See [`aggregate_status`]. `models[].health`
+    /// and `config` remain the per-dimension detail.
     pub status: &'static str,
     pub models: Vec<ModelHealth>,
     /// Etcd watch supervisor freshness. Omitted when the supervisor
     /// isn't wired into AdminState.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config: Option<ConfigStatus>,
+}
+
+/// A snapshot older than this (or never applied) means the etcd watch is
+/// not delivering fresh config, so the gateway may be serving a frozen
+/// snapshot — reflected as `degraded` (#114, #618).
+const SNAPSHOT_STALE_SECS: u64 = 300;
+
+/// Aggregate the top-level `status` from per-model health and config
+/// freshness so a single glance reflects real state instead of a fixed
+/// `"ok"` marker (#618):
+///
+/// - `"unhealthy"` — at least one model is Down (health level 2).
+/// - `"degraded"` — at least one model is Degraded (level 1), or the
+///   config watch is stale / not yet applied.
+/// - `"ok"` — every model is Healthy and config is fresh (or the watch
+///   supervisor isn't wired, so freshness can't be assessed).
+fn aggregate_status(models: &[ModelHealth], config: Option<&ConfigStatus>) -> &'static str {
+    if models.iter().any(|m| m.health >= 2) {
+        return "unhealthy";
+    }
+    let degraded_model = models.iter().any(|m| m.health == 1);
+    let stale_config = match config {
+        Some(c) => match c.snapshot_age_seconds {
+            None => true,
+            Some(age) => age > SNAPSHOT_STALE_SECS,
+        },
+        None => false,
+    };
+    if degraded_model || stale_config {
+        return "degraded";
+    }
+    "ok"
 }
 
 pub async fn get_health(
@@ -113,8 +146,10 @@ pub async fn get_health(
         }
     });
 
+    let status = aggregate_status(&models, config.as_ref());
+
     Ok(Json(HealthResponse {
-        status: "ok",
+        status,
         models,
         config,
     }))
@@ -212,5 +247,69 @@ mod tests {
         // success resets
         t.record_success("m");
         assert_eq!(t.level("m"), aisix_proxy::health::HealthLevel::Healthy);
+    }
+
+    fn mh(health: u8) -> super::ModelHealth {
+        super::ModelHealth {
+            id: "id".into(),
+            name: "m".into(),
+            health,
+        }
+    }
+
+    fn cfg(age: Option<u64>) -> super::ConfigStatus {
+        super::ConfigStatus {
+            snapshot_revision: 1,
+            snapshot_age_seconds: age,
+        }
+    }
+
+    #[test]
+    fn aggregate_ok_when_all_healthy_and_fresh() {
+        let models = vec![mh(0), mh(0)];
+        assert_eq!(super::aggregate_status(&models, Some(&cfg(Some(5)))), "ok");
+    }
+
+    #[test]
+    fn aggregate_ok_when_watch_status_unwired() {
+        // No supervisor → freshness can't be assessed, base on models only.
+        let models = vec![mh(0)];
+        assert_eq!(super::aggregate_status(&models, None), "ok");
+    }
+
+    #[test]
+    fn aggregate_degraded_when_a_model_degraded() {
+        let models = vec![mh(0), mh(1)];
+        assert_eq!(
+            super::aggregate_status(&models, Some(&cfg(Some(5)))),
+            "degraded"
+        );
+    }
+
+    #[test]
+    fn aggregate_unhealthy_when_a_model_down_even_if_config_stale() {
+        let models = vec![mh(0), mh(2)];
+        assert_eq!(
+            super::aggregate_status(&models, Some(&cfg(Some(9999)))),
+            "unhealthy"
+        );
+    }
+
+    #[test]
+    fn aggregate_degraded_when_config_stale() {
+        let models = vec![mh(0)];
+        assert_eq!(
+            super::aggregate_status(&models, Some(&cfg(Some(super::SNAPSHOT_STALE_SECS + 1)))),
+            "degraded"
+        );
+    }
+
+    #[test]
+    fn aggregate_degraded_when_config_never_applied() {
+        let models = vec![mh(0)];
+        assert_eq!(
+            super::aggregate_status(&models, Some(&cfg(None))),
+            "degraded"
+        );
     }
 }

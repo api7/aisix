@@ -2991,9 +2991,11 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "status": {
             "type": "string",
             "enum": [
-              "ok"
+              "ok",
+              "degraded",
+              "unhealthy"
             ],
-            "description": "Fixed success marker for this response. Successful responses currently always return `ok`. This field does not summarize model health. Use `models[].health` and `config` for actionable health details.",
+            "description": "Aggregate health summary derived from per-model health and config freshness. `ok` = all models healthy and config fresh; `degraded` = at least one model degraded or the config watch is stale/not yet applied; `unhealthy` = at least one model is down. Use `models[].health` and `config` for the per-dimension detail.",
             "example": "ok"
           },
           "models": {
@@ -3929,7 +3931,7 @@ mod tests {
         );
         assert_eq!(
             schemas["HealthResponse"]["properties"]["status"]["description"],
-            "Fixed success marker for this response. Successful responses currently always return `ok`. This field does not summarize model health. Use `models[].health` and `config` for actionable health details."
+            "Aggregate health summary derived from per-model health and config freshness. `ok` = all models healthy and config fresh; `degraded` = at least one model degraded or the config watch is stale/not yet applied; `unhealthy` = at least one model is down. Use `models[].health` and `config` for the per-dimension detail."
         );
         assert_eq!(
             schemas["ObservabilityExporter"]["oneOf"][0]["properties"]["sample_rate"]["default"],
