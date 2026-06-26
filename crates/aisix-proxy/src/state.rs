@@ -138,6 +138,11 @@ pub struct ProxyState {
     /// client IP on each request (#492). Default = trust nothing → the
     /// logged source IP is the immediate TCP peer.
     pub real_ip: Arc<ResolvedRealIp>,
+    /// Optional config-freshness probe for `GET /readyz`: returns the time
+    /// since the etcd watch last applied config (`None` = never applied).
+    /// Wired from the watch supervisor in aisix-server; `None` here means
+    /// no freshness signal, so readiness gates on shutdown only (#591).
+    pub config_apply_age: Option<Arc<dyn Fn() -> Option<std::time::Duration> + Send + Sync>>,
 }
 
 impl ProxyState {
@@ -155,6 +160,7 @@ impl ProxyState {
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
+            config_apply_age: None,
             runtime_status: Arc::new(ModelRuntimeStatusTracker::new()),
             usage_sink: UsageSink::disabled(),
             otlp_fan_out: OtlpHttpFanOut::new(),
@@ -184,6 +190,7 @@ impl ProxyState {
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
+            config_apply_age: None,
             runtime_status: Arc::new(ModelRuntimeStatusTracker::new()),
             usage_sink: UsageSink::disabled(),
             otlp_fan_out: OtlpHttpFanOut::new(),
@@ -216,6 +223,7 @@ impl ProxyState {
             budgets: Arc::new(BudgetClient::disabled()),
             health: Arc::new(HealthTracker::new()),
             livez: Arc::new(LivezState::new()),
+            config_apply_age: None,
             runtime_status: Arc::new(ModelRuntimeStatusTracker::new()),
             usage_sink: UsageSink::disabled(),
             otlp_fan_out: OtlpHttpFanOut::new(),
@@ -251,6 +259,16 @@ impl ProxyState {
     /// the disabled (allow-all) client used in self-hosted dev.
     pub fn with_budget_client(mut self, client: Arc<BudgetClient>) -> Self {
         self.budgets = client;
+        self
+    }
+
+    /// Wire the config-freshness probe used by `GET /readyz` (#591). The
+    /// closure returns the time since the etcd watch last applied config.
+    pub fn with_config_apply_age(
+        mut self,
+        probe: Arc<dyn Fn() -> Option<std::time::Duration> + Send + Sync>,
+    ) -> Self {
+        self.config_apply_age = Some(probe);
         self
     }
 }

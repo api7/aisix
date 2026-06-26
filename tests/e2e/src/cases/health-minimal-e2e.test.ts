@@ -39,6 +39,33 @@ describe("livez e2e: public liveness route is /livez and /health is gone", () =>
     await adminHealth.body.dump();
   });
 
+  test("proxy and admin /readyz report ready once config is applied (#591)", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+
+    // Readiness gates on config freshness, so poll until the supervisor's
+    // first apply lands (a fresh spawn briefly reports 503 = starting up).
+    const deadline = Date.now() + 5000;
+    let proxyReady = false;
+    while (Date.now() < deadline) {
+      const r = await harnessRequest(`${app.proxyUrl}/readyz`, { method: "GET" });
+      const ok = r.statusCode === 200;
+      await r.body.dump();
+      if (ok) {
+        proxyReady = true;
+        break;
+      }
+      await new Promise((res) => setTimeout(res, 50));
+    }
+    expect(proxyReady).toBe(true);
+
+    const adminReadyz = await harnessRequest(`${app.adminUrl}/readyz`, { method: "GET" });
+    expect(adminReadyz.statusCode).toBe(200);
+    expect(await adminReadyz.body.text()).toBe("ok");
+  });
+
   test("proxy /livez turns unhealthy after SIGTERM before exit", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();

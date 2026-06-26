@@ -47,6 +47,31 @@ impl LivezState {
             Ok(())
         }
     }
+
+    /// Whether graceful shutdown has been signalled. Used by `/readyz` to
+    /// drain traffic before the process exits.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Relaxed)
+    }
+}
+
+/// A config snapshot older than this — or never applied — means the etcd
+/// watch isn't delivering fresh config, so the instance shouldn't be
+/// counted ready for traffic (#591). Matches the freshness threshold the
+/// admin health aggregate uses.
+pub const READYZ_STALE_AFTER: Duration = Duration::from_secs(300);
+
+/// Decide whether config freshness blocks readiness. `last_apply_age` is
+/// the time since the config watch last applied an event: `None` means no
+/// apply yet (still starting up / disconnected), `Some(age)` past the
+/// stale threshold means a wedged watch. Returns `Some(reason)` when the
+/// instance is not ready, `None` when config is fresh enough.
+pub fn config_readiness_block(last_apply_age: Option<Duration>) -> Option<&'static str> {
+    match last_apply_age {
+        None => Some("config not yet applied"),
+        Some(age) if age > READYZ_STALE_AFTER => Some("config watch is stale"),
+        Some(_) => None,
+    }
 }
 
 pub fn livez_response(livez: &LivezState, verbose: bool) -> Response {
@@ -68,8 +93,11 @@ pub fn livez_response(livez: &LivezState, verbose: bool) -> Response {
     ];
 
     if failed {
+        // Graceful shutdown is an expected drain, not an internal error —
+        // 503 so Kubernetes stops routing without treating it as a crash
+        // loop (#591).
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
             headers,
             format!("{body}livez check failed"),
         )
@@ -84,6 +112,62 @@ pub fn livez_response(livez: &LivezState, verbose: bool) -> Response {
         StatusCode::OK,
         headers,
         format!("{body}livez check passed\n"),
+    )
+        .into_response()
+}
+
+/// `GET /readyz` — readiness (traffic eligibility), distinct from `/livez`
+/// (process liveness). Returns 503 while draining (graceful shutdown) or
+/// while config isn't fresh (still starting up, or a wedged watch), so
+/// Kubernetes keeps the instance out of the Service endpoints until it can
+/// actually serve. `config_block` is the result of
+/// [`config_readiness_block`]; pass `None` when no freshness signal is
+/// wired (readiness then gates on shutdown only).
+pub fn readyz_response(
+    livez: &LivezState,
+    config_block: Option<&'static str>,
+    verbose: bool,
+) -> Response {
+    let mut body = String::new();
+    let mut failed = false;
+
+    match livez.shutdown_check() {
+        Ok(()) => body.push_str("[+]shutdown ok\n"),
+        Err(_) => {
+            failed = true;
+            body.push_str("[-]shutdown failed: draining\n");
+        }
+    }
+    match config_block {
+        None => body.push_str("[+]config ok\n"),
+        Some(_) => {
+            failed = true;
+            body.push_str("[-]config failed: not ready\n");
+        }
+    }
+
+    let headers = [
+        (CONTENT_TYPE, TEXT_PLAIN_UTF8.clone()),
+        (X_CONTENT_TYPE_OPTIONS.clone(), NOSNIFF.clone()),
+    ];
+
+    if failed {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            headers,
+            format!("{body}readyz check failed"),
+        )
+            .into_response();
+    }
+
+    if !verbose {
+        return (StatusCode::OK, headers, "ok").into_response();
+    }
+
+    (
+        StatusCode::OK,
+        headers,
+        format!("{body}readyz check passed\n"),
     )
         .into_response()
 }
@@ -477,16 +561,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn livez_failure_returns_500_with_reason_withheld() {
+    async fn livez_failure_returns_503_with_reason_withheld() {
         let state = LivezState::new();
         state.mark_shutting_down();
         let resp = livez_response(&state, false);
 
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = to_bytes(resp.into_body(), 1024).await.unwrap();
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("[-]shutdown failed: reason withheld"));
         assert!(text.contains("livez check failed"));
+    }
+
+    #[test]
+    fn config_readiness_block_logic() {
+        // No apply yet → not ready (startup).
+        assert!(config_readiness_block(None).is_some());
+        // Fresh apply → ready.
+        assert!(config_readiness_block(Some(Duration::from_secs(5))).is_none());
+        // Beyond the stale threshold → not ready (wedged watch).
+        assert!(
+            config_readiness_block(Some(READYZ_STALE_AFTER + Duration::from_secs(1))).is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn readyz_ok_when_not_draining_and_config_fresh() {
+        let state = LivezState::new();
+        let resp = readyz_response(&state, None, false);
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readyz_503_when_draining() {
+        let state = LivezState::new();
+        state.mark_shutting_down();
+        let resp = readyz_response(&state, None, false);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn readyz_503_when_config_not_ready() {
+        let state = LivezState::new();
+        let resp = readyz_response(&state, Some("config not yet applied"), true);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("[-]config failed"));
     }
 
     #[test]

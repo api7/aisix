@@ -68,8 +68,8 @@ const OPENAPI_JSON_BASE: &str = r##"{
               }
             }
           },
-          "500": {
-            "description": "Liveness checks failed during shutdown",
+          "503": {
+            "description": "Process is shutting down (graceful drain)",
             "content": {
               "text/plain": {
                 "schema": {
@@ -82,7 +82,51 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "tags": [
           "Health"
         ],
-        "description": "Get the liveness status of the admin process."
+        "description": "Process liveness: 200 while the process is alive, 503 once graceful shutdown has begun (an expected drain, not a crash). Use /readyz for traffic eligibility (readiness)."
+      }
+    },
+    "/readyz": {
+      "get": {
+        "summary": "Get Readiness Status",
+        "security": [],
+        "parameters": [
+          {
+            "name": "verbose",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "When present, returns a detailed multi-line text report instead of the short `ok` response.",
+            "example": "1"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Ready to receive traffic",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Not ready: shutting down (drain), still starting up, or the config watch is stale",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Health"
+        ],
+        "description": "Traffic eligibility (readiness): 200 when the instance can serve, 503 while draining, before the first config apply, or when the etcd config watch is stale. Distinct from /livez (process liveness)."
       }
     },
     "/admin/openapi.json": {
@@ -3671,6 +3715,7 @@ mod tests {
             .collect();
         let expected = BTreeSet::from([
             "/livez",
+            "/readyz",
             "/admin/openapi.json",
             "/admin/openapi-scalar",
             "/admin/v1/models",
@@ -4300,7 +4345,12 @@ mod tests {
             parsed["paths"]["/livez"]["get"]["parameters"][0]["name"],
             "verbose"
         );
-        assert!(parsed["paths"]["/livez"]["get"]["responses"]["500"].is_object());
+        // Graceful shutdown is documented as 503 (drain), not 500 (#591).
+        assert!(parsed["paths"]["/livez"]["get"]["responses"]["503"].is_object());
+        assert!(parsed["paths"]["/livez"]["get"]["responses"]["500"].is_null());
+        // /readyz is documented with 200 + 503 (readiness).
+        assert!(parsed["paths"]["/readyz"]["get"]["responses"]["200"].is_object());
+        assert!(parsed["paths"]["/readyz"]["get"]["responses"]["503"].is_object());
     }
 
     #[tokio::test]

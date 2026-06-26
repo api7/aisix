@@ -85,6 +85,7 @@ pub fn build_router(state: ProxyState) -> Router {
     let body_limit = state.request_body_limit_bytes;
     Router::new()
         .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
         .route("/v1/models", get(models::list_models))
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/v1/completions", post(completions::completions))
@@ -164,6 +165,7 @@ async fn record_in_flight_request(
 fn normalize_endpoint_label(path: &str) -> &'static str {
     match path {
         "/livez" => "/livez",
+        "/readyz" => "/readyz",
         "/v1/models" => "/v1/models",
         "/v1/chat/completions" => "/v1/chat/completions",
         "/v1/completions" => "/v1/completions",
@@ -325,6 +327,17 @@ async fn livez(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     crate::health::livez_response(&state.livez, params.contains_key("verbose"))
+}
+
+async fn readyz(
+    State(state): State<ProxyState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let config_block = state
+        .config_apply_age
+        .as_ref()
+        .and_then(|probe| crate::health::config_readiness_block(probe()));
+    crate::health::readyz_response(&state.livez, config_block, params.contains_key("verbose"))
 }
 
 #[cfg(test)]
@@ -823,7 +836,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn livez_returns_500_when_shutting_down() {
+    async fn livez_returns_503_when_shutting_down() {
         let hub = Arc::new(Hub::new());
         let snap = seed_snapshot("my-gpt4", &["my-gpt4"], "http://unused");
         let state = build_state(snap, hub);
@@ -837,7 +850,7 @@ mod tests {
             .unwrap();
 
         let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(text.contains("livez check failed"));

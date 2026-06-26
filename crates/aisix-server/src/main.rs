@@ -494,6 +494,12 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     let background_hub = hub.clone();
     let background_runtime_status_tracker = runtime_status_tracker.clone();
     let background_cancel_rx = cancel_rx.clone();
+    // Wire the config-freshness probe so the proxy's /readyz reflects etcd
+    // watch staleness (and pre-first-apply startup), not just shutdown (#591).
+    let readyz_watch_status = supervisor.watch_status();
+    proxy_state = proxy_state.with_config_apply_age(Arc::new(move || {
+        readyz_watch_status.snapshot().last_apply_age
+    }));
     let proxy_router = aisix_proxy::build_router(proxy_state);
 
     let background_check_task = tokio::spawn(async move {

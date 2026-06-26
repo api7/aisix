@@ -75,6 +75,7 @@ pub fn build_router(state: AdminState) -> Router {
 
     let router = Router::new()
         .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
         // OpenAPI scalar UI is unauthenticated like /livez — admin
         // listener is private in production.
         .route("/admin/openapi.json", get(openapi::openapi_json))
@@ -217,6 +218,21 @@ async fn livez(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     aisix_proxy::health::livez_response(&state.livez_state, params.contains_key("verbose"))
+}
+
+async fn readyz(
+    axum::extract::State(state): axum::extract::State<AdminState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let config_block = state
+        .watch_status
+        .as_ref()
+        .and_then(|ws| aisix_proxy::health::config_readiness_block(ws.snapshot().last_apply_age));
+    aisix_proxy::health::readyz_response(
+        &state.livez_state,
+        config_block,
+        params.contains_key("verbose"),
+    )
 }
 
 #[cfg(test)]
@@ -450,7 +466,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn livez_returns_500_when_shutting_down() {
+    async fn livez_returns_503_when_shutting_down() {
         let state = build_state();
         state.livez_state.mark_shutting_down();
         let app = build_router(state);
@@ -459,7 +475,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = run(app, req).await;
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(text.contains("livez check failed"));
