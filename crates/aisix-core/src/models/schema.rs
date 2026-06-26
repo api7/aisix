@@ -473,6 +473,25 @@ mod tests {
     }
 
     #[test]
+    fn model_rate_limit_accepts_all_request_windows_incl_rps_rph() {
+        // Regression for #644: the inline rate_limit schema is derived from the
+        // RateLimit struct (#638), so every request-count window — rps/rpm/rph/
+        // rpd — alongside the token windows and concurrency must be accepted,
+        // not just rpm/rpd/tpm/tpd/concurrency.
+        let v = json!({
+            "display_name": "my-gpt4",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "11111111-1111-1111-1111-111111111111",
+            "rate_limit": {
+                "rps": 10, "rpm": 100, "rph": 1000, "rpd": 10000,
+                "tpm": 100000, "tpd": 1000000, "concurrency": 5
+            }
+        });
+        validate_model(&v).unwrap();
+    }
+
+    #[test]
     fn model_ensemble_with_direct_fields_fails() {
         // ensemble is mutually exclusive with the direct upstream triple.
         let v = json!({
@@ -972,6 +991,19 @@ mod tests {
             "allowed_models":["gpt-4o"],
             "team_id": null,
             "user_id": null
+        });
+        validate_apikey(&v).unwrap();
+    }
+
+    #[test]
+    fn apikey_rate_limit_accepts_rps_and_rph() {
+        // Regression for #644: inline rate_limit on a caller API key must accept
+        // the per-second and per-hour request windows too, not only
+        // rpm/rpd/tpm/tpd/concurrency.
+        let v = json!({
+            "key_hash":"9df37f5e7cbc3c391d872742b5f286c242e733a09add9eeaa4d26a599bd90b20",
+            "allowed_models":["gpt-4o"],
+            "rate_limit": {"rps": 5, "rph": 500}
         });
         validate_apikey(&v).unwrap();
     }

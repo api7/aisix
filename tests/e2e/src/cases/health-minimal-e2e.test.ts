@@ -39,6 +39,28 @@ describe("livez e2e: public liveness route is /livez and /health is gone", () =>
     await adminHealth.body.dump();
   });
 
+  test("admin /admin/v1/health reports an aggregate status (#618)", async (ctx) => {
+    if (!etcdReachable || !app) {
+      ctx.skip();
+      return;
+    }
+
+    const res = await harnessRequest(`${app.adminUrl}/admin/v1/health`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${app.adminKey}` },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = (await res.body.json()) as { status: string; models: unknown[] };
+
+    // #618: the top-level status is now a real aggregate of model health +
+    // config freshness, not a fixed "ok" marker.
+    expect(["ok", "degraded", "unhealthy"]).toContain(body.status);
+    // A freshly spawned gateway has no upstream failures, so no model is
+    // down — it must never be "unhealthy".
+    expect(body.status).not.toBe("unhealthy");
+    expect(Array.isArray(body.models)).toBe(true);
+  });
+
   test("proxy and admin /readyz report ready once config is applied (#591)", async (ctx) => {
     if (!etcdReachable || !app) {
       ctx.skip();
