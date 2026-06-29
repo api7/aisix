@@ -9,6 +9,7 @@ authors.workspace = true
 description = "aisix: MCP gateway — upstream client + downstream-facing aggregating endpoint (Streamable HTTP)"
 
 [dependencies]
+aisix-core = { path = "../aisix-core" }
 tokio.workspace = true
 async-trait.workspace = true
 futures.workspace = true
@@ -44,6 +45,7 @@ features = [
 ]
 
 [dev-dependencies]
+aisix-core = { path = "../aisix-core" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 axum.workspace = true
 async-trait.workspace = true
