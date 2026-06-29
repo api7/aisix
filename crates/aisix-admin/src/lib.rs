@@ -41,6 +41,7 @@ mod error;
 pub mod etcd_store;
 mod guardrails_handlers;
 mod health_handler;
+mod mcp_servers_handlers;
 mod models_handlers;
 mod models_status_handler;
 mod observability_exporters_handlers;
@@ -118,6 +119,17 @@ pub fn build_router(state: AdminState) -> Router {
             get(provider_keys_handlers::get_provider_key)
                 .put(provider_keys_handlers::update_provider_key)
                 .delete(provider_keys_handlers::delete_provider_key),
+        )
+        .route(
+            "/admin/v1/mcp_servers",
+            get(mcp_servers_handlers::list_mcp_servers)
+                .post(mcp_servers_handlers::create_mcp_server),
+        )
+        .route(
+            "/admin/v1/mcp_servers/:id",
+            get(mcp_servers_handlers::get_mcp_server)
+                .put(mcp_servers_handlers::update_mcp_server)
+                .delete(mcp_servers_handlers::delete_mcp_server),
         )
         .route(
             "/admin/v1/guardrails",

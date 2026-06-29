@@ -30,6 +30,7 @@ pub struct Schemas {
     pub cache_policy: Validator,
     pub observability_exporter: Validator,
     pub rate_limit_policy: Validator,
+    pub mcp_server: Validator,
 }
 
 pub static SCHEMAS: Lazy<Arc<Schemas>> = Lazy::new(|| Arc::new(Schemas::compile()));
@@ -61,6 +62,9 @@ impl Schemas {
             rate_limit_policy: jsonschema::options()
                 .build(&rate_limit_policy_root_schema())
                 .expect("rate_limit_policy schema is well-formed"),
+            mcp_server: jsonschema::options()
+                .build(&mcp_server_root_schema())
+                .expect("mcp_server schema is well-formed"),
         }
     }
 }
@@ -117,6 +121,10 @@ pub fn validate_guardrail_attachment(value: &Value) -> Result<(), SchemaError> {
     validate(&SCHEMAS.guardrail_attachment, value)
 }
 
+pub fn validate_mcp_server(value: &Value) -> Result<(), SchemaError> {
+    validate(&SCHEMAS.mcp_server, value)
+}
+
 /// Build a resource's canonical JSON Schema from its struct via `schemars`,
 /// the single source of field shapes and per-field constraints.
 ///
@@ -171,6 +179,17 @@ pub fn apikey_root_schema() -> Value {
 /// keeping all optionals nullable matches the resource's wire contract.
 pub fn provider_key_root_schema() -> Value {
     struct_root_schema::<crate::models::ProviderKey>(true)
+}
+
+/// Canonical JSON Schema for the `mcp_server` resource, derived from the
+/// [`McpServer`](crate::models::McpServer) struct. Uses the nullable `Option`
+/// representation (`true`) so the optional `secret` / `timeout_ms` fields accept
+/// an explicit `null` as well as being absent, matching the resource's wire
+/// contract. The `transport` / `auth_type` closed sets come from the
+/// [`McpTransport`](crate::models::McpTransport) /
+/// [`McpAuthType`](crate::models::McpAuthType) enums.
+pub fn mcp_server_root_schema() -> Value {
+    struct_root_schema::<crate::models::McpServer>(true)
 }
 
 /// Canonical JSON Schema for the `guardrail` resource, derived from the

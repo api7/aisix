@@ -7,7 +7,9 @@
 //! in the handler layer so the store stays dumb and fast.
 
 use aisix_core::resource::ResourceEntry;
-use aisix_core::{ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter, ProviderKey};
+use aisix_core::{
+    ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter, ProviderKey,
+};
 use dashmap::DashMap;
 use std::sync::Arc;
 
@@ -65,6 +67,14 @@ pub trait ConfigStore: Send + Sync + 'static {
         &self,
     ) -> Result<Vec<ResourceEntry<ObservabilityExporter>>, StoreError>;
     async fn delete_observability_exporter(&self, id: &str) -> Result<bool, StoreError>;
+
+    async fn put_mcp_server(&self, entry: ResourceEntry<McpServer>) -> Result<(), StoreError>;
+    async fn get_mcp_server(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<McpServer>>, StoreError>;
+    async fn list_mcp_servers(&self) -> Result<Vec<ResourceEntry<McpServer>>, StoreError>;
+    async fn delete_mcp_server(&self, id: &str) -> Result<bool, StoreError>;
 }
 
 /// In-memory store. Thread-safe via DashMap; mainly used by tests, but
@@ -77,6 +87,7 @@ pub struct InMemoryStore {
     guardrails: DashMap<String, ResourceEntry<Guardrail>>,
     cache_policies: DashMap<String, ResourceEntry<CachePolicy>>,
     observability_exporters: DashMap<String, ResourceEntry<ObservabilityExporter>>,
+    mcp_servers: DashMap<String, ResourceEntry<McpServer>>,
 }
 
 impl InMemoryStore {
@@ -208,6 +219,26 @@ impl ConfigStore for InMemoryStore {
 
     async fn delete_observability_exporter(&self, id: &str) -> Result<bool, StoreError> {
         Ok(self.observability_exporters.remove(id).is_some())
+    }
+
+    async fn put_mcp_server(&self, entry: ResourceEntry<McpServer>) -> Result<(), StoreError> {
+        self.mcp_servers.insert(entry.id.clone(), entry);
+        Ok(())
+    }
+
+    async fn get_mcp_server(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<McpServer>>, StoreError> {
+        Ok(self.mcp_servers.get(id).map(|r| r.clone()))
+    }
+
+    async fn list_mcp_servers(&self) -> Result<Vec<ResourceEntry<McpServer>>, StoreError> {
+        Ok(self.mcp_servers.iter().map(|r| r.clone()).collect())
+    }
+
+    async fn delete_mcp_server(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.mcp_servers.remove(id).is_some())
     }
 }
 

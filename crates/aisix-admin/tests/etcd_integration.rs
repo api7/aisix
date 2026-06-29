@@ -197,6 +197,27 @@ async fn provider_keys_round_trip_through_real_etcd() {
 }
 
 #[tokio::test]
+async fn mcp_servers_round_trip_through_real_etcd() {
+    let Some(url) = etcd_url() else {
+        eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
+        return;
+    };
+    let prefix = unique_prefix();
+    let state = build_state_with_real_etcd(&url, &prefix).await;
+    admin_crud_round_trip(
+        state,
+        "/admin/v1/mcp_servers",
+        json!({
+            "display_name": "github-it",
+            "url": "https://api.example.com/mcp",
+            "auth_type": "bearer",
+            "secret": "tok-it"
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn guardrails_round_trip_through_real_etcd() {
     let Some(url) = etcd_url() else {
         eprintln!("skipping: ADMIN_TEST_ETCD_URL not set");
@@ -317,6 +338,10 @@ async fn loader_picks_up_every_admin_write() {
                 "endpoint": "https://otel.example.com/v1/traces"
             }),
         ),
+        (
+            "/admin/v1/mcp_servers",
+            json!({"display_name": "loader-mcp", "url": "https://api.example.com/mcp"}),
+        ),
     ];
     for (uri, body) in writes {
         let app = build_router(state.clone());
@@ -363,7 +388,7 @@ async fn loader_picks_up_every_admin_write() {
          likely a subkey-constant drift between EtcdConfigStore::*_SUBKEY \
          and the match arms in aisix_etcd::loader: {stats:?}"
     );
-    assert_eq!(stats.accepted, 6, "expected 6 entries; got {stats:?}");
+    assert_eq!(stats.accepted, 7, "expected 7 entries; got {stats:?}");
 
     // Each resource table should now have exactly one entry.
     assert_eq!(snap.models.len(), 1);
@@ -372,4 +397,5 @@ async fn loader_picks_up_every_admin_write() {
     assert_eq!(snap.guardrails.len(), 1);
     assert_eq!(snap.cache_policies.len(), 1);
     assert_eq!(snap.observability_exporters.len(), 1);
+    assert_eq!(snap.mcp_servers.len(), 1);
 }

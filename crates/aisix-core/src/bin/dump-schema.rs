@@ -62,6 +62,7 @@ fn main() {
         "guardrail_attachment",
         schema::guardrail_attachment_root_schema(),
     );
+    dump_value(&out_dir, "mcp_server", schema::mcp_server_root_schema());
 
     dump::<EnsembleConfig>(&out_dir, "ensemble");
     dump::<RateLimit>(&out_dir, "rate_limit");

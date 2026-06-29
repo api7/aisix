@@ -1,0 +1,94 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "McpAuthType": {
+      "description": "How the gateway authenticates to an upstream MCP server.",
+      "oneOf": [
+        {
+          "description": "No authentication; the server is reached as-is.",
+          "enum": [
+            "none"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Bearer token authentication. The token is supplied in `secret` and sent as `Authorization: Bearer <secret>`.",
+          "enum": [
+            "bearer"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "McpTransport": {
+      "description": "Transport used to reach an upstream MCP server.",
+      "oneOf": [
+        {
+          "description": "Streamable HTTP transport: a single endpoint that serves both POST and GET.",
+          "enum": [
+            "streamable_http"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "auth_type": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/McpAuthType"
+        }
+      ],
+      "default": "none",
+      "description": "How the gateway authenticates to the upstream server. The credential is held by the gateway and is never forwarded from or exposed to the calling client."
+    },
+    "display_name": {
+      "description": "Operator-facing label, unique within the gateway. It is used as the namespace prefix for this server's tools, which are exposed to clients as `<display_name>__<tool>`, so it must not contain the reserved separator `__`.",
+      "minLength": 1,
+      "type": "string"
+    },
+    "enabled": {
+      "default": true,
+      "description": "Whether this server is active. When `false`, its tools are not listed and cannot be called.",
+      "type": "boolean"
+    },
+    "secret": {
+      "description": "Authentication credential for the upstream server. Required when `auth_type` is `bearer`, where it is sent as `Authorization: Bearer <secret>` on every upstream request. Leave unset when `auth_type` is `none`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "timeout_ms": {
+      "description": "Maximum time, in milliseconds, to wait for a single upstream operation (establishing the session, listing tools, or calling a tool). When omitted, the gateway applies a built-in default.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "transport": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/McpTransport"
+        }
+      ],
+      "default": "streamable_http",
+      "description": "Transport used to reach the upstream server. Streamable HTTP is the only supported transport."
+    },
+    "url": {
+      "description": "The upstream server's MCP endpoint URL, reached over the Streamable HTTP transport, such as `https://api.example.com/mcp`.",
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "display_name",
+    "url"
+  ],
+  "title": "McpServer",
+  "type": "object"
+}

@@ -376,6 +376,9 @@ impl<P: ConfigProvider> Supervisor<P> {
             for e in tiny.rate_limit_policies.entries() {
                 new.rate_limit_policies.insert(clone_entry(&e));
             }
+            for e in tiny.mcp_servers.entries() {
+                new.mcp_servers.insert(clone_entry(&e));
+            }
             new
         });
         self.remove_rejection_for_key(&entry.key);
@@ -430,6 +433,7 @@ impl<P: ConfigProvider> Supervisor<P> {
                 snap.observability_exporters.get_by_id(parsed.id).is_some()
             }
             "rate_limit_policies" => snap.rate_limit_policies.get_by_id(parsed.id).is_some(),
+            "mcp_servers" => snap.mcp_servers.get_by_id(parsed.id).is_some(),
             _ => false,
         };
         let removed_rejection = self.remove_rejection_for_key(key_str);
@@ -474,6 +478,9 @@ impl<P: ConfigProvider> Supervisor<P> {
                 }
                 "rate_limit_policies" => {
                     new.rate_limit_policies.remove(parsed.id);
+                }
+                "mcp_servers" => {
+                    new.mcp_servers.remove(parsed.id);
                 }
                 _ => {}
             }
@@ -707,6 +714,9 @@ fn clone_snapshot(src: &AisixSnapshot) -> AisixSnapshot {
     }
     for e in src.rate_limit_policies.entries() {
         out.rate_limit_policies.insert(clone_entry(&e));
+    }
+    for e in src.mcp_servers.entries() {
+        out.mcp_servers.insert(clone_entry(&e));
     }
     out
 }

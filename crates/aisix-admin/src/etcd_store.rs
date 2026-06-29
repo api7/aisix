@@ -19,7 +19,9 @@
 //! deterministic behaviour continue to use [`crate::InMemoryStore`].
 
 use aisix_core::resource::ResourceEntry;
-use aisix_core::{ApiKey, CachePolicy, Guardrail, Model, ObservabilityExporter, ProviderKey};
+use aisix_core::{
+    ApiKey, CachePolicy, Guardrail, McpServer, Model, ObservabilityExporter, ProviderKey,
+};
 use etcd_client::{Client, DeleteOptions, GetOptions};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -35,6 +37,7 @@ pub const PROVIDER_KEYS_SUBKEY: &str = "provider_keys";
 pub const GUARDRAILS_SUBKEY: &str = "guardrails";
 pub const CACHE_POLICIES_SUBKEY: &str = "cache_policies";
 pub const OBSERVABILITY_EXPORTERS_SUBKEY: &str = "observability_exporters";
+pub const MCP_SERVERS_SUBKEY: &str = "mcp_servers";
 
 pub struct EtcdConfigStore {
     client: Mutex<Client>,
@@ -332,6 +335,35 @@ impl ConfigStore for EtcdConfigStore {
     async fn delete_observability_exporter(&self, id: &str) -> Result<bool, StoreError> {
         self.delete_one(&self.key_for(OBSERVABILITY_EXPORTERS_SUBKEY, id))
             .await
+    }
+
+    async fn put_mcp_server(&self, entry: ResourceEntry<McpServer>) -> Result<(), StoreError> {
+        let key = self.key_for(MCP_SERVERS_SUBKEY, &entry.id);
+        self.put_json(&key, &entry.value).await
+    }
+
+    async fn get_mcp_server(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResourceEntry<McpServer>>, StoreError> {
+        let key = self.key_for(MCP_SERVERS_SUBKEY, id);
+        Ok(self
+            .get_one::<McpServer>(&key)
+            .await?
+            .map(|(v, rev)| ResourceEntry::new(id, v, rev)))
+    }
+
+    async fn list_mcp_servers(&self) -> Result<Vec<ResourceEntry<McpServer>>, StoreError> {
+        Ok(self
+            .list_range::<McpServer>(MCP_SERVERS_SUBKEY)
+            .await?
+            .into_iter()
+            .map(|(id, v, rev)| ResourceEntry::new(id, v, rev))
+            .collect())
+    }
+
+    async fn delete_mcp_server(&self, id: &str) -> Result<bool, StoreError> {
+        self.delete_one(&self.key_for(MCP_SERVERS_SUBKEY, id)).await
     }
 }
 

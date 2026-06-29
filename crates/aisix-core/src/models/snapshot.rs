@@ -7,6 +7,7 @@
 use super::apikey::ApiKey;
 use super::cache_policy::CachePolicy;
 use super::guardrail::{Guardrail, GuardrailAttachment};
+use super::mcp_server::McpServer;
 use super::model::Model;
 use super::observability_exporter::ObservabilityExporter;
 use super::provider_key::ProviderKey;
@@ -34,6 +35,10 @@ pub struct AisixSnapshot {
     /// fan-out POST per chat completion (see `aisix-obs::OtlpHttpFanOut`).
     pub observability_exporters: ResourceTable<ObservabilityExporter>,
     pub rate_limit_policies: ResourceTable<RateLimitPolicy>,
+    /// Registered upstream MCP servers: `/aisix/<env>/mcp_servers/<uuid>`. The
+    /// MCP gateway endpoint aggregates each enabled server's tools and routes
+    /// tool calls back to the owning server.
+    pub mcp_servers: ResourceTable<McpServer>,
 }
 
 impl AisixSnapshot {
@@ -52,6 +57,7 @@ impl AisixSnapshot {
             + self.cache_policies.len()
             + self.observability_exporters.len()
             + self.rate_limit_policies.len()
+            + self.mcp_servers.len()
     }
 }
 
