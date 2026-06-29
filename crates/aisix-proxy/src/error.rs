@@ -161,9 +161,9 @@ pub enum ProxyError {
     ProviderUnavailable,
     /// Every routing candidate was excluded by the runtime status layer
     /// (all in cooldown or background-unhealthy) and the routing model
-    /// is configured with `on_all_filtered: fail`. Caller-visible as
+    /// is configured with `when_all_unavailable: fail`. Caller-visible as
     /// 503 with a Retry-After hint derived from the nearest cooldown
-    /// expiry. See [`aisix_core::OnAllFilteredPolicy`].
+    /// expiry. See [`aisix_core::WhenAllUnavailablePolicy`].
     #[error("all routing candidates are unavailable")]
     AllCandidatesUnavailable { retry_after_secs: Option<u64> },
     /// Caller-visible message MUST NOT carry the matched-pattern detail.

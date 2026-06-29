@@ -15,7 +15,7 @@
 //!   *first* target choice — once we're falling back, order is positional).
 
 use aisix_core::{
-    AisixSnapshot, Model, OnAllFilteredPolicy, Routing, RoutingStrategy, RoutingTarget,
+    AisixSnapshot, Model, Routing, RoutingStrategy, RoutingTarget, WhenAllUnavailablePolicy,
 };
 use aisix_gateway::BridgeError;
 use dashmap::DashMap;
@@ -29,7 +29,7 @@ use crate::error::ProxyError;
 /// candidate is background-unhealthy and no cooldown timer is available
 /// to derive a more precise hint. Operators tune per-model cooldown
 /// TTLs via `cooldown.default_seconds`; this is only the all-unhealthy
-/// fallback for the `on_all_filtered: fail` path.
+/// fallback for the `when_all_unavailable: fail` path.
 const FALLBACK_ALL_UNHEALTHY_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// Whether a Bridge error is retryable at all, optionally treating 429
@@ -204,7 +204,7 @@ pub(crate) enum FilterOutcome {
     /// minus the excluded entries.
     Selected(Vec<AttemptModel>),
     /// Every candidate is currently background-unhealthy and the
-    /// routing model is configured with `on_all_filtered: fail`. The
+    /// routing model is configured with `when_all_unavailable: fail`. The
     /// caller should surface a 503 with the supplied Retry-After hint
     /// (in seconds), if any.
     AllUnhealthy { retry_after_secs: Option<u64> },
@@ -213,7 +213,7 @@ pub(crate) enum FilterOutcome {
 pub(crate) fn filter_attempt_models(
     runtime_status: &crate::ModelRuntimeStatusTracker,
     attempts: Vec<AttemptModel>,
-    policy: OnAllFilteredPolicy,
+    policy: WhenAllUnavailablePolicy,
 ) -> FilterOutcome {
     let mut healthy = Vec::new();
     let mut cooldown_only = Vec::new();
@@ -263,10 +263,10 @@ pub(crate) fn filter_attempt_models(
     // by construction every candidate that reaches here is in the
     // background-unhealthy state and has no cooldown timer to read.
     match policy {
-        OnAllFilteredPolicy::Fail => FilterOutcome::AllUnhealthy {
+        WhenAllUnavailablePolicy::Fail => FilterOutcome::AllUnhealthy {
             retry_after_secs: Some(FALLBACK_ALL_UNHEALTHY_RETRY_AFTER.as_secs()),
         },
-        OnAllFilteredPolicy::OriginalOrder => FilterOutcome::Selected(attempts),
+        WhenAllUnavailablePolicy::TryAnyway => FilterOutcome::Selected(attempts),
     }
 }
 
@@ -315,7 +315,7 @@ pub(crate) fn resolve_attempt_models(
     match filter_attempt_models(
         runtime_status,
         resolved,
-        routing.on_all_filtered_or_default(),
+        routing.when_all_unavailable_or_default(),
     ) {
         FilterOutcome::Selected(list) => Ok(list),
         FilterOutcome::AllUnhealthy { retry_after_secs } => {
@@ -345,7 +345,7 @@ mod tests {
             retries: None,
             max_fallbacks,
             retry_on_429: None,
-            on_all_filtered: None,
+            when_all_unavailable: None,
         }
     }
 
@@ -690,7 +690,7 @@ mod tests {
     fn healthy_only_returns_all_healthy() {
         let t = crate::ModelRuntimeStatusTracker::new();
         let attempts = vec![am("a"), am("b")];
-        match filter_attempt_models(&t, attempts, OnAllFilteredPolicy::Fail) {
+        match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
             FilterOutcome::Selected(list) => {
                 assert_eq!(list.len(), 2);
             }
@@ -706,7 +706,7 @@ mod tests {
         let t = crate::ModelRuntimeStatusTracker::new();
         t.mark_cooldown("a", Duration::from_secs(30), "retryable_failure");
         let attempts = vec![am("a"), am("b")];
-        match filter_attempt_models(&t, attempts, OnAllFilteredPolicy::Fail) {
+        match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
             FilterOutcome::Selected(list) => {
                 assert_eq!(list.len(), 1);
                 assert_eq!(list[0].id, "b");
@@ -725,7 +725,7 @@ mod tests {
         t.mark_unhealthy("a", Some(503), "background_check_failed");
         t.mark_unhealthy("b", Some(503), "background_check_failed");
         let attempts = vec![am("a"), am("b")];
-        match filter_attempt_models(&t, attempts, OnAllFilteredPolicy::Fail) {
+        match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
             FilterOutcome::AllUnhealthy { retry_after_secs } => {
                 assert_eq!(retry_after_secs, Some(30));
             }
@@ -743,7 +743,7 @@ mod tests {
         t.mark_unhealthy("b", Some(503), "background_check_failed");
         t.mark_cooldown("c", Duration::from_secs(30), "x");
         let attempts = vec![am("a"), am("b"), am("c")];
-        match filter_attempt_models(&t, attempts, OnAllFilteredPolicy::Fail) {
+        match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
             FilterOutcome::Selected(list) => {
                 assert_eq!(list.len(), 1);
                 assert_eq!(list[0].id, "c");
@@ -753,17 +753,17 @@ mod tests {
     }
 
     #[test]
-    fn all_unhealthy_original_order_policy_returns_full_list() {
+    fn all_unhealthy_try_anyway_policy_returns_full_list() {
         // Legacy opt-in: send to all candidates regardless.
         let t = crate::ModelRuntimeStatusTracker::new();
         t.mark_unhealthy("a", Some(503), "background_check_failed");
         t.mark_unhealthy("b", Some(503), "background_check_failed");
         let attempts = vec![am("a"), am("b")];
-        match filter_attempt_models(&t, attempts, OnAllFilteredPolicy::OriginalOrder) {
+        match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::TryAnyway) {
             FilterOutcome::Selected(list) => {
                 assert_eq!(list.len(), 2);
             }
-            _ => panic!("expected Selected under OriginalOrder policy"),
+            _ => panic!("expected Selected under TryAnyway policy"),
         }
     }
 
@@ -776,7 +776,7 @@ mod tests {
         t.mark_cooldown("a", Duration::from_secs(30), "x");
         t.mark_cooldown("b", Duration::from_secs(30), "x");
         let attempts = vec![am("a"), am("b")];
-        match filter_attempt_models(&t, attempts, OnAllFilteredPolicy::Fail) {
+        match filter_attempt_models(&t, attempts, WhenAllUnavailablePolicy::Fail) {
             FilterOutcome::Selected(list) => {
                 assert_eq!(list.len(), 2);
             }

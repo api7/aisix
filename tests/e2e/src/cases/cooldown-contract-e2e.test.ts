@@ -20,7 +20,7 @@ import {
  *  - H2: Retry-After header from upstream drives the cooldown TTL.
  *  - H3: When every routing candidate is filtered out, the proxy
  *        fails fast with 503 + Retry-After (default policy).
- *  - H3 escape hatch: `on_all_filtered: original_order` preserves the
+ *  - H3 escape hatch: `when_all_unavailable: try_anyway` preserves the
  *        legacy "send to known-bad" behavior for operators that
  *        explicitly opt in.
  *  - M1: 429 cools down regardless of `retry_on_429` — cooldown and
@@ -548,7 +548,7 @@ describe("filter contract (H3) — all candidates unhealthy returns 503", () => 
         stale_after_seconds: 120,
       },
     });
-    // Default on_all_filtered policy is "fail" — explicit here for
+    // Default when_all_unavailable policy is "fail" — explicit here for
     // clarity even though it's the default.
     await admin.createModel({
       display_name: "h3-router-fail",
@@ -556,7 +556,7 @@ describe("filter contract (H3) — all candidates unhealthy returns 503", () => 
         strategy: "failover",
         targets: [{ model: "h3-down-a" }, { model: "h3-down-b" }],
         max_fallbacks: 1,
-        on_all_filtered: "fail",
+        when_all_unavailable: "fail",
       },
     });
     await admin.createApiKey({
@@ -616,7 +616,7 @@ describe("filter contract (H3) — all candidates unhealthy returns 503", () => 
   });
 });
 
-describe("filter contract (H3 escape hatch) — original_order sends to known-bad", () => {
+describe("filter contract (H3 escape hatch) — try_anyway sends to known-bad", () => {
   let app: SpawnedApp | undefined;
   let admin: AdminClient | undefined;
   let etcdReachable = false;
@@ -661,7 +661,7 @@ describe("filter contract (H3 escape hatch) — original_order sends to known-ba
         strategy: "failover",
         targets: [{ model: "h3-escape-down" }],
         max_fallbacks: 0,
-        on_all_filtered: "original_order",
+        when_all_unavailable: "try_anyway",
       },
     });
     await admin.createApiKey({
@@ -675,7 +675,7 @@ describe("filter contract (H3 escape hatch) — original_order sends to known-ba
     await downUpstream?.close();
   });
 
-  test("with on_all_filtered=original_order, the proxy still tries the unhealthy target (legacy opt-in)", async (ctx) => {
+  test("with when_all_unavailable=try_anyway, the proxy still tries the unhealthy target (legacy opt-in)", async (ctx) => {
     if (!etcdReachable || !app || !admin || !downUpstream) {
       ctx.skip();
       return;
@@ -689,7 +689,7 @@ describe("filter contract (H3 escape hatch) — original_order sends to known-ba
 
     const baseline = downUpstream.receivedRequests.length;
 
-    // With original_order, the request goes out to the unhealthy
+    // With try_anyway, the request goes out to the unhealthy
     // target. The upstream still returns 503 and the SDK throws,
     // but the key point is that a request *was sent*.
     const resp = await fetch(`${app.proxyUrl}/v1/chat/completions`, {

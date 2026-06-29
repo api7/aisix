@@ -112,7 +112,7 @@ pub enum EmbeddingFailureMode {
 /// Wire shape mirrors the proposal: the bare string `"default"` / `"fail"`,
 /// or an object `{ "target": "<direct alias>" }` to fall back to a specific
 /// safe model. Replicates the spirit of
-/// [`OnAllFilteredPolicy`](super::OnAllFilteredPolicy) with the added
+/// [`WhenAllUnavailablePolicy`](super::WhenAllUnavailablePolicy) with the added
 /// explicit-target option.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]

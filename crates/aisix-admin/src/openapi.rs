@@ -3313,7 +3313,7 @@ fn add_variant_titles(doc: &mut Value) {
             &["OTLP HTTP", "Aliyun SLS", "Object storage", "Datadog"],
         ),
         (
-            "/components/schemas/OnAllFilteredPolicy/oneOf",
+            "/components/schemas/WhenAllUnavailablePolicy/oneOf",
             &["Fail", "Original order"],
         ),
         (
@@ -3463,7 +3463,7 @@ fn add_schema_defaults(doc: &mut Value) {
             serde_json::json!({}),
         ),
         (
-            "/components/schemas/Routing/properties/on_all_filtered",
+            "/components/schemas/Routing/properties/when_all_unavailable",
             serde_json::json!("fail"),
         ),
     ] {
@@ -3989,7 +3989,7 @@ mod tests {
             "runtime default cooldown trigger statuses should be visible in OpenAPI"
         );
         assert_eq!(
-            schemas["Routing"]["properties"]["on_all_filtered"]["default"],
+            schemas["Routing"]["properties"]["when_all_unavailable"]["default"],
             serde_json::json!("fail"),
             "runtime default routing policy should be visible in OpenAPI"
         );

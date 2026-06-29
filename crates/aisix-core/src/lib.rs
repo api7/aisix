@@ -35,9 +35,10 @@ pub use models::{
     validate_observability_exporter, validate_provider_key, validate_rate_limit_policy, Adapter,
     AisixSnapshot, ApiKey, AppliedGuardrail, CachePolicy, CooldownConfig, ExporterKind, Guardrail,
     GuardrailHookPoint, GuardrailKind, KeywordConfig, KeywordPattern, Model, ObservabilityExporter,
-    OnAllFilteredPolicy, ParamConstraints, PolicyScope, PolicyWindow, ProviderKey, RateLimit,
-    RateLimitPolicy, RequestOverrides, ResponseOverrides, Routing, RoutingStrategy, RoutingTarget,
-    SchemaError, StreamDoneMarker, TelemetryKind, TelemetryTags, DEFAULT_COOLDOWN_TRIGGER_STATUSES,
+    ParamConstraints, PolicyScope, PolicyWindow, ProviderKey, RateLimit, RateLimitPolicy,
+    RequestOverrides, ResponseOverrides, Routing, RoutingStrategy, RoutingTarget, SchemaError,
+    StreamDoneMarker, TelemetryKind, TelemetryTags, WhenAllUnavailablePolicy,
+    DEFAULT_COOLDOWN_TRIGGER_STATUSES,
 };
 pub use resource::{Resource, ResourceEntry};
 pub use snapshot::{ResourceTable, SnapshotHandle};

@@ -249,25 +249,6 @@
       ],
       "type": "object"
     },
-    "OnAllFilteredPolicy": {
-      "description": "Behavior when every routing target is filtered out by runtime health or cooldown state.",
-      "oneOf": [
-        {
-          "description": "Return `503` with a fixed `Retry-After` hint.",
-          "enum": [
-            "fail"
-          ],
-          "type": "string"
-        },
-        {
-          "description": "Route to the original candidate list in declaration order even when all targets were filtered by health or cooldown status. Use only when maintaining availability is preferred over avoiding recently unhealthy targets.",
-          "enum": [
-            "original_order"
-          ],
-          "type": "string"
-        }
-      ]
-    },
     "OnEmbeddingFailure": {
       "anyOf": [
         {
@@ -293,7 +274,7 @@
           "type": "object"
         }
       ],
-      "description": "What the router does when the embedding call errors or times out.\n\nWire shape mirrors the proposal: the bare string `\"default\"` / `\"fail\"`, or an object `{ \"target\": \"<direct alias>\" }` to fall back to a specific safe model. Replicates the spirit of [`OnAllFilteredPolicy`](super::OnAllFilteredPolicy) with the added explicit-target option."
+      "description": "What the router does when the embedding call errors or times out.\n\nWire shape mirrors the proposal: the bare string `\"default\"` / `\"fail\"`, or an object `{ \"target\": \"<direct alias>\" }` to fall back to a specific safe model. Replicates the spirit of [`WhenAllUnavailablePolicy`](super::WhenAllUnavailablePolicy) with the added explicit-target option."
     },
     "PanelMember": {
       "additionalProperties": false,
@@ -385,14 +366,6 @@
           "minimum": 0.0,
           "type": "integer"
         },
-        "on_all_filtered": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/OnAllFilteredPolicy"
-            }
-          ],
-          "description": "Policy to apply when runtime status filtering removes every candidate."
-        },
         "retries": {
           "description": "Retry attempts on the current target before failing over.",
           "format": "uint32",
@@ -419,6 +392,14 @@
           },
           "minItems": 1,
           "type": "array"
+        },
+        "when_all_unavailable": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/WhenAllUnavailablePolicy"
+            }
+          ],
+          "description": "Policy to apply when every target is unavailable because of runtime health or cooldown state."
         }
       },
       "required": [
@@ -602,6 +583,25 @@
         "target"
       ],
       "type": "object"
+    },
+    "WhenAllUnavailablePolicy": {
+      "description": "Behavior when every routing target is unavailable because of runtime health or cooldown state.",
+      "oneOf": [
+        {
+          "description": "Return `503` with a fixed `Retry-After` hint.",
+          "enum": [
+            "fail"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Try every target in declaration order even when all of them are currently unavailable because of health or cooldown status. Use only when maintaining availability is preferred over avoiding recently unhealthy targets.",
+          "enum": [
+            "try_anyway"
+          ],
+          "type": "string"
+        }
+      ]
     }
   },
   "oneOf": [

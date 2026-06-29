@@ -60,20 +60,20 @@ impl RoutingTarget {
     }
 }
 
-/// Behavior when every routing target is filtered out by runtime health or cooldown state.
+/// Behavior when every routing target is unavailable because of runtime health or cooldown state.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum OnAllFilteredPolicy {
+pub enum WhenAllUnavailablePolicy {
     /// Return `503` with a fixed `Retry-After` hint.
     #[default]
     Fail,
-    /// Route to the original candidate list in declaration order even
-    /// when all targets were filtered by health or cooldown status. Use
+    /// Try every target in declaration order even when all of them are
+    /// currently unavailable because of health or cooldown status. Use
     /// only when maintaining availability is preferred over avoiding
     /// recently unhealthy targets.
-    OriginalOrder,
+    TryAnyway,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -94,9 +94,9 @@ pub struct Routing {
     /// Whether upstream 429 participates in retries and failover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_on_429: Option<bool>,
-    /// Policy to apply when runtime status filtering removes every candidate.
+    /// Policy to apply when every target is unavailable because of runtime health or cooldown state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_all_filtered: Option<OnAllFilteredPolicy>,
+    pub when_all_unavailable: Option<WhenAllUnavailablePolicy>,
 }
 
 impl Routing {
@@ -116,8 +116,8 @@ impl Routing {
         self.retry_on_429.unwrap_or(false)
     }
 
-    pub fn on_all_filtered_or_default(&self) -> OnAllFilteredPolicy {
-        self.on_all_filtered.unwrap_or_default()
+    pub fn when_all_unavailable_or_default(&self) -> WhenAllUnavailablePolicy {
+        self.when_all_unavailable.unwrap_or_default()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -169,7 +169,7 @@ mod tests {
             retries: Some(0),
             max_fallbacks: Some(0),
             retry_on_429: None,
-            on_all_filtered: None,
+            when_all_unavailable: None,
         };
         assert_eq!(r.max_fallbacks_or_default(), 0);
     }
@@ -182,33 +182,36 @@ mod tests {
             retries: None,
             max_fallbacks: Some(99),
             retry_on_429: None,
-            on_all_filtered: None,
+            when_all_unavailable: None,
         };
         assert_eq!(r.max_fallbacks_or_default(), 0);
     }
 
     #[test]
-    fn on_all_filtered_defaults_to_fail() {
+    fn when_all_unavailable_defaults_to_fail() {
         let r: Routing = serde_json::from_str(r#"{"targets":[{"model":"a"}]}"#).unwrap();
-        assert_eq!(r.on_all_filtered_or_default(), OnAllFilteredPolicy::Fail);
-    }
-
-    #[test]
-    fn on_all_filtered_parses_original_order() {
-        let r: Routing = serde_json::from_str(
-            r#"{"targets":[{"model":"a"}],"on_all_filtered":"original_order"}"#,
-        )
-        .unwrap();
         assert_eq!(
-            r.on_all_filtered_or_default(),
-            OnAllFilteredPolicy::OriginalOrder
+            r.when_all_unavailable_or_default(),
+            WhenAllUnavailablePolicy::Fail
         );
     }
 
     #[test]
-    fn on_all_filtered_rejects_unknown_value() {
+    fn when_all_unavailable_parses_try_anyway() {
+        let r: Routing = serde_json::from_str(
+            r#"{"targets":[{"model":"a"}],"when_all_unavailable":"try_anyway"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            r.when_all_unavailable_or_default(),
+            WhenAllUnavailablePolicy::TryAnyway
+        );
+    }
+
+    #[test]
+    fn when_all_unavailable_rejects_unknown_value() {
         let r: Result<Routing, _> =
-            serde_json::from_str(r#"{"targets":[{"model":"a"}],"on_all_filtered":"explode"}"#);
+            serde_json::from_str(r#"{"targets":[{"model":"a"}],"when_all_unavailable":"explode"}"#);
         assert!(r.is_err());
     }
 

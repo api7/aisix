@@ -15,17 +15,6 @@
       "format": "uint32",
       "minimum": 0.0
     },
-    "on_all_filtered": {
-      "description": "Policy to apply when runtime status filtering removes every candidate.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/OnAllFilteredPolicy"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
     "retries": {
       "description": "Retry attempts on the current target before failing over.",
       "type": [
@@ -58,29 +47,21 @@
         "$ref": "#/definitions/RoutingTarget"
       },
       "minItems": 1
+    },
+    "when_all_unavailable": {
+      "description": "Policy to apply when every target is unavailable because of runtime health or cooldown state.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/WhenAllUnavailablePolicy"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "additionalProperties": false,
   "definitions": {
-    "OnAllFilteredPolicy": {
-      "description": "Behavior when every routing target is filtered out by runtime health or cooldown state.",
-      "oneOf": [
-        {
-          "description": "Return `503` with a fixed `Retry-After` hint.",
-          "type": "string",
-          "enum": [
-            "fail"
-          ]
-        },
-        {
-          "description": "Route to the original candidate list in declaration order even when all targets were filtered by health or cooldown status. Use only when maintaining availability is preferred over avoiding recently unhealthy targets.",
-          "type": "string",
-          "enum": [
-            "original_order"
-          ]
-        }
-      ]
-    },
     "RoutingStrategy": {
       "oneOf": [
         {
@@ -129,6 +110,25 @@
         }
       },
       "additionalProperties": false
+    },
+    "WhenAllUnavailablePolicy": {
+      "description": "Behavior when every routing target is unavailable because of runtime health or cooldown state.",
+      "oneOf": [
+        {
+          "description": "Return `503` with a fixed `Retry-After` hint.",
+          "type": "string",
+          "enum": [
+            "fail"
+          ]
+        },
+        {
+          "description": "Try every target in declaration order even when all of them are currently unavailable because of health or cooldown status. Use only when maintaining availability is preferred over avoiding recently unhealthy targets.",
+          "type": "string",
+          "enum": [
+            "try_anyway"
+          ]
+        }
+      ]
     }
   }
 }

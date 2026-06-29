@@ -100,7 +100,7 @@
       ]
     },
     "OnEmbeddingFailure": {
-      "description": "What the router does when the embedding call errors or times out.\n\nWire shape mirrors the proposal: the bare string `\"default\"` / `\"fail\"`, or an object `{ \"target\": \"<direct alias>\" }` to fall back to a specific safe model. Replicates the spirit of [`OnAllFilteredPolicy`](super::OnAllFilteredPolicy) with the added explicit-target option.",
+      "description": "What the router does when the embedding call errors or times out.\n\nWire shape mirrors the proposal: the bare string `\"default\"` / `\"fail\"`, or an object `{ \"target\": \"<direct alias>\" }` to fall back to a specific safe model. Replicates the spirit of [`WhenAllUnavailablePolicy`](super::WhenAllUnavailablePolicy) with the added explicit-target option.",
       "anyOf": [
         {
           "description": "`\"default\"` or `\"fail\"`.",

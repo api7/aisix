@@ -120,7 +120,7 @@ fn accept_routing_full() {
                 "retries": 2,
                 "max_fallbacks": 1,
                 "retry_on_429": true,
-                "on_all_filtered": "original_order"
+                "when_all_unavailable": "try_anyway"
             },
             "timeout": 1000,
             "rate_limit": {"rpm": 10},
@@ -391,10 +391,10 @@ fn reject_routing_bad_strategy() {
 }
 
 #[test]
-fn reject_routing_bad_on_all_filtered() {
+fn reject_routing_bad_when_all_unavailable() {
     reject(
-        "routing invalid on_all_filtered",
-        json!({"display_name": "r", "routing": {"targets": [{"model": "x"}], "on_all_filtered": "shrug"}}),
+        "routing invalid when_all_unavailable",
+        json!({"display_name": "r", "routing": {"targets": [{"model": "x"}], "when_all_unavailable": "shrug"}}),
     );
 }
 

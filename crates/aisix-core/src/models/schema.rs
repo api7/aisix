@@ -1138,36 +1138,36 @@ mod tests {
     }
 
     #[test]
-    fn routing_on_all_filtered_fail_passes() {
+    fn routing_when_all_unavailable_fail_passes() {
         let v = json!({
             "display_name": "router-1",
             "routing": {
                 "targets": [{"model": "a"}],
-                "on_all_filtered": "fail"
+                "when_all_unavailable": "fail"
             }
         });
         validate_model(&v).unwrap();
     }
 
     #[test]
-    fn routing_on_all_filtered_original_order_passes() {
+    fn routing_when_all_unavailable_try_anyway_passes() {
         let v = json!({
             "display_name": "router-1",
             "routing": {
                 "targets": [{"model": "a"}],
-                "on_all_filtered": "original_order"
+                "when_all_unavailable": "try_anyway"
             }
         });
         validate_model(&v).unwrap();
     }
 
     #[test]
-    fn routing_on_all_filtered_rejects_unknown_value() {
+    fn routing_when_all_unavailable_rejects_unknown_value() {
         let v = json!({
             "display_name": "router-1",
             "routing": {
                 "targets": [{"model": "a"}],
-                "on_all_filtered": "yolo"
+                "when_all_unavailable": "yolo"
             }
         });
         assert!(validate_model(&v).is_err());
