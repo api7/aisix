@@ -1,101 +1,52 @@
 # Roadmap
 
-This roadmap tracks planned capabilities and areas that are not yet ready to document as generally available product behavior.
+This page lists capabilities that are planned or in progress but not yet generally available. It shows direction, not dates, and is not a delivery commitment.
 
-Use this roadmap to understand direction. Use the [official documentation](https://docs.api7.ai/ai-gateway/) to understand what is available today.
+For what the gateway does today — including [semantic routing](https://docs.api7.ai/ai-gateway/routing-and-resilience/semantic-routing), [ensemble models](https://docs.api7.ai/ai-gateway/routing-and-resilience/ensemble-models), [caching](https://docs.api7.ai/ai-gateway/add-traffic-controls/response-caching), and [guardrails](https://docs.api7.ai/ai-gateway/add-traffic-controls/guardrails) — see the [AISIX AI Gateway documentation](https://docs.api7.ai/ai-gateway/).
 
-## Principles
+## How to read this page
 
-- Official documentation describes current, verified behavior.
-- This roadmap collects planned or incomplete capabilities.
-- Presence in this roadmap is not a delivery commitment.
+- **Now** — in active design or development.
+- **Next** — planned after the current focus.
+- **Later** — on the longer-term horizon.
+
+The **Surface** column shows where a capability lands: **Gateway** is the AISIX AI Gateway data plane; **Cloud** is the AISIX Cloud control plane and dashboard.
 
 ## Now
 
-### Provider Compatibility Expansion
-
-Current status:
-- The gateway already exposes multiple client-facing endpoints across OpenAI-compatible and Anthropic-style paths.
-- Support depth still varies by endpoint and provider combination.
-
-Planned outcome:
-- Broader parity across providers and endpoint families.
-
-Applies to:
-- `AISIX AI Gateway`
+| Capability | What's planned | Surface |
+| --- | --- | --- |
+| MCP gateway | Register MCP servers as first-class resources and govern them with the same caller keys, teams, and policies as model traffic, including transport, authentication, per-tool access control, and per-server usage. | Gateway · Cloud |
+| Enterprise SSO | Single sign-on through SAML and generic OIDC, beyond today's social logins. | Cloud |
+| Directory sync (SCIM) | Provision and deprovision users and groups from your identity provider. | Cloud |
+| Service accounts | Login-less, first-class principals for automated callers. | Cloud |
+| Smart routing strategies | Cost-aware, latency-aware, and least-connections target selection, alongside today's ordered, weighted, failover, and semantic routing. | Gateway |
+| Semantic caching | Serve responses for prompts close in meaning, on top of today's exact-match cache. | Gateway |
+| PII guardrails | Detect and redact personally identifiable information in requests and responses. | Gateway |
 
 ## Next
 
-### Redis-Backed Cache Policy Completion
-
-Current status:
-- The data plane enforces `CachePolicy.backend` per matched policy: `memory` uses the in-process cache; `redis` uses the shared Redis cache when the bootstrap config provides `cache.redis`, otherwise caching is disabled for matching requests (no silent memory fallback).
-- Redis cluster/sentinel modes and broader support boundaries are still being expanded.
-
-Planned outcome:
-- Clear, fully supported Redis-backed cache policy behavior across all Redis deployment modes.
-
-Applies to:
-- `AISIX AI Gateway`
-
-### Cloud Playground Parity With Data-Plane Path
-
-Current status:
-- AISIX Cloud playground is a preview path that sends requests from the control plane directly to the upstream provider.
-- It does not pass through the managed data plane, so it does not exercise data-plane routing, cache, guardrails, or rate limiting.
-
-Planned outcome:
-- A more production-representative playground experience.
-
-Applies to:
-- `AISIX Cloud`
-
-### First-Party Data-Warehouse Sinks
-
-Current status:
-- The `object_store` observability exporter writes batched NDJSON telemetry to Amazon S3, Google Cloud Storage, or Azure Blob today. Loading that telemetry into a warehouse such as Snowflake or Databricks is a customer-run step.
-- A first-party sink that manages the pipe, the schema, and exactly-once streaming directly to the warehouse is not yet available.
-
-Planned outcome:
-- First-party Snowflake and Databricks sinks where the gateway owns the end-to-end delivery to the warehouse table, including managed schema and exactly-once semantics.
-
-Applies to:
-- `AISIX Cloud`
+| Capability | What's planned | Surface |
+| --- | --- | --- |
+| Fine-grained authorization | Custom roles with per-resource and per-action permissions, beyond today's fixed roles and read/write scopes. | Cloud |
+| Conditional and wildcard routing | Route on request metadata, headers, and tags, and match upstreams by wildcard names such as `provider/*`. | Gateway |
+| Prompt management | Store, version, and reuse prompt templates with variables, resolved at the gateway. | Gateway · Cloud |
+| Caller key rotation experience | Self-service key rotation in the dashboard, plus scheduled auto-rotation with a grace overlap. | Cloud |
+| Production-path playground | Run the Cloud playground through the managed data plane so it reflects real routing, caching, guardrails, and rate limiting. | Cloud |
+| Cross-provider endpoint parity | Consistent embeddings, image generation, and Responses behavior across more providers. | Gateway |
 
 ## Later
 
-### Advanced Governance And Multi-Team Controls
+| Capability | What's planned | Surface |
+| --- | --- | --- |
+| External secret management | Manage provider and API credentials through external KMS and secret stores such as Vault. | Gateway · Cloud |
+| Expanded observability export | OTLP export for metrics and logs, alerting integrations such as Slack and PagerDuty, and first-party data-warehouse sinks. | Gateway · Cloud |
+| More proxy endpoints | Passthrough for Batch, Files, and Fine-tuning, plus Realtime endpoints. | Gateway |
+| Metered usage billing | Usage-based billing in addition to subscription plans. | Cloud |
+| SDKs and agent-framework integrations | First-party SDKs and integrations with common agent frameworks. | Gateway · Cloud |
 
-Current status:
-- Core environment and resource management are the active focus.
-
-Planned outcome:
-- Richer organization and governance controls.
-
-Applies to:
-- `AISIX Cloud`
-
-### Expanded Advanced Cache Backends
-
-Current status:
-- The current docs and runtime center on prompt-response caching with the currently implemented backends.
-
-Planned outcome:
-- Additional backend strategies where they are backed by real runtime support.
-
-Applies to:
-- `AISIX AI Gateway`
-
-## Not Current Product Behavior
-
-These areas are not current product behavior unless implementation status changes:
-
-- planned-only MCP or agent-gateway features
-- planned-only control-plane governance features not yet backed by code
-- provider or endpoint support that is not yet reflected in the current implementation
-
-## Related Pages
+## Related pages
 
 - [AISIX AI Gateway documentation](https://docs.api7.ai/ai-gateway/)
-- [AISIX AI Gateway quickstart](https://docs.api7.ai/ai-gateway/quickstart/)
 - [AISIX Cloud](https://api7.ai/ai-gateway)
+- Tracked live in [issues](https://github.com/api7/aisix/issues)
