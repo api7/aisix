@@ -144,6 +144,13 @@ pub async fn chat_completions(
         Ok(mut success) => {
             let status = 200;
             let elapsed = started.elapsed();
+            // #890 req-3/req-4: resolve the readable provider-key name from the
+            // snapshot and normalise the inbound client type once.
+            let provider_key_name = {
+                let snap = state.snapshot.load();
+                crate::usage_attr::provider_key_metric_name(&snap, &success.provider_key_id)
+            };
+            let client_type = aisix_obs::client_type_from_user_agent(&client.user_agent);
             record_success(
                 &state.metrics,
                 &success.provider,
@@ -151,6 +158,11 @@ pub async fn chat_completions(
                 &api_key_id,
                 auth.key().team_id.as_deref(),
                 auth.key().user_id.as_deref(),
+                auth.key().user_name.as_deref(),
+                &provider_key_name,
+                client_type,
+                req.is_streaming(),
+                success.routing.fallback_count() > 0,
                 status,
                 &success,
                 elapsed,
@@ -342,6 +354,32 @@ pub async fn chat_completions(
                 .map(|c| c.routing.clone())
                 .filter(|r| !r.attempts.is_empty())
                 .unwrap_or(routing);
+            // #890 req-2: record the FAILED request on the same rich request
+            // metrics successes use, so a success rate is computable
+            // (numerator outcome="success" over a denominator that includes
+            // failures — previously these series were success-path-only).
+            // Provider / upstream_model / provider_key are unknown on the
+            // failure path; identity + status + outcome + stream + is_fallback
+            // are what the success-rate query needs.
+            let fail_labels = RequestLabels {
+                endpoint: "/v1/chat/completions",
+                inbound_protocol: "openai",
+                provider: "unknown",
+                model: &model_name,
+                upstream_model: "unknown",
+                provider_key_id: "unknown",
+                provider_key_name: "unknown",
+                api_key_id: &api_key_id,
+                team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
+                user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
+                user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
+                stream: req.is_streaming(),
+                is_fallback: routing.fallback_count() > 0,
+                status,
+                outcome: RequestOutcome::from_status(status),
+            };
+            state.metrics.record_proxy_request(fail_labels, elapsed);
+            state.metrics.record_llm_request(fail_labels, elapsed);
             emit_access_log(
                 method,
                 path,
@@ -1149,6 +1187,15 @@ async fn dispatch(
         let provider_for_metrics = provider.to_ascii_lowercase();
         let model_for_metrics = req.model.clone();
         let provider_key_id_for_metrics = pk_id.clone();
+        // #890 req-3/req-4: readable provider-key name + normalised inbound
+        // client type, captured for the streaming on_complete metric emission
+        // (mirrors the non-streaming `record_success` path).
+        let provider_key_name_for_metrics = {
+            let snap = state.snapshot.load();
+            crate::usage_attr::provider_key_metric_name(&snap, &pk_id)
+        };
+        let user_name_for_metrics = auth.key().user_name.clone();
+        let client_type_for_metrics = aisix_obs::client_type_from_user_agent(&client.user_agent);
         // Captured for the stream-end telemetry closure so
         // emit_usage_event can look up `telemetry_tags` for per-PK
         // attribution (#302 M17 / AISIX-Cloud#436). The metrics
@@ -1295,9 +1342,11 @@ async fn dispatch(
                         model: &model_for_metrics,
                         upstream_model: &upstream_model_for_metrics,
                         provider_key_id: &provider_key_id_for_metrics,
+                        provider_key_name: &provider_key_name_for_metrics,
                         api_key_id: &api_key_id_for_telem,
                         team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
                         user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
+                        user_name: user_name_for_metrics.as_deref().unwrap_or("unknown"),
                     },
                     LlmUsage {
                         input_tokens: comp.prompt_tokens,
@@ -1305,6 +1354,12 @@ async fn dispatch(
                         total_tokens: comp.total_tokens.min(u64::from(u32::MAX)) as u32,
                         spend_usd: 0.0,
                     },
+                );
+                // #890 req-4: streaming token volume by inbound client type.
+                metrics_for_stream.record_llm_tokens_by_client(
+                    client_type_for_metrics,
+                    u64::from(comp.prompt_tokens),
+                    u64::from(comp.completion_tokens),
                 );
                 metrics_for_stream.record_time_to_first_token(
                     UsageLabels {
@@ -1314,9 +1369,11 @@ async fn dispatch(
                         model: &model_for_metrics,
                         upstream_model: &upstream_model_for_metrics,
                         provider_key_id: &provider_key_id_for_metrics,
+                        provider_key_name: &provider_key_name_for_metrics,
                         api_key_id: &api_key_id_for_telem,
                         team_id: team_id_for_metrics.as_deref().unwrap_or("unknown"),
                         user_id: user_id_for_metrics.as_deref().unwrap_or("unknown"),
+                        user_name: user_name_for_metrics.as_deref().unwrap_or("unknown"),
                     },
                     Duration::from_millis(u64::from(comp.ttft_ms)),
                 );
@@ -2638,6 +2695,12 @@ fn record_success(
     api_key_id: &str,
     team_id: Option<&str>,
     user_id: Option<&str>,
+    // #890 req-3 readable name + req-4 client type + req-1/req-2 dimensions.
+    user_name: Option<&str>,
+    provider_key_name: &str,
+    client_type: &'static str,
+    stream: bool,
+    is_fallback: bool,
     status: u16,
     s: &Success,
     elapsed: Duration,
@@ -2651,9 +2714,13 @@ fn record_success(
         model,
         upstream_model: &s.upstream_model,
         provider_key_id: &s.provider_key_id,
+        provider_key_name,
         api_key_id,
         team_id: team_id.unwrap_or("unknown"),
         user_id: user_id.unwrap_or("unknown"),
+        user_name: user_name.unwrap_or("unknown"),
+        stream,
+        is_fallback,
         status,
         outcome,
     };
@@ -2670,9 +2737,11 @@ fn record_success(
             model,
             upstream_model: &s.upstream_model,
             provider_key_id: &s.provider_key_id,
+            provider_key_name,
             api_key_id,
             team_id: team_id.unwrap_or("unknown"),
             user_id: user_id.unwrap_or("unknown"),
+            user_name: user_name.unwrap_or("unknown"),
         },
         LlmUsage {
             input_tokens: s.prompt_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
@@ -2680,6 +2749,14 @@ fn record_success(
             total_tokens: s.total_tokens.unwrap_or(0).min(u64::from(u32::MAX)) as u32,
             spend_usd: s.cost_usd,
         },
+    );
+    // #890 req-4: token volume by inbound client type (non-streaming path;
+    // streaming tokens arrive in the SSE on_complete and are recorded there).
+    // No-op when both counts are zero (e.g. the streaming branch here).
+    metrics.record_llm_tokens_by_client(
+        client_type,
+        s.prompt_tokens.unwrap_or(0),
+        s.completion_tokens.unwrap_or(0),
     );
 }
 

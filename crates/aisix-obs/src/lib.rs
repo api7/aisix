@@ -27,8 +27,8 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 pub use access_log::AccessLog;
 pub use metrics::{
-    BudgetGauges, BudgetLabels, DeploymentLabels, DeploymentState, LlmUsage, Metrics,
-    RequestLabels, RequestOutcome, UsageLabels,
+    client_type_from_user_agent, BudgetGauges, BudgetLabels, DeploymentLabels, DeploymentState,
+    LlmUsage, Metrics, RequestLabels, RequestOutcome, UsageLabels,
 };
 pub use otlp::{install_otlp_tracer, shutdown_otlp, OtlpError, OtlpHandle};
 pub use otlp_http_sink::{content_capture_cap, OtlpHttpFanOut, OtlpSink};

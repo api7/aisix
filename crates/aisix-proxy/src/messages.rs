@@ -119,6 +119,12 @@ pub async fn messages(
     // read below to attach `applied_guardrails` to the telemetry event on both
     // the success and failure (input-block) paths (#379).
     let mut applied_guardrails: Vec<AppliedGuardrail> = Vec::new();
+    // #890 req-1: capture the client's streaming intent before dispatch
+    // (which mutates the body).
+    let stream_requested = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     match dispatch(
         &state,
         &auth,
@@ -159,6 +165,11 @@ pub async fn messages(
                 elapsed,
             );
             let outcome = RequestOutcome::from_status(status);
+            // #890 req-3: readable provider-key name resolved from the snapshot.
+            let provider_key_name = {
+                let snap = state.snapshot.load();
+                crate::usage_attr::provider_key_metric_name(&snap, &provider_key_id)
+            };
             let labels = RequestLabels {
                 endpoint: "/v1/messages",
                 inbound_protocol: "anthropic",
@@ -166,9 +177,13 @@ pub async fn messages(
                 model: &model_name,
                 upstream_model: &upstream_model,
                 provider_key_id: &provider_key_id,
+                provider_key_name: &provider_key_name,
                 api_key_id: &api_key_id,
                 team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
                 user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
+                user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
+                stream: stream_requested,
+                is_fallback: routing.fallback_count() > 0,
                 status,
                 outcome,
             };
@@ -186,6 +201,7 @@ pub async fn messages(
                 &upstream_model,
                 auth.key().team_id.as_deref(),
                 auth.key().user_id.as_deref(),
+                auth.key().user_name.as_deref(),
                 &client,
                 &applied_guardrails,
                 &routing,
@@ -213,6 +229,7 @@ pub async fn messages(
                     &upstream_model,
                     auth.key().team_id.as_deref(),
                     auth.key().user_id.as_deref(),
+                    auth.key().user_name.as_deref(),
                     status,
                     elapsed,
                     metrics,
@@ -243,6 +260,28 @@ pub async fn messages(
                 RequestOutcome::from_status(status),
                 elapsed,
             );
+            // #890 req-2: count the FAILED request on the rich request metrics
+            // so a success rate is computable (denominator incl. failures).
+            // Provider/upstream/provider_key are unknown on the failure path.
+            let fail_labels = RequestLabels {
+                endpoint: "/v1/messages",
+                inbound_protocol: "anthropic",
+                provider: "unknown",
+                model: &model_name,
+                upstream_model: "unknown",
+                provider_key_id: "unknown",
+                provider_key_name: "unknown",
+                api_key_id: &api_key_id,
+                team_id: auth.key().team_id.as_deref().unwrap_or("unknown"),
+                user_id: auth.key().user_id.as_deref().unwrap_or("unknown"),
+                user_name: auth.key().user_name.as_deref().unwrap_or("unknown"),
+                stream: stream_requested,
+                is_fallback: routing.fallback_count() > 0,
+                status,
+                outcome: RequestOutcome::from_status(status),
+            };
+            state.metrics.record_proxy_request(fail_labels, elapsed);
+            state.metrics.record_llm_request(fail_labels, elapsed);
             // Per #655: emit one zero-token UsageEvent per FAILED attempt so
             // the dashboard's Logs tab surfaces each failed upstream try.
             emit_failed_attempts_anthropic(
@@ -254,6 +293,7 @@ pub async fn messages(
                 "unknown",
                 auth.key().team_id.as_deref(),
                 auth.key().user_id.as_deref(),
+                auth.key().user_name.as_deref(),
                 &client,
                 &applied_guardrails,
                 &routing,
@@ -274,6 +314,7 @@ pub async fn messages(
                     "unknown",
                     auth.key().team_id.as_deref(),
                     auth.key().user_id.as_deref(),
+                    auth.key().user_name.as_deref(),
                     status,
                     elapsed,
                     AnthropicUsageMetrics::default(),
@@ -310,6 +351,7 @@ fn emit_failed_attempts_anthropic(
     upstream_model: &str,
     team_id: Option<&str>,
     user_id: Option<&str>,
+    user_name: Option<&str>,
     client: &ClientContext,
     applied_guardrails: &[AppliedGuardrail],
     routing: &RoutingTelemetry,
@@ -328,6 +370,7 @@ fn emit_failed_attempts_anthropic(
             upstream_model,
             team_id,
             user_id,
+            user_name,
             rec.status,
             Duration::from_millis(u64::from(rec.latency_ms)),
             AnthropicUsageMetrics::default(),
@@ -510,6 +553,7 @@ async fn dispatch(
                 &auth.entry.id,
                 auth.key().team_id.clone(),
                 auth.key().user_id.clone(),
+                auth.key().user_name.clone(),
                 resolved_chain.clone(),
                 client,
                 AttemptInfo {
@@ -594,6 +638,7 @@ async fn dispatch_to_target(
     api_key_id: &str,
     team_id: Option<String>,
     user_id: Option<String>,
+    user_name: Option<String>,
     resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
     client: &ClientContext,
     // Winning-attempt classification (#655) — used by the streaming paths
@@ -617,6 +662,7 @@ async fn dispatch_to_target(
             api_key_id,
             team_id,
             user_id,
+            user_name,
             resolved_chain,
             client,
             attempt,
@@ -637,6 +683,7 @@ async fn dispatch_to_target(
         api_key_id,
         team_id,
         user_id,
+        user_name,
         resolved_chain,
         client,
         attempt,
@@ -662,6 +709,7 @@ async fn anthropic_passthrough_dispatch(
     api_key_id: &str,
     team_id: Option<String>,
     user_id: Option<String>,
+    user_name: Option<String>,
     resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
     client_ctx: &ClientContext,
     attempt: AttemptInfo,
@@ -886,6 +934,7 @@ async fn anthropic_passthrough_dispatch(
         let upstream_model_c = upstream_model.clone();
         let team_id_c = team_id.clone();
         let user_id_c = user_id.clone();
+        let user_name_c = user_name.clone();
         // #492: log the same client IP/UA on streamed responses.
         let client_ctx_c = client_ctx.clone();
         // Winning-attempt classification (#655) for the stream-end emit.
@@ -944,6 +993,7 @@ async fn anthropic_passthrough_dispatch(
                     &upstream_model_c,
                     team_id_c.as_deref(),
                     user_id_c.as_deref(),
+                    user_name_c.as_deref(),
                     200,
                     started.elapsed(),
                     metrics,
@@ -1197,6 +1247,7 @@ async fn cross_provider_dispatch(
     api_key_id: &str,
     team_id: Option<String>,
     user_id: Option<String>,
+    user_name: Option<String>,
     resolved_chain: std::sync::Arc<aisix_guardrails::GuardrailChain>,
     client: &ClientContext,
     attempt: AttemptInfo,
@@ -1329,6 +1380,7 @@ async fn cross_provider_dispatch(
         let upstream_model_for_telem = upstream_model.clone();
         let team_id_for_telem = team_id;
         let user_id_for_telem = user_id;
+        let user_name_for_telem = user_name;
         let started_for_telem = started;
         // #492: log the same client IP/UA on streamed responses.
         let client_for_telem = client.clone();
@@ -1384,6 +1436,7 @@ async fn cross_provider_dispatch(
                     &upstream_model_for_telem,
                     team_id_for_telem.as_deref(),
                     user_id_for_telem.as_deref(),
+                    user_name_for_telem.as_deref(),
                     200,
                     started_for_telem.elapsed(),
                     metrics,
@@ -1800,6 +1853,8 @@ fn emit_anthropic_usage_event(
     upstream_model: &str,
     team_id: Option<&str>,
     user_id: Option<&str>,
+    // #890 req-3: readable owner name (1:1 with user_id) for the metric label.
+    user_name: Option<&str>,
     status_code: u16,
     elapsed: Duration,
     metrics: AnthropicUsageMetrics,
@@ -1824,6 +1879,9 @@ fn emit_anthropic_usage_event(
     } else {
         Default::default()
     };
+    // #890 req-3: readable provider-key name for the metric label (shared
+    // resolver so chat + messages can't drift).
+    let provider_key_name = crate::usage_attr::provider_key_metric_name(&snap, provider_key_id);
     let event = UsageEvent {
         request_id: request_id.to_string(),
         occurred_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -1873,9 +1931,11 @@ fn emit_anthropic_usage_event(
             model,
             upstream_model,
             provider_key_id,
+            provider_key_name: &provider_key_name,
             api_key_id,
             team_id: team_id.unwrap_or("unknown"),
             user_id: user_id.unwrap_or("unknown"),
+            user_name: user_name.unwrap_or("unknown"),
         },
         LlmUsage {
             input_tokens: metrics.prompt_tokens,
@@ -1886,6 +1946,13 @@ fn emit_anthropic_usage_event(
             spend_usd: 0.0,
         },
     );
+    // #890 req-4: token volume by inbound client type (covers streaming and
+    // non-streaming — every /v1/messages usage event flows through here).
+    state.metrics.record_llm_tokens_by_client(
+        aisix_obs::client_type_from_user_agent(&client.user_agent),
+        u64::from(metrics.prompt_tokens),
+        u64::from(metrics.completion_tokens),
+    );
     if metrics.ttft_ms > 0 {
         state.metrics.record_time_to_first_token(
             UsageLabels {
@@ -1895,9 +1962,11 @@ fn emit_anthropic_usage_event(
                 model,
                 upstream_model,
                 provider_key_id,
+                provider_key_name: &provider_key_name,
                 api_key_id,
                 team_id: team_id.unwrap_or("unknown"),
                 user_id: user_id.unwrap_or("unknown"),
+                user_name: user_name.unwrap_or("unknown"),
             },
             Duration::from_millis(u64::from(metrics.ttft_ms)),
         );

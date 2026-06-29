@@ -41,6 +41,14 @@ pub struct ApiKey {
     #[schemars(length(min = 1))]
     pub user_id: Option<String>,
 
+    /// Readable display name of the owning member (#890 req-3). Synced by
+    /// cp-api solely so the proxy can stamp a human-readable `user_name`
+    /// metric label alongside `user_id`; never used for auth or routing.
+    /// Absent on older cp-api payloads → the metric label falls back to
+    /// `"unknown"` (DP-first rollout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+
     /// etcd-key uuid. Filled by the loader and never included in the JSON payload.
     #[serde(skip)]
     pub(crate) runtime_id: String,
@@ -157,6 +165,7 @@ mod tests {
             rate_limit: None,
             team_id: None,
             user_id: None,
+            user_name: None,
             runtime_id: String::new(),
         };
         assert!(!k.can_access("my-gpt4"));
@@ -228,12 +237,14 @@ mod tests {
               "key_hash": "{SAMPLE_HASH}",
               "allowed_models": ["gpt-4o"],
               "team_id": "team-uuid-1",
-              "user_id": "member-uuid-1"
+              "user_id": "member-uuid-1",
+              "user_name": "Alice Example"
             }}"#
         ))
         .unwrap();
         assert_eq!(k.team_id.as_deref(), Some("team-uuid-1"));
         assert_eq!(k.user_id.as_deref(), Some("member-uuid-1"));
+        assert_eq!(k.user_name.as_deref(), Some("Alice Example"));
     }
 
     #[test]
@@ -241,5 +252,6 @@ mod tests {
         let k = sample();
         assert!(k.team_id.is_none());
         assert!(k.user_id.is_none());
+        assert!(k.user_name.is_none());
     }
 }

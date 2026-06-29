@@ -33,6 +33,28 @@ pub(crate) fn provider_telemetry_tags(
         .unwrap_or_default()
 }
 
+/// Resolve the readable provider-key NAME for the #890 req-3 metric label
+/// (`provider_key_name`). Returns the ProviderKey's `display_name`
+/// (control-char stripped + length-capped via [`sanitize_tag`]) or
+/// `"unknown"` when the id is empty / unresolved / blank. 1:1 with the
+/// `provider_key_id`, so it adds no metric series. Shared by the chat +
+/// messages metric emitters so the value can't drift between handlers.
+pub(crate) fn provider_key_metric_name(snap: &AisixSnapshot, provider_key_id: &str) -> String {
+    if provider_key_id.is_empty() {
+        return "unknown".to_string();
+    }
+    let name = snap
+        .provider_keys
+        .get_by_id(provider_key_id)
+        .map(|e| sanitize_tag(e.value.display_name.clone()))
+        .unwrap_or_default();
+    if name.is_empty() {
+        "unknown".to_string()
+    } else {
+        name
+    }
+}
+
 /// Stamp the five per-PK attribution fields onto an in-progress UsageEvent,
 /// sanitising the operator-controlled tag strings (control-char strip + length
 /// cap) before they hit the wire. One source of truth for the mapping so the

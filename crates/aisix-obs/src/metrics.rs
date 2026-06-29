@@ -40,6 +40,12 @@ pub const M_LLM_REQUESTS_TOTAL: &str = "aisix_llm_requests_total";
 pub const M_LLM_REQUEST_DURATION: &str = "aisix_llm_request_duration_seconds";
 pub const M_LLM_API_LATENCY: &str = "aisix_llm_api_latency_seconds";
 pub const M_LLM_TTFT: &str = "aisix_llm_time_to_first_token_seconds";
+/// Issue #890 req-4: token volume sliced by inbound client type only — a
+/// DEDICATED low-cardinality series so the client dimension never multiplies
+/// the per-key `aisix_llm_*_tokens_total` families. `client_type` is
+/// normalised to a bounded allowlist by [`client_type_from_user_agent`]; the
+/// raw user-agent + client version stay in logs / `UsageEvent`, never here.
+pub const M_LLM_TOKENS_BY_CLIENT_TOTAL: &str = "aisix_llm_tokens_by_client_total";
 pub const M_PROXY_IN_FLIGHT: &str = "aisix_proxy_in_flight_requests";
 pub const M_PROXY_REQUESTS_TOTAL: &str = "aisix_proxy_requests_total";
 pub const M_PROXY_FAILED_REQUESTS_TOTAL: &str = "aisix_proxy_failed_requests_total";
@@ -253,9 +259,12 @@ impl Metrics {
                 "model" => labels.model.to_string(),
                 "upstream_model" => labels.upstream_model.to_string(),
                 "provider_key_id" => labels.provider_key_id.to_string(),
+                "provider_key_name" => labels.provider_key_name.to_string(),
                 "api_key_id" => labels.api_key_id.to_string(),
                 "team_id" => labels.team_id.to_string(),
                 "user_id" => labels.user_id.to_string(),
+                "user_name" => labels.user_name.to_string(),
+                "stream" => bool_str(labels.stream),
                 "status" => labels.status.to_string(),
                 "outcome" => labels.outcome.as_str().to_string(),
             )
@@ -277,9 +286,12 @@ impl Metrics {
                 "model" => labels.model.to_string(),
                 "upstream_model" => labels.upstream_model.to_string(),
                 "provider_key_id" => labels.provider_key_id.to_string(),
+                "provider_key_name" => labels.provider_key_name.to_string(),
                 "api_key_id" => labels.api_key_id.to_string(),
                 "team_id" => labels.team_id.to_string(),
                 "user_id" => labels.user_id.to_string(),
+                "user_name" => labels.user_name.to_string(),
+                "stream" => bool_str(labels.stream),
                 "status" => labels.status.to_string(),
                 "outcome" => labels.outcome.as_str().to_string(),
             )
@@ -320,11 +332,46 @@ impl Metrics {
                 "model" => labels.model.to_string(),
                 "upstream_model" => labels.upstream_model.to_string(),
                 "provider_key_id" => labels.provider_key_id.to_string(),
+                "provider_key_name" => labels.provider_key_name.to_string(),
                 "api_key_id" => labels.api_key_id.to_string(),
                 "team_id" => labels.team_id.to_string(),
                 "user_id" => labels.user_id.to_string(),
+                "user_name" => labels.user_name.to_string(),
             )
             .record(ttft.as_secs_f64());
+        });
+    }
+
+    /// #890 req-4: record token volume for the inbound `client_type` on the
+    /// dedicated [`M_LLM_TOKENS_BY_CLIENT_TOTAL`] series. `client_type` is a
+    /// `&'static str` from [`client_type_from_user_agent`] so cardinality is
+    /// bounded; zero dims are skipped to keep the series sparse.
+    pub fn record_llm_tokens_by_client(
+        &self,
+        client_type: &'static str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) {
+        if input_tokens == 0 && output_tokens == 0 {
+            return;
+        }
+        metrics::with_local_recorder(&self.inner.recorder, || {
+            if input_tokens > 0 {
+                metrics::counter!(
+                    M_LLM_TOKENS_BY_CLIENT_TOTAL,
+                    "client_type" => client_type,
+                    "token_type" => "input",
+                )
+                .increment(input_tokens);
+            }
+            if output_tokens > 0 {
+                metrics::counter!(
+                    M_LLM_TOKENS_BY_CLIENT_TOTAL,
+                    "client_type" => client_type,
+                    "token_type" => "output",
+                )
+                .increment(output_tokens);
+            }
         });
     }
 
@@ -497,6 +544,72 @@ fn status_bucket(status: u16) -> &'static str {
     }
 }
 
+/// Render a boolean metric dimension as a stable `"true"`/`"false"` label
+/// value (#890 reqs 1 & 2: `stream`, `is_fallback`).
+fn bool_str(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+/// Normalise a raw inbound `User-Agent` into a BOUNDED `client_type` label
+/// for [`M_LLM_TOKENS_BY_CLIENT_TOTAL`] (#890 req-4).
+///
+/// The result is always one of a fixed allowlist (plus `"other"` /
+/// `"unknown"`), returned as `&'static str`, so a client-controlled header
+/// can never grow prometheus cardinality. Matching is case-insensitive and
+/// substring-based, most-specific first (SDK/tool names win over the generic
+/// HTTP-library buckets, whose UA a higher-level SDK often embeds). The full
+/// user-agent and its version are preserved on the `UsageEvent`/logs — only
+/// this coarse, bounded type ever becomes a metric label.
+pub fn client_type_from_user_agent(user_agent: &str) -> &'static str {
+    let ua = user_agent.trim().to_ascii_lowercase();
+    if ua.is_empty() {
+        return "unknown";
+    }
+    // (substring, label) — ordered: products/SDKs before generic libs.
+    const TABLE: &[(&str, &str)] = &[
+        ("claude-cli", "claude-code"),
+        ("claude-code", "claude-code"),
+        ("codex", "codex"),
+        ("cline", "cline"),
+        ("aider", "aider"),
+        ("openai-python", "openai-python"),
+        ("openai/python", "openai-python"),
+        ("openai-node", "openai-node"),
+        ("openai/js", "openai-node"),
+        ("anthropic-sdk-python", "anthropic-python"),
+        ("anthropic/python", "anthropic-python"),
+        ("anthropic-sdk-typescript", "anthropic-typescript"),
+        ("anthropic/js", "anthropic-typescript"),
+        ("langchain", "langchain"),
+        ("llama-index", "llamaindex"),
+        ("llama_index", "llamaindex"),
+        ("llamaindex", "llamaindex"),
+        ("litellm", "litellm"),
+        ("curl", "curl"),
+        ("python-requests", "python-requests"),
+        ("python-httpx", "httpx"),
+        ("httpx", "httpx"),
+        ("aiohttp", "aiohttp"),
+        ("okhttp", "okhttp"),
+        ("go-http-client", "go-http-client"),
+        ("node-fetch", "node"),
+        ("undici", "node"),
+        ("axios", "node"),
+        ("postmanruntime", "postman"),
+        ("mozilla", "browser"),
+    ];
+    for (needle, label) in TABLE {
+        if ua.contains(needle) {
+            return label;
+        }
+    }
+    "other"
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RequestLabels<'a> {
     pub endpoint: &'a str,
@@ -505,9 +618,26 @@ pub struct RequestLabels<'a> {
     pub model: &'a str,
     pub upstream_model: &'a str,
     pub provider_key_id: &'a str,
+    /// Readable provider-key name (#890 req-3). 1:1 with `provider_key_id`
+    /// so it adds no new series; `"unknown"` when unresolved.
+    pub provider_key_name: &'a str,
     pub api_key_id: &'a str,
     pub team_id: &'a str,
     pub user_id: &'a str,
+    /// Readable user display name (#890 req-3). 1:1 with `user_id`;
+    /// `"unknown"` until cp-api syncs it onto the api-key config.
+    pub user_name: &'a str,
+    /// Whether the client requested a streaming (SSE) response (#890 req-1).
+    /// Emitted on the request counter AND duration histogram so a
+    /// TTFT-vs-E2E comparison can restrict the E2E latency to the same
+    /// streaming-only sample TTFT is measured on.
+    pub stream: bool,
+    /// Whether serving this request involved a fallback to a different
+    /// routing target (#890 req-2). Emitted on the request COUNTERS only
+    /// (a success-rate dimension — kept off the bucketed histograms to
+    /// avoid ×2 per latency bucket) so a success rate can exclude fallback
+    /// requests from the denominator.
+    pub is_fallback: bool,
     pub status: u16,
     pub outcome: RequestOutcome,
 }
@@ -521,9 +651,13 @@ impl Default for RequestLabels<'_> {
             model: "unknown",
             upstream_model: "unknown",
             provider_key_id: "unknown",
+            provider_key_name: "unknown",
             api_key_id: "unknown",
             team_id: "unknown",
             user_id: "unknown",
+            user_name: "unknown",
+            stream: false,
+            is_fallback: false,
             status: 0,
             outcome: RequestOutcome::UpstreamError,
         }
@@ -540,9 +674,13 @@ impl RequestLabels<'_> {
             "model" => self.model.to_string(),
             "upstream_model" => self.upstream_model.to_string(),
             "provider_key_id" => self.provider_key_id.to_string(),
+            "provider_key_name" => self.provider_key_name.to_string(),
             "api_key_id" => self.api_key_id.to_string(),
             "team_id" => self.team_id.to_string(),
             "user_id" => self.user_id.to_string(),
+            "user_name" => self.user_name.to_string(),
+            "stream" => bool_str(self.stream),
+            "is_fallback" => bool_str(self.is_fallback),
             "status" => self.status.to_string(),
             "outcome" => self.outcome.as_str().to_string(),
         )
@@ -558,9 +696,13 @@ pub struct UsageLabels<'a> {
     pub model: &'a str,
     pub upstream_model: &'a str,
     pub provider_key_id: &'a str,
+    /// Readable provider-key name (#890 req-3). 1:1 with `provider_key_id`.
+    pub provider_key_name: &'a str,
     pub api_key_id: &'a str,
     pub team_id: &'a str,
     pub user_id: &'a str,
+    /// Readable user display name (#890 req-3). 1:1 with `user_id`.
+    pub user_name: &'a str,
 }
 
 impl Default for UsageLabels<'_> {
@@ -572,9 +714,11 @@ impl Default for UsageLabels<'_> {
             model: "unknown",
             upstream_model: "unknown",
             provider_key_id: "unknown",
+            provider_key_name: "unknown",
             api_key_id: "unknown",
             team_id: "unknown",
             user_id: "unknown",
+            user_name: "unknown",
         }
     }
 }
@@ -589,9 +733,11 @@ impl UsageLabels<'_> {
             "model" => self.model.to_string(),
             "upstream_model" => self.upstream_model.to_string(),
             "provider_key_id" => self.provider_key_id.to_string(),
+            "provider_key_name" => self.provider_key_name.to_string(),
             "api_key_id" => self.api_key_id.to_string(),
             "team_id" => self.team_id.to_string(),
             "user_id" => self.user_id.to_string(),
+            "user_name" => self.user_name.to_string(),
         )
         .increment(value);
     }
@@ -612,9 +758,11 @@ impl UsageLabels<'_> {
             "model" => self.model.to_string(),
             "upstream_model" => self.upstream_model.to_string(),
             "provider_key_id" => self.provider_key_id.to_string(),
+            "provider_key_name" => self.provider_key_name.to_string(),
             "api_key_id" => self.api_key_id.to_string(),
             "team_id" => self.team_id.to_string(),
             "user_id" => self.user_id.to_string(),
+            "user_name" => self.user_name.to_string(),
         )
         .increment(micro_usd as u64);
     }
@@ -857,26 +1005,33 @@ mod tests {
             model: "gpt",
             upstream_model: "gpt-4o",
             provider_key_id: "pk-1",
+            provider_key_name: "my-openai-key",
             api_key_id: "ak-1",
             team_id: "team-1",
             user_id: "user-1",
+            user_name: "alice",
+            stream: true,
+            is_fallback: true,
             status: 200,
             outcome: RequestOutcome::Success,
+        };
+        let usage_labels = UsageLabels {
+            endpoint: "/v1/chat/completions",
+            inbound_protocol: "openai",
+            provider: "openai",
+            model: "gpt",
+            upstream_model: "gpt-4o",
+            provider_key_id: "pk-1",
+            provider_key_name: "my-openai-key",
+            api_key_id: "ak-1",
+            team_id: "team-1",
+            user_id: "user-1",
+            user_name: "alice",
         };
         m.record_proxy_request(labels, Duration::from_millis(25));
         m.record_llm_request(labels, Duration::from_millis(20));
         m.record_llm_usage(
-            UsageLabels {
-                endpoint: "/v1/chat/completions",
-                inbound_protocol: "openai",
-                provider: "openai",
-                model: "gpt",
-                upstream_model: "gpt-4o",
-                provider_key_id: "pk-1",
-                api_key_id: "ak-1",
-                team_id: "team-1",
-                user_id: "user-1",
-            },
+            usage_labels,
             LlmUsage {
                 input_tokens: 5,
                 output_tokens: 7,
@@ -884,20 +1039,7 @@ mod tests {
                 spend_usd: 0.001,
             },
         );
-        m.record_time_to_first_token(
-            UsageLabels {
-                endpoint: "/v1/chat/completions",
-                inbound_protocol: "openai",
-                provider: "openai",
-                model: "gpt",
-                upstream_model: "gpt-4o",
-                provider_key_id: "pk-1",
-                api_key_id: "ak-1",
-                team_id: "team-1",
-                user_id: "user-1",
-            },
-            Duration::from_millis(42),
-        );
+        m.record_time_to_first_token(usage_labels, Duration::from_millis(42));
 
         let rendered = m.render();
         assert!(rendered.contains(M_PROXY_REQUESTS_TOTAL));
@@ -911,6 +1053,72 @@ mod tests {
         assert!(rendered.contains("endpoint=\"/v1/chat/completions\""));
         assert!(rendered.contains("team_id=\"team-1\""));
         assert!(rendered.contains("user_id=\"user-1\""));
+        // #890 req-3: readable names ride alongside the ids (1:1).
+        assert!(rendered.contains("provider_key_name=\"my-openai-key\""));
+        assert!(rendered.contains("user_name=\"alice\""));
+        // #890 req-1/req-2: stream on counter + duration; is_fallback on
+        // the counter only (verified absent from the duration below).
+        assert!(rendered.contains("stream=\"true\""));
+        assert!(rendered.contains("is_fallback=\"true\""));
+        // is_fallback must NOT appear on the duration histogram series.
+        for line in rendered.lines() {
+            if line.starts_with(M_LLM_REQUEST_DURATION)
+                || line.starts_with(M_PROXY_REQUEST_DURATION)
+            {
+                assert!(
+                    !line.contains("is_fallback="),
+                    "is_fallback must stay off the duration histogram: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tokens_by_client_records_bounded_client_type() {
+        let m = Metrics::new(false);
+        m.record_llm_tokens_by_client("openai-python", 100, 40);
+        m.record_llm_tokens_by_client("openai-python", 10, 0);
+        // Zero/zero is a no-op (keeps the series sparse).
+        m.record_llm_tokens_by_client("curl", 0, 0);
+        let rendered = m.render();
+        assert!(rendered.contains(M_LLM_TOKENS_BY_CLIENT_TOTAL));
+        assert!(rendered.contains("client_type=\"openai-python\""));
+        assert!(rendered.contains("token_type=\"input\""));
+        assert!(rendered.contains("token_type=\"output\""));
+        // The zero/zero curl call recorded nothing.
+        assert!(!rendered.contains("client_type=\"curl\""));
+    }
+
+    #[test]
+    fn client_type_from_user_agent_normalises_to_allowlist() {
+        // Known SDKs/tools normalise to a stable bounded label.
+        assert_eq!(
+            client_type_from_user_agent("OpenAI/Python 1.30.1"),
+            "openai-python"
+        );
+        assert_eq!(
+            client_type_from_user_agent("openai-node/4.20.0"),
+            "openai-node"
+        );
+        assert_eq!(
+            client_type_from_user_agent("claude-cli/1.2.3"),
+            "claude-code"
+        );
+        assert_eq!(client_type_from_user_agent("curl/8.4.0"), "curl");
+        // Version differences collapse to the SAME bounded type — no
+        // per-version cardinality blowup.
+        assert_eq!(
+            client_type_from_user_agent("OpenAI/Python 1.0.0"),
+            client_type_from_user_agent("OpenAI/Python 2.99.9"),
+        );
+        // Empty → unknown; unrecognised → other (the only unbounded inputs
+        // both collapse into bounded buckets).
+        assert_eq!(client_type_from_user_agent(""), "unknown");
+        assert_eq!(client_type_from_user_agent("   "), "unknown");
+        assert_eq!(
+            client_type_from_user_agent("SomeRandomBespokeClient/9.9"),
+            "other"
+        );
     }
 
     #[test]
