@@ -95,8 +95,11 @@ mod tests {
                 "clientInfo": { "name": "endpoint-test", "version": "0.1" }
             }
         });
+        // A non-loopback Host on purpose: proves the gateway accepts the
+        // deployment's real DNS name (rmcp's default Host allowlist is disabled
+        // for this key-authenticated endpoint).
         let mut builder = HttpRequest::post("/mcp")
-            .header("host", "localhost")
+            .header("host", "mcp.aisix.example.com")
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream");
         if let Some(token) = auth {
@@ -127,6 +130,50 @@ mod tests {
             .await
             .expect("router responds");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_gates_non_post_methods() {
+        // The route is `any(...)`, so every method must be auth-gated — a GET
+        // with no key must 401 (not fall through to rmcp's 405).
+        let router = router_with(snapshot_with_key());
+        let req = HttpRequest::get("/mcp")
+            .header("host", "mcp.aisix.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.expect("router responds");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn trailing_slash_route_is_auth_gated() {
+        let router = router_with(snapshot_with_key());
+        let req = HttpRequest::post("/mcp/")
+            .header("host", "mcp.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = router.oneshot(req).await.expect("router responds");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn oversized_unauthenticated_body_is_limited_before_handler() {
+        // A declared Content-Length over the cap is rejected (413) by the
+        // body-limit layer, which wraps the route — before auth or the handler,
+        // so an oversized unauthenticated body can't pin resources.
+        let router = router_with(snapshot_with_key());
+        let big = "a".repeat(1_048_577); // cfg() cap is 1 MiB
+        let req = HttpRequest::post("/mcp")
+            .header("host", "mcp.aisix.example.com")
+            .header("content-type", "application/json")
+            .header("content-length", big.len().to_string())
+            .body(Body::from(big))
+            .unwrap();
+        let resp = router.oneshot(req).await.expect("router responds");
+        let status = resp.status();
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "got {status}");
     }
 
     #[tokio::test]

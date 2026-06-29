@@ -221,6 +221,15 @@ pub fn streamable_http_service(
     let mut config = StreamableHttpServerConfig::default();
     config.stateful_mode = false;
     config.json_response = true;
+    // Disable rmcp's `Host`-header allowlist. Its default
+    // (`localhost`/`127.0.0.1`/`::1`) is a DNS-rebinding guard for
+    // browser-driven local servers — it 403s every request whose `Host` is
+    // the deployment's real DNS name. This endpoint is not browser-driven: it
+    // is reached server-to-server by agents and is gated by the AISIX API key,
+    // which is the real access control. An empty allowlist accepts any `Host`;
+    // the request is still authenticated upstream of this service. (Operators
+    // who want Host pinning can layer it at their ingress.)
+    config.allowed_hosts = Vec::new();
     StreamableHttpService::new(
         move || Ok(gateway.clone()),
         Arc::new(LocalSessionManager::default()),
