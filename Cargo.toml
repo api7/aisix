@@ -4,6 +4,7 @@ members = [
     "crates/aisix-core",
     "crates/aisix-etcd",
     "crates/aisix-gateway",
+    "crates/aisix-mcp",
     "crates/aisix-provider-openai",
     "crates/aisix-provider-anthropic",
     "crates/aisix-provider-vertex",

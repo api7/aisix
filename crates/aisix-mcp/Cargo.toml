@@ -1,0 +1,48 @@
+[package]
+name = "aisix-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "aisix: MCP gateway — upstream MCP server client (Streamable HTTP) behind the McpBridge trait"
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+# Official MCP Rust SDK. Pinned exactly: rmcp is <16 months old and still
+# ships breaking changes on a roughly-monthly cadence, so we hold a fixed
+# version and keep all rmcp types behind this crate's `McpBridge` trait to
+# absorb API drift. Production only needs the upstream-facing client; the
+# server side (used to stand up a real MCP server in tests, and later for the
+# DP `/mcp` endpoint) is a dev-dependency so the gateway binary does not link
+# it yet.
+[dependencies.rmcp]
+version = "=1.8.0"
+default-features = false
+features = [
+    "client",
+    "base64",
+    "transport-streamable-http-client",
+    "transport-streamable-http-client-reqwest",
+]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+axum.workspace = true
+
+# Server-side rmcp, dev-only: lets the integration test stand up a real MCP
+# server over real Streamable HTTP (no mock transport) for the client to talk
+# to end-to-end.
+[dev-dependencies.rmcp]
+version = "=1.8.0"
+default-features = false
+features = [
+    "server",
+    "transport-streamable-http-server",
+]
