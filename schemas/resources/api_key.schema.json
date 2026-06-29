@@ -80,6 +80,16 @@
       },
       "type": "array"
     },
+    "allowed_tools": {
+      "description": "MCP tools this key may call, as namespaced `<server>__<tool>` names (the form the gateway exposes). A wildcard entry `\"*\"` grants every tool. When omitted, the key has no MCP tool access — access is granted explicitly, matching `allowed_models`.",
+      "items": {
+        "type": "string"
+      },
+      "type": [
+        "array",
+        "null"
+      ]
+    },
     "key_hash": {
       "description": "SHA-256 hexadecimal hash of the plaintext bearer. The proxy hashes incoming bearer tokens before lookup.",
       "minLength": 1,

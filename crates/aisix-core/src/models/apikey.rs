@@ -49,6 +49,13 @@ pub struct ApiKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_name: Option<String>,
 
+    /// MCP tools this key may call, as namespaced `<server>__<tool>` names
+    /// (the form the gateway exposes). A wildcard entry `"*"` grants every
+    /// tool. When omitted, the key has no MCP tool access — access is granted
+    /// explicitly, matching `allowed_models`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+
     /// etcd-key uuid. Filled by the loader and never included in the JSON payload.
     #[serde(skip)]
     pub(crate) runtime_id: String,
@@ -76,6 +83,19 @@ impl ApiKey {
         self.allowed_models
             .iter()
             .any(|n| n == "*" || n == model_name)
+    }
+
+    /// True if this key may call the given MCP tool, named in the gateway's
+    /// namespaced `<server>__<tool>` form.
+    ///
+    /// A wildcard entry `"*"` grants every tool. A key with no `allowed_tools`
+    /// (or an empty list) may call no MCP tools — access is granted explicitly,
+    /// matching [`ApiKey::can_access`].
+    pub fn can_access_tool(&self, tool: &str) -> bool {
+        match &self.allowed_tools {
+            None => false,
+            Some(allowed) => allowed.iter().any(|t| t == "*" || t == tool),
+        }
     }
 
     /// Iterate over the names of models this key may access, filtering
@@ -166,10 +186,39 @@ mod tests {
             team_id: None,
             user_id: None,
             user_name: None,
+            allowed_tools: None,
             runtime_id: String::new(),
         };
         assert!(!k.can_access("my-gpt4"));
         assert!(!k.can_access("anything"));
+    }
+
+    #[test]
+    fn can_access_tool_enforces_namespaced_allowlist() {
+        // No `allowed_tools` configured → no MCP tool access.
+        let none: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_models":["*"]}"#).unwrap();
+        assert!(!none.can_access_tool("github__create_issue"));
+
+        // Empty list also denies everything.
+        let empty: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_models":[],"allowed_tools":[]}"#)
+                .unwrap();
+        assert!(!empty.can_access_tool("github__create_issue"));
+
+        // Exact namespaced names.
+        let specific: ApiKey = serde_json::from_str(
+            r#"{"key_hash":"h","allowed_models":[],"allowed_tools":["github__create_issue"]}"#,
+        )
+        .unwrap();
+        assert!(specific.can_access_tool("github__create_issue"));
+        assert!(!specific.can_access_tool("github__delete_repo"));
+
+        // Wildcard grants every tool.
+        let wildcard: ApiKey =
+            serde_json::from_str(r#"{"key_hash":"h","allowed_models":[],"allowed_tools":["*"]}"#)
+                .unwrap();
+        assert!(wildcard.can_access_tool("anything__at_all"));
     }
 
     #[test]

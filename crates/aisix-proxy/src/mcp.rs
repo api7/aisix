@@ -24,12 +24,15 @@ use crate::state::ProxyState;
 /// AISIX API key (responding `401` otherwise); the request is then handled by an
 /// MCP gateway built from the current snapshot's `mcp_servers`.
 pub async fn mcp_endpoint(
-    _auth: AuthenticatedKey,
+    auth: AuthenticatedKey,
     State(state): State<ProxyState>,
     request: Request,
 ) -> Response {
     let snapshot = state.snapshot.load();
-    let gateway = aisix_mcp::McpGateway::from_snapshot(&snapshot);
+    // Scope the gateway to the tools this caller's key permits, so MCP tool
+    // access is governed by the same key object as LLM access.
+    let acl = aisix_mcp::ToolAcl::from_allowed(auth.key().allowed_tools.as_deref());
+    let gateway = aisix_mcp::McpGateway::from_snapshot(&snapshot).with_tool_acl(acl);
     let service = aisix_mcp::streamable_http_service(gateway);
     // `StreamableHttpService` is a tower service that dispatches on method and
     // never fails (`Error = Infallible`); map its boxed body back to axum's.

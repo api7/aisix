@@ -22,4 +22,4 @@ pub use bridge::{
     McpUpstream, RmcpBridge,
 };
 pub use error::McpError;
-pub use gateway::{streamable_http_service, McpGateway, TOOL_NAMESPACE_SEPARATOR};
+pub use gateway::{streamable_http_service, McpGateway, ToolAcl, TOOL_NAMESPACE_SEPARATOR};

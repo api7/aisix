@@ -175,7 +175,11 @@ async fn apikeys_round_trip_through_real_etcd() {
     admin_crud_round_trip(
         state,
         "/admin/v1/apikeys",
-        json!({"key_hash": key_hash, "allowed_models": ["it-gpt4"]}),
+        json!({
+            "key_hash": key_hash,
+            "allowed_models": ["it-gpt4"],
+            "allowed_tools": ["github__create_issue", "*"]
+        }),
     )
     .await;
 }

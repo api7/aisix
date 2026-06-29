@@ -32,6 +32,10 @@ struct StandaloneApiKeyBody {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     rate_limit: Option<aisix_core::models::RateLimit>,
+    /// MCP tools this key may call (namespaced `<server>__<tool>`, or `"*"`).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -40,6 +44,8 @@ pub struct PublicApiKey {
     pub allowed_models: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<aisix_core::models::RateLimit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 impl From<ApiKey> for PublicApiKey {
@@ -48,6 +54,7 @@ impl From<ApiKey> for PublicApiKey {
             key_hash: value.key_hash,
             allowed_models: value.allowed_models,
             rate_limit: value.rate_limit,
+            allowed_tools: value.allowed_tools,
         }
     }
 }

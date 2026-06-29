@@ -50,12 +50,45 @@ struct NamedUpstream {
     bridge: Arc<dyn McpBridge>,
 }
 
+/// Which tools a gateway instance may expose and call, in the namespaced
+/// `<server>__<tool>` form. Built per request from the caller's API key so MCP
+/// tool access is governed by the same key object as LLM access.
+#[derive(Clone)]
+pub enum ToolAcl {
+    /// No restriction — every aggregated tool is exposed.
+    AllowAll,
+    /// Only these namespaced tool names are exposed; any other is hidden from
+    /// `tools/list` and rejected by `tools/call`.
+    Allow(std::collections::HashSet<String>),
+}
+
+impl ToolAcl {
+    /// Build an ACL from an API key's `allowed_tools` list: `None` or an empty
+    /// list grants no tools; a list containing `"*"` grants all; otherwise the
+    /// exact namespaced set. Mirrors `ApiKey::can_access_tool`.
+    pub fn from_allowed(allowed: Option<&[String]>) -> Self {
+        match allowed {
+            Some(list) if list.iter().any(|t| t == "*") => Self::AllowAll,
+            Some(list) => Self::Allow(list.iter().cloned().collect()),
+            None => Self::Allow(std::collections::HashSet::new()),
+        }
+    }
+
+    fn permits(&self, namespaced_tool: &str) -> bool {
+        match self {
+            Self::AllowAll => true,
+            Self::Allow(set) => set.contains(namespaced_tool),
+        }
+    }
+}
+
 /// Aggregates N upstream MCP servers behind one downstream MCP server surface.
 /// Cheap to clone (the upstream set is shared); the Streamable HTTP transport
 /// clones it per session.
 #[derive(Clone)]
 pub struct McpGateway {
     upstreams: Arc<[NamedUpstream]>,
+    tool_acl: ToolAcl,
 }
 
 impl McpGateway {
@@ -86,7 +119,16 @@ impl McpGateway {
         }
         Self {
             upstreams: deduped.into(),
+            tool_acl: ToolAcl::AllowAll,
         }
+    }
+
+    /// Scope this gateway to a per-tool [`ToolAcl`]: `tools/list` returns only
+    /// permitted tools and `tools/call` rejects the rest. The mount builds this
+    /// from the caller's API key.
+    pub fn with_tool_acl(mut self, acl: ToolAcl) -> Self {
+        self.tool_acl = acl;
+        self
     }
 
     /// Build a gateway whose upstreams are the **enabled** `mcp_servers` in the
@@ -149,6 +191,8 @@ impl ServerHandler for McpGateway {
                 }
             }
         }
+        // Per-tool ACL: expose only the tools this caller's key permits.
+        tools.retain(|tool| self.tool_acl.permits(tool.name.as_ref()));
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -169,6 +213,17 @@ impl ServerHandler for McpGateway {
                     None,
                 )
             })?;
+
+        // Per-tool ACL: reject a call the caller's key doesn't permit. A
+        // disallowed tool is also absent from `tools/list`, so this is
+        // defense-in-depth; the message stays neutral and does not reveal
+        // whether the tool exists upstream.
+        if !self.tool_acl.permits(request.name.as_ref()) {
+            return Err(ErrorData::invalid_params(
+                format!("tool '{}' is not available", request.name),
+                None,
+            ));
+        }
 
         let bridge = self.find(server).ok_or_else(|| {
             ErrorData::invalid_params(format!("unknown MCP server '{server}'"), None)

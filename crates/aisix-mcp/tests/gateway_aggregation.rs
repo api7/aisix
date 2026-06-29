@@ -16,7 +16,7 @@ use std::sync::Arc;
 use aisix_core::{AisixSnapshot, McpServer, ResourceEntry};
 use aisix_mcp::{
     streamable_http_service, upstream_from_mcp_server, McpAuth, McpBridge, McpError, McpGateway,
-    McpTool, McpToolResult, McpUpstream, RmcpBridge,
+    McpTool, McpToolResult, McpUpstream, RmcpBridge, ToolAcl,
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, ErrorData, ListToolsResult,
@@ -363,6 +363,62 @@ async fn from_snapshot_sources_only_enabled_upstreams() {
         .await
         .expect("call");
     assert_eq!(first_text(&result), "alpha:hi");
+}
+
+#[test]
+fn tool_acl_from_allowed_semantics() {
+    // No allowed_tools / empty → deny all.
+    assert!(matches!(ToolAcl::from_allowed(None), ToolAcl::Allow(ref s) if s.is_empty()));
+    assert!(matches!(ToolAcl::from_allowed(Some(&[])), ToolAcl::Allow(ref s) if s.is_empty()));
+    // Wildcard → allow all.
+    assert!(matches!(
+        ToolAcl::from_allowed(Some(&["*".to_string()])),
+        ToolAcl::AllowAll
+    ));
+    // Exact set.
+    assert!(matches!(
+        ToolAcl::from_allowed(Some(&["a__b".to_string()])),
+        ToolAcl::Allow(_)
+    ));
+}
+
+#[tokio::test]
+async fn tool_acl_filters_list_and_rejects_calls() {
+    // Two real upstreams; the key permits only alpha's tool.
+    let gateway = McpGateway::new([
+        ("alpha".to_string(), bridge_to("alpha").await),
+        ("beta".to_string(), bridge_to("beta").await),
+    ])
+    .with_tool_acl(ToolAcl::from_allowed(Some(&["alpha__echo".to_string()])));
+    let gw_addr = spawn_gateway(gateway).await;
+    let client = ()
+        .serve(StreamableHttpClientTransport::from_uri(format!(
+            "http://{gw_addr}/mcp"
+        )))
+        .await
+        .expect("connect");
+
+    // tools/list exposes only the permitted tool — beta's is hidden.
+    let tools = client.list_all_tools().await.expect("list tools");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert_eq!(
+        names,
+        vec!["alpha__echo"],
+        "ACL must hide non-permitted tools"
+    );
+
+    // The permitted tool is callable.
+    let allowed = client
+        .call_tool(call("alpha__echo", "hi"))
+        .await
+        .expect("permitted call");
+    assert_eq!(first_text(&allowed), "alpha:hi");
+
+    // A non-permitted tool is rejected (defense-in-depth), not routed upstream.
+    assert!(
+        client.call_tool(call("beta__echo", "hi")).await.is_err(),
+        "non-permitted tool call must be rejected"
+    );
 }
 
 /// Build a `tools/call` for `name` with a single `text` argument.
