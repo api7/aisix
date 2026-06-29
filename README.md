@@ -94,7 +94,8 @@ Covered by 90+ E2E tests.
   failover, retry budgets, cooldowns, and per-attempt timeouts.
 - **Semantic routing** — one virtual model that dispatches by the *meaning* of each
   request: it embeds the prompt, scores it against per-route example utterances, and routes
-  to the best match (or a default). See [docs/semantic-routing.md](docs/semantic-routing.md).
+  to the best match (or a default). See the
+  [semantic routing docs](https://docs.api7.ai/ai-gateway/routing-and-resilience/semantic-routing).
 - **Rate limiting & concurrency** — RPM/RPD + TPM/TPD + concurrency caps, AND-combined
   across `ApiKey`, `Model`, and policy scopes (`api_key` / `model` / `team` / `member`).
 - **Guardrails** — content-policy enforcement on input and output: keyword/regex

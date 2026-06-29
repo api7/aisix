@@ -88,6 +88,14 @@ After every `gh pr create` or force-push, spawn a fresh `general-purpose` Agent 
 
 Output HIGH/MEDIUM/LOW per finding with **concrete suggested code**, not vague "consider". **Merge gate:** every HIGH and MEDIUM is either fixed in code or explicitly justified in the PR (e.g. "feature gap, filed as #N, agreed not to block"); silent merge is not enough. For findings that surface gateway/product-behavior gaps, file separate issues and link them. Self-review misses the author's blind spots — an independent agent catches them.
 
+## Documentation Lives in api7/docs
+
+**User-facing documentation is maintained in the `api7/docs` repository (published to <https://docs.api7.ai/ai-gateway/>), not in this repo.**
+
+- This repo's source tree intentionally carries **no** user-facing doc pages — they were migrated to `api7/docs` so one site stays authoritative and never drifts from a stale in-repo copy. Do not add or keep prose docs under `docs/` here.
+- When a feature needs documentation, add or update the page in `api7/docs` and link to its `docs.api7.ai` URL (e.g. from the README) — never re-introduce a `docs/*.md` page in this repo, even temporarily or "just for now".
+- Only user-facing *prose* moves out. Code-level doc comments stay with the code — including the generated API reference below.
+
 ## Generated API Documentation
 
 **Some source comments are rendered into user-facing API references.**
