@@ -111,6 +111,13 @@
         "string",
         "null"
       ]
+    },
+    "user_name": {
+      "description": "Readable display name of the owning member (#890 req-3). Synced by cp-api solely so the proxy can stamp a human-readable `user_name` metric label alongside `user_id`; never used for auth or routing. Absent on older cp-api payloads → the metric label falls back to `\"unknown\"` (DP-first rollout).",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [
