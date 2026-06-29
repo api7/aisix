@@ -46,3 +46,4 @@ features = [
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 axum.workspace = true
+async-trait.workspace = true
