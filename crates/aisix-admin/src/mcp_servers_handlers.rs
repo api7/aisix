@@ -7,7 +7,7 @@
 
 use aisix_core::models::validate_mcp_server;
 use aisix_core::resource::ResourceEntry;
-use aisix_core::McpServer;
+use aisix_core::{McpAuthType, McpServer};
 use axum::extract::{Path, State};
 use axum::Json;
 use serde_json::Value;
@@ -102,6 +102,13 @@ fn decode(raw: &Value) -> Result<McpServer, AdminError> {
             "display_name must not contain the reserved separator `{TOOL_NAMESPACE_SEPARATOR}`"
         )));
     }
+    if matches!(server.auth_type, McpAuthType::Bearer)
+        && server.secret.as_deref().unwrap_or_default().is_empty()
+    {
+        return Err(AdminError::BadRequest(
+            "secret is required and must be non-empty when auth_type is `bearer`".to_string(),
+        ));
+    }
     Ok(server)
 }
 
@@ -116,4 +123,41 @@ fn assert_unique_display_name(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn decode_rejects_separator_in_display_name() {
+        let err = decode(&json!({"display_name": "a__b", "url": "https://x/mcp"}))
+            .expect_err("`__` in display_name must be rejected");
+        assert!(matches!(err, AdminError::BadRequest(_)));
+    }
+
+    #[test]
+    fn decode_rejects_bearer_without_secret() {
+        let err = decode(&json!({
+            "display_name": "gh",
+            "url": "https://x/mcp",
+            "auth_type": "bearer"
+        }))
+        .expect_err("bearer auth without a secret must be rejected");
+        assert!(matches!(err, AdminError::BadRequest(_)));
+    }
+
+    #[test]
+    fn decode_accepts_valid_server() {
+        let server = decode(&json!({
+            "display_name": "github",
+            "url": "https://api.example.com/mcp",
+            "auth_type": "bearer",
+            "secret": "tok"
+        }))
+        .expect("valid server should decode");
+        assert_eq!(server.display_name, "github");
+        assert_eq!(server.secret.as_deref(), Some("tok"));
+    }
 }
