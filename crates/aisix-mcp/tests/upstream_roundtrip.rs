@@ -59,6 +59,10 @@ impl ServerHandler for EchoServer {
             .and_then(|m| m.get("text"))
             .and_then(|v| v.as_str())
             .unwrap_or_default();
+        // A `sleep` argument lets the timeout test drive a slow upstream.
+        if text == "sleep" {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
@@ -141,9 +145,9 @@ async fn lists_and_calls_tools_over_streamable_http() {
         .await
         .expect("call echo tool");
     assert!(!result.is_error, "echo should not be a tool error");
-    assert!(
-        result.content.to_string().contains("hello mcp"),
-        "echoed content should carry the input, got: {}",
+    assert_eq!(
+        result.content[0]["text"], "hello mcp",
+        "echoed text block should equal the input, got: {}",
         result.content
     );
 
@@ -175,4 +179,23 @@ async fn forwards_gateway_held_bearer_to_upstream() {
     let tools = bridge.list_tools().await.expect("list tools");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name, "echo");
+}
+
+#[tokio::test]
+async fn upstream_call_times_out_instead_of_hanging() {
+    let addr = spawn_echo_server(None).await;
+    let upstream = McpUpstream::new(format!("http://{addr}/mcp"))
+        .with_timeout(std::time::Duration::from_millis(200));
+    let bridge = RmcpBridge::connect(&upstream).await.expect("connect");
+
+    // The server sleeps 2s on this call; the 200ms deadline must fire first.
+    let started = std::time::Instant::now();
+    let result = bridge
+        .call_tool("echo", serde_json::json!({ "text": "sleep" }))
+        .await;
+    assert!(result.is_err(), "a call exceeding the deadline must error");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "call should give up at the ~200ms deadline, not wait out the 2s server sleep"
+    );
 }

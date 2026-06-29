@@ -11,6 +11,8 @@
 //! the rest of the data plane never depends on the SDK directly. That keeps
 //! rmcp's still-moving API contained to this file.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
@@ -20,13 +22,19 @@ use rmcp::ServiceExt;
 
 use crate::error::McpError;
 
+/// Default deadline for a single upstream operation (connect / list / call).
+/// rmcp's high-level client sets no request timeout and reqwest has no default
+/// one, so without this a hung or slow upstream pins the gateway request task
+/// indefinitely. Overridable per upstream via [`McpUpstream::with_timeout`].
+pub const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How the gateway authenticates to an upstream MCP server. The credential is
 /// held here on the gateway side and is never exposed to the calling agent —
 /// the agent presents only its AISIX key. The MCP authorization spec
 /// (2025-11-25) also requires that a downstream client token is never passed
 /// through to the upstream; a Bearer set here is a distinct, gateway-held
 /// credential.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum McpAuth {
     /// No upstream auth — the server is reachable as-is.
     None,
@@ -35,22 +43,49 @@ pub enum McpAuth {
     Bearer(String),
 }
 
+// Hand-written so the gateway-held token never lands in logs via `{:?}`. This
+// crate is the credential holder; a derived `Debug` would print the bearer in
+// plaintext the moment any caller logs an upstream.
+impl std::fmt::Debug for McpAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            McpAuth::None => f.write_str("None"),
+            McpAuth::Bearer(_) => f.write_str("Bearer(***redacted***)"),
+        }
+    }
+}
+
 /// Connection parameters for a single upstream MCP server.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct McpUpstream {
     /// The server's Streamable HTTP MCP endpoint, e.g.
     /// `https://api.example.com/mcp`.
     pub url: String,
     /// Upstream authentication, held gateway-side.
     pub auth: McpAuth,
+    /// Per-operation deadline. Defaults to [`DEFAULT_UPSTREAM_TIMEOUT`].
+    pub timeout: Duration,
+}
+
+// Manual so a `Bearer` token cannot leak through `McpUpstream`'s `Debug`
+// (delegates to the redacting `McpAuth` impl above).
+impl std::fmt::Debug for McpUpstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpUpstream")
+            .field("url", &self.url)
+            .field("auth", &self.auth)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl McpUpstream {
-    /// Build an unauthenticated upstream.
+    /// Build an unauthenticated upstream with the default timeout.
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
             auth: McpAuth::None,
+            timeout: DEFAULT_UPSTREAM_TIMEOUT,
         }
     }
 
@@ -59,9 +94,19 @@ impl McpUpstream {
         self.auth = McpAuth::Bearer(token.into());
         self
     }
+
+    /// Override the per-operation deadline.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
 }
 
 /// One tool advertised by an upstream server, normalised off the wire shape.
+///
+/// Minimal for this step: tool annotations (`readOnlyHint` / `destructiveHint`)
+/// and `output_schema` are dropped here and will be carried when the per-tool
+/// ACL / guardrail layer (DP-4) needs them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct McpTool {
     /// The tool's name, as the upstream advertises it (no gateway prefix yet).
@@ -79,6 +124,9 @@ pub struct McpToolResult {
     /// resource links, …). Left as raw JSON here; the downstream endpoint
     /// shapes it for the agent.
     pub content: serde_json::Value,
+    /// The tool's structured result, when it returns one (MCP `structuredContent`).
+    /// A tool may return only structured content with an empty `content` array.
+    pub structured_content: Option<serde_json::Value>,
     /// Whether the upstream flagged this result as a tool-level error.
     pub is_error: bool,
 }
@@ -105,11 +153,13 @@ pub trait McpBridge: Send + Sync {
 /// upstream. Dropping it tears the session down.
 pub struct RmcpBridge {
     running: RunningService<RoleClient, ()>,
+    timeout: Duration,
 }
 
 impl RmcpBridge {
     /// Open a session to `upstream`: build the Streamable HTTP transport
-    /// (injecting gateway-held auth) and run the `initialize` handshake.
+    /// (injecting gateway-held auth) and run the `initialize` handshake,
+    /// bounded by the upstream's timeout.
     pub async fn connect(upstream: &McpUpstream) -> Result<Self, McpError> {
         let transport = match &upstream.auth {
             McpAuth::None => StreamableHttpClientTransport::from_uri(upstream.url.clone()),
@@ -118,18 +168,23 @@ impl RmcpBridge {
                     .auth_header(token.clone()),
             ),
         };
-        let running = ().serve(transport).await.map_err(|e| McpError::Connect(e.to_string()))?;
-        Ok(Self { running })
+        let running = tokio::time::timeout(upstream.timeout, ().serve(transport))
+            .await
+            .map_err(|_| McpError::Connect("upstream MCP connect timed out".to_string()))?
+            .map_err(|e| McpError::Connect(e.to_string()))?;
+        Ok(Self {
+            running,
+            timeout: upstream.timeout,
+        })
     }
 }
 
 #[async_trait]
 impl McpBridge for RmcpBridge {
     async fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
-        let result = self
-            .running
-            .list_tools(None)
+        let result = tokio::time::timeout(self.timeout, self.running.list_tools(None))
             .await
+            .map_err(|_| McpError::Request("upstream tools/list timed out".to_string()))?
             .map_err(|e| McpError::Request(e.to_string()))?;
         Ok(result.tools.into_iter().map(into_mcp_tool).collect())
     }
@@ -149,15 +204,15 @@ impl McpBridge for RmcpBridge {
                 ))
             }
         };
-        let result = self
-            .running
-            .call_tool(params)
+        let result = tokio::time::timeout(self.timeout, self.running.call_tool(params))
             .await
+            .map_err(|_| McpError::Request("upstream tools/call timed out".to_string()))?
             .map_err(|e| McpError::Request(e.to_string()))?;
         let content = serde_json::to_value(&result.content)
             .map_err(|e| McpError::Request(format!("failed to encode tool result: {e}")))?;
         Ok(McpToolResult {
             content,
+            structured_content: result.structured_content,
             is_error: result.is_error.unwrap_or(false),
         })
     }

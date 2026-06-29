@@ -30,6 +30,12 @@ features = [
     "base64",
     "transport-streamable-http-client",
     "transport-streamable-http-client-reqwest",
+    # `transport-streamable-http-client-reqwest` only wires `dep:reqwest`
+    # with NO TLS backend; rmcp gates rustls behind its separate `reqwest`
+    # feature (`reqwest?/rustls`). Without this, `https://` upstreams — i.e.
+    # every real authenticated upstream — fail to connect. rustls matches the
+    # workspace TLS posture (reqwest 0.12 already uses rustls-tls elsewhere).
+    "reqwest",
 ]
 
 [dev-dependencies]
