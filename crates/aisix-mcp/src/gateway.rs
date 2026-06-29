@@ -35,7 +35,9 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{RoleServer, ServerHandler};
 
-use crate::bridge::McpBridge;
+use aisix_core::AisixSnapshot;
+
+use crate::bridge::{upstream_from_mcp_server, EphemeralBridge, McpBridge};
 
 /// Separator between an upstream server's registered name and a tool name in
 /// the aggregated namespace, e.g. `github__create_issue`. Server names must
@@ -85,6 +87,26 @@ impl McpGateway {
         Self {
             upstreams: deduped.into(),
         }
+    }
+
+    /// Build a gateway whose upstreams are the **enabled** `mcp_servers` in the
+    /// snapshot, each reached through an [`EphemeralBridge`] (connect per
+    /// request). Disabled servers are skipped. Registration order follows the
+    /// snapshot's iteration order; duplicate display_names are deduped (first
+    /// wins) by [`McpGateway::new`], though the Admin API already enforces
+    /// uniqueness.
+    pub fn from_snapshot(snapshot: &AisixSnapshot) -> Self {
+        let upstreams = snapshot
+            .mcp_servers
+            .entries()
+            .into_iter()
+            .filter(|entry| entry.value.enabled)
+            .map(|entry| {
+                let upstream = upstream_from_mcp_server(&entry.value);
+                let bridge: Arc<dyn McpBridge> = Arc::new(EphemeralBridge::new(upstream));
+                (entry.value.display_name.clone(), bridge)
+            });
+        McpGateway::new(upstreams)
     }
 
     fn find(&self, server: &str) -> Option<&Arc<dyn McpBridge>> {

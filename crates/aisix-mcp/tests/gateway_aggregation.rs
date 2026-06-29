@@ -13,9 +13,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use aisix_core::{AisixSnapshot, McpServer, ResourceEntry};
 use aisix_mcp::{
-    streamable_http_service, McpBridge, McpError, McpGateway, McpTool, McpToolResult, McpUpstream,
-    RmcpBridge,
+    streamable_http_service, upstream_from_mcp_server, McpAuth, McpBridge, McpError, McpGateway,
+    McpTool, McpToolResult, McpUpstream, RmcpBridge,
 };
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Content, ErrorData, ListToolsResult,
@@ -286,6 +287,82 @@ async fn duplicate_upstream_name_keeps_first() {
         "first:hi",
         "should route to first registration"
     );
+}
+
+#[test]
+fn upstream_from_mcp_server_maps_auth_and_timeout() {
+    let server: McpServer = serde_json::from_value(serde_json::json!({
+        "display_name": "gh",
+        "url": "https://api.example.com/mcp",
+        "auth_type": "bearer",
+        "secret": "tok",
+        "timeout_ms": 1234
+    }))
+    .unwrap();
+    let upstream = upstream_from_mcp_server(&server);
+    assert_eq!(upstream.url, "https://api.example.com/mcp");
+    assert_eq!(upstream.timeout, std::time::Duration::from_millis(1234));
+    assert!(matches!(upstream.auth, McpAuth::Bearer(ref t) if t == "tok"));
+
+    // `none` auth and absent timeout fall back to defaults.
+    let plain: McpServer = serde_json::from_value(serde_json::json!({
+        "display_name": "x", "url": "https://x/mcp"
+    }))
+    .unwrap();
+    assert!(matches!(
+        upstream_from_mcp_server(&plain).auth,
+        McpAuth::None
+    ));
+}
+
+/// Build a snapshot resource entry for an upstream at `addr`.
+fn mcp_entry(id: &str, name: &str, addr: &SocketAddr, enabled: bool) -> ResourceEntry<McpServer> {
+    let server: McpServer = serde_json::from_value(serde_json::json!({
+        "display_name": name,
+        "url": format!("http://{addr}/mcp"),
+        "enabled": enabled
+    }))
+    .unwrap();
+    ResourceEntry::new(id, server, 1)
+}
+
+#[tokio::test]
+async fn from_snapshot_sources_only_enabled_upstreams() {
+    let alpha = spawn_upstream("alpha").await;
+    let beta = spawn_upstream("beta").await;
+
+    let snapshot = AisixSnapshot::new();
+    snapshot
+        .mcp_servers
+        .insert(mcp_entry("e1", "alpha", &alpha, true));
+    snapshot
+        .mcp_servers
+        .insert(mcp_entry("e2", "beta", &beta, false)); // disabled
+
+    let gw_addr = spawn_gateway(McpGateway::from_snapshot(&snapshot)).await;
+    let client = ()
+        .serve(StreamableHttpClientTransport::from_uri(format!(
+            "http://{gw_addr}/mcp"
+        )))
+        .await
+        .expect("connect");
+
+    // Only the enabled server's tool is aggregated.
+    let tools = client.list_all_tools().await.expect("list tools");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert_eq!(
+        tools.len(),
+        1,
+        "disabled upstream must be skipped: {names:?}"
+    );
+    assert_eq!(names[0], "alpha__echo");
+
+    // And it routes correctly (ephemeral connect per call).
+    let result = client
+        .call_tool(call("alpha__echo", "hi"))
+        .await
+        .expect("call");
+    assert_eq!(first_text(&result), "alpha:hi");
 }
 
 /// Build a `tools/call` for `name` with a single `text` argument.

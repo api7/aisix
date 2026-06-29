@@ -13,6 +13,7 @@
 
 use std::time::Duration;
 
+use aisix_core::{McpAuthType, McpServer};
 use async_trait::async_trait;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
@@ -224,5 +225,64 @@ fn into_mcp_tool(tool: rmcp::model::Tool) -> McpTool {
         name: tool.name.into_owned(),
         description: tool.description.map(|d| d.into_owned()),
         input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
+    }
+}
+
+/// Build the connection parameters for an upstream from its registered
+/// [`McpServer`] resource: maps `auth_type`/`secret` to [`McpAuth`] and
+/// `timeout_ms` to the per-operation deadline.
+pub fn upstream_from_mcp_server(server: &McpServer) -> McpUpstream {
+    let auth = match server.auth_type {
+        McpAuthType::None => McpAuth::None,
+        McpAuthType::Bearer => McpAuth::Bearer(server.secret.clone().unwrap_or_default()),
+    };
+    let timeout = server
+        .timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_UPSTREAM_TIMEOUT);
+    McpUpstream {
+        url: server.url.clone(),
+        auth,
+        timeout,
+    }
+}
+
+/// An [`McpBridge`] that opens a fresh upstream session for each operation and
+/// drops it when done.
+///
+/// The downstream `/mcp` endpoint is stateless, so the gateway holds no
+/// long-lived upstream connections: every `tools/list` / `tools/call` connects,
+/// runs, and disconnects. Connection pooling is a later optimization; this keeps
+/// the snapshot-sourced gateway free of connection-lifecycle state, so a
+/// configuration change is picked up on the next request with nothing to
+/// reconcile.
+pub struct EphemeralBridge {
+    upstream: McpUpstream,
+}
+
+impl EphemeralBridge {
+    pub fn new(upstream: McpUpstream) -> Self {
+        Self { upstream }
+    }
+}
+
+#[async_trait]
+impl McpBridge for EphemeralBridge {
+    async fn list_tools(&self) -> Result<Vec<McpTool>, McpError> {
+        RmcpBridge::connect(&self.upstream)
+            .await?
+            .list_tools()
+            .await
+    }
+
+    async fn call_tool(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<McpToolResult, McpError> {
+        RmcpBridge::connect(&self.upstream)
+            .await?
+            .call_tool(name, arguments)
+            .await
     }
 }
