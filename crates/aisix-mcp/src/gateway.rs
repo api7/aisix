@@ -59,13 +59,31 @@ pub struct McpGateway {
 impl McpGateway {
     /// Build a gateway over the given `(server_name, bridge)` upstreams.
     /// Registration order is the order tools are listed in.
+    ///
+    /// A name may only register once: a duplicate is dropped (the first
+    /// registration wins) with a warning, rather than silently shadowing the
+    /// later one and emitting duplicate tool names on the wire. Server names
+    /// must not contain [`TOOL_NAMESPACE_SEPARATOR`].
     pub fn new(upstreams: impl IntoIterator<Item = (String, Arc<dyn McpBridge>)>) -> Self {
-        let upstreams: Vec<NamedUpstream> = upstreams
-            .into_iter()
-            .map(|(name, bridge)| NamedUpstream { name, bridge })
-            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::new();
+        for (name, bridge) in upstreams {
+            debug_assert!(
+                !name.contains(TOOL_NAMESPACE_SEPARATOR),
+                "upstream server name `{name}` must not contain the namespace \
+                 separator `{TOOL_NAMESPACE_SEPARATOR}`"
+            );
+            if !seen.insert(name.clone()) {
+                tracing::warn!(
+                    upstream = %name,
+                    "duplicate MCP upstream name; keeping the first registration, dropping this one"
+                );
+                continue;
+            }
+            deduped.push(NamedUpstream { name, bridge });
+        }
         Self {
-            upstreams: upstreams.into(),
+            upstreams: deduped.into(),
         }
     }
 
