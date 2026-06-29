@@ -15,6 +15,8 @@
 
 pub mod bridge;
 pub mod error;
+pub mod gateway;
 
 pub use bridge::{McpAuth, McpBridge, McpTool, McpToolResult, McpUpstream, RmcpBridge};
 pub use error::McpError;
+pub use gateway::{streamable_http_service, McpGateway, TOOL_NAMESPACE_SEPARATOR};
