@@ -414,10 +414,20 @@ async fn tool_acl_filters_list_and_rejects_calls() {
         .expect("permitted call");
     assert_eq!(first_text(&allowed), "alpha:hi");
 
-    // A non-permitted tool is rejected (defense-in-depth), not routed upstream.
+    // A non-permitted tool is rejected (defense-in-depth), not routed upstream,
+    // with a neutral message that doesn't reveal whether the tool/server exists.
+    let err = client
+        .call_tool(call("beta__echo", "hi"))
+        .await
+        .expect_err("non-permitted tool call must be rejected");
+    let msg = format!("{err:?}");
     assert!(
-        client.call_tool(call("beta__echo", "hi")).await.is_err(),
-        "non-permitted tool call must be rejected"
+        msg.contains("not available"),
+        "rejection should use the neutral message, got: {msg}"
+    );
+    assert!(
+        !msg.contains("permitted") && !msg.contains("forbidden") && !msg.contains("exists"),
+        "rejection must not reveal existence/permission detail, got: {msg}"
     );
 }
 

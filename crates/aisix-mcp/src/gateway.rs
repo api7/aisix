@@ -99,6 +99,11 @@ impl McpGateway {
     /// registration wins) with a warning, rather than silently shadowing the
     /// later one and emitting duplicate tool names on the wire. Server names
     /// must not contain [`TOOL_NAMESPACE_SEPARATOR`].
+    ///
+    /// The gateway is **unrestricted** ([`ToolAcl::AllowAll`]) until scoped with
+    /// [`McpGateway::with_tool_acl`]. Any caller that serves external traffic
+    /// MUST scope it to the caller's key — the proxy `/mcp` mount is the single
+    /// enforcement point and always does.
     pub fn new(upstreams: impl IntoIterator<Item = (String, Arc<dyn McpBridge>)>) -> Self {
         let mut seen = std::collections::HashSet::new();
         let mut deduped = Vec::new();
