@@ -42,6 +42,7 @@ mod error_translate;
 pub mod health;
 mod http_client;
 mod images;
+mod mcp;
 mod messages;
 mod models;
 mod passthrough;
@@ -105,6 +106,10 @@ pub fn build_router(state: ProxyState) -> Router {
             "/passthrough/:provider/*rest",
             any(passthrough::passthrough),
         )
+        // Downstream-facing MCP gateway. Authentication (AISIX API key) is
+        // enforced inside the handler via the `AuthenticatedKey` extractor.
+        .route("/mcp", any(mcp::mcp_endpoint))
+        .route("/mcp/", any(mcp::mcp_endpoint))
         // Wire the configured cap into axum's request-body extractor
         // chain (`Json<T>` defers to `Bytes` which honors this layer).
         // Without this, axum 0.7's `DefaultBodyLimit` falls back to
@@ -178,6 +183,7 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
         "/v1/audio/transcriptions" => "/v1/audio/transcriptions",
         "/v1/audio/translations" => "/v1/audio/translations",
         "/v1/audio/speech" => "/v1/audio/speech",
+        "/mcp" | "/mcp/" => "/mcp",
         _ if path.starts_with("/passthrough/") => "/passthrough/:provider/*rest",
         _ => "other",
     }
@@ -186,6 +192,8 @@ fn normalize_endpoint_label(path: &str) -> &'static str {
 fn inbound_protocol_for_endpoint(endpoint: &str) -> &'static str {
     if endpoint == "/v1/messages" || endpoint == "/v1/messages/count_tokens" {
         "anthropic"
+    } else if endpoint == "/mcp" {
+        "mcp"
     } else {
         "openai"
     }

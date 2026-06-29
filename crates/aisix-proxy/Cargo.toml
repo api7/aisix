@@ -11,6 +11,9 @@ description = "aisix: /v1/* proxy router (OpenAI-compatible) + middleware + hook
 [dependencies]
 aisix-core = { path = "../aisix-core" }
 aisix-gateway = { path = "../aisix-gateway" }
+# Mounts the downstream-facing `/mcp` MCP gateway endpoint (mcp.rs): the
+# proxy builds an `McpGateway` from the snapshot's `mcp_servers` per request.
+aisix-mcp = { path = "../aisix-mcp" }
 # /v1/messages handler reaches into the Anthropic wire helpers
 # (parse_inbound_request / chat_response_into_anthropic_json /
 # AnthropicSseEncoder) so it can translate Anthropic-protocol
