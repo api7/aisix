@@ -216,16 +216,27 @@ pub async fn mcp_endpoint(
     response
 }
 
-/// Run the output guardrail chain over an MCP tool result. Returns the firing
-/// guardrail's name when the result is blocked, `None` to allow. The JSON-RPC
-/// `result` is fed to `check_output` as assistant text — the same hook the LLM
-/// response path uses; an error response (no `result`) has nothing to scan.
+/// Run the output guardrail chain over an MCP tool result. Returns `Some(_)` to
+/// block — the inner value is the firing guardrail's name, or `None` for a
+/// fail-closed block on a body that cannot be parsed — and `None` to allow. The
+/// tool result's text is fed to `check_output` as assistant text, the same hook
+/// the LLM response path uses; a protocol-level error envelope (no `result`) has
+/// nothing to scan and is allowed.
 async fn output_guardrail_block(
     chain: &aisix_guardrails::GuardrailChain,
     response_bytes: &[u8],
     tool: &str,
 ) -> Option<Option<String>> {
-    let value: serde_json::Value = serde_json::from_slice(response_bytes).ok()?;
+    // Fail closed on an unparseable body. The `/mcp` gateway is configured
+    // `json_response = true`, so a `tools/call` returns a single
+    // `application/json` object; a body that does not parse (e.g. if that ever
+    // regressed to SSE framing) must not slip an unscanned tool result past the
+    // guardrail — block rather than allow.
+    let value: serde_json::Value = match serde_json::from_slice(response_bytes) {
+        Ok(value) => value,
+        Err(_) => return Some(None),
+    };
+    // A protocol-level error envelope (no `result`) has no tool output to scan.
     let result = value.get("result")?;
     // Scan the client-visible tool text — the `text`-type content blocks the
     // result carries — not the serialized JSON envelope. This keeps MCP output
@@ -804,6 +815,16 @@ mod tests {
                 .await
                 .is_none(),
             "an error response has no tool result to scan"
+        );
+
+        // A body that is not JSON at all (e.g. SSE framing from a config
+        // regression) fails closed — block, never pass an unscanned result.
+        let sse_body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"result\":{}}\n\n";
+        assert!(
+            output_guardrail_block(&chain, sse_body, "echo")
+                .await
+                .is_some(),
+            "an unparseable response body must fail closed (block)"
         );
     }
 
